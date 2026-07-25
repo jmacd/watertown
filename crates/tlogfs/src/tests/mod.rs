@@ -2546,7 +2546,10 @@ async fn test_collapse_table_series_reencodes_versions() {
             .collapse_table_series(id)
             .await
             .expect("second collapse_table_series");
-        assert!(!stats.collapsed, "collapsing an already-merged series is a no-op");
+        assert!(
+            !stats.collapsed,
+            "collapsing an already-merged series is a no-op"
+        );
         tx.commit_test().await.expect("commit");
     }
 

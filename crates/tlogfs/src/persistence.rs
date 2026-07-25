@@ -1432,10 +1432,9 @@ impl State {
             .flush()
             .await
             .map_err(|e| TLogFSError::Internal(format!("collapse: flush merged parquet: {e}")))?;
-        let result = writer
-            .finalize()
-            .await
-            .map_err(|e| TLogFSError::Internal(format!("collapse: finalize merged parquet: {e}")))?;
+        let result = writer.finalize().await.map_err(|e| {
+            TLogFSError::Internal(format!("collapse: finalize merged parquet: {e}"))
+        })?;
 
         let content_len = result.size;
         let series_outboard = utilities::bao_outboard::SeriesOutboard::from_first_version_state(
@@ -1477,14 +1476,7 @@ impl State {
 
             let mut entry = match content_ref {
                 crate::file_writer::ContentRef::Small(content) => OplogEntry::new_file_series(
-                    id,
-                    now,
-                    version,
-                    content,
-                    min_event,
-                    max_event,
-                    ea,
-                    txn_seq,
+                    id, now, version, content, min_event, max_event, ea, txn_seq,
                 ),
                 crate::file_writer::ContentRef::Large(b3, size) => {
                     OplogEntry::new_large_file_series(
@@ -1568,9 +1560,10 @@ impl State {
             let writer = match writer {
                 Some(ref mut w) => w,
                 None => {
-                    let w = ArrowWriter::try_new(Vec::new(), batch.schema(), None).map_err(|e| {
-                        TLogFSError::Internal(format!("collapse: create parquet writer: {e}"))
-                    })?;
+                    let w =
+                        ArrowWriter::try_new(Vec::new(), batch.schema(), None).map_err(|e| {
+                            TLogFSError::Internal(format!("collapse: create parquet writer: {e}"))
+                        })?;
                     writer.insert(w)
                 }
             };
