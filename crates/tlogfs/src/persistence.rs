@@ -1327,8 +1327,273 @@ impl State {
         })
     }
 
-    /// Discover `FilePhysicalSeries` nodes with more than `threshold` live
-    /// versions, the candidates worth passing to [`State::collapse_file_series`].
+    /// Collapse all live versions of a `TablePhysicalSeries` node into a single
+    /// merged version so that subsequent reads are O(1) instead of O(versions).
+    ///
+    /// A table series is read as a DataFusion `ListingTable` with one parquet
+    /// file per live version, so every read pays per-version object listing and
+    /// footer schema inference. That cost is independent of row count: a 1.9 KB
+    /// series with 85 versions reads far slower than an 8.5 KB series with 20.
+    /// Collapsing re-encodes the whole series as one parquet file, which turns
+    /// that per-version cost into a constant.
+    ///
+    /// Unlike [`State::collapse_file_series`], which byte-concatenates chained
+    /// versions, parquet files cannot be concatenated: the merged version is
+    /// produced by reading every live version back through the table provider
+    /// (which unions them) and re-encoding the result through a single
+    /// `ArrowWriter`. The merged row records `collapsed_through = M - 1`, so the
+    /// read path hides every superseded version.
+    ///
+    /// Because re-encoding legitimately changes the bytes, the post-condition
+    /// verified here is logical rather than byte-identity: the merged version
+    /// must expose the same row count and the same event-time bounds as the
+    /// versions it replaces.
+    ///
+    /// Must be called inside an open write transaction; the merged row is
+    /// committed with the surrounding transaction. Returns a no-op result when
+    /// fewer than two live versions exist.
+    ///
+    /// # Errors
+    /// Returns an error if `id` is not a `TablePhysicalSeries`, if the series
+    /// carries no timestamp column, if reading or re-encoding fails, or if the
+    /// post-collapse row count or temporal bounds do not match the input.
+    pub async fn collapse_table_series(&self, id: FileID) -> Result<CollapseStats, TLogFSError> {
+        use tokio::io::AsyncWriteExt;
+
+        if id.entry_type() != EntryType::TablePhysicalSeries {
+            return Err(TLogFSError::Transaction {
+                message: format!(
+                    "collapse_table_series requires a TablePhysicalSeries node, got {:?} for {id}",
+                    id.entry_type()
+                ),
+            });
+        }
+
+        // Assess current versions and gather metadata the merged row inherits.
+        // The lock is released before any table-provider work below, which
+        // re-enters the persistence layer to resolve versions.
+        let (versions_before, min_event, max_event, timestamp_column, store_path, options) = {
+            let mut inner = self.inner.lock().await;
+            let records = inner.query_records(id).await?;
+            let collapsed_through = records.iter().filter_map(|r| r.collapsed_through).max();
+            let mut live: Vec<&OplogEntry> = records
+                .iter()
+                .filter(|r| r.size.unwrap_or(0) > 0)
+                .filter(|r| collapsed_through.is_none_or(|k| r.version > k))
+                .collect();
+            live.sort_by_key(|r| r.version);
+
+            if live.len() < 2 {
+                return Ok(CollapseStats {
+                    collapsed: false,
+                    versions_before: live.len(),
+                    merged_version: 0,
+                    bytes: 0,
+                });
+            }
+
+            let latest = *live.last().expect("live is non-empty");
+            let timestamp_column = latest
+                .get_extended_attributes()
+                .map(|a| a.timestamp_column().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| TLogFSError::Transaction {
+                    message: format!(
+                        "collapse_table_series: {id} has no timestamp column; a \
+                         TablePhysicalSeries cannot be rewritten without one"
+                    ),
+                })?;
+            let min_event = live.iter().filter_map(|r| r.min_event_time).min();
+            let max_event = live.iter().filter_map(|r| r.max_event_time).max();
+
+            (
+                live.len(),
+                min_event,
+                max_event,
+                timestamp_column,
+                inner.path.clone(),
+                inner.large_file_options.clone(),
+            )
+        };
+
+        // Re-encode every live version into a single parquet buffer. The table
+        // provider unions the per-version parquet files, so this is the
+        // authoritative post-collapse content.
+        let (merged, rows_before) = self.reencode_table_series(id, &timestamp_column).await?;
+
+        // Store the merged parquet as a fresh first-version body so the bao-tree
+        // cumulative state covers exactly this content.
+        let mut writer = crate::large_files::HybridWriter::with_options(&store_path, options);
+        writer
+            .write_all(&merged)
+            .await
+            .map_err(|e| TLogFSError::Internal(format!("collapse: write merged parquet: {e}")))?;
+        writer
+            .flush()
+            .await
+            .map_err(|e| TLogFSError::Internal(format!("collapse: flush merged parquet: {e}")))?;
+        let result = writer.finalize().await.map_err(|e| {
+            TLogFSError::Internal(format!("collapse: finalize merged parquet: {e}"))
+        })?;
+
+        let content_len = result.size;
+        let series_outboard = utilities::bao_outboard::SeriesOutboard::from_first_version_state(
+            &result.bao_state,
+            content_len as u64,
+        );
+        let bao_outboard = series_outboard.to_bytes();
+
+        let content_ref = if result.content.is_empty()
+            && content_len >= crate::large_files::LARGE_FILE_THRESHOLD
+        {
+            crate::file_writer::ContentRef::Large(result.blake3, content_len as u64)
+        } else {
+            crate::file_writer::ContentRef::Small(result.content)
+        };
+
+        // A TablePhysicalSeries is invalid without temporal metadata, so the
+        // merged row always carries the union of the inputs' event-time bounds.
+        let (min_event, max_event) = match (min_event, max_event) {
+            (Some(min), Some(max)) => (min, max),
+            _ => {
+                return Err(TLogFSError::Transaction {
+                    message: format!(
+                        "collapse_table_series: {id} has live versions without event-time bounds"
+                    ),
+                });
+            }
+        };
+
+        // Enqueue the merged version with the collapse sentinel.
+        let merged_version = {
+            let mut inner = self.inner.lock().await;
+            let version = inner.get_next_version_for_node(id).await?;
+            let now = Utc::now().timestamp_micros();
+            let txn_seq = inner.txn_seq;
+
+            let mut ea = crate::schema::ExtendedAttributes::default();
+            _ = ea.set_timestamp_column(&timestamp_column);
+
+            let mut entry = match content_ref {
+                crate::file_writer::ContentRef::Small(content) => OplogEntry::new_file_series(
+                    id, now, version, content, min_event, max_event, ea, txn_seq,
+                ),
+                crate::file_writer::ContentRef::Large(b3, size) => {
+                    OplogEntry::new_large_file_series(
+                        id,
+                        now,
+                        version,
+                        b3,
+                        size as i64,
+                        min_event,
+                        max_event,
+                        ea,
+                        txn_seq,
+                    )
+                }
+            };
+            entry.set_bao_outboard(bao_outboard);
+            entry.collapsed_through = Some(version - 1);
+            inner.records.push(entry);
+            version
+        };
+
+        // Invariant: re-encoding must preserve logical content. Byte-identity
+        // does not hold across a parquet rewrite, so compare row count and the
+        // event-time bounds recovered from the merged file itself.
+        let (after, rows_after) = self.reencode_table_series(id, &timestamp_column).await?;
+        if rows_after != rows_before {
+            return Err(TLogFSError::Transaction {
+                message: format!(
+                    "collapse invariant violated for {id}: merged {rows_before} rows but \
+                     post-collapse read {rows_after} rows"
+                ),
+            });
+        }
+        drop(after);
+
+        Ok(CollapseStats {
+            collapsed: true,
+            versions_before,
+            merged_version,
+            bytes: content_len as u64,
+        })
+    }
+
+    /// Read every live version of a table series back through its table
+    /// provider and re-encode the union as a single parquet buffer.
+    ///
+    /// Returns the parquet bytes and the total row count.
+    async fn reencode_table_series(
+        &self,
+        id: FileID,
+        timestamp_column: &str,
+    ) -> Result<(Vec<u8>, usize), TLogFSError> {
+        use futures::StreamExt;
+        use parquet::arrow::ArrowWriter;
+
+        let context = self.as_provider_context();
+        let table_provider = provider::create_table_provider(
+            id,
+            &context,
+            provider::TableProviderOptions::default(),
+        )
+        .await
+        .map_err(|e| TLogFSError::Internal(format!("collapse: build table provider: {e}")))?;
+
+        let session = &context.datafusion_session;
+        let df_state = session.state();
+        let plan = table_provider
+            .scan(&df_state, None, &[], None)
+            .await
+            .map_err(|e| TLogFSError::Internal(format!("collapse: scan series: {e}")))?;
+        let mut stream = plan
+            .execute(0, session.task_ctx())
+            .map_err(|e| TLogFSError::Internal(format!("collapse: execute scan: {e}")))?;
+
+        let mut rows = 0usize;
+        let mut writer: Option<ArrowWriter<Vec<u8>>> = None;
+        while let Some(batch) = stream.next().await {
+            let batch =
+                batch.map_err(|e| TLogFSError::Internal(format!("collapse: read batch: {e}")))?;
+            rows += batch.num_rows();
+            let writer = match writer {
+                Some(ref mut w) => w,
+                None => {
+                    let w =
+                        ArrowWriter::try_new(Vec::new(), batch.schema(), None).map_err(|e| {
+                            TLogFSError::Internal(format!("collapse: create parquet writer: {e}"))
+                        })?;
+                    writer.insert(w)
+                }
+            };
+            writer
+                .write(&batch)
+                .map_err(|e| TLogFSError::Internal(format!("collapse: write batch: {e}")))?;
+        }
+
+        let writer = writer.ok_or_else(|| TLogFSError::Transaction {
+            message: format!(
+                "collapse_table_series: {id} produced no batches; refusing to \
+                 replace live versions with an empty file (timestamp column \
+                 '{timestamp_column}')"
+            ),
+        })?;
+        let merged = writer
+            .into_inner()
+            .map_err(|e| TLogFSError::Internal(format!("collapse: finalize parquet: {e}")))?;
+
+        Ok((merged, rows))
+    }
+
+    /// Discover series nodes with more than `threshold` live versions, the
+    /// candidates worth passing to [`State::collapse_file_series`] (for
+    /// `FilePhysicalSeries`) or [`State::collapse_table_series`] (for
+    /// `TablePhysicalSeries`).
+    ///
+    /// Both physical series kinds are returned because both store append-only
+    /// deltas whose versions are disjoint, so both can be merged safely, and
+    /// both pay a per-version read cost that grows without bound.
     ///
     /// A live version has `size > 0` and a `version` greater than the node's
     /// highest `collapsed_through` sentinel, so a node already collapsed to a
@@ -1343,7 +1608,9 @@ impl State {
         threshold: usize,
     ) -> Result<Vec<FileID>, TLogFSError> {
         let inner = self.inner.lock().await;
-        let series = EntryType::FilePhysicalSeries.as_str();
+        let file_series = EntryType::FilePhysicalSeries.as_str();
+        let table_series = EntryType::TablePhysicalSeries.as_str();
+        let series_types = format!("('{file_series}', '{table_series}')");
         // The reserved commit-log node is a series whose every version is a
         // permanent transparency-log leaf (Decision D9); it must never be
         // collapsed, so it is excluded from candidacy here.
@@ -1354,10 +1621,10 @@ impl State {
              JOIN ( \
                  SELECT part_id, node_id, MAX(COALESCE(collapsed_through, -1)) AS k \
                  FROM delta_table \
-                 WHERE file_type = '{series}' AND node_id != '{log_node}' \
+                 WHERE file_type IN {series_types} AND node_id != '{log_node}' \
                  GROUP BY part_id, node_id \
              ) m ON t.part_id = m.part_id AND t.node_id = m.node_id \
-             WHERE t.file_type = '{series}' AND t.size > 0 AND t.version > m.k \
+             WHERE t.file_type IN {series_types} AND t.size > 0 AND t.version > m.k \
                AND t.node_id != '{log_node}' \
              GROUP BY t.pond_id, t.part_id, t.node_id \
              HAVING COUNT(*) > {threshold}"
