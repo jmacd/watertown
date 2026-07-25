@@ -879,7 +879,14 @@ impl Ship {
             Err(e) => return Err(tx.abort(e).await),
         };
         for id in candidates {
-            match state.collapse_file_series(id).await {
+            // Both physical series kinds are collapsible, but by different
+            // means: a FilePhysicalSeries is byte-concatenated, while a
+            // TablePhysicalSeries must be re-encoded as a single parquet file.
+            let collapsed = match id.entry_type() {
+                tinyfs::EntryType::TablePhysicalSeries => state.collapse_table_series(id).await,
+                _ => state.collapse_file_series(id).await,
+            };
+            match collapsed {
                 Ok(stats) if stats.collapsed => {
                     report.files_collapsed += 1;
                     report.versions_collapsed += stats.versions_before;

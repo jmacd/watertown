@@ -57,7 +57,7 @@ async fn test_transaction_guard_basic_usage() {
     let root = tx.root().await.expect("Failed to get root directory");
 
     let root_debug = format!("{:?}", root);
-    info!("[OK] Successfully got root directory: {:?}", &root_debug);
+    info!("[OK] Successfully got root directory: {root_debug:?}");
 
     // Commit the transaction
     debug!("Committing transaction");
@@ -2381,6 +2381,212 @@ async fn collapse_now(persistence: &mut OpLogPersistence, file_path: &str) -> i6
     assert!(stats.collapsed, "expected a collapse at {file_path}");
     tx.commit_test().await.expect("commit collapse");
     stats.merged_version
+}
+
+/// Append one parquet version to a `TablePhysicalSeries`, creating it on the
+/// first call. Each call produces an independent per-version parquet file,
+/// which is exactly the layout that makes uncollapsed reads O(versions).
+async fn append_table_series_version(
+    persistence: &mut OpLogPersistence,
+    file_path: &str,
+    timestamps: Vec<i64>,
+    values: Vec<f64>,
+) {
+    let tx = persistence.begin_test().await.expect("begin write tx");
+    let wd = tx.root().await.expect("root");
+    let batch = {
+        use arrow_array::{Float64Array, Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(timestamps)),
+                Arc::new(Float64Array::from(values)),
+            ],
+        )
+        .expect("build batch")
+    };
+    _ = wd
+        .write_series_from_batch(file_path, &batch, Some("timestamp"))
+        .await
+        .expect("create table series version");
+    tx.commit_test().await.expect("commit");
+}
+
+/// Total row count of a series as seen through its table provider.
+async fn table_series_rows(persistence: &mut OpLogPersistence, file_path: &str) -> usize {
+    use futures::StreamExt;
+    let tx = persistence.begin_test().await.expect("begin read tx");
+    let wd = tx.root().await.expect("root");
+    let id = wd.get_node_path(file_path).await.expect("node").id();
+    let state = tx.state().expect("state");
+    let context = state.as_provider_context();
+    let table_provider =
+        provider::create_table_provider(id, &context, provider::TableProviderOptions::default())
+            .await
+            .expect("table provider");
+    let session = &context.datafusion_session;
+    let plan = table_provider
+        .scan(&session.state(), None, &[], None)
+        .await
+        .expect("scan");
+    let mut stream = plan.execute(0, session.task_ctx()).expect("execute");
+    let mut rows = 0usize;
+    while let Some(batch) = stream.next().await {
+        rows += batch.expect("batch").num_rows();
+    }
+    tx.commit_test().await.expect("commit read");
+    rows
+}
+
+/// A `TablePhysicalSeries` accumulates one parquet file per version, so reads
+/// cost O(versions) no matter how few rows each version carries. Collapsing
+/// must merge them into a single version by re-encoding (parquet files cannot
+/// be byte-concatenated the way a `FilePhysicalSeries` can), preserving every
+/// row, and must be a no-op once already collapsed.
+#[tokio::test]
+async fn test_collapse_table_series_reencodes_versions() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let store_path = test_dir();
+    let mut persistence = OpLogPersistence::create_test(&store_path)
+        .await
+        .expect("Failed to create persistence");
+    let file_path = "table.series";
+
+    // Three versions, mimicking an hourly collector: tiny disjoint appends.
+    append_table_series_version(&mut persistence, file_path, vec![100, 200], vec![1.0, 2.0]).await;
+    append_table_series_version(&mut persistence, file_path, vec![300, 400], vec![3.0, 4.0]).await;
+    append_table_series_version(&mut persistence, file_path, vec![500, 600], vec![5.0, 6.0]).await;
+
+    assert_eq!(
+        live_version_count(&mut persistence, file_path).await,
+        3,
+        "three appended versions are all live before collapse"
+    );
+    let rows_before = table_series_rows(&mut persistence, file_path).await;
+    assert_eq!(rows_before, 6, "all six rows are visible before collapse");
+
+    let id = node_id_of(&mut persistence, file_path).await;
+    assert_eq!(
+        id.entry_type(),
+        tinyfs::EntryType::TablePhysicalSeries,
+        "create_series_from_batch writes a TablePhysicalSeries"
+    );
+
+    // A table series must be discoverable as a collapse candidate; before this
+    // was supported the discovery query matched FilePhysicalSeries only and
+    // these nodes could never be collapsed at any threshold.
+    {
+        let tx = persistence.begin_test().await.expect("begin read tx");
+        let candidates = tx
+            .state()
+            .expect("state")
+            .list_collapsible_series(1)
+            .await
+            .expect("list_collapsible_series");
+        assert!(
+            candidates.contains(&id),
+            "a multi-version table series must be a collapse candidate"
+        );
+        tx.commit_test().await.expect("commit read");
+    }
+
+    // Collapse.
+    {
+        let tx = persistence.begin_test().await.expect("begin collapse tx");
+        let stats = tx
+            .state()
+            .expect("state")
+            .collapse_table_series(id)
+            .await
+            .expect("collapse_table_series");
+        assert!(stats.collapsed, "expected a collapse");
+        assert_eq!(stats.versions_before, 3, "three versions were merged");
+        tx.commit_test().await.expect("commit collapse");
+    }
+
+    assert_eq!(
+        live_version_count(&mut persistence, file_path).await,
+        1,
+        "collapse leaves exactly one live version"
+    );
+    assert_eq!(
+        table_series_rows(&mut persistence, file_path).await,
+        rows_before,
+        "re-encoding must preserve every row and must not double-count \
+         superseded versions"
+    );
+
+    // Already collapsed: no further candidacy and no further work.
+    {
+        let tx = persistence.begin_test().await.expect("begin read tx");
+        let candidates = tx
+            .state()
+            .expect("state")
+            .list_collapsible_series(1)
+            .await
+            .expect("list_collapsible_series");
+        assert!(
+            !candidates.contains(&id),
+            "a collapsed table series is no longer a candidate"
+        );
+        tx.commit_test().await.expect("commit read");
+    }
+    {
+        let tx = persistence.begin_test().await.expect("begin collapse tx");
+        let stats = tx
+            .state()
+            .expect("state")
+            .collapse_table_series(id)
+            .await
+            .expect("second collapse_table_series");
+        assert!(!stats.collapsed, "collapsing an already-merged series is a no-op");
+        tx.commit_test().await.expect("commit");
+    }
+
+    // Appending after a collapse must extend the merged baseline, not resurrect
+    // the superseded versions.
+    append_table_series_version(&mut persistence, file_path, vec![700, 800], vec![7.0, 8.0]).await;
+    assert_eq!(
+        table_series_rows(&mut persistence, file_path).await,
+        rows_before + 2,
+        "a post-collapse append adds exactly its own rows"
+    );
+}
+
+/// Collapse must reject a node that is not a table series, so a mis-dispatched
+/// `FilePhysicalSeries` can never be silently rewritten as parquet.
+#[tokio::test]
+async fn test_collapse_table_series_rejects_file_series() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let store_path = test_dir();
+    let mut persistence = OpLogPersistence::create_test(&store_path)
+        .await
+        .expect("Failed to create persistence");
+    let file_path = "data/bytes.csv";
+    append_series_version(&mut persistence, file_path, b"a,1\n", Some("data")).await;
+    append_series_version(&mut persistence, file_path, b"a,2\n", None).await;
+
+    let id = node_id_of(&mut persistence, file_path).await;
+    let tx = persistence.begin_test().await.expect("begin tx");
+    let err = tx
+        .state()
+        .expect("state")
+        .collapse_table_series(id)
+        .await
+        .expect_err("a FilePhysicalSeries must be rejected");
+    assert!(
+        format!("{err}").contains("requires a TablePhysicalSeries"),
+        "unexpected error: {err}"
+    );
+    tx.commit_test().await.expect("commit");
 }
 
 /// `list_collapsible_series` must honor the threshold, return only series files
