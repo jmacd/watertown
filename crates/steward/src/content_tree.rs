@@ -1578,7 +1578,7 @@ mod tests {
         // Run A absorbed versions 1..=10 and was allocated version 26.
         // A later window, versions 21..=31, merged as version 36 -- so the
         // highest sentinel (31) sits *above* run A's version number (26).
-        let mut series_row = |version: i64, from: Option<i64>, through: Option<i64>| {
+        let series_row = |version: i64, from: Option<i64>, through: Option<i64>| {
             let mut row = OplogEntry::new_small_file(
                 series_id,
                 version,

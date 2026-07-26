@@ -148,26 +148,18 @@ pub async fn listing_table_from_cache(
     cache_dir: &Path,
     scheme: &str,
     node_id: &tinyfs::NodeID,
-    _ctx: &SessionContext,
+    versions: &[FileVersionInfo],
+    ctx: &SessionContext,
 ) -> Result<Arc<dyn TableProvider>> {
-    let dir = cache_node_dir(cache_dir, scheme, node_id);
-    let dir_url = format!("file://{}/", dir.display());
-
-    let table_url = ListingTableUrl::parse(&dir_url)?;
-    let listing_options =
-        ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
-
-    // Merge schemas from all cached parquet versions.  Format providers like
-    // oteljson produce variable schemas (columns appear/disappear across
-    // lines), so even a single file's cached versions can differ.
-    let merged_schema = merge_parquet_schemas_in_dir(&dir).await?;
-
-    let config = ListingTableConfig::new(table_url)
-        .with_listing_options(listing_options)
-        .with_schema(merged_schema);
-
-    let table = ListingTable::try_new(config)?;
-    Ok(Arc::new(table))
+    listing_table_from_cache_bounded(
+        cache_dir,
+        scheme,
+        node_id,
+        versions,
+        &tinyfs::SeriesReadBounds::NONE,
+        ctx,
+    )
+    .await
 }
 
 /// Extract a series version's recorded `max_event_time` (epoch µs) from its
@@ -197,17 +189,19 @@ pub async fn listing_table_from_cache_bounded(
     node_id: &tinyfs::NodeID,
     versions: &[FileVersionInfo],
     bounds: &tinyfs::SeriesReadBounds,
-    ctx: &SessionContext,
+    _ctx: &SessionContext,
 ) -> Result<Arc<dyn TableProvider>> {
-    if *bounds == tinyfs::SeriesReadBounds::NONE {
-        return listing_table_from_cache(cache_dir, scheme, node_id, ctx).await;
-    }
-
-    let dir = cache_node_dir(cache_dir, scheme, node_id);
-    let merged_schema = merge_parquet_schemas_in_dir(&dir).await?;
-
     // Collect the retained versions' Parquet paths (only those present on disk).
+    //
+    // These paths are named EXPLICITLY rather than by globbing the node's
+    // cache directory.  The directory accumulates a Parquet per version ever
+    // written, but `versions` is the set of versions that are currently LIVE.
+    // Version collapse breaks the assumption that those two sets agree: it
+    // replaces a run of versions with one merged version carrying the same
+    // content, so a glob would return both the merged version and the
+    // superseded ones it stands for, silently double-counting every row.
     let mut paths: Vec<ListingTableUrl> = Vec::new();
+    let mut files: Vec<PathBuf> = Vec::new();
     for v in versions {
         if !bounds.retains(version_max_event_time(v), v.version as i64) {
             continue;
@@ -215,8 +209,14 @@ pub async fn listing_table_from_cache_bounded(
         let p = cache_version_path(cache_dir, scheme, node_id, v);
         if p.exists() {
             paths.push(ListingTableUrl::parse(format!("file://{}", p.display()))?);
+            files.push(p);
         }
     }
+
+    // Merge schemas from the retained files only, for the same reason: a
+    // superseded version's cached schema must not shape the read.
+    let merged_schema =
+        merge_parquet_schemas(&files, &cache_node_dir(cache_dir, scheme, node_id)).await?;
 
     if paths.is_empty() {
         // Every version pruned: return an empty table over the cache schema so
@@ -345,6 +345,41 @@ pub async fn listing_table_from_glob_cache(
 /// them via `Schema::try_merge`.  This gives UNION-ALL-BY-NAME semantics:
 /// columns that appear in any file are present in the result, and files
 /// missing a column will produce NULLs when read through the ListingTable.
+/// Merge the schemas of an explicit list of cached Parquet files.
+///
+/// `context_dir` is used only to describe the error when the list is empty.
+async fn merge_parquet_schemas(files: &[PathBuf], context_dir: &Path) -> Result<SchemaRef> {
+    use arrow::datatypes::Schema;
+
+    let mut schemas = Vec::new();
+    for path in files {
+        let file = tokio::fs::File::open(path).await?;
+        let reader = parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(file)
+            .await
+            .map_err(|e| {
+                crate::error::Error::Arrow(format!(
+                    "Failed to read parquet metadata from '{}': {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+        schemas.push(reader.schema().as_ref().clone());
+    }
+
+    if schemas.is_empty() {
+        // No live version is cached yet.  Fall back to whatever the directory
+        // holds so the caller gets an empty table with a usable schema rather
+        // than an error.
+        return merge_parquet_schemas_in_dir(context_dir).await;
+    }
+
+    let merged = Schema::try_merge(schemas).map_err(|e| {
+        crate::error::Error::Arrow(format!("Failed to merge parquet schemas: {}", e))
+    })?;
+
+    Ok(Arc::new(merged))
+}
+
 async fn merge_parquet_schemas_in_dir(dir: &Path) -> Result<SchemaRef> {
     use arrow::datatypes::Schema;
 
@@ -522,8 +557,10 @@ mod tests {
         let schema = test_schema();
 
         // Write two versions
+        let mut versions = Vec::new();
         for i in 1_i64..=2 {
             let version = test_version(i as u64, &format!("hash{}", i));
+            versions.push(version.clone());
             let batch = test_batch(&schema, &[i * 1000], &[&format!("val{}", i)]);
             let stream: Pin<
                 Box<
@@ -541,7 +578,7 @@ mod tests {
 
         // Build ListingTable and verify
         let ctx = SessionContext::new();
-        let table = listing_table_from_cache(cache_dir, "csv", &node_id, &ctx)
+        let table = listing_table_from_cache(cache_dir, "csv", &node_id, &versions, &ctx)
             .await
             .unwrap();
 
