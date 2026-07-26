@@ -363,22 +363,32 @@ pub struct CollapseRange {
 }
 
 impl CollapseRange {
-    /// Range covered by `entry`. A row with `collapsed_through = Some(hi)` and
-    /// no `collapsed_from` is a pre-tiering full-history merge, i.e. `[0, hi]`.
+    /// Range covered by a row given its version and collapse columns. A row with
+    /// `collapsed_through = Some(hi)` and no `collapsed_from` is a pre-tiering
+    /// full-history merge, i.e. `[0, hi]`.
+    ///
+    /// Takes the columns rather than a whole [`OplogEntry`] so consumers that
+    /// project a narrow row (steward's content scan) share one definition.
     #[must_use]
-    pub fn of(entry: &OplogEntry) -> Self {
-        match entry.collapsed_through {
+    pub fn new(version: i64, collapsed_from: Option<i64>, collapsed_through: Option<i64>) -> Self {
+        match collapsed_through {
             Some(hi) => Self {
-                lo: entry.collapsed_from.unwrap_or(0),
+                lo: collapsed_from.unwrap_or(0),
                 hi,
                 merged: true,
             },
             None => Self {
-                lo: entry.version,
-                hi: entry.version,
+                lo: version,
+                hi: version,
                 merged: false,
             },
         }
+    }
+
+    /// Range covered by `entry`.
+    #[must_use]
+    pub fn of(entry: &OplogEntry) -> Self {
+        Self::new(entry.version, entry.collapsed_from, entry.collapsed_through)
     }
 
     /// Ordering key placing rows in series byte order (oldest content first).
@@ -394,6 +404,45 @@ impl CollapseRange {
     }
 }
 
+/// Whether the row at index `i` of `rows` is superseded by some other row's
+/// merged range. `rows` pairs each row's `version` with its [`CollapseRange`].
+///
+/// This is *the* supersession rule. Every consumer that decides which series
+/// rows are live must go through it (directly or via [`live_series_entries`] /
+/// [`live_series_versions`]), because a reader using a different rule than the
+/// read path fails silently rather than loudly.
+#[must_use]
+fn is_superseded(i: usize, rows: &[(i64, CollapseRange)]) -> bool {
+    let (version, range) = rows[i];
+    rows.iter().enumerate().any(|(j, (other_version, run))| {
+        if j == i || !run.merged {
+            return false; // a run never supersedes itself; loose rows supersede nothing
+        }
+        // Identical ranges (should not occur) resolve to the newer row.
+        run.covers(&range) && (*run != range || *other_version > version)
+    })
+}
+
+/// Live subset of `(version, range)` pairs, ordered oldest content first.
+///
+/// The version-keyed counterpart of [`live_series_entries`], for callers that
+/// hold versions and ranges rather than whole rows -- notably steward's content
+/// fold, which must agree with the read path exactly or a mirror silently
+/// under-replicates.
+///
+/// Note the returned order is *range* order, not version order: a merged run
+/// carries a fresh highest version while standing for content in the middle of
+/// the stream.
+#[must_use]
+pub fn live_series_versions(rows: &[(i64, CollapseRange)]) -> Vec<i64> {
+    let mut live: Vec<(i64, CollapseRange)> = (0..rows.len())
+        .filter(|i| !is_superseded(*i, rows))
+        .map(|i| rows[i])
+        .collect();
+    live.sort_by_key(|(_, range)| range.sort_key());
+    live.into_iter().map(|(version, _)| version).collect()
+}
+
 /// Select the live rows of a series — those not superseded by any merged
 /// collapse row — ordered oldest content first.
 ///
@@ -406,26 +455,15 @@ impl CollapseRange {
 /// loose versions.
 #[must_use]
 pub fn live_series_entries(records: &[OplogEntry]) -> Vec<&OplogEntry> {
-    let runs: Vec<(usize, CollapseRange)> = records
+    let rows: Vec<(i64, CollapseRange)> = records
         .iter()
-        .enumerate()
-        .map(|(i, e)| (i, CollapseRange::of(e)))
-        .filter(|(_, r)| r.merged)
+        .map(|e| (e.version, CollapseRange::of(e)))
         .collect();
 
     let mut live: Vec<&OplogEntry> = records
         .iter()
         .enumerate()
-        .filter(|(i, entry)| {
-            let range = CollapseRange::of(entry);
-            !runs.iter().any(|(j, run)| {
-                if j == i {
-                    return false; // a run never supersedes itself
-                }
-                // Identical ranges (should not occur) resolve to the newer row.
-                run.covers(&range) && (*run != range || records[*j].version > entry.version)
-            })
-        })
+        .filter(|(i, _)| !is_superseded(*i, &rows))
         .map(|(_, entry)| entry)
         .collect();
 

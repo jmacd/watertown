@@ -3682,3 +3682,84 @@ async fn series_bounded_read_memory_plateaus_as_history_grows() {
         "bounded read must be smaller than the full-history read at N=16: {b16} < {f16}"
     );
 }
+
+/// Supersession must be decided by *range containment*, never by the highest
+/// `collapsed_through` sentinel.
+///
+/// Once collapse is tiered, a merged run carries a fresh highest version while
+/// standing for content in the middle of the stream, so the two rules diverge:
+/// a run created early (low version, low range) can be outlived by a later
+/// merge whose range extends past that run's *version number*. The old
+/// `max(collapsed_through)` rule -- "every version <= K is dead" -- then drops a
+/// live run and its content disappears silently.
+#[test]
+fn test_supersession_uses_ranges_not_max_watermark() {
+    use crate::schema::{CollapseRange, live_series_versions};
+
+    let loose = |v: i64| {
+        (
+            v,
+            CollapseRange {
+                lo: v,
+                hi: v,
+                merged: false,
+            },
+        )
+    };
+    let run = |v: i64, lo: i64, hi: i64| {
+        (
+            v,
+            CollapseRange {
+                lo,
+                hi,
+                merged: true,
+            },
+        )
+    };
+
+    // Run A merged versions 1..=10 and was allocated version 26. Later, a
+    // window of loose versions 21..=31 merged as version 36. Note 36's range
+    // ends at 31, which is *above* run A's version number of 26.
+    let rows = vec![
+        run(26, 1, 10),
+        loose(11),
+        loose(12),
+        run(36, 21, 31),
+        loose(40),
+    ];
+
+    let live = live_series_versions(&rows);
+    assert_eq!(
+        live,
+        vec![26, 11, 12, 36, 40],
+        "every row is live: no range contains another. Order is range order \
+         (run A first, covering versions 1..=10), not version order"
+    );
+
+    // The rule this replaced: max(collapsed_through) = 31, retain version > 31.
+    let watermark = rows
+        .iter()
+        .filter(|(_, r)| r.merged)
+        .map(|(_, r)| r.hi)
+        .max()
+        .expect("a merged run is present");
+    let dropped_by_watermark: Vec<i64> = rows
+        .iter()
+        .map(|(v, _)| *v)
+        .filter(|v| *v <= watermark)
+        .collect();
+    assert_eq!(
+        dropped_by_watermark,
+        vec![26, 11, 12],
+        "the watermark rule would silently drop run A (version 26) along with \
+         live loose versions 11 and 12"
+    );
+
+    // A run does supersede what it actually covers.
+    let rows = vec![run(26, 1, 10), loose(5), loose(11)];
+    assert_eq!(
+        live_series_versions(&rows),
+        vec![26, 11],
+        "version 5 lies inside run A's range and is superseded"
+    );
+}
