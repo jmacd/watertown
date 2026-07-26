@@ -1499,7 +1499,11 @@ impl State {
     /// Returns an error if `id` is not a `TablePhysicalSeries`, if the series
     /// carries no timestamp column, if reading or re-encoding fails, or if the
     /// post-collapse row count or temporal bounds do not match the input.
-    pub async fn collapse_table_series(&self, id: FileID) -> Result<CollapseStats, TLogFSError> {
+    pub async fn collapse_table_series(
+        &self,
+        id: FileID,
+        max_live: usize,
+    ) -> Result<CollapseStats, TLogFSError> {
         use tokio::io::AsyncWriteExt;
 
         if id.entry_type() != EntryType::TablePhysicalSeries {
@@ -1511,18 +1515,20 @@ impl State {
             });
         }
 
-        // Assess current versions and gather metadata the merged row inherits.
-        // The lock is released before any table-provider work below, which
-        // re-enters the persistence layer to resolve versions.
-        //
-        // Unlike `collapse_file_series`, this still merges the *entire* live set
-        // on every call: `reencode_table_series` reads the whole series back
-        // through the table provider, which has no way to restrict itself to a
-        // version window. Tiering the table path therefore needs a
-        // version-bounded provider and is left as follow-up work; the range
-        // bookkeeping below is written generically so only the window selection
-        // has to change.
-        let (versions_before, lo, hi, min_event, max_event, timestamp_column, store_path, options) = {
+        // Assess current versions and pick the window to merge. The lock is
+        // released before any table-provider work below, which re-enters the
+        // persistence layer to resolve versions.
+        let (
+            versions_before,
+            window_versions,
+            lo,
+            hi,
+            min_event,
+            max_event,
+            timestamp_column,
+            store_path,
+            options,
+        ) = {
             let mut inner = self.inner.lock().await;
             let records = inner.query_records(id).await?;
             let live: Vec<&OplogEntry> = crate::schema::live_series_entries(&records)
@@ -1530,17 +1536,18 @@ impl State {
                 .filter(|r| r.size.unwrap_or(0) > 0)
                 .collect();
 
-            if live.len() < 2 {
+            let Some(range) = choose_collapse_window(&live, max_live) else {
                 return Ok(CollapseStats {
                     collapsed: false,
                     versions_before: live.len(),
                     merged_version: 0,
                     bytes: 0,
                 });
-            }
+            };
+            let window = &live[range];
 
-            let latest = *live.last().expect("live is non-empty");
-            let timestamp_column = latest
+            let newest = *window.last().expect("window is non-empty");
+            let timestamp_column = newest
                 .get_extended_attributes()
                 .map(|a| a.timestamp_column().to_string())
                 .filter(|s| !s.is_empty())
@@ -1550,22 +1557,24 @@ impl State {
                          TablePhysicalSeries cannot be rewritten without one"
                     ),
                 })?;
-            let min_event = live.iter().filter_map(|r| r.min_event_time).min();
-            let max_event = live.iter().filter_map(|r| r.max_event_time).max();
+            let min_event = window.iter().filter_map(|r| r.min_event_time).min();
+            let max_event = window.iter().filter_map(|r| r.max_event_time).max();
 
-            let lo = live
+            let lo = window
                 .iter()
                 .map(|r| crate::schema::CollapseRange::of(r).lo)
                 .min()
-                .expect("live is non-empty");
-            let hi = live
+                .expect("window is non-empty");
+            let hi = window
                 .iter()
                 .map(|r| crate::schema::CollapseRange::of(r).hi)
                 .max()
-                .expect("live is non-empty");
+                .expect("window is non-empty");
+            let window_versions: Vec<i64> = window.iter().map(|r| r.version).collect();
 
             (
                 live.len(),
+                window_versions,
                 lo,
                 hi,
                 min_event,
@@ -1576,10 +1585,12 @@ impl State {
             )
         };
 
-        // Re-encode every live version into a single parquet buffer. The table
-        // provider unions the per-version parquet files, so this is the
-        // authoritative post-collapse content.
-        let (merged, rows_before) = self.reencode_table_series(id, &timestamp_column).await?;
+        // Re-encode just this window into a single parquet buffer. The table
+        // provider unions the listed per-version parquet files and merges their
+        // schemas, so this is the authoritative content for the merged run.
+        let (merged, rows_before) = self
+            .reencode_table_versions(id, &window_versions, &timestamp_column)
+            .await?;
 
         // Store the merged parquet as a fresh first-version body so the bao-tree
         // cumulative state covers exactly this content.
@@ -1660,9 +1671,12 @@ impl State {
         };
 
         // Invariant: re-encoding must preserve logical content. Byte-identity
-        // does not hold across a parquet rewrite, so compare row count and the
-        // event-time bounds recovered from the merged file itself.
-        let (after, rows_after) = self.reencode_table_series(id, &timestamp_column).await?;
+        // does not hold across a parquet rewrite, so compare the row count of
+        // the stored merged run against the window it replaced. Scanning only
+        // the merged version keeps verification proportional to the window.
+        let (after, rows_after) = self
+            .reencode_table_versions(id, &[merged_version], &timestamp_column)
+            .await?;
         if rows_after != rows_before {
             return Err(TLogFSError::Transaction {
                 message: format!(
@@ -1681,23 +1695,37 @@ impl State {
         })
     }
 
-    /// Read every live version of a table series back through its table
-    /// provider and re-encode the union as a single parquet buffer.
+    /// Read the given versions of a table series back through a table provider
+    /// and re-encode their union as a single parquet buffer.
+    ///
+    /// The versions are passed as explicit per-version URLs rather than the
+    /// series' "all versions" pattern, so a collapse can re-encode just the
+    /// window it intends to merge. DataFusion still infers and merges the schema
+    /// across the listed files, which is why this goes through the provider
+    /// instead of decoding each version's parquet directly.
     ///
     /// Returns the parquet bytes and the total row count.
-    async fn reencode_table_series(
+    async fn reencode_table_versions(
         &self,
         id: FileID,
+        versions: &[i64],
         timestamp_column: &str,
     ) -> Result<(Vec<u8>, usize), TLogFSError> {
         use futures::StreamExt;
         use parquet::arrow::ArrowWriter;
 
         let context = self.as_provider_context();
+        let additional_urls: Vec<String> = versions
+            .iter()
+            .map(|v| provider::TinyFsPathBuilder::url_specific_version(&id, *v as u64))
+            .collect();
         let table_provider = provider::create_table_provider(
             id,
             &context,
-            provider::TableProviderOptions::default(),
+            provider::TableProviderOptions {
+                version_selection: provider::VersionSelection::AllVersions,
+                additional_urls,
+            },
         )
         .await
         .map_err(|e| TLogFSError::Internal(format!("collapse: build table provider: {e}")))?;

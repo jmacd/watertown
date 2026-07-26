@@ -2432,10 +2432,7 @@ async fn test_collapse_tiered_windows_preserve_order_and_content() {
 
     // `max_live` is high enough that the read-cost backstop never fires, so
     // every merge below is a genuine same-class tiered merge.
-    async fn collapse_window(
-        persistence: &mut OpLogPersistence,
-        file_path: &str,
-    ) -> (bool, i64) {
+    async fn collapse_window(persistence: &mut OpLogPersistence, file_path: &str) -> (bool, i64) {
         let tx = persistence.begin_test().await.expect("begin collapse tx");
         let wd = tx.root().await.expect("root");
         let id = wd.get_node_path(file_path).await.expect("node").id();
@@ -2617,7 +2614,7 @@ async fn test_collapse_table_series_reencodes_versions() {
         let stats = tx
             .state()
             .expect("state")
-            .collapse_table_series(id)
+            .collapse_table_series(id, 1)
             .await
             .expect("collapse_table_series");
         assert!(stats.collapsed, "expected a collapse");
@@ -2657,7 +2654,7 @@ async fn test_collapse_table_series_reencodes_versions() {
         let stats = tx
             .state()
             .expect("state")
-            .collapse_table_series(id)
+            .collapse_table_series(id, 1)
             .await
             .expect("second collapse_table_series");
         assert!(
@@ -2673,6 +2670,111 @@ async fn test_collapse_table_series_reencodes_versions() {
     assert_eq!(
         table_series_rows(&mut persistence, file_path).await,
         rows_before + 2,
+        "a post-collapse append adds exactly its own rows"
+    );
+}
+
+/// Tiering the table path: with a realistic `max_live`, collapse must merge a
+/// bounded *window* of same-size-class versions instead of re-encoding the
+/// entire series on every trigger. That is what turns collapse from an O(N^2)
+/// write amplifier into an O(N log N) one.
+///
+/// This drives two collapses so a merged run and loose versions coexist, which
+/// is the configuration that hid the ordering bugs on the file path. For tables
+/// the risk is different: the window is re-encoded through a table provider fed
+/// explicit per-version URLs, so a run must be readable as an ordinary version
+/// and must not be double-counted alongside the versions it replaced.
+#[tokio::test]
+async fn test_collapse_table_series_tiered_windows() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let store_path = test_dir();
+    let mut persistence = OpLogPersistence::create_test(&store_path)
+        .await
+        .expect("Failed to create persistence");
+    let file_path = "table.series";
+
+    // 25 tiny disjoint appends, the shape of an hourly collector.
+    const VERSIONS: usize = 25;
+    for i in 0..VERSIONS {
+        let base = (i as i64 + 1) * 1000;
+        append_table_series_version(
+            &mut persistence,
+            file_path,
+            vec![base, base + 1],
+            vec![i as f64, i as f64 + 0.5],
+        )
+        .await;
+    }
+
+    let rows_before = table_series_rows(&mut persistence, file_path).await;
+    assert_eq!(rows_before, VERSIONS * 2, "every appended row is visible");
+    assert_eq!(
+        live_version_count(&mut persistence, file_path).await,
+        VERSIONS,
+        "no collapse has run yet"
+    );
+
+    let id = node_id_of(&mut persistence, file_path).await;
+
+    // First collapse: merges exactly one fanout-sized window, not the history.
+    async fn collapse(
+        persistence: &mut OpLogPersistence,
+        id: tinyfs::FileID,
+        max_live: usize,
+    ) -> crate::persistence::CollapseStats {
+        let tx = persistence.begin_test().await.expect("begin collapse tx");
+        let stats = tx
+            .state()
+            .expect("state")
+            .collapse_table_series(id, max_live)
+            .await
+            .expect("collapse_table_series");
+        tx.commit_test().await.expect("commit collapse");
+        stats
+    }
+
+    let stats = collapse(&mut persistence, id, VERSIONS).await;
+    assert!(
+        stats.collapsed,
+        "a full same-size-class window is available"
+    );
+    let after_first = live_version_count(&mut persistence, file_path).await;
+    assert_eq!(
+        after_first,
+        VERSIONS - 9,
+        "a window of {} versions collapses to one merged run",
+        crate::persistence::COLLAPSE_FANOUT
+    );
+    assert_eq!(
+        table_series_rows(&mut persistence, file_path).await,
+        rows_before,
+        "merging a window must neither lose rows nor double-count the \
+         versions it superseded"
+    );
+
+    // Second collapse: a merged run now coexists with loose versions, so the
+    // window picker must skip the run (different size class) and merge the next
+    // group of loose versions.
+    let stats = collapse(&mut persistence, id, VERSIONS).await;
+    assert!(stats.collapsed, "a second loose window is still available");
+    assert_eq!(
+        live_version_count(&mut persistence, file_path).await,
+        after_first - 9,
+        "the second window collapses independently of the first run"
+    );
+    assert_eq!(
+        table_series_rows(&mut persistence, file_path).await,
+        rows_before,
+        "two coexisting merged runs must not overlap or drop rows"
+    );
+
+    // Appending afterwards must extend the series, not resurrect superseded
+    // versions absorbed by either run.
+    append_table_series_version(&mut persistence, file_path, vec![99_000], vec![9.9]).await;
+    assert_eq!(
+        table_series_rows(&mut persistence, file_path).await,
+        rows_before + 1,
         "a post-collapse append adds exactly its own rows"
     );
 }
@@ -2696,7 +2798,7 @@ async fn test_collapse_table_series_rejects_file_series() {
     let err = tx
         .state()
         .expect("state")
-        .collapse_table_series(id)
+        .collapse_table_series(id, 1)
         .await
         .expect_err("a FilePhysicalSeries must be rejected");
     assert!(

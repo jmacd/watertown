@@ -883,7 +883,9 @@ impl Ship {
             // means: a FilePhysicalSeries is byte-concatenated, while a
             // TablePhysicalSeries must be re-encoded as a single parquet file.
             let collapsed = match id.entry_type() {
-                tinyfs::EntryType::TablePhysicalSeries => state.collapse_table_series(id).await,
+                tinyfs::EntryType::TablePhysicalSeries => {
+                    state.collapse_table_series(id, threshold).await
+                }
                 _ => state.collapse_file_series(id, threshold).await,
             };
             match collapsed {
