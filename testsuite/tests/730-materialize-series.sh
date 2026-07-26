@@ -27,6 +27,8 @@
 #   - A tick with no new source rows appends NOTHING (no empty versions).
 #   - The materialized content equals what the derived node computes.
 #   - The result is a genuine collapse candidate.
+#   - It works when the source lives inside a `dynamic-dir`, which is the
+#     topology selfmon actually uses (config/watershop-selfmon.yaml:/derived).
 #
 # History:
 #   Added on jmacd/analysis8 with the materialize-series factory, closing the
@@ -151,5 +153,62 @@ check 'grep -qE "collapse: [1-9][0-9]* file\(s\) collapsed" /tmp/730-collapse.lo
 AFTER_ROWS=$(pond cat --format table /metrics/cpu.series 2>/dev/null | grep -c "2024-01-01" || true)
 check '[ "'"${AFTER_ROWS}"'" = "9" ]' \
     "collapse preserved every materialized row (${AFTER_ROWS})"
+
+echo "--- Step 6: source inside a dynamic-dir (selfmon's real topology) ---"
+# selfmon does not put its derived nodes at the pond root: they are entries of
+# a `dynamic-dir` at /derived, addressed as series:///derived/p-<pond>. Those
+# children are synthesized on directory read rather than being real nodes, so
+# path resolution reaches them differently. Materializing a root-level node
+# proves nothing about the configuration we are actually going to deploy.
+cat > /tmp/730-dyndir.yaml << 'EOF'
+entries:
+  - name: "p-testpond"
+    factory: "sql-derived-series"
+    config:
+      patterns:
+        m: "jsonlogs:///measure/pond.jsonl"
+      query: >-
+        SELECT
+          CAST(ts AS TIMESTAMP)                    as timestamp,
+          CAST("peak_rss.bytes" AS BIGINT)         as "peak_rss.bytes",
+          CAST("list.seconds" AS DOUBLE)           as "list.seconds"
+        FROM m
+        ORDER BY timestamp
+EOF
+pond mknod dynamic-dir /derived --config-path /tmp/730-dyndir.yaml >/dev/null 2>&1
+
+pond cat --format table /derived/p-testpond > /tmp/730-dyn-read.txt 2>&1
+check 'grep -q "2024-01-01" /tmp/730-dyn-read.txt' \
+    "the dynamic-dir child is readable before we try to materialize it"
+
+cat > /tmp/730-mat2.yaml << 'EOF'
+source: "series:///derived/p-testpond"
+target: /metrics/dyn.series
+time_column: timestamp
+EOF
+pond mknod materialize-series /system/etc/materialize-dyn --config-path /tmp/730-mat2.yaml >/dev/null 2>&1
+
+pond run /system/etc/materialize-dyn > /tmp/730-run-dyn.log 2>&1 || true
+cat /tmp/730-run-dyn.log
+check '! grep -qi "error" /tmp/730-run-dyn.log' \
+    "materializing a dynamic-dir child does not error"
+
+pond describe /metrics/dyn.series > /tmp/730-describe-dyn.txt 2>&1 || true
+cat /tmp/730-describe-dyn.txt
+check 'grep -q "Type: TablePhysicalSeries" /tmp/730-describe-dyn.txt' \
+    "a dynamic-dir source yields a TablePhysicalSeries too"
+
+DYN_ROWS=$(pond cat --format table /metrics/dyn.series 2>/dev/null | grep -c "2024-01-01" || true)
+check '[ "'"${DYN_ROWS}"'" = "9" ]' \
+    "all 9 rows materialized through the dynamic-dir path (${DYN_ROWS})"
+
+# Incrementality must survive the indirection, not just the happy path.
+emit "2024-01-01T00:09:00Z" 2100 0.9
+pond run /system/etc/ingest >/dev/null 2>&1
+pond run /system/etc/materialize-dyn > /tmp/730-run-dyn2.log 2>&1
+pond describe /metrics/dyn.series > /tmp/730-describe-dyn2.txt 2>&1
+cat /tmp/730-describe-dyn2.txt
+check 'grep -qE "^ *Version [0-9]+: 1 rows" /tmp/730-describe-dyn2.txt' \
+    "the dynamic-dir path appends only the new row"
 
 check_finish
