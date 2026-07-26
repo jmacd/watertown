@@ -3763,3 +3763,155 @@ fn test_supersession_uses_ranges_not_max_watermark() {
         "version 5 lies inside run A's range and is superseded"
     );
 }
+
+/// Build a `FilePhysicalSeries` of `n` nine-byte versions and collapse it twice,
+/// leaving two merged runs coexisting with a loose tail. Returns the cumulative
+/// stream bytes.
+///
+/// This is the only shape that exposes the tiered-collapse reader bugs: with a
+/// single run, or with no loose tail, version order and byte order still agree.
+async fn build_two_run_series(persistence: &mut OpLogPersistence, file_path: &str) -> Vec<u8> {
+    let mut cumulative: Vec<u8> = Vec::new();
+    for i in 0..25u32 {
+        let chunk = format!("line-{i:03}\n").into_bytes();
+        cumulative.extend_from_slice(&chunk);
+        let create = if i == 0 { Some("data") } else { None };
+        append_series_version(persistence, file_path, &chunk, create).await;
+    }
+    for _ in 0..2 {
+        let tx = persistence.begin_test().await.expect("begin collapse tx");
+        let wd = tx.root().await.expect("root");
+        let id = wd.get_node_path(file_path).await.expect("node").id();
+        let stats = tx
+            .state()
+            .expect("state")
+            .collapse_file_series(id, 1000)
+            .await
+            .expect("collapse_file_series");
+        assert!(stats.collapsed, "expected a tiered collapse");
+        tx.commit_test().await.expect("commit collapse");
+    }
+    cumulative
+}
+
+/// Corruption #1: the series read path must concatenate live rows in *range*
+/// order, not version order.
+///
+/// A merged run is allocated a fresh (highest) version number while standing for
+/// content in the middle of the stream, so sorting by version emits the runs
+/// after the loose tail. The bytes are all present and the length is unchanged,
+/// so this corrupts content silently -- only comparing the exact byte sequence
+/// detects it.
+#[tokio::test]
+async fn test_corruption_read_path_orders_runs_by_range_not_version() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let store_path = test_dir();
+    let mut persistence = OpLogPersistence::create_test(&store_path)
+        .await
+        .expect("Failed to create persistence");
+    let file_path = "data/order.csv";
+
+    let cumulative = build_two_run_series(&mut persistence, file_path).await;
+    let read = read_series_content(&mut persistence, file_path).await;
+
+    assert_eq!(
+        read.len(),
+        cumulative.len(),
+        "no bytes may be lost or duplicated"
+    );
+    assert_eq!(
+        read, cumulative,
+        "runs must appear at their range position, not after the loose tail"
+    );
+    assert!(
+        read.starts_with(b"line-000\n"),
+        "the stream must begin with the oldest content, which now lives inside \
+         a run carrying one of the *highest* version numbers"
+    );
+}
+
+/// Corruption #2: `metadata()` must describe the row covering the *end* of the
+/// stream -- the last live row in range order -- not the highest version.
+///
+/// The append path resumes its cumulative bao state from this row. Post-tiering
+/// the highest version is a mid-stream run, so returning it makes every
+/// subsequent append continue from the wrong prefix, silently corrupting
+/// `cumulative_blake3` for all later readers.
+#[tokio::test]
+async fn test_corruption_metadata_describes_stream_tail_not_highest_version() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let store_path = test_dir();
+    let mut persistence = OpLogPersistence::create_test(&store_path)
+        .await
+        .expect("Failed to create persistence");
+    let file_path = "data/meta.csv";
+
+    let cumulative = build_two_run_series(&mut persistence, file_path).await;
+
+    let tx = persistence.begin_test().await.expect("begin read tx");
+    let wd = tx.root().await.expect("root");
+    let id = wd.get_node_path(file_path).await.expect("node").id();
+    let meta = {
+        use tinyfs::persistence::PersistenceLayer;
+        tx.state()
+            .expect("state")
+            .metadata(id)
+            .await
+            .expect("metadata")
+    };
+    tx.commit_test().await.expect("commit read");
+
+    let bao = meta
+        .bao_outboard
+        .expect("a series row carries a bao outboard");
+    let outboard =
+        utilities::bao_outboard::SeriesOutboard::from_bytes(&bao).expect("decode series outboard");
+    assert_eq!(
+        outboard.cumulative_size,
+        cumulative.len() as u64,
+        "metadata must describe the whole stream ({} bytes). A mid-stream run \
+         would report only the bytes through the end of its own range",
+        cumulative.len()
+    );
+}
+
+/// Corruption #3: `read_pending_bytes` must walk live rows backward in *range*
+/// order.
+///
+/// It reconstructs the trailing partial bao block, so it must return the true
+/// last `pending_len` bytes of the stream. Counting version numbers downward
+/// interleaves runs with loose versions and can re-read rows a run already
+/// superseded, yielding the right *number* of bytes from the wrong places --
+/// which then poisons the resumed hash state rather than failing.
+#[tokio::test]
+async fn test_corruption_read_pending_bytes_walks_range_order() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let store_path = test_dir();
+    let mut persistence = OpLogPersistence::create_test(&store_path)
+        .await
+        .expect("Failed to create persistence");
+    let file_path = "data/pending.csv";
+
+    let cumulative = build_two_run_series(&mut persistence, file_path).await;
+
+    let tx = persistence.begin_test().await.expect("begin read tx");
+    let wd = tx.root().await.expect("root");
+    let id = wd.get_node_path(file_path).await.expect("node").id();
+    let state = tx.state().expect("state");
+
+    // `allocated_version` is the version a subsequent append would take: high
+    // enough that every existing row is in scope.
+    let allocated = 10_000;
+    for pending_len in [9usize, 27, cumulative.len()] {
+        let tail = crate::file::read_pending_bytes(&state, id, allocated, pending_len)
+            .await
+            .expect("read_pending_bytes");
+        assert_eq!(
+            tail,
+            cumulative[cumulative.len() - pending_len..].to_vec(),
+            "the last {pending_len} bytes must come from the end of the stream \
+             in range order"
+        );
+    }
+    tx.commit_test().await.expect("commit read");
+}

@@ -268,7 +268,7 @@ impl OpLogFile {
 /// content in the middle of the stream, and the versions it superseded still
 /// exist as rows, so a numeric walk would both mis-order the tail and
 /// double-count superseded bytes.
-async fn read_pending_bytes(
+pub(crate) async fn read_pending_bytes(
     state: &State,
     file_id: FileID,
     allocated_version: i64,
