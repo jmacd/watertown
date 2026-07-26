@@ -124,14 +124,17 @@ async fn detect_overlaps_impl(
             .map_err(|e| anyhow!("Failed to get records for {}: {}", path_str, e))?;
 
         // Filter out empty versions (size == 0) to avoid Parquet parsing errors,
-        // and versions superseded by a collapse merge row (collapsed_through).
-        let collapsed_through = records.iter().filter_map(|r| r.collapsed_through).max();
+        // and rows superseded by a collapse merge row's version range.
+        let live: std::collections::HashSet<i64> = tlogfs::schema::live_series_entries(&records)
+            .into_iter()
+            .map(|r| r.version)
+            .collect();
         let versions: Vec<_> = records
             .into_iter()
             .filter(|r| {
                 !matches!(r.format, tlogfs::schema::StorageFormat::Inline)
                     && r.size.unwrap_or(0) > 0
-                    && collapsed_through.is_none_or(|k| r.version > k)
+                    && live.contains(&r.version)
             })
             .collect();
 

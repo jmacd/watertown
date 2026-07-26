@@ -319,12 +319,118 @@ pub struct OplogEntry {
 
     /// Version-collapse sentinel for `FilePhysicalSeries`.
     ///
-    /// When a multi-version series file is collapsed into a single merged
-    /// version `M`, that merged row stores `collapsed_through = Some(M - 1)`,
-    /// meaning every version `<= M - 1` has been superseded by this row and
-    /// must be skipped by series readers. `None` for all non-merged rows and
-    /// all non-series entry types.
+    /// When a run of series versions is collapsed into a single merged row,
+    /// that row stores `collapsed_through = Some(hi)`, meaning every version in
+    /// `[collapsed_from, hi]` has been superseded by this row and must be
+    /// skipped by series readers. `None` for all non-merged rows and all
+    /// non-series entry types.
     pub collapsed_through: Option<i64>,
+
+    /// Lowest series version superseded by this merged row; paired with
+    /// [`Self::collapsed_through`] to form the closed range `[lo, hi]` that this
+    /// row replaces.
+    ///
+    /// `None` on a row that also has `collapsed_through = Some(hi)` means the
+    /// run starts at the beginning of the series (`lo = 0`) — this is how
+    /// pre-tiering rows, which always merged the entire history, are read.
+    /// `None` on a row with no `collapsed_through` simply means the row is not
+    /// a merged run.
+    ///
+    /// Version numbers are never reassigned. A merged row is allocated a fresh
+    /// (highest) version like any other append, so `version` is **not** part of
+    /// the range it covers, and rows must be ordered for reading by range start
+    /// rather than by `version` — see [`CollapseRange::sort_key`].
+    pub collapsed_from: Option<i64>,
+}
+
+/// The closed range of series versions a row occupies (loose row) or supersedes
+/// (merged collapse row).
+///
+/// Collapse is a *physical* regrouping of an append-only byte stream: merging
+/// versions changes how bytes are stored, never their identity or order. Version
+/// numbers are therefore never reassigned, and a merged row is allocated a fresh
+/// (highest) version like any other append. That makes `version` useless as a
+/// read ordering key for merged rows — a run covering versions 101..=200 may
+/// carry version 4000 — so readers must order by [`Self::sort_key`] instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollapseRange {
+    /// First superseded version (inclusive); equals `version` for a loose row.
+    pub lo: i64,
+    /// Last superseded version (inclusive); equals `version` for a loose row.
+    pub hi: i64,
+    /// True when this row is a collapse output standing in for `[lo, hi]`.
+    pub merged: bool,
+}
+
+impl CollapseRange {
+    /// Range covered by `entry`. A row with `collapsed_through = Some(hi)` and
+    /// no `collapsed_from` is a pre-tiering full-history merge, i.e. `[0, hi]`.
+    #[must_use]
+    pub fn of(entry: &OplogEntry) -> Self {
+        match entry.collapsed_through {
+            Some(hi) => Self {
+                lo: entry.collapsed_from.unwrap_or(0),
+                hi,
+                merged: true,
+            },
+            None => Self {
+                lo: entry.version,
+                hi: entry.version,
+                merged: false,
+            },
+        }
+    }
+
+    /// Ordering key placing rows in series byte order (oldest content first).
+    #[must_use]
+    pub fn sort_key(&self) -> i64 {
+        self.lo
+    }
+
+    /// Whether `self` fully covers `other`.
+    #[must_use]
+    pub fn covers(&self, other: &Self) -> bool {
+        self.lo <= other.lo && other.hi <= self.hi
+    }
+}
+
+/// Select the live rows of a series — those not superseded by any merged
+/// collapse row — ordered oldest content first.
+///
+/// Replaces the former `max(collapsed_through)` scalar-watermark idiom, which
+/// could only express "everything up to K is dead" and so forced collapse to
+/// merge the entire series history on every cycle.
+///
+/// Cost is `O(rows x runs)`, not `O(rows^2)`: only merged rows can supersede
+/// anything, and they are few, while a single node can accumulate thousands of
+/// loose versions.
+#[must_use]
+pub fn live_series_entries(records: &[OplogEntry]) -> Vec<&OplogEntry> {
+    let runs: Vec<(usize, CollapseRange)> = records
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (i, CollapseRange::of(e)))
+        .filter(|(_, r)| r.merged)
+        .collect();
+
+    let mut live: Vec<&OplogEntry> = records
+        .iter()
+        .enumerate()
+        .filter(|(i, entry)| {
+            let range = CollapseRange::of(entry);
+            !runs.iter().any(|(j, run)| {
+                if j == i {
+                    return false; // a run never supersedes itself
+                }
+                // Identical ranges (should not occur) resolve to the newer row.
+                run.covers(&range) && (*run != range || records[*j].version > entry.version)
+            })
+        })
+        .map(|(_, entry)| entry)
+        .collect();
+
+    live.sort_by_key(|e| CollapseRange::of(e).sort_key());
+    live
 }
 
 impl ForArrow for OplogEntry {
@@ -354,6 +460,7 @@ impl ForArrow for OplogEntry {
             Arc::new(Field::new("pond_id", DataType::Utf8, false)), // Pond identity UUID (required, non-nullable)
             Arc::new(Field::new("bao_outboard", DataType::Binary, true)), // Bao-tree outboard for verified streaming
             Arc::new(Field::new("collapsed_through", DataType::Int64, true)), // Highest series version superseded by this merged row
+            Arc::new(Field::new("collapsed_from", DataType::Int64, true)), // Lowest series version superseded by this merged row (None => 0)
         ]
     }
 }
@@ -403,6 +510,7 @@ impl OplogEntry {
             pond_id: id.pond_id().to_string(),
             bao_outboard: None,
             collapsed_through: None,
+            collapsed_from: None,
         }
     }
 
@@ -445,6 +553,7 @@ impl OplogEntry {
             pond_id: id.pond_id().to_string(),
             bao_outboard: None,
             collapsed_through: None,
+            collapsed_from: None,
         }
     }
 
@@ -485,6 +594,7 @@ impl OplogEntry {
             pond_id: id.pond_id().to_string(),
             bao_outboard: None,
             collapsed_through: None,
+            collapsed_from: None,
         }
     }
 
@@ -543,6 +653,7 @@ impl OplogEntry {
             pond_id: id.pond_id().to_string(),
             bao_outboard: None,
             collapsed_through: None,
+            collapsed_from: None,
         }
     }
 
@@ -593,6 +704,7 @@ impl OplogEntry {
             pond_id: id.pond_id().to_string(),
             bao_outboard: None,
             collapsed_through: None,
+            collapsed_from: None,
         }
     }
 
@@ -719,6 +831,7 @@ impl OplogEntry {
             pond_id: id.pond_id().to_string(),
             bao_outboard: None,
             collapsed_through: None,
+            collapsed_from: None,
         }
     }
 
@@ -915,6 +1028,7 @@ impl OplogEntry {
             pond_id: id.pond_id().to_string(),
             bao_outboard: None,
             collapsed_through: None,
+            collapsed_from: None,
         }
     }
 }

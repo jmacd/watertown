@@ -2110,7 +2110,7 @@ async fn test_file_physical_series_collapse_and_append() {
         let id = wd.get_node_path(file_path).await.expect("node").id();
         let state = tx.state().expect("state");
         let stats = state
-            .collapse_file_series(id)
+            .collapse_file_series(id, 1)
             .await
             .expect("collapse_file_series");
         assert!(stats.collapsed, "expected a collapse to occur");
@@ -2273,7 +2273,7 @@ async fn test_collapse_large_file_series() {
         let stats = tx
             .state()
             .expect("state")
-            .collapse_file_series(id)
+            .collapse_file_series(id, 1)
             .await
             .expect("collapse_file_series");
         assert!(stats.collapsed, "expected a collapse");
@@ -2375,12 +2375,126 @@ async fn collapse_now(persistence: &mut OpLogPersistence, file_path: &str) -> i6
     let stats = tx
         .state()
         .expect("state")
-        .collapse_file_series(id)
+        .collapse_file_series(id, 1)
         .await
         .expect("collapse_file_series");
     assert!(stats.collapsed, "expected a collapse at {file_path}");
     tx.commit_test().await.expect("commit collapse");
     stats.merged_version
+}
+
+/// Read the full series content at `file_path`.
+async fn read_series_content(persistence: &mut OpLogPersistence, file_path: &str) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let tx = persistence.begin_test().await.expect("begin read tx");
+    let wd = tx.root().await.expect("root");
+    let mut reader = wd.async_reader_path(file_path).await.expect("reader");
+    let mut content = Vec::new();
+    _ = reader.read_to_end(&mut content).await.expect("read series");
+    tx.commit_test().await.expect("commit read");
+    content
+}
+
+/// Size-tiered collapse merges a bounded *window* of same-size-class versions
+/// instead of the whole series, so several merged runs coexist. This is what
+/// makes total write volume `O(N log N)` rather than `O(N^2)`: absorbing new
+/// versions must not rewrite the accumulated history.
+///
+/// The critical invariant is ordering. A merged run is allocated a fresh
+/// (highest) version number, so a run covering versions 1..=10 outranks the
+/// loose versions 21..=25 that follow it in the byte stream. Readers must
+/// therefore order by range start, not by version. Concatenating by version
+/// would silently emit the runs *after* the loose tail, which only a
+/// multi-run fixture like this one can detect.
+#[tokio::test]
+async fn test_collapse_tiered_windows_preserve_order_and_content() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    use crate::persistence::COLLAPSE_FANOUT;
+
+    let store_path = test_dir();
+    let mut persistence = OpLogPersistence::create_test(&store_path)
+        .await
+        .expect("Failed to create persistence");
+    let file_path = "data/tiered.csv";
+
+    // 25 versions of 9 bytes each: small enough to share one size class, so the
+    // tiering policy sees a single mergeable group.
+    let mut cumulative: Vec<u8> = Vec::new();
+    for i in 0..25u32 {
+        let chunk = format!("line-{i:03}\n").into_bytes();
+        assert_eq!(chunk.len(), 9);
+        cumulative.extend_from_slice(&chunk);
+        let create = if i == 0 { Some("data") } else { None };
+        append_series_version(&mut persistence, file_path, &chunk, create).await;
+    }
+    assert_eq!(live_version_count(&mut persistence, file_path).await, 25);
+
+    // `max_live` is high enough that the read-cost backstop never fires, so
+    // every merge below is a genuine same-class tiered merge.
+    async fn collapse_window(
+        persistence: &mut OpLogPersistence,
+        file_path: &str,
+    ) -> (bool, i64) {
+        let tx = persistence.begin_test().await.expect("begin collapse tx");
+        let wd = tx.root().await.expect("root");
+        let id = wd.get_node_path(file_path).await.expect("node").id();
+        let stats = tx
+            .state()
+            .expect("state")
+            .collapse_file_series(id, 1000)
+            .await
+            .expect("collapse_file_series");
+        tx.commit_test().await.expect("commit collapse");
+        (stats.collapsed, stats.merged_version)
+    }
+
+    // First window: COLLAPSE_FANOUT versions merge into one run, leaving the
+    // rest loose. A whole-series collapse would have left exactly one version.
+    let (first_collapsed, first_version) = collapse_window(&mut persistence, file_path).await;
+    assert!(first_collapsed, "expected a tiered collapse");
+    assert_eq!(
+        live_version_count(&mut persistence, file_path).await,
+        25 - COLLAPSE_FANOUT + 1,
+        "only one window merges; the remaining versions stay loose"
+    );
+    assert_eq!(
+        read_series_content(&mut persistence, file_path).await,
+        cumulative,
+        "content unchanged after the first tiered merge"
+    );
+
+    // Second window: a second run now coexists with the first. Its version
+    // number is higher than the loose tail's, so this is the case that fails if
+    // readers order by version rather than by range start.
+    let (second_collapsed, second_version) = collapse_window(&mut persistence, file_path).await;
+    assert!(second_collapsed, "expected a second tiered collapse");
+    assert!(
+        second_version > first_version,
+        "runs are appended, never renumbered"
+    );
+    assert_eq!(
+        live_version_count(&mut persistence, file_path).await,
+        25 - 2 * COLLAPSE_FANOUT + 2,
+        "two runs plus the still-loose tail"
+    );
+    assert_eq!(
+        read_series_content(&mut persistence, file_path).await,
+        cumulative,
+        "two coexisting runs still concatenate in series byte order"
+    );
+
+    // Appending after collapse must continue from the tail, and cumulative bao
+    // must still describe the whole stream.
+    let tail = b"line-final\n";
+    cumulative.extend_from_slice(tail);
+    append_series_version(&mut persistence, file_path, tail, None).await;
+    assert_eq!(
+        read_series_content(&mut persistence, file_path).await,
+        cumulative,
+        "append after tiered collapse lands at the end"
+    );
+    verify_cumulative_blake3(&mut persistence, file_path, &cumulative).await;
 }
 
 /// Append one parquet version to a `TablePhysicalSeries`, creating it on the

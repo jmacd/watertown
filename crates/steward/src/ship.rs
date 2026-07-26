@@ -884,7 +884,7 @@ impl Ship {
             // TablePhysicalSeries must be re-encoded as a single parquet file.
             let collapsed = match id.entry_type() {
                 tinyfs::EntryType::TablePhysicalSeries => state.collapse_table_series(id).await,
-                _ => state.collapse_file_series(id).await,
+                _ => state.collapse_file_series(id, threshold).await,
             };
             match collapsed {
                 Ok(stats) if stats.collapsed => {
