@@ -865,3 +865,72 @@ impl tokio::io::AsyncSeek for ParquetFileReader {
         Poll::Ready(Ok(self.position))
     }
 }
+
+/// Outcome of a [`sweep_unreferenced`] pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SweepStats {
+    /// Blobs deleted because no row referenced their hash.
+    pub removed: usize,
+    /// Bytes reclaimed from the deleted blobs.
+    pub bytes_freed: u64,
+}
+
+/// Delete every `_large_files` blob whose blake3 is absent from `referenced`.
+///
+/// Blobs are content-addressed, so one file can back many rows across many
+/// nodes and ponds; reclamation must therefore be a mark-sweep over the whole
+/// table's referenced hashes, never a per-row delete.
+///
+/// # Safety
+///
+/// The caller **must** hold the pond write lock. An uncommitted transaction can
+/// have already written a blob that no committed row references yet, and this
+/// sweep cannot distinguish that from garbage.
+///
+/// Only files named `blake3=<hash>.parquet` are considered, so in-flight temp
+/// files are never touched.
+///
+/// # Errors
+///
+/// Returns an error if `_large_files` cannot be traversed or a blob cannot be
+/// removed.
+pub async fn sweep_unreferenced<P: AsRef<Path>>(
+    pond_path: P,
+    referenced: &std::collections::HashSet<String>,
+) -> std::io::Result<SweepStats> {
+    let root = pond_path.as_ref().join("_large_files");
+    if !root.exists() {
+        return Ok(SweepStats::default());
+    }
+
+    // `_large_files` is either flat or one level of `blake3_16=` shards.
+    let mut dirs = vec![root];
+    let mut stats = SweepStats::default();
+    while let Some(dir) = dirs.pop() {
+        let mut entries = tokio::fs::read_dir(&dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let file_type = entry.file_type().await?;
+            if file_type.is_dir() {
+                dirs.push(entry.path());
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(hash) = name
+                .to_str()
+                .and_then(|n| n.strip_prefix("blake3="))
+                .and_then(|n| n.strip_suffix(".parquet"))
+            else {
+                continue;
+            };
+            if referenced.contains(hash) {
+                continue;
+            }
+            let size = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
+            tokio::fs::remove_file(entry.path()).await?;
+            stats.removed += 1;
+            stats.bytes_freed += size;
+            debug!("swept unreferenced large-file blob blake3={hash} ({size} bytes)");
+        }
+    }
+    Ok(stats)
+}
