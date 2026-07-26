@@ -25,7 +25,7 @@
 use crate::{ExecutionContext, FactoryContext, register_executable_factory};
 use arrow::compute::concat_batches;
 use clap::{Parser, Subcommand};
-use datafusion::prelude::{SessionConfig, SessionContext, col, lit};
+use datafusion::prelude::{SessionContext, col, lit};
 use datafusion::scalar::ScalarValue;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
@@ -107,18 +107,15 @@ async fn initialize(_config: Value, _context: FactoryContext) -> Result<(), tiny
     Ok(())
 }
 
-/// A private session that can still resolve `tinyfs:///` URLs.
+/// A table name that is unique to this node.
 ///
-/// Reading a *physical* series goes through a `ListingTable` over `tinyfs://`
-/// paths, which only resolves if the tinyfs object store is registered -- and
-/// it is registered on the persistence layer's own session, not on a fresh
-/// one.  Borrowing that session's `RuntimeEnv` inherits the object-store
-/// registry while keeping a private catalog, so the table names used here
-/// cannot collide with anything else running in the transaction.
-fn scratch_session(context: &FactoryContext) -> SessionContext {
-    SessionContext::new_with_config_rt(
-        SessionConfig::new(),
-        context.context.datafusion_session.runtime_env(),
+/// Registrations go on the pond's shared session, so a bare name like
+/// "source" would collide with another materialize-series node running in the
+/// same transaction.  `sql_derived` qualifies its table names the same way.
+fn table_name(context: &FactoryContext, role: &str) -> String {
+    format!(
+        "materialize_{role}_{}",
+        context.file_id.node_id().to_string().replace('-', "")
     )
 }
 
@@ -159,15 +156,16 @@ async fn read_watermark(
     }
 
     let url = format!("series://{}", config.target);
-    let ctx = scratch_session(context);
-    let table = table_for(context, &url, &ctx).await?;
+    let ctx = &context.context.datafusion_session;
+    let table = table_for(context, &url, ctx).await?;
+    let name = table_name(context, "target");
     let _previous = ctx
-        .register_table("target", table)
+        .register_table(name.as_str(), table)
         .map_err(|e| tinyfs::Error::Other(format!("materialize-series: register target: {e}")))?;
 
     let batches = ctx
         .sql(&format!(
-            "SELECT max(\"{}\") AS watermark FROM target",
+            "SELECT max(\"{}\") AS watermark FROM \"{name}\"",
             config.time_column
         ))
         .await
@@ -175,6 +173,12 @@ async fn read_watermark(
         .collect()
         .await
         .map_err(|e| tinyfs::Error::Other(format!("materialize-series: watermark scan: {e}")))?;
+
+    // The shared session outlives this call, and the target grows a version
+    // every tick, so a registration left behind would be a stale view.
+    let _registered = ctx
+        .deregister_table(name.as_str())
+        .map_err(|e| tinyfs::Error::Other(format!("materialize-series: deregister: {e}")))?;
 
     for batch in &batches {
         if batch.num_rows() == 0 {
@@ -207,14 +211,15 @@ pub async fn execute(
 
     let watermark = read_watermark(&context, &config).await?;
 
-    let session = scratch_session(&context);
-    let source = table_for(&context, &config.source.to_string(), &session).await?;
+    let session = &context.context.datafusion_session;
+    let source = table_for(&context, &config.source.to_string(), session).await?;
+    let source_name = table_name(&context, "source");
     let _previous = session
-        .register_table("source", source)
+        .register_table(source_name.as_str(), source)
         .map_err(|e| tinyfs::Error::Other(format!("materialize-series: register source: {e}")))?;
 
     let mut frame = session
-        .table("source")
+        .table(source_name.as_str())
         .await
         .map_err(|e| tinyfs::Error::Other(format!("materialize-series: read source: {e}")))?;
 
@@ -235,6 +240,10 @@ pub async fn execute(
         .collect()
         .await
         .map_err(|e| tinyfs::Error::Other(format!("materialize-series: collect: {e}")))?;
+
+    let _registered = session
+        .deregister_table(source_name.as_str())
+        .map_err(|e| tinyfs::Error::Other(format!("materialize-series: deregister: {e}")))?;
 
     let rows: usize = batches
         .iter()
