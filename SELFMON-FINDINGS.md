@@ -746,6 +746,40 @@ bump.
   `max_live`, making `live.len() > max_live` true by construction. It now merges
   the cheapest window of the same width.
 
+### 12.4 A second review pass, after the fixes above
+
+The branch was then reviewed as a whole rather than change by change. That
+found one more piece of **silent data loss**, in the same family as §12.1 —
+something collapse destroys without saying so.
+
+`set-temporal-bounds` stores manual bounds on a dedicated **zero-byte**
+version. Collapse filters zero-byte rows out of its merge window, since they
+contribute no content — but the merged run's `[lo, hi]` range still **spans**
+their version numbers, so `is_superseded` retired them anyway. The bounds were
+deleted without ever being carried anywhere, and because a missing override
+maps to `(i64::MIN, i64::MAX)`, the series silently reverted to *unbounded*
+filtering: it re-admitted exactly the rows the operator had excluded. The
+lookup was independently wrong in the same way, selecting the override row by
+`max_by_key(version)` — the flavour-2 bug named in §12 — which after a collapse
+picks the merged run, which carries no override. Both halves had to be fixed;
+either alone still loses the bounds.
+
+Two smaller ones: reclaim scanned **every** `pond_id` for deletion candidates
+while its content-root guard only covers the local pond, so a foreign row was
+in scope for deletion but invisible to the check that is supposed to make
+deletion safe (latent — nothing currently lands a foreign superseded row
+locally); and `reconcile`, which runs on the **read** path where no write lock
+is held, aborted the whole query with `ENOENT` when a concurrent reader deleted
+the same stale sidecar first.
+
+The review also found that the test named for the reclaim content-root
+invariant did not actually pin it: a single collapse round leaves the merged
+run holding the highest version, so range containment and a watermark select
+the same rows and the test passed under both rules. Worth stating plainly,
+because it is the same failure mode as testsuite 050 in §12.1 — **a test that
+runs the right scenario but asserts something invariant under the bug.** That
+is now the second time on this branch, and it is the thing to watch for.
+
 ### Still open
 
 - **`version_gt` pruning is still blind after collapse** (§7). The fix is to
