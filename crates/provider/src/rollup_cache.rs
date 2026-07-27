@@ -93,99 +93,6 @@ fn version_key(node_id: &tinyfs::NodeID, version: &FileVersionInfo) -> String {
     }
 }
 
-/// Path for a single input version's cached partials Parquet file.
-///
-/// Returns `{cache_dir}/rollup_{cfg_hash}_{node_id}/v{version}_{key}.parquet`.
-#[must_use]
-pub fn cache_version_path(
-    cache_dir: &Path,
-    cfg_hash: &str,
-    node_id: &tinyfs::NodeID,
-    version: &FileVersionInfo,
-) -> PathBuf {
-    let key = version_key(node_id, version);
-    cache_node_dir(cache_dir, cfg_hash, node_id)
-        .join(format!("v{}_{}.parquet", version.version, key))
-}
-
-/// Return the subset of versions whose cached partials do not yet exist on disk.
-#[must_use]
-pub fn find_uncached_versions(
-    cache_dir: &Path,
-    cfg_hash: &str,
-    node_id: &tinyfs::NodeID,
-    versions: &[FileVersionInfo],
-) -> Vec<FileVersionInfo> {
-    versions
-        .iter()
-        .filter(|v| !cache_version_path(cache_dir, cfg_hash, node_id, v).exists())
-        .cloned()
-        .collect()
-}
-
-/// Write a single input version's partials to cache as Parquet.
-///
-/// Streams partial batches through `AsyncArrowWriter` to disk without
-/// collecting into memory.  Uses an atomic write (`.tmp` then rename) so a
-/// crash never leaves a partial file behind that would be mistaken for a
-/// complete cached version.
-pub async fn cache_write_version(
-    cache_dir: &Path,
-    cfg_hash: &str,
-    node_id: &tinyfs::NodeID,
-    version: &FileVersionInfo,
-    schema: SchemaRef,
-    stream: Pin<
-        Box<dyn Stream<Item = std::result::Result<RecordBatch, crate::error::Error>> + Send>,
-    >,
-) -> Result<PathBuf> {
-    let dir = cache_node_dir(cache_dir, cfg_hash, node_id);
-    tokio::fs::create_dir_all(&dir).await?;
-
-    let final_path = cache_version_path(cache_dir, cfg_hash, node_id, version);
-    let tmp_path = final_path.with_extension("parquet.tmp");
-
-    let file = tokio::fs::File::create(&tmp_path).await?;
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(parquet::basic::ZstdLevel::default()))
-        .build();
-    let mut writer = AsyncArrowWriter::try_new(file, schema, Some(props))
-        .map_err(|e| crate::error::Error::Arrow(e.to_string()))?;
-
-    let mut stream = stream;
-    while let Some(batch) = stream.next().await {
-        let batch = batch?;
-        writer
-            .write(&batch)
-            .await
-            .map_err(|e| crate::error::Error::Arrow(e.to_string()))?;
-    }
-    let _metadata = writer
-        .close()
-        .await
-        .map_err(|e| crate::error::Error::Arrow(e.to_string()))?;
-
-    tokio::fs::rename(&tmp_path, &final_path).await?;
-    log::debug!("[SAVE] Rollup cache: wrote {}", final_path.display());
-
-    Ok(final_path)
-}
-
-/// Build a `ListingTable` over all cached per-version partials for a node.
-///
-/// Assumes every version is already cached (call [`cache_write_version`] for
-/// any uncached versions first).  Schemas are merged across versions so columns
-/// that appear only in newer versions are present and back-filled with NULLs
-/// for older ones.
-pub async fn listing_table_from_cache(
-    cache_dir: &Path,
-    cfg_hash: &str,
-    node_id: &tinyfs::NodeID,
-    ctx: &SessionContext,
-) -> Result<Arc<dyn TableProvider>> {
-    listing_table_from_dir(&cache_node_dir(cache_dir, cfg_hash, node_id), ctx).await
-}
-
 /// Build a `ListingTable` over every `.parquet` partials file directly under
 /// `dir`, merging their schemas (UNION-ALL-BY-NAME across versions/sources).
 pub async fn listing_table_from_dir(
@@ -779,45 +686,40 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_version_path_keys_by_blake3() {
-        let cache_dir = Path::new("/tmp/pond/cache");
+    fn test_glob_member_path_keys_by_blake3() {
         let node_id = test_node_id();
         let version = test_version(3, Some("abc123"));
-        let path = cache_version_path(cache_dir, "cfg", &node_id, &version);
+        let path = glob_member_path(Path::new("/tmp/pond/cache/rollup_cfg_x"), &node_id, &version);
         let filename = path.file_name().unwrap().to_str().unwrap();
-        assert_eq!(filename, "v3_abc123.parquet");
+        assert_eq!(filename, format!("{}_v3_abc123.parquet", node_id));
     }
 
     #[test]
-    fn test_cache_version_path_dynamic_uses_node_id() {
-        let cache_dir = Path::new("/tmp/pond/cache");
+    fn test_glob_member_path_dynamic_uses_node_id() {
         let node_id = test_node_id();
         let version = test_version(1, None);
-        let path = cache_version_path(cache_dir, "cfg", &node_id, &version);
+        let path = glob_member_path(Path::new("/tmp/pond/cache/rollup_cfg_x"), &node_id, &version);
         let filename = path.file_name().unwrap().to_str().unwrap();
-        assert!(filename.starts_with("v1_"));
+        assert!(filename.contains("_v1_"));
         assert!(filename.contains(&node_id.to_short_string()));
     }
 
     #[test]
-    fn test_find_uncached_versions() {
+    fn test_find_uncached_members() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache_dir = tmp.path();
         let node_id = test_node_id();
+        let gdir = glob_dir(tmp.path(), "cfg", &node_id);
         let versions = vec![test_version(1, Some("aaa")), test_version(2, Some("bbb"))];
 
         // Nothing cached yet.
-        assert_eq!(
-            find_uncached_versions(cache_dir, "cfg", &node_id, &versions).len(),
-            2
-        );
+        assert_eq!(find_uncached_members(&gdir, &node_id, &versions).len(), 2);
 
         // Pre-create v1's partial file.
-        let v1 = cache_version_path(cache_dir, "cfg", &node_id, &versions[0]);
+        let v1 = glob_member_path(&gdir, &node_id, &versions[0]);
         std::fs::create_dir_all(v1.parent().unwrap()).unwrap();
         std::fs::write(&v1, b"fake").unwrap();
 
-        let uncached = find_uncached_versions(cache_dir, "cfg", &node_id, &versions);
+        let uncached = find_uncached_members(&gdir, &node_id, &versions);
         assert_eq!(uncached.len(), 1);
         assert_eq!(uncached[0].version, 2);
     }
@@ -825,8 +727,8 @@ mod tests {
     #[tokio::test]
     async fn test_write_and_list_partials_merge() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache_dir = tmp.path();
         let node_id = test_node_id();
+        let gdir = glob_dir(tmp.path(), "cfg", &node_id);
         let schema = partials_schema();
 
         // Version 1: bucket 0 sum=10 count=2 ; bucket 1 sum=5 count=1
@@ -835,7 +737,7 @@ mod tests {
         let s1: Pin<
             Box<dyn Stream<Item = std::result::Result<RecordBatch, crate::error::Error>> + Send>,
         > = Box::pin(futures::stream::iter(vec![Ok(b1)]));
-        _ = cache_write_version(cache_dir, "cfg", &node_id, &v1, schema.clone(), s1)
+        _ = write_glob_member(&gdir, &node_id, &v1, schema.clone(), s1)
             .await
             .unwrap();
 
@@ -845,21 +747,19 @@ mod tests {
         let s2: Pin<
             Box<dyn Stream<Item = std::result::Result<RecordBatch, crate::error::Error>> + Send>,
         > = Box::pin(futures::stream::iter(vec![Ok(b2)]));
-        _ = cache_write_version(cache_dir, "cfg", &node_id, &v2, schema.clone(), s2)
+        _ = write_glob_member(&gdir, &node_id, &v2, schema.clone(), s2)
             .await
             .unwrap();
 
         // Incrementality: both versions now cached.
         assert_eq!(
-            find_uncached_versions(cache_dir, "cfg", &node_id, &[v1.clone(), v2.clone()]).len(),
+            find_uncached_members(&gdir, &node_id, &[v1.clone(), v2.clone()]).len(),
             0
         );
 
         // Merge the partials and verify the boundary bucket reconstructs exactly.
         let ctx = SessionContext::new();
-        let table = listing_table_from_cache(cache_dir, "cfg", &node_id, &ctx)
-            .await
-            .unwrap();
+        let table = listing_table_from_dir(&gdir, &ctx).await.unwrap();
         _ = ctx.register_table("partials", table).unwrap();
         let df = ctx
             .sql(
@@ -908,10 +808,15 @@ mod tests {
         let s1: Pin<
             Box<dyn Stream<Item = std::result::Result<RecordBatch, crate::error::Error>> + Send>,
         > = Box::pin(futures::stream::iter(vec![Ok(b1)]));
-        _ = cache_write_version(cache_dir, "cfg", &node_id, &v1, schema.clone(), s1)
-            .await
-            .unwrap();
-
+        _ = write_glob_member(
+            &glob_dir(cache_dir, "cfg", &node_id),
+            &node_id,
+            &v1,
+            schema.clone(),
+            s1,
+        )
+        .await
+        .unwrap();
         assert!(cache_node_dir(cache_dir, "cfg", &node_id).exists());
         drop_node_namespace(cache_dir, "cfg", &node_id).unwrap();
         assert!(!cache_node_dir(cache_dir, "cfg", &node_id).exists());
