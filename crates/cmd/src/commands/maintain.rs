@@ -15,6 +15,8 @@ use log::info;
 /// When `prune` is true, first deletes replicated control-table lifecycle
 /// history at or below a safe horizon so the subsequent checkpoint +
 /// vacuum reclaims it in the SAME pass (no extra ship open / read txn).
+/// Collapse likewise runs before the checkpoint + vacuum, since its
+/// reclamation phase deletes the rows that collapse superseded.
 pub async fn maintain_command(
     ship_context: &ShipContext,
     compact: bool,
@@ -44,8 +46,9 @@ pub async fn maintain_command(
         None
     };
 
-    let report = ship.maintain(true, compact).await;
-
+    // Collapse BEFORE maintain, for the same reason as prune above: collapse's
+    // reclamation phase deletes superseded rows, and those tombstones are only
+    // turned back into free space by the checkpoint + vacuum that follows.
     let collapse_report = if collapse_versions > 0 {
         Some(
             ship.collapse_versions(collapse_versions)
@@ -55,6 +58,8 @@ pub async fn maintain_command(
     } else {
         None
     };
+
+    let report = ship.maintain(true, compact).await;
 
     // Print results to stdout
     #[allow(clippy::print_stdout)]

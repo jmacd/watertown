@@ -259,49 +259,48 @@ impl OpLogFile {
 /// Read the pending tail bytes from previous versions of a FilePhysicalSeries.
 ///
 /// The pending bytes are the last `pending_len` bytes of the cumulative content
-/// (all versions concatenated). They are needed to correctly resume the bao-tree
-/// incremental hash state.
+/// (all live versions concatenated). They are needed to correctly resume the
+/// bao-tree incremental hash state.
 ///
-/// Reads versions backward from the most recent, collecting enough tail bytes.
-async fn read_pending_bytes(
+/// Walks the *live* rows backward in series byte order. Counting down through
+/// version numbers would be wrong once size-tiered collapse is in play: a merged
+/// run is appended with a fresh, highest version number while standing for
+/// content in the middle of the stream, and the versions it superseded still
+/// exist as rows, so a numeric walk would both mis-order the tail and
+/// double-count superseded bytes.
+pub(crate) async fn read_pending_bytes(
     state: &State,
     file_id: FileID,
     allocated_version: i64,
     pending_len: usize,
 ) -> tinyfs::Result<Vec<u8>> {
     debug!(
-        "Reading {} pending bytes for file {} (versions 1..{})",
-        pending_len,
-        file_id,
-        allocated_version - 1
+        "Reading {} pending bytes for file {} (versions below {})",
+        pending_len, file_id, allocated_version
     );
+
+    let records = state
+        .query_records(file_id)
+        .await
+        .map_other_context("read_pending_bytes: query records")?;
+    let live_versions: Vec<u64> = crate::schema::live_series_entries(&records)
+        .into_iter()
+        .filter(|r| r.size.unwrap_or(0) > 0 && r.version < allocated_version)
+        .map(|r| r.version as u64)
+        .collect();
 
     let mut collected: Vec<u8> = Vec::with_capacity(pending_len);
 
-    // Walk versions backward from the most recent
-    let mut version = (allocated_version - 1) as u64;
-    while collected.len() < pending_len && version >= 1 {
-        let version_content = state.read_file_version(file_id, version).await?;
-        let needed = pending_len - collected.len();
-
-        if version_content.len() >= needed {
-            // This version has enough bytes — take from the tail
-            let start = version_content.len() - needed;
-            // Prepend to collected (we're walking backward)
-            let mut new_collected = version_content[start..].to_vec();
-            new_collected.extend_from_slice(&collected);
-            collected = new_collected;
-        } else {
-            // Take the entire version and keep looking
-            let mut new_collected = version_content;
-            new_collected.extend_from_slice(&collected);
-            collected = new_collected;
-        }
-
-        if version == 0 {
+    for version in live_versions.iter().rev() {
+        if collected.len() >= pending_len {
             break;
         }
-        version -= 1;
+        let version_content = state.read_file_version(file_id, *version).await?;
+        let needed = pending_len - collected.len();
+        let start = version_content.len().saturating_sub(needed);
+        let mut new_collected = version_content[start..].to_vec();
+        new_collected.extend_from_slice(&collected);
+        collected = new_collected;
     }
 
     if collected.len() != pending_len {

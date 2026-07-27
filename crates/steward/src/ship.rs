@@ -52,6 +52,8 @@ pub struct CollapseReport {
     pub files_collapsed: usize,
     /// Total live versions superseded across all collapsed nodes.
     pub versions_collapsed: usize,
+    /// What the reclamation pass that follows the collapse actually freed.
+    pub reclaimed: crate::reclaim::ReclaimStats,
 }
 
 impl std::fmt::Display for CollapseReport {
@@ -60,7 +62,11 @@ impl std::fmt::Display for CollapseReport {
             f,
             "collapse: {} file(s) collapsed, {} version(s) superseded ({} candidate(s))",
             self.files_collapsed, self.versions_collapsed, self.candidates
-        )
+        )?;
+        if !self.reclaimed.is_empty() {
+            write!(f, "\n  {}", self.reclaimed)?;
+        }
+        Ok(())
     }
 }
 
@@ -869,6 +875,10 @@ impl Ship {
             ..CollapseReport::default()
         };
         if candidates.is_empty() {
+            // Still reclaim: a pond can carry debt from before reclamation
+            // existed, from a crash between collapse and reclaim, or from a
+            // blob staged by a transaction that never committed.
+            report.reclaimed = self.reclaim(&meta).await?;
             return Ok(report);
         }
 
@@ -883,8 +893,10 @@ impl Ship {
             // means: a FilePhysicalSeries is byte-concatenated, while a
             // TablePhysicalSeries must be re-encoded as a single parquet file.
             let collapsed = match id.entry_type() {
-                tinyfs::EntryType::TablePhysicalSeries => state.collapse_table_series(id).await,
-                _ => state.collapse_file_series(id).await,
+                tinyfs::EntryType::TablePhysicalSeries => {
+                    state.collapse_table_series(id, threshold).await
+                }
+                _ => state.collapse_file_series(id, threshold).await,
             };
             match collapsed {
                 Ok(stats) if stats.collapsed => {
@@ -897,7 +909,60 @@ impl Ship {
         }
         _ = tx.commit().await?;
 
+        // Phase 3: reclaim, now that the merged runs are durable.  This is the
+        // second half of collapse, not a separate feature: until the superseded
+        // rows are deleted they still reference their `_large_files` blobs, so
+        // collapse alone bounds the GROWTH RATE of a pond without ever
+        // returning a byte.  Doing it after the commit is what makes it
+        // crash-safe -- an interruption leaves the superseded rows in place,
+        // which is exactly the pre-reclaim state, whereas deleting first could
+        // lose content if the merged run never landed.
+        report.reclaimed = self.reclaim(&meta).await?;
+
         Ok(report)
+    }
+
+    /// Delete rows no reader can see and sweep the blobs they held down.
+    ///
+    /// Content-preserving and therefore invisible to replication: steward's
+    /// content fold already prunes superseded rows, so `root_tree_hash` is
+    /// unchanged and mirrors -- which never received them -- stay converged.
+    /// `reclaim_superseded` asserts that rather than assuming it, and skips the
+    /// irreversible blob sweep if it does not hold.
+    ///
+    /// Consuming no sequence of its own is what makes reclamation a tail of the
+    /// collapse rather than a transaction: it introduces no new logical
+    /// content, so there is nothing for a mirror to receive.  Its delete
+    /// commits are therefore stamped as MAINTENANCE (`pond_maintenance`), not
+    /// as `pond_txn`.  Stamping them with the collapse's `txn_seq` would make
+    /// `reconstruct_txn_history` -- which yields one transaction per `pond_txn`
+    /// commit -- emit N+1 entries for that one sequence, so `pond rebuild`
+    /// would replay N+1 duplicate lifecycle records into the control table.
+    /// Seq recovery on open is unaffected: it takes the per-pond MAX over
+    /// `pond_txn` commits, and the collapse's own commit still carries it.
+    async fn reclaim(
+        &mut self,
+        meta: &PondUserMetadata,
+    ) -> Result<crate::reclaim::ReclaimStats, StewardError> {
+        let pond_id = self.control_table.pond_id_uuid();
+        let control_dir = get_control_path(&self.pond_path);
+        let mut txn_meta = PondTxnMetadata::new(self.last_write_seq, meta.clone());
+        txn_meta.pond_id = pond_id.to_string();
+
+        // The sweep deletes every blob no committed row names, which it cannot
+        // distinguish from a blob a concurrent writer has staged but not yet
+        // committed.  Exclusion is the guarantee that makes it safe.
+        let _write_lock = crate::write_lock::WriteLockGuard::try_acquire(&control_dir, &txn_meta)?;
+
+        let (new_table, stats) = crate::reclaim::reclaim_superseded(
+            self.data_persistence.table().clone(),
+            &get_data_path(&self.pond_path),
+            &pond_id.to_string(),
+            txn_meta.to_delta_maintenance_metadata(),
+        )
+        .await?;
+        self.data_persistence.set_table(new_table);
+        Ok(stats)
     }
 
     /// Compact this pond's own data partitions as a RECORDED, pushable

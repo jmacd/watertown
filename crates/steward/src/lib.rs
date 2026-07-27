@@ -28,6 +28,7 @@ mod host;
 mod inner_control;
 pub mod maintenance;
 mod rebuild;
+pub mod reclaim;
 mod remote_config;
 mod ship;
 mod write_lock;

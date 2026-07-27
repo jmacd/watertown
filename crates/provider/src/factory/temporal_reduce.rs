@@ -478,6 +478,13 @@ impl TemporalReduceSqlFile {
         // and write the same finest-resolution partials.
         let site_node_id = id.part_id().to_node_id();
         let glob_dir = crate::rollup_cache::glob_dir(&cache_dir, &cfg_hash, &site_node_id);
+        let partials = crate::rollup_cache::partials_dir(&cache_dir, &cfg_hash, &site_node_id);
+        // Accumulated across source nodes: the partials of every source node's
+        // LIVE versions, named explicitly. Reading this instead of listing
+        // `glob_dir` is what keeps a version-collapse leftover out of the
+        // merge, where it would be summed a second time (testsuite 733).
+        let mut live_partials =
+            crate::version_cache::CachedSet::empty_in(partials.path().to_path_buf());
 
         let fs = self.context.context.filesystem();
         let mut provider_api =
@@ -514,8 +521,23 @@ impl TemporalReduceSqlFile {
                 EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries
             );
 
-            let mut uncached =
-                crate::rollup_cache::find_uncached_members(&glob_dir, &source_node_id, &versions);
+            let live =
+                crate::version_cache::LiveVersions::from_persistence(source_node_id, versions);
+            // Reconcile before writing: this both reports which live versions
+            // still need a partial and DELETES the partials of versions that a
+            // collapse superseded. A cache that only ever added is how those
+            // leftovers survived to be double-counted.
+            let reconciled = partials.reconcile(&live).map_other()?;
+            if !reconciled.removed.is_empty() {
+                log::info!(
+                    "temporal-reduce rollup: source node {} dropped {} partial(s) whose \
+                     versions are no longer live (version collapse); any sealed run built \
+                     on them will be rebuilt from the live partials",
+                    source_node_id,
+                    reconciled.removed.len()
+                );
+            }
+            let mut uncached = reconciled.missing;
             uncached.sort_by_key(|v| v.version);
             let mut frontier =
                 crate::rollup_cache::read_frontier(&glob_dir, &source_node_id).map_other()?;
@@ -569,6 +591,11 @@ impl TemporalReduceSqlFile {
                     }
                 }
             }
+
+            // Collected after the writes above, so newly written partials are
+            // included. Node scoped: a sibling source node's partials in this
+            // shared directory belong to its own live set, not this one's.
+            live_partials.extend(partials.cached_set(&live, |_| true));
         }
 
         let ctx = &context.datafusion_session;
@@ -596,9 +623,7 @@ impl TemporalReduceSqlFile {
             .collect();
         let partials_table = format!("__rollup_partials_{}_{}", cfg_hash, sanitized_id);
         if !ctx.table_exist(partials_table.as_str()).unwrap_or(false) {
-            let provider = crate::rollup_cache::listing_table_from_dir(&glob_dir, ctx)
-                .await
-                .map_other()?;
+            let provider = live_partials.table_provider().await.map_other()?;
             _ = ctx
                 .register_table(partials_table.as_str(), provider)
                 .map_other()?;
@@ -1317,15 +1342,10 @@ impl TemporalReduceSqlFile {
 
         let schema = stream.schema();
         let mapped = stream.map(|r| r.map_err(|e| crate::error::Error::Arrow(e.to_string())));
-        _ = crate::rollup_cache::write_glob_member(
-            glob_dir,
-            source_node_id,
-            version,
-            schema,
-            Box::pin(mapped),
-        )
-        .await
-        .map_other()?;
+        _ = crate::rollup_cache::partials_dir_at(glob_dir)
+            .write_sidecar(source_node_id, version, schema, Box::pin(mapped))
+            .await
+            .map_other()?;
         Ok(())
     }
 

@@ -22,6 +22,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use provider::{FactoryContext, FactoryRegistry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -178,6 +179,124 @@ struct CollapseCandidate {
     pond_id: String,
     part_id: String,
     node_id: String,
+}
+
+/// Number of same-size-class runs merged into one run of the next class.
+///
+/// This is the fanout of a size-tiered (LSM-style) compaction: each byte is
+/// rewritten once per class it is promoted through, so total write volume is
+/// `O(N log_F N)` rather than the `O(N^2)` of repeatedly rewriting the whole
+/// series.
+///
+/// The value trades write volume against read cost. A larger fanout writes
+/// slightly less but leaves up to `F - 1` live runs per class, and reads pay
+/// per live segment. At `F = 10` a series holds at most a few dozen live
+/// segments across all classes -- fewer than the ~100 loose versions the old
+/// scheme allowed between collapses -- while keeping write amplification to a
+/// small constant.
+pub const COLLAPSE_FANOUT: usize = 10;
+
+/// Size class of a run, i.e. its magnitude in units of [`COLLAPSE_FANOUT`].
+///
+/// Runs merge only with runs of the same class, which is what keeps a large
+/// accumulated run from being rewritten every time a few small versions arrive.
+fn size_class(bytes: u64) -> u32 {
+    let mut class = 0u32;
+    let mut bound = COLLAPSE_FANOUT as u64;
+    while bytes >= bound {
+        class += 1;
+        match bound.checked_mul(COLLAPSE_FANOUT as u64) {
+            Some(next) => bound = next,
+            None => break,
+        }
+    }
+    class
+}
+
+/// Temporal overrides the merged run must carry forward.
+///
+/// `set-temporal-bounds` records manual bounds on a dedicated ZERO-BYTE version.
+/// Collapse deliberately excludes zero-byte rows from the merge window (they
+/// contribute no content), but the merged run's `[lo, hi]` range still SPANS
+/// their version numbers, so `is_superseded` retires them. Without inheriting
+/// their bounds here, a collapse silently deletes the override and every reader
+/// falls back to unbounded filtering -- re-admitting exactly the rows the
+/// operator excluded.
+///
+/// The newest override inside the window wins, matching "latest setting wins".
+/// A newer override outside the window still wins overall, because the merged
+/// run sorts at its range position, below that later row.
+fn inherited_overrides(records: &[OplogEntry], lo: i64, hi: i64) -> (Option<i64>, Option<i64>) {
+    records
+        .iter()
+        .filter(|r| r.version >= lo && r.version <= hi)
+        .filter(|r| r.min_override.is_some() || r.max_override.is_some())
+        .max_by_key(|r| r.version)
+        .map_or((None, None), |r| (r.min_override, r.max_override))
+}
+
+/// Choose the contiguous window of live rows to merge, or `None` for a no-op.
+///
+/// Size-tiered policy: merge the oldest group of [`COLLAPSE_FANOUT`] *adjacent*
+/// rows sharing a size class. Merging only same-class neighbours is the whole
+/// point -- it is what stops a 96 MB accumulated run from being rewritten to
+/// absorb 10 KB of new data.
+///
+/// `max_live` is a backstop for read cost. If no same-class group exists but the
+/// series has drifted past `max_live` segments, `COLLAPSE_FANOUT` adjacent rows
+/// are merged regardless of class so segment count stays bounded.
+///
+/// The backstop merges the CHEAPEST such window, not the oldest. Taking the
+/// oldest looks natural but is the one choice that defeats tiering: after any
+/// previous collapse the oldest row IS the large accumulated run, so a backstop
+/// anchored at index 0 rewrites megabytes to absorb kilobytes -- precisely the
+/// `O(N^2)` behaviour size classes exist to prevent. It also fires more often
+/// than it appears to, because callers pass the same number as both the
+/// candidacy threshold (`HAVING COUNT(*) > threshold`) and `max_live`, so every
+/// candidate satisfies `live.len() > max_live` by construction. Choosing by
+/// total bytes bounds the segment count just as well while keeping write volume
+/// at the minimum any window could achieve.
+///
+/// Returns a half-open index range into `live` (which must be ordered oldest
+/// content first).
+fn choose_collapse_window(live: &[&OplogEntry], max_live: usize) -> Option<Range<usize>> {
+    if live.len() < 2 {
+        return None;
+    }
+
+    // Oldest same-class group of at least COLLAPSE_FANOUT adjacent rows.
+    let classes: Vec<u32> = live
+        .iter()
+        .map(|r| size_class(r.size.unwrap_or(0).max(0) as u64))
+        .collect();
+    let mut start = 0usize;
+    while start < classes.len() {
+        let mut end = start + 1;
+        while end < classes.len() && classes[end] == classes[start] {
+            end += 1;
+        }
+        if end - start >= COLLAPSE_FANOUT {
+            return Some(start..start + COLLAPSE_FANOUT);
+        }
+        start = end;
+    }
+
+    // Backstop: bound live segment count even when classes are ragged. Every
+    // window of this width reduces the segment count identically, so pick the
+    // one that rewrites the fewest bytes; ties resolve to the oldest.
+    if live.len() > max_live {
+        let width = COLLAPSE_FANOUT.min(live.len());
+        let cost = |start: usize| -> u128 {
+            live[start..start + width]
+                .iter()
+                .map(|r| r.size.unwrap_or(0).max(0) as u128)
+                .sum()
+        };
+        let best = (0..=live.len() - width).min_by_key(|&start| cost(start))?;
+        return Some(best..best + width);
+    }
+
+    None
 }
 
 /// One reconstructed write transaction recovered from the data Delta
@@ -622,7 +741,7 @@ impl OpLogPersistence {
                     "delta.dataSkippingStatsColumns".to_string(),
                     // pond_id and part_id are partition columns (in the file path);
                     // partition columns do not need data-skipping stats.
-                    Some("node_id,name,parent_id,entry_type,file_type,timestamp,version,blake3,size,min_event_time,max_event_time,min_override,max_override,extended_attributes,factory,txn_seq,collapsed_through".to_string())
+                    Some("node_id,name,parent_id,entry_type,file_type,timestamp,version,blake3,size,min_event_time,max_event_time,min_override,max_override,extended_attributes,factory,txn_seq,collapsed_through,collapsed_from".to_string())
                 )]
                 .into_iter()
                 .collect();
@@ -1144,24 +1263,41 @@ impl State {
         &self.large_file_options
     }
 
-    /// Collapse all live versions of a `FilePhysicalSeries` node into a single
-    /// merged version so that subsequent reads are O(1) instead of O(versions).
+    /// Collapse one contiguous window of live versions of a
+    /// `FilePhysicalSeries` node into a single merged run, bounding the number
+    /// of segments a reader must open.
     ///
-    /// The merged version stores the full concatenated content plus a
-    /// `collapsed_through = M - 1` sentinel; the series read path then skips
-    /// every superseded version. The bytes read back from the file are
-    /// byte-identical before and after, which this method verifies, failing
-    /// the transaction on any mismatch.
+    /// Uses size-tiered (LSM-style) compaction: only [`COLLAPSE_FANOUT`]
+    /// adjacent runs of the same size class are merged, and the merged row
+    /// records the closed version range `[collapsed_from, collapsed_through]` it
+    /// supersedes. Merging a bounded window rather than the whole series is what
+    /// makes total write volume `O(N log N)` instead of `O(N^2)`: previously
+    /// every collapse rewrote the entire accumulated history to absorb one
+    /// window's worth of new bytes.
+    ///
+    /// The newest versions are deliberately left un-merged. That keeps
+    /// per-version `max_event_time` and version numbers intact at the tail,
+    /// where bounded readers ([`tinyfs::SeriesReadBounds`]) prune, and it means
+    /// the latest row's cumulative bao outboard -- which the append path resumes
+    /// from -- is never disturbed.
+    ///
+    /// Bytes read back from the file are identical before and after, which this
+    /// method verifies over the merged window, failing the transaction on any
+    /// mismatch.
     ///
     /// Must be called inside an open write transaction; the merged row is
     /// committed with the surrounding transaction. Returns a no-op result when
-    /// fewer than two live versions exist.
+    /// no window qualifies.
     ///
     /// # Errors
     /// Returns an error if `id` is not a `FilePhysicalSeries`, if reading or
     /// writing the merged content fails, or if the post-collapse content does
     /// not match the pre-collapse content.
-    pub async fn collapse_file_series(&self, id: FileID) -> Result<CollapseStats, TLogFSError> {
+    pub async fn collapse_file_series(
+        &self,
+        id: FileID,
+        max_live: usize,
+    ) -> Result<CollapseStats, TLogFSError> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         if id.entry_type() != EntryType::FilePhysicalSeries {
@@ -1173,62 +1309,101 @@ impl State {
             });
         }
 
-        // Assess current versions and gather metadata the merged row inherits.
-        let (versions_before, temporal, store_path, options) = {
+        // Assess current versions and pick the window to merge.
+        let (
+            versions_before,
+            window,
+            temporal,
+            inherited_bao,
+            newest_version,
+            overrides,
+            store_path,
+            options,
+        ) = {
             let mut inner = self.inner.lock().await;
             let records = inner.query_records(id).await?;
-            let collapsed_through = records.iter().filter_map(|r| r.collapsed_through).max();
-            let mut live: Vec<&OplogEntry> = records
-                .iter()
+            let live: Vec<&OplogEntry> = crate::schema::live_series_entries(&records)
+                .into_iter()
                 .filter(|r| r.size.unwrap_or(0) > 0)
-                .filter(|r| collapsed_through.is_none_or(|k| r.version > k))
                 .collect();
-            live.sort_by_key(|r| r.version);
 
-            if live.len() < 2 {
+            let Some(range) = choose_collapse_window(&live, max_live) else {
                 return Ok(CollapseStats {
                     collapsed: false,
                     versions_before: live.len(),
                     merged_version: 0,
                     bytes: 0,
                 });
-            }
+            };
+            let window: Vec<OplogEntry> = live[range].iter().map(|r| (*r).clone()).collect();
 
-            let latest = *live.last().expect("live is non-empty");
-            let timestamp_column = latest
+            let newest = window.last().expect("window is non-empty");
+            let timestamp_column = newest
                 .get_extended_attributes()
                 .map(|a| a.timestamp_column().to_string())
                 .filter(|s| !s.is_empty());
-            let min_event = live.iter().filter_map(|r| r.min_event_time).min();
-            let max_event = live.iter().filter_map(|r| r.max_event_time).max();
+            let min_event = window.iter().filter_map(|r| r.min_event_time).min();
+            let max_event = window.iter().filter_map(|r| r.max_event_time).max();
             let temporal = match (min_event, max_event, timestamp_column) {
                 (Some(min), Some(max), Some(col)) => Some((min, max, col)),
                 _ => None,
             };
 
+            // The merged run inherits the cumulative bao state of the newest
+            // version it absorbs. Collapse regroups an unchanged byte stream, so
+            // the series prefix through that version is byte-identical before and
+            // after; recomputing it would be both wasteful and, for a run that
+            // does not start at version 1, wrong.
+            let inherited_bao = newest.bao_outboard.clone();
+            let newest_version = newest.version;
+
+            // Zero-byte override rows are filtered out of `window` above, but
+            // the merged range still spans them, so carry their bounds forward.
+            let overrides = {
+                let lo = crate::schema::CollapseRange::of(&window[0]).lo;
+                let hi =
+                    crate::schema::CollapseRange::of(window.last().expect("window is non-empty"))
+                        .hi;
+                inherited_overrides(&records, lo, hi)
+            };
+
             (
                 live.len(),
+                window,
                 temporal,
+                inherited_bao,
+                newest_version,
+                overrides,
                 inner.path.clone(),
                 inner.large_file_options.clone(),
             )
         };
 
-        // Read the merged content via the existing series reader. It already
-        // concatenates only the live versions oldest-first, so this is the
-        // authoritative post-collapse content.
+        let lo = crate::schema::CollapseRange::of(&window[0]).lo;
+        let hi = crate::schema::CollapseRange::of(window.last().expect("non-empty")).hi;
+
+        // Read just this window's bytes. Reading the whole series here is what
+        // made collapse O(N^2); the window is the only content the merged run
+        // stands in for.
         let merged = {
-            let mut reader = self.inner.lock().await.async_file_reader(id).await?;
+            let inner = self.inner.lock().await;
             let mut buf = Vec::new();
-            _ = reader.read_to_end(&mut buf).await.map_err(|e| {
-                TLogFSError::Internal(format!("collapse: read merged content: {e}"))
-            })?;
+            for record in &window {
+                if record.is_large_file() {
+                    let mut reader = inner.open_large_file_reader(record).await?;
+                    let before = buf.len();
+                    _ = reader.read_to_end(&mut buf).await.map_err(|e| {
+                        TLogFSError::Internal(format!("collapse: read window content: {e}"))
+                    })?;
+                    debug_assert!(buf.len() >= before);
+                } else {
+                    buf.extend_from_slice(record.verified_content_required()?);
+                }
+            }
             buf
         };
 
-        // Re-write the merged bytes as a fresh first-version body so the
-        // bao-tree cumulative state covers exactly this content; a later append
-        // then resumes correctly from the merged baseline.
+        // Re-write the window's bytes as a single standalone body.
         let mut writer = crate::large_files::HybridWriter::with_options(&store_path, options);
         writer
             .write_all(&merged)
@@ -1244,11 +1419,45 @@ impl State {
             .map_err(|e| TLogFSError::Internal(format!("collapse: finalize merged: {e}")))?;
 
         let content_len = result.size;
-        let series_outboard = utilities::bao_outboard::SeriesOutboard::from_first_version_state(
-            &result.bao_state,
-            content_len as u64,
-        );
-        let bao_outboard = series_outboard.to_bytes();
+
+        // The merged run inherits the cumulative bao state of the newest version
+        // it absorbs, with `version_size` restated as the run's own length.
+        // Collapse only regroups bytes, so the series prefix through `hi` is
+        // unchanged; recomputing it as a fresh first version would be correct
+        // only for a run starting at the very beginning of the series, and is
+        // wrong for every later run.
+        // "No outboard" and "unparseable outboard" are NOT the same case, and
+        // must not share a fallback: the fallback below is the FIRST-version
+        // baseline, which -- as the comment above states -- is correct only for
+        // a run starting at the beginning of the series.  Silently applying it
+        // to a run that merely failed to parse its predecessor's state would
+        // stamp a wrong baseline onto the merged run, which no later
+        // verification could attribute back to here.  A corrupt outboard is a
+        // hard error that aborts the collapse instead.
+        let bao_outboard = match inherited_bao.as_deref() {
+            Some(bytes) => {
+                let mut inherited = utilities::bao_outboard::SeriesOutboard::from_bytes(bytes)
+                    .map_err(|e| {
+                        TLogFSError::Internal(format!(
+                            "collapse: node {} version {} has an unreadable bao outboard \
+                             ({} bytes): {e}. The merged run must inherit that cumulative \
+                             state -- recomputing it as a first version would stamp a wrong \
+                             baseline -- so the collapse is aborted, leaving the series \
+                             uncollapsed and intact.",
+                            id,
+                            newest_version,
+                            bytes.len(),
+                        ))
+                    })?;
+                inherited.version_size = content_len as u64;
+                inherited.to_bytes()
+            }
+            None => utilities::bao_outboard::SeriesOutboard::from_first_version_state(
+                &result.bao_state,
+                content_len as u64,
+            )
+            .to_bytes(),
+        };
 
         let content_ref = if result.content.is_empty()
             && content_len >= crate::large_files::LARGE_FILE_THRESHOLD
@@ -1294,20 +1503,37 @@ impl State {
                 }
             };
             entry.set_bao_outboard(bao_outboard);
-            entry.collapsed_through = Some(version - 1);
+            entry.collapsed_from = Some(lo);
+            entry.collapsed_through = Some(hi);
+            (entry.min_override, entry.max_override) = overrides;
             inner.records.push(entry);
             version
         };
 
-        // Invariant: bytes read back must be identical to the merged content.
+        // Invariant: the merged run must read back byte-identically. Verifying
+        // the run rather than the whole series keeps collapse's I/O proportional
+        // to the window it actually rewrote.
         let after = {
-            let mut reader = self.inner.lock().await.async_file_reader(id).await?;
-            let mut buf = Vec::new();
-            _ = reader
-                .read_to_end(&mut buf)
-                .await
-                .map_err(|e| TLogFSError::Internal(format!("collapse: verify read: {e}")))?;
-            buf
+            let inner = self.inner.lock().await;
+            let record = inner
+                .records
+                .iter()
+                .rev()
+                .find(|r| r.node_id == id.node_id() && r.version == merged_version)
+                .ok_or_else(|| {
+                    TLogFSError::Internal("collapse: merged row missing after enqueue".to_string())
+                })?;
+            if record.is_large_file() {
+                let mut reader = inner.open_large_file_reader(record).await?;
+                let mut buf = Vec::new();
+                _ = reader
+                    .read_to_end(&mut buf)
+                    .await
+                    .map_err(|e| TLogFSError::Internal(format!("collapse: verify read: {e}")))?;
+                buf
+            } else {
+                record.verified_content_required()?.to_vec()
+            }
         };
         if after != merged {
             return Err(TLogFSError::Transaction {
@@ -1357,7 +1583,11 @@ impl State {
     /// Returns an error if `id` is not a `TablePhysicalSeries`, if the series
     /// carries no timestamp column, if reading or re-encoding fails, or if the
     /// post-collapse row count or temporal bounds do not match the input.
-    pub async fn collapse_table_series(&self, id: FileID) -> Result<CollapseStats, TLogFSError> {
+    pub async fn collapse_table_series(
+        &self,
+        id: FileID,
+        max_live: usize,
+    ) -> Result<CollapseStats, TLogFSError> {
         use tokio::io::AsyncWriteExt;
 
         if id.entry_type() != EntryType::TablePhysicalSeries {
@@ -1369,31 +1599,40 @@ impl State {
             });
         }
 
-        // Assess current versions and gather metadata the merged row inherits.
-        // The lock is released before any table-provider work below, which
-        // re-enters the persistence layer to resolve versions.
-        let (versions_before, min_event, max_event, timestamp_column, store_path, options) = {
+        // Assess current versions and pick the window to merge. The lock is
+        // released before any table-provider work below, which re-enters the
+        // persistence layer to resolve versions.
+        let (
+            versions_before,
+            window_versions,
+            lo,
+            hi,
+            min_event,
+            max_event,
+            timestamp_column,
+            overrides,
+            store_path,
+            options,
+        ) = {
             let mut inner = self.inner.lock().await;
             let records = inner.query_records(id).await?;
-            let collapsed_through = records.iter().filter_map(|r| r.collapsed_through).max();
-            let mut live: Vec<&OplogEntry> = records
-                .iter()
+            let live: Vec<&OplogEntry> = crate::schema::live_series_entries(&records)
+                .into_iter()
                 .filter(|r| r.size.unwrap_or(0) > 0)
-                .filter(|r| collapsed_through.is_none_or(|k| r.version > k))
                 .collect();
-            live.sort_by_key(|r| r.version);
 
-            if live.len() < 2 {
+            let Some(range) = choose_collapse_window(&live, max_live) else {
                 return Ok(CollapseStats {
                     collapsed: false,
                     versions_before: live.len(),
                     merged_version: 0,
                     bytes: 0,
                 });
-            }
+            };
+            let window = &live[range];
 
-            let latest = *live.last().expect("live is non-empty");
-            let timestamp_column = latest
+            let newest = *window.last().expect("window is non-empty");
+            let timestamp_column = newest
                 .get_extended_attributes()
                 .map(|a| a.timestamp_column().to_string())
                 .filter(|s| !s.is_empty())
@@ -1403,23 +1642,45 @@ impl State {
                          TablePhysicalSeries cannot be rewritten without one"
                     ),
                 })?;
-            let min_event = live.iter().filter_map(|r| r.min_event_time).min();
-            let max_event = live.iter().filter_map(|r| r.max_event_time).max();
+            let min_event = window.iter().filter_map(|r| r.min_event_time).min();
+            let max_event = window.iter().filter_map(|r| r.max_event_time).max();
+
+            let lo = window
+                .iter()
+                .map(|r| crate::schema::CollapseRange::of(r).lo)
+                .min()
+                .expect("window is non-empty");
+            let hi = window
+                .iter()
+                .map(|r| crate::schema::CollapseRange::of(r).hi)
+                .max()
+                .expect("window is non-empty");
+            let window_versions: Vec<i64> = window.iter().map(|r| r.version).collect();
+
+            // Zero-byte override rows are filtered out of `window` above, but
+            // the merged range still spans them, so carry their bounds forward.
+            let overrides = inherited_overrides(&records, lo, hi);
 
             (
                 live.len(),
+                window_versions,
+                lo,
+                hi,
                 min_event,
                 max_event,
                 timestamp_column,
+                overrides,
                 inner.path.clone(),
                 inner.large_file_options.clone(),
             )
         };
 
-        // Re-encode every live version into a single parquet buffer. The table
-        // provider unions the per-version parquet files, so this is the
-        // authoritative post-collapse content.
-        let (merged, rows_before) = self.reencode_table_series(id, &timestamp_column).await?;
+        // Re-encode just this window into a single parquet buffer. The table
+        // provider unions the listed per-version parquet files and merges their
+        // schemas, so this is the authoritative content for the merged run.
+        let (merged, rows_before) = self
+            .reencode_table_versions(id, &window_versions, &timestamp_column)
+            .await?;
 
         // Store the merged parquet as a fresh first-version body so the bao-tree
         // cumulative state covers exactly this content.
@@ -1493,15 +1754,20 @@ impl State {
                 }
             };
             entry.set_bao_outboard(bao_outboard);
-            entry.collapsed_through = Some(version - 1);
+            entry.collapsed_from = Some(lo);
+            entry.collapsed_through = Some(hi);
+            (entry.min_override, entry.max_override) = overrides;
             inner.records.push(entry);
             version
         };
 
         // Invariant: re-encoding must preserve logical content. Byte-identity
-        // does not hold across a parquet rewrite, so compare row count and the
-        // event-time bounds recovered from the merged file itself.
-        let (after, rows_after) = self.reencode_table_series(id, &timestamp_column).await?;
+        // does not hold across a parquet rewrite, so compare the row count of
+        // the stored merged run against the window it replaced. Scanning only
+        // the merged version keeps verification proportional to the window.
+        let (after, rows_after) = self
+            .reencode_table_versions(id, &[merged_version], &timestamp_column)
+            .await?;
         if rows_after != rows_before {
             return Err(TLogFSError::Transaction {
                 message: format!(
@@ -1520,23 +1786,37 @@ impl State {
         })
     }
 
-    /// Read every live version of a table series back through its table
-    /// provider and re-encode the union as a single parquet buffer.
+    /// Read the given versions of a table series back through a table provider
+    /// and re-encode their union as a single parquet buffer.
+    ///
+    /// The versions are passed as explicit per-version URLs rather than the
+    /// series' "all versions" pattern, so a collapse can re-encode just the
+    /// window it intends to merge. DataFusion still infers and merges the schema
+    /// across the listed files, which is why this goes through the provider
+    /// instead of decoding each version's parquet directly.
     ///
     /// Returns the parquet bytes and the total row count.
-    async fn reencode_table_series(
+    async fn reencode_table_versions(
         &self,
         id: FileID,
+        versions: &[i64],
         timestamp_column: &str,
     ) -> Result<(Vec<u8>, usize), TLogFSError> {
         use futures::StreamExt;
         use parquet::arrow::ArrowWriter;
 
         let context = self.as_provider_context();
+        let additional_urls: Vec<String> = versions
+            .iter()
+            .map(|v| provider::TinyFsPathBuilder::url_specific_version(&id, *v as u64))
+            .collect();
         let table_provider = provider::create_table_provider(
             id,
             &context,
-            provider::TableProviderOptions::default(),
+            provider::TableProviderOptions {
+                version_selection: provider::VersionSelection::AllVersions,
+                additional_urls,
+            },
         )
         .await
         .map_err(|e| TLogFSError::Internal(format!("collapse: build table provider: {e}")))?;
@@ -1595,10 +1875,11 @@ impl State {
     /// deltas whose versions are disjoint, so both can be merged safely, and
     /// both pay a per-version read cost that grows without bound.
     ///
-    /// A live version has `size > 0` and a `version` greater than the node's
-    /// highest `collapsed_through` sentinel, so a node already collapsed to a
-    /// single merged version is never returned. The query spans all partitions
-    /// in the pond.
+    /// A live row has `size > 0` and is not covered by any *other* row's
+    /// collapse range `[collapsed_from, collapsed_through]`. Loose rows occupy
+    /// the degenerate range `[version, version]`, so one anti-join expresses
+    /// supersession for both loose rows and superseded merge runs. The query
+    /// spans all partitions in the pond.
     ///
     /// # Errors
     /// Returns an error if the discovery query fails or a returned identifier
@@ -1616,17 +1897,28 @@ impl State {
         // collapsed, so it is excluded from candidacy here.
         let log_node = tinyfs::LOG_NODE_UUID;
         let sql = format!(
-            "SELECT t.pond_id AS pond_id, t.part_id AS part_id, t.node_id AS node_id \
-             FROM delta_table t \
-             JOIN ( \
-                 SELECT part_id, node_id, MAX(COALESCE(collapsed_through, -1)) AS k \
+            "SELECT pond_id, part_id, node_id FROM ( \
+                 SELECT t.pond_id AS pond_id, t.part_id AS part_id, t.node_id AS node_id, \
+                        t.version AS version, \
+                        CASE WHEN t.collapsed_through IS NULL THEN t.version \
+                             ELSE COALESCE(t.collapsed_from, 0) END AS lo, \
+                        CASE WHEN t.collapsed_through IS NULL THEN t.version \
+                             ELSE t.collapsed_through END AS hi \
+                 FROM delta_table t \
+                 WHERE t.file_type IN {series_types} AND t.size > 0 \
+                   AND t.node_id != '{log_node}' \
+             ) x \
+             LEFT JOIN ( \
+                 SELECT part_id AS rpart, node_id AS rnode, version AS rversion, \
+                        COALESCE(collapsed_from, 0) AS rlo, collapsed_through AS rhi \
                  FROM delta_table \
-                 WHERE file_type IN {series_types} AND node_id != '{log_node}' \
-                 GROUP BY part_id, node_id \
-             ) m ON t.part_id = m.part_id AND t.node_id = m.node_id \
-             WHERE t.file_type IN {series_types} AND t.size > 0 AND t.version > m.k \
-               AND t.node_id != '{log_node}' \
-             GROUP BY t.pond_id, t.part_id, t.node_id \
+                 WHERE file_type IN {series_types} AND collapsed_through IS NOT NULL \
+                   AND node_id != '{log_node}' \
+             ) r \
+             ON x.part_id = r.rpart AND x.node_id = r.rnode AND r.rversion != x.version \
+                AND r.rlo <= x.lo AND x.hi <= r.rhi \
+             WHERE r.rversion IS NULL \
+             GROUP BY pond_id, part_id, node_id \
              HAVING COUNT(*) > {threshold}"
         );
 
@@ -2195,23 +2487,28 @@ impl State {
             return Ok(None);
         }
 
-        // FAIL-FAST: Find latest version or fail explicitly
-        let latest_version = file_series_records
+        // Resolve over LIVE rows in range order, not by raw version.
+        //
+        // A collapse output takes a fresh highest version while standing for
+        // content in the middle of the stream, so `max_by_key(version)` selects
+        // the merged run rather than the real tail. Merged runs never carry
+        // overrides (the merge constructors do not copy them), so that lookup
+        // returns None and the caller falls back to (i64::MIN, i64::MAX) --
+        // silently disabling the filtering `set-temporal-bounds` established.
+        // Take the newest live row that actually carries an override.
+        let live = crate::schema::live_series_entries(&file_series_records);
+        let Some(latest_override) = live
             .iter()
-            .max_by_key(|r| r.version)
-            .ok_or_else(|| {
-                debug!(
-                    "[ERR] FAIL-FAST: No records found to determine latest version for node_id {id}"
-                );
-                TLogFSError::Transaction {
-                    message: format!(
-                        "Cannot find latest version for temporal overrides: node_id {id}"
-                    ),
-                }
-            })?;
+            .rev()
+            .find(|r| r.temporal_overrides().is_some())
+            .copied()
+        else {
+            debug!("[WARN] TEMPORAL: No live record carries temporal overrides for node_id {id}");
+            return Ok(None);
+        };
 
-        let version = latest_version.version;
-        let temporal_overrides = latest_version.temporal_overrides();
+        let version = latest_override.version;
+        let temporal_overrides = latest_override.temporal_overrides();
         let has_overrides = temporal_overrides.is_some();
         debug!(
             "[SEARCH] TEMPORAL: Latest version {version} has temporal overrides: {has_overrides}"
@@ -2925,25 +3222,29 @@ impl InnerState {
     ) -> Result<Pin<Box<dyn tinyfs::AsyncReadSeek>>, TLogFSError> {
         use tinyfs::chained_reader::ChainedReader;
 
-        // Versions at or below the highest `collapsed_through` sentinel have been
-        // superseded by a merged collapse row and must be skipped; otherwise their
-        // bytes would be double-counted alongside the merged version that replaced
-        // them. `None` (the common, un-collapsed case) keeps every version.
-        let collapsed_through = records.iter().filter_map(|r| r.collapsed_through).max();
-
-        // Filter for non-empty, non-superseded versions and reverse to get
-        // oldest-first order (query_records returns newest-first).
-        let mut valid_records: Vec<&OplogEntry> = records
-            .iter()
+        // Rows inside a merged collapse row's [collapsed_from, collapsed_through]
+        // range have been superseded and must be skipped; otherwise their bytes
+        // would be double-counted alongside the merged row that replaced them.
+        // `live_series_entries` returns rows in series byte order (by range
+        // start), which for merged rows is *not* their version number.
+        let mut valid_records: Vec<&OplogEntry> = crate::schema::live_series_entries(records)
+            .into_iter()
             .filter(|r| r.size.unwrap_or(0) > 0) // Skip 0-byte versions
-            .filter(|r| collapsed_through.is_none_or(|k| r.version > k))
             // Bounded pruning: skip versions below the event-time lower bound
             // and/or at-or-below the version watermark. Versions without a
             // recorded `max_event_time` are retained by the event-time
-            // predicate (a missing bound must never drop data).
-            .filter(|r| series_version_retained(r.max_event_time, r.version, &bounds))
+            // predicate (a missing bound must never drop data). A merged row is
+            // pruned on the newest version it covers, so a run is retained
+            // whenever any version inside it would have been.
+            .filter(|r| {
+                series_version_retained(
+                    r.max_event_time,
+                    crate::schema::CollapseRange::of(r).hi,
+                    &bounds,
+                )
+            })
             .collect();
-        valid_records.reverse(); // Now oldest-first
+        valid_records.sort_by_key(|r| crate::schema::CollapseRange::of(r).sort_key());
 
         if valid_records.is_empty() {
             // Return empty reader for empty series
@@ -4213,7 +4514,22 @@ impl InnerState {
             );
         }
 
-        if let Some(record) = records.first() {
+        // For a FilePhysicalSeries the newest *content* is not necessarily the
+        // highest *version*: size-tiered collapse appends a merged run with a
+        // fresh (highest) version number while that run stands for versions in
+        // the middle of the byte stream. The append path resumes its cumulative
+        // bao state from this record, so it must be the row covering the end of
+        // the stream -- the last live row in range order -- not `records.first()`.
+        let newest = if id.entry_type() == EntryType::FilePhysicalSeries {
+            crate::schema::live_series_entries(&records)
+                .into_iter()
+                .rfind(|r| r.size.unwrap_or(0) > 0)
+                .or_else(|| records.first())
+        } else {
+            records.first()
+        };
+
+        if let Some(record) = newest {
             // Use the record directly - it's already an OplogEntry with metadata() method
             let file_type_str = format!("{:?}", record.file_type);
             debug!(
@@ -4251,15 +4567,19 @@ impl InnerState {
         // Sort records by version number (which should match timestamp order anyway)
         records.sort_by_key(|record| record.version);
 
-        // Hide versions superseded by a collapse merge row: a FilePhysicalSeries
-        // merged version stores collapsed_through = M-1, so versions <= M-1 are no
-        // longer independently readable. collapsed_through is always None for other
-        // entry types, leaving their listings unchanged.
-        let collapsed_through = records.iter().filter_map(|r| r.collapsed_through).max();
+        // Hide versions superseded by a collapse merge row: a merged
+        // FilePhysicalSeries row covers the closed version range
+        // [collapsed_from, collapsed_through], so rows inside that range are no
+        // longer independently readable. Rows of other entry types carry no
+        // range and are left unchanged.
+        let live: std::collections::HashSet<i64> = crate::schema::live_series_entries(&records)
+            .into_iter()
+            .map(|r| r.version)
+            .collect();
 
         let version_infos = records
             .into_iter()
-            .filter(|record| collapsed_through.is_none_or(|k| record.version > k))
+            .filter(|record| live.contains(&record.version))
             .map(|record| {
                 // Use the actual database version number, not a re-enumerated logical version
                 let version = record.version as u64;
@@ -4894,5 +5214,112 @@ mod series_bounds_tests {
         // gate alone decides.
         assert!(series_version_retained(None, 6, &b));
         assert!(!series_version_retained(None, 5, &b));
+    }
+}
+
+#[cfg(test)]
+mod collapse_window_tests {
+    use super::{COLLAPSE_FANOUT, choose_collapse_window, size_class};
+    use crate::schema::OplogEntry;
+
+    /// A live row of the given byte size; only `size` affects window choice.
+    fn row(size: i64) -> OplogEntry {
+        let mut e = OplogEntry::new_small_file(
+            tinyfs::FileID::new_in_partition(
+                tinyfs::FileID::root_for(tinyfs::local_pond_uuid()).part_id(),
+                tinyfs::EntryType::FilePhysicalSeries,
+                tinyfs::local_pond_uuid(),
+            ),
+            0,
+            1,
+            Vec::new(),
+            0,
+        );
+        e.size = Some(size);
+        e
+    }
+
+    fn window(sizes: &[i64], max_live: usize) -> Option<std::ops::Range<usize>> {
+        let rows: Vec<OplogEntry> = sizes.iter().map(|s| row(*s)).collect();
+        let live: Vec<&OplogEntry> = rows.iter().collect();
+        choose_collapse_window(&live, max_live)
+    }
+
+    #[test]
+    fn fewer_than_two_live_rows_is_a_noop() {
+        assert_eq!(window(&[], 1), None);
+        assert_eq!(window(&[100], 1), None);
+    }
+
+    #[test]
+    fn size_classes_are_powers_of_the_fanout() {
+        assert_eq!(size_class(0), 0);
+        assert_eq!(size_class(COLLAPSE_FANOUT as u64 - 1), 0);
+        assert_eq!(size_class(COLLAPSE_FANOUT as u64), 1);
+        assert_eq!(size_class((COLLAPSE_FANOUT * COLLAPSE_FANOUT) as u64), 2);
+    }
+
+    /// The tiering rule: the oldest run of FANOUT same-class neighbours wins,
+    /// even when an older, larger run sits in front of it.
+    #[test]
+    fn prefers_the_oldest_same_class_group() {
+        // One big run, then ten small same-class rows.
+        let mut sizes = vec![1_000_000];
+        sizes.extend(std::iter::repeat_n(5, COLLAPSE_FANOUT));
+        assert_eq!(window(&sizes, usize::MAX), Some(1..1 + COLLAPSE_FANOUT));
+    }
+
+    /// Without a same-class group and within `max_live`, nothing is merged:
+    /// rewriting bytes to no purpose is worse than a few extra segments.
+    #[test]
+    fn ragged_classes_within_the_bound_are_left_alone() {
+        let sizes: Vec<i64> = (0..6).map(|i| 10i64.pow(i)).collect();
+        assert_eq!(window(&sizes, 100), None);
+    }
+
+    /// The backstop must NOT anchor at index 0.
+    ///
+    /// After any previous collapse the oldest row is the large accumulated run,
+    /// so merging from index 0 rewrites it to absorb a few small rows -- the
+    /// `O(N^2)` behaviour size classes exist to prevent. Callers pass the same
+    /// number as both the candidacy threshold and `max_live`, so this path is
+    /// reached far more often than "drifted past the bound" suggests.
+    #[test]
+    fn backstop_merges_the_cheapest_window_not_the_oldest() {
+        // A huge accumulated run, then rows whose classes are deliberately
+        // ragged so no same-class group of FANOUT exists.
+        let mut sizes = vec![100_000_000];
+        for i in 0..(COLLAPSE_FANOUT * 2) {
+            sizes.push(10i64.pow((i % 5) as u32 + 1));
+        }
+        let chosen = window(&sizes, 2).expect("backstop must fire past the bound");
+        assert_ne!(
+            chosen.start, 0,
+            "must not rewrite the large accumulated run"
+        );
+        assert_eq!(chosen.len(), COLLAPSE_FANOUT);
+
+        // And it really is the minimum-cost window.
+        let cheapest = (0..=sizes.len() - COLLAPSE_FANOUT)
+            .min_by_key(|&s| sizes[s..s + COLLAPSE_FANOUT].iter().sum::<i64>())
+            .unwrap();
+        assert_eq!(chosen.start, cheapest);
+    }
+
+    /// Ties resolve to the oldest window, so a uniform series still compacts
+    /// front to back rather than wandering.
+    #[test]
+    fn equal_cost_windows_resolve_to_the_oldest() {
+        let sizes: Vec<i64> = std::iter::repeat_n(7, COLLAPSE_FANOUT + 3).collect();
+        // All one class, so the same-class rule fires first -- also at 0.
+        assert_eq!(window(&sizes, 2), Some(0..COLLAPSE_FANOUT));
+    }
+
+    /// Fewer live rows than the fanout still collapses under the backstop,
+    /// merging everything available.
+    #[test]
+    fn backstop_handles_a_series_shorter_than_the_fanout() {
+        let sizes = vec![1, 1_000, 1_000_000];
+        assert_eq!(window(&sizes, 1), Some(0..3));
     }
 }

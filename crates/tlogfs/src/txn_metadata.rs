@@ -70,6 +70,29 @@ impl PondTxnMetadata {
         HashMap::from([("pond_txn".to_string(), pond_txn)])
     }
 
+    /// Convert to Delta commit metadata for a **maintenance** commit.
+    ///
+    /// Maintenance commits (reclaim's row deletes) are content-preserving and
+    /// represent no transaction of their own: they are the tail of a
+    /// transaction that has already committed and been recorded. Stamping them
+    /// under a distinct key keeps them attributable for forensics while making
+    /// them invisible to anything that reads transactions, which is what
+    /// `pond_txn` means.
+    ///
+    /// This matters because [`Self::from_delta_metadata`] is how
+    /// `reconstruct_txn_history` decides what a transaction *was*: a
+    /// maintenance commit carrying `pond_txn` would be replayed as a second
+    /// (duplicate) lifecycle record at a sequence that already has one. Seq
+    /// recovery on open is unaffected -- it takes the per-pond MAX over all
+    /// `pond_txn` commits, and the originating transaction's own commit still
+    /// carries that seq.
+    #[must_use]
+    pub fn to_delta_maintenance_metadata(&self) -> HashMap<String, serde_json::Value> {
+        let meta = serde_json::to_value(self).expect("Failed to serialize PondTxnMetadata");
+
+        HashMap::from([("pond_maintenance".to_string(), meta)])
+    }
+
     /// Extract from Delta Lake commit metadata (for reading backups)
     ///
     /// Returns None if pond_txn field is missing or malformed.

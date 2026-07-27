@@ -1131,6 +1131,102 @@ async fn test_temporal_bounds_on_file_series() -> Result<(), Box<dyn std::error:
         // Don't commit this read-only transaction
     }
 
+    // Transaction 6: keep appending after the bounds were set, so the series
+    // has enough versions to be collapsible and the override row is no longer
+    // the highest version.  The new points sit OUTSIDE [10s, 20s], so if the
+    // bounds ever stop applying the count jumps above 10.
+    debug!("Appending further out-of-bounds versions after the temporal bounds...");
+    for (i, t) in [100_i64, 200, 300, 400].into_iter().enumerate() {
+        let tx = persistence.begin_test().await?;
+        let wd = tx.root().await?;
+
+        use arrow_array::{Float64Array, RecordBatch, StringArray, TimestampSecondArray};
+        use arrow_schema::{DataType, Field, Schema, TimeUnit};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Second, Some("+00:00".into())),
+                false,
+            ),
+            Field::new("value", DataType::Float64, false),
+            Field::new("sensor_id", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampSecondArray::from(vec![Some(t)]).with_timezone("+00:00")),
+                Arc::new(Float64Array::from(vec![900.0_f64 + i as f64])),
+                Arc::new(StringArray::from(vec!["sensor_001"])),
+            ],
+        )?;
+        _ = wd
+            .write_series_from_batch(series_path, &batch, Some("timestamp"))
+            .await?;
+        tx.commit_test().await?;
+    }
+
+    // Transaction 7: Collapse the series, then re-query.  The bounds must
+    // survive.
+    //
+    // Regression: a collapse output takes a fresh HIGHEST version while
+    // standing for content mid-stream, and merged rows never carry temporal
+    // overrides.  Resolving the override by `max_by_key(version)` therefore
+    // picked the merged run, found no override, and the caller fell back to
+    // (i64::MIN, i64::MAX) -- silently re-admitting the T=1s and T=50s rows
+    // that `set-temporal-bounds` exists to exclude, plus the new ones above.
+    debug!("Collapsing the series and re-checking temporal bounds...");
+    {
+        let tx = persistence.begin_test().await?;
+        {
+            let state = tx.state()?;
+            let candidates = state.list_collapsible_series(2).await?;
+            assert!(
+                !candidates.is_empty(),
+                "series should be collapsible after the appends above"
+            );
+            for id in candidates {
+                let stats = state.collapse_table_series(id, 2).await?;
+                assert!(stats.collapsed, "collapse should have merged a window");
+            }
+        }
+        tx.commit_test().await?;
+    }
+
+    {
+        let tx = persistence.begin_test().await?;
+        let wd = tx.root().await?;
+
+        let mut result_stream = execute_sql_on_file(
+            &wd,
+            series_path,
+            "SELECT COUNT(*) as row_count FROM source",
+            &tx.state()?.as_provider_context(),
+        )
+        .await?;
+
+        let mut total_count = 0_i64;
+        while let Some(batch_result) = result_stream.next().await {
+            let batch = batch_result?;
+            if batch.num_rows() > 0 {
+                let count_array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .expect("COUNT(*) should return Int64Array");
+                total_count = count_array.value(0);
+            }
+        }
+
+        debug!("Count after collapse: {}", total_count);
+        assert_eq!(
+            total_count, 10,
+            "temporal bounds must survive a collapse; got {total_count} rows, which means \
+             the override was not found and filtering silently reverted to unbounded"
+        );
+    }
+
     debug!("SUCCESS: Temporal bounds test completed");
     debug!(
         "  - Created file series with data points at T=1,10,11,12,13,14,15,16,17,18,19,50 seconds"
@@ -2110,7 +2206,7 @@ async fn test_file_physical_series_collapse_and_append() {
         let id = wd.get_node_path(file_path).await.expect("node").id();
         let state = tx.state().expect("state");
         let stats = state
-            .collapse_file_series(id)
+            .collapse_file_series(id, 1)
             .await
             .expect("collapse_file_series");
         assert!(stats.collapsed, "expected a collapse to occur");
@@ -2273,7 +2369,7 @@ async fn test_collapse_large_file_series() {
         let stats = tx
             .state()
             .expect("state")
-            .collapse_file_series(id)
+            .collapse_file_series(id, 1)
             .await
             .expect("collapse_file_series");
         assert!(stats.collapsed, "expected a collapse");
@@ -2375,12 +2471,123 @@ async fn collapse_now(persistence: &mut OpLogPersistence, file_path: &str) -> i6
     let stats = tx
         .state()
         .expect("state")
-        .collapse_file_series(id)
+        .collapse_file_series(id, 1)
         .await
         .expect("collapse_file_series");
     assert!(stats.collapsed, "expected a collapse at {file_path}");
     tx.commit_test().await.expect("commit collapse");
     stats.merged_version
+}
+
+/// Read the full series content at `file_path`.
+async fn read_series_content(persistence: &mut OpLogPersistence, file_path: &str) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let tx = persistence.begin_test().await.expect("begin read tx");
+    let wd = tx.root().await.expect("root");
+    let mut reader = wd.async_reader_path(file_path).await.expect("reader");
+    let mut content = Vec::new();
+    _ = reader.read_to_end(&mut content).await.expect("read series");
+    tx.commit_test().await.expect("commit read");
+    content
+}
+
+/// Size-tiered collapse merges a bounded *window* of same-size-class versions
+/// instead of the whole series, so several merged runs coexist. This is what
+/// makes total write volume `O(N log N)` rather than `O(N^2)`: absorbing new
+/// versions must not rewrite the accumulated history.
+///
+/// The critical invariant is ordering. A merged run is allocated a fresh
+/// (highest) version number, so a run covering versions 1..=10 outranks the
+/// loose versions 21..=25 that follow it in the byte stream. Readers must
+/// therefore order by range start, not by version. Concatenating by version
+/// would silently emit the runs *after* the loose tail, which only a
+/// multi-run fixture like this one can detect.
+#[tokio::test]
+async fn test_collapse_tiered_windows_preserve_order_and_content() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    use crate::persistence::COLLAPSE_FANOUT;
+
+    let store_path = test_dir();
+    let mut persistence = OpLogPersistence::create_test(&store_path)
+        .await
+        .expect("Failed to create persistence");
+    let file_path = "data/tiered.csv";
+
+    // 25 versions of 9 bytes each: small enough to share one size class, so the
+    // tiering policy sees a single mergeable group.
+    let mut cumulative: Vec<u8> = Vec::new();
+    for i in 0..25u32 {
+        let chunk = format!("line-{i:03}\n").into_bytes();
+        assert_eq!(chunk.len(), 9);
+        cumulative.extend_from_slice(&chunk);
+        let create = if i == 0 { Some("data") } else { None };
+        append_series_version(&mut persistence, file_path, &chunk, create).await;
+    }
+    assert_eq!(live_version_count(&mut persistence, file_path).await, 25);
+
+    // `max_live` is high enough that the read-cost backstop never fires, so
+    // every merge below is a genuine same-class tiered merge.
+    async fn collapse_window(persistence: &mut OpLogPersistence, file_path: &str) -> (bool, i64) {
+        let tx = persistence.begin_test().await.expect("begin collapse tx");
+        let wd = tx.root().await.expect("root");
+        let id = wd.get_node_path(file_path).await.expect("node").id();
+        let stats = tx
+            .state()
+            .expect("state")
+            .collapse_file_series(id, 1000)
+            .await
+            .expect("collapse_file_series");
+        tx.commit_test().await.expect("commit collapse");
+        (stats.collapsed, stats.merged_version)
+    }
+
+    // First window: COLLAPSE_FANOUT versions merge into one run, leaving the
+    // rest loose. A whole-series collapse would have left exactly one version.
+    let (first_collapsed, first_version) = collapse_window(&mut persistence, file_path).await;
+    assert!(first_collapsed, "expected a tiered collapse");
+    assert_eq!(
+        live_version_count(&mut persistence, file_path).await,
+        25 - COLLAPSE_FANOUT + 1,
+        "only one window merges; the remaining versions stay loose"
+    );
+    assert_eq!(
+        read_series_content(&mut persistence, file_path).await,
+        cumulative,
+        "content unchanged after the first tiered merge"
+    );
+
+    // Second window: a second run now coexists with the first. Its version
+    // number is higher than the loose tail's, so this is the case that fails if
+    // readers order by version rather than by range start.
+    let (second_collapsed, second_version) = collapse_window(&mut persistence, file_path).await;
+    assert!(second_collapsed, "expected a second tiered collapse");
+    assert!(
+        second_version > first_version,
+        "runs are appended, never renumbered"
+    );
+    assert_eq!(
+        live_version_count(&mut persistence, file_path).await,
+        25 - 2 * COLLAPSE_FANOUT + 2,
+        "two runs plus the still-loose tail"
+    );
+    assert_eq!(
+        read_series_content(&mut persistence, file_path).await,
+        cumulative,
+        "two coexisting runs still concatenate in series byte order"
+    );
+
+    // Appending after collapse must continue from the tail, and cumulative bao
+    // must still describe the whole stream.
+    let tail = b"line-final\n";
+    cumulative.extend_from_slice(tail);
+    append_series_version(&mut persistence, file_path, tail, None).await;
+    assert_eq!(
+        read_series_content(&mut persistence, file_path).await,
+        cumulative,
+        "append after tiered collapse lands at the end"
+    );
+    verify_cumulative_blake3(&mut persistence, file_path, &cumulative).await;
 }
 
 /// Append one parquet version to a `TablePhysicalSeries`, creating it on the
@@ -2503,7 +2710,7 @@ async fn test_collapse_table_series_reencodes_versions() {
         let stats = tx
             .state()
             .expect("state")
-            .collapse_table_series(id)
+            .collapse_table_series(id, 1)
             .await
             .expect("collapse_table_series");
         assert!(stats.collapsed, "expected a collapse");
@@ -2543,7 +2750,7 @@ async fn test_collapse_table_series_reencodes_versions() {
         let stats = tx
             .state()
             .expect("state")
-            .collapse_table_series(id)
+            .collapse_table_series(id, 1)
             .await
             .expect("second collapse_table_series");
         assert!(
@@ -2559,6 +2766,111 @@ async fn test_collapse_table_series_reencodes_versions() {
     assert_eq!(
         table_series_rows(&mut persistence, file_path).await,
         rows_before + 2,
+        "a post-collapse append adds exactly its own rows"
+    );
+}
+
+/// Tiering the table path: with a realistic `max_live`, collapse must merge a
+/// bounded *window* of same-size-class versions instead of re-encoding the
+/// entire series on every trigger. That is what turns collapse from an O(N^2)
+/// write amplifier into an O(N log N) one.
+///
+/// This drives two collapses so a merged run and loose versions coexist, which
+/// is the configuration that hid the ordering bugs on the file path. For tables
+/// the risk is different: the window is re-encoded through a table provider fed
+/// explicit per-version URLs, so a run must be readable as an ordinary version
+/// and must not be double-counted alongside the versions it replaced.
+#[tokio::test]
+async fn test_collapse_table_series_tiered_windows() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let store_path = test_dir();
+    let mut persistence = OpLogPersistence::create_test(&store_path)
+        .await
+        .expect("Failed to create persistence");
+    let file_path = "table.series";
+
+    // 25 tiny disjoint appends, the shape of an hourly collector.
+    const VERSIONS: usize = 25;
+    for i in 0..VERSIONS {
+        let base = (i as i64 + 1) * 1000;
+        append_table_series_version(
+            &mut persistence,
+            file_path,
+            vec![base, base + 1],
+            vec![i as f64, i as f64 + 0.5],
+        )
+        .await;
+    }
+
+    let rows_before = table_series_rows(&mut persistence, file_path).await;
+    assert_eq!(rows_before, VERSIONS * 2, "every appended row is visible");
+    assert_eq!(
+        live_version_count(&mut persistence, file_path).await,
+        VERSIONS,
+        "no collapse has run yet"
+    );
+
+    let id = node_id_of(&mut persistence, file_path).await;
+
+    // First collapse: merges exactly one fanout-sized window, not the history.
+    async fn collapse(
+        persistence: &mut OpLogPersistence,
+        id: tinyfs::FileID,
+        max_live: usize,
+    ) -> crate::persistence::CollapseStats {
+        let tx = persistence.begin_test().await.expect("begin collapse tx");
+        let stats = tx
+            .state()
+            .expect("state")
+            .collapse_table_series(id, max_live)
+            .await
+            .expect("collapse_table_series");
+        tx.commit_test().await.expect("commit collapse");
+        stats
+    }
+
+    let stats = collapse(&mut persistence, id, VERSIONS).await;
+    assert!(
+        stats.collapsed,
+        "a full same-size-class window is available"
+    );
+    let after_first = live_version_count(&mut persistence, file_path).await;
+    assert_eq!(
+        after_first,
+        VERSIONS - 9,
+        "a window of {} versions collapses to one merged run",
+        crate::persistence::COLLAPSE_FANOUT
+    );
+    assert_eq!(
+        table_series_rows(&mut persistence, file_path).await,
+        rows_before,
+        "merging a window must neither lose rows nor double-count the \
+         versions it superseded"
+    );
+
+    // Second collapse: a merged run now coexists with loose versions, so the
+    // window picker must skip the run (different size class) and merge the next
+    // group of loose versions.
+    let stats = collapse(&mut persistence, id, VERSIONS).await;
+    assert!(stats.collapsed, "a second loose window is still available");
+    assert_eq!(
+        live_version_count(&mut persistence, file_path).await,
+        after_first - 9,
+        "the second window collapses independently of the first run"
+    );
+    assert_eq!(
+        table_series_rows(&mut persistence, file_path).await,
+        rows_before,
+        "two coexisting merged runs must not overlap or drop rows"
+    );
+
+    // Appending afterwards must extend the series, not resurrect superseded
+    // versions absorbed by either run.
+    append_table_series_version(&mut persistence, file_path, vec![99_000], vec![9.9]).await;
+    assert_eq!(
+        table_series_rows(&mut persistence, file_path).await,
+        rows_before + 1,
         "a post-collapse append adds exactly its own rows"
     );
 }
@@ -2582,7 +2894,7 @@ async fn test_collapse_table_series_rejects_file_series() {
     let err = tx
         .state()
         .expect("state")
-        .collapse_table_series(id)
+        .collapse_table_series(id, 1)
         .await
         .expect_err("a FilePhysicalSeries must be rejected");
     assert!(
@@ -3465,4 +3777,237 @@ async fn series_bounded_read_memory_plateaus_as_history_grows() {
         b16 < f16,
         "bounded read must be smaller than the full-history read at N=16: {b16} < {f16}"
     );
+}
+
+/// Supersession must be decided by *range containment*, never by the highest
+/// `collapsed_through` sentinel.
+///
+/// Once collapse is tiered, a merged run carries a fresh highest version while
+/// standing for content in the middle of the stream, so the two rules diverge:
+/// a run created early (low version, low range) can be outlived by a later
+/// merge whose range extends past that run's *version number*. The old
+/// `max(collapsed_through)` rule -- "every version <= K is dead" -- then drops a
+/// live run and its content disappears silently.
+#[test]
+fn test_supersession_uses_ranges_not_max_watermark() {
+    use crate::schema::{CollapseRange, live_series_versions};
+
+    let loose = |v: i64| {
+        (
+            v,
+            CollapseRange {
+                lo: v,
+                hi: v,
+                merged: false,
+            },
+        )
+    };
+    let run = |v: i64, lo: i64, hi: i64| {
+        (
+            v,
+            CollapseRange {
+                lo,
+                hi,
+                merged: true,
+            },
+        )
+    };
+
+    // Run A merged versions 1..=10 and was allocated version 26. Later, a
+    // window of loose versions 21..=31 merged as version 36. Note 36's range
+    // ends at 31, which is *above* run A's version number of 26.
+    let rows = vec![
+        run(26, 1, 10),
+        loose(11),
+        loose(12),
+        run(36, 21, 31),
+        loose(40),
+    ];
+
+    let live = live_series_versions(&rows);
+    assert_eq!(
+        live,
+        vec![26, 11, 12, 36, 40],
+        "every row is live: no range contains another. Order is range order \
+         (run A first, covering versions 1..=10), not version order"
+    );
+
+    // The rule this replaced: max(collapsed_through) = 31, retain version > 31.
+    let watermark = rows
+        .iter()
+        .filter(|(_, r)| r.merged)
+        .map(|(_, r)| r.hi)
+        .max()
+        .expect("a merged run is present");
+    let dropped_by_watermark: Vec<i64> = rows
+        .iter()
+        .map(|(v, _)| *v)
+        .filter(|v| *v <= watermark)
+        .collect();
+    assert_eq!(
+        dropped_by_watermark,
+        vec![26, 11, 12],
+        "the watermark rule would silently drop run A (version 26) along with \
+         live loose versions 11 and 12"
+    );
+
+    // A run does supersede what it actually covers.
+    let rows = vec![run(26, 1, 10), loose(5), loose(11)];
+    assert_eq!(
+        live_series_versions(&rows),
+        vec![26, 11],
+        "version 5 lies inside run A's range and is superseded"
+    );
+}
+
+/// Build a `FilePhysicalSeries` of `n` nine-byte versions and collapse it twice,
+/// leaving two merged runs coexisting with a loose tail. Returns the cumulative
+/// stream bytes.
+///
+/// This is the only shape that exposes the tiered-collapse reader bugs: with a
+/// single run, or with no loose tail, version order and byte order still agree.
+async fn build_two_run_series(persistence: &mut OpLogPersistence, file_path: &str) -> Vec<u8> {
+    let mut cumulative: Vec<u8> = Vec::new();
+    for i in 0..25u32 {
+        let chunk = format!("line-{i:03}\n").into_bytes();
+        cumulative.extend_from_slice(&chunk);
+        let create = if i == 0 { Some("data") } else { None };
+        append_series_version(persistence, file_path, &chunk, create).await;
+    }
+    for _ in 0..2 {
+        let tx = persistence.begin_test().await.expect("begin collapse tx");
+        let wd = tx.root().await.expect("root");
+        let id = wd.get_node_path(file_path).await.expect("node").id();
+        let stats = tx
+            .state()
+            .expect("state")
+            .collapse_file_series(id, 1000)
+            .await
+            .expect("collapse_file_series");
+        assert!(stats.collapsed, "expected a tiered collapse");
+        tx.commit_test().await.expect("commit collapse");
+    }
+    cumulative
+}
+
+/// Corruption #1: the series read path must concatenate live rows in *range*
+/// order, not version order.
+///
+/// A merged run is allocated a fresh (highest) version number while standing for
+/// content in the middle of the stream, so sorting by version emits the runs
+/// after the loose tail. The bytes are all present and the length is unchanged,
+/// so this corrupts content silently -- only comparing the exact byte sequence
+/// detects it.
+#[tokio::test]
+async fn test_corruption_read_path_orders_runs_by_range_not_version() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let store_path = test_dir();
+    let mut persistence = OpLogPersistence::create_test(&store_path)
+        .await
+        .expect("Failed to create persistence");
+    let file_path = "data/order.csv";
+
+    let cumulative = build_two_run_series(&mut persistence, file_path).await;
+    let read = read_series_content(&mut persistence, file_path).await;
+
+    assert_eq!(
+        read.len(),
+        cumulative.len(),
+        "no bytes may be lost or duplicated"
+    );
+    assert_eq!(
+        read, cumulative,
+        "runs must appear at their range position, not after the loose tail"
+    );
+    assert!(
+        read.starts_with(b"line-000\n"),
+        "the stream must begin with the oldest content, which now lives inside \
+         a run carrying one of the *highest* version numbers"
+    );
+}
+
+/// Corruption #2: `metadata()` must describe the row covering the *end* of the
+/// stream -- the last live row in range order -- not the highest version.
+///
+/// The append path resumes its cumulative bao state from this row. Post-tiering
+/// the highest version is a mid-stream run, so returning it makes every
+/// subsequent append continue from the wrong prefix, silently corrupting
+/// `cumulative_blake3` for all later readers.
+#[tokio::test]
+async fn test_corruption_metadata_describes_stream_tail_not_highest_version() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let store_path = test_dir();
+    let mut persistence = OpLogPersistence::create_test(&store_path)
+        .await
+        .expect("Failed to create persistence");
+    let file_path = "data/meta.csv";
+
+    let cumulative = build_two_run_series(&mut persistence, file_path).await;
+
+    let tx = persistence.begin_test().await.expect("begin read tx");
+    let wd = tx.root().await.expect("root");
+    let id = wd.get_node_path(file_path).await.expect("node").id();
+    let meta = {
+        use tinyfs::persistence::PersistenceLayer;
+        tx.state()
+            .expect("state")
+            .metadata(id)
+            .await
+            .expect("metadata")
+    };
+    tx.commit_test().await.expect("commit read");
+
+    let bao = meta
+        .bao_outboard
+        .expect("a series row carries a bao outboard");
+    let outboard =
+        utilities::bao_outboard::SeriesOutboard::from_bytes(&bao).expect("decode series outboard");
+    assert_eq!(
+        outboard.cumulative_size,
+        cumulative.len() as u64,
+        "metadata must describe the whole stream ({} bytes). A mid-stream run \
+         would report only the bytes through the end of its own range",
+        cumulative.len()
+    );
+}
+
+/// Corruption #3: `read_pending_bytes` must walk live rows backward in *range*
+/// order.
+///
+/// It reconstructs the trailing partial bao block, so it must return the true
+/// last `pending_len` bytes of the stream. Counting version numbers downward
+/// interleaves runs with loose versions and can re-read rows a run already
+/// superseded, yielding the right *number* of bytes from the wrong places --
+/// which then poisons the resumed hash state rather than failing.
+#[tokio::test]
+async fn test_corruption_read_pending_bytes_walks_range_order() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let store_path = test_dir();
+    let mut persistence = OpLogPersistence::create_test(&store_path)
+        .await
+        .expect("Failed to create persistence");
+    let file_path = "data/pending.csv";
+
+    let cumulative = build_two_run_series(&mut persistence, file_path).await;
+
+    let tx = persistence.begin_test().await.expect("begin read tx");
+    let wd = tx.root().await.expect("root");
+    let id = wd.get_node_path(file_path).await.expect("node").id();
+    let state = tx.state().expect("state");
+
+    // `allocated_version` is the version a subsequent append would take: high
+    // enough that every existing row is in scope.
+    let allocated = 10_000;
+    for pending_len in [9usize, 27, cumulative.len()] {
+        let tail = crate::file::read_pending_bytes(&state, id, allocated, pending_len)
+            .await
+            .expect("read_pending_bytes");
+        assert_eq!(
+            tail,
+            cumulative[cumulative.len() - pending_len..].to_vec(),
+            "the last {pending_len} bytes must come from the end of the stream \
+             in range order"
+        );
+    }
+    tx.commit_test().await.expect("commit read");
 }

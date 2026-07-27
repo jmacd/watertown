@@ -44,7 +44,7 @@ use sync_store::content::{
     recipe_hash, series_hash,
 };
 use tinyfs::{EntryType, ROOT_UUID};
-use tlogfs::schema::{OplogEntry, decode_directory_entries};
+use tlogfs::schema::{CollapseRange, OplogEntry, decode_directory_entries, live_series_versions};
 
 use crate::control_table::CommitSpine;
 use crate::{Ship, StewardError};
@@ -537,7 +537,7 @@ pub(crate) async fn incremental_spine_inputs(
     let mut dir_rows: HashMap<String, (i64, Vec<u8>)> = HashMap::new();
     let mut leaf_latest: HashMap<String, OplogEntry> = HashMap::new();
     let mut series_new: HashMap<String, BTreeMap<i64, ObjectHash>> = HashMap::new();
-    let mut series_collapsed: HashMap<String, i64> = HashMap::new();
+    let mut series_ranges: HashMap<String, Vec<(i64, CollapseRange)>> = HashMap::new();
     let mut changed: BTreeSet<String> = BTreeSet::new();
     for row in uncommitted {
         // Foreign-pond rows (cross-pond mount subtrees) are never folded into
@@ -556,10 +556,10 @@ pub(crate) async fn incremental_spine_inputs(
                     .entry(node.clone())
                     .or_default()
                     .insert(row.version, hash);
-                if let Some(k) = row.collapsed_through {
-                    let slot = series_collapsed.entry(node).or_insert(k);
-                    *slot = (*slot).max(k);
-                }
+                series_ranges
+                    .entry(node)
+                    .or_default()
+                    .push((row.version, CollapseRange::of(&row)));
             }
             EntryType::DirectoryPhysical => {
                 let content = row.content.clone().unwrap_or_default();
@@ -607,23 +607,23 @@ pub(crate) async fn incremental_spine_inputs(
     }
 
     // New content hash of every touched series: its committed version blobs
-    // followed by this transaction's appended versions, with every version at
-    // or below the highest `collapsed_through` sentinel (from either side)
-    // pruned, exactly as [`fold_rows`] does, then hashed as one series object.
+    // followed by this transaction's appended versions, pruned by range
+    // containment and ordered oldest content first, exactly as [`fold_rows`]
+    // does, then hashed as one series object.
     for (node, appended) in &series_new {
-        let (mut versions, committed_collapsed) =
+        let (mut versions, mut ranges) =
             read_series_committed(committed_table.clone(), local_pond_id, node).await?;
         for (version, hash) in appended {
             let _ = versions.insert(*version, *hash);
         }
-        let collapsed = committed_collapsed
+        // This transaction's rows shadow the committed rows of the same version.
+        if let Some(new_ranges) = series_ranges.get(node) {
+            ranges.retain(|(v, _)| !new_ranges.iter().any(|(nv, _)| nv == v));
+            ranges.extend(new_ranges.iter().copied());
+        }
+        let ordered: Vec<ObjectHash> = live_series_versions(&ranges)
             .into_iter()
-            .chain(series_collapsed.get(node).copied())
-            .max();
-        let ordered: Vec<ObjectHash> = versions
-            .into_iter()
-            .filter(|(version, _)| collapsed.is_none_or(|k| *version > k))
-            .map(|(_, hash)| hash)
+            .filter_map(|version| versions.get(&version).copied())
             .collect();
         let _ = child_hash.insert(node.clone(), series_hash(&ordered));
     }
@@ -772,9 +772,9 @@ fn node_depth(
 }
 
 /// Read a series node's committed version blob hashes from `table`, keyed by
-/// version, together with the highest `collapsed_through` sentinel recorded on
-/// any of its committed rows.  Unlike [`fold_rows`], the pruning is left to the
-/// caller so this transaction's appended sentinel can be folded in first.
+/// version, together with the [`CollapseRange`] of every committed row.  Unlike
+/// [`fold_rows`], the pruning is left to the caller so this transaction's
+/// appended rows can be folded in first.
 ///
 /// Used by the incremental fold to rebuild a touched series' hash from its
 /// committed history plus this transaction's appended versions.
@@ -786,13 +786,13 @@ async fn read_series_committed(
     table: deltalake::DeltaTable,
     pond_id: &str,
     node_id: &str,
-) -> Result<(BTreeMap<i64, ObjectHash>, Option<i64>), StewardError> {
+) -> Result<(BTreeMap<i64, ObjectHash>, Vec<(i64, CollapseRange)>), StewardError> {
     let ctx = SessionContext::new();
     let _previous = ctx
         .register_table("series_live", Arc::new(table))
         .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
     let sql = format!(
-        "SELECT version, blake3, content, collapsed_through FROM series_live \
+        "SELECT version, blake3, content, collapsed_from, collapsed_through FROM series_live \
          WHERE pond_id = '{pond_id}' AND node_id = '{node_id}' ORDER BY version",
     );
     let batches = ctx
@@ -808,7 +808,15 @@ async fn read_series_committed(
             .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
         rows.extend(parsed);
     }
-    let collapsed = rows.iter().filter_map(|r| r.collapsed_through).max();
+    let ranges: Vec<(i64, CollapseRange)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.version,
+                CollapseRange::new(r.version, r.collapsed_from, r.collapsed_through),
+            )
+        })
+        .collect();
     let mut versions: BTreeMap<i64, ObjectHash> = BTreeMap::new();
     for row in rows {
         let _ = versions.insert(
@@ -816,16 +824,17 @@ async fn read_series_committed(
             row_blob_hash(&row.blake3, row.content.as_deref()),
         );
     }
-    Ok((versions, collapsed))
+    Ok((versions, ranges))
 }
 
 /// One committed series version row: its version and the fields
-/// [`row_blob_hash`] needs, plus the compaction sentinel.
+/// [`row_blob_hash`] needs, plus the collapse range columns.
 #[derive(serde::Deserialize)]
 struct SeriesVersionRow {
     version: i64,
     blake3: Option<String>,
     content: Option<Vec<u8>>,
+    collapsed_from: Option<i64>,
     collapsed_through: Option<i64>,
 }
 
@@ -1108,7 +1117,7 @@ async fn scan_live_rows(
 const NARROW_META_SQL: &str = "SELECT part_id, node_id, file_type, timestamp, version, \
      arrow_cast(NULL, 'Binary') AS content, blake3, size, min_event_time, max_event_time, \
      min_override, max_override, extended_attributes, factory, format, txn_seq, pond_id, \
-     arrow_cast(NULL, 'Binary') AS bao_outboard, collapsed_through \
+     arrow_cast(NULL, 'Binary') AS bao_outboard, collapsed_through, collapsed_from \
      FROM content_live ORDER BY pond_id, part_id, node_id, version";
 
 /// Content of exactly the structural rows the fold decodes -- those without a
@@ -1200,10 +1209,10 @@ fn fold_rows(
     // Latest-version facts per node, and per-version blobs for series.
     let mut latest: HashMap<NodeKey, NodeFacts> = HashMap::new();
     let mut series_versions: HashMap<NodeKey, BTreeMap<i64, VersionBlob>> = HashMap::new();
-    // Highest `collapsed_through` sentinel seen per series node.  A series
-    // compaction leaves the superseded per-version rows in the table beside a
-    // merged row carrying this sentinel; the versions are pruned after the scan.
-    let mut collapsed_through: HashMap<NodeKey, i64> = HashMap::new();
+    // Collapse range of every series row.  A compaction leaves the superseded
+    // per-version rows in the table beside a merged row covering them; the
+    // superseded versions are pruned after the scan.
+    let mut series_ranges: HashMap<NodeKey, Vec<(i64, CollapseRange)>> = HashMap::new();
 
     for row in rows {
         let key = (row.pond_id.clone(), row.node_id.to_string());
@@ -1220,10 +1229,10 @@ fn fold_rows(
                     content: row.content.clone(),
                 },
             );
-            if let Some(k) = row.collapsed_through {
-                let entry = collapsed_through.entry(key.clone()).or_insert(k);
-                *entry = (*entry).max(k);
-            }
+            series_ranges
+                .entry(key.clone())
+                .or_default()
+                .push((row.version, CollapseRange::of(&row)));
         }
 
         let _ = latest.insert(
@@ -1236,17 +1245,35 @@ fn fold_rows(
         );
     }
 
-    // Drop versions superseded by a compaction.  The live series read path skips
-    // every version at or below the highest `collapsed_through` sentinel (see
+    // Drop versions superseded by a compaction.  The live series read path keeps
+    // exactly the rows no *other* row's collapse range contains (see
+    // tlogfs::schema::live_series_entries, used by
     // OpLogPersistence::async_file_reader_series); the content fold must match it
-    // exactly, or a compacted series would fold in phantom superseded blobs and a
-    // pulled mirror would reconstruct duplicated data whose fold still equals the
-    // source's (both sides would fold the same dead rows).
-    for (key, k) in &collapsed_through {
-        if let Some(versions) = series_versions.get_mut(key) {
-            versions.retain(|version, _| *version > *k);
-        }
+    // exactly.  Folding in phantom superseded blobs makes a pulled mirror
+    // reconstruct duplicated data whose fold still equals the source's; dropping
+    // a live row is worse, because the mirror then never learns it needs that
+    // blob yet both sides still agree the trees match.
+    //
+    // The result is a *sequence in byte order*, not a version-keyed map: a
+    // merged run carries a fresh highest version while standing for content in
+    // the middle of the stream, so iterating by version would order the runs
+    // after the loose tail. That ordering is not cosmetic -- a destination
+    // reconstructs a pulled series by writing these blobs in order, and
+    // plan_series_versions compares them as a prefix to find the suffix it must
+    // append.
+    let mut series_live: HashMap<NodeKey, Vec<VersionBlob>> = HashMap::new();
+    for (key, versions) in &mut series_versions {
+        let ordered = match series_ranges.get(key) {
+            Some(ranges) => live_series_versions(ranges),
+            None => versions.keys().copied().collect(),
+        };
+        let blobs: Vec<VersionBlob> = ordered
+            .into_iter()
+            .filter_map(|version| versions.remove(&version))
+            .collect();
+        let _ = series_live.insert(key.clone(), blobs);
     }
+    let series_versions = series_live;
 
     let root_key = (local_pond_id.to_string(), ROOT_UUID.to_string());
     if !latest.contains_key(&root_key) {
@@ -1270,7 +1297,7 @@ fn fold_rows(
 
     let series_version_hashes = series_versions
         .into_iter()
-        .map(|(key, versions)| (key, versions.values().map(|v| v.hash).collect()))
+        .map(|(key, versions)| (key, versions.iter().map(|v| v.hash).collect()))
         .collect();
 
     Ok(ContentTreeIndex {
@@ -1301,7 +1328,7 @@ fn row_blob_hash(blake3: &Option<String>, content: Option<&[u8]>) -> ObjectHash 
 fn hash_directory(
     key: &NodeKey,
     latest: &HashMap<NodeKey, NodeFacts>,
-    series_versions: &HashMap<NodeKey, BTreeMap<i64, VersionBlob>>,
+    series_versions: &HashMap<NodeKey, Vec<VersionBlob>>,
     memo: &mut HashMap<NodeKey, ObjectHash>,
     in_progress: &mut Vec<NodeKey>,
     dirs: &mut HashMap<NodeKey, Vec<ChildRef>>,
@@ -1402,7 +1429,7 @@ fn hash_child(
     key: &NodeKey,
     entry_type: EntryType,
     latest: &HashMap<NodeKey, NodeFacts>,
-    series_versions: &HashMap<NodeKey, BTreeMap<i64, VersionBlob>>,
+    series_versions: &HashMap<NodeKey, Vec<VersionBlob>>,
     memo: &mut HashMap<NodeKey, ObjectHash>,
     in_progress: &mut Vec<NodeKey>,
     dirs: &mut HashMap<NodeKey, Vec<ChildRef>>,
@@ -1416,13 +1443,13 @@ fn hash_child(
             let versions = series_versions.get(key).ok_or_else(|| {
                 StewardError::DeltaLake(format!("missing series node {}/{}", key.0, key.1))
             })?;
-            let ordered: Vec<ObjectHash> = versions.values().map(|v| v.hash).collect();
+            let ordered: Vec<ObjectHash> = versions.iter().map(|v| v.hash).collect();
             let series = series_hash(&ordered);
             if let Some(sink) = sink {
                 // The series manifest object, plus each version blob: small
                 // versions inline, large (externalized) versions by hash (D7).
                 sink.put_inline(series, encode_series(&ordered));
-                for v in versions.values() {
+                for v in versions.iter() {
                     record_blob(sink, v.hash, v.content.as_deref());
                 }
             }
@@ -1507,6 +1534,111 @@ mod tests {
             .register_table("content_live", Arc::new(mem))
             .expect("register");
         ctx
+    }
+
+    /// The narrow scan projects an explicit column list, and serde_arrow fills a
+    /// missing `Option` field with `None` instead of failing. Adding a field to
+    /// `OplogEntry` without adding it here therefore fails *silently*, which is
+    /// how `collapsed_from` was first missed: every merged run then folded as
+    /// `[0, hi]` and superseded live rows it never covered.
+    #[test]
+    fn narrow_scan_projects_every_oplog_entry_field() {
+        use tlogfs::schema::ForArrow;
+        for field in OplogEntry::for_arrow() {
+            let name = field.name();
+            assert!(
+                NARROW_META_SQL.contains(name.as_str()),
+                "NARROW_META_SQL is missing OplogEntry field `{name}`; a field                  absent from the projection deserializes as None and corrupts                  the fold silently"
+            );
+        }
+    }
+
+    /// Corruption #4: the content fold must prune series versions by *range
+    /// containment*, never by the highest `collapsed_through` sentinel.
+    ///
+    /// Once collapse is tiered, a run created early carries a low version and a
+    /// low range, while a later merge of a *newer* window can have a
+    /// `collapsed_through` above that run's version number. The old rule --
+    /// "drop every version <= max(collapsed_through)" -- then discards a live
+    /// run holding the only copy of the versions it absorbed.
+    ///
+    /// The failure is silent in the worst way: both ponds in a pull apply the
+    /// same rule, so their tree hashes still agree and the guard reports
+    /// convergence, while the destination never learns it needs that blob.
+    #[test]
+    fn fold_prunes_series_by_range_not_by_max_watermark() {
+        use tinyfs::{DirectoryEntry, EntryType, FileID};
+        use tlogfs::schema::encode_directory_entries;
+
+        let pond = tinyfs::local_pond_uuid();
+        let dir_id = FileID::root_for(pond);
+        let series_id =
+            FileID::new_in_partition(dir_id.part_id(), EntryType::FilePhysicalSeries, pond);
+
+        // Run A absorbed versions 1..=10 and was allocated version 26.
+        // A later window, versions 21..=31, merged as version 36 -- so the
+        // highest sentinel (31) sits *above* run A's version number (26).
+        let series_row = |version: i64, from: Option<i64>, through: Option<i64>| {
+            let mut row = OplogEntry::new_small_file(
+                series_id,
+                version,
+                version,
+                format!("blob-for-version-{version}").into_bytes(),
+                1,
+            );
+            row.collapsed_from = from;
+            row.collapsed_through = through;
+            row
+        };
+        let run_a = series_row(26, Some(1), Some(10));
+        let loose_11 = series_row(11, None, None);
+        let run_b = series_row(36, Some(21), Some(31));
+        let loose_40 = series_row(40, None, None);
+        // A row run A genuinely covers: it must be pruned.
+        let superseded_5 = series_row(5, None, None);
+
+        let dir_content = encode_directory_entries(&[DirectoryEntry::new(
+            "series".to_string(),
+            series_id.node_id(),
+            EntryType::FilePhysicalSeries,
+            1,
+        )])
+        .expect("encode directory");
+        let dir_row = OplogEntry::new_inline(dir_id, 1, 1, dir_content, 1);
+
+        let rows = vec![
+            dir_row,
+            run_a.clone(),
+            loose_11.clone(),
+            run_b.clone(),
+            loose_40.clone(),
+            superseded_5.clone(),
+        ];
+        let index = fold_rows(rows, &pond.to_string(), None).expect("fold");
+
+        let key = (pond.to_string(), series_id.node_id().to_string());
+        let folded = index
+            .series_versions
+            .get(&key)
+            .expect("the series is folded into the tree");
+
+        let expect = |row: &OplogEntry| row_blob_hash(&row.blake3, row.content.as_deref());
+        assert_eq!(
+            folded,
+            &vec![
+                expect(&run_a),
+                expect(&loose_11),
+                expect(&run_b),
+                expect(&loose_40)
+            ],
+            "run A (version 26) is live -- no other row's range contains \
+             [1,10] -- and must be folded, in range order, ahead of the loose \
+             versions that follow it in the byte stream"
+        );
+        assert!(
+            !folded.contains(&expect(&superseded_5)),
+            "version 5 lies inside run A's range and must be pruned"
+        );
     }
 
     #[tokio::test]

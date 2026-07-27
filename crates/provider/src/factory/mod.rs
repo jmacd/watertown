@@ -8,6 +8,7 @@ pub mod dynamic_dir;
 pub mod journal_ingest;
 mod lazy_sql_file;
 pub mod logfile_ingest;
+pub mod materialize_series;
 pub mod sql_derived;
 pub mod synthetic_timeseries;
 pub mod temporal_reduce;
