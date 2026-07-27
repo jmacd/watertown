@@ -927,8 +927,19 @@ impl Ship {
     /// Content-preserving and therefore invisible to replication: steward's
     /// content fold already prunes superseded rows, so `root_tree_hash` is
     /// unchanged and mirrors -- which never received them -- stay converged.
-    /// The delete commit reuses the collapse transaction's sequence rather than
-    /// consuming a new one, since it introduces no new logical content.
+    /// `reclaim_superseded` asserts that rather than assuming it, and skips the
+    /// irreversible blob sweep if it does not hold.
+    ///
+    /// Consuming no sequence of its own is what makes reclamation a tail of the
+    /// collapse rather than a transaction: it introduces no new logical
+    /// content, so there is nothing for a mirror to receive.  Its delete
+    /// commits are therefore stamped as MAINTENANCE (`pond_maintenance`), not
+    /// as `pond_txn`.  Stamping them with the collapse's `txn_seq` would make
+    /// `reconstruct_txn_history` -- which yields one transaction per `pond_txn`
+    /// commit -- emit N+1 entries for that one sequence, so `pond rebuild`
+    /// would replay N+1 duplicate lifecycle records into the control table.
+    /// Seq recovery on open is unaffected: it takes the per-pond MAX over
+    /// `pond_txn` commits, and the collapse's own commit still carries it.
     async fn reclaim(
         &mut self,
         meta: &PondUserMetadata,
@@ -946,7 +957,8 @@ impl Ship {
         let (new_table, stats) = crate::reclaim::reclaim_superseded(
             self.data_persistence.table().clone(),
             &get_data_path(&self.pond_path),
-            txn_meta.to_delta_metadata(),
+            &pond_id.to_string(),
+            txn_meta.to_delta_maintenance_metadata(),
         )
         .await?;
         self.data_persistence.set_table(new_table);

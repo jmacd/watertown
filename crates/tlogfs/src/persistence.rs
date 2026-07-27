@@ -221,8 +221,19 @@ fn size_class(bytes: u64) -> u32 {
 /// absorb 10 KB of new data.
 ///
 /// `max_live` is a backstop for read cost. If no same-class group exists but the
-/// series has drifted past `max_live` segments, the oldest `COLLAPSE_FANOUT`
-/// rows are merged regardless of class so segment count stays bounded.
+/// series has drifted past `max_live` segments, `COLLAPSE_FANOUT` adjacent rows
+/// are merged regardless of class so segment count stays bounded.
+///
+/// The backstop merges the CHEAPEST such window, not the oldest. Taking the
+/// oldest looks natural but is the one choice that defeats tiering: after any
+/// previous collapse the oldest row IS the large accumulated run, so a backstop
+/// anchored at index 0 rewrites megabytes to absorb kilobytes -- precisely the
+/// `O(N^2)` behaviour size classes exist to prevent. It also fires more often
+/// than it appears to, because callers pass the same number as both the
+/// candidacy threshold (`HAVING COUNT(*) > threshold`) and `max_live`, so every
+/// candidate satisfies `live.len() > max_live` by construction. Choosing by
+/// total bytes bounds the segment count just as well while keeping write volume
+/// at the minimum any window could achieve.
 ///
 /// Returns a half-open index range into `live` (which must be ordered oldest
 /// content first).
@@ -248,9 +259,19 @@ fn choose_collapse_window(live: &[&OplogEntry], max_live: usize) -> Option<Range
         start = end;
     }
 
-    // Backstop: bound live segment count even when classes are ragged.
+    // Backstop: bound live segment count even when classes are ragged. Every
+    // window of this width reduces the segment count identically, so pick the
+    // one that rewrites the fewest bytes; ties resolve to the oldest.
     if live.len() > max_live {
-        return Some(0..COLLAPSE_FANOUT.min(live.len()));
+        let width = COLLAPSE_FANOUT.min(live.len());
+        let cost = |start: usize| -> u128 {
+            live[start..start + width]
+                .iter()
+                .map(|r| r.size.unwrap_or(0).max(0) as u128)
+                .sum()
+        };
+        let best = (0..=live.len() - width).min_by_key(|&start| cost(start))?;
+        return Some(best..best + width);
     }
 
     None
@@ -1267,7 +1288,7 @@ impl State {
         }
 
         // Assess current versions and pick the window to merge.
-        let (versions_before, window, temporal, inherited_bao, store_path, options) = {
+        let (versions_before, window, temporal, inherited_bao, newest_version, store_path, options) = {
             let mut inner = self.inner.lock().await;
             let records = inner.query_records(id).await?;
             let live: Vec<&OplogEntry> = crate::schema::live_series_entries(&records)
@@ -1303,12 +1324,14 @@ impl State {
             // after; recomputing it would be both wasteful and, for a run that
             // does not start at version 1, wrong.
             let inherited_bao = newest.bao_outboard.clone();
+            let newest_version = newest.version;
 
             (
                 live.len(),
                 window,
                 temporal,
                 inherited_bao,
+                newest_version,
                 inner.path.clone(),
                 inner.large_file_options.clone(),
             )
@@ -1361,11 +1384,29 @@ impl State {
         // unchanged; recomputing it as a fresh first version would be correct
         // only for a run starting at the very beginning of the series, and is
         // wrong for every later run.
-        let bao_outboard = match inherited_bao
-            .as_deref()
-            .and_then(|b| utilities::bao_outboard::SeriesOutboard::from_bytes(b).ok())
-        {
-            Some(mut inherited) => {
+        // "No outboard" and "unparseable outboard" are NOT the same case, and
+        // must not share a fallback: the fallback below is the FIRST-version
+        // baseline, which -- as the comment above states -- is correct only for
+        // a run starting at the beginning of the series.  Silently applying it
+        // to a run that merely failed to parse its predecessor's state would
+        // stamp a wrong baseline onto the merged run, which no later
+        // verification could attribute back to here.  A corrupt outboard is a
+        // hard error that aborts the collapse instead.
+        let bao_outboard = match inherited_bao.as_deref() {
+            Some(bytes) => {
+                let mut inherited = utilities::bao_outboard::SeriesOutboard::from_bytes(bytes)
+                    .map_err(|e| {
+                        TLogFSError::Internal(format!(
+                            "collapse: node {} version {} has an unreadable bao outboard \
+                             ({} bytes): {e}. The merged run must inherit that cumulative \
+                             state -- recomputing it as a first version would stamp a wrong \
+                             baseline -- so the collapse is aborted, leaving the series \
+                             uncollapsed and intact.",
+                            id,
+                            newest_version,
+                            bytes.len(),
+                        ))
+                    })?;
                 inherited.version_size = content_len as u64;
                 inherited.to_bytes()
             }
@@ -5118,5 +5159,112 @@ mod series_bounds_tests {
         // gate alone decides.
         assert!(series_version_retained(None, 6, &b));
         assert!(!series_version_retained(None, 5, &b));
+    }
+}
+
+#[cfg(test)]
+mod collapse_window_tests {
+    use super::{COLLAPSE_FANOUT, choose_collapse_window, size_class};
+    use crate::schema::OplogEntry;
+
+    /// A live row of the given byte size; only `size` affects window choice.
+    fn row(size: i64) -> OplogEntry {
+        let mut e = OplogEntry::new_small_file(
+            tinyfs::FileID::new_in_partition(
+                tinyfs::FileID::root_for(tinyfs::local_pond_uuid()).part_id(),
+                tinyfs::EntryType::FilePhysicalSeries,
+                tinyfs::local_pond_uuid(),
+            ),
+            0,
+            1,
+            Vec::new(),
+            0,
+        );
+        e.size = Some(size);
+        e
+    }
+
+    fn window(sizes: &[i64], max_live: usize) -> Option<std::ops::Range<usize>> {
+        let rows: Vec<OplogEntry> = sizes.iter().map(|s| row(*s)).collect();
+        let live: Vec<&OplogEntry> = rows.iter().collect();
+        choose_collapse_window(&live, max_live)
+    }
+
+    #[test]
+    fn fewer_than_two_live_rows_is_a_noop() {
+        assert_eq!(window(&[], 1), None);
+        assert_eq!(window(&[100], 1), None);
+    }
+
+    #[test]
+    fn size_classes_are_powers_of_the_fanout() {
+        assert_eq!(size_class(0), 0);
+        assert_eq!(size_class(COLLAPSE_FANOUT as u64 - 1), 0);
+        assert_eq!(size_class(COLLAPSE_FANOUT as u64), 1);
+        assert_eq!(size_class((COLLAPSE_FANOUT * COLLAPSE_FANOUT) as u64), 2);
+    }
+
+    /// The tiering rule: the oldest run of FANOUT same-class neighbours wins,
+    /// even when an older, larger run sits in front of it.
+    #[test]
+    fn prefers_the_oldest_same_class_group() {
+        // One big run, then ten small same-class rows.
+        let mut sizes = vec![1_000_000];
+        sizes.extend(std::iter::repeat_n(5, COLLAPSE_FANOUT));
+        assert_eq!(window(&sizes, usize::MAX), Some(1..1 + COLLAPSE_FANOUT));
+    }
+
+    /// Without a same-class group and within `max_live`, nothing is merged:
+    /// rewriting bytes to no purpose is worse than a few extra segments.
+    #[test]
+    fn ragged_classes_within_the_bound_are_left_alone() {
+        let sizes: Vec<i64> = (0..6).map(|i| 10i64.pow(i)).collect();
+        assert_eq!(window(&sizes, 100), None);
+    }
+
+    /// The backstop must NOT anchor at index 0.
+    ///
+    /// After any previous collapse the oldest row is the large accumulated run,
+    /// so merging from index 0 rewrites it to absorb a few small rows -- the
+    /// `O(N^2)` behaviour size classes exist to prevent. Callers pass the same
+    /// number as both the candidacy threshold and `max_live`, so this path is
+    /// reached far more often than "drifted past the bound" suggests.
+    #[test]
+    fn backstop_merges_the_cheapest_window_not_the_oldest() {
+        // A huge accumulated run, then rows whose classes are deliberately
+        // ragged so no same-class group of FANOUT exists.
+        let mut sizes = vec![100_000_000];
+        for i in 0..(COLLAPSE_FANOUT * 2) {
+            sizes.push(10i64.pow((i % 5) as u32 + 1));
+        }
+        let chosen = window(&sizes, 2).expect("backstop must fire past the bound");
+        assert_ne!(
+            chosen.start, 0,
+            "must not rewrite the large accumulated run"
+        );
+        assert_eq!(chosen.len(), COLLAPSE_FANOUT);
+
+        // And it really is the minimum-cost window.
+        let cheapest = (0..=sizes.len() - COLLAPSE_FANOUT)
+            .min_by_key(|&s| sizes[s..s + COLLAPSE_FANOUT].iter().sum::<i64>())
+            .unwrap();
+        assert_eq!(chosen.start, cheapest);
+    }
+
+    /// Ties resolve to the oldest window, so a uniform series still compacts
+    /// front to back rather than wandering.
+    #[test]
+    fn equal_cost_windows_resolve_to_the_oldest() {
+        let sizes: Vec<i64> = std::iter::repeat_n(7, COLLAPSE_FANOUT + 3).collect();
+        // All one class, so the same-class rule fires first -- also at 0.
+        assert_eq!(window(&sizes, 2), Some(0..COLLAPSE_FANOUT));
+    }
+
+    /// Fewer live rows than the fanout still collapses under the backstop,
+    /// merging everything available.
+    #[test]
+    fn backstop_handles_a_series_shorter_than_the_fanout() {
+        let sizes = vec![1, 1_000, 1_000_000];
+        assert_eq!(window(&sizes, 1), Some(0..3));
     }
 }

@@ -248,3 +248,53 @@ async fn reclamation_is_idempotent() {
     );
     assert_eq!(blobs_on_disk(&pond), settled, "blob set must be stable");
 }
+
+/// Collapse + reclaim must leave the pond fully readable and internally
+/// consistent: every appended byte still present, and no row naming a blob the
+/// sweep removed.
+///
+/// The Merkle-neutrality of reclamation itself is pinned separately, as a unit
+/// test in `steward::reclaim`, because it must bracket the deletes alone --
+/// collapse commits merged rows as an ordinary write and legitimately moves the
+/// content root, so it cannot be measured through `collapse_versions`.
+#[tokio::test]
+async fn collapse_and_reclaim_leave_a_consistent_pond() {
+    let tmp = tempdir().expect("tempdir");
+    let pond = tmp.path().join("pond");
+    let mut ship = Ship::create_pond(pond.clone(), "reclaim-consistent")
+        .await
+        .expect("create pond");
+
+    for i in 0..12 {
+        append_series_version(&mut ship, "/events.series", &chunk(i + 7, 96 * 1024)).await;
+    }
+    write_file(&mut ship, "/bystander.txt", b"untouched").await;
+
+    let report = ship.collapse_versions(1).await.expect("collapse");
+    assert!(report.files_collapsed > 0, "series should have collapsed");
+    assert!(
+        report.reclaimed.rows_deleted > 0,
+        "reclamation must have deleted superseded rows for this to prove anything"
+    );
+
+    let bytes = read_bytes(&mut ship, "/events.series").await;
+    assert_eq!(
+        bytes.len(),
+        12 * 96 * 1024,
+        "every appended byte must survive collapse + reclaim"
+    );
+    assert_eq!(
+        read_bytes(&mut ship, "/bystander.txt").await,
+        b"untouched",
+        "reclamation must not touch an unrelated file"
+    );
+
+    let fsck = steward::fsck(&ship, FsckOptions::default())
+        .await
+        .expect("fsck after reclaim");
+    assert!(
+        fsck.errors.is_empty(),
+        "fsck must find no dangling blob after the sweep: {:?}",
+        fsck.errors
+    );
+}

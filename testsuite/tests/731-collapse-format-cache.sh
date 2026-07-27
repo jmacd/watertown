@@ -96,7 +96,11 @@ DERIVED_AGAIN=$(pond cat --format table /derived-cpu 2>/dev/null | grep -c "2024
 check '[ "'"${DERIVED_AGAIN}"'" = "9" ]' \
     "a second collapse pass keeps the count at 9 (${DERIVED_AGAIN})"
 
+# Capture the status immediately: `check` evaluates its argument later, by
+# which point `$?` reflects check's own machinery, not fsck -- so an inline
+# `[ $? -eq 0 ]` is vacuously true and would pass even when fsck fails.
 pond fsck > /tmp/731-fsck.log 2>&1
-check '[ $? -eq 0 ]' "pond fsck passes after collapse"
+FSCK_RC=$?
+check '[ "'"${FSCK_RC}"'" -eq 0 ]' "pond fsck passes after collapse (rc=${FSCK_RC})"
 
 check_finish

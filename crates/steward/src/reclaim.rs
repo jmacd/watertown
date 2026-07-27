@@ -21,7 +21,13 @@
 //!
 //! Deleting superseded rows is Merkle-neutral: steward's content fold already
 //! prunes them, so a pond's `root_tree_hash` is unchanged by reclamation and
-//! mirrors -- which never received these rows -- stay converged.
+//! mirrors -- which never received these rows -- stay converged.  That claim is
+//! *checked*, not assumed: the content root is snapshotted before and after the
+//! deletes and asserted identical, and the check runs BEFORE the blob sweep.
+//! The ordering is the point -- deleted rows are still recoverable from Delta
+//! history or a mirror, but a swept blob is gone.  Verifying while recovery is
+//! still possible turns a silent, unrecoverable data loss into a loud, fixable
+//! one.
 //!
 //! Reclamation is deliberately *not* a separate command or flag.  It is what
 //! makes collapse actually free space, so it runs as part of the same
@@ -125,6 +131,7 @@ const PREDICATE_BUDGET: usize = 60_000;
 pub async fn reclaim_superseded(
     table: DeltaTable,
     pond_path: &Path,
+    local_pond_id: &str,
     app_metadata: HashMap<String, serde_json::Value>,
 ) -> Result<(DeltaTable, ReclaimStats), StewardError> {
     let mut stats = ReclaimStats::default();
@@ -132,7 +139,43 @@ pub async fn reclaim_superseded(
     let dead = find_superseded(&table).await?;
     let mut table = table;
     if !dead.is_empty() {
+        // Snapshot the content root BEFORE deleting.  Reclamation must be
+        // content-preserving; this is what turns that from a comment into a
+        // checked invariant.
+        let pre = crate::content_tree::compute_content_tree_for_table(table.clone(), local_pond_id)
+            .await
+            .map_err(|e| {
+                StewardError::ControlTable(format!("reclaim: pre-delete content snapshot: {e}"))
+            })?
+            .root_tree_hash;
+
         table = delete_rows(table, &dead, app_metadata, &mut stats).await?;
+
+        let post =
+            crate::content_tree::compute_content_tree_for_table(table.clone(), local_pond_id)
+                .await
+                .map_err(|e| {
+                    StewardError::ControlTable(format!(
+                        "reclaim: post-delete content snapshot: {e}"
+                    ))
+                })?
+                .root_tree_hash;
+
+        // Return BEFORE sweeping.  A wrong delete has removed rows that Delta
+        // history still holds and that a mirror can restore; sweeping their
+        // blobs is what would make the loss permanent.
+        if pre != post {
+            return Err(StewardError::ControlTable(format!(
+                "reclaim altered content root: pre={} post={} -- {} superseded row(s) were \
+                 deleted that a reader could still see, so supersession was computed wrong. \
+                 The `_large_files` sweep was SKIPPED, so no content is lost yet: recover the \
+                 rows from the data table's Delta history or re-pull from a mirror before \
+                 running maintain again.",
+                pre.to_hex(),
+                post.to_hex(),
+                stats.rows_deleted,
+            )));
+        }
     }
 
     // Only now that the rows are gone can their blobs be unreferenced.
@@ -279,4 +322,125 @@ async fn flush_delete(
 async fn referenced_hashes(table: &DeltaTable) -> Result<HashSet<String>, StewardError> {
     let rows: Vec<ReferencedHash> = query_rows(table, REFERENCED_SQL).await?;
     Ok(rows.into_iter().filter_map(|r| r.blake3).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Ship, get_data_path};
+    use tempfile::tempdir;
+    use tlogfs::{PondTxnMetadata, PondUserMetadata};
+    use tokio::io::AsyncWriteExt;
+
+    /// Deleting superseded rows must not move the pond's `root_tree_hash`.
+    ///
+    /// This is the assumption reclamation rests on: mirrors never received the
+    /// superseded rows, so a pond that deletes them must still fold to the same
+    /// content root, or replication silently diverges.  It is also what makes
+    /// the deletes safe -- if supersession were computed wrong, reclamation
+    /// would remove rows a reader can still see and then sweep their blobs.
+    ///
+    /// The check must bracket the DELETES ALONE.  It cannot be observed through
+    /// `Ship::collapse_versions`, because collapse commits its merged rows as an
+    /// ordinary write and legitimately does move the content root; so this test
+    /// collapses and reclaims as separate steps, exactly as `Ship::reclaim`
+    /// brackets them internally.
+    #[tokio::test]
+    async fn deleting_superseded_rows_preserves_the_content_root() {
+        let tmp = tempdir().expect("tempdir");
+        let pond = tmp.path().join("pond");
+        let mut ship = Ship::create_pond(pond.clone(), "reclaim-merkle")
+            .await
+            .expect("create pond");
+
+        let meta = PondUserMetadata::new(vec!["test".into(), "reclaim-merkle".into()]);
+        for i in 0..12u64 {
+            let bytes = filler(i);
+            ship.write_transaction(&meta, async move |fs| {
+                let root = fs.root().await?;
+                let mut w = root
+                    .async_writer_path_with_type(
+                        "/events.series",
+                        tinyfs::EntryType::FilePhysicalSeries,
+                    )
+                    .await?;
+                w.write_all(&bytes)
+                    .await
+                    .map_err(|e| crate::StewardError::Aborted(format!("write: {e}")))?;
+                w.shutdown()
+                    .await
+                    .map_err(|e| crate::StewardError::Aborted(format!("close: {e}")))?;
+                Ok(())
+            })
+            .await
+            .expect("append version");
+        }
+
+        // Collapse ONLY -- no reclaim.  The pond now carries superseded rows,
+        // which is precisely the state reclamation acts on.
+        let tx = ship.begin_write(&meta).await.expect("begin write");
+        {
+            let state = tx.state().expect("state");
+            let candidates = state
+                .list_collapsible_series(1)
+                .await
+                .expect("list collapsible");
+            assert!(!candidates.is_empty(), "series should be collapsible");
+            for id in candidates {
+                let stats = state.collapse_file_series(id, 1).await.expect("collapse");
+                assert!(stats.collapsed, "collapse should have merged a window");
+            }
+        }
+        let _ = tx.commit().await.expect("commit collapse");
+
+        let pond_id = ship.control_table().pond_id_uuid().to_string();
+        let table = ship.data_persistence().table().clone();
+
+        let before = crate::content_tree::compute_content_tree_for_table(table.clone(), &pond_id)
+            .await
+            .expect("content root before reclaim")
+            .root_tree_hash;
+
+        let mut txn_meta = PondTxnMetadata::new(ship.last_write_seq(), meta.clone());
+        txn_meta.pond_id = pond_id.clone();
+        let (new_table, stats) = super::reclaim_superseded(
+            table,
+            &get_data_path(&pond),
+            &pond_id,
+            txn_meta.to_delta_maintenance_metadata(),
+        )
+        .await
+        .expect("reclaim must not trip its own content invariant");
+
+        assert!(
+            stats.rows_deleted > 0,
+            "the collapse must have left superseded rows for this to prove anything"
+        );
+
+        let after = crate::content_tree::compute_content_tree_for_table(new_table, &pond_id)
+            .await
+            .expect("content root after reclaim")
+            .root_tree_hash;
+
+        assert_eq!(
+            before.to_hex(),
+            after.to_hex(),
+            "deleting {} superseded row(s) moved the content root; a mirror that never \
+             received them would now diverge",
+            stats.rows_deleted,
+        );
+    }
+
+    /// Distinct, incompressible bytes per version, so each lands as its own
+    /// `_large_files` blob instead of deduplicating or inlining.
+    pub(super) fn filler(seed: u64) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..96 * 1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect()
+    }
 }

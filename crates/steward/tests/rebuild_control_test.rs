@@ -257,3 +257,79 @@ async fn rebuild_control_preserves_content_roots() -> Result<()> {
 
     Ok(())
 }
+
+/// Reclamation's delete commits must not be replayed as transactions.
+///
+/// `reclaim` runs as the tail of a collapse and deliberately consumes no
+/// sequence of its own.  Its deletes are chunked, so stamping them with the
+/// collapse's `txn_seq` under the `pond_txn` key would make
+/// `reconstruct_txn_history` -- which yields one transaction per `pond_txn`
+/// commit -- emit several entries for that single sequence, and rebuild would
+/// replay a duplicate lifecycle record for each.  Maintenance commits are
+/// stamped under `pond_maintenance` instead, so they stay attributable on disk
+/// while being invisible to transaction reconstruction.
+#[tokio::test]
+async fn rebuild_after_collapse_reclaim_replays_one_txn_per_seq() -> Result<()> {
+    let temp = tempdir()?;
+    let pond_path = temp.path().join("pond");
+
+    let (orig_last_seq, reclaimed_rows) = {
+        let mut ship = Ship::create_pond(&pond_path, "reclaim-rebuild").await?;
+
+        // Enough versions of a collapsible series that a collapse has real
+        // work, and reclaim has real rows to delete.
+        for i in 0..12u64 {
+            let meta = PondUserMetadata::new(vec!["test".into(), format!("append{i}")]);
+            let bytes = vec![b'a'.wrapping_add((i % 26) as u8); 4096];
+            ship.write_transaction(&meta, async move |fs| {
+                let root = fs.root().await?;
+                let mut w = root
+                    .async_writer_path_with_type("/events.series", EntryType::FilePhysicalSeries)
+                    .await?;
+                w.write_all(&bytes)
+                    .await
+                    .map_err(|e| steward::StewardError::Aborted(format!("write: {}", e)))?;
+                w.shutdown()
+                    .await
+                    .map_err(|e| steward::StewardError::Aborted(format!("close: {}", e)))?;
+                Ok(())
+            })
+            .await?;
+        }
+
+        let report = ship.collapse_versions(1).await?;
+        assert!(report.files_collapsed > 0, "series should have collapsed");
+        assert!(
+            report.reclaimed.rows_deleted > 0,
+            "collapse must have superseded rows to reclaim"
+        );
+        (ship.last_write_seq(), report.reclaimed.rows_deleted)
+    };
+
+    std::fs::remove_dir_all(get_control_path(&pond_path))?;
+    let report = rebuild_control_table(&pond_path, false).await?;
+
+    assert_eq!(
+        report.last_txn_seq, orig_last_seq,
+        "reclaim consumes no sequence, so the recovered frontier is the collapse's"
+    );
+    assert_eq!(
+        report.txns_reconstructed as i64, orig_last_seq,
+        "exactly one reconstructed txn per committed seq: reclaim deleted {reclaimed_rows} \
+         row(s) across its own Delta commits, and none of them may appear as a transaction"
+    );
+
+    // The rebuilt control table must agree, and the pond must still open.
+    let mut ship = Ship::open_pond(&pond_path).await?;
+    assert_eq!(ship.last_write_seq(), orig_last_seq);
+    assert_eq!(
+        ship.control_table().get_last_write_sequence().await?,
+        orig_last_seq
+    );
+
+    // And a further write continues from the recovered frontier.
+    write_file(&mut ship, "/after.txt", b"ok", vec!["copy", "after"]).await?;
+    assert_eq!(ship.last_write_seq(), orig_last_seq + 1);
+
+    Ok(())
+}
