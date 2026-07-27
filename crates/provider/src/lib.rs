@@ -21,6 +21,7 @@ mod table_provider_options;
 mod tinyfs_object_store;
 mod tinyfs_path;
 mod url_pattern_matcher;
+pub mod version_cache;
 mod version_selection;
 
 pub use error::{Error, Result};

@@ -36,7 +36,6 @@ use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
-use datafusion::execution::context::SessionContext;
 use datafusion::parquet::basic::Compression;
 use datafusion::parquet::file::properties::WriterProperties;
 use futures::StreamExt;
@@ -47,7 +46,6 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use tinyfs::FileVersionInfo;
 
 /// Result type for rollup cache operations.
 type Result<T> = std::result::Result<T, crate::error::Error>;
@@ -82,44 +80,13 @@ pub fn cache_node_dir(cache_dir: &Path, cfg_hash: &str, node_id: &tinyfs::NodeID
     cache_dir.join(format!("rollup_{}_{}", cfg_hash, node_id))
 }
 
-/// Cache key for an input version: its blake3 content hash, or -- for dynamic
-/// inputs that carry no blake3 -- the node's short id (already content derived).
-///
-/// Mirrors [`crate::format_cache::cache_version_path`] keying exactly.
-fn version_key(node_id: &tinyfs::NodeID, version: &FileVersionInfo) -> String {
-    match version.blake3.as_deref() {
-        Some(hash) => hash.to_string(),
-        None => node_id.to_short_string(),
-    }
-}
-
-/// Build a `ListingTable` over every `.parquet` partials file directly under
-/// `dir`, merging their schemas (UNION-ALL-BY-NAME across versions/sources).
-pub async fn listing_table_from_dir(
-    dir: &Path,
-    _ctx: &SessionContext,
-) -> Result<Arc<dyn TableProvider>> {
-    let dir_url = format!("file://{}/", dir.display());
-
-    let table_url = ListingTableUrl::parse(&dir_url)?;
-    let listing_options =
-        ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
-
-    let merged_schema = merge_parquet_schemas_in_dir(dir).await?;
-
-    let config = ListingTableConfig::new(table_url)
-        .with_listing_options(listing_options)
-        .with_schema(merged_schema);
-
-    let table = ListingTable::try_new(config)?;
-    Ok(Arc::new(table))
-}
-
-// A `ListingTable` reads all partials in the glob dir together. There is one
-// partial file per (source node, input version). The source pattern can match
-// many rotated input files, each its own node with its own versions; keying the
-// partial filename by the source node id keeps them collision-free while all
-// partials still merge in a single `ListingTable`.
+// A rollup glob dir is a `SidecarNaming::NodeScoped` [`crate::version_cache::SidecarDir`]:
+// one partial file per (source node, input version). The source pattern can
+// match many rotated input files, each its own node with its own versions, so
+// the directory is shared and reconciliation there must be node scoped. The
+// naming, writing, reconciling and reading of those partials lives in
+// `version_cache`; this module keeps only what is genuinely rollup specific
+// (the sequentiality frontier, sealed runs, and namespace drops).
 
 /// Directory holding all per-source-version partials for one temporal-reduce
 /// node and config namespace: `{cache_dir}/rollup_{cfg_hash}_{tr_node_id}/`.
@@ -128,73 +95,26 @@ pub fn glob_dir(cache_dir: &Path, cfg_hash: &str, tr_node_id: &tinyfs::NodeID) -
     cache_node_dir(cache_dir, cfg_hash, tr_node_id)
 }
 
-/// Path for one source node's input version partial within the glob dir:
-/// `{glob_dir}/{source_node}_v{version}_{key}.parquet`.
+/// Wrap an already-resolved partials directory path as a sidecar dir.
 #[must_use]
-pub fn glob_member_path(
-    glob_dir: &Path,
-    source_node_id: &tinyfs::NodeID,
-    version: &FileVersionInfo,
-) -> PathBuf {
-    let key = version_key(source_node_id, version);
-    glob_dir.join(format!(
-        "{}_v{}_{}.parquet",
-        source_node_id, version.version, key
-    ))
+pub fn partials_dir_at(glob_dir: &Path) -> crate::version_cache::SidecarDir {
+    crate::version_cache::SidecarDir::new(
+        glob_dir.to_path_buf(),
+        crate::version_cache::SidecarNaming::NodeScoped,
+    )
 }
 
-/// Return the subset of a source node's versions whose partials are not yet
-/// present in the glob dir.
+/// The partials directory of one temporal-reduce node, as a sidecar dir.
 #[must_use]
-pub fn find_uncached_members(
-    glob_dir: &Path,
-    source_node_id: &tinyfs::NodeID,
-    versions: &[FileVersionInfo],
-) -> Vec<FileVersionInfo> {
-    versions
-        .iter()
-        .filter(|v| !glob_member_path(glob_dir, source_node_id, v).exists())
-        .cloned()
-        .collect()
-}
-
-/// Write one source-version partials stream into the glob dir (atomic).
-pub async fn write_glob_member(
-    glob_dir: &Path,
-    source_node_id: &tinyfs::NodeID,
-    version: &FileVersionInfo,
-    schema: SchemaRef,
-    stream: Pin<
-        Box<dyn Stream<Item = std::result::Result<RecordBatch, crate::error::Error>> + Send>,
-    >,
-) -> Result<PathBuf> {
-    tokio::fs::create_dir_all(glob_dir).await?;
-    let final_path = glob_member_path(glob_dir, source_node_id, version);
-    let tmp_path = final_path.with_extension("parquet.tmp");
-
-    let file = tokio::fs::File::create(&tmp_path).await?;
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(parquet::basic::ZstdLevel::default()))
-        .build();
-    let mut writer = AsyncArrowWriter::try_new(file, schema, Some(props))
-        .map_err(|e| crate::error::Error::Arrow(e.to_string()))?;
-
-    let mut stream = stream;
-    while let Some(batch) = stream.next().await {
-        let batch = batch?;
-        writer
-            .write(&batch)
-            .await
-            .map_err(|e| crate::error::Error::Arrow(e.to_string()))?;
-    }
-    let _metadata = writer
-        .close()
-        .await
-        .map_err(|e| crate::error::Error::Arrow(e.to_string()))?;
-
-    tokio::fs::rename(&tmp_path, &final_path).await?;
-    log::debug!("[SAVE] Rollup cache: wrote {}", final_path.display());
-    Ok(final_path)
+pub fn partials_dir(
+    cache_dir: &Path,
+    cfg_hash: &str,
+    tr_node_id: &tinyfs::NodeID,
+) -> crate::version_cache::SidecarDir {
+    crate::version_cache::SidecarDir::new(
+        glob_dir(cache_dir, cfg_hash, tr_node_id),
+        crate::version_cache::SidecarNaming::NodeScoped,
+    )
 }
 
 /// Drop a node's entire rollup-cache namespace for one config, forcing all
@@ -340,44 +260,6 @@ pub fn list_glob_members(glob_dir: &Path) -> Result<Vec<PathBuf>> {
     }
     out.sort();
     Ok(out)
-}
-
-/// via `Schema::try_merge`, giving UNION-ALL-BY-NAME semantics across versions.
-async fn merge_parquet_schemas_in_dir(dir: &Path) -> Result<SchemaRef> {
-    use arrow::datatypes::Schema;
-
-    let mut schemas = Vec::new();
-    let mut entries = tokio::fs::read_dir(dir).await?;
-
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "parquet") {
-            let file = tokio::fs::File::open(&path).await?;
-            let reader = parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(file)
-                .await
-                .map_err(|e| {
-                    crate::error::Error::Arrow(format!(
-                        "Failed to read parquet metadata from '{}': {}",
-                        path.display(),
-                        e
-                    ))
-                })?;
-            schemas.push(reader.schema().as_ref().clone());
-        }
-    }
-
-    if schemas.is_empty() {
-        return Err(crate::error::Error::Arrow(format!(
-            "No parquet files found in rollup cache dir '{}'",
-            dir.display()
-        )));
-    }
-
-    let merged = Schema::try_merge(schemas).map_err(|e| {
-        crate::error::Error::Arrow(format!("Failed to merge rollup partial schemas: {}", e))
-    })?;
-
-    Ok(Arc::new(merged))
 }
 
 // --- Sealed-runs merged cache (Phase 2: watermark + immutable runs) ----------
@@ -610,7 +492,7 @@ pub async fn listing_table_for_res_dir(
         .with_file_sort_order(vec![vec![
             datafusion::prelude::col(ts_column).sort(true, false),
         ]]);
-    let merged_schema = merge_parquet_schemas_in_dir(res_dir).await?;
+    let merged_schema = crate::version_cache::merge_parquet_schemas_in_dir(res_dir).await?;
     let config = ListingTableConfig::new(table_url)
         .with_listing_options(listing_options)
         .with_schema(merged_schema);
@@ -623,7 +505,9 @@ mod tests {
     use super::*;
     use arrow::array::{Float64Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::execution::context::SessionContext;
     use std::sync::Arc;
+    use tinyfs::FileVersionInfo;
 
     fn partials_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -685,50 +569,17 @@ mod tests {
         assert!(dir_str.contains(&node_id.to_string()));
     }
 
-    #[test]
-    fn test_glob_member_path_keys_by_blake3() {
-        let node_id = test_node_id();
-        let version = test_version(3, Some("abc123"));
-        let path = glob_member_path(Path::new("/tmp/pond/cache/rollup_cfg_x"), &node_id, &version);
-        let filename = path.file_name().unwrap().to_str().unwrap();
-        assert_eq!(filename, format!("{}_v3_abc123.parquet", node_id));
-    }
-
-    #[test]
-    fn test_glob_member_path_dynamic_uses_node_id() {
-        let node_id = test_node_id();
-        let version = test_version(1, None);
-        let path = glob_member_path(Path::new("/tmp/pond/cache/rollup_cfg_x"), &node_id, &version);
-        let filename = path.file_name().unwrap().to_str().unwrap();
-        assert!(filename.contains("_v1_"));
-        assert!(filename.contains(&node_id.to_short_string()));
-    }
-
-    #[test]
-    fn test_find_uncached_members() {
-        let tmp = tempfile::tempdir().unwrap();
-        let node_id = test_node_id();
-        let gdir = glob_dir(tmp.path(), "cfg", &node_id);
-        let versions = vec![test_version(1, Some("aaa")), test_version(2, Some("bbb"))];
-
-        // Nothing cached yet.
-        assert_eq!(find_uncached_members(&gdir, &node_id, &versions).len(), 2);
-
-        // Pre-create v1's partial file.
-        let v1 = glob_member_path(&gdir, &node_id, &versions[0]);
-        std::fs::create_dir_all(v1.parent().unwrap()).unwrap();
-        std::fs::write(&v1, b"fake").unwrap();
-
-        let uncached = find_uncached_members(&gdir, &node_id, &versions);
-        assert_eq!(uncached.len(), 1);
-        assert_eq!(uncached[0].version, 2);
-    }
-
+    /// Partials of several input versions merge to exactly the single-pass
+    /// GROUP BY result, including a bucket straddling two versions -- and,
+    /// after a version collapse, the superseded versions' partials are gone
+    /// rather than summed a second time.
     #[tokio::test]
     async fn test_write_and_list_partials_merge() {
+        use crate::version_cache::LiveVersions;
+
         let tmp = tempfile::tempdir().unwrap();
         let node_id = test_node_id();
-        let gdir = glob_dir(tmp.path(), "cfg", &node_id);
+        let dir = partials_dir(tmp.path(), "cfg", &node_id);
         let schema = partials_schema();
 
         // Version 1: bucket 0 sum=10 count=2 ; bucket 1 sum=5 count=1
@@ -737,7 +588,8 @@ mod tests {
         let s1: Pin<
             Box<dyn Stream<Item = std::result::Result<RecordBatch, crate::error::Error>> + Send>,
         > = Box::pin(futures::stream::iter(vec![Ok(b1)]));
-        _ = write_glob_member(&gdir, &node_id, &v1, schema.clone(), s1)
+        _ = dir
+            .write_sidecar(&node_id, &v1, schema.clone(), s1)
             .await
             .unwrap();
 
@@ -747,19 +599,47 @@ mod tests {
         let s2: Pin<
             Box<dyn Stream<Item = std::result::Result<RecordBatch, crate::error::Error>> + Send>,
         > = Box::pin(futures::stream::iter(vec![Ok(b2)]));
-        _ = write_glob_member(&gdir, &node_id, &v2, schema.clone(), s2)
+        _ = dir
+            .write_sidecar(&node_id, &v2, schema.clone(), s2)
             .await
             .unwrap();
 
-        // Incrementality: both versions now cached.
-        assert_eq!(
-            find_uncached_members(&gdir, &node_id, &[v1.clone(), v2.clone()]).len(),
-            0
-        );
+        // Incrementality: both versions now cached, nothing stale.
+        let live = LiveVersions::from_persistence(node_id, vec![v1.clone(), v2.clone()]);
+        let reconciled = dir.reconcile(&live).unwrap();
+        assert!(reconciled.missing.is_empty());
+        assert!(reconciled.removed.is_empty());
 
-        // Merge the partials and verify the boundary bucket reconstructs exactly.
+        let merged = merge_partials(&dir.cached_set(&live, |_| true)).await;
+        assert_eq!(merged, vec![(0, 10.0, 2), (1, 12.0, 2), (2, 4.0, 1)]);
+
+        // Now collapse v1+v2 into a single live v3 covering the same rows. The
+        // superseded partials must be removed, not merged on top of v3's --
+        // that addition is the double-count pinned by testsuite 733.
+        let v3 = test_version(3, Some("v3hash"));
+        let live = LiveVersions::from_persistence(node_id, vec![v3.clone()]);
+        let reconciled = dir.reconcile(&live).unwrap();
+        assert_eq!(reconciled.removed.len(), 2);
+        assert_eq!(reconciled.missing.len(), 1);
+
+        let b3 = partials_batch(&schema, &[0, 1, 2], &[10.0, 12.0, 4.0], &[2, 2, 1]);
+        let s3: Pin<
+            Box<dyn Stream<Item = std::result::Result<RecordBatch, crate::error::Error>> + Send>,
+        > = Box::pin(futures::stream::iter(vec![Ok(b3)]));
+        _ = dir
+            .write_sidecar(&node_id, &v3, schema.clone(), s3)
+            .await
+            .unwrap();
+
+        let merged = merge_partials(&dir.cached_set(&live, |_| true)).await;
+        assert_eq!(merged, vec![(0, 10.0, 2), (1, 12.0, 2), (2, 4.0, 1)]);
+    }
+
+    /// Fold a cached set the way the read path does, returning
+    /// `(time_bucket, sum, count)` rows.
+    async fn merge_partials(set: &crate::version_cache::CachedSet) -> Vec<(i64, f64, i64)> {
         let ctx = SessionContext::new();
-        let table = listing_table_from_dir(&gdir, &ctx).await.unwrap();
+        let table = set.table_provider().await.unwrap();
         _ = ctx.register_table("partials", table).unwrap();
         let df = ctx
             .sql(
@@ -770,7 +650,6 @@ mod tests {
             .unwrap();
         let batches = df.collect().await.unwrap();
         let merged = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
-
         let bucket = merged
             .column(0)
             .as_any()
@@ -786,15 +665,9 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-
-        assert_eq!(bucket.values(), &[0, 1, 2]);
-        // Bucket 1 straddles both versions: sum 5+7=12, count 1+1=2.
-        assert_eq!(s.value(0), 10.0);
-        assert_eq!(s.value(1), 12.0);
-        assert_eq!(s.value(2), 4.0);
-        assert_eq!(c.value(0), 2);
-        assert_eq!(c.value(1), 2);
-        assert_eq!(c.value(2), 1);
+        (0..merged.num_rows())
+            .map(|i| (bucket.value(i), s.value(i), c.value(i)))
+            .collect()
     }
 
     #[tokio::test]
@@ -808,15 +681,10 @@ mod tests {
         let s1: Pin<
             Box<dyn Stream<Item = std::result::Result<RecordBatch, crate::error::Error>> + Send>,
         > = Box::pin(futures::stream::iter(vec![Ok(b1)]));
-        _ = write_glob_member(
-            &glob_dir(cache_dir, "cfg", &node_id),
-            &node_id,
-            &v1,
-            schema.clone(),
-            s1,
-        )
-        .await
-        .unwrap();
+        _ = partials_dir(cache_dir, "cfg", &node_id)
+            .write_sidecar(&node_id, &v1, schema.clone(), s1)
+            .await
+            .unwrap();
         assert!(cache_node_dir(cache_dir, "cfg", &node_id).exists());
         drop_node_namespace(cache_dir, "cfg", &node_id).unwrap();
         assert!(!cache_node_dir(cache_dir, "cfg", &node_id).exists());
