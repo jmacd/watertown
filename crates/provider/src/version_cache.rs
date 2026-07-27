@@ -244,12 +244,28 @@ impl SidecarDir {
     /// source version. Doing it here rather than leaving it to a separate
     /// sweep is the point: a cache that only adds silently accumulates the
     /// superseded sidecars that produce double-counted reads.
+    ///
+    /// Reconciliation runs on the read path, and reads do not take the pond's
+    /// write lock, so two readers can reconcile the same shared directory at
+    /// once. A stale sidecar already removed by the other one satisfies this
+    /// one's post-condition, so `NotFound` is success, not failure -- the same
+    /// tolerance the write path gets from its tmp-file-and-rename.
     pub fn reconcile(&self, live: &LiveVersions) -> Result<Reconciliation> {
         let mut removed = Vec::new();
         for path in self.stale(live)? {
-            std::fs::remove_file(&path).map_err(crate::error::Error::Io)?;
-            log::debug!("[SWEEP] sidecar cache: removed stale {}", path.display());
-            removed.push(path);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    log::debug!("[SWEEP] sidecar cache: removed stale {}", path.display());
+                    removed.push(path);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    log::debug!(
+                        "[SWEEP] sidecar cache: stale {} already removed concurrently",
+                        path.display()
+                    );
+                }
+                Err(e) => return Err(crate::error::Error::Io(e)),
+            }
         }
         Ok(Reconciliation {
             missing: self.missing(live),
@@ -577,6 +593,33 @@ mod tests {
         assert!(rec.removed.is_empty());
         assert!(tmp_file.exists(), "in-flight writes are not garbage");
         assert!(frontier.exists(), "sidecar sweep must not eat bookkeeping");
+    }
+
+    #[test]
+    fn reconcile_tolerates_a_concurrently_removed_stale_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = SidecarDir::new(tmp.path().to_path_buf(), SidecarNaming::NodeOwned);
+        let n = node(1);
+        let live = LiveVersions::from_persistence(n, vec![version(1, Some("aaa"))]);
+        touch(&dir.sidecar_path(&n, &live.as_slice()[0]));
+
+        // A superseded sidecar that another reader deletes after we listed it
+        // but before we unlink it. Reads take no write lock, so this race is
+        // reachable by two concurrent reads of the same collapsed node.
+        let doomed = dir.sidecar_path(&n, &version(9, Some("dead")));
+        touch(&doomed);
+        let stale = dir.stale(&live).unwrap();
+        assert_eq!(stale, vec![doomed.clone()]);
+        std::fs::remove_file(&doomed).unwrap();
+
+        let rec = dir
+            .reconcile(&live)
+            .expect("losing the delete race is not an error");
+        assert!(
+            rec.removed.is_empty(),
+            "we did not remove it; the other did"
+        );
+        assert!(!doomed.exists());
     }
 
     #[test]

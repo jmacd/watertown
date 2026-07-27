@@ -1131,6 +1131,102 @@ async fn test_temporal_bounds_on_file_series() -> Result<(), Box<dyn std::error:
         // Don't commit this read-only transaction
     }
 
+    // Transaction 6: keep appending after the bounds were set, so the series
+    // has enough versions to be collapsible and the override row is no longer
+    // the highest version.  The new points sit OUTSIDE [10s, 20s], so if the
+    // bounds ever stop applying the count jumps above 10.
+    debug!("Appending further out-of-bounds versions after the temporal bounds...");
+    for (i, t) in [100_i64, 200, 300, 400].into_iter().enumerate() {
+        let tx = persistence.begin_test().await?;
+        let wd = tx.root().await?;
+
+        use arrow_array::{Float64Array, RecordBatch, StringArray, TimestampSecondArray};
+        use arrow_schema::{DataType, Field, Schema, TimeUnit};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Second, Some("+00:00".into())),
+                false,
+            ),
+            Field::new("value", DataType::Float64, false),
+            Field::new("sensor_id", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampSecondArray::from(vec![Some(t)]).with_timezone("+00:00")),
+                Arc::new(Float64Array::from(vec![900.0_f64 + i as f64])),
+                Arc::new(StringArray::from(vec!["sensor_001"])),
+            ],
+        )?;
+        _ = wd
+            .write_series_from_batch(series_path, &batch, Some("timestamp"))
+            .await?;
+        tx.commit_test().await?;
+    }
+
+    // Transaction 7: Collapse the series, then re-query.  The bounds must
+    // survive.
+    //
+    // Regression: a collapse output takes a fresh HIGHEST version while
+    // standing for content mid-stream, and merged rows never carry temporal
+    // overrides.  Resolving the override by `max_by_key(version)` therefore
+    // picked the merged run, found no override, and the caller fell back to
+    // (i64::MIN, i64::MAX) -- silently re-admitting the T=1s and T=50s rows
+    // that `set-temporal-bounds` exists to exclude, plus the new ones above.
+    debug!("Collapsing the series and re-checking temporal bounds...");
+    {
+        let tx = persistence.begin_test().await?;
+        {
+            let state = tx.state()?;
+            let candidates = state.list_collapsible_series(2).await?;
+            assert!(
+                !candidates.is_empty(),
+                "series should be collapsible after the appends above"
+            );
+            for id in candidates {
+                let stats = state.collapse_table_series(id, 2).await?;
+                assert!(stats.collapsed, "collapse should have merged a window");
+            }
+        }
+        tx.commit_test().await?;
+    }
+
+    {
+        let tx = persistence.begin_test().await?;
+        let wd = tx.root().await?;
+
+        let mut result_stream = execute_sql_on_file(
+            &wd,
+            series_path,
+            "SELECT COUNT(*) as row_count FROM source",
+            &tx.state()?.as_provider_context(),
+        )
+        .await?;
+
+        let mut total_count = 0_i64;
+        while let Some(batch_result) = result_stream.next().await {
+            let batch = batch_result?;
+            if batch.num_rows() > 0 {
+                let count_array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .expect("COUNT(*) should return Int64Array");
+                total_count = count_array.value(0);
+            }
+        }
+
+        debug!("Count after collapse: {}", total_count);
+        assert_eq!(
+            total_count, 10,
+            "temporal bounds must survive a collapse; got {total_count} rows, which means \
+             the override was not found and filtering silently reverted to unbounded"
+        );
+    }
+
     debug!("SUCCESS: Temporal bounds test completed");
     debug!(
         "  - Created file series with data points at T=1,10,11,12,13,14,15,16,17,18,19,50 seconds"

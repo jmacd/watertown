@@ -80,7 +80,7 @@ impl std::fmt::Display for ReclaimStats {
 
 /// The projection reclamation needs: enough to evaluate supersession, and the
 /// identity columns needed to name a row in a delete predicate.
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 struct SeriesRow {
     pond_id: String,
     part_id: String,
@@ -90,15 +90,29 @@ struct SeriesRow {
     collapsed_through: Option<i64>,
 }
 
-/// Every row of a physical series, projected to the columns above.
+/// Every row of a physical series *in the local pond*, projected to the columns
+/// above.
 ///
 /// Both physical series kinds are collapsible and so both can hold superseded
 /// rows; no other entry type has a supersession relation at all.
+///
+/// The `pond_id` filter is a safety scope, not an optimization. The content-root
+/// guard in [`reclaim_superseded`] is computed for the local pond only, and the
+/// fold deliberately skips foreign-pond subtrees, so a foreign row deleted here
+/// would be invisible to the guard -- `pre == post` even if the delete were
+/// wrong, after which the sweep would make it permanent. Restricting the scan
+/// keeps what we may delete equal to what the guard can see.
 const SERIES_ROWS_SQL: &str = "SELECT pond_id, part_id, node_id, version, collapsed_from, \
      collapsed_through FROM reclaim_scan \
-     WHERE file_type IN ('file:physical:series', 'table:physical:series')";
+     WHERE file_type IN ('file:physical:series', 'table:physical:series') \
+     AND pond_id = '{pond_id}'";
 
 /// Hashes still referenced by *some* row, across every pond_id.
+///
+/// Deliberately unscoped, and the asymmetry with [`SERIES_ROWS_SQL`] is the
+/// point: we may only delete rows the guard can see, but a blob must be
+/// retained if *anything* references it, including a foreign pond mirrored
+/// into this table.
 const REFERENCED_SQL: &str = "SELECT DISTINCT blake3 FROM reclaim_scan WHERE blake3 IS NOT NULL";
 
 #[derive(serde::Deserialize)]
@@ -136,7 +150,7 @@ pub async fn reclaim_superseded(
 ) -> Result<(DeltaTable, ReclaimStats), StewardError> {
     let mut stats = ReclaimStats::default();
 
-    let dead = find_superseded(&table).await?;
+    let dead = find_superseded(&table, local_pond_id).await?;
     let mut table = table;
     if !dead.is_empty() {
         // Snapshot the content root BEFORE deleting.  Reclamation must be
@@ -224,8 +238,22 @@ async fn query_rows<T: serde::de::DeserializeOwned>(
 /// version while standing for content in the middle of the stream, so both
 /// "everything below K" and "any version inside a run's range" would delete
 /// live runs.
-async fn find_superseded(table: &DeltaTable) -> Result<HashMap<SeriesKey, Vec<i64>>, StewardError> {
-    let rows: Vec<SeriesRow> = query_rows(table, SERIES_ROWS_SQL).await?;
+async fn find_superseded(
+    table: &DeltaTable,
+    local_pond_id: &str,
+) -> Result<HashMap<SeriesKey, Vec<i64>>, StewardError> {
+    // pond_id is a UUID from the control table, never user text; reject anything
+    // that could not be one rather than interpolating it blind.
+    if !local_pond_id
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() || c == '-')
+    {
+        return Err(StewardError::ControlTable(format!(
+            "reclaim: refusing to scan with a non-UUID pond id {local_pond_id:?}"
+        )));
+    }
+    let sql = SERIES_ROWS_SQL.replace("{pond_id}", local_pond_id);
+    let rows: Vec<SeriesRow> = query_rows(table, &sql).await?;
 
     let mut by_node: HashMap<SeriesKey, Vec<(i64, CollapseRange)>> = HashMap::new();
     for row in rows {
@@ -344,6 +372,15 @@ mod tests {
     /// ordinary write and legitimately does move the content root; so this test
     /// collapses and reclaims as separate steps, exactly as `Ship::reclaim`
     /// brackets them internally.
+    ///
+    /// It collapses in SEVERAL ROUNDS on purpose.  A single round produces one
+    /// merged run holding the highest version, so "drop everything at or below
+    /// the highest `collapsed_through`" and "drop everything inside some run's
+    /// range" select the same rows, and the test would pass under either rule.
+    /// Only once an earlier merged run sits BELOW a later run's
+    /// `collapsed_through` do the two rules disagree -- and the watermark rule
+    /// then deletes a live run.  The test asserts that shape was actually
+    /// reached before it concludes anything.
     #[tokio::test]
     async fn deleting_superseded_rows_preserves_the_content_root() {
         let tmp = tempdir().expect("tempdir");
@@ -352,48 +389,65 @@ mod tests {
             .await
             .expect("create pond");
 
-        let meta = PondUserMetadata::new(vec!["test".into(), "reclaim-merkle".into()]);
-        for i in 0..12u64 {
-            let bytes = filler(i);
-            ship.write_transaction(&meta, async move |fs| {
-                let root = fs.root().await?;
-                let mut w = root
-                    .async_writer_path_with_type(
-                        "/events.series",
-                        tinyfs::EntryType::FilePhysicalSeries,
-                    )
-                    .await?;
-                w.write_all(&bytes)
-                    .await
-                    .map_err(|e| crate::StewardError::Aborted(format!("write: {e}")))?;
-                w.shutdown()
-                    .await
-                    .map_err(|e| crate::StewardError::Aborted(format!("close: {e}")))?;
-                Ok(())
-            })
-            .await
-            .expect("append version");
-        }
+        const MAX_LIVE: usize = 4;
 
-        // Collapse ONLY -- no reclaim.  The pond now carries superseded rows,
-        // which is precisely the state reclamation acts on.
-        let tx = ship.begin_write(&meta).await.expect("begin write");
-        {
-            let state = tx.state().expect("state");
-            let candidates = state
-                .list_collapsible_series(1)
+        let meta = PondUserMetadata::new(vec!["test".into(), "reclaim-merkle".into()]);
+        let mut seed = 0u64;
+        for _round in 0..3 {
+            for _ in 0..12u64 {
+                let bytes = filler(seed);
+                seed += 1;
+                ship.write_transaction(&meta, async move |fs| {
+                    let root = fs.root().await?;
+                    let mut w = root
+                        .async_writer_path_with_type(
+                            "/events.series",
+                            tinyfs::EntryType::FilePhysicalSeries,
+                        )
+                        .await?;
+                    w.write_all(&bytes)
+                        .await
+                        .map_err(|e| crate::StewardError::Aborted(format!("write: {e}")))?;
+                    w.shutdown()
+                        .await
+                        .map_err(|e| crate::StewardError::Aborted(format!("close: {e}")))?;
+                    Ok(())
+                })
                 .await
-                .expect("list collapsible");
-            assert!(!candidates.is_empty(), "series should be collapsible");
-            for id in candidates {
-                let stats = state.collapse_file_series(id, 1).await.expect("collapse");
-                assert!(stats.collapsed, "collapse should have merged a window");
+                .expect("append version");
             }
+
+            // Collapse ONLY -- no reclaim.  The pond accumulates superseded
+            // rows across rounds, which is precisely the state reclaim acts on.
+            let tx = ship.begin_write(&meta).await.expect("begin write");
+            {
+                let state = tx.state().expect("state");
+                // max_live must be > 1.  With max_live == 1 every round is
+                // forced to merge the previous round's accumulated run too, so
+                // the series is flattened back to one tier and the tiered shape
+                // this test needs never forms.
+                let candidates = state
+                    .list_collapsible_series(MAX_LIVE)
+                    .await
+                    .expect("list collapsible");
+                assert!(!candidates.is_empty(), "series should be collapsible");
+                for id in candidates {
+                    let stats = state
+                        .collapse_file_series(id, MAX_LIVE)
+                        .await
+                        .expect("collapse");
+                    assert!(stats.collapsed, "collapse should have merged a window");
+                }
+            }
+            let _ = tx.commit().await.expect("commit collapse");
         }
-        let _ = tx.commit().await.expect("commit collapse");
 
         let pond_id = ship.control_table().pond_id_uuid().to_string();
         let table = ship.data_persistence().table().clone();
+
+        // Prove the structure actually distinguishes the two rules, so a future
+        // change that flattens it turns this test red instead of toothless.
+        assert_tiered_beyond_a_watermark(&table, &pond_id).await;
 
         let before = crate::content_tree::compute_content_tree_for_table(table.clone(), &pond_id)
             .await
@@ -427,6 +481,59 @@ mod tests {
             "deleting {} superseded row(s) moved the content root; a mirror that never \
              received them would now diverge",
             stats.rows_deleted,
+        );
+    }
+
+    /// Assert some LIVE row sits at or below the highest `collapsed_through`.
+    ///
+    /// That is exactly the case where a watermark ("everything below K is
+    /// dead") disagrees with range containment, because a merged run takes a
+    /// fresh highest version while standing for content mid-stream.  Without
+    /// this shape, the surrounding test cannot tell the two rules apart.
+    async fn assert_tiered_beyond_a_watermark(table: &deltalake::DeltaTable, pond_id: &str) {
+        let sql = super::SERIES_ROWS_SQL.replace("{pond_id}", pond_id);
+        let rows: Vec<super::SeriesRow> = super::query_rows(table, &sql).await.expect("scan rows");
+        assert!(!rows.is_empty(), "expected series rows");
+
+        // Group exactly as find_superseded does; versions are only comparable
+        // within one node.
+        let mut by_node: std::collections::HashMap<
+            (String, String, String),
+            Vec<(i64, tlogfs::schema::CollapseRange)>,
+        > = std::collections::HashMap::new();
+        for r in &rows {
+            by_node
+                .entry((r.pond_id.clone(), r.part_id.clone(), r.node_id.clone()))
+                .or_default()
+                .push((
+                    r.version,
+                    tlogfs::schema::CollapseRange::new(
+                        r.version,
+                        r.collapsed_from,
+                        r.collapsed_through,
+                    ),
+                ));
+        }
+
+        let tiered = by_node.values().any(|entries| {
+            let Some(watermark) = entries
+                .iter()
+                .filter(|(_, r)| r.merged)
+                .map(|(_, r)| r.hi)
+                .max()
+            else {
+                return false;
+            };
+            tlogfs::schema::live_series_versions(entries)
+                .into_iter()
+                .any(|v| v <= watermark)
+        });
+
+        assert!(
+            tiered,
+            "collapse produced only a single tier (every live version sits above its node's \
+             highest collapsed_through), so this test cannot distinguish range containment \
+             from a watermark; rows={rows:?}"
         );
     }
 

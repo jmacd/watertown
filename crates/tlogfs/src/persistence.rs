@@ -213,6 +213,28 @@ fn size_class(bytes: u64) -> u32 {
     class
 }
 
+/// Temporal overrides the merged run must carry forward.
+///
+/// `set-temporal-bounds` records manual bounds on a dedicated ZERO-BYTE version.
+/// Collapse deliberately excludes zero-byte rows from the merge window (they
+/// contribute no content), but the merged run's `[lo, hi]` range still SPANS
+/// their version numbers, so `is_superseded` retires them. Without inheriting
+/// their bounds here, a collapse silently deletes the override and every reader
+/// falls back to unbounded filtering -- re-admitting exactly the rows the
+/// operator excluded.
+///
+/// The newest override inside the window wins, matching "latest setting wins".
+/// A newer override outside the window still wins overall, because the merged
+/// run sorts at its range position, below that later row.
+fn inherited_overrides(records: &[OplogEntry], lo: i64, hi: i64) -> (Option<i64>, Option<i64>) {
+    records
+        .iter()
+        .filter(|r| r.version >= lo && r.version <= hi)
+        .filter(|r| r.min_override.is_some() || r.max_override.is_some())
+        .max_by_key(|r| r.version)
+        .map_or((None, None), |r| (r.min_override, r.max_override))
+}
+
 /// Choose the contiguous window of live rows to merge, or `None` for a no-op.
 ///
 /// Size-tiered policy: merge the oldest group of [`COLLAPSE_FANOUT`] *adjacent*
@@ -1288,7 +1310,16 @@ impl State {
         }
 
         // Assess current versions and pick the window to merge.
-        let (versions_before, window, temporal, inherited_bao, newest_version, store_path, options) = {
+        let (
+            versions_before,
+            window,
+            temporal,
+            inherited_bao,
+            newest_version,
+            overrides,
+            store_path,
+            options,
+        ) = {
             let mut inner = self.inner.lock().await;
             let records = inner.query_records(id).await?;
             let live: Vec<&OplogEntry> = crate::schema::live_series_entries(&records)
@@ -1326,12 +1357,23 @@ impl State {
             let inherited_bao = newest.bao_outboard.clone();
             let newest_version = newest.version;
 
+            // Zero-byte override rows are filtered out of `window` above, but
+            // the merged range still spans them, so carry their bounds forward.
+            let overrides = {
+                let lo = crate::schema::CollapseRange::of(&window[0]).lo;
+                let hi =
+                    crate::schema::CollapseRange::of(window.last().expect("window is non-empty"))
+                        .hi;
+                inherited_overrides(&records, lo, hi)
+            };
+
             (
                 live.len(),
                 window,
                 temporal,
                 inherited_bao,
                 newest_version,
+                overrides,
                 inner.path.clone(),
                 inner.large_file_options.clone(),
             )
@@ -1463,6 +1505,7 @@ impl State {
             entry.set_bao_outboard(bao_outboard);
             entry.collapsed_from = Some(lo);
             entry.collapsed_through = Some(hi);
+            (entry.min_override, entry.max_override) = overrides;
             inner.records.push(entry);
             version
         };
@@ -1567,6 +1610,7 @@ impl State {
             min_event,
             max_event,
             timestamp_column,
+            overrides,
             store_path,
             options,
         ) = {
@@ -1613,6 +1657,10 @@ impl State {
                 .expect("window is non-empty");
             let window_versions: Vec<i64> = window.iter().map(|r| r.version).collect();
 
+            // Zero-byte override rows are filtered out of `window` above, but
+            // the merged range still spans them, so carry their bounds forward.
+            let overrides = inherited_overrides(&records, lo, hi);
+
             (
                 live.len(),
                 window_versions,
@@ -1621,6 +1669,7 @@ impl State {
                 min_event,
                 max_event,
                 timestamp_column,
+                overrides,
                 inner.path.clone(),
                 inner.large_file_options.clone(),
             )
@@ -1707,6 +1756,7 @@ impl State {
             entry.set_bao_outboard(bao_outboard);
             entry.collapsed_from = Some(lo);
             entry.collapsed_through = Some(hi);
+            (entry.min_override, entry.max_override) = overrides;
             inner.records.push(entry);
             version
         };
@@ -2437,23 +2487,28 @@ impl State {
             return Ok(None);
         }
 
-        // FAIL-FAST: Find latest version or fail explicitly
-        let latest_version = file_series_records
+        // Resolve over LIVE rows in range order, not by raw version.
+        //
+        // A collapse output takes a fresh highest version while standing for
+        // content in the middle of the stream, so `max_by_key(version)` selects
+        // the merged run rather than the real tail. Merged runs never carry
+        // overrides (the merge constructors do not copy them), so that lookup
+        // returns None and the caller falls back to (i64::MIN, i64::MAX) --
+        // silently disabling the filtering `set-temporal-bounds` established.
+        // Take the newest live row that actually carries an override.
+        let live = crate::schema::live_series_entries(&file_series_records);
+        let Some(latest_override) = live
             .iter()
-            .max_by_key(|r| r.version)
-            .ok_or_else(|| {
-                debug!(
-                    "[ERR] FAIL-FAST: No records found to determine latest version for node_id {id}"
-                );
-                TLogFSError::Transaction {
-                    message: format!(
-                        "Cannot find latest version for temporal overrides: node_id {id}"
-                    ),
-                }
-            })?;
+            .rev()
+            .find(|r| r.temporal_overrides().is_some())
+            .copied()
+        else {
+            debug!("[WARN] TEMPORAL: No live record carries temporal overrides for node_id {id}");
+            return Ok(None);
+        };
 
-        let version = latest_version.version;
-        let temporal_overrides = latest_version.temporal_overrides();
+        let version = latest_override.version;
+        let temporal_overrides = latest_override.temporal_overrides();
         let has_overrides = temporal_overrides.is_some();
         debug!(
             "[SEARCH] TEMPORAL: Latest version {version} has temporal overrides: {has_overrides}"
