@@ -1,12 +1,17 @@
 # Selfmon findings — storage amplification and coverage gaps
 
-**Status: TEMPORARY working notes. Not intended to be committed as-is.**
-Investigated 2026-07-25/26 against the live `watershop-selfmon` instance.
-Every number below is measured on the host, not estimated.
-Updated 2026-07-26: items 1-3 are implemented (§8, §9, item 3) and two
-findings not in the original audit were added (§10, §11). **Nothing here is
-deployed yet** — the watertown work is unpushed and the submodule pointer has
-not moved.
+**Status: working notes, committed for traceability rather than as
+documentation.** Investigated 2026-07-25/26 against the live
+`watershop-selfmon` instance. Every number below is measured on the host, not
+estimated.
+
+Updated 2026-07-26: items 1-3 implemented (§8, §9, item 3); two findings not in
+the original audit added (§10, §11).
+
+Updated 2026-07-27 after a review of the whole branch, which found that §10 had
+been fixed in only one of two identical caches and that four further defects
+had no test. See §12. **Nothing here is deployed yet** — the watertown work is
+unpushed and the submodule pointer has not moved.
 
 Selfmon exists to exercise watertown and surface its inefficiencies. It did.
 This is what it found.
@@ -19,12 +24,17 @@ This is what it found.
 |---|---|---|
 | **Collapse output is an O(N²) write amplifier** — superseded blobs never GC'd | **high** | **fixed** §8, item 1 |
 | No GC for superseded `_large_files` blobs — 8.2 GB unreclaimable | **high** | **fixed** §9, item 2 |
-| **Collapse blinds both read-pruning predicates** — bounded reads silently become full-history reads (§7) | **high** | **fixed** by tiering (§7 "Consequence") |
-| **Reading a collapsed series double-counts every row** (§10) | **high** | **fixed**, not previously known |
+| **Collapse blinds both read-pruning predicates** — bounded reads silently become full-history reads (§7) | **high** | **partly fixed** by tiering: event-time pruning survives, `version_gt` does not (§7 "Consequence") |
+| **Reading a collapsed series double-counts every row** (§10) | **high** | **fixed** in the format cache; the same bug in the rollup cache was live until §12 |
+| **Rollup partials double-counted a collapsed window** (§12) | **high** | **fixed** §12, testsuite 733 |
+| reclaim's delete commits replayed as duplicate transactions by `pond rebuild` (§12) | medium | **fixed** §12 |
+| reclaim deleted rows and swept blobs with no content-root check (§12) | medium | **fixed** §12 |
+| A corrupt bao outboard silently produced a wrong collapse baseline (§12) | medium | **fixed** §12 |
+| The collapse backstop rewrote the largest run, defeating tiering (§12) | medium | **fixed** §12 |
 | Selfmon has no `TablePhysicalSeries`, so that collapse path is never exercised | **high** (coverage) | **fixed** in config; NOT YET DEPLOYED |
 | **Tick steps failed silently, and a failed read published as a fast read** (§11) | **high** | **fixed** in caspar.water |
 | `logfile-ingest` silently truncates a series when its active file is rotated (§11) | medium | open, latent |
-| Stale format-cache parquets are never pruned (§10) | low | open (disk only) |
+| Stale format-cache parquets are never pruned (§10) | low | **fixed** §12 (rollup); format cache still leaks disk only |
 | `libpod-conmon-*` journal files unbounded in count; one is 165.8 MB | medium | open (item 4) |
 | `pond copy` versions identical content — 9,769 versions of a 19-byte file | medium | open (item 5) |
 | `_minio-admin.env` measured as if it were a pond (duplicate + dead data) | low | open (item 7) |
@@ -352,6 +362,16 @@ runs beyond write amplification: each run carries its own version range *and*
 its own `min`/`max_event_time`, so pruning survives at run granularity instead
 of being all-or-nothing.
 
+**Only half of this was actually delivered.** Tiering restored *event-time*
+pruning at run granularity, as described below. It did **not** restore
+`version_gt` pruning: a merged run still takes a fresh highest version number
+while standing in for mid-stream content, so version order no longer matches
+byte order and an incremental reader keyed on `version_gt` still cannot prune —
+it degrades from `O(N)` to `O(fanout)` rather than to `O(1)`. The rule that
+fixes this exists (`CollapseRange` / `is_superseded` in `tlogfs::schema`) but is
+confined to tlogfs; `tinyfs::FileVersionInfo` never gained the collapse range,
+so nothing above tinyfs can apply it. See §12 "Still open".
+
 The shape is also right. Under tiered collapse, recent versions stay loose and
 unmerged, so full per-version resolution is preserved precisely where
 incremental readers operate — the tail — and only cold history is coarsened,
@@ -546,13 +566,20 @@ explicitly (`SeriesReadBounds::NONE.retains()` is true for everything, so the
 merge is safe), and schema merging was scoped to the retained files via a new
 `merge_parquet_schemas()`.
 
-### Still open: nothing prunes the stale cache parquets
+### Still open: nothing prunes the stale format-cache parquets
 
 Reclamation (§9) does not help. It deletes superseded rows and blobs *inside*
 the pond; the format cache is a separate host-side artifact keyed by version +
-content hash, and nothing sweeps it. Now a disk-waste issue rather than a
+content hash, and nothing sweeps it. A disk-waste issue rather than a
 correctness one — the 21,659 `cache/jsonlogs_*` files in §1's table are this
 population. Natural home is `pond maintain`.
+
+### Wrong scope: this section claimed more coverage than it had
+
+The fix above covered `format_cache`. It did **not** cover `rollup_cache`,
+which is a near-identical copy of the same code and had the same defect —
+with the worse consequence that it silently *double-counted* rather than
+merely re-read. That is §12.
 
 ---
 
@@ -624,3 +651,109 @@ config precisely because rotation is anticipated, so this is armed for whenever
 someone adds logrotate. Worth a testsuite case regardless of whether the
 behaviour is judged wrong: silently returning `ok` while dropping data is not an
 acceptable outcome either way.
+
+---
+
+## 12. Branch review: one live corruption and four untested defects
+
+Added 2026-07-27 after reviewing the whole `jmacd/analysis8` branch rather than
+each change in isolation. The review was prompted by the sense that details did
+not add up; they did not.
+
+### 12.1 The same bug, fixed in one of two copies (the live corruption)
+
+§10 fixed version-collapse double-counting in `format_cache`. `rollup_cache` is
+a near-identical copy of that module — one of its functions was even documented
+as *"Mirrors `format_cache::cache_version_path` keying exactly"* — and it still
+had the defect.
+
+The mechanism: `find_uncached_members` only ever **added** partials named
+`{node}_v{version}_{blake3}.parquet`, and the read side **globbed the
+directory**. After `maintain --collapse-versions`, the merged version got a new
+partial while the superseded versions' partials stayed. The merge is
+`SUM(__p_sum_i), SUM(__p_count_i) GROUP BY bucket`, so every row in the
+collapsed window was summed twice — and again on each later collapse.
+
+Scope: the rollup cache engages only when the input scheme has a
+`FormatProvider` (`oteljson`, `jsonlogs`, `csv`). Builtin `series:///`,
+`file:///`, `table:///` bypass it, so selfmon's own
+`materialize-series → temporal-reduce` pipeline was **not** affected.
+`water.yaml` / `septic.yaml` reading `oteljson:///ingest/*.json` **were**, with
+`config/scripts/run.sh` running `maintain --compact --collapse-versions 100`
+hourly.
+
+**Why it hid for a year.** Testsuite `050` already ran the exact sequence —
+collapse, then an oteljson temporal-reduce — but asserted only on `avg` and
+bucket count. `avg` is `SUM(sum)/SUM(count)`, unchanged when both double; the
+`GROUP BY` re-collapses duplicate buckets so the count is unchanged too. Both
+assertions are invariant under precisely this corruption. `temporal_reduce.rs`
+also explicitly skips its sequentiality guard for series inputs, justified on
+the grounds that *"distinct versions never share a row"* — the one invariant
+collapse breaks.
+
+Pinned red by testsuite `733` (96 → 192), now green.
+
+### 12.2 The fix: name the abstraction instead of patching the copy
+
+Patching `rollup_cache` would have left two copies of a shape that had already
+proven it silently diverges. Both modules are the same thing: a directory of
+per-version Parquet sidecars that must be a projection of a node's **live**
+versions. `crates/provider/src/version_cache.rs` now names it once, with three
+barriers chosen so the bug class is unwritable rather than merely fixed:
+
+1. **`LiveVersions`** — a version list is a node-scoped type, not a bare `Vec`,
+   so "did the caller pass the live set?" is a type question, not a review one.
+2. **`SidecarDir::reconcile`** — both **adds** missing sidecars and **removes**
+   stale ones. A cache that only adds is how a superseded sidecar survives to be
+   counted twice.
+3. **`CachedSet`** — the only route to a `TableProvider`, carrying explicit file
+   paths. There is deliberately **no** `fn(&Path) -> TableProvider` in the
+   module, because every instance of this bug has been exactly that function.
+
+`SidecarNaming::NodeScoped` guards the rollup directory, which is shared by
+every node one `*` pattern matched: reconciliation there must never delete a
+sibling node's partials.
+
+**Behaviour change.** With superseded partials now deleted, a sealed run built
+on them is no longer a valid incremental base, so the level is **rebuilt** from
+the live partials instead of hard-failing with *"backfills an already-sealed
+bucket"*. That error was the site-staging outage. Raising `allowed_lateness` to
+14d only suppressed it — and left the silent doubling in its place.
+
+**Migration.** Reconciliation fixes future reads only. Water/septic sealed runs
+already froze doubled values and need a one-time `--rebuild` or a `cfg_hash`
+bump.
+
+### 12.3 Four defects with no test
+
+- **reclaim's delete commits were replayed as transactions.** They stamped the
+  collapse's `txn_seq` under `pond_txn`, and `reconstruct_txn_history` yields one
+  transaction per such commit, so `pond rebuild` replayed N+1 duplicate lifecycle
+  records at one sequence. Now stamped `pond_maintenance`.
+- **reclaim asserted nothing about what it deleted.** The strictly safer
+  `compact` verifies its `root_tree_hash`; reclaim, which deletes rows and sweeps
+  blobs permanently, did not. It now checks the content root either side of the
+  deletes **before** the sweep — deleted rows are recoverable from Delta history
+  or a mirror, a swept blob is not.
+- **A corrupt bao outboard silently produced a wrong baseline.** `.ok()`
+  conflated "no outboard" with "unparseable outboard", falling back to the
+  first-version baseline that the adjacent comment says is wrong for any later
+  run. Now a hard error.
+- **The collapse backstop rewrote the largest run.** It merged `0..FANOUT`, and
+  after any previous collapse index 0 *is* the accumulated run — the `O(N²)`
+  behaviour tiering exists to prevent. It fires far more often than it looks,
+  because callers pass the same number as both the candidacy threshold and
+  `max_live`, making `live.len() > max_live` true by construction. It now merges
+  the cheapest window of the same width.
+
+### Still open
+
+- **`version_gt` pruning is still blind after collapse** (§7). The fix is to
+  plumb `collapsed_from` / `collapsed_through` onto `tinyfs::FileVersionInfo`
+  and make raw `version` unusable for ordering, which would kill this class at
+  compile time. Two known sites order on raw `version`:
+  `format_cache` pruning and `tinyfs_object_store`'s `max_by_key(|v| v.version)`.
+- **Water/septic need a one-time `--rebuild`** before their reduced series can
+  be trusted (§12.2).
+- **The format cache still leaks stale parquets to disk** (§10). Correctness is
+  fine — reads name live files explicitly — but nothing sweeps them.
