@@ -596,9 +596,11 @@ impl Provider {
             )));
         }
 
-        // Find uncached versions
+        // Reconcile, not merely check: `versions` is this node's complete live
+        // set, so this is the one place that can also retire the sidecars of
+        // versions a collapse superseded. Without it the cache only ever grew.
         let uncached =
-            crate::format_cache::find_uncached_versions(cache_dir, scheme, &node_id, &versions);
+            crate::format_cache::reconcile_cached_versions(cache_dir, scheme, &node_id, &versions)?;
 
         if uncached.is_empty() {
             log::debug!(

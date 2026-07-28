@@ -61,6 +61,14 @@ pub fn cache_version_path(
 }
 
 /// Check which of a node's live versions are missing from the cache.
+///
+/// Adds only; never deletes. Use it when `versions` may be a SUBSET of the
+/// node's live versions -- notably the dynamic-file path, which synthesizes a
+/// single version from metadata because such nodes have no persistence records.
+/// Reconciling against a subset would delete the sidecars of every version not
+/// in it. Callers holding the full live set should use
+/// [`reconcile_cached_versions`] instead, so the cache stays a projection of
+/// what is live rather than growing forever.
 #[must_use]
 pub fn find_uncached_versions(
     cache_dir: &Path,
@@ -70,6 +78,42 @@ pub fn find_uncached_versions(
 ) -> Vec<FileVersionInfo> {
     let live = LiveVersions::from_persistence(*node_id, versions.to_vec());
     node_sidecars(cache_dir, scheme, node_id).missing(&live)
+}
+
+/// Make a node's cache directory a projection of its live versions: delete the
+/// sidecars of versions that are no longer live, and report which live versions
+/// still need writing.
+///
+/// This is the collection step the format cache never had. Every other property
+/// in this module's header held -- per-version files are immutable, so there was
+/// nothing to INVALIDATE -- but nothing ever removed them, so the directory grew
+/// by one Parquet for every version ever written and was never bounded. Version
+/// collapse makes that worse than mere disk cost: it replaces a run of versions
+/// with one merged version carrying the same content, so the superseded
+/// sidecars are duplicates of data the merged one already holds.
+///
+/// Reads are what keep it bounded, because reads are what happen. Deleting is
+/// safe: a sidecar is derived data, regenerable from the source version.
+///
+/// `versions` MUST be the node's complete live set, as returned by
+/// `list_file_versions`. Passing a subset deletes the rest.
+pub fn reconcile_cached_versions(
+    cache_dir: &Path,
+    scheme: &str,
+    node_id: &tinyfs::NodeID,
+    versions: &[FileVersionInfo],
+) -> Result<Vec<FileVersionInfo>> {
+    let live = LiveVersions::from_persistence(*node_id, versions.to_vec());
+    let rec = node_sidecars(cache_dir, scheme, node_id).reconcile(&live)?;
+    if !rec.removed.is_empty() {
+        log::debug!(
+            "[SWEEP] format cache: removed {} superseded sidecar(s) for {}_{}",
+            rec.removed.len(),
+            scheme,
+            node_id
+        );
+    }
+    Ok(rec.missing)
 }
 
 /// Write a single version's format output to cache as Parquet.
@@ -229,6 +273,73 @@ mod tests {
 
     fn test_node_id() -> tinyfs::NodeID {
         tinyfs::NodeID::new(uuid7::uuid7().to_string())
+    }
+
+    /// Reconciling retires the sidecars of versions that are no longer live and
+    /// reports nothing missing when every live version is already cached.
+    ///
+    /// This is the collection step the format cache lacked entirely: its files
+    /// are immutable, so there was never anything to invalidate, but nothing
+    /// removed them either and the directory grew by one Parquet per version
+    /// ever written. Collapse is what makes that a correctness concern and not
+    /// just disk: it replaces versions 1..3 with a single merged version, and
+    /// the superseded sidecars hold the very rows the merged one now carries.
+    #[tokio::test]
+    async fn reconcile_retires_sidecars_a_collapse_superseded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path();
+        let node_id = test_node_id();
+        let schema = test_schema();
+
+        let before = vec![
+            test_version(1, "h1"),
+            test_version(2, "h2"),
+            test_version(3, "h3"),
+        ];
+        for v in &before {
+            let batch = test_batch(&schema, &[v.version as i64], &["x"]);
+            let stream: crate::version_cache::BatchStream =
+                Box::pin(futures::stream::once(async move { Ok(batch) }));
+            let _ = cache_write_version(cache_dir, "csv", &node_id, v, schema.clone(), stream)
+                .await
+                .unwrap();
+        }
+        let dir = cache_node_dir(cache_dir, "csv", &node_id);
+        let count = |d: &Path| std::fs::read_dir(d).unwrap().count();
+        assert_eq!(count(&dir), 3, "three versions cached");
+
+        // A collapse merges 1..3 into one new, higher-numbered version with the
+        // same content. `list_file_versions` would now return only version 4.
+        let after = vec![test_version(4, "merged")];
+        let missing = reconcile_cached_versions(cache_dir, "csv", &node_id, &after).unwrap();
+
+        assert_eq!(
+            missing.len(),
+            1,
+            "the merged version is not cached yet, so it must be reported missing"
+        );
+        assert_eq!(missing[0].version, 4);
+        assert_eq!(
+            count(&dir),
+            0,
+            "all three superseded sidecars must be gone; a cache that only adds \
+             is how they survived to be double-counted"
+        );
+
+        // Cache the merged version, then reconcile again: steady state is a
+        // no-op, neither deleting a live sidecar nor reporting it missing.
+        let batch = test_batch(&schema, &[4], &["x"]);
+        let stream: crate::version_cache::BatchStream =
+            Box::pin(futures::stream::once(async move { Ok(batch) }));
+        let _ = cache_write_version(cache_dir, "csv", &node_id, &after[0], schema, stream)
+            .await
+            .unwrap();
+        let missing = reconcile_cached_versions(cache_dir, "csv", &node_id, &after).unwrap();
+        assert!(
+            missing.is_empty(),
+            "live cached version must not be missing"
+        );
+        assert_eq!(count(&dir), 1, "live sidecar must survive reconciliation");
     }
 
     #[test]
