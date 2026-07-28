@@ -34,7 +34,8 @@ This is what it found.
 | Selfmon has no `TablePhysicalSeries`, so that collapse path is never exercised | **high** (coverage) | **fixed** in config; NOT YET DEPLOYED |
 | **Tick steps failed silently, and a failed read published as a fast read** (§11) | **high** | **fixed** in caspar.water |
 | `logfile-ingest` silently truncates a series when its active file is rotated (§11) | medium | open, latent |
-| Stale format-cache parquets are never pruned (§10) | low | **fixed** §12 (rollup); format cache still leaks disk only |
+| Stale format-cache parquets are never pruned (§10) | low | **fixed** — §12 for the rollup, and the format cache now reconciles (`docs/rollup-storage-redesign.md` P4) |
+| **The rollup cache stored one tiny Parquet per source version per build** — tens of thousands of small files, and a collapse looked like a change because the cache was keyed by version number | **high** | **fixed** — cache re-keyed on content and stored as size-gated, compacted segments (`docs/rollup-storage-redesign.md`) |
 | `libpod-conmon-*` journal files unbounded in count; one is 165.8 MB | medium | open (item 4) |
 | `pond copy` versions identical content — 9,769 versions of a 19-byte file | medium | open (item 5) |
 | `_minio-admin.env` measured as if it were a pond (duplicate + dead data) | low | open (item 7) |
@@ -417,12 +418,15 @@ everything, including the hot tail that `version_gt` depends on.
    is unbounded in count.
 5. Make `pond copy` a no-op when the content hash is unchanged (fixes §2
    Source 3 generically, not just here).
-6. Document/enforce the `--collapse-versions` bounds: it is bounded **below** by
-   `allowed_lateness` (rewrite depth → sealed-bucket outages) and **above** by
-   read cost (~58 ms/version), and lowering it *increases* O(N²) write
-   amplification. Neither bound is enforced in code today. Note that tiering
-   (1) largely retires this hazard: merges touch only old, sealed windows and
-   never reach back toward the `allowed_lateness` horizon.
+6. ~~Document/enforce the `--collapse-versions` lower bound.~~ **RETIRED.** The
+   lower bound existed because a collapse reaching below the rollup's sealed
+   watermark was a hard error demanding `--rebuild`. The rollup cache is now
+   keyed by the time range each segment covers rather than by source version, so
+   a collapse is content-identical and reads as *unchanged*, and genuine late
+   data unseals the affected segments instead of failing
+   (`docs/rollup-storage-redesign.md`). The **upper** bound still stands: read
+   cost is ~58 ms/version, and lowering `--collapse-versions` still increases
+   O(N²) write amplification, though tiering already bounds that.
 
 **caspar.water**
 

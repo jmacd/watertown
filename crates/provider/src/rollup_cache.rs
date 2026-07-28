@@ -200,6 +200,13 @@ pub const SEAL_TARGET_BYTES: u64 = 1024 * 1024;
 /// `max` is INCLUSIVE: it is the largest event time present, not a half-open
 /// end. Ranges elsewhere in this module are half-open, so the distinction is
 /// called out here rather than assumed.
+///
+/// Only `min_us` drives the dirty range -- unsealing is governed by a single
+/// watermark, so there is nothing an upper bound could exclude. `max_us` earns
+/// its place in the comparison: a version whose bounds were absent and are
+/// later recorded (an ingest fix, or a tlogfs upgrade backfilling them) keeps
+/// its blake3 but changes its range, and that must read as changed so the
+/// pessimistic full-axis range it had is replaced by the real one.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SourceRange {
     pub min_us: i64,
@@ -254,7 +261,7 @@ pub const SEALED_FORMAT: &str = "segments-v3";
 
 /// Manifest describing the segment cache for one output resolution. Its
 /// serialized bytes are the export-hint digest, so it must serialize
-/// deterministically (fixed field order; `covered` is an ordered set).
+/// deterministically (fixed field order; `sources` is an ordered map).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SegmentManifest {
     /// On-disk file format (see [`SEALED_FORMAT`]). Absent in legacy manifests,
