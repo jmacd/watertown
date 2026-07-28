@@ -448,15 +448,27 @@ pub async fn write_parquet_atomic(
     Ok(digest)
 }
 
-/// Build the read provider for a res dir: a `ListingTable` over all sealed runs
-/// plus the hot file. Verifies every manifest run and the hot file are present
-/// on disk first; a missing member is a hard error (corrupt cache), never a
-/// silent hole in the series.
+/// Build the read provider for a res dir: a `ListingTable` over exactly the
+/// sealed runs named by `manifest`, plus the hot file. A manifest member
+/// missing on disk is a hard error (corrupt cache), never a silent hole in the
+/// series.
+///
+/// The scan names its files EXPLICITLY rather than listing `res_dir`. The two
+/// are not the same set: a `.parquet` can sit in the directory without being
+/// referenced by the manifest, and every such orphan is a duplicate copy of
+/// some bucket range that a directory-shaped scan sums a second time. Orphans
+/// arise in normal operation, not only after a crash -- [`write_parquet_atomic`]
+/// renames a new run into place BEFORE the manifest recording it is written, so
+/// any interruption in that window leaves one behind, and compaction (which must
+/// publish a merged segment before deleting its inputs) widens that window by
+/// design. This is the same defect that let a directory-listed format cache
+/// double-count the versions a collapse superseded; the fix is the same one.
 pub async fn listing_table_for_res_dir(
     res_dir: &Path,
     manifest: &SealedManifest,
     ts_column: &str,
 ) -> Result<Arc<dyn TableProvider>> {
+    let mut files: Vec<PathBuf> = Vec::with_capacity(manifest.runs.len() + 1);
     for run in &manifest.runs {
         let p = run_path(res_dir, &run.name);
         if !p.exists() {
@@ -466,6 +478,7 @@ pub async fn listing_table_for_res_dir(
                 p.display()
             )));
         }
+        files.push(p);
     }
     let hot = hot_path(res_dir);
     if !hot.exists() {
@@ -475,8 +488,16 @@ pub async fn listing_table_for_res_dir(
             hot.display()
         )));
     }
-    let dir_url = format!("file://{}/", res_dir.display());
-    let table_url = ListingTableUrl::parse(&dir_url)?;
+    files.push(hot);
+
+    // Schema from the same explicit member list, so an orphan cannot contribute
+    // a column either. `files` always holds at least the hot file, so the
+    // empty-list directory fallback inside `merge_parquet_schemas` is unreachable.
+    let merged_schema = crate::version_cache::merge_parquet_schemas(&files, res_dir).await?;
+    let mut paths = Vec::with_capacity(files.len());
+    for p in &files {
+        paths.push(ListingTableUrl::parse(format!("file://{}", p.display()))?);
+    }
     // Every run and the hot file is written by a query ending in
     // `ORDER BY time_bucket`, so each file is individually sorted ascending on
     // the timestamp column, and the runs' bucket ranges are disjoint. Declaring
@@ -492,8 +513,7 @@ pub async fn listing_table_for_res_dir(
         .with_file_sort_order(vec![vec![
             datafusion::prelude::col(ts_column).sort(true, false),
         ]]);
-    let merged_schema = crate::version_cache::merge_parquet_schemas_in_dir(res_dir).await?;
-    let config = ListingTableConfig::new(table_url)
+    let config = ListingTableConfig::new_with_multi_paths(paths)
         .with_listing_options(listing_options)
         .with_schema(merged_schema);
     let table = ListingTable::try_new(config)?;
@@ -668,6 +688,117 @@ mod tests {
         (0..merged.num_rows())
             .map(|i| (bucket.value(i), s.value(i), c.value(i)))
             .collect()
+    }
+
+    /// A stray Parquet in the res dir must not contribute rows: the manifest,
+    /// not the directory listing, defines what the scan reads.
+    ///
+    /// Orphans are ordinary, not exotic. `write_parquet_atomic` renames a run
+    /// into place before the manifest naming it is written, so an interruption
+    /// in that window leaves one; compaction must publish a merged segment
+    /// before deleting the inputs it replaces, so it holds that window open on
+    /// purpose. A directory-shaped scan sums such a file a second time, which is
+    /// exactly how a directory-listed format cache double-counted the versions a
+    /// collapse superseded.
+    #[tokio::test]
+    async fn listing_table_ignores_a_parquet_the_manifest_does_not_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let res_dir = tmp.path().join("res60");
+        let schema = partials_schema();
+
+        async fn put(path: &Path, schema: SchemaRef, batch: RecordBatch) -> String {
+            let s: Pin<
+                Box<
+                    dyn Stream<Item = std::result::Result<RecordBatch, crate::error::Error>> + Send,
+                >,
+            > = Box::pin(futures::stream::iter(vec![Ok(batch)]));
+            write_parquet_atomic(path, schema, s).await.unwrap()
+        }
+
+        // One sealed run covering buckets [0, 120) and the open hot file.
+        let run_name = "run-00000000.parquet";
+        let run_digest = put(
+            &run_path(&res_dir, run_name),
+            schema.clone(),
+            partials_batch(&schema, &[0, 60], &[10.0, 20.0], &[1, 2]),
+        )
+        .await;
+        let hot_digest = put(
+            &hot_path(&res_dir),
+            schema.clone(),
+            partials_batch(&schema, &[120], &[40.0], &[4]),
+        )
+        .await;
+
+        // The orphan: a duplicate of the sealed run under a name the manifest
+        // never records, as an interrupted seal or an in-flight compaction
+        // would leave behind.
+        _ = put(
+            &run_path(&res_dir, "run-00000001.parquet"),
+            schema.clone(),
+            partials_batch(&schema, &[0, 60], &[10.0, 20.0], &[1, 2]),
+        )
+        .await;
+
+        let manifest = SealedManifest {
+            format: SEALED_FORMAT.to_string(),
+            allowed_lateness_secs: 0,
+            sealed_hi_secs: Some(120),
+            next_seq: 1,
+            runs: vec![SealedRun {
+                name: run_name.to_string(),
+                lo_secs: None,
+                hi_secs: 120,
+                digest: run_digest,
+            }],
+            hot_digest: Some(hot_digest),
+            covered: BTreeSet::new(),
+            source_digest: None,
+        };
+
+        let provider = listing_table_for_res_dir(&res_dir, &manifest, "time_bucket")
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        _ = ctx.register_table("merged", provider).unwrap();
+        let batches = ctx
+            .sql(
+                "SELECT time_bucket, SUM(\"__p_sum_0\") AS s, SUM(\"__p_count_1\") AS c \
+                 FROM merged GROUP BY time_bucket ORDER BY time_bucket",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let merged = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+        let bucket = merged
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let s = merged
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let c = merged
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let got: Vec<(i64, f64, i64)> = (0..merged.num_rows())
+            .map(|i| (bucket.value(i), s.value(i), c.value(i)))
+            .collect();
+
+        // Assert the SUMS, not an average: the orphan doubles sum and count
+        // together, so avg is invariant under this bug and would pass either way.
+        assert_eq!(
+            got,
+            vec![(0, 10.0, 1), (60, 20.0, 2), (120, 40.0, 4)],
+            "an unreferenced Parquet in the res dir was scanned; the read must \
+             enumerate the manifest, not list the directory"
+        );
     }
 
     #[tokio::test]
