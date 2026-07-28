@@ -151,6 +151,31 @@ pub struct TemporalReduceConfig {
     /// (sealed-runs) cache, which is rebuilt from the retained partials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_lateness: Option<String>,
+
+    /// Minimum accumulated size before frozen buckets are sealed into an
+    /// immutable run file. Accepts a byte count; defaults to
+    /// [`crate::rollup_cache::SEAL_TARGET_BYTES`].
+    ///
+    /// Unlike `allowed_lateness`, changing this does NOT invalidate the cache:
+    /// a run already sealed is correct at any target, so the new value simply
+    /// governs the next seal. Exposed mainly so the tradeoff can be measured
+    /// against real data -- larger means fewer files but a heavier hot-window
+    /// recompute each build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal_target_bytes: Option<u64>,
+}
+
+/// The two knobs governing how the sealed layout advances, carried together so
+/// they stay in step: `lateness_secs` decides WHICH buckets may freeze, and
+/// `target_bytes` decides WHEN enough have frozen to be worth a file.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SealPolicy {
+    /// Maximum allowed lateness in seconds; recorded in the manifest because a
+    /// change to it invalidates the cache.
+    pub lateness_secs: i64,
+    /// Seal threshold in bytes; deliberately NOT recorded, because a change to
+    /// it invalidates nothing.
+    pub target_bytes: u64,
 }
 
 /// Default maximum allowed lateness when `allowed_lateness` is unset: one day.
@@ -171,6 +196,13 @@ impl TemporalReduceConfig {
             None => DEFAULT_ALLOWED_LATENESS,
         };
         Ok(dur.as_secs() as i64)
+    }
+
+    /// Resolve the seal threshold in bytes, defaulting to
+    /// [`crate::rollup_cache::SEAL_TARGET_BYTES`].
+    fn seal_target_bytes(&self) -> u64 {
+        self.seal_target_bytes
+            .unwrap_or(crate::rollup_cache::SEAL_TARGET_BYTES)
     }
 }
 
@@ -645,7 +677,10 @@ impl TemporalReduceSqlFile {
         // resolution, so a consumer of any resolution transparently materializes
         // the finer levels it depends on. Each level reuses its cache when
         // unchanged, so this is cheap after the first cold build.
-        let lateness_secs = filled.allowed_lateness_secs()?;
+        let policy = SealPolicy {
+            lateness_secs: filled.allowed_lateness_secs()?,
+            target_bytes: filled.seal_target_bytes(),
+        };
         let merged_dir = crate::rollup_cache::merged_dir(&cache_dir, &cfg_hash, &site_node_id);
 
         // Levels to build: finest .. this file's resolution (inclusive).
@@ -671,7 +706,7 @@ impl TemporalReduceSqlFile {
                     &res_dir,
                     &partials_table,
                     &glob_dir,
-                    lateness_secs,
+                    policy,
                 )
                 .await?
             } else {
@@ -697,7 +732,7 @@ impl TemporalReduceSqlFile {
                         &finer_table,
                         &finer_digest,
                         finer_rebuilt,
-                        lateness_secs,
+                        policy,
                     )
                     .await;
                 let _ = ctx.deregister_table(finer_table.as_str()).map_other()?;
@@ -958,6 +993,7 @@ impl TemporalReduceSqlFile {
         input_table: &str,
         in_bucket_col: &str,
         m: &mut crate::rollup_cache::SealedManifest,
+        policy: SealPolicy,
     ) -> TinyFSResult<()> {
         // Event-time frontier: newest output bucket over the input (epoch
         // seconds). Bounded MAX scan, no per-bucket state.
@@ -968,10 +1004,21 @@ impl TemporalReduceSqlFile {
         let watermark = data_hi_secs
             .map(|hi| (hi - m.allowed_lateness_secs).div_euclid(interval_secs) * interval_secs);
 
-        // Seal buckets [sealed_hi, watermark) into a new immutable run when the
-        // watermark advances. Bounded to the newly-frozen span.
+        // Seal buckets [sealed_hi, watermark) into a new immutable run once
+        // enough has accumulated to be worth freezing. Bounded to the
+        // newly-frozen span.
+        //
+        // The size gate is what keeps the run count proportional to data rather
+        // than to build frequency. `hot` currently spans [sealed_hi, inf), which
+        // contains the frozen span [sealed_hi, wm) a seal would write, so
+        // `hot_bytes` from the previous build is an upper bound on the seal's
+        // size: under target, there is nothing worth sealing and we skip without
+        // writing a candidate to find out. The buckets are not lost -- they stay
+        // in `hot`, which is recomputed from the input below, and are sealed in
+        // one larger run on a later build.
         if let Some(wm) = watermark
             && m.sealed_hi_secs.is_none_or(|sh| wm > sh)
+            && m.hot_bytes >= policy.target_bytes
         {
             let seal_sql = pieces.merge_partials_sql(
                 output_interval,
@@ -985,11 +1032,13 @@ impl TemporalReduceSqlFile {
             let run_file = crate::rollup_cache::run_path(res_dir, &name);
             let (run_digest, rows) = self.write_merge_to(ctx, &seal_sql, &run_file).await?;
             if rows > 0 {
+                let bytes = tokio::fs::metadata(&run_file).await.map_other()?.len();
                 m.runs.push(crate::rollup_cache::SealedRun {
                     name,
                     lo_secs: m.sealed_hi_secs,
                     hi_secs: wm,
                     digest: run_digest,
+                    bytes,
                 });
                 m.next_seq += 1;
             } else {
@@ -1014,6 +1063,10 @@ impl TemporalReduceSqlFile {
         let hot_file = crate::rollup_cache::hot_path(res_dir);
         let (hot_digest, _rows) = self.write_merge_to(ctx, &hot_sql, &hot_file).await?;
         m.hot_digest = Some(hot_digest);
+        m.hot_bytes = tokio::fs::metadata(&hot_file)
+            .await
+            .map(|md| md.len())
+            .unwrap_or(0);
         Ok(())
     }
 
@@ -1032,11 +1085,11 @@ impl TemporalReduceSqlFile {
         res_dir: &std::path::Path,
         partials_table: &str,
         glob_dir: &std::path::Path,
-        lateness_secs: i64,
+        policy: SealPolicy,
     ) -> TinyFSResult<LevelBuild> {
         let manifest = match crate::rollup_cache::read_sealed_manifest(res_dir).map_other()? {
             Some(m)
-                if m.allowed_lateness_secs == lateness_secs
+                if m.allowed_lateness_secs == policy.lateness_secs
                     && m.format == crate::rollup_cache::SEALED_FORMAT =>
             {
                 Some(m)
@@ -1110,7 +1163,7 @@ impl TemporalReduceSqlFile {
                          {}s). Data older than the watermark cannot reopen a \
                          sealed run. Re-run the export with --rebuild to \
                          recompute the rollup cache from scratch.",
-                        dl, sealed_hi, lateness_secs
+                        dl, sealed_hi, policy.lateness_secs
                     )));
                 }
                 (m, dirty_lo_secs)
@@ -1120,7 +1173,7 @@ impl TemporalReduceSqlFile {
                 (
                     crate::rollup_cache::SealedManifest {
                         format: crate::rollup_cache::SEALED_FORMAT.to_string(),
-                        allowed_lateness_secs: lateness_secs,
+                        allowed_lateness_secs: policy.lateness_secs,
                         ..Default::default()
                     },
                     None,
@@ -1137,6 +1190,7 @@ impl TemporalReduceSqlFile {
             partials_table,
             "time_bucket",
             &mut m,
+            policy,
         )
         .await?;
         m.covered = current_names;
@@ -1179,11 +1233,11 @@ impl TemporalReduceSqlFile {
         finer_table: &str,
         finer_digest: &str,
         finer_rebuilt: bool,
-        lateness_secs: i64,
+        policy: SealPolicy,
     ) -> TinyFSResult<LevelBuild> {
         let manifest = match crate::rollup_cache::read_sealed_manifest(res_dir).map_other()? {
             Some(m)
-                if m.allowed_lateness_secs == lateness_secs
+                if m.allowed_lateness_secs == policy.lateness_secs
                     && m.format == crate::rollup_cache::SEALED_FORMAT =>
             {
                 Some(m)
@@ -1227,7 +1281,7 @@ impl TemporalReduceSqlFile {
             (
                 crate::rollup_cache::SealedManifest {
                     format: crate::rollup_cache::SEALED_FORMAT.to_string(),
-                    allowed_lateness_secs: lateness_secs,
+                    allowed_lateness_secs: policy.lateness_secs,
                     ..Default::default()
                 },
                 None,
@@ -1244,6 +1298,7 @@ impl TemporalReduceSqlFile {
             finer_table,
             ts,
             &mut m,
+            policy,
         )
         .await?;
         m.covered = std::collections::BTreeSet::new();
@@ -2618,6 +2673,9 @@ mod tests {
             aggregations,
             transforms: None,
             allowed_lateness: None,
+            // Seal on every advance, as before the size gate existed: these
+            // tests assert seal MECHANICS on datasets far under any real target.
+            seal_target_bytes: Some(0),
         }
     }
 
@@ -3028,6 +3086,9 @@ mod tests {
                 ],
                 transforms: None,
                 allowed_lateness: None,
+                // Seal on every advance, as before the size gate existed: these
+                // tests assert seal MECHANICS on datasets far under any real target.
+                seal_target_bytes: Some(0),
             };
 
             let context = test_context(&provider_context, FileID::root());
@@ -3238,6 +3299,9 @@ mod tests {
                 aggregations: vec![],
                 transforms: None,
                 allowed_lateness: None,
+                // Seal on every advance, as before the size gate existed: these
+                // tests assert seal MECHANICS on datasets far under any real target.
+                seal_target_bytes: Some(0),
             };
             TemporalReduceSqlFile::new(
                 config,
@@ -3368,6 +3432,9 @@ mod tests {
                 ],
                 transforms: None,
                 allowed_lateness: None,
+                // Seal on every advance, as before the size gate existed: these
+                // tests assert seal MECHANICS on datasets far under any real target.
+                seal_target_bytes: Some(0),
             };
 
             let context = test_context(&provider_context, FileID::root());
@@ -3528,6 +3595,9 @@ mod tests {
             ],
             transforms: None,
             allowed_lateness: None,
+            // Seal on every advance, as before the size gate existed: these
+            // tests assert seal MECHANICS on datasets far under any real target.
+            seal_target_bytes: Some(0),
         };
 
         let make_ctx = |cache: Option<std::path::PathBuf>| {
@@ -3716,6 +3786,9 @@ mod tests {
             ],
             transforms: None,
             allowed_lateness: None,
+            // Seal on every advance, as before the size gate existed: these
+            // tests assert seal MECHANICS on datasets far under any real target.
+            seal_target_bytes: Some(0),
         };
 
         let make_ctx = |cache: Option<std::path::PathBuf>| {
@@ -3884,6 +3957,9 @@ mod tests {
             aggregations: vec![agg(AggregationType::Max, &["temperature"])],
             transforms: None,
             allowed_lateness: Some("1d".to_string()),
+            // Seal on every advance, as before the size gate existed: these
+            // tests assert seal MECHANICS on datasets far under any real target.
+            seal_target_bytes: Some(0),
         };
 
         let tmp = tempfile::tempdir().unwrap();
@@ -4011,6 +4087,9 @@ mod tests {
             aggregations: vec![agg(AggregationType::Avg, &["temperature"])],
             transforms: None,
             allowed_lateness: None,
+            // Seal on every advance, as before the size gate existed: these
+            // tests assert seal MECHANICS on datasets far under any real target.
+            seal_target_bytes: Some(0),
         };
 
         let tmp = tempfile::tempdir().unwrap();
@@ -4109,6 +4188,9 @@ mod tests {
             ],
             transforms: None,
             allowed_lateness: None,
+            // Seal on every advance, as before the size gate existed: these
+            // tests assert seal MECHANICS on datasets far under any real target.
+            seal_target_bytes: Some(0),
         };
 
         let tmp = tempfile::tempdir().unwrap();
@@ -4239,6 +4321,9 @@ mod tests {
             ],
             transforms: None,
             allowed_lateness: None,
+            // Seal on every advance, as before the size gate existed: these
+            // tests assert seal MECHANICS on datasets far under any real target.
+            seal_target_bytes: Some(0),
         };
 
         let make_ctx = |cache: Option<std::path::PathBuf>| {
@@ -4435,6 +4520,9 @@ mod tests {
             aggregations: vec![agg(AggregationType::Max, &["temperature"])],
             transforms: None,
             allowed_lateness: None,
+            // Seal on every advance, as before the size gate existed: these
+            // tests assert seal MECHANICS on datasets far under any real target.
+            seal_target_bytes: Some(0),
         };
 
         let make_ctx = |cache: std::path::PathBuf| {
@@ -4566,6 +4654,9 @@ mod tests {
             aggregations: vec![agg(AggregationType::Max, &["temperature"])],
             transforms: None,
             allowed_lateness: lateness.map(str::to_string),
+            // Seal on every advance, as before the size gate existed: these
+            // tests assert seal MECHANICS on datasets far under any real target.
+            seal_target_bytes: Some(0),
         }
     }
 
@@ -4730,6 +4821,9 @@ mod tests {
             aggregations: vec![agg(AggregationType::Avg, &["temperature"])],
             transforms: None,
             allowed_lateness: Some("1d".to_string()),
+            // Seal on every advance, as before the size gate existed: these
+            // tests assert seal MECHANICS on datasets far under any real target.
+            seal_target_bytes: Some(0),
         };
 
         // Grow history so the watermark advances and buckets seal into runs.
@@ -4868,6 +4962,81 @@ mod tests {
                 rows
             );
         }
+    }
+
+    /// Under the DEFAULT seal target, four days of a handful of rows each never
+    /// accumulate enough bytes to be worth freezing, so no run file is written
+    /// at all -- yet the query still returns every day correctly, because the
+    /// unsealed buckets simply stay in the recomputed hot window.
+    ///
+    /// This is the point of the size gate. Sealing used to fire whenever the
+    /// watermark moved, so a pond rebuilt on a timer grew one small file per
+    /// build regardless of how little data had arrived. The companion test
+    /// `test_sealed_runs_advance_as_history_grows` pins the mechanics with the
+    /// gate disabled; this one pins the policy, and together they show that
+    /// whether a bucket is sealed or hot is invisible to the answer.
+    #[tokio::test]
+    async fn small_data_seals_nothing_yet_still_reads_correctly() {
+        let _ = env_logger::try_init();
+        let persistence = tinyfs::MemoryPersistence::default();
+        let fs = tinyfs::FS::new(persistence.clone()).await.unwrap();
+        {
+            let root = fs.root().await.unwrap();
+            _ = root.create_dir_path("/ingest").await.unwrap();
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+
+        // Same shape as the mechanics test, but leaving seal_target_bytes unset
+        // so the real default (SEAL_TARGET_BYTES) applies.
+        let default_target = || {
+            let mut c = lateness_config(Some("1d"));
+            c.seal_target_bytes = None;
+            c
+        };
+
+        for day in 1..=4u32 {
+            append_day_series(&fs, "/ingest/weather.csv", day).await;
+            let rows = daily_max(&reduce_ctx(&persistence, &cache_dir), default_target())
+                .await
+                .expect("append within lateness window must succeed");
+            assert_eq!(rows.len(), day as usize, "day {day}: one bucket per day");
+        }
+
+        let runs = walk_find(&cache_dir, &|n| {
+            n.starts_with("run-") && n.ends_with(".parquet")
+        });
+        assert!(
+            runs.is_empty(),
+            "a few rows per day is far under {} bytes, so nothing should have \
+             been sealed; found {:?}",
+            crate::rollup_cache::SEAL_TARGET_BYTES,
+            runs
+        );
+
+        // Unsealed does not mean unavailable: every day is still answered, from
+        // the hot window alone.
+        let rows = daily_max(&reduce_ctx(&persistence, &cache_dir), default_target())
+            .await
+            .unwrap();
+        let approx = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert_eq!(rows.len(), 4, "all four days still present without any run");
+        for (i, day) in (1..=4u32).enumerate() {
+            assert!(
+                approx(rows[i], 43.5 + day as f64 * 100.0),
+                "day {day} max wrong: {rows:?}"
+            );
+        }
+
+        // And the watermark still advanced: the buckets are frozen-but-unsealed,
+        // waiting to be written as one larger run rather than four tiny ones.
+        let manifests = walk_find(&cache_dir, &|n| n == "manifest.json");
+        assert_eq!(manifests.len(), 1, "one manifest for the single resolution");
+        let m: Value = serde_json::from_slice(&std::fs::read(&manifests[0]).unwrap()).unwrap();
+        assert!(
+            m["runs"].as_array().is_some_and(Vec::is_empty),
+            "manifest must record no runs: {m}"
+        );
     }
 
     /// A backfill that lands INSIDE the allowed_lateness window (nothing older

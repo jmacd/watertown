@@ -256,13 +256,30 @@ pub fn list_glob_members(glob_dir: &Path) -> Result<Vec<PathBuf>> {
 //   {merged_dir}/res{secs}/
 //       run-00000000.parquet   immutable sealed run (buckets [lo, hi))
 //       run-00000001.parquet   ...
-//       hot.parquet            open buckets >= watermark, recomputed each build
+//       hot.parquet            every bucket at or above sealed_hi, recomputed
+//                              each build
 //       manifest.json          watermark + run ranges + coverage + digests
 //
-// Buckets below the watermark are frozen once and never rescanned, so per-build
-// cost is bounded to the hot window (~allowed_lateness). The read provider is a
+// Buckets below sealed_hi are frozen once and never rescanned, so per-build cost
+// is bounded to the hot window. That window holds the allowed-lateness tail plus
+// whatever has frozen since the last seal, which SEAL_TARGET_BYTES bounds. The read provider is a
 // `ListingTable` over the whole res dir (runs ⧺ hot); consumers apply their own
 // `ORDER BY`.
+
+/// Minimum accumulated size, in bytes, before frozen buckets are sealed into a
+/// run file.
+///
+/// Sealing used to trigger on the watermark advancing, which tied the file count
+/// to how often a build ran rather than to how much data existed: a pond rebuilt
+/// every minute grew a run file every minute, each a few kilobytes. Gating on
+/// size decouples the two, so the count tracks data volume.
+///
+/// Deliberately modest. The cost of raising it is that the hot window -- which is
+/// recomputed in full on every build -- carries the unsealed remainder, so the
+/// target bounds per-build work. 1 MiB keeps that recompute trivial while still
+/// collapsing hundreds of builds into one run. Compaction is the right tool for
+/// making files genuinely large; this only has to stop the bleeding.
+pub const SEAL_TARGET_BYTES: u64 = 1024 * 1024;
 
 /// One immutable sealed run file and the half-open output-bucket range it
 /// covers, in epoch seconds. `lo_secs` is `None` for the genesis run (unbounded
@@ -273,6 +290,9 @@ pub struct SealedRun {
     pub lo_secs: Option<i64>,
     pub hi_secs: i64,
     pub digest: String,
+    /// On-disk size of the run file in bytes, recorded when it was written.
+    /// Lets compaction choose merge candidates without stat-ing every run.
+    pub bytes: u64,
 }
 
 /// On-disk format of the sealed run + hot files. Bumped when their column
@@ -282,7 +302,7 @@ pub struct SealedRun {
 /// read time (design §3 / Phase 3 step 1) AND may derive a coarser resolution by
 /// folding the next-finer resolution's runs (`source_digest`; Phase 3 step 2);
 /// legacy caches deserialize with an empty `format` and are wiped + rebuilt.
-pub const SEALED_FORMAT: &str = "partials-v2";
+pub const SEALED_FORMAT: &str = "partials-v3";
 
 /// Manifest describing the sealed-runs cache for one output resolution. Its
 /// serialized bytes are the export-hint digest, so it must serialize
@@ -306,6 +326,15 @@ pub struct SealedManifest {
     pub runs: Vec<SealedRun>,
     /// blake3 digest of `hot.parquet`.
     pub hot_digest: Option<String>,
+    /// On-disk size of `hot.parquet` as of the last build, in bytes.
+    ///
+    /// This is the seal trigger. `hot` spans `[sealed_hi, inf)`, which strictly
+    /// contains the frozen span `[sealed_hi, watermark)` that a seal would
+    /// write, so this is a conservative upper bound on how much a seal would
+    /// produce: below the target, sealing cannot be worthwhile, and we can skip
+    /// it without writing anything to find out.
+    #[serde(default)]
+    pub hot_bytes: u64,
     /// Partial member file names this cache reflects (freshness key; identical
     /// role to the Phase 1 coverage sidecar). Used only by the finest resolution,
     /// which folds the shared finest partials directly; empty for coarser
@@ -690,8 +719,10 @@ mod tests {
                 lo_secs: None,
                 hi_secs: 120,
                 digest: run_digest,
+                bytes: 0,
             }],
             hot_digest: Some(hot_digest),
+            hot_bytes: 0,
             covered: BTreeSet::new(),
             source_digest: None,
         };
