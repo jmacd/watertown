@@ -3084,7 +3084,7 @@ query: ""
                 // Seal on every advance, as before the size gate existed: these
                 // tests assert seal MECHANICS on datasets far under any real target.
                 seal_target_bytes: Some(0),
-                max_live_runs: None,
+                max_live_segments: None,
             };
 
             TemporalReduceDirectory::new(config, context).unwrap()
@@ -3387,7 +3387,7 @@ query: ""
                 // Seal on every advance, as before the size gate existed: these
                 // tests assert seal MECHANICS on datasets far under any real target.
                 seal_target_bytes: Some(0),
-                max_live_runs: None,
+                max_live_segments: None,
             };
 
             // Create temporal reduce directory within the same transaction that will access it

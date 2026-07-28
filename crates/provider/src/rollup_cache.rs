@@ -147,18 +147,18 @@ pub fn merged_dir(cache_dir: &Path, cfg_hash: &str, node_id: &tinyfs::NodeID) ->
     cache_dir.join(format!("merged_{}_{}", cfg_hash, node_id))
 }
 
-// --- Segments: watermark + immutable sealed runs ------------------------------
+// --- Segments: watermark + immutable segments ------------------------------
 //
-// Each resolution is a directory of immutable *sealed run* files plus one
+// Each resolution is a directory of immutable *segment* files plus one
 // recomputed *hot* file, separated by a watermark derived from
 // `allowed_lateness`:
 //
 //   {merged_dir}/res{secs}/
-//       run-00000000.parquet   immutable sealed run (buckets [lo, hi))
-//       run-00000001.parquet   ...
+//       seg-00000000.parquet   immutable segment (buckets [lo, hi))
+//       seg-00000001.parquet   ...
 //       hot.parquet            every bucket at or above sealed_hi, recomputed
 //                              each build
-//       manifest.json          watermark + run ranges + source content + digests
+//       manifest.json          watermark + segment ranges + source content + digests
 //
 // Buckets below sealed_hi are frozen once and never rescanned, so per-build cost
 // is bounded to the hot window: the allowed-lateness tail plus whatever has
@@ -166,8 +166,8 @@ pub fn merged_dir(cache_dir: &Path, cfg_hash: &str, node_id: &tinyfs::NodeID) ->
 // one mutable Parquet whose sealed prefix is rewritten every build -- costs
 // O(history) I/O per build.
 //
-// Because a run is identified by the bucket range it covers, late data below the
-// watermark is answerable: the runs holding those buckets are found by lookup,
+// Because a segment is identified by the bucket range it covers, late data below the
+// watermark is answerable: the segments holding those buckets are found by lookup,
 // dropped, and recomputed by the ordinary seal path.
 //
 // The read provider names the manifest's members explicitly; it never lists the
@@ -175,17 +175,17 @@ pub fn merged_dir(cache_dir: &Path, cfg_hash: &str, node_id: &tinyfs::NodeID) ->
 // cannot be double-counted. Consumers apply their own `ORDER BY`.
 
 /// Minimum accumulated size, in bytes, before frozen buckets are sealed into a
-/// run file.
+/// segment file.
 ///
 /// Sealing used to trigger on the watermark advancing, which tied the file count
 /// to how often a build ran rather than to how much data existed: a pond rebuilt
-/// every minute grew a run file every minute, each a few kilobytes. Gating on
+/// every minute grew a segment file every minute, each a few kilobytes. Gating on
 /// size decouples the two, so the count tracks data volume.
 ///
 /// Deliberately modest. The cost of raising it is that the hot window -- which is
 /// recomputed in full on every build -- carries the unsealed remainder, so the
 /// target bounds per-build work. 1 MiB keeps that recompute trivial while still
-/// collapsing hundreds of builds into one run. Compaction is the right tool for
+/// collapsing hundreds of builds into one segment. Compaction is the right tool for
 /// making files genuinely large; this only has to stop the bleeding.
 pub const SEAL_TARGET_BYTES: u64 = 1024 * 1024;
 
@@ -220,43 +220,43 @@ impl SourceRange {
     };
 }
 
-/// Maximum number of sealed runs to leave live in one resolution before
+/// Maximum number of segments to leave live in one resolution before
 /// compaction merges regardless of size class.
 ///
-/// This bounds read fan-out: every query opens every live run plus hot, so the
+/// This bounds read fan-out: every query opens every live segment plus hot, so the
 /// count is what a reader pays. Size-tiered merging keeps the number near
 /// `log(data)` on its own; this is the backstop for ragged inputs.
-pub const MAX_LIVE_RUNS: usize = 50;
+pub const MAX_LIVE_SEGMENTS: usize = 50;
 
-/// One immutable sealed run file and the half-open output-bucket range it
-/// covers, in epoch seconds. `lo_secs` is `None` for the genesis run (unbounded
+/// One immutable segment file and the half-open output-bucket range it
+/// covers, in epoch seconds. `lo_secs` is `None` for the genesis segment (unbounded
 /// below); `hi_secs` is exclusive.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SealedRun {
+pub struct Segment {
     pub name: String,
     pub lo_secs: Option<i64>,
     pub hi_secs: i64,
     pub digest: String,
-    /// On-disk size of the run file in bytes, recorded when it was written.
-    /// Lets compaction choose merge candidates without stat-ing every run.
+    /// On-disk size of the segment file in bytes, recorded when it was written.
+    /// Lets compaction choose merge candidates without stat-ing every segment.
     pub bytes: u64,
 }
 
-/// On-disk format of the sealed run + hot files. Bumped when their column
+/// On-disk format of the segment + hot files. Bumped when their column
 /// layout or the manifest's build semantics change so an older cache is
 /// discarded and rebuilt rather than misread. `segments-v3` stores the
 /// *mergeable partials* (sum/count/min/max) with output columns reconstructed at
 /// read time, keys the finest resolution on source CONTENT (`sources`) rather
 /// than on per-version partial filenames, and may derive a coarser resolution by
-/// folding the next-finer resolution's runs (`source_digest`). Older caches
+/// folding the next-finer resolution's segments (`source_digest`). Older caches
 /// carry a different (or empty) `format` and are wiped + rebuilt.
 pub const SEALED_FORMAT: &str = "segments-v3";
 
-/// Manifest describing the sealed-runs cache for one output resolution. Its
+/// Manifest describing the segment cache for one output resolution. Its
 /// serialized bytes are the export-hint digest, so it must serialize
 /// deterministically (fixed field order; `covered` is an ordered set).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct SealedManifest {
+pub struct SegmentManifest {
     /// On-disk file format (see [`SEALED_FORMAT`]). Absent in legacy manifests,
     /// which deserialize to `""` and are treated as a format mismatch (rebuild).
     #[serde(default)]
@@ -265,13 +265,13 @@ pub struct SealedManifest {
     /// a different value discards and rebuilds the res dir.
     pub allowed_lateness_secs: i64,
     /// Exclusive upper bound (epoch seconds) of the sealed region: every output
-    /// bucket with start `< sealed_hi_secs` lives in some run. `None` before any
+    /// bucket with start `< sealed_hi_secs` lives in some segment. `None` before any
     /// bucket has been sealed.
     pub sealed_hi_secs: Option<i64>,
-    /// Next sealed-run sequence number for file naming.
+    /// Next segment sequence number for file naming.
     pub next_seq: u64,
-    /// Sealed run files in ascending bucket order.
-    pub runs: Vec<SealedRun>,
+    /// Sealed segment files in ascending bucket order.
+    pub segments: Vec<Segment>,
     /// blake3 digest of `hot.parquet`.
     pub hot_digest: Option<String>,
     /// On-disk size of `hot.parquet` as of the last build, in bytes.
@@ -300,7 +300,7 @@ pub struct SealedManifest {
     /// directory holding one file per version ever written was unbounded.
     pub sources: BTreeMap<String, SourceRange>,
     /// For a coarser resolution built by folding the next-finer resolution's
-    /// runs (Phase 3 step 2): the finer resolution's manifest digest this cache
+    /// segments (Phase 3 step 2): the finer resolution's manifest digest this cache
     /// was folded from. `None` for the finest resolution (which aggregates the
     /// sources directly and uses `sources`). A change in the finer digest
     /// triggers a coarse rebuild/advance.
@@ -308,13 +308,13 @@ pub struct SealedManifest {
     pub source_digest: Option<String>,
 }
 
-/// Per-resolution sealed-runs directory: `{merged_dir}/res{interval_secs}/`.
+/// Per-resolution segment directory: `{merged_dir}/res{interval_secs}/`.
 #[must_use]
-pub fn sealed_res_dir(merged_dir: &Path, interval_secs: u64) -> PathBuf {
+pub fn segment_res_dir(merged_dir: &Path, interval_secs: u64) -> PathBuf {
     merged_dir.join(format!("res{}", interval_secs))
 }
 
-fn sealed_manifest_path(res_dir: &Path) -> PathBuf {
+fn segment_manifest_path(res_dir: &Path) -> PathBuf {
     res_dir.join("manifest.json")
 }
 
@@ -324,17 +324,17 @@ pub fn hot_path(res_dir: &Path) -> PathBuf {
     res_dir.join("hot.parquet")
 }
 
-/// Path of a sealed run file by name in a res dir.
+/// Path of a segment file by name in a res dir.
 #[must_use]
-pub fn run_path(res_dir: &Path, name: &str) -> PathBuf {
+pub fn segment_path(res_dir: &Path, name: &str) -> PathBuf {
     res_dir.join(name)
 }
 
-/// Read the sealed-runs manifest. `Ok(None)` when absent (fresh cache). A
+/// Read the segment manifest. `Ok(None)` when absent (fresh cache). A
 /// present-but-unparseable manifest is a hard error rather than a silent
 /// rebuild, matching the frontier/merged-cache corruption discipline.
-pub fn read_sealed_manifest(res_dir: &Path) -> Result<Option<SealedManifest>> {
-    let path = sealed_manifest_path(res_dir);
+pub fn read_segment_manifest(res_dir: &Path) -> Result<Option<SegmentManifest>> {
+    let path = segment_manifest_path(res_dir);
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -342,7 +342,7 @@ pub fn read_sealed_manifest(res_dir: &Path) -> Result<Option<SealedManifest>> {
     };
     serde_json::from_slice(&bytes).map(Some).map_err(|e| {
         crate::error::Error::CacheCorrupt(format!(
-            "sealed-runs manifest '{}' is present but unparseable ({}); the rollup \
+            "segment manifest '{}' is present but unparseable ({}); the rollup \
              cache is corrupt. Re-run the export with --rebuild to recompute it.",
             path.display(),
             e
@@ -352,31 +352,31 @@ pub fn read_sealed_manifest(res_dir: &Path) -> Result<Option<SealedManifest>> {
 
 /// Compute the export-hint digest of a manifest without writing it (used on the
 /// reuse path, where the res dir is served unchanged).
-pub fn sealed_manifest_digest(manifest: &SealedManifest) -> Result<String> {
+pub fn segment_manifest_digest(manifest: &SegmentManifest) -> Result<String> {
     let bytes = serde_json::to_vec_pretty(manifest)
         .map_err(|e| crate::error::Error::Arrow(format!("serialize sealed manifest: {}", e)))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
-/// Persist the sealed-runs manifest atomically (tmp + rename) and return the
+/// Persist the segment manifest atomically (tmp + rename) and return the
 /// blake3 digest of its serialized bytes, which callers use as the export-hint
 /// digest for the whole resolution.
-pub async fn write_sealed_manifest(res_dir: &Path, manifest: &SealedManifest) -> Result<String> {
+pub async fn write_segment_manifest(res_dir: &Path, manifest: &SegmentManifest) -> Result<String> {
     tokio::fs::create_dir_all(res_dir).await?;
     let bytes = serde_json::to_vec_pretty(manifest)
         .map_err(|e| crate::error::Error::Arrow(format!("serialize sealed manifest: {}", e)))?;
     let digest = blake3::hash(&bytes).to_hex().to_string();
-    let path = sealed_manifest_path(res_dir);
+    let path = segment_manifest_path(res_dir);
     let tmp = PathBuf::from(format!("{}.tmp", path.display()));
     tokio::fs::write(&tmp, &bytes).await?;
     tokio::fs::rename(&tmp, &path).await?;
     Ok(digest)
 }
 
-/// Delete run files that compaction superseded.
+/// Delete segment files that compaction superseded.
 ///
 /// MUST be called only after the manifest naming their replacement has been
-/// durably written. Publishing the merged run first and deleting its inputs
+/// durably written. Publishing the merged segment first and deleting its inputs
 /// second means a crash in between leaves orphans rather than a hole, and
 /// orphans are harmless precisely because reads enumerate the manifest instead
 /// of listing the directory. Doing it the other way round would lose data.
@@ -389,7 +389,7 @@ pub async fn remove_superseded(files: &[PathBuf]) {
             && e.kind() != std::io::ErrorKind::NotFound
         {
             log::warn!(
-                "rollup compaction: could not remove superseded run {}: {e}",
+                "rollup compaction: could not remove superseded segment {}: {e}",
                 f.display()
             );
         }
@@ -398,7 +398,7 @@ pub async fn remove_superseded(files: &[PathBuf]) {
 
 /// Remove an entire res dir, forcing this resolution to be rebuilt from source
 /// (used when `allowed_lateness` or the on-disk format changes).
-pub fn wipe_sealed_res_dir(res_dir: &Path) -> Result<()> {
+pub fn wipe_segment_res_dir(res_dir: &Path) -> Result<()> {
     match std::fs::remove_dir_all(res_dir) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -407,7 +407,7 @@ pub fn wipe_sealed_res_dir(res_dir: &Path) -> Result<()> {
 }
 
 /// Build the read provider for a res dir: a `ListingTable` over exactly the
-/// sealed runs named by `manifest`, plus the hot file. A manifest member
+/// segments named by `manifest`, plus the hot file. A manifest member
 /// missing on disk is a hard error (corrupt cache), never a silent hole in the
 /// series.
 ///
@@ -416,22 +416,22 @@ pub fn wipe_sealed_res_dir(res_dir: &Path) -> Result<()> {
 /// referenced by the manifest, and every such orphan is a duplicate copy of
 /// some bucket range that a directory-shaped scan sums a second time. Orphans
 /// arise in normal operation, not only after a crash -- [`crate::version_cache::write_parquet_atomic`]
-/// renames a new run into place BEFORE the manifest recording it is written, so
+/// renames a new segment into place BEFORE the manifest recording it is written, so
 /// any interruption in that window leaves one behind, and compaction (which must
 /// publish a merged segment before deleting its inputs) widens that window by
 /// design. This is the same defect that let a directory-listed format cache
 /// double-count the versions a collapse superseded; the fix is the same one.
 pub async fn listing_table_for_res_dir(
     res_dir: &Path,
-    manifest: &SealedManifest,
+    manifest: &SegmentManifest,
     ts_column: &str,
 ) -> Result<Arc<dyn TableProvider>> {
-    let mut files: Vec<PathBuf> = Vec::with_capacity(manifest.runs.len() + 1);
-    for run in &manifest.runs {
-        let p = run_path(res_dir, &run.name);
+    let mut files: Vec<PathBuf> = Vec::with_capacity(manifest.segments.len() + 1);
+    for seg in &manifest.segments {
+        let p = segment_path(res_dir, &seg.name);
         if !p.exists() {
             return Err(crate::error::Error::CacheCorrupt(format!(
-                "sealed run '{}' recorded in the manifest is missing on disk; the \
+                "segment '{}' recorded in the manifest is missing on disk; the \
                  rollup cache is corrupt. Re-run the export with --rebuild.",
                 p.display()
             )));
@@ -441,7 +441,7 @@ pub async fn listing_table_for_res_dir(
     let hot = hot_path(res_dir);
     if !hot.exists() {
         return Err(crate::error::Error::CacheCorrupt(format!(
-            "sealed-runs hot file '{}' is missing; the rollup cache is corrupt. \
+            "hot file '{}' is missing; the rollup cache is corrupt. \
              Re-run the export with --rebuild.",
             hot.display()
         )));
@@ -455,7 +455,7 @@ pub async fn listing_table_for_res_dir(
 ///
 /// The explicit list is the point: a directory-shaped table would also pick up
 /// orphans, which is the defect [`listing_table_for_res_dir`] exists to avoid.
-/// Compaction needs the same guarantee over a subset -- it reads only the runs
+/// Compaction needs the same guarantee over a subset -- it reads only the segments
 /// it is merging -- so both go through here.
 pub async fn listing_table_for_files(
     files: &[PathBuf],
@@ -470,12 +470,12 @@ pub async fn listing_table_for_files(
     for p in files {
         paths.push(ListingTableUrl::parse(format!("file://{}", p.display()))?);
     }
-    // Every run and the hot file is written by a query ending in
+    // Every segment and the hot file is written by a query ending in
     // `ORDER BY time_bucket`, so each file is individually sorted ascending on
-    // the timestamp column, and the runs' bucket ranges are disjoint. Declaring
+    // the timestamp column, and the segments' bucket ranges are disjoint. Declaring
     // that file-level ordering lets the physical planner satisfy a consumer's
     // `ORDER BY {ts}` with a streaming `SortPreservingMergeExec` (k-way merge of
-    // the already-sorted runs + hot) instead of a `SortExec` that buffers the
+    // the already-sorted segments + hot) instead of a `SortExec` that buffers the
     // whole reduced series in memory -- the O(1)-memory read path from the design
     // §3. Parquet statistics (collected by default) give the planner the per-file
     // min/max it needs to order the file groups.
@@ -602,7 +602,7 @@ mod tests {
     /// A stray Parquet in the res dir must not contribute rows: the manifest,
     /// not the directory listing, defines what the scan reads.
     ///
-    /// Orphans are ordinary, not exotic. `write_parquet_atomic` renames a run
+    /// Orphans are ordinary, not exotic. `write_parquet_atomic` renames a segment
     /// into place before the manifest naming it is written, so an interruption
     /// in that window leaves one; compaction must publish a merged segment
     /// before deleting the inputs it replaces, so it holds that window open on
@@ -620,10 +620,10 @@ mod tests {
             write_parquet_atomic(path, schema, s).await.unwrap()
         }
 
-        // One sealed run covering buckets [0, 120) and the open hot file.
-        let run_name = "run-00000000.parquet";
-        let run_digest = put(
-            &run_path(&res_dir, run_name),
+        // One segment covering buckets [0, 120) and the open hot file.
+        let seg_name = "seg-00000000.parquet";
+        let seg_digest = put(
+            &segment_path(&res_dir, seg_name),
             schema.clone(),
             partials_batch(&schema, &[0, 60], &[10.0, 20.0], &[1, 2]),
         )
@@ -635,26 +635,26 @@ mod tests {
         )
         .await;
 
-        // The orphan: a duplicate of the sealed run under a name the manifest
+        // The orphan: a duplicate of the segment under a name the manifest
         // never records, as an interrupted seal or an in-flight compaction
         // would leave behind.
         _ = put(
-            &run_path(&res_dir, "run-00000001.parquet"),
+            &segment_path(&res_dir, "seg-00000001.parquet"),
             schema.clone(),
             partials_batch(&schema, &[0, 60], &[10.0, 20.0], &[1, 2]),
         )
         .await;
 
-        let manifest = SealedManifest {
+        let manifest = SegmentManifest {
             format: SEALED_FORMAT.to_string(),
             allowed_lateness_secs: 0,
             sealed_hi_secs: Some(120),
             next_seq: 1,
-            runs: vec![SealedRun {
-                name: run_name.to_string(),
+            segments: vec![Segment {
+                name: seg_name.to_string(),
                 lo_secs: None,
                 hi_secs: 120,
-                digest: run_digest,
+                digest: seg_digest,
                 bytes: 0,
             }],
             hot_digest: Some(hot_digest),
@@ -733,14 +733,14 @@ mod tests {
     async fn test_merged_cache_drop_all_removes_merged_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let node_id = test_node_id();
-        // Materialize a sealed-runs res dir so drop_all has a merged_* dir to
+        // Materialize a segment res dir so drop_all has a merged_* dir to
         // remove.
-        let res_dir = sealed_res_dir(&merged_dir(tmp.path(), "cfg", &node_id), 60);
-        let manifest = SealedManifest {
+        let res_dir = segment_res_dir(&merged_dir(tmp.path(), "cfg", &node_id), 60);
+        let manifest = SegmentManifest {
             allowed_lateness_secs: 86400,
             ..Default::default()
         };
-        let _ = write_sealed_manifest(&res_dir, &manifest).await.unwrap();
+        let _ = write_segment_manifest(&res_dir, &manifest).await.unwrap();
         assert!(res_dir.exists());
         let dropped = drop_all(tmp.path()).unwrap();
         assert!(dropped >= 1);
