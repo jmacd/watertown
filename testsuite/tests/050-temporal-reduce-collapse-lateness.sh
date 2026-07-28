@@ -18,15 +18,17 @@
 #   The original mitigation was to raise allowed_lateness so the collapse
 #   window stays inside the unsealed hot window (config/water.yaml sets 14d on
 #   every reduced instrument). That mitigation hid a deeper defect: the merged
-#   version's partial was ADDED to the rollup partials directory while the
-#   superseded versions' partials stayed, so at 14d the read did not fail --
-#   it silently summed the collapsed window twice (see test 733).
+#   version's rows were ADDED to the rollup while the superseded versions' rows
+#   stayed, so at 14d the read did not fail -- it silently summed the collapsed
+#   window twice (see test 733).
 #
-#   The real fix is reconciliation: the partials directory is now a projection
-#   of the source node's LIVE versions, so a collapse DELETES the superseded
-#   partials. A sealed run built from partials that no longer exist is no
-#   longer a valid incremental base, so the level is rebuilt from the live
-#   partials rather than either erroring or double-counting.
+#   The real fix is to stop keying the cache on version identity at all. The
+#   manifest now records the CONTENT of each live source version (its blake3 and
+#   its event-time range), so a collapse -- which rewrites N versions into one
+#   with identical content -- changes the version numbers but not the recorded
+#   ranges' union. What did change is dirty, and only that range is recomputed;
+#   the segments covering it are unsealed rather than rejected. A collapse that
+#   preserves content is therefore neither an error nor a double-count.
 #
 #   Both reduced nodes below read the SAME collapsed source; only their
 #   allowed_lateness differs, isolating the knob under test.

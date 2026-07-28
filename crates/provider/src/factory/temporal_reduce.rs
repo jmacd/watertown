@@ -146,9 +146,10 @@ pub struct TemporalReduceConfig {
     /// `newest_bucket - allowed_lateness` are frozen into immutable segment files and
     /// never recomputed, which bounds the rollup's working set to this window
     /// instead of all history. Parsed with `humantime::parse_duration`; defaults
-    /// to one day. Data arriving older than the sealed watermark is a hard error
-    /// (re-run with `--rebuild`). Changing this value invalidates the merged
-    /// (segment) cache, which is rebuilt from the retained partials.
+    /// to one day. Data arriving older than the sealed watermark is not an
+    /// error: the segments covering it are unsealed and recomputed from source.
+    /// Changing this value invalidates the merged (segment) cache, which is
+    /// rebuilt from the cached source versions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_lateness: Option<String>,
 
@@ -235,14 +236,57 @@ impl TemporalReduceConfig {
 /// mergeable-partials form), which the next-coarser level folds and which the
 /// final level wraps in a read-time reconstruction view. `digest` is the level's
 /// manifest digest (the coarser level records it as its `source_digest`);
-/// `changed_since` feeds the export hint; `rebuilt` is true when this level was
+/// `changed` feeds the export hint and the coarser level's unsealing;
+/// `rebuilt` is true when this level was
 /// wiped and rebuilt from scratch (a non-append change), which forces the next
 /// coarser level to rebuild too.
 struct LevelBuild {
     provider: Arc<dyn datafusion::catalog::TableProvider>,
     digest: String,
-    changed_since: Option<i64>,
+    changed: LevelChange,
     rebuilt: bool,
+}
+
+/// Which output buckets a level changed this build.
+///
+/// This used to be a bare `Option<i64>` carrying three different meanings on
+/// the same `None`: "nothing changed" (reuse), "everything changed" (rebuild),
+/// and "the dirty range is unbounded" (a source version with no recorded event
+/// range). That conflation is harmless for the export hint, which treats every
+/// `None` as "rewrite all", but it is not harmless for the coarser level, which
+/// must unseal EVERYTHING in the last two cases and NOTHING in the first.
+/// Spelling the three out keeps a reader of one from silently behaving like a
+/// reader of another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LevelChange {
+    /// Nothing changed; the level was served from cache untouched.
+    Nothing,
+    /// Every bucket at or after this one (epoch seconds, bucket-aligned).
+    Since(i64),
+    /// The whole axis: a rebuild, or a dirty range with no lower bound.
+    Everything,
+}
+
+impl LevelChange {
+    /// The dirty point to hand `unseal_from`, whose `None` means "the whole
+    /// axis". Returns `None` for [`LevelChange::Nothing`] too, so callers must
+    /// check that case before calling.
+    fn dirty_lo(self) -> Option<i64> {
+        match self {
+            LevelChange::Since(s) => Some(s),
+            LevelChange::Nothing | LevelChange::Everything => None,
+        }
+    }
+
+    /// The export hint's `changed_since`, where `None` means "rewrite every
+    /// partition". Unchanged levels are reported as `None` as well; the hint's
+    /// digest is what lets the exporter skip them.
+    fn export_hint(self) -> Option<i64> {
+        match self {
+            LevelChange::Since(s) => Some(s),
+            LevelChange::Nothing | LevelChange::Everything => None,
+        }
+    }
 }
 
 pub struct TemporalReduceSqlFile {
@@ -646,6 +690,9 @@ impl TemporalReduceSqlFile {
 
         let mut finer: Option<(String, Arc<dyn datafusion::catalog::TableProvider>)> = None;
         let mut finer_rebuilt = false;
+        // The finer level's dirty point, so a backfill propagates up the chain
+        // instead of stopping at the finest resolution.
+        let mut finer_changed: LevelChange = LevelChange::Nothing;
         let mut final_level: Option<LevelBuild> = None;
 
         for (idx, level) in levels.iter().copied().enumerate() {
@@ -689,6 +736,7 @@ impl TemporalReduceSqlFile {
                         &finer_table,
                         &finer_digest,
                         finer_rebuilt,
+                        finer_changed,
                         policy,
                     )
                     .await;
@@ -696,6 +744,7 @@ impl TemporalReduceSqlFile {
                 out?
             };
             finer_rebuilt = built.rebuilt;
+            finer_changed = built.changed;
             finer = Some((built.digest.clone(), built.provider.clone()));
             final_level = Some(built);
         }
@@ -704,7 +753,7 @@ impl TemporalReduceSqlFile {
         let (table_provider, digest, changed_since) = (
             final_level.provider,
             final_level.digest,
-            final_level.changed_since,
+            final_level.changed.export_hint(),
         );
 
         // The segments + hot file store mergeable partials
@@ -1013,19 +1062,20 @@ impl TemporalReduceSqlFile {
         source_table: &str,
         policy: SealPolicy,
     ) -> TinyFSResult<LevelBuild> {
-        let manifest = match crate::rollup_cache::read_segment_manifest(res_dir).map_other()? {
-            Some(m)
-                if m.allowed_lateness_secs == policy.lateness_secs
-                    && m.format == crate::rollup_cache::SEALED_FORMAT =>
-            {
+        let manifest =
+            match crate::rollup_cache::read_verified_segment_manifest(res_dir).map_other()? {
                 Some(m)
-            }
-            Some(_) => {
-                crate::rollup_cache::wipe_segment_res_dir(res_dir).map_other()?;
-                None
-            }
-            None => None,
-        };
+                    if m.allowed_lateness_secs == policy.lateness_secs
+                        && m.format == crate::rollup_cache::SEALED_FORMAT =>
+                {
+                    Some(m)
+                }
+                Some(_) => {
+                    crate::rollup_cache::wipe_segment_res_dir(res_dir).map_other()?;
+                    None
+                }
+                None => None,
+            };
 
         enum Plan {
             Reuse,
@@ -1059,16 +1109,29 @@ impl TemporalReduceSqlFile {
             return Ok(LevelBuild {
                 provider,
                 digest,
-                changed_since: None,
+                changed: LevelChange::Nothing,
                 rebuilt: false,
             });
         }
 
         let rebuilt = matches!(plan, Plan::Rebuild);
-        let (mut m, mut unsealed, changed_since) = match plan {
+        let (mut m, mut unsealed, changed) = match plan {
             Plan::Incremental { dirty_lo_us } => {
                 let mut m = manifest.expect("incremental implies a manifest");
-                let dirty_lo_secs = dirty_lo_us.map(floor_us_to_secs);
+                // Floor to the BUCKET, not just to the second. `sealed_hi_secs`
+                // is a bucket boundary everywhere else, and every consumer
+                // compares it against a bucket START (`merge_partials_sql`
+                // filters `date_bin(...) >= lo`). An unaligned watermark would
+                // leave the bucket containing the dirty point in neither a
+                // segment (they stop at the aligned edge below it) nor the hot
+                // window (it starts strictly above it), silently dropping that
+                // bucket -- including the very rows that made it dirty. It
+                // would also prune source versions at the unaligned point,
+                // dropping rows in [bucket_start, dirty_lo) that the bucket
+                // still needs.
+                let dirty_lo_secs = dirty_lo_us
+                    .map(floor_us_to_secs)
+                    .map(|s| floor_secs_to_bucket(s, output_interval));
                 // Late data is ordinary work now, not a --rebuild error. Buckets
                 // at or after the dirty point must be recomputed; those below
                 // sealed_hi live in immutable segments, so the segments covering
@@ -1081,7 +1144,12 @@ impl TemporalReduceSqlFile {
                 // Under the old version-keyed layout there was no way to find
                 // them again, which is exactly why it had to error instead.
                 let unsealed = unseal_from(&mut m, dirty_lo_secs, res_dir)?;
-                (m, unsealed, dirty_lo_secs)
+                let changed = match dirty_lo_secs {
+                    Some(lo) => LevelChange::Since(lo),
+                    // An unbounded dirty range is the whole axis, not "nothing".
+                    None => LevelChange::Everything,
+                };
+                (m, unsealed, changed)
             }
             _ => {
                 crate::rollup_cache::wipe_segment_res_dir(res_dir).map_other()?;
@@ -1092,7 +1160,7 @@ impl TemporalReduceSqlFile {
                         ..Default::default()
                     },
                     Vec::new(),
-                    None,
+                    LevelChange::Everything,
                 )
             }
         };
@@ -1101,7 +1169,7 @@ impl TemporalReduceSqlFile {
         // [sealed_hi, inf) plus the dirty range. Pruning below this is what
         // keeps an incremental build off the whole history; pruning ABOVE it
         // would silently drop contributing rows, so take the lower of the two.
-        let read_lo_us = match (m.sealed_hi_secs, changed_since) {
+        let read_lo_us = match (m.sealed_hi_secs, changed.dirty_lo()) {
             (Some(sealed_hi), Some(dirty_lo)) => Some(secs_to_us(sealed_hi.min(dirty_lo))),
             // No watermark means every bucket is hot: read everything.
             (None, _) => None,
@@ -1112,6 +1180,21 @@ impl TemporalReduceSqlFile {
         // what `seal_and_recompute` folds, so it plays exactly the role the
         // partials directory used to -- as a query, not as a file population.
         let source_set = bounded_source_set(cache_dir, scheme, source_nodes, read_lo_us);
+        // This build is about to record `now` as the coverage of what it wrote.
+        // A live version whose sidecar vanished (a concurrent reconciler deleted
+        // it; neither side locks) would contribute no rows, and the manifest
+        // would then claim it was covered -- an undercount that agrees with
+        // itself forever, because the next build sees `sources == now` and
+        // reuses. Fail the build instead; the retry re-caches and succeeds.
+        if !source_set.missing().is_empty() {
+            return Err(tinyfs::Error::Other(format!(
+                "temporal-reduce rollup: {} live source version(s) have no cached \
+                 Parquet (first: {}). This is a lost race with cache \
+                 reconciliation, not a data error; re-run the read.",
+                source_set.missing().len(),
+                source_set.missing()[0].display(),
+            )));
+        }
         let provider = source_set.table_provider().await.map_other()?;
         let available: std::collections::HashSet<String> = provider
             .schema()
@@ -1167,7 +1250,7 @@ impl TemporalReduceSqlFile {
         Ok(LevelBuild {
             provider,
             digest,
-            changed_since,
+            changed,
             rebuilt,
         })
     }
@@ -1182,8 +1265,14 @@ impl TemporalReduceSqlFile {
     ///
     /// No beyond-window hard-fail is needed here: this level's watermark aligns
     /// down at least as far as the finer level's (coarser interval, same
-    /// lateness), so `coarse_sealed_hi ≤ finer_sealed_hi`, and the finest level
-    /// already enforces the append-only contract for the whole chain.
+    /// lateness), so `coarse_sealed_hi ≤ finer_sealed_hi`.
+    ///
+    /// `finer_changed` is what the finer level changed. Late data is NOT a
+    /// rebuild -- it takes the finer level's incremental path -- so
+    /// `finer_rebuilt` alone would leave this level's segments below its own
+    /// watermark holding pre-backfill values forever. This level therefore
+    /// unseals from the same point, or unseals entirely when the finer level's
+    /// dirty range was unbounded.
     #[allow(clippy::too_many_arguments)]
     async fn build_level_from_finer(
         &self,
@@ -1195,21 +1284,23 @@ impl TemporalReduceSqlFile {
         finer_table: &str,
         finer_digest: &str,
         finer_rebuilt: bool,
+        finer_changed: LevelChange,
         policy: SealPolicy,
     ) -> TinyFSResult<LevelBuild> {
-        let manifest = match crate::rollup_cache::read_segment_manifest(res_dir).map_other()? {
-            Some(m)
-                if m.allowed_lateness_secs == policy.lateness_secs
-                    && m.format == crate::rollup_cache::SEALED_FORMAT =>
-            {
+        let manifest =
+            match crate::rollup_cache::read_verified_segment_manifest(res_dir).map_other()? {
                 Some(m)
-            }
-            Some(_) => {
-                crate::rollup_cache::wipe_segment_res_dir(res_dir).map_other()?;
-                None
-            }
-            None => None,
-        };
+                    if m.allowed_lateness_secs == policy.lateness_secs
+                        && m.format == crate::rollup_cache::SEALED_FORMAT =>
+                {
+                    Some(m)
+                }
+                Some(_) => {
+                    crate::rollup_cache::wipe_segment_res_dir(res_dir).map_other()?;
+                    None
+                }
+                None => None,
+            };
 
         // Reuse: the finer level was reused (not rebuilt) and its digest matches
         // what this level last folded, so nothing downstream changed.
@@ -1224,7 +1315,7 @@ impl TemporalReduceSqlFile {
             return Ok(LevelBuild {
                 provider,
                 digest,
-                changed_since: None,
+                changed: LevelChange::Nothing,
                 rebuilt: false,
             });
         }
@@ -1233,11 +1324,33 @@ impl TemporalReduceSqlFile {
         // below our watermark is immutable, so our segments stay valid);
         // otherwise rebuild from empty.
         let can_advance = !finer_rebuilt && manifest.is_some();
-        let (mut m, changed_since, rebuilt) = if can_advance {
-            let m = manifest.expect("can_advance implies a manifest");
-            // Earliest coarse bucket that the hot recompute may change.
-            let changed_since = m.sealed_hi_secs;
-            (m, changed_since, false)
+        let (mut m, mut unsealed, changed, rebuilt) = if can_advance {
+            let mut m = manifest.expect("can_advance implies a manifest");
+            // Late data at the finest level lowered ITS watermark; ours must
+            // follow, or our segments keep their pre-backfill values forever.
+            // Align to our own (coarser) bucket so the watermark stays a bucket
+            // boundary -- see `floor_secs_to_bucket`.
+            let unsealed = match finer_changed {
+                // Nothing below our watermark moved, so our segments stand.
+                LevelChange::Nothing => Vec::new(),
+                // Align to OUR (coarser) bucket: a watermark must be a bucket
+                // boundary or the bucket straddling it belongs to neither the
+                // sealed nor the hot side. See `floor_secs_to_bucket`.
+                LevelChange::Since(lo) => unseal_from(
+                    &mut m,
+                    Some(floor_secs_to_bucket(lo, output_interval)),
+                    res_dir,
+                )?,
+                // Unbounded: unseal everything.
+                LevelChange::Everything => unseal_from(&mut m, None, res_dir)?,
+            };
+            // Post-unseal, so it already reflects any segments folded back in.
+            // No watermark left means the whole axis is hot.
+            let changed = match m.sealed_hi_secs {
+                Some(hi) => LevelChange::Since(hi),
+                None => LevelChange::Everything,
+            };
+            (m, unsealed, changed, false)
         } else {
             crate::rollup_cache::wipe_segment_res_dir(res_dir).map_other()?;
             (
@@ -1246,7 +1359,8 @@ impl TemporalReduceSqlFile {
                     allowed_lateness_secs: policy.lateness_secs,
                     ..Default::default()
                 },
-                None,
+                Vec::new(),
+                LevelChange::Everything,
                 true,
             )
         };
@@ -1271,14 +1385,15 @@ impl TemporalReduceSqlFile {
             .await
             .map_other()?;
         // Only now that the manifest naming the merged segments is durable.
-        crate::rollup_cache::remove_superseded(&superseded).await;
+        unsealed.extend(superseded);
+        crate::rollup_cache::remove_superseded(&unsealed).await;
         let provider = crate::rollup_cache::listing_table_for_res_dir(res_dir, &m, ts)
             .await
             .map_other()?;
         Ok(LevelBuild {
             provider,
             digest,
-            changed_since,
+            changed,
             rebuilt,
         })
     }
@@ -2718,6 +2833,16 @@ fn bounded_source_set(
 /// bounds, so a rounding error can only cause extra work, never dropped data.
 fn floor_us_to_secs(us: i64) -> i64 {
     us.div_euclid(1_000_000)
+}
+
+/// Epoch seconds -> the start of the output bucket containing them, rounding
+/// DOWN. `sealed_hi_secs` and every segment edge are bucket boundaries, and the
+/// read path filters on a bucket START, so any value used as a watermark must
+/// be aligned or the bucket straddling it belongs to neither the sealed nor the
+/// hot side.
+fn floor_secs_to_bucket(secs: i64, interval: Duration) -> i64 {
+    let i = interval.as_secs() as i64;
+    if i <= 0 { secs } else { secs.div_euclid(i) * i }
 }
 
 fn secs_to_us(secs: i64) -> i64 {
@@ -4250,6 +4375,43 @@ mod tests {
         let dropped = unseal_from(&mut m, Some(300), dir).unwrap();
         assert!(dropped.is_empty(), "no segment covers [300, 500)");
         assert_eq!(m.sealed_hi_secs, Some(300));
+
+        // The watermark this produces is exactly the dirty point, so the dirty
+        // point MUST already be bucket-aligned -- see `floor_secs_to_bucket` and
+        // the caller. An unaligned one would leave the bucket containing it in
+        // neither a segment (they stop at the aligned edge below) nor the hot
+        // window (it starts strictly at or above the watermark, because the read
+        // filters on a bucket START), dropping that bucket and the very rows
+        // that made it dirty.
+        let interval = Duration::from_secs(100);
+        let mut m = crate::rollup_cache::SegmentManifest {
+            sealed_hi_secs: Some(500),
+            segments: vec![seg("seg-0", None, 100)],
+            ..Default::default()
+        };
+        let unaligned = 350;
+        let _ = unseal_from(&mut m, Some(floor_secs_to_bucket(unaligned, interval)), dir).unwrap();
+        assert_eq!(
+            m.sealed_hi_secs,
+            Some(300),
+            "the watermark must fall to the START of the bucket holding the \
+             dirty point, not to the dirty point itself"
+        );
+    }
+
+    /// Watermarks are bucket boundaries; flooring must round toward -inf so it
+    /// holds for pre-epoch times too.
+    #[test]
+    fn test_floor_secs_to_bucket_rounds_down() {
+        let hour = Duration::from_secs(3600);
+        assert_eq!(floor_secs_to_bucket(3600, hour), 3600, "already aligned");
+        assert_eq!(floor_secs_to_bucket(3601, hour), 3600);
+        assert_eq!(floor_secs_to_bucket(7199, hour), 3600);
+        // Pre-epoch: -1s is in the bucket starting at -3600, not at 0.
+        assert_eq!(floor_secs_to_bucket(-1, hour), -3600);
+        assert_eq!(floor_secs_to_bucket(-3600, hour), -3600);
+        // A zero interval cannot divide; pass the value through rather than panic.
+        assert_eq!(floor_secs_to_bucket(42, Duration::from_secs(0)), 42);
     }
 
     /// Phase 3: non-nesting resolution sets are rejected so cascaded rollups can
@@ -4883,7 +5045,16 @@ mod tests {
             out_pattern: "weather".to_string(),
             time_column: "timestamp".to_string(),
             resolutions: vec!["1d".to_string()],
-            aggregations: vec![agg(AggregationType::Max, &["temperature"])],
+            // Max ALONE is invariant under both double-counting and dropping a
+            // duplicate: max(x, x) == x. It cannot distinguish "every row was
+            // read once" from "the sealed window was summed twice", which is
+            // exactly how the original double-count survived review (see
+            // testsuite 733, where the blind statistic was avg). Sum is carried
+            // alongside it so these tests can assert a total.
+            aggregations: vec![
+                agg(AggregationType::Max, &["temperature"]),
+                agg(AggregationType::Sum, &["temperature"]),
+            ],
             transforms: None,
             allowed_lateness: lateness.map(str::to_string),
             // Seal on every advance, as before the size gate existed: these
@@ -4952,6 +5123,14 @@ mod tests {
         }
         _ = ctx.deregister_table("reduced").unwrap();
         Ok(rows)
+    }
+
+    /// Each day appended by [`append_day_series`] holds 24 hourly rows of
+    /// `20.5 + hour + day * 100`, so its total is `768 + 2400 * day`. A rollup
+    /// that counted the day twice would report double this; one that dropped a
+    /// segment would report less. Unlike the daily max, this moves.
+    fn expected_day_sum(day: u32) -> f64 {
+        768.0 + 2400.0 * f64::from(day)
     }
 
     /// Like [`daily_max`] but reads an arbitrary output column, for aggregations
@@ -5249,6 +5428,30 @@ mod tests {
             assert!(
                 approx(rows[i], 43.5 + f64::from(day) * 100.0),
                 "day {day} max wrong after compaction: {rows:?}"
+            );
+        }
+
+        // The load-bearing assertion: a merge that duplicated or dropped rows
+        // leaves the daily max untouched but moves the daily sum.
+        let sums = daily_max_col(
+            &reduce_ctx(&persistence, &cache_dir),
+            compacting(),
+            "temperature.sum",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sums.len(),
+            DAYS as usize,
+            "one sum per day after compaction"
+        );
+        for (i, day) in (1..=DAYS).enumerate() {
+            assert!(
+                approx(sums[i], expected_day_sum(day)),
+                "day {day} sum wrong after compaction (double-counted or dropped): \
+                 got {}, want {}",
+                sums[i],
+                expected_day_sum(day)
             );
         }
 

@@ -283,15 +283,15 @@ impl SidecarDir {
         live: &LiveVersions,
         retain: impl Fn(&FileVersionInfo) -> bool,
     ) -> CachedSet {
-        let files = live
+        let (files, missing) = live
             .as_slice()
             .iter()
             .filter(|v| retain(v))
             .map(|v| self.sidecar_path(live.node_id(), v))
-            .filter(|p| p.exists())
-            .collect();
+            .partition(|p| p.exists());
         CachedSet {
             files,
+            missing,
             fallback_dir: self.dir.clone(),
         }
     }
@@ -325,6 +325,10 @@ impl SidecarDir {
 #[derive(Debug, Clone)]
 pub struct CachedSet {
     files: Vec<PathBuf>,
+    /// Live versions that were retained by the caller's predicate but whose
+    /// sidecar is not on disk. Silently reading fewer rows is never correct, so
+    /// this is reported rather than dropped; see [`CachedSet::missing`].
+    missing: Vec<PathBuf>,
     /// Used only to recover a schema when no live sidecar is present yet.
     fallback_dir: PathBuf,
 }
@@ -340,6 +344,20 @@ impl CachedSet {
         self.files.is_empty()
     }
 
+    /// Retained live versions with no sidecar on disk.
+    ///
+    /// Normally empty: the caller caches every live version before reading. It
+    /// is non-empty when a concurrent reconciler deleted a sidecar this reader
+    /// still considers live (neither takes a lock), and it matters because a
+    /// caller that RECORDS what it read -- the rollup manifest names the live
+    /// source digests it covered -- would otherwise publish coverage it does not
+    /// have, and then reuse that undercount forever because the record agrees
+    /// with itself.
+    #[must_use]
+    pub fn missing(&self) -> &[PathBuf] {
+        &self.missing
+    }
+
     /// Absorb another node's cached set from the same directory.
     ///
     /// A [`SidecarNaming::NodeScoped`] directory is read as one table spanning
@@ -348,6 +366,7 @@ impl CachedSet {
     /// live versions, which is what keeps a superseded sidecar out.
     pub fn extend(&mut self, other: CachedSet) {
         self.files.extend(other.files);
+        self.missing.extend(other.missing);
     }
 
     /// An empty set that falls back to `dir` for schema recovery.
@@ -355,6 +374,7 @@ impl CachedSet {
     pub fn empty_in(dir: PathBuf) -> Self {
         Self {
             files: Vec::new(),
+            missing: Vec::new(),
             fallback_dir: dir,
         }
     }
@@ -662,6 +682,32 @@ mod tests {
         // v2 has no file yet, and the dead sidecar is not reachable at all.
         assert_eq!(set.files().len(), 1);
         assert!(set.files()[0].ends_with("v1_aaa.parquet"));
+
+        // v2 is live but absent, so it is REPORTED rather than silently
+        // dropped: a caller that records what it covered must not claim it.
+        assert_eq!(set.missing().len(), 1, "v2 is live with no sidecar");
+        assert!(set.missing()[0].ends_with("v2_bbb.parquet"));
+    }
+
+    #[test]
+    fn missing_excludes_versions_the_predicate_pruned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = SidecarDir::new(tmp.path().to_path_buf(), SidecarNaming::NodeOwned);
+        let n = node(1);
+        let v1 = version(1, Some("aaa"));
+        let v2 = version(2, Some("bbb"));
+        touch(&dir.sidecar_path(&n, &v1));
+
+        // v2 has no sidecar, but the predicate excluded it, so it was never
+        // going to be read: pruning for a query's bounds is not a lost race.
+        let live = LiveVersions::from_persistence(n, vec![v1, v2]);
+        let set = dir.cached_set(&live, |v| v.version < 2);
+        assert_eq!(set.files().len(), 1);
+        assert!(
+            set.missing().is_empty(),
+            "a pruned version is not missing: {:?}",
+            set.missing()
+        );
     }
 
     #[test]

@@ -479,7 +479,8 @@ revertible. All landed; P4 was done before P3, being independent of it.
 | P2 | compaction | `d97ee7c4` |
 | P3 | re-key on content, delete partials | `03b633df`, renamed in `2cfd8662` |
 | P4 | reconcile the format cache | `64880b47` |
-| P5 | retire the stale design doc | this commit |
+| P5 | retire the stale design doc | `51540fa4` |
+| P6 | review fixes (§13) | this commit |
 
 **P0 — read by manifest, not by directory listing.** (§5.7) Small, strictly a
 bug fix, no format change. Should land regardless.
@@ -555,3 +556,54 @@ Tests here must assert quantities that move:
 5. **Whether `hot.parquet` should itself be several files** if
    `allowed_lateness` is large. Probably not; if it is large enough to matter,
    P1's size trigger already splits it.
+
+## 13. What the post-landing review found
+
+A read of the whole branch after P5 turned up four defects, all of them
+consequences of the same thing: P3 moved decisions from "which files exist" to
+"what the manifest records", and three places kept reasoning about the old
+question.
+
+**A watermark must be bucket-aligned.** `dirty_lo` was floored to the second,
+not to the output interval, and then used as the new watermark. Everything else
+treats `sealed_hi_secs` as a bucket boundary -- the read filters on a bucket
+START -- so an unaligned watermark leaves the bucket containing the dirty point
+in neither a segment (they stop at the aligned edge below it) nor the hot window
+(it begins at or above the watermark). That bucket, including the backfilled
+rows that made it dirty, is dropped, and the next build reuses. Fixed by
+`floor_secs_to_bucket`, applied at both levels.
+
+**Unsealing must propagate up the cascade.** A coarser level keyed its freshness
+on the finer level's digest plus whether it was *rebuilt*. Late data is not a
+rebuild -- it is the ordinary incremental path -- so the coarse level kept its
+own sealed segments and reported pre-backfill values forever. The finest level's
+dirty point is now passed up the chain, and each level unseals from it, aligned
+to its own interval.
+
+This surfaced a latent ambiguity: `changed_since: Option<i64>` carried three
+meanings on the same `None` -- "nothing changed", "rebuilt", and "the dirty
+range is unbounded". That is harmless for the export hint, which treats every
+`None` as "rewrite all", but the coarse level must unseal *everything* in the
+last two cases and *nothing* in the first. It is now the explicit
+`LevelChange::{Nothing, Since(secs), Everything}`.
+
+**Content-keying removed a self-correction.** `cached_set` silently skipped a
+live version whose sidecar was absent. Under the old design the key was the set
+of partial *filenames*, so a version with no file simply looked uncovered and
+was rebuilt; keying on content instead means the build records that version as
+covered while having read none of its rows -- an undercount that agrees with
+itself forever. `CachedSet` now reports those versions and the rollup fails the
+build rather than publishing coverage it does not have. The window is real
+because P4's `reconcile` deletes sidecars on the read path, which takes no lock.
+
+**`hot.parquet` is the one file mutated in place.** It is published before the
+manifest that records the watermark it was built for, so a crash between them
+leaves buckets in no member of the cache -- served indefinitely, because an
+unchanged source makes the next build reuse. The recorded `hot_digest` was never
+checked despite §5.7 claiming it was; it is now verified per build, and a
+disagreement rebuilds the resolution.
+
+The test lesson from §11 recurred a third time: `lateness_config` declared only
+`Max`, and `max(x, x) == x` is invariant under double-counting exactly as `avg`
+is. The seal and compaction tests were asserting a statistic that cannot move.
+They now carry `Sum`.

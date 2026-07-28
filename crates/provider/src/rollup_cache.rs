@@ -105,10 +105,12 @@ pub fn drop_all(cache_dir: &Path) -> Result<usize> {
 // recomputes only the buckets a change can reach and reuses the rest.
 //
 // Integrity: a blake3 digest of each Parquet's bytes is recorded in the
-// manifest. On read the digest is re-verified. An absent or incompletely
-// published file self-heals via a full remerge; a present file whose bytes do
-// not match the digest is a hard error rather than silently serving tampered
-// aggregates.
+// manifest. A file the manifest names but that is absent is a hard error --
+// segments are published before the manifest that names them, so a missing one
+// means the directory was damaged, not that a build was interrupted. The hot
+// file is the exception: it is mutated in place, so its digest is re-verified
+// against the manifest on every build and a disagreement rebuilds the
+// resolution rather than serving a gap. See `read_verified_segment_manifest`.
 
 /// Directory holding the merged-output cache for one temporal-reduce node and
 /// config namespace: `{cache_dir}/merged_{cfg_hash}_{node_id}/`.
@@ -325,6 +327,52 @@ pub fn read_segment_manifest(res_dir: &Path) -> Result<Option<SegmentManifest>> 
             e
         ))
     })
+}
+
+/// [`read_segment_manifest`], discarding a manifest that disagrees with the hot
+/// file on disk.
+///
+/// `hot.parquet` is the one file in the layout that is MUTATED IN PLACE: each
+/// build renames a freshly merged hot over the previous one, and only then
+/// writes the manifest recording the watermark that hot was built for. A crash
+/// in that window leaves a hot holding only `bucket >= new_wm` alongside a
+/// manifest still claiming `sealed_hi = old_wm`, so the buckets between them
+/// live in no member of the cache. Nothing else detects this: the read path
+/// checks only that the named files EXIST, and if the sources are unchanged the
+/// next build reuses the manifest and serves the hole indefinitely.
+///
+/// Treating the disagreement as "no usable manifest" makes it self-healing --
+/// the caller rebuilds the resolution from source -- at the cost of one blake3
+/// of hot per build, which is bounded by the seal target and is rewritten by
+/// that same build anyway.
+///
+/// Segments need no such check: they are immutable, published under a fresh
+/// name BEFORE the manifest that names them, and deleted only after it is
+/// durable, so a crash can only orphan a file that no manifest references.
+pub fn read_verified_segment_manifest(res_dir: &Path) -> Result<Option<SegmentManifest>> {
+    let Some(m) = read_segment_manifest(res_dir)? else {
+        return Ok(None);
+    };
+    let hot = hot_path(res_dir);
+    match (&m.hot_digest, hot.exists()) {
+        (Some(recorded), true) => {
+            let actual = crate::version_cache::file_blake3(&hot)?;
+            if &actual == recorded {
+                Ok(Some(m))
+            } else {
+                log::warn!(
+                    "[ROLLUP] hot file '{}' does not match the digest recorded in \
+                     the manifest; rebuilding this resolution (a build was \
+                     interrupted between publishing hot and its manifest)",
+                    hot.display()
+                );
+                Ok(None)
+            }
+        }
+        // No hot yet, or a manifest that predates the digest: nothing to check
+        // against, and the caller's existence checks still apply.
+        _ => Ok(Some(m)),
+    }
 }
 
 /// Compute the export-hint digest of a manifest without writing it (used on the
@@ -626,6 +674,42 @@ mod tests {
             "an unreferenced Parquet in the res dir was scanned; the read must \
              enumerate the manifest, not list the directory"
         );
+    }
+
+    /// The hot file is mutated in place BEFORE the manifest recording the
+    /// watermark it was built for. A crash in that window leaves the two
+    /// disagreeing and the buckets between the old and new watermarks in no
+    /// member of the cache -- served forever, because an unchanged source makes
+    /// the next build reuse. The manifest must therefore be rejected when hot
+    /// does not match the digest it recorded.
+    #[tokio::test]
+    async fn a_hot_file_that_disagrees_with_its_manifest_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let res_dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(&res_dir).unwrap();
+        std::fs::write(hot_path(&res_dir), b"hot bytes").unwrap();
+        let digest = crate::version_cache::file_blake3(&hot_path(&res_dir)).unwrap();
+
+        let m = SegmentManifest {
+            format: SEALED_FORMAT.to_string(),
+            hot_digest: Some(digest),
+            ..Default::default()
+        };
+        _ = write_segment_manifest(&res_dir, &m).await.unwrap();
+
+        assert!(
+            read_verified_segment_manifest(&res_dir).unwrap().is_some(),
+            "a matching hot file keeps the manifest usable"
+        );
+
+        // Simulate the crash: hot advanced, the manifest did not.
+        std::fs::write(hot_path(&res_dir), b"a newer hot, published first").unwrap();
+        assert!(
+            read_verified_segment_manifest(&res_dir).unwrap().is_none(),
+            "a hot file that does not match its manifest must force a rebuild"
+        );
+        // The manifest itself is still readable: this is a rebuild, not corruption.
+        assert!(read_segment_manifest(&res_dir).unwrap().is_some());
     }
 
     #[tokio::test]

@@ -96,6 +96,8 @@ aggregations:
     columns: ["well_depth_value"]
   - type: "max"
     columns: ["well_depth_value"]
+  - type: "count"
+    columns: ["well_depth_value"]
 YAML
 
 pond mknod temporal-reduce /reduced --config-path /tmp/reduce.yaml
@@ -122,6 +124,13 @@ LATE_AVG=$(pond cat /reduced/data/res=1h.series --format=table --sql "
   SELECT \"well_depth_value.avg\" AS v FROM source ORDER BY timestamp DESC LIMIT 1" 2>&1 \
   | grep -E '^\| *[0-9]' | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
 
+# Totals, not averages: avg = SUM(sum)/SUM(count) is invariant under a
+# double-count, so it cannot distinguish "counted once" from "counted twice"
+# (see test 733). Only a total sample count can.
+TOTAL_N=$(pond cat /reduced/data/res=1h.series --format=table \
+  --sql "SELECT CAST(SUM(\"well_depth_value.count\") AS BIGINT) AS n FROM source" 2>&1 \
+  | grep -E '^\| *[0-9]' | head -1 | grep -oE '[0-9]+' | head -1)
+
 # ---- Verify ----
 echo ""
 echo "--- Verification ---"
@@ -146,5 +155,8 @@ check '[ "${EARLY_AVG}" = "42.2" ]' \
 
 check '[ "${LATE_AVG}" = "44.1" ]' \
   "09:00 bucket reconstructs avg(44.0,44.2)=44.1, got ${LATE_AVG}"
+
+check '[ "${TOTAL_N}" = "4" ]' \
+  "each of the 4 source samples is counted exactly once after the late append, got ${TOTAL_N}"
 
 check_finish
