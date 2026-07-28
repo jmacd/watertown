@@ -309,7 +309,9 @@ impl SidecarDir {
     ) -> Result<PathBuf> {
         tokio::fs::create_dir_all(&self.dir).await?;
         let final_path = self.sidecar_path(node_id, version);
-        write_parquet_stream(&final_path, schema, stream).await?;
+        // The sidecar's identity is its filename (node, version, blake3 of the
+        // SOURCE), so the digest of the written Parquet is not recorded here.
+        let _digest = write_parquet_atomic(&final_path, schema, stream).await?;
         log::debug!("[SAVE] sidecar cache: wrote {}", final_path.display());
         Ok(final_path)
     }
@@ -387,16 +389,25 @@ impl CachedSet {
     }
 }
 
-/// Stream `stream` into a Parquet file at `path`, atomically.
-pub async fn write_parquet_stream(
+/// Stream `stream` into a Parquet file at `path` atomically (tmp + rename), and
+/// return the blake3 digest of the bytes written.
+///
+/// The single Parquet writer for every on-disk cache in this crate: the
+/// per-version sidecars, the rollup's sealed runs, and its hot file. They had
+/// diverged into two byte-identical copies differing only in whether the digest
+/// was returned, which is the shape of duplication that later drifts apart.
+/// Callers with nothing to record simply drop the digest.
+pub async fn write_parquet_atomic(
     path: &Path,
     schema: SchemaRef,
     mut stream: BatchStream,
-) -> Result<()> {
+) -> Result<String> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let tmp_path = path.with_extension("parquet.tmp");
+    // Deliberately NOT `{stem}.parquet.tmp`: a partial write must not end in
+    // `.parquet`, or a `ListingTable` filtering on that extension would scan it.
+    let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
     let file = tokio::fs::File::create(&tmp_path).await?;
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(parquet::basic::ZstdLevel::default()))
@@ -416,8 +427,18 @@ pub async fn write_parquet_stream(
         .await
         .map_err(|e| crate::error::Error::Arrow(e.to_string()))?;
 
+    // Digest the temp file, before the rename publishes it.
+    let digest = file_blake3(&tmp_path)?;
     tokio::fs::rename(&tmp_path, path).await?;
-    Ok(())
+    Ok(digest)
+}
+
+/// Hex blake3 digest of a file's bytes.
+pub fn file_blake3(path: &Path) -> Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    let mut file = std::fs::File::open(path).map_err(crate::error::Error::Io)?;
+    let _copied = std::io::copy(&mut file, &mut hasher).map_err(crate::error::Error::Io)?;
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// Read and merge the Arrow schemas of an explicit list of Parquet files.

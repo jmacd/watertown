@@ -1292,7 +1292,7 @@ impl TemporalReduceSqlFile {
             })
             .map_err(|e| crate::error::Error::Arrow(e.to_string()))
         });
-        let digest = crate::rollup_cache::write_parquet_atomic(path, schema, Box::pin(mapped))
+        let digest = crate::version_cache::write_parquet_atomic(path, schema, Box::pin(mapped))
             .await
             .map_other()?;
         Ok((digest, rows.load(std::sync::atomic::Ordering::Relaxed)))

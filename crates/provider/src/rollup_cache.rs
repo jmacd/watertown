@@ -29,22 +29,14 @@
 //! - Config-namespaced: a different aggregation set / time column / resolution
 //!   list yields a fresh `cfg_hash` namespace rather than mixing semantics.
 
-use arrow::datatypes::SchemaRef;
-use arrow::record_batch::RecordBatch;
 use datafusion::catalog::TableProvider;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
-use datafusion::parquet::basic::Compression;
-use datafusion::parquet::file::properties::WriterProperties;
-use futures::StreamExt;
-use futures::stream::Stream;
-use parquet::arrow::AsyncArrowWriter;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
 
 /// Result type for rollup cache operations.
@@ -234,14 +226,6 @@ pub fn merged_dir(cache_dir: &Path, cfg_hash: &str, node_id: &tinyfs::NodeID) ->
     cache_dir.join(format!("merged_{}_{}", cfg_hash, node_id))
 }
 
-/// Compute the hex blake3 digest of a file's bytes.
-fn file_blake3(path: &Path) -> Result<String> {
-    let mut hasher = blake3::Hasher::new();
-    let mut file = std::fs::File::open(path).map_err(crate::error::Error::Io)?;
-    let _copied = std::io::copy(&mut file, &mut hasher).map_err(crate::error::Error::Io)?;
-    Ok(hasher.finalize().to_hex().to_string())
-}
-
 /// List the per-source-version partial member files (`*.parquet`) currently
 /// present in a glob dir. These are the partials merged into every resolution's
 /// output; the returned paths are sorted for deterministic diffing.
@@ -411,43 +395,6 @@ pub fn wipe_sealed_res_dir(res_dir: &Path) -> Result<()> {
     }
 }
 
-/// Stream a record batch stream to `path` atomically (tmp + rename) and return
-/// the blake3 digest of the written Parquet bytes. Used for both sealed runs and
-/// the hot file; the digest is recorded in the manifest rather than a sidecar.
-pub async fn write_parquet_atomic(
-    path: &Path,
-    schema: SchemaRef,
-    stream: Pin<
-        Box<dyn Stream<Item = std::result::Result<RecordBatch, crate::error::Error>> + Send>,
-    >,
-) -> Result<String> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
-    let file = tokio::fs::File::create(&tmp_path).await?;
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(parquet::basic::ZstdLevel::default()))
-        .build();
-    let mut writer = AsyncArrowWriter::try_new(file, schema, Some(props))
-        .map_err(|e| crate::error::Error::Arrow(e.to_string()))?;
-    let mut stream = stream;
-    while let Some(batch) = stream.next().await {
-        let batch = batch?;
-        writer
-            .write(&batch)
-            .await
-            .map_err(|e| crate::error::Error::Arrow(e.to_string()))?;
-    }
-    let _ = writer
-        .close()
-        .await
-        .map_err(|e| crate::error::Error::Arrow(e.to_string()))?;
-    let digest = file_blake3(&tmp_path)?;
-    tokio::fs::rename(&tmp_path, path).await?;
-    Ok(digest)
-}
-
 /// Build the read provider for a res dir: a `ListingTable` over exactly the
 /// sealed runs named by `manifest`, plus the hot file. A manifest member
 /// missing on disk is a hard error (corrupt cache), never a silent hole in the
@@ -457,7 +404,7 @@ pub async fn write_parquet_atomic(
 /// are not the same set: a `.parquet` can sit in the directory without being
 /// referenced by the manifest, and every such orphan is a duplicate copy of
 /// some bucket range that a directory-shaped scan sums a second time. Orphans
-/// arise in normal operation, not only after a crash -- [`write_parquet_atomic`]
+/// arise in normal operation, not only after a crash -- [`crate::version_cache::write_parquet_atomic`]
 /// renames a new run into place BEFORE the manifest recording it is written, so
 /// any interruption in that window leaves one behind, and compaction (which must
 /// publish a merged segment before deleting its inputs) widens that window by
@@ -523,8 +470,11 @@ pub async fn listing_table_for_res_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::version_cache::{BatchStream, write_parquet_atomic};
     use arrow::array::{Float64Array, Int64Array};
+    use arrow::datatypes::SchemaRef;
     use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
     use datafusion::execution::context::SessionContext;
     use std::sync::Arc;
     use tinyfs::FileVersionInfo;
@@ -605,9 +555,7 @@ mod tests {
         // Version 1: bucket 0 sum=10 count=2 ; bucket 1 sum=5 count=1
         let v1 = test_version(1, Some("v1hash"));
         let b1 = partials_batch(&schema, &[0, 1], &[10.0, 5.0], &[2, 1]);
-        let s1: Pin<
-            Box<dyn Stream<Item = std::result::Result<RecordBatch, crate::error::Error>> + Send>,
-        > = Box::pin(futures::stream::iter(vec![Ok(b1)]));
+        let s1: BatchStream = Box::pin(futures::stream::iter(vec![Ok(b1)]));
         _ = dir
             .write_sidecar(&node_id, &v1, schema.clone(), s1)
             .await
@@ -616,9 +564,7 @@ mod tests {
         // Version 2: bucket 1 (boundary straddle) sum=7 count=1 ; bucket 2 sum=4 count=1
         let v2 = test_version(2, Some("v2hash"));
         let b2 = partials_batch(&schema, &[1, 2], &[7.0, 4.0], &[1, 1]);
-        let s2: Pin<
-            Box<dyn Stream<Item = std::result::Result<RecordBatch, crate::error::Error>> + Send>,
-        > = Box::pin(futures::stream::iter(vec![Ok(b2)]));
+        let s2: BatchStream = Box::pin(futures::stream::iter(vec![Ok(b2)]));
         _ = dir
             .write_sidecar(&node_id, &v2, schema.clone(), s2)
             .await
@@ -643,9 +589,7 @@ mod tests {
         assert_eq!(reconciled.missing.len(), 1);
 
         let b3 = partials_batch(&schema, &[0, 1, 2], &[10.0, 12.0, 4.0], &[2, 2, 1]);
-        let s3: Pin<
-            Box<dyn Stream<Item = std::result::Result<RecordBatch, crate::error::Error>> + Send>,
-        > = Box::pin(futures::stream::iter(vec![Ok(b3)]));
+        let s3: BatchStream = Box::pin(futures::stream::iter(vec![Ok(b3)]));
         _ = dir
             .write_sidecar(&node_id, &v3, schema.clone(), s3)
             .await
@@ -707,11 +651,7 @@ mod tests {
         let schema = partials_schema();
 
         async fn put(path: &Path, schema: SchemaRef, batch: RecordBatch) -> String {
-            let s: Pin<
-                Box<
-                    dyn Stream<Item = std::result::Result<RecordBatch, crate::error::Error>> + Send,
-                >,
-            > = Box::pin(futures::stream::iter(vec![Ok(batch)]));
+            let s: BatchStream = Box::pin(futures::stream::iter(vec![Ok(batch)]));
             write_parquet_atomic(path, schema, s).await.unwrap()
         }
 
@@ -809,9 +749,7 @@ mod tests {
         let schema = partials_schema();
         let v1 = test_version(1, Some("v1hash"));
         let b1 = partials_batch(&schema, &[0], &[1.0], &[1]);
-        let s1: Pin<
-            Box<dyn Stream<Item = std::result::Result<RecordBatch, crate::error::Error>> + Send>,
-        > = Box::pin(futures::stream::iter(vec![Ok(b1)]));
+        let s1: BatchStream = Box::pin(futures::stream::iter(vec![Ok(b1)]));
         _ = partials_dir(cache_dir, "cfg", &node_id)
             .write_sidecar(&node_id, &v1, schema.clone(), s1)
             .await

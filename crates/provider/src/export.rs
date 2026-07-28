@@ -695,7 +695,7 @@ async fn export_one_partition(
             e
         )
     })?;
-    file_blake3(abs_file)
+    Ok(crate::version_cache::file_blake3(abs_file)?)
 }
 
 /// Full-rewrite export via a single `COPY ... PARTITIONED BY` (one source scan).
@@ -784,7 +784,7 @@ async fn full_rewrite_partitioned(
                 )
             })?;
         }
-        let digest = file_blake3(&dst_abs)?;
+        let digest = crate::version_cache::file_blake3(&dst_abs)?;
         manifest.partitions.push(ManifestPartition {
             file: file_rel.clone(),
             digest,
@@ -805,18 +805,10 @@ async fn full_rewrite_partitioned(
     Ok((results, manifest))
 }
 
-/// blake3 hex digest of a file's bytes.
-fn file_blake3(path: &Path) -> Result<String> {
-    let mut hasher = blake3::Hasher::new();
-    let mut file = std::fs::File::open(path)?;
-    let _copied = std::io::copy(&mut file, &mut hasher)?;
-    Ok(hasher.finalize().to_hex().to_string())
-}
-
 /// Verify a partition file's bytes match a recorded digest, hard-failing on a
 /// mismatch so a corrupted or externally modified partition is never reused.
 fn verify_partition_digest(abs_file: &Path, expected: &str, source_label: &str) -> Result<()> {
-    let actual = file_blake3(abs_file)?;
+    let actual = crate::version_cache::file_blake3(abs_file)?;
     if actual != expected {
         return Err(anyhow::anyhow!(
             "Export partition '{}' for '{}' does not match its recorded digest \
@@ -1525,7 +1517,10 @@ mod tests {
         assert_eq!(manifest.partitions.len(), 2);
         assert!(manifest.digest.is_none());
         for p in &manifest.partitions {
-            assert_eq!(p.digest, file_blake3(&base.join(&p.file)).unwrap());
+            assert_eq!(
+                p.digest,
+                crate::version_cache::file_blake3(&base.join(&p.file)).unwrap()
+            );
         }
     }
 
