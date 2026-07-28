@@ -2,32 +2,41 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Rollup partial-aggregate cache -- per-version Parquet cache of decomposable
-//! temporal-reduce partials.
+//! Rollup aggregate cache -- on-disk storage for `temporal-reduce` levels.
 //!
 //! `temporal-reduce` downsamples a source series into per-resolution
-//! aggregations.  Without caching, every read recomputes a full
+//! aggregations. Without caching, every read recomputes a full
 //! `GROUP BY date_bin` over the entire source history, so per-build cost grows
 //! without bound as the pond ages.
 //!
-//! This module caches the decomposable partials (`Sum`, `Count`, `Min`, `Max`,
-//! ...) for each individual input version as a Parquet file on disk under
-//! `{POND}/cache/`.  At read time a `ListingTable` is built over the cached
-//! partials and a cheap cross-version merge (`GROUP BY time_bucket`)
-//! reconstructs the final aggregation.
+//! Each output resolution is stored as a small set of files under
+//! `{POND}/cache/`: immutable *segments* covering closed bucket ranges, plus one
+//! recomputed `hot.parquet` for the open window above the watermark. They hold
+//! decomposable partials (`Sum`, `Count`, `Min`, `Max`, ...), so a read is a
+//! cheap `GROUP BY time_bucket` merge and the output columns are reconstructed
+//! at read time. A `manifest.json` names the members and the range each covers.
 //!
 //! This is the aggregation-tier analogue of [`crate::format_cache`], which
-//! caches the *parsed leaves*.  Together they make both the parse and the
+//! caches the *parsed leaves*. Together they make both the parse and the
 //! aggregation incremental.
 //!
-//! Key properties (identical discipline to the format cache):
-//! - Per-version caching: each input version is independently immutable
-//!   (blake3 hash), so there is nothing to invalidate.  One new ingest version
-//!   produces exactly one new partial.
-//! - Incremental: only uncached versions are computed; cached versions are free.
-//! - Throwaway: `rm -rf {POND}/cache/` is always safe.
-//! - Config-namespaced: a different aggregation set / time column / resolution
-//!   list yields a fresh `cfg_hash` namespace rather than mixing semantics.
+//! Key properties:
+//! - **Keyed by time range, not by source version.** The manifest records which
+//!   bucket range each segment covers and which source CONTENT (blake3) the
+//!   level reflects. Version numbers are not stable -- a tlogfs collapse
+//!   rewrites N versions into one merged version with a new, higher number and
+//!   identical content -- so keying on them made unchanged data look changed.
+//! - **File count tracks data, not build frequency.** Sealing is gated on
+//!   accumulated bytes ([`SEAL_TARGET_BYTES`]) and segments are compacted by the
+//!   same size-tiered policy tlogfs uses ([`crate::size_tier`]), so a pond
+//!   rebuilt every minute does not grow a file every minute.
+//! - **Self-correcting.** Late data unseals the segments covering it and lets
+//!   the ordinary seal path recompute them; nothing here is a dead end
+//!   requiring `--rebuild`.
+//! - **Throwaway.** `rm -rf {POND}/cache/` is always safe.
+//! - **Config-namespaced.** A different aggregation set / time column /
+//!   resolution list yields a fresh `cfg_hash` namespace rather than mixing
+//!   semantics.
 
 use datafusion::catalog::TableProvider;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
@@ -35,7 +44,7 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -43,11 +52,11 @@ use std::sync::Arc;
 type Result<T> = std::result::Result<T, crate::error::Error>;
 
 /// Compute a stable namespace hash over the parts of a temporal-reduce config
-/// that change the *meaning* of the cached partials: the aggregation set, the
+/// that change the *meaning* of the cached aggregates: the aggregation set, the
 /// time column, and the resolution list.
 ///
 /// A config change yields a fresh namespace rather than mixing incompatible
-/// partials into one directory.  Changing config invalidates semantics, not
+/// aggregates into one directory.  Changing config invalidates semantics, not
 /// content, so a new namespace is the correct response; the old one is reaped
 /// by normal cache pruning.
 ///
@@ -64,60 +73,26 @@ pub fn cfg_hash(canonical: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-/// Directory holding a node's cached rollup partials for one config namespace.
+/// Where an older binary kept a node's per-source-version partials:
+/// `{cache_dir}/rollup_{cfg_hash}_{node_id}/`.
 ///
-/// Returns `{cache_dir}/rollup_{cfg_hash}_{node_id}/`.
+/// Nothing writes here. It exists only so [`drop_node_namespace`] and
+/// [`drop_all`] still clear a directory left behind by a pond built before the
+/// rollup aggregated its sources directly.
 #[must_use]
-pub fn cache_node_dir(cache_dir: &Path, cfg_hash: &str, node_id: &tinyfs::NodeID) -> PathBuf {
+fn legacy_partials_node_dir(cache_dir: &Path, cfg_hash: &str, node_id: &tinyfs::NodeID) -> PathBuf {
     cache_dir.join(format!("rollup_{}_{}", cfg_hash, node_id))
 }
 
-// A rollup glob dir is a `SidecarNaming::NodeScoped` [`crate::version_cache::SidecarDir`]:
-// one partial file per (source node, input version). The source pattern can
-// match many rotated input files, each its own node with its own versions, so
-// the directory is shared and reconciliation there must be node scoped. The
-// naming, writing, reconciling and reading of those partials lives in
-// `version_cache`; this module keeps only what is genuinely rollup specific
-// (the sequentiality frontier, sealed runs, and namespace drops).
-
-/// Directory holding all per-source-version partials for one temporal-reduce
-/// node and config namespace: `{cache_dir}/rollup_{cfg_hash}_{tr_node_id}/`.
-#[must_use]
-pub fn glob_dir(cache_dir: &Path, cfg_hash: &str, tr_node_id: &tinyfs::NodeID) -> PathBuf {
-    cache_node_dir(cache_dir, cfg_hash, tr_node_id)
-}
-
-/// Wrap an already-resolved partials directory path as a sidecar dir.
-#[must_use]
-pub fn partials_dir_at(glob_dir: &Path) -> crate::version_cache::SidecarDir {
-    crate::version_cache::SidecarDir::new(
-        glob_dir.to_path_buf(),
-        crate::version_cache::SidecarNaming::NodeScoped,
-    )
-}
-
-/// The partials directory of one temporal-reduce node, as a sidecar dir.
-#[must_use]
-pub fn partials_dir(
-    cache_dir: &Path,
-    cfg_hash: &str,
-    tr_node_id: &tinyfs::NodeID,
-) -> crate::version_cache::SidecarDir {
-    crate::version_cache::SidecarDir::new(
-        glob_dir(cache_dir, cfg_hash, tr_node_id),
-        crate::version_cache::SidecarNaming::NodeScoped,
-    )
-}
-
-/// Drop a node's entire rollup-cache namespace for one config, forcing all
-/// partials to be recomputed on next read.  Used by the `--rebuild` recovery
-/// path.  Idempotent: a missing directory is not an error.
+/// Drop a node's entire rollup-cache namespace for one config, forcing the
+/// rollup to be recomputed from source on next read. Used by the `--rebuild`
+/// recovery path. Idempotent: a missing directory is not an error.
 pub fn drop_node_namespace(
     cache_dir: &Path,
     cfg_hash: &str,
     node_id: &tinyfs::NodeID,
 ) -> Result<()> {
-    let dir = cache_node_dir(cache_dir, cfg_hash, node_id);
+    let dir = legacy_partials_node_dir(cache_dir, cfg_hash, node_id);
     if dir.exists() {
         std::fs::remove_dir_all(&dir).map_err(crate::error::Error::Io)?;
     }
@@ -128,8 +103,8 @@ pub fn drop_node_namespace(
     Ok(())
 }
 
-/// Drop every rollup-cache namespace under `cache_dir`, forcing all partials
-/// for all temporal-reduce nodes to be recomputed on next read.  This is the
+/// Drop every rollup-cache namespace under `cache_dir`, forcing every
+/// temporal-reduce level to be recomputed from source on next read.  This is the
 /// global `--rebuild` recovery primitive.  The format cache and any other cache
 /// content are left untouched.  Idempotent: a missing `cache_dir` is not an
 /// error.
@@ -154,70 +129,16 @@ pub fn drop_all(cache_dir: &Path) -> Result<usize> {
     Ok(dropped)
 }
 
-/// Path of a source node's sequentiality-frontier sidecar within the glob dir:
-/// `{glob_dir}/{source_node}.frontier`.  The file holds the maximum sealed
-/// `time_bucket` value (in the finest-interval timestamp unit) observed across
-/// every cached version of that source node.
-#[must_use]
-pub fn frontier_path(glob_dir: &Path, source_node_id: &tinyfs::NodeID) -> PathBuf {
-    glob_dir.join(format!("{}.frontier", source_node_id))
-}
-
-/// Read a source node's persisted sequentiality frontier.
-///
-/// Returns `Ok(None)` only when the frontier file is genuinely absent, which is
-/// the self-heal path for a fresh or `--rebuild`-cleared cache. A file that is
-/// present but unparseable is a corrupt control artifact and is a hard error:
-/// silently treating it as absent would disable the double-count guard for
-/// overlapping non-series sources, allowing a re-snapshot to be summed twice.
-pub fn read_frontier(glob_dir: &Path, source_node_id: &tinyfs::NodeID) -> Result<Option<i64>> {
-    let path = frontier_path(glob_dir, source_node_id);
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(crate::error::Error::Io(e)),
-    };
-    contents.trim().parse::<i64>().map(Some).map_err(|e| {
-        crate::error::Error::CacheCorrupt(format!(
-            "frontier file '{}' is present but unparseable ({}); the rollup cache \
-             is corrupt. Re-run the export with --rebuild to recompute it from scratch.",
-            path.display(),
-            e
-        ))
-    })
-}
-
-/// Persist a source node's frontier (atomic write via `.tmp` then rename).
-pub fn write_frontier(
-    glob_dir: &Path,
-    source_node_id: &tinyfs::NodeID,
-    frontier: i64,
-) -> Result<()> {
-    std::fs::create_dir_all(glob_dir).map_err(crate::error::Error::Io)?;
-    let final_path = frontier_path(glob_dir, source_node_id);
-    let tmp_path = final_path.with_extension("frontier.tmp");
-    std::fs::write(&tmp_path, frontier.to_string()).map_err(crate::error::Error::Io)?;
-    std::fs::rename(&tmp_path, &final_path).map_err(crate::error::Error::Io)?;
-    Ok(())
-}
-
-// --- Merged-output cache: per-resolution materialized merge result -----------
+// --- Merged-output cache: per-resolution materialized aggregation ------------
 //
-// The partial cache above makes the partial COMPUTATION incremental, but the
-// cross-version merge (`GROUP BY date_bin` over every cached partial) still runs
-// in full on every build. This merged-output cache materializes the merged
-// buckets to one Parquet file per output resolution, so a rebuild recomputes
-// only the suffix of buckets touched by newly-added source versions and reuses
-// the sealed prefix unchanged.
+// Materializes each output resolution's merged buckets on disk, so a rebuild
+// recomputes only the buckets a change can reach and reuses the rest.
 //
-// It lives in a directory SEPARATE from the partials glob dir so the partials
-// `ListingTable` (which unions every `.parquet` under the glob dir) never
-// mistakes a merged-output file for a partial.
-//
-// Integrity: a blake3 digest of the Parquet bytes is written to a sidecar. On
-// read the digest is re-verified. An absent or incompletely published file
-// self-heals via a full remerge; a present file whose bytes do not match the
-// digest is a hard error rather than silently serving tampered aggregates.
+// Integrity: a blake3 digest of each Parquet's bytes is recorded in the
+// manifest. On read the digest is re-verified. An absent or incompletely
+// published file self-heals via a full remerge; a present file whose bytes do
+// not match the digest is a hard error rather than silently serving tampered
+// aggregates.
 
 /// Directory holding the merged-output cache for one temporal-reduce node and
 /// config namespace: `{cache_dir}/merged_{cfg_hash}_{node_id}/`.
@@ -226,45 +147,32 @@ pub fn merged_dir(cache_dir: &Path, cfg_hash: &str, node_id: &tinyfs::NodeID) ->
     cache_dir.join(format!("merged_{}_{}", cfg_hash, node_id))
 }
 
-/// List the per-source-version partial member files (`*.parquet`) currently
-/// present in a glob dir. These are the partials merged into every resolution's
-/// output; the returned paths are sorted for deterministic diffing.
-pub fn list_glob_members(glob_dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    let rd = match std::fs::read_dir(glob_dir) {
-        Ok(rd) => rd,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-        Err(e) => return Err(crate::error::Error::Io(e)),
-    };
-    for entry in rd {
-        let path = entry.map_err(crate::error::Error::Io)?.path();
-        if path.extension().is_some_and(|ext| ext == "parquet") {
-            out.push(path);
-        }
-    }
-    out.sort();
-    Ok(out)
-}
-
-// --- Sealed-runs merged cache (Phase 2: watermark + immutable runs) ----------
+// --- Segments: watermark + immutable sealed runs ------------------------------
 //
-// Phase 1's merged cache is a single mutable Parquet whose sealed prefix is
-// rewritten on every build (O(history) I/O). Phase 2 replaces it with a
-// directory of immutable, append-only *sealed run* files plus one recomputed
-// *hot* file, separated by a watermark derived from `allowed_lateness`:
+// Each resolution is a directory of immutable *sealed run* files plus one
+// recomputed *hot* file, separated by a watermark derived from
+// `allowed_lateness`:
 //
 //   {merged_dir}/res{secs}/
 //       run-00000000.parquet   immutable sealed run (buckets [lo, hi))
 //       run-00000001.parquet   ...
 //       hot.parquet            every bucket at or above sealed_hi, recomputed
 //                              each build
-//       manifest.json          watermark + run ranges + coverage + digests
+//       manifest.json          watermark + run ranges + source content + digests
 //
 // Buckets below sealed_hi are frozen once and never rescanned, so per-build cost
-// is bounded to the hot window. That window holds the allowed-lateness tail plus
-// whatever has frozen since the last seal, which SEAL_TARGET_BYTES bounds. The read provider is a
-// `ListingTable` over the whole res dir (runs ⧺ hot); consumers apply their own
-// `ORDER BY`.
+// is bounded to the hot window: the allowed-lateness tail plus whatever has
+// frozen since the last seal, which SEAL_TARGET_BYTES bounds. The alternative --
+// one mutable Parquet whose sealed prefix is rewritten every build -- costs
+// O(history) I/O per build.
+//
+// Because a run is identified by the bucket range it covers, late data below the
+// watermark is answerable: the runs holding those buckets are found by lookup,
+// dropped, and recomputed by the ordinary seal path.
+//
+// The read provider names the manifest's members explicitly; it never lists the
+// directory, so a superseded file left behind by an interrupted compaction
+// cannot be double-counted. Consumers apply their own `ORDER BY`.
 
 /// Minimum accumulated size, in bytes, before frozen buckets are sealed into a
 /// run file.
@@ -280,6 +188,37 @@ pub fn list_glob_members(glob_dir: &Path) -> Result<Vec<PathBuf>> {
 /// collapsing hundreds of builds into one run. Compaction is the right tool for
 /// making files genuinely large; this only has to stop the bleeding.
 pub const SEAL_TARGET_BYTES: u64 = 1024 * 1024;
+
+/// The event-time span covered by one source version, in epoch MICROSECONDS.
+///
+/// Microseconds because that is the unit tlogfs records on `OplogEntry` and
+/// surfaces as `min_event_time` / `max_event_time`, so for series sources this
+/// is free -- no scan. Output-bucket ranges elsewhere in this module are epoch
+/// SECONDS; conversion between the two must round outward (floor a lower bound,
+/// ceil an upper one) so a rounding step can never exclude a contributing row.
+///
+/// `max` is INCLUSIVE: it is the largest event time present, not a half-open
+/// end. Ranges elsewhere in this module are half-open, so the distinction is
+/// called out here rather than assumed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceRange {
+    pub min_us: i64,
+    pub max_us: i64,
+}
+
+impl SourceRange {
+    /// A version whose event-time bounds were never recorded, covering the whole
+    /// axis.
+    ///
+    /// Not a special case to test for downstream: any dirty range containing it
+    /// becomes unbounded, so the build reads everything -- pessimistic, still
+    /// correct. Non-series sources land here, which is why the pruning benefit
+    /// is confined to series data, where the bounds are recorded for free.
+    pub const UNKNOWN: Self = Self {
+        min_us: i64::MIN,
+        max_us: i64::MAX,
+    };
+}
 
 /// Maximum number of sealed runs to leave live in one resolution before
 /// compaction merges regardless of size class.
@@ -305,12 +244,13 @@ pub struct SealedRun {
 
 /// On-disk format of the sealed run + hot files. Bumped when their column
 /// layout or the manifest's build semantics change so an older cache is
-/// discarded and rebuilt rather than misread. `partials-v2` stores the
+/// discarded and rebuilt rather than misread. `segments-v3` stores the
 /// *mergeable partials* (sum/count/min/max) with output columns reconstructed at
-/// read time (design §3 / Phase 3 step 1) AND may derive a coarser resolution by
-/// folding the next-finer resolution's runs (`source_digest`; Phase 3 step 2);
-/// legacy caches deserialize with an empty `format` and are wiped + rebuilt.
-pub const SEALED_FORMAT: &str = "partials-v3";
+/// read time, keys the finest resolution on source CONTENT (`sources`) rather
+/// than on per-version partial filenames, and may derive a coarser resolution by
+/// folding the next-finer resolution's runs (`source_digest`). Older caches
+/// carry a different (or empty) `format` and are wiped + rebuilt.
+pub const SEALED_FORMAT: &str = "segments-v3";
 
 /// Manifest describing the sealed-runs cache for one output resolution. Its
 /// serialized bytes are the export-hint digest, so it must serialize
@@ -343,16 +283,27 @@ pub struct SealedManifest {
     /// it without writing anything to find out.
     #[serde(default)]
     pub hot_bytes: u64,
-    /// Partial member file names this cache reflects (freshness key; identical
-    /// role to the Phase 1 coverage sidecar). Used only by the finest resolution,
-    /// which folds the shared finest partials directly; empty for coarser
-    /// resolutions, which key freshness on `source_digest` instead.
-    pub covered: BTreeSet<String>,
+    /// The source content this cache reflects: blake3 of each LIVE source
+    /// version, mapped to the event-time range it covers. Used only by the
+    /// finest resolution, which aggregates the sources directly; empty for
+    /// coarser resolutions, which key freshness on `source_digest` instead.
+    ///
+    /// Keying on CONTENT rather than on storage artifacts is the point. The
+    /// previous key was a set of partial FILENAMES, one per source version, and
+    /// version numbers are not stable: a tlogfs collapse rewrites N versions
+    /// into one merged version with a new, higher number and identical content.
+    /// Every guard this cache used to need -- the sequentiality frontier, the
+    /// series/non-series split, the backfill hard errors -- existed to defend a
+    /// key that changed when the data had not. A blake3 does not.
+    ///
+    /// Bounded: tlogfs collapse bounds the number of live versions, whereas a
+    /// directory holding one file per version ever written was unbounded.
+    pub sources: BTreeMap<String, SourceRange>,
     /// For a coarser resolution built by folding the next-finer resolution's
     /// runs (Phase 3 step 2): the finer resolution's manifest digest this cache
-    /// was folded from. `None` for the finest resolution (which folds the shared
-    /// partials and uses `covered`). A change in the finer digest triggers a
-    /// coarse rebuild/advance.
+    /// was folded from. `None` for the finest resolution (which aggregates the
+    /// sources directly and uses `sources`). A change in the finer digest
+    /// triggers a coarse rebuild/advance.
     #[serde(default)]
     pub source_digest: Option<String>,
 }
@@ -445,8 +396,8 @@ pub async fn remove_superseded(files: &[PathBuf]) {
     }
 }
 
-/// Remove an entire res dir (used when `allowed_lateness` changes or the
-/// coverage shrinks, forcing a rebuild from the retained partials).
+/// Remove an entire res dir, forcing this resolution to be rebuilt from source
+/// (used when `allowed_lateness` or the on-disk format changes).
 pub fn wipe_sealed_res_dir(res_dir: &Path) -> Result<()> {
     match std::fs::remove_dir_all(res_dir) {
         Ok(()) => Ok(()),
@@ -604,73 +555,13 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_node_dir_layout() {
+    fn test_legacy_partials_node_dir_layout() {
         let cache_dir = Path::new("/tmp/pond/cache");
         let node_id = test_node_id();
-        let dir = cache_node_dir(cache_dir, "deadbeef", &node_id);
+        let dir = legacy_partials_node_dir(cache_dir, "deadbeef", &node_id);
         let dir_str = dir.to_str().unwrap();
         assert!(dir_str.starts_with("/tmp/pond/cache/rollup_deadbeef_"));
         assert!(dir_str.contains(&node_id.to_string()));
-    }
-
-    /// Partials of several input versions merge to exactly the single-pass
-    /// GROUP BY result, including a bucket straddling two versions -- and,
-    /// after a version collapse, the superseded versions' partials are gone
-    /// rather than summed a second time.
-    #[tokio::test]
-    async fn test_write_and_list_partials_merge() {
-        use crate::version_cache::LiveVersions;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let node_id = test_node_id();
-        let dir = partials_dir(tmp.path(), "cfg", &node_id);
-        let schema = partials_schema();
-
-        // Version 1: bucket 0 sum=10 count=2 ; bucket 1 sum=5 count=1
-        let v1 = test_version(1, Some("v1hash"));
-        let b1 = partials_batch(&schema, &[0, 1], &[10.0, 5.0], &[2, 1]);
-        let s1: BatchStream = Box::pin(futures::stream::iter(vec![Ok(b1)]));
-        _ = dir
-            .write_sidecar(&node_id, &v1, schema.clone(), s1)
-            .await
-            .unwrap();
-
-        // Version 2: bucket 1 (boundary straddle) sum=7 count=1 ; bucket 2 sum=4 count=1
-        let v2 = test_version(2, Some("v2hash"));
-        let b2 = partials_batch(&schema, &[1, 2], &[7.0, 4.0], &[1, 1]);
-        let s2: BatchStream = Box::pin(futures::stream::iter(vec![Ok(b2)]));
-        _ = dir
-            .write_sidecar(&node_id, &v2, schema.clone(), s2)
-            .await
-            .unwrap();
-
-        // Incrementality: both versions now cached, nothing stale.
-        let live = LiveVersions::from_persistence(node_id, vec![v1.clone(), v2.clone()]);
-        let reconciled = dir.reconcile(&live).unwrap();
-        assert!(reconciled.missing.is_empty());
-        assert!(reconciled.removed.is_empty());
-
-        let merged = merge_partials(&dir.cached_set(&live, |_| true)).await;
-        assert_eq!(merged, vec![(0, 10.0, 2), (1, 12.0, 2), (2, 4.0, 1)]);
-
-        // Now collapse v1+v2 into a single live v3 covering the same rows. The
-        // superseded partials must be removed, not merged on top of v3's --
-        // that addition is the double-count pinned by testsuite 733.
-        let v3 = test_version(3, Some("v3hash"));
-        let live = LiveVersions::from_persistence(node_id, vec![v3.clone()]);
-        let reconciled = dir.reconcile(&live).unwrap();
-        assert_eq!(reconciled.removed.len(), 2);
-        assert_eq!(reconciled.missing.len(), 1);
-
-        let b3 = partials_batch(&schema, &[0, 1, 2], &[10.0, 12.0, 4.0], &[2, 2, 1]);
-        let s3: BatchStream = Box::pin(futures::stream::iter(vec![Ok(b3)]));
-        _ = dir
-            .write_sidecar(&node_id, &v3, schema.clone(), s3)
-            .await
-            .unwrap();
-
-        let merged = merge_partials(&dir.cached_set(&live, |_| true)).await;
-        assert_eq!(merged, vec![(0, 10.0, 2), (1, 12.0, 2), (2, 4.0, 1)]);
     }
 
     /// Fold a cached set the way the read path does, returning
@@ -768,7 +659,7 @@ mod tests {
             }],
             hot_digest: Some(hot_digest),
             hot_bytes: 0,
-            covered: BTreeSet::new(),
+            sources: BTreeMap::new(),
             source_digest: None,
         };
 
@@ -822,17 +713,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cache_dir = tmp.path();
         let node_id = test_node_id();
-        let schema = partials_schema();
-        let v1 = test_version(1, Some("v1hash"));
-        let b1 = partials_batch(&schema, &[0], &[1.0], &[1]);
-        let s1: BatchStream = Box::pin(futures::stream::iter(vec![Ok(b1)]));
-        _ = partials_dir(cache_dir, "cfg", &node_id)
-            .write_sidecar(&node_id, &v1, schema.clone(), s1)
-            .await
-            .unwrap();
-        assert!(cache_node_dir(cache_dir, "cfg", &node_id).exists());
+        // Both namespaces: the live merged cache and the partials directory a
+        // pre-`segments-v3` binary would have left behind. `--rebuild` must
+        // clear both, or the stale one wastes disk forever.
+        let legacy = legacy_partials_node_dir(cache_dir, "cfg", &node_id);
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("v1.parquet"), b"stale").unwrap();
+        let merged = merged_dir(cache_dir, "cfg", &node_id);
+        std::fs::create_dir_all(&merged).unwrap();
+
         drop_node_namespace(cache_dir, "cfg", &node_id).unwrap();
-        assert!(!cache_node_dir(cache_dir, "cfg", &node_id).exists());
+        assert!(!legacy.exists());
+        assert!(!merged.exists());
         // Idempotent.
         drop_node_namespace(cache_dir, "cfg", &node_id).unwrap();
     }

@@ -508,10 +508,10 @@ impl TemporalReduceSqlFile {
             return Ok(None);
         }
 
-        // Partials are stored once at the finest resolution and re-binned to
-        // this file's resolution at merge time, so coarser resolutions never
-        // rescan raw history. The finest-partial namespace is therefore shared
-        // across all resolutions of the same site.
+        // The finest resolution aggregates the sources directly; every coarser
+        // resolution folds the next-finer resolution's segments, so no level
+        // rescans raw history more than once. The cache namespace is therefore
+        // shared across all resolutions of the same site.
         let resolution_durations = parse_nesting_resolutions(&self.config.resolutions)?;
         let Some(finest_interval) = resolution_durations.first().copied() else {
             return Ok(None);
@@ -525,18 +525,9 @@ impl TemporalReduceSqlFile {
             &self.pattern_url,
         ));
 
-        // Key the partials directory by the parent site partition, which is
-        // shared by every resolution file of this site, so all resolutions read
-        // and write the same finest-resolution partials.
+        // Key the cache by the parent site partition, which is shared by every
+        // resolution file of this site, so all resolutions share one namespace.
         let site_node_id = id.part_id().to_node_id();
-        let glob_dir = crate::rollup_cache::glob_dir(&cache_dir, &cfg_hash, &site_node_id);
-        let partials = crate::rollup_cache::partials_dir(&cache_dir, &cfg_hash, &site_node_id);
-        // Accumulated across source nodes: the partials of every source node's
-        // LIVE versions, named explicitly. Reading this instead of listing
-        // `glob_dir` is what keeps a version-collapse leftover out of the
-        // merge, where it would be summed a second time (testsuite 733).
-        let mut live_partials =
-            crate::version_cache::CachedSet::empty_in(partials.path().to_path_buf());
 
         let fs = self.context.context.filesystem();
         let mut provider_api =
@@ -544,6 +535,14 @@ impl TemporalReduceSqlFile {
         if let Ok(root) = self.context.root().await {
             provider_api = provider_api.with_root(root);
         }
+
+        // Collect every source node's LIVE versions, plus the content identity
+        // of the set: blake3 -> event-time range. That map is the freshness key
+        // (design §5.3); nothing here is keyed by a version number or filename.
+        let mut source_nodes: Vec<(tinyfs::NodeID, Vec<tinyfs::FileVersionInfo>)> =
+            Vec::with_capacity(source_files.len());
+        let mut now: std::collections::BTreeMap<String, crate::rollup_cache::SourceRange> =
+            std::collections::BTreeMap::new();
 
         for node_path in &source_files {
             let file_url_str = node_file_url(scheme, node_path);
@@ -554,100 +553,41 @@ impl TemporalReduceSqlFile {
                 .await
                 .map_other()?;
 
-            // Per-version partials only sum correctly when each source version
-            // contributes a DISJOINT row set, because the read-side merge is a
-            // GROUP BY time_bucket over every version's partial. FilePhysicalSeries
-            // and TablePhysicalSeries store append-only deltas (concatenated on
-            // read), so distinct versions never share a row; their partials merge
-            // in any order and late / out-of-order data is summed into the correct
-            // bucket exactly like a single-pass GROUP BY. Ordering is irrelevant.
+            // The rollup sums every live version of a source. Series entry types
+            // (FilePhysicalSeries, TablePhysicalSeries) store append-only deltas
+            // that are concatenated on read, so their versions are disjoint and
+            // summing them is exactly a single-pass GROUP BY over the whole
+            // series. A non-series file stores a full RE-SNAPSHOT per version,
+            // so two live versions share rows and summing them double-counts.
             //
-            // Non-series sources (FilePhysicalVersion) store a full re-snapshot per
-            // version, so successive versions OVERLAP and merging their partials
-            // would double-count. For those we keep the sequentiality frontier: a
-            // version whose earliest bucket precedes the frontier is an overlapping
-            // re-snapshot and is a hard error recovered with --rebuild, never a
-            // silent double-count.
-            let disjoint_versions = matches!(
+            // This used to be defended by a per-source "sequentiality frontier":
+            // scan each new version's bucket span, persist the high-water mark,
+            // and fail if a later version reached below it. That is a
+            // data-dependent test for a condition fixed by the entry type -- and
+            // for a re-snapshot it fires on the second version regardless, since
+            // every snapshot re-covers all of history. Testing the structure
+            // says the same thing without the scan, the sidecar file, or the
+            // chance of a stale frontier disagreeing with the data.
+            let is_series = matches!(
                 node_path.id().entry_type(),
                 EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries
             );
-
-            let live =
-                crate::version_cache::LiveVersions::from_persistence(source_node_id, versions);
-            // Reconcile before writing: this both reports which live versions
-            // still need a partial and DELETES the partials of versions that a
-            // collapse superseded. A cache that only ever added is how those
-            // leftovers survived to be double-counted.
-            let reconciled = partials.reconcile(&live).map_other()?;
-            if !reconciled.removed.is_empty() {
-                log::info!(
-                    "temporal-reduce rollup: source node {} dropped {} partial(s) whose \
-                     versions are no longer live (version collapse); any sealed run built \
-                     on them will be rebuilt from the live partials",
-                    source_node_id,
-                    reconciled.removed.len()
-                );
-            }
-            let mut uncached = reconciled.missing;
-            uncached.sort_by_key(|v| v.version);
-            let mut frontier =
-                crate::rollup_cache::read_frontier(&glob_dir, &source_node_id).map_other()?;
-            for version in &uncached {
-                let parquet_path = crate::format_cache::cache_version_path(
-                    &cache_dir,
-                    scheme,
-                    &source_node_id,
-                    version,
-                );
-                // Disjoint (series) sources skip the frontier entirely; only
-                // overlapping sources pay the per-version span scan and guard.
-                let span = if disjoint_versions {
-                    None
-                } else {
-                    self.version_bucket_span(finest_interval, &parquet_path)
-                        .await?
-                };
-                if let Some((lo, _hi)) = span
-                    && let Some(f) = frontier
-                    && lo < f
-                {
-                    return Err(tinyfs::Error::Other(format!(
-                        "temporal-reduce rollup: source node {} version {} backfills \
-                         already-sealed buckets (earliest bucket {} precedes frontier \
-                         {}); an overlapping non-series input breaks incremental partial \
-                         summation. Re-run the export with --rebuild to recompute the \
-                         rollup cache from scratch.",
-                        source_node_id, version.version, lo, f
-                    )));
-                }
-                self.write_version_partial(
-                    &pieces,
-                    finest_interval,
-                    &glob_dir,
-                    &source_node_id,
-                    version,
-                    &parquet_path,
-                )
-                .await?;
-                // Advance and persist the frontier only after the partial is
-                // durably written, so a later violation in this loop cannot
-                // strand an unrecorded sealed bucket: on retry the persisted
-                // frontier still reflects every version already cached.
-                if let Some((_lo, hi)) = span {
-                    let advanced = frontier.map_or(hi, |f| f.max(hi));
-                    if frontier != Some(advanced) {
-                        frontier = Some(advanced);
-                        crate::rollup_cache::write_frontier(&glob_dir, &source_node_id, advanced)
-                            .map_other()?;
-                    }
-                }
+            if !is_series && versions.len() > 1 {
+                return Err(tinyfs::Error::Other(format!(
+                    "temporal-reduce rollup: source '{}' is a non-series file with \
+                     {} live versions. Each version is a full re-snapshot, so they \
+                     overlap and cannot be aggregated together without \
+                     double-counting. Use a series entry type for incrementally \
+                     appended data, or reduce a single-version source.",
+                    node_path.path().display(),
+                    versions.len()
+                )));
             }
 
-            // Collected after the writes above, so newly written partials are
-            // included. Node scoped: a sibling source node's partials in this
-            // shared directory belong to its own live set, not this one's.
-            live_partials.extend(partials.cached_set(&live, |_| true));
+            for v in &versions {
+                let _ = now.insert(source_version_key(&source_node_id, v), source_range(v));
+            }
+            source_nodes.push((source_node_id, versions));
         }
 
         let ctx = &context.datafusion_session;
@@ -673,13 +613,7 @@ impl TemporalReduceSqlFile {
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect();
-        let partials_table = format!("__rollup_partials_{}_{}", cfg_hash, sanitized_id);
-        if !ctx.table_exist(partials_table.as_str()).unwrap_or(false) {
-            let provider = live_partials.table_provider().await.map_other()?;
-            _ = ctx
-                .register_table(partials_table.as_str(), provider)
-                .map_other()?;
-        }
+        let source_table = format!("__rollup_source_{}_{}", cfg_hash, sanitized_id);
 
         let ts = filled.time_column.clone();
 
@@ -689,11 +623,10 @@ impl TemporalReduceSqlFile {
         // per-build cost is bounded to ~allowed_lateness instead of all history.
         //
         // Resolutions form a nesting chain (finest .. coarsest). The finest
-        // resolution folds the shared finest partials directly; every coarser
-        // resolution is built by folding the *next-finer resolution's* runs +
-        // hot (exponentially less input than rescanning the finest partials),
-        // which is exact because the stored partials are associative and the
-        // intervals nest. We build the chain finest-first up to this file's
+        // resolution aggregates the SOURCE directly; every coarser resolution is
+        // built by folding the *next-finer resolution's* runs + hot
+        // (exponentially less input than rescanning the source), which is exact
+        // because the stored partials are associative and the intervals nest. We build the chain finest-first up to this file's
         // resolution, so a consumer of any resolution transparently materializes
         // the finer levels it depends on. Each level reuses its cache when
         // unchanged, so this is cheap after the first cold build.
@@ -718,15 +651,18 @@ impl TemporalReduceSqlFile {
         for (idx, level) in levels.iter().copied().enumerate() {
             let res_dir = crate::rollup_cache::sealed_res_dir(&merged_dir, level.as_secs());
             let built = if idx == 0 {
-                // Finest resolution: fold the shared finest partials.
-                self.build_level_from_partials(
+                // Finest resolution: aggregate the sources directly.
+                self.build_level_from_source(
                     ctx,
                     &pieces,
                     &ts,
                     level,
                     &res_dir,
-                    &partials_table,
-                    &glob_dir,
+                    &cache_dir,
+                    scheme,
+                    &source_nodes,
+                    &now,
+                    &source_table,
                     policy,
                 )
                 .await?
@@ -821,135 +757,6 @@ impl TemporalReduceSqlFile {
         )?;
 
         Ok(Some(table_provider))
-    }
-
-    /// Compute the finest-interval `time_bucket` span [min, max] of one cached
-    /// source version, in the timestamp unit cast to `i64`. Returns `None` when
-    /// the version contributes no non-null timestamps, in which case it neither
-    /// advances nor is checked against the sequentiality frontier. The unit is
-    /// consistent across all versions of one source node, so comparing these
-    /// spans against a per-node frontier is well defined.
-    async fn version_bucket_span(
-        &self,
-        finest_interval: Duration,
-        parquet_path: &std::path::Path,
-    ) -> TinyFSResult<Option<(i64, i64)>> {
-        let ctx = datafusion::prelude::SessionContext::new();
-        let table = "__src_version";
-        ctx.register_parquet(
-            table,
-            parquet_path.to_string_lossy().as_ref(),
-            datafusion::prelude::ParquetReadOptions::default(),
-        )
-        .await
-        .map_other_context(format!(
-            "register cached parquet '{}'",
-            parquet_path.display()
-        ))?;
-
-        let interval = duration_to_sql_interval(finest_interval);
-        let bin = date_bin_expr(&interval, &self.config.time_column);
-        let ts = &self.config.time_column;
-        let span_sql = format!(
-            "SELECT CAST(MIN({bin}) AS BIGINT) AS lo, CAST(MAX({bin}) AS BIGINT) AS hi \
-             FROM {table} WHERE {ts} IS NOT NULL"
-        );
-        let batches = ctx
-            .sql(&span_sql)
-            .await
-            .map_other_context("rollup span SQL planning failed")?
-            .collect()
-            .await
-            .map_other_context("rollup span SQL execution failed")?;
-
-        for batch in &batches {
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            let lo = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>();
-            let hi = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>();
-            if let (Some(lo), Some(hi)) = (lo, hi) {
-                use arrow::array::Array;
-                if lo.is_null(0) || hi.is_null(0) {
-                    return Ok(None);
-                }
-                return Ok(Some((lo.value(0), hi.value(0))));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Compute the earliest output-interval bucket touched by a set of freshly
-    /// written partial files. Returns `(native_lo, secs_lo)` where `native_lo`
-    /// is `CAST(date_bin(out, time_bucket) AS BIGINT)` in the timestamp's native
-    /// unit, used as the internal splice point, and `secs_lo` is the same bucket
-    /// as epoch seconds via `EXTRACT(EPOCH FROM ...)`, published in the export
-    /// hint so the export layer can compare against Hive partition path times
-    /// without knowing the timestamp's storage unit.
-    ///
-    /// Returns `None` only when none of the partials contribute a non-null
-    /// bucket. This lower bound (`dirty_lo`) is the splice point for the
-    /// merged-output cache: every output bucket strictly before it is unchanged
-    /// because no new partial falls into it, so it is reused from the cache.
-    async fn min_output_bucket(
-        &self,
-        partial_paths: &[std::path::PathBuf],
-        output_interval: Duration,
-    ) -> TinyFSResult<Option<(i64, i64)>> {
-        let interval = duration_to_sql_interval(output_interval);
-        let bin = date_bin_expr(&interval, "time_bucket");
-        let mut global: Option<(i64, i64)> = None;
-        for path in partial_paths {
-            let ctx = datafusion::prelude::SessionContext::new();
-            let table = "__new_partial";
-            ctx.register_parquet(
-                table,
-                path.to_string_lossy().as_ref(),
-                datafusion::prelude::ParquetReadOptions::default(),
-            )
-            .await
-            .map_other_context(format!("register new partial '{}'", path.display()))?;
-            let sql = format!(
-                "SELECT CAST(MIN({bin}) AS BIGINT) AS lo, \
-                        CAST(MIN(EXTRACT(EPOCH FROM {bin})) AS BIGINT) AS lo_secs \
-                 FROM {table}"
-            );
-            let batches = ctx
-                .sql(&sql)
-                .await
-                .map_other_context("min-output-bucket SQL planning failed")?
-                .collect()
-                .await
-                .map_other_context("min-output-bucket SQL execution failed")?;
-            for batch in &batches {
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                let lo = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int64Array>();
-                let lo_secs = batch
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int64Array>();
-                if let (Some(lo), Some(lo_secs)) = (lo, lo_secs) {
-                    use arrow::array::Array;
-                    if !lo.is_null(0) && !lo_secs.is_null(0) {
-                        let v = (lo.value(0), lo_secs.value(0));
-                        global =
-                            Some(global.map_or(v, |g: (i64, i64)| if v.0 < g.0 { v } else { g }));
-                    }
-                }
-            }
-        }
-        Ok(global)
     }
 
     /// Newest output-bucket start (epoch seconds) over `table`, re-binning its
@@ -1178,21 +985,32 @@ impl TemporalReduceSqlFile {
         Ok(superseded)
     }
 
-    /// Build the finest resolution level by folding the shared finest partials.
-    /// Freshness is keyed on the partial member set (`covered`): unchanged →
-    /// Reuse; an append-only superset → Incremental (advance watermark, seal,
-    /// recompute hot); any other shape → Rebuild. A backfill older than the
-    /// sealed watermark is a hard error (§5).
+    /// Build the finest resolution level by aggregating the SOURCE directly.
+    ///
+    /// Freshness is keyed on source CONTENT: `sources` maps the blake3 of each
+    /// live source version to the event-time range it covers. Unchanged means
+    /// Reuse; any difference means Incremental over the dirty range; no
+    /// compatible manifest means Rebuild.
+    ///
+    /// There is no per-version partial cache. The cached source Parquets are
+    /// aggregated through a view, pruned to the versions whose recorded
+    /// `max_event_time` reaches the range being rebuilt. That prune is what the
+    /// partials were really buying -- "do not rescan old versions" -- and it
+    /// comes from data tlogfs already records, without a second file population
+    /// and without a cache keyed by a version number.
     #[allow(clippy::too_many_arguments)]
-    async fn build_level_from_partials(
+    async fn build_level_from_source(
         &self,
         ctx: &datafusion::prelude::SessionContext,
         pieces: &AggSqlPieces,
         ts: &str,
         output_interval: Duration,
         res_dir: &std::path::Path,
-        partials_table: &str,
-        glob_dir: &std::path::Path,
+        cache_dir: &std::path::Path,
+        scheme: &str,
+        source_nodes: &[(tinyfs::NodeID, Vec<tinyfs::FileVersionInfo>)],
+        now: &std::collections::BTreeMap<String, crate::rollup_cache::SourceRange>,
+        source_table: &str,
         policy: SealPolicy,
     ) -> TinyFSResult<LevelBuild> {
         let manifest = match crate::rollup_cache::read_sealed_manifest(res_dir).map_other()? {
@@ -1209,36 +1027,27 @@ impl TemporalReduceSqlFile {
             None => None,
         };
 
-        let current_members = crate::rollup_cache::list_glob_members(glob_dir).map_other()?;
-        let current_names: std::collections::BTreeSet<String> = current_members
-            .iter()
-            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .collect();
-
         enum Plan {
             Reuse,
-            Incremental { dirty_lo_secs: Option<i64> },
+            /// Rebuild every output bucket at or after this event time (epoch
+            /// microseconds). `None` means the whole axis.
+            Incremental {
+                dirty_lo_us: Option<i64>,
+            },
             Rebuild,
         }
+
         let plan = match &manifest {
-            Some(m) if m.covered == current_names => Plan::Reuse,
-            Some(m) if m.covered.is_subset(&current_names) => {
-                let new_members: Vec<std::path::PathBuf> = current_members
-                    .iter()
-                    .filter(|p| {
-                        p.file_name()
-                            .map(|n| !m.covered.contains(n.to_string_lossy().as_ref()))
-                            .unwrap_or(false)
-                    })
-                    .cloned()
-                    .collect();
-                let dirty_lo_secs = self
-                    .min_output_bucket(&new_members, output_interval)
-                    .await?
-                    .map(|(_native, secs)| secs);
-                Plan::Incremental { dirty_lo_secs }
-            }
-            _ => Plan::Rebuild,
+            Some(m) if m.sources == *now => Plan::Reuse,
+            Some(m) => Plan::Incremental {
+                // The dirty range is driven by the SYMMETRIC difference, not
+                // just by additions. A digest that vanished matters as much as
+                // one that appeared: it means a version was collapsed away or
+                // deleted, and the buckets it contributed to must be recomputed
+                // from whatever now covers them.
+                dirty_lo_us: dirty_lo_us(&m.sources, now),
+            },
+            None => Plan::Rebuild,
         };
 
         if let Plan::Reuse = plan {
@@ -1256,25 +1065,23 @@ impl TemporalReduceSqlFile {
         }
 
         let rebuilt = matches!(plan, Plan::Rebuild);
-        let (mut m, changed_since) = match plan {
-            Plan::Incremental { dirty_lo_secs } => {
-                let m = manifest.expect("incremental implies a manifest");
-                // Hard-fail on data older than the sealed watermark: it would
-                // reopen an immutable bucket beyond allowed_lateness.
-                if let (Some(sealed_hi), Some(dl)) = (m.sealed_hi_secs, dirty_lo_secs)
-                    && dl < sealed_hi
-                {
-                    return Err(tinyfs::Error::Other(format!(
-                        "temporal-reduce rollup: source data backfills an \
-                         already-sealed bucket (earliest new output bucket {}s \
-                         precedes the sealed watermark {}s; allowed_lateness = \
-                         {}s). Data older than the watermark cannot reopen a \
-                         sealed run. Re-run the export with --rebuild to \
-                         recompute the rollup cache from scratch.",
-                        dl, sealed_hi, policy.lateness_secs
-                    )));
-                }
-                (m, dirty_lo_secs)
+        let (mut m, mut unsealed, changed_since) = match plan {
+            Plan::Incremental { dirty_lo_us } => {
+                let mut m = manifest.expect("incremental implies a manifest");
+                let dirty_lo_secs = dirty_lo_us.map(floor_us_to_secs);
+                // Late data is ordinary work now, not a --rebuild error. Buckets
+                // at or after the dirty point must be recomputed; those below
+                // sealed_hi live in immutable segments, so the segments covering
+                // them are UNSEALED -- dropped from the manifest and folded back
+                // into the hot window, which the seal path below recomputes from
+                // source and re-seals.
+                //
+                // This works only because segments are keyed by the bucket range
+                // they cover, so "which segments hold this instant" is a lookup.
+                // Under the old version-keyed layout there was no way to find
+                // them again, which is exactly why it had to error instead.
+                let unsealed = unseal_from(&mut m, dirty_lo_secs, res_dir)?;
+                (m, unsealed, dirty_lo_secs)
             }
             _ => {
                 crate::rollup_cache::wipe_sealed_res_dir(res_dir).map_other()?;
@@ -1284,32 +1091,76 @@ impl TemporalReduceSqlFile {
                         allowed_lateness_secs: policy.lateness_secs,
                         ..Default::default()
                     },
+                    Vec::new(),
                     None,
                 )
             }
         };
 
-        let superseded = self
-            .seal_and_recompute(
+        // Everything the build must be able to see: the hot window
+        // [sealed_hi, inf) plus the dirty range. Pruning below this is what
+        // keeps an incremental build off the whole history; pruning ABOVE it
+        // would silently drop contributing rows, so take the lower of the two.
+        let read_lo_us = match (m.sealed_hi_secs, changed_since) {
+            (Some(sealed_hi), Some(dirty_lo)) => Some(secs_to_us(sealed_hi.min(dirty_lo))),
+            // No watermark means every bucket is hot: read everything.
+            (None, _) => None,
+            (Some(sealed_hi), None) => Some(secs_to_us(sealed_hi)),
+        };
+
+        // Aggregate the sources into partial columns on the fly. This view is
+        // what `seal_and_recompute` folds, so it plays exactly the role the
+        // partials directory used to -- as a query, not as a file population.
+        let source_set = bounded_source_set(cache_dir, scheme, source_nodes, read_lo_us);
+        let provider = source_set.table_provider().await.map_other()?;
+        let available: std::collections::HashSet<String> = provider
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        if ctx.table_exist(source_table).unwrap_or(false) {
+            _ = ctx.deregister_table(source_table).map_other()?;
+        }
+        _ = ctx.register_table(source_table, provider).map_other()?;
+
+        let partials_view = format!("{}_partials", source_table);
+        let partial_sql = pieces.partial_sql(output_interval, ts, source_table, &available);
+        let build = async {
+            _ = ctx
+                .sql(&format!(
+                    "CREATE OR REPLACE VIEW {partials_view} AS {partial_sql}"
+                ))
+                .await
+                .map_other_context("rollup source partial view")?;
+            self.seal_and_recompute(
                 ctx,
                 pieces,
                 ts,
                 output_interval,
                 res_dir,
-                partials_table,
+                &partials_view,
                 "time_bucket",
                 &mut m,
                 policy,
             )
-            .await?;
-        m.covered = current_names;
+            .await
+        }
+        .await;
+        _ = ctx
+            .sql(&format!("DROP VIEW IF EXISTS {partials_view}"))
+            .await;
+        let superseded = build?;
+
+        m.sources = now.clone();
         m.source_digest = None;
 
         let digest = crate::rollup_cache::write_sealed_manifest(res_dir, &m)
             .await
             .map_other()?;
         // Only now that the manifest naming the merged runs is durable.
-        crate::rollup_cache::remove_superseded(&superseded).await;
+        unsealed.extend(superseded);
+        crate::rollup_cache::remove_superseded(&unsealed).await;
         let provider = crate::rollup_cache::listing_table_for_res_dir(res_dir, &m, ts)
             .await
             .map_other()?;
@@ -1413,7 +1264,7 @@ impl TemporalReduceSqlFile {
                 policy,
             )
             .await?;
-        m.covered = std::collections::BTreeSet::new();
+        m.sources.clear();
         m.source_digest = Some(finer_digest.to_string());
 
         let digest = crate::rollup_cache::write_sealed_manifest(res_dir, &m)
@@ -1465,57 +1316,6 @@ impl TemporalReduceSqlFile {
             .await
             .map_other()?;
         Ok((digest, rows.load(std::sync::atomic::Ordering::Relaxed)))
-    }
-
-    async fn write_version_partial(
-        &self,
-        pieces: &AggSqlPieces,
-        finest_interval: Duration,
-        glob_dir: &std::path::Path,
-        source_node_id: &tinyfs::NodeID,
-        version: &tinyfs::FileVersionInfo,
-        parquet_path: &std::path::Path,
-    ) -> TinyFSResult<()> {
-        let ctx = datafusion::prelude::SessionContext::new();
-        let table = "__src_version";
-        ctx.register_parquet(
-            table,
-            parquet_path.to_string_lossy().as_ref(),
-            datafusion::prelude::ParquetReadOptions::default(),
-        )
-        .await
-        .map_other_context(format!(
-            "register cached parquet '{}'",
-            parquet_path.display()
-        ))?;
-
-        let available: std::collections::HashSet<String> = ctx
-            .table(table)
-            .await
-            .map_other_context("read cached version schema")?
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
-
-        let partial_sql =
-            pieces.partial_sql(finest_interval, &self.config.time_column, table, &available);
-        let stream = ctx
-            .sql(&partial_sql)
-            .await
-            .map_other_context("rollup partial SQL planning failed")?
-            .execute_stream()
-            .await
-            .map_other_context("rollup partial SQL execution failed")?;
-
-        let schema = stream.schema();
-        let mapped = stream.map(|r| r.map_err(|e| crate::error::Error::Arrow(e.to_string())));
-        _ = crate::rollup_cache::partials_dir_at(glob_dir)
-            .write_sidecar(source_node_id, version, schema, Box::pin(mapped))
-            .await
-            .map_other()?;
-        Ok(())
     }
 
     /// Resolve this partition's `pattern_url` to concrete source file
@@ -2764,6 +2564,166 @@ register_dynamic_factory!(
     validate: validate_temporal_reduce_config
 );
 
+/// Content identity of one live source version: its blake3, qualified by node so
+/// two nodes with byte-identical versions stay distinct entries.
+///
+/// A version with no recorded blake3 falls back to node+version, which is
+/// unstable across a collapse and so degrades to "looks changed" -- a rebuild,
+/// never a stale reuse.
+fn source_version_key(node_id: &tinyfs::NodeID, v: &tinyfs::FileVersionInfo) -> String {
+    match &v.blake3 {
+        Some(h) => format!("{}:{}", node_id, h),
+        None => format!("{}:v{}", node_id, v.version),
+    }
+}
+
+/// Event-time range covered by one source version (epoch microseconds, `max`
+/// inclusive), from the bounds tlogfs records on a series version.
+///
+/// A version without recorded bounds gets the whole axis. That is not a special
+/// case to test for later: it makes any dirty range containing it unbounded, so
+/// the build falls back to reading everything -- correct, merely not pruned.
+fn source_range(v: &tinyfs::FileVersionInfo) -> crate::rollup_cache::SourceRange {
+    let md = v.extended_metadata.as_ref();
+    let get = |k: &str| {
+        md.and_then(|m| m.get(k))
+            .and_then(|s| s.parse::<i64>().ok())
+    };
+    match (get("min_event_time"), get("max_event_time")) {
+        (Some(min_us), Some(max_us)) => crate::rollup_cache::SourceRange { min_us, max_us },
+        _ => crate::rollup_cache::SourceRange::UNKNOWN,
+    }
+}
+
+/// Oldest event time (epoch µs) touched by the difference between the cached
+/// source set and the current one, or `None` if the difference reaches the
+/// beginning of time (or a version with no recorded range).
+///
+/// The SYMMETRIC difference matters: a digest that disappeared invalidates the
+/// buckets it fed just as much as a new one does.
+fn dirty_lo_us(
+    before: &std::collections::BTreeMap<String, crate::rollup_cache::SourceRange>,
+    after: &std::collections::BTreeMap<String, crate::rollup_cache::SourceRange>,
+) -> Option<i64> {
+    let mut lo: Option<i64> = None;
+    let mut note = |r: &crate::rollup_cache::SourceRange| {
+        lo = Some(match lo {
+            Some(cur) => cur.min(r.min_us),
+            None => r.min_us,
+        });
+    };
+    for (k, r) in after {
+        if before.get(k) != Some(r) {
+            note(r);
+        }
+    }
+    for (k, r) in before {
+        if !after.contains_key(k) {
+            note(r);
+        }
+    }
+    match lo {
+        Some(v) if v == i64::MIN => None,
+        other => other,
+    }
+}
+
+/// Fold every sealed segment that covers a bucket at or after `dirty_lo_secs`
+/// back into the hot window, returning their files (to delete once the manifest
+/// that no longer names them is durable).
+///
+/// This is how late data is handled. A backfill below the watermark used to be a
+/// hard error demanding `--rebuild`, because segments were keyed by which source
+/// versions produced them and there was no way to ask "which segments hold this
+/// instant". Segments are keyed by bucket range now, so that question is a
+/// lookup: drop the ones that answer it, lower `sealed_hi` to the oldest drop,
+/// and the ordinary seal path recomputes those buckets from source and re-seals
+/// them. No merge-in-place, no separate late-data path.
+///
+/// `dirty_lo_secs = None` means the dirty range reaches the beginning of time, so
+/// everything unseals -- which is a rebuild, expressed in the same terms.
+fn unseal_from(
+    m: &mut crate::rollup_cache::SealedManifest,
+    dirty_lo_secs: Option<i64>,
+    res_dir: &std::path::Path,
+) -> TinyFSResult<Vec<std::path::PathBuf>> {
+    // Nothing sealed reaches the dirty range: no unsealing to do.
+    let Some(sealed_hi) = m.sealed_hi_secs else {
+        return Ok(Vec::new());
+    };
+    if dirty_lo_secs.is_some_and(|lo| sealed_hi <= lo) {
+        return Ok(Vec::new());
+    }
+
+    // A segment covers [lo, hi); it is dirty iff it holds any bucket >= dirty_lo.
+    let dirty = |r: &crate::rollup_cache::SealedRun| match dirty_lo_secs {
+        Some(lo) => r.hi_secs > lo,
+        None => true,
+    };
+    let (dropped, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut m.runs)
+        .into_iter()
+        .partition(|r| dirty(r));
+    m.runs = kept;
+
+    // The new watermark is the dirty point, lowered further to the bottom edge
+    // of any segment straddling it -- a segment is dropped whole, so everything
+    // it covered is hot again. A `None` bottom edge reached the beginning of
+    // time, so nothing stays sealed.
+    //
+    // This is computed from the dirty point rather than from the dropped
+    // segments alone, because the watermark can legitimately have advanced over
+    // a span that produced no segment file: sealing an empty range (a gap in the
+    // data) records the watermark and writes nothing. Deriving the new watermark
+    // only from dropped files would leave it above the dirty point with no
+    // segment covering the difference, silently losing those buckets.
+    let mut new_hi: Option<i64> = dirty_lo_secs;
+    let mut open_ended = dirty_lo_secs.is_none();
+    for r in &dropped {
+        match r.lo_secs {
+            Some(lo) => new_hi = Some(new_hi.map_or(lo, |cur: i64| cur.min(lo))),
+            None => open_ended = true,
+        }
+    }
+    m.sealed_hi_secs = if open_ended { None } else { new_hi };
+
+    // Those bytes are hot again, so account for them: the seal gate reads
+    // `hot_bytes` to decide whether freezing is worthwhile, and the next build
+    // rewrites exactly this much.
+    m.hot_bytes = m
+        .hot_bytes
+        .saturating_add(dropped.iter().map(|r| r.bytes).sum());
+
+    Ok(dropped
+        .iter()
+        .map(|r| crate::rollup_cache::run_path(res_dir, &r.name))
+        .collect())
+}
+
+/// The cached source Parquets to aggregate, pruned to versions that can reach
+/// `read_lo_us` (epoch µs). `None` reads every live version.
+fn bounded_source_set(
+    cache_dir: &std::path::Path,
+    scheme: &str,
+    source_nodes: &[(tinyfs::NodeID, Vec<tinyfs::FileVersionInfo>)],
+    read_lo_us: Option<i64>,
+) -> crate::version_cache::CachedSet {
+    let bounds = read_lo_us.map_or(tinyfs::SeriesReadBounds::NONE, |lo| {
+        tinyfs::SeriesReadBounds::from_event_time_lo(lo)
+    });
+    crate::format_cache::glob_cached_set_bounded(cache_dir, scheme, source_nodes, &bounds)
+}
+
+/// Epoch microseconds -> epoch seconds, rounding DOWN (toward -inf, so it holds
+/// for pre-epoch times too). Every µs->s conversion here widens the range it
+/// bounds, so a rounding error can only cause extra work, never dropped data.
+fn floor_us_to_secs(us: i64) -> i64 {
+    us.div_euclid(1_000_000)
+}
+
+fn secs_to_us(secs: i64) -> i64 {
+    secs.saturating_mul(1_000_000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3792,8 +3752,17 @@ mod tests {
             rows
         }
 
-        fn count_rollup_partials(cache_dir: &std::path::Path) -> usize {
-            let mut count = 0;
+        /// Every cache file with its content digest, under `filter`ed dirs.
+        ///
+        /// Incrementality is asserted on this rather than on a file COUNT: a
+        /// count cannot tell reuse apart from recompute-and-overwrite, which is
+        /// exactly the failure worth catching now that the cache is a fixed
+        /// handful of files instead of one per source version.
+        fn cache_fingerprint(
+            cache_dir: &std::path::Path,
+            keep: &dyn Fn(&std::path::Path) -> bool,
+        ) -> Vec<(String, String)> {
+            let mut out = Vec::new();
             let mut stack = vec![cache_dir.to_path_buf()];
             while let Some(dir) = stack.pop() {
                 let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -3803,18 +3772,17 @@ mod tests {
                     let path = entry.path();
                     if path.is_dir() {
                         stack.push(path);
-                    } else if path.extension().is_some_and(|e| e == "parquet")
-                        && path
-                            .parent()
-                            .and_then(|p| p.file_name())
-                            .and_then(|n| n.to_str())
-                            .is_some_and(|n| n.starts_with("rollup_"))
-                    {
-                        count += 1;
+                    } else if keep(&path) {
+                        let bytes = std::fs::read(&path).unwrap();
+                        out.push((
+                            path.strip_prefix(cache_dir).unwrap().display().to_string(),
+                            blake3::hash(&bytes).to_hex().to_string(),
+                        ));
                     }
                 }
             }
-            count
+            out.sort();
+            out
         }
 
         let tmp = tempfile::tempdir().unwrap();
@@ -3840,20 +3808,31 @@ mod tests {
         assert_eq!(tmin0, 20.5, "day0 min temp");
         assert_eq!(tmax0, 43.5, "day0 max temp");
 
-        // One partial per source file after the first read.
-        let partials_after_first = count_rollup_partials(&cache_dir);
-        assert_eq!(partials_after_first, 2, "one partial per source file");
+        // The cache names the content of both source files, and holds only the
+        // merged levels -- no per-source-version file population.
+        let all = |_: &std::path::Path| true;
+        let after_first = cache_fingerprint(&cache_dir, &all);
+        let manifests = walk_find(&cache_dir, &|n| n == "manifest.json");
+        assert_eq!(
+            manifests.len(),
+            1,
+            "one manifest, for the single resolution"
+        );
+        let m = crate::rollup_cache::read_sealed_manifest(manifests[0].parent().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.sources.len(), 2, "one source entry per source file");
 
         // A second read over an unchanged source, with a fresh session but the
-        // same cache directory, must reuse the cached partials: identical output
-        // and no newly-written partials.
+        // same cache directory, must REUSE: identical output, and not one cache
+        // byte rewritten.
         let cache_ctx2 = make_ctx(Some(cache_dir.clone()));
         let rollup_rows2 = collect_daily(&fs, &cache_ctx2, config()).await;
         assert_eq!(rollup_rows2, rollup_rows, "incremental read matches");
         assert_eq!(
-            count_rollup_partials(&cache_dir),
-            partials_after_first,
-            "second read must not recompute any partials"
+            cache_fingerprint(&cache_dir, &all),
+            after_first,
+            "second read over unchanged sources must not rewrite the cache"
         );
     }
 
@@ -3983,8 +3962,17 @@ mod tests {
             rows
         }
 
-        fn count_rollup_partials(cache_dir: &std::path::Path) -> usize {
-            let mut count = 0;
+        /// Every cache file with its content digest, under `filter`ed dirs.
+        ///
+        /// Incrementality is asserted on this rather than on a file COUNT: a
+        /// count cannot tell reuse apart from recompute-and-overwrite, which is
+        /// exactly the failure worth catching now that the cache is a fixed
+        /// handful of files instead of one per source version.
+        fn cache_fingerprint(
+            cache_dir: &std::path::Path,
+            keep: &dyn Fn(&std::path::Path) -> bool,
+        ) -> Vec<(String, String)> {
+            let mut out = Vec::new();
             let mut stack = vec![cache_dir.to_path_buf()];
             while let Some(dir) = stack.pop() {
                 let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -3994,18 +3982,17 @@ mod tests {
                     let path = entry.path();
                     if path.is_dir() {
                         stack.push(path);
-                    } else if path.extension().is_some_and(|e| e == "parquet")
-                        && path
-                            .parent()
-                            .and_then(|p| p.file_name())
-                            .and_then(|n| n.to_str())
-                            .is_some_and(|n| n.starts_with("rollup_"))
-                    {
-                        count += 1;
+                    } else if keep(&path) {
+                        let bytes = std::fs::read(&path).unwrap();
+                        out.push((
+                            path.strip_prefix(cache_dir).unwrap().display().to_string(),
+                            blake3::hash(&bytes).to_hex().to_string(),
+                        ));
                     }
                 }
             }
-            count
+            out.sort();
+            out
         }
 
         let tmp = tempfile::tempdir().unwrap();
@@ -4014,20 +4001,23 @@ mod tests {
 
         // Read all three resolutions from the cascading rollup path.
         let hourly = collect_resolution(&cache_ctx, config(), "res=1h.series", "r_1h").await;
-        let partials_after_first_res = count_rollup_partials(&cache_dir);
+        // The finest level (res3600) is the only one that touches raw source.
+        let finest = |p: &std::path::Path| p.to_string_lossy().contains("res3600");
+        let finest_after_1h = cache_fingerprint(&cache_dir, &finest);
+        assert!(
+            !finest_after_1h.is_empty(),
+            "the finest resolution must be materialized"
+        );
         let six_hourly = collect_resolution(&cache_ctx, config(), "res=6h.series", "r_6h").await;
         let daily = collect_resolution(&cache_ctx, config(), "res=1d.series", "r_1d").await;
 
-        // Raw is scanned only once: the finest partials (one per source file)
-        // are shared, so reading coarser resolutions adds no new partials.
+        // Raw is scanned once. The coarser resolutions fold the finest level's
+        // output, so they must leave it byte-identical -- if a coarser read
+        // rewrote it, the cascade would be rescanning source per resolution.
         assert_eq!(
-            partials_after_first_res, 2,
-            "one finest partial per source file"
-        );
-        assert_eq!(
-            count_rollup_partials(&cache_dir),
-            2,
-            "coarser resolutions must reuse the shared finest partials"
+            cache_fingerprint(&cache_dir, &finest),
+            finest_after_1h,
+            "coarser resolutions must reuse the finest level untouched"
         );
 
         // Each cascaded resolution matches its single-pass output.
@@ -4112,8 +4102,9 @@ mod tests {
         let hots = walk_find(&cache_dir, &|n| n == "hot.parquet");
         assert_eq!(hots.len(), 3, "each level recomputes its own hot window");
 
-        // The finest level folds raw partials (source_digest == None); each
-        // coarser level records the finer manifest digest it folded.
+        // The finest level aggregates the sources (source_digest == None, and
+        // `sources` names their content); each coarser level records the finer
+        // manifest digest it folded instead.
         for m_path in &manifests {
             let res_dir = m_path.parent().unwrap();
             let secs: u64 = res_dir
@@ -4128,11 +4119,11 @@ mod tests {
             if secs == 3600 {
                 assert!(
                     m.source_digest.is_none(),
-                    "finest level folds shared partials, not a finer level"
+                    "finest level aggregates sources, not a finer level"
                 );
                 assert!(
-                    !m.covered.is_empty(),
-                    "finest level tracks its partial member set"
+                    !m.sources.is_empty(),
+                    "finest level tracks the content of its live source versions"
                 );
             } else {
                 assert!(
@@ -4141,6 +4132,124 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn range(min_us: i64, max_us: i64) -> crate::rollup_cache::SourceRange {
+        crate::rollup_cache::SourceRange { min_us, max_us }
+    }
+
+    fn source_map(
+        entries: &[(&str, crate::rollup_cache::SourceRange)],
+    ) -> std::collections::BTreeMap<String, crate::rollup_cache::SourceRange> {
+        entries
+            .iter()
+            .map(|(k, r)| ((*k).to_string(), *r))
+            .collect()
+    }
+
+    /// The dirty point is driven by the SYMMETRIC difference of the source sets.
+    /// A version that DISAPPEARED -- collapsed away or deleted -- invalidates the
+    /// buckets it fed just as surely as a new one does, so keying only on
+    /// additions would serve output still containing its rows.
+    #[test]
+    fn test_dirty_lo_us_covers_both_directions() {
+        let a = range(1_000, 2_000);
+        let b = range(5_000, 6_000);
+        let c = range(9_000, 9_500);
+
+        let before = source_map(&[("a", a), ("b", b)]);
+
+        assert_eq!(
+            dirty_lo_us(&before, &before),
+            None,
+            "unchanged: no dirty range"
+        );
+
+        // Pure append: only the new version's span is dirty.
+        let appended = source_map(&[("a", a), ("b", b), ("c", c)]);
+        assert_eq!(dirty_lo_us(&before, &appended), Some(9_000));
+
+        // Removal: the vanished version's span is dirty even though nothing
+        // was added.
+        let removed = source_map(&[("a", a)]);
+        assert_eq!(dirty_lo_us(&before, &removed), Some(5_000));
+
+        // A collapse -- several versions replaced by one merged version with the
+        // same content -- is dirty over the whole span it replaces, and no
+        // further back.
+        let collapsed = source_map(&[("merged", range(1_000, 6_000))]);
+        assert_eq!(dirty_lo_us(&before, &collapsed), Some(1_000));
+
+        // A version with no recorded range makes the dirty range unbounded, so
+        // the build reads everything rather than pruning something it cannot
+        // prove is unaffected.
+        let unknown = source_map(&[
+            ("a", a),
+            ("b", b),
+            ("c", crate::rollup_cache::SourceRange::UNKNOWN),
+        ]);
+        assert_eq!(dirty_lo_us(&before, &unknown), None);
+    }
+
+    /// Late data unseals: segments covering the dirty point are dropped and the
+    /// watermark falls back to the bottom of the oldest one dropped, so the
+    /// ordinary seal path recomputes those buckets from source.
+    #[test]
+    fn test_unseal_from_drops_segments_covering_the_dirty_point() {
+        let seg = |name: &str, lo: Option<i64>, hi: i64| crate::rollup_cache::SealedRun {
+            name: name.to_string(),
+            lo_secs: lo,
+            hi_secs: hi,
+            digest: "d".to_string(),
+            bytes: 100,
+        };
+        let base = crate::rollup_cache::SealedManifest {
+            format: crate::rollup_cache::SEALED_FORMAT.to_string(),
+            sealed_hi_secs: Some(300),
+            runs: vec![
+                seg("run-0", None, 100),
+                seg("run-1", Some(100), 200),
+                seg("run-2", Some(200), 300),
+            ],
+            hot_bytes: 7,
+            ..Default::default()
+        };
+        let dir = std::path::Path::new("/tmp/unused");
+
+        // Dirty above the watermark: nothing sealed is affected.
+        let mut m = base.clone();
+        assert!(unseal_from(&mut m, Some(400), dir).unwrap().is_empty());
+        assert_eq!(m.runs.len(), 3);
+        assert_eq!(m.sealed_hi_secs, Some(300));
+
+        // Dirty inside the middle segment: it and everything after it are
+        // dropped, and the watermark falls to that segment's bottom -- not to
+        // the dirty point, because a segment is dropped whole.
+        let mut m = base.clone();
+        let dropped = unseal_from(&mut m, Some(150), dir).unwrap();
+        assert_eq!(dropped.len(), 2, "run-1 and run-2");
+        assert_eq!(m.runs.len(), 1);
+        assert_eq!(m.sealed_hi_secs, Some(100));
+        assert_eq!(m.hot_bytes, 207, "unsealed bytes are hot again");
+
+        // An unbounded dirty range unseals everything.
+        let mut m = base.clone();
+        let dropped = unseal_from(&mut m, None, dir).unwrap();
+        assert_eq!(dropped.len(), 3);
+        assert!(m.runs.is_empty());
+        assert_eq!(m.sealed_hi_secs, None);
+
+        // A watermark advanced over an empty span records no segment file. The
+        // watermark must still fall back to the dirty point, or the buckets
+        // between them would be neither sealed nor recomputed -- silently lost.
+        let mut m = crate::rollup_cache::SealedManifest {
+            sealed_hi_secs: Some(500),
+            runs: vec![seg("run-0", None, 100)],
+            ..Default::default()
+        };
+        let dropped = unseal_from(&mut m, Some(300), dir).unwrap();
+        assert!(dropped.is_empty(), "no segment covers [300, 500)");
+        assert_eq!(m.sealed_hi_secs, Some(300));
     }
 
     /// Phase 3: non-nesting resolution sets are rejected so cascaded rollups can
@@ -4157,13 +4266,18 @@ mod tests {
         assert_eq!(ok.first().copied(), Some(Duration::from_secs(3600)));
     }
 
-    /// Phase 4: a non-sequential source version, one that backfills buckets
-    /// already sealed by an earlier version, is a hard error on the incremental
-    /// path rather than a silent double-count. A single source file is written
-    /// twice: the first version holds only day 2, the second is a full rewrite
-    /// that prepends day 1, regressing the input min-ts below the frontier.
+    /// A non-series source with more than one live version is a hard error
+    /// rather than a silent double-count: each version is a full re-snapshot, so
+    /// summing them counts the overlapping rows twice. A single CSV is written
+    /// twice; the second version is a full rewrite that also prepends a day.
+    ///
+    /// This used to be phrased as a *sequentiality* check -- scan each version's
+    /// bucket span and fail if it reached below a persisted frontier -- which
+    /// tested the data for a property fixed by the entry type, and needed a
+    /// sidecar file to remember. The structural test reports the same case, and
+    /// reports it before reading a single row.
     #[tokio::test]
-    async fn test_rollup_rejects_non_sequential_version() {
+    async fn test_rollup_rejects_multi_version_non_series_source() {
         let _ = env_logger::try_init();
 
         let persistence = tinyfs::MemoryPersistence::default();
@@ -4244,11 +4358,11 @@ mod tests {
             .as_table_provider(file_id, &provider_context)
             .await;
 
-        let err = result.expect_err("non-sequential version must be a hard error");
+        let err = result.expect_err("overlapping re-snapshots must be a hard error");
         let msg = err.to_string();
         assert!(
-            msg.contains("backfills") && msg.contains("--rebuild"),
-            "error must explain the violation and suggest --rebuild, got: {}",
+            msg.contains("non-series") && msg.contains("double-counting"),
+            "error must name the overlap and why it is refused, got: {}",
             msg
         );
     }
@@ -4256,9 +4370,9 @@ mod tests {
     /// A FilePhysicalSeries source appends disjoint deltas, so a later version
     /// carrying EARLIER timestamps (late / out-of-order data, e.g. a collector
     /// flushing a buffered sample after a newer one) must merge correctly rather
-    /// than tripping the sequentiality frontier. The frontier guard only applies
-    /// to overlapping non-series sources; for series the per-version partials are
-    /// disjoint and the GROUP BY time_bucket merge is order-independent.
+    /// than being refused. The overlap guard applies only to non-series sources;
+    /// series versions are disjoint deltas and the GROUP BY time_bucket merge is
+    /// order-independent.
     #[tokio::test]
     async fn test_rollup_series_tolerates_late_data() {
         let _ = env_logger::try_init();
@@ -4394,11 +4508,13 @@ mod tests {
         );
     }
 
-    /// Merged-output cache incremental splice: after a first build seeds the
-    /// cache, a later build that appends a NEWER version splices the cached
-    /// prefix with a freshly merged suffix. A build that BACKFILLS a version
-    /// older than the sealed watermark (beyond allowed_lateness) is a hard error
-    /// suggesting --rebuild, since it would reopen an immutable sealed run.
+    /// Merged-output cache across the three shapes of a rebuild: seed, APPEND a
+    /// newer version, and BACKFILL one older than everything already built.
+    ///
+    /// The backfill is the point. It was a hard error suggesting `--rebuild`
+    /// until segments were keyed by the bucket range they cover; now the
+    /// segments holding the backfilled buckets are unsealed and recomputed, and
+    /// the output is simply correct.
     #[tokio::test]
     async fn test_merged_cache_incremental_splice_append_and_backfill() {
         let _ = env_logger::try_init();
@@ -4555,47 +4671,38 @@ mod tests {
             hint1.digest, hint2.digest,
             "append changes the merged digest"
         );
-        let day3_secs = 2 * 86400; // 1970-01-03T00:00:00Z
-        assert_eq!(
-            hint2.changed_since,
-            Some(day3_secs),
-            "append splice watermark should be day 3 in epoch seconds"
+        // `changed_since` is derived from the event-time range tlogfs records on
+        // each source version. MemoryPersistence records none, so every version
+        // reports an unknown range and the dirty range is the whole axis -- the
+        // export rewrites everything. Correct, merely unoptimized; `dirty_lo_us`
+        // is unit-tested directly on known ranges. What matters here is that the
+        // unknown case degrades to MORE work, never to stale output.
+        assert!(
+            hint2.changed_since.is_none(),
+            "sources with no recorded event range must widen the dirty range, \
+             not narrow it: {:?}",
+            hint2.changed_since
         );
 
-        // Build 3 (BACKFILL beyond the lateness window): add day 1 (earliest).
-        // With the default allowed_lateness of 1 day, day 2 has already been
-        // sealed (watermark = day2), so day-1 data would reopen an immutable
-        // sealed bucket. The new contract is a hard error suggesting --rebuild,
-        // not a silent unbounded backfill.
+        // Build 3 (BACKFILL): add day 1, older than everything already built and
+        // potentially below the sealed watermark. This used to be a hard error
+        // demanding --rebuild, because segments were keyed by the source versions
+        // that produced them and there was no way to find which held day 1.
+        // Segments are keyed by bucket range now, so the affected ones are simply
+        // unsealed and recomputed.
         {
             let root = fs.root().await.unwrap();
             append_day(&root, "/ingest/weather.csv", 1).await;
         }
-        let provider_context = make_ctx(Some(cache_dir.clone()));
-        let context = test_context(&provider_context, FileID::root());
-        let temporal_dir = TemporalReduceDirectory::new(config(), context).unwrap();
-        let temporal_handle = temporal_dir.create_handle();
-        let weather_node = temporal_handle.get("weather").await.unwrap().unwrap();
-        let NodeType::Directory(weather_dir) = &weather_node.node_type else {
-            panic!("expected directory");
-        };
-        let daily_node = weather_dir.get("res=1d.series").await.unwrap().unwrap();
-        let file_id = daily_node.id;
-        let NodeType::File(file_handle) = &daily_node.node_type else {
-            panic!("expected file node");
-        };
-        let file_arc = file_handle.get_file().await;
-        let file_guard = file_arc.lock().await;
-        let queryable = file_guard.as_queryable().expect("queryable");
-        let err = queryable
-            .as_table_provider(file_id, &provider_context)
-            .await
-            .expect_err("backfill beyond allowed_lateness must hard-fail");
-        let msg = err.to_string();
+        let (rows3, hint3) = collect_daily(&make_ctx(Some(cache_dir.clone())), config()).await;
+        assert_eq!(rows3.len(), 3, "backfill adds a bucket, got {:?}", rows3);
         assert!(
-            msg.contains("sealed") && msg.contains("--rebuild"),
-            "backfill error should mention the sealed watermark and --rebuild: {msg}"
+            approx(rows3[0].0, 132.0) && approx(rows3[1].0, 232.0) && approx(rows3[2].0, 332.0),
+            "backfill values wrong (a double-count would inflate these): {:?}",
+            rows3
         );
+        let hint3 = hint3.expect("build 3 publishes an export hint");
+        assert_ne!(hint2.digest, hint3.digest, "backfill changes the digest");
     }
 
     /// Regression: partials are shared by every resolution, so when a later
@@ -5382,13 +5489,18 @@ mod tests {
             .await
             .unwrap();
         }
+        // At least one sealed run plus the hot file, i.e. two separately-ordered
+        // inputs -- which is what the k-way merge has to reconcile. Only one run
+        // survives here: MemoryPersistence records no event-time bounds, so every
+        // source version reports an unknown range, every build's dirty range is
+        // the whole axis, and the sealed segments are unsealed and re-sealed as
+        // one. Under tlogfs the bounds are recorded and segments accumulate.
         let runs = walk_find(&cache_dir, &|n| {
             n.starts_with("run-") && n.ends_with(".parquet")
         });
         assert!(
-            runs.len() >= 2,
-            "test needs multiple sealed runs to exercise the merge, got {}",
-            runs.len()
+            !runs.is_empty(),
+            "test needs a sealed run plus hot to exercise the merge, got none"
         );
 
         // Acquire the reduced table provider (built during the last rollup).

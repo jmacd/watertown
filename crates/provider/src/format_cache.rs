@@ -139,7 +139,7 @@ pub async fn cache_write_version(
 /// without event-time bounds return `None` (and are always retained by an
 /// event-time bound -- a missing bound must never drop data).
 #[must_use]
-fn version_max_event_time(v: &FileVersionInfo) -> Option<i64> {
+pub fn version_max_event_time(v: &FileVersionInfo) -> Option<i64> {
     v.extended_metadata
         .as_ref()?
         .get("max_event_time")?
@@ -204,13 +204,34 @@ pub fn glob_cached_set(
     scheme: &str,
     nodes: &[(tinyfs::NodeID, Vec<FileVersionInfo>)],
 ) -> crate::version_cache::CachedSet {
+    glob_cached_set_bounded(cache_dir, scheme, nodes, &tinyfs::SeriesReadBounds::NONE)
+}
+
+/// [`glob_cached_set`], pruned by a per-version event-time bound.
+///
+/// The multi-node analogue of [`listing_table_from_cache_bounded`], and the
+/// reason the rollup needs no per-version partial cache: an incremental rebuild
+/// of recent buckets scans only the source versions that can reach them, which
+/// is the same "skip old inputs" property the partials directory provided, from
+/// metadata tlogfs already records.
+#[must_use]
+pub fn glob_cached_set_bounded(
+    cache_dir: &Path,
+    scheme: &str,
+    nodes: &[(tinyfs::NodeID, Vec<FileVersionInfo>)],
+    bounds: &tinyfs::SeriesReadBounds,
+) -> crate::version_cache::CachedSet {
     // Falls back to the cache root only for schema recovery when no member is
     // cached yet, which is the same "no data to describe" case the glob
     // directory reported as an error.
     let mut set = crate::version_cache::CachedSet::empty_in(cache_dir.to_path_buf());
     for (node_id, versions) in nodes {
         let live = LiveVersions::from_persistence(*node_id, versions.clone());
-        set.extend(node_sidecars(cache_dir, scheme, node_id).cached_set(&live, |_| true));
+        set.extend(
+            node_sidecars(cache_dir, scheme, node_id).cached_set(&live, |v| {
+                bounds.retains(version_max_event_time(v), v.version as i64)
+            }),
+        );
     }
     set
 }

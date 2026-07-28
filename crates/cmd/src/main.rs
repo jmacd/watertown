@@ -481,7 +481,8 @@ enum Commands {
         #[arg(long)]
         end_time: Option<String>,
         /// Drop the temporal-reduce rollup cache before exporting, forcing a
-        /// full recompute. Recovery path for a sequentiality violation.
+        /// full recompute. A maintenance escape hatch: the cache is derived
+        /// state, so discarding it can only cost time.
         #[arg(long)]
         rebuild: bool,
     },
