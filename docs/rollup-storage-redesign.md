@@ -470,7 +470,16 @@ identical, and the export hint / digest contract is unchanged.
 ## 10. Sequencing
 
 Ordered so that each step is independently valuable and independently
-revertible.
+revertible. All landed; P4 was done before P3, being independent of it.
+
+| | | |
+|---|---|---|
+| P0 | read by manifest | `61c08f53` |
+| P1 | seal on size | `bf9b0b1d` |
+| P2 | compaction | `d97ee7c4` |
+| P3 | re-key on content, delete partials | `03b633df`, renamed in `2cfd8662` |
+| P4 | reconcile the format cache | `64880b47` |
+| P5 | retire the stale design doc | this commit |
 
 **P0 — read by manifest, not by directory listing.** (§5.7) Small, strictly a
 bug fix, no format change. Should land regardless.
@@ -496,8 +505,9 @@ readable.
 
 **P5 — retire the stale design doc.** `docs/archive/incremental-rollup-implementation.md`
 still asserts "no watermark, no mutable state file" (void since Phase 2 added
-both) and the sequential-input invariant (void since series collapse). It should
-say what is actually true or be replaced by this document.
+both) and the sequential-input invariant (void since P3). It is archived
+history, so it now carries a header pointing here rather than being edited to
+say something it never said.
 
 ## 11. Testing
 
