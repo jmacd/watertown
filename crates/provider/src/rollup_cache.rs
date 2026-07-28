@@ -263,9 +263,15 @@ pub struct SegmentManifest {
     #[serde(default)]
     pub hot_bytes: u64,
     /// The source content this cache reflects: blake3 of each LIVE source
-    /// version, mapped to the event-time range it covers. Used only by the
-    /// finest resolution, which aggregates the sources directly; empty for
-    /// coarser resolutions, which key freshness on `source_digest` instead.
+    /// version, mapped to the event-time range it covers.
+    ///
+    /// Recorded by EVERY resolution, not just the finest. The finest uses it to
+    /// decide reuse-vs-incremental directly. A coarser resolution keys reuse on
+    /// `source_digest`, but still needs this to bound how far back to unseal
+    /// when that digest is stale: its finer level's in-call change may already
+    /// have been consumed by an earlier build of a different output file, so
+    /// "the finer level reports no change" does not mean this level is current.
+    /// See `build_level_from_finer`.
     ///
     /// Keying on CONTENT rather than on storage artifacts is the point. The
     /// previous key was a set of partial FILENAMES, one per source version, and

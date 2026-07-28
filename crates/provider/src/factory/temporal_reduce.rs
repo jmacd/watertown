@@ -287,6 +287,21 @@ impl LevelChange {
             LevelChange::Nothing | LevelChange::Everything => None,
         }
     }
+
+    /// The lower -- i.e. more inclusive -- of two dirty ranges.
+    ///
+    /// [`LevelChange::Everything`] absorbs anything, [`LevelChange::Nothing`] is
+    /// the identity, and two bounded ranges keep the earlier point. Used where a
+    /// level has more than one independent reason to believe its sealed history
+    /// is stale and must honour all of them at once.
+    fn min(self, other: LevelChange) -> LevelChange {
+        match (self, other) {
+            (LevelChange::Everything, _) | (_, LevelChange::Everything) => LevelChange::Everything,
+            (LevelChange::Nothing, o) => o,
+            (s, LevelChange::Nothing) => s,
+            (LevelChange::Since(a), LevelChange::Since(b)) => LevelChange::Since(a.min(b)),
+        }
+    }
 }
 
 pub struct TemporalReduceSqlFile {
@@ -737,6 +752,7 @@ impl TemporalReduceSqlFile {
                         &finer_digest,
                         finer_rebuilt,
                         finer_changed,
+                        &now,
                         policy,
                     )
                     .await;
@@ -777,13 +793,18 @@ impl TemporalReduceSqlFile {
             .register_table(read_name.as_str(), table_provider)
             .map_other()?;
         let recon_sql = pieces.reconstruct_sql(&ts, &read_name);
-        let recon_plan = ctx
-            .sql(&recon_sql)
-            .await
-            .map_other_context("rollup reconstruction planning failed")?
-            .logical_plan()
-            .clone();
-        let _ = ctx.deregister_table(read_name.as_str()).map_other()?;
+        // Deregister before propagating: read_name is deterministic in
+        // cfg_hash/node/resolution, so leaving it behind on the shared session
+        // turns one transient planning failure into a permanent duplicate-name
+        // error for this resolution.
+        let recon_plan = {
+            let out = ctx
+                .sql(&recon_sql)
+                .await
+                .map_other_context("rollup reconstruction planning failed");
+            let _ = ctx.deregister_table(read_name.as_str()).map_other()?;
+            out?.logical_plan().clone()
+        };
         let table_provider: Arc<dyn datafusion::catalog::TableProvider> = Arc::new(
             datafusion::catalog::view::ViewTable::new(recon_plan, Some(recon_sql)),
         );
@@ -1273,6 +1294,12 @@ impl TemporalReduceSqlFile {
     /// watermark holding pre-backfill values forever. This level therefore
     /// unseals from the same point, or unseals entirely when the finer level's
     /// dirty range was unbounded.
+    ///
+    /// `finer_changed` alone is not sufficient, however: it reports only what
+    /// moved in THIS call, and a sibling output file's earlier build may already
+    /// have consumed the finer level's change. This level therefore ALSO
+    /// compares `now` against the source set it last folded and unseals from
+    /// whichever of the two points is lower.
     #[allow(clippy::too_many_arguments)]
     async fn build_level_from_finer(
         &self,
@@ -1285,6 +1312,7 @@ impl TemporalReduceSqlFile {
         finer_digest: &str,
         finer_rebuilt: bool,
         finer_changed: LevelChange,
+        now: &std::collections::BTreeMap<String, crate::rollup_cache::SourceRange>,
         policy: SealPolicy,
     ) -> TinyFSResult<LevelBuild> {
         let manifest =
@@ -1326,21 +1354,59 @@ impl TemporalReduceSqlFile {
         let can_advance = !finer_rebuilt && manifest.is_some();
         let (mut m, mut unsealed, changed, rebuilt) = if can_advance {
             let mut m = manifest.expect("can_advance implies a manifest");
+            // This level has TWO independent reasons to distrust its sealed
+            // history, and must honour the lower of them.
+            //
+            // (1) `finer_changed`: what the finer level moved in THIS call.
+            //
+            // (2) The source content this level last folded versus what is live
+            //     now. This is not implied by (1). Each output file
+            //     (`res=1h.series`, `res=1d.series`) is a separate build over
+            //     the same cache, and the finer level's change is consumed by
+            //     whichever build runs first: by the time the coarse file is
+            //     built, the finest level legitimately reports `Nothing` -- it
+            //     is unchanged since a moment ago -- while THIS level has never
+            //     folded the backfill. The same gap opens whenever a previous
+            //     build failed between the finer level's manifest write and
+            //     this one's.
+            //
+            //     Keying only on (1) would advance in place, recompute only the
+            //     hot window `[sealed_hi, inf)`, and then record the new finer
+            //     digest -- marking itself fresh forever while every sealed
+            //     bucket below the watermark keeps its pre-backfill value.
+            //
+            // Computing (2) from the same symmetric difference the finest level
+            // uses is what makes each level's freshness self-sufficient: it does
+            // not depend on which files are built, in what order, or on how many
+            // finer-level changes have been consumed since this level last ran.
+            let source_changed = if m.sources == *now {
+                LevelChange::Nothing
+            } else {
+                match dirty_lo_us(&m.sources, now) {
+                    Some(us) => LevelChange::Since(floor_secs_to_bucket(
+                        floor_us_to_secs(us),
+                        output_interval,
+                    )),
+                    // An unbounded dirty range is the whole axis, not "nothing".
+                    None => LevelChange::Everything,
+                }
+            };
+            // Align to OUR (coarser) bucket: a watermark must be a bucket
+            // boundary or the bucket straddling it belongs to neither the
+            // sealed nor the hot side. See `floor_secs_to_bucket`.
+            let dirty = match finer_changed {
+                LevelChange::Since(lo) => {
+                    LevelChange::Since(floor_secs_to_bucket(lo, output_interval))
+                }
+                other => other,
+            }
+            .min(source_changed);
             // Late data at the finest level lowered ITS watermark; ours must
             // follow, or our segments keep their pre-backfill values forever.
-            // Align to our own (coarser) bucket so the watermark stays a bucket
-            // boundary -- see `floor_secs_to_bucket`.
-            let unsealed = match finer_changed {
+            let unsealed = match dirty {
                 // Nothing below our watermark moved, so our segments stand.
                 LevelChange::Nothing => Vec::new(),
-                // Align to OUR (coarser) bucket: a watermark must be a bucket
-                // boundary or the bucket straddling it belongs to neither the
-                // sealed nor the hot side. See `floor_secs_to_bucket`.
-                LevelChange::Since(lo) => unseal_from(
-                    &mut m,
-                    Some(floor_secs_to_bucket(lo, output_interval)),
-                    res_dir,
-                )?,
+                LevelChange::Since(lo) => unseal_from(&mut m, Some(lo), res_dir)?,
                 // Unbounded: unseal everything.
                 LevelChange::Everything => unseal_from(&mut m, None, res_dir)?,
             };
@@ -1378,7 +1444,7 @@ impl TemporalReduceSqlFile {
                 policy,
             )
             .await?;
-        m.sources.clear();
+        m.sources = now.clone();
         m.source_digest = Some(finer_digest.to_string());
 
         let digest = crate::rollup_cache::write_segment_manifest(res_dir, &m)
@@ -5606,6 +5672,152 @@ mod tests {
             "within-window backfill values wrong: {:?}",
             rows
         );
+    }
+
+    /// Regression: a coarse level must unseal on a backfill even when the finer
+    /// level's change was already consumed by a SIBLING output file's build.
+    ///
+    /// Each output file is a separate build over the shared cache, and
+    /// `res=1h.series` is read before `res=1d.series` here. The 1h build
+    /// unseals and absorbs the backfill; the 1d build that follows therefore
+    /// sees the 1h level report `Nothing` -- it genuinely did not move in that
+    /// call -- while the 1d level has never folded the backfilled day.
+    ///
+    /// Keying the 1d level's unsealing on the finer level's in-call change alone
+    /// made it advance in place, recompute only its hot window, and record the
+    /// new finer digest, marking itself fresh forever with the backfilled day
+    /// missing from its sealed history. It now also compares the live source set
+    /// against the one it last folded, so the staleness is visible to it
+    /// directly.
+    #[tokio::test]
+    async fn test_coarse_unseals_backfill_consumed_by_sibling_build() {
+        let _ = env_logger::try_init();
+        let persistence = tinyfs::MemoryPersistence::default();
+        let fs = tinyfs::FS::new(persistence.clone()).await.unwrap();
+        {
+            let root = fs.root().await.unwrap();
+            _ = root.create_dir_path("/ingest").await.unwrap();
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+
+        // Both resolutions, so the 1d level is built by folding the 1h level.
+        // Zero lateness plus a zero seal target puts everything below the
+        // newest bucket into sealed segments, which is where the defect hides:
+        // a hot-window recompute alone cannot repair a sealed bucket.
+        let config = || TemporalReduceConfig {
+            resolutions: vec!["1h".to_string(), "1d".to_string()],
+            ..lateness_config(Some("0s"))
+        };
+
+        async fn sums(
+            provider_context: &crate::ProviderContext,
+            config: TemporalReduceConfig,
+            res_file: &str,
+        ) -> Vec<f64> {
+            let context = test_context(provider_context, FileID::root());
+            let temporal_dir = TemporalReduceDirectory::new(config, context).unwrap();
+            let temporal_handle = temporal_dir.create_handle();
+            let weather_node = temporal_handle.get("weather").await.unwrap().unwrap();
+            let NodeType::Directory(weather_dir) = &weather_node.node_type else {
+                panic!("expected directory");
+            };
+            let node = weather_dir.get(res_file).await.unwrap().unwrap();
+            let file_id = node.id;
+            let NodeType::File(file_handle) = &node.node_type else {
+                panic!("expected file node");
+            };
+            let file_arc = file_handle.get_file().await;
+            let file_guard = file_arc.lock().await;
+            let queryable = file_guard.as_queryable().expect("queryable");
+            let table_provider = queryable
+                .as_table_provider(file_id, provider_context)
+                .await
+                .expect("table provider");
+            drop(file_guard);
+            let ctx = &provider_context.datafusion_session;
+            let table = format!("t_{}", res_file.replace(['=', '.'], "_"));
+            _ = ctx.register_table(&table, table_provider).unwrap();
+            let batches = ctx
+                .sql(&format!(
+                    "SELECT \"temperature.sum\" FROM {} ORDER BY timestamp",
+                    table
+                ))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let mut rows = Vec::new();
+            for b in &batches {
+                let col = b
+                    .column_by_name("temperature.sum")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .clone();
+                for i in 0..b.num_rows() {
+                    rows.push(col.value(i));
+                }
+            }
+            _ = ctx.deregister_table(&table).unwrap();
+            rows
+        }
+
+        // Seed both levels with days 3..=5, so the 1d level accumulates sealed
+        // segments well above the day the backfill will land in.
+        for day in 3..=5u32 {
+            append_day_series(&fs, "/ingest/weather.csv", day).await;
+        }
+        let seeded = sums(
+            &reduce_ctx(&persistence, &cache_dir),
+            config(),
+            "res=1d.series",
+        )
+        .await;
+        assert_eq!(seeded.len(), 3, "days 3..=5 seeded, got {:?}", seeded);
+        let _ = sums(
+            &reduce_ctx(&persistence, &cache_dir),
+            config(),
+            "res=1h.series",
+        )
+        .await;
+
+        // Backfill day 1: older than every sealed bucket in either level.
+        append_day_series(&fs, "/ingest/weather.csv", 1).await;
+
+        // The FINEST resolution is read first and consumes the change.
+        let ctx = reduce_ctx(&persistence, &cache_dir);
+        let hourly = sums(&ctx, config(), "res=1h.series").await;
+        assert_eq!(
+            hourly.len(),
+            24 * 4,
+            "four days of hourly buckets after the backfill, got {}",
+            hourly.len()
+        );
+
+        // The COARSE resolution is read second, in the same session. Its finer
+        // level now reports no change, but it has never folded day 1.
+        let daily = sums(&ctx, config(), "res=1d.series").await;
+        assert_eq!(
+            daily.len(),
+            4,
+            "coarse level dropped the backfilled day, which its sealed segments \
+             cannot repair by recomputing the hot window alone: {:?}",
+            daily
+        );
+        let approx = |a: f64, b: f64| (a - b).abs() < 1e-6;
+        for (i, day) in [1u32, 3, 4, 5].iter().copied().enumerate() {
+            assert!(
+                approx(daily[i], expected_day_sum(day)),
+                "coarse day {} sum wrong (a double-count inflates, a lost \
+                 segment deflates): got {}, want {}",
+                day,
+                daily[i],
+                expected_day_sum(day)
+            );
+        }
     }
 
     /// Changing `allowed_lateness` invalidates the sealed layout: the manifest
