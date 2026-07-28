@@ -163,6 +163,13 @@ pub struct TemporalReduceConfig {
     /// recompute each build.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seal_target_bytes: Option<u64>,
+
+    /// Maximum number of sealed run files to leave live per resolution before
+    /// compaction merges them regardless of size class. Defaults to
+    /// [`crate::rollup_cache::MAX_LIVE_RUNS`]. Like `seal_target_bytes`, changing
+    /// it invalidates nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_live_runs: Option<usize>,
 }
 
 /// The two knobs governing how the sealed layout advances, carried together so
@@ -176,6 +183,10 @@ pub(crate) struct SealPolicy {
     /// Seal threshold in bytes; deliberately NOT recorded, because a change to
     /// it invalidates nothing.
     pub target_bytes: u64,
+    /// Compaction backstop: how many sealed runs may stay live before adjacent
+    /// runs are merged regardless of size class. Also not recorded, for the same
+    /// reason.
+    pub max_runs: usize,
 }
 
 /// Default maximum allowed lateness when `allowed_lateness` is unset: one day.
@@ -203,6 +214,15 @@ impl TemporalReduceConfig {
     fn seal_target_bytes(&self) -> u64 {
         self.seal_target_bytes
             .unwrap_or(crate::rollup_cache::SEAL_TARGET_BYTES)
+    }
+
+    /// Resolve the compaction backstop, defaulting to
+    /// [`crate::rollup_cache::MAX_LIVE_RUNS`]. Clamped to at least 1 so a
+    /// nonsense setting cannot make compaction spin.
+    fn max_live_runs(&self) -> usize {
+        self.max_live_runs
+            .unwrap_or(crate::rollup_cache::MAX_LIVE_RUNS)
+            .max(1)
     }
 }
 
@@ -680,6 +700,7 @@ impl TemporalReduceSqlFile {
         let policy = SealPolicy {
             lateness_secs: filled.allowed_lateness_secs()?,
             target_bytes: filled.seal_target_bytes(),
+            max_runs: filled.max_live_runs(),
         };
         let merged_dir = crate::rollup_cache::merged_dir(&cache_dir, &cfg_hash, &site_node_id);
 
@@ -994,7 +1015,7 @@ impl TemporalReduceSqlFile {
         in_bucket_col: &str,
         m: &mut crate::rollup_cache::SealedManifest,
         policy: SealPolicy,
-    ) -> TinyFSResult<()> {
+    ) -> TinyFSResult<Vec<std::path::PathBuf>> {
         // Event-time frontier: newest output bucket over the input (epoch
         // seconds). Bounded MAX scan, no per-bucket state.
         let data_hi_secs = self
@@ -1067,7 +1088,94 @@ impl TemporalReduceSqlFile {
             .await
             .map(|md| md.len())
             .unwrap_or(0);
-        Ok(())
+
+        self.compact_runs(ctx, pieces, ts, output_interval, res_dir, m, policy)
+            .await
+    }
+
+    /// Merge adjacent sealed runs until the size-tiered policy is satisfied,
+    /// returning the run files the merges superseded.
+    ///
+    /// Sealing alone only stops the count growing per build; without compaction
+    /// it still grows without bound as data accumulates, and every query opens
+    /// every live run. This is what actually bounds read fan-out.
+    ///
+    /// The window is chosen by [`crate::size_tier::choose_merge_window`] -- the
+    /// same function tlogfs uses to collapse series versions, not a second
+    /// implementation of the same idea. Its two properties are what make this
+    /// affordable: only same-size-class neighbours merge, so a large accumulated
+    /// run is not rewritten to absorb a few kilobytes; and the ragged-input
+    /// backstop merges the CHEAPEST window rather than the oldest, because after
+    /// any previous merge the oldest run IS the large one.
+    ///
+    /// Superseded files are NOT deleted here. They are returned so the caller can
+    /// delete them only after the manifest naming their replacement is durable;
+    /// see [`crate::rollup_cache::remove_superseded`].
+    #[allow(clippy::too_many_arguments)]
+    async fn compact_runs(
+        &self,
+        ctx: &datafusion::prelude::SessionContext,
+        pieces: &AggSqlPieces,
+        ts: &str,
+        output_interval: Duration,
+        res_dir: &std::path::Path,
+        m: &mut crate::rollup_cache::SealedManifest,
+        policy: SealPolicy,
+    ) -> TinyFSResult<Vec<std::path::PathBuf>> {
+        let mut superseded: Vec<std::path::PathBuf> = Vec::new();
+        loop {
+            let sizes: Vec<u64> = m.runs.iter().map(|r| r.bytes).collect();
+            let Some(window) = crate::size_tier::choose_merge_window(&sizes, policy.max_runs)
+            else {
+                break;
+            };
+
+            let inputs: Vec<std::path::PathBuf> = m.runs[window.clone()]
+                .iter()
+                .map(|r| crate::rollup_cache::run_path(res_dir, &r.name))
+                .collect();
+            let table = crate::rollup_cache::listing_table_for_files(&inputs, res_dir, ts)
+                .await
+                .map_other()?;
+
+            // Re-merge the partials of just these runs. Merging partials is
+            // associative, so folding a window of runs into one gives exactly
+            // what folding the original inputs would have; this is the same
+            // property that lets a coarser resolution be built from a finer one.
+            let table_name = format!("__rollup_compact_{}", m.next_seq);
+            _ = ctx.register_table(&table_name, table).map_other()?;
+            let sql = pieces.merge_partials_sql(output_interval, ts, &table_name, ts, None, None);
+            let name = format!("run-{:08}.parquet", m.next_seq);
+            let out = crate::rollup_cache::run_path(res_dir, &name);
+            let merged = self.write_merge_to(ctx, &sql, &out).await;
+            _ = ctx.deregister_table(&table_name).map_other()?;
+            let (digest, rows) = merged?;
+
+            if rows == 0 {
+                // Cannot happen for non-empty runs (an empty run is never
+                // recorded), but if it did, dropping the inputs would delete
+                // data. Leave the layout untouched and stop.
+                tokio::fs::remove_file(&out).await.map_other()?;
+                log::warn!(
+                    "rollup compaction: merge of {} runs produced no rows; leaving them alone",
+                    inputs.len()
+                );
+                break;
+            }
+
+            let bytes = tokio::fs::metadata(&out).await.map_other()?.len();
+            let replacement = crate::rollup_cache::SealedRun {
+                name,
+                lo_secs: m.runs[window.start].lo_secs,
+                hi_secs: m.runs[window.end - 1].hi_secs,
+                digest,
+                bytes,
+            };
+            _ = m.runs.splice(window, [replacement]);
+            m.next_seq += 1;
+            superseded.extend(inputs);
+        }
+        Ok(superseded)
     }
 
     /// Build the finest resolution level by folding the shared finest partials.
@@ -1181,24 +1289,27 @@ impl TemporalReduceSqlFile {
             }
         };
 
-        self.seal_and_recompute(
-            ctx,
-            pieces,
-            ts,
-            output_interval,
-            res_dir,
-            partials_table,
-            "time_bucket",
-            &mut m,
-            policy,
-        )
-        .await?;
+        let superseded = self
+            .seal_and_recompute(
+                ctx,
+                pieces,
+                ts,
+                output_interval,
+                res_dir,
+                partials_table,
+                "time_bucket",
+                &mut m,
+                policy,
+            )
+            .await?;
         m.covered = current_names;
         m.source_digest = None;
 
         let digest = crate::rollup_cache::write_sealed_manifest(res_dir, &m)
             .await
             .map_other()?;
+        // Only now that the manifest naming the merged runs is durable.
+        crate::rollup_cache::remove_superseded(&superseded).await;
         let provider = crate::rollup_cache::listing_table_for_res_dir(res_dir, &m, ts)
             .await
             .map_other()?;
@@ -1289,24 +1400,27 @@ impl TemporalReduceSqlFile {
             )
         };
 
-        self.seal_and_recompute(
-            ctx,
-            pieces,
-            ts,
-            output_interval,
-            res_dir,
-            finer_table,
-            ts,
-            &mut m,
-            policy,
-        )
-        .await?;
+        let superseded = self
+            .seal_and_recompute(
+                ctx,
+                pieces,
+                ts,
+                output_interval,
+                res_dir,
+                finer_table,
+                ts,
+                &mut m,
+                policy,
+            )
+            .await?;
         m.covered = std::collections::BTreeSet::new();
         m.source_digest = Some(finer_digest.to_string());
 
         let digest = crate::rollup_cache::write_sealed_manifest(res_dir, &m)
             .await
             .map_other()?;
+        // Only now that the manifest naming the merged runs is durable.
+        crate::rollup_cache::remove_superseded(&superseded).await;
         let provider = crate::rollup_cache::listing_table_for_res_dir(res_dir, &m, ts)
             .await
             .map_other()?;
@@ -2676,6 +2790,7 @@ mod tests {
             // Seal on every advance, as before the size gate existed: these
             // tests assert seal MECHANICS on datasets far under any real target.
             seal_target_bytes: Some(0),
+            max_live_runs: None,
         }
     }
 
@@ -3089,6 +3204,7 @@ mod tests {
                 // Seal on every advance, as before the size gate existed: these
                 // tests assert seal MECHANICS on datasets far under any real target.
                 seal_target_bytes: Some(0),
+                max_live_runs: None,
             };
 
             let context = test_context(&provider_context, FileID::root());
@@ -3302,6 +3418,7 @@ mod tests {
                 // Seal on every advance, as before the size gate existed: these
                 // tests assert seal MECHANICS on datasets far under any real target.
                 seal_target_bytes: Some(0),
+                max_live_runs: None,
             };
             TemporalReduceSqlFile::new(
                 config,
@@ -3435,6 +3552,7 @@ mod tests {
                 // Seal on every advance, as before the size gate existed: these
                 // tests assert seal MECHANICS on datasets far under any real target.
                 seal_target_bytes: Some(0),
+                max_live_runs: None,
             };
 
             let context = test_context(&provider_context, FileID::root());
@@ -3598,6 +3716,7 @@ mod tests {
             // Seal on every advance, as before the size gate existed: these
             // tests assert seal MECHANICS on datasets far under any real target.
             seal_target_bytes: Some(0),
+            max_live_runs: None,
         };
 
         let make_ctx = |cache: Option<std::path::PathBuf>| {
@@ -3789,6 +3908,7 @@ mod tests {
             // Seal on every advance, as before the size gate existed: these
             // tests assert seal MECHANICS on datasets far under any real target.
             seal_target_bytes: Some(0),
+            max_live_runs: None,
         };
 
         let make_ctx = |cache: Option<std::path::PathBuf>| {
@@ -3960,6 +4080,7 @@ mod tests {
             // Seal on every advance, as before the size gate existed: these
             // tests assert seal MECHANICS on datasets far under any real target.
             seal_target_bytes: Some(0),
+            max_live_runs: None,
         };
 
         let tmp = tempfile::tempdir().unwrap();
@@ -4090,6 +4211,7 @@ mod tests {
             // Seal on every advance, as before the size gate existed: these
             // tests assert seal MECHANICS on datasets far under any real target.
             seal_target_bytes: Some(0),
+            max_live_runs: None,
         };
 
         let tmp = tempfile::tempdir().unwrap();
@@ -4191,6 +4313,7 @@ mod tests {
             // Seal on every advance, as before the size gate existed: these
             // tests assert seal MECHANICS on datasets far under any real target.
             seal_target_bytes: Some(0),
+            max_live_runs: None,
         };
 
         let tmp = tempfile::tempdir().unwrap();
@@ -4324,6 +4447,7 @@ mod tests {
             // Seal on every advance, as before the size gate existed: these
             // tests assert seal MECHANICS on datasets far under any real target.
             seal_target_bytes: Some(0),
+            max_live_runs: None,
         };
 
         let make_ctx = |cache: Option<std::path::PathBuf>| {
@@ -4523,6 +4647,7 @@ mod tests {
             // Seal on every advance, as before the size gate existed: these
             // tests assert seal MECHANICS on datasets far under any real target.
             seal_target_bytes: Some(0),
+            max_live_runs: None,
         };
 
         let make_ctx = |cache: std::path::PathBuf| {
@@ -4657,6 +4782,7 @@ mod tests {
             // Seal on every advance, as before the size gate existed: these
             // tests assert seal MECHANICS on datasets far under any real target.
             seal_target_bytes: Some(0),
+            max_live_runs: None,
         }
     }
 
@@ -4824,6 +4950,7 @@ mod tests {
             // Seal on every advance, as before the size gate existed: these
             // tests assert seal MECHANICS on datasets far under any real target.
             seal_target_bytes: Some(0),
+            max_live_runs: None,
         };
 
         // Grow history so the watermark advances and buckets seal into runs.
@@ -4962,6 +5089,94 @@ mod tests {
                 rows
             );
         }
+    }
+
+    /// Compaction bounds the number of live run files, and the merged runs
+    /// answer exactly what the originals did.
+    ///
+    /// Seals on every advance and sets a tiny backstop so that many small runs
+    /// accumulate and the ragged-input path fires -- the situation a real pond
+    /// reaches over months, reproduced in a few dozen buckets. Without
+    /// compaction the run count grows forever and every query opens all of them.
+    ///
+    /// The load-bearing assertion is not the file count but the VALUES: merging
+    /// partials is associative, so folding a window of runs into one must give
+    /// bit-for-bit the same answer as leaving them apart. If it did not, the
+    /// symptom would be a silently wrong aggregate, which is why the check is on
+    /// every day's maximum rather than on the shape of the cache.
+    #[tokio::test]
+    async fn compaction_bounds_run_count_without_changing_answers() {
+        let _ = env_logger::try_init();
+        let persistence = tinyfs::MemoryPersistence::default();
+        let fs = tinyfs::FS::new(persistence.clone()).await.unwrap();
+        {
+            let root = fs.root().await.unwrap();
+            _ = root.create_dir_path("/ingest").await.unwrap();
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+
+        const DAYS: u32 = 16;
+        let compacting = || {
+            let mut c = lateness_config(Some("1d"));
+            c.seal_target_bytes = Some(0); // seal on every advance
+            c.max_live_runs = Some(2); // force the backstop constantly
+            c
+        };
+
+        for day in 1..=DAYS {
+            append_day_series(&fs, "/ingest/weather.csv", day).await;
+            let rows = daily_max(&reduce_ctx(&persistence, &cache_dir), compacting())
+                .await
+                .expect("append within lateness window must succeed");
+            assert_eq!(rows.len(), day as usize, "day {day}: one bucket per day");
+        }
+
+        // Every day is still answered correctly after repeated merges.
+        let rows = daily_max(&reduce_ctx(&persistence, &cache_dir), compacting())
+            .await
+            .unwrap();
+        let approx = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert_eq!(rows.len(), DAYS as usize, "all days survive compaction");
+        for (i, day) in (1..=DAYS).enumerate() {
+            assert!(
+                approx(rows[i], 43.5 + f64::from(day) * 100.0),
+                "day {day} max wrong after compaction: {rows:?}"
+            );
+        }
+
+        // The run count is bounded well below one-per-sealed-advance.
+        let manifests = walk_find(&cache_dir, &|n| n == "manifest.json");
+        assert_eq!(manifests.len(), 1, "one manifest for the single resolution");
+        let m: Value = serde_json::from_slice(&std::fs::read(&manifests[0]).unwrap()).unwrap();
+        let live = m["runs"].as_array().expect("runs array").len();
+        // Tight on purpose: the backstop merges until the count is back within
+        // max_live_runs, so anything above it means compaction did not run to
+        // completion. A loose bound like `live < DAYS` would pass even with
+        // compaction disabled entirely, since sealing alone yields one run per
+        // day -- which is exactly the growth this phase exists to stop.
+        assert!(
+            live <= 2,
+            "compaction left {live} runs; max_live_runs was 2 (after {DAYS} days)"
+        );
+
+        // Superseded inputs were actually deleted, not merely unlinked from the
+        // manifest -- otherwise compaction would trade read cost for unbounded
+        // disk. Every run file on disk must be one the manifest names.
+        let named: std::collections::BTreeSet<String> = m["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap().to_string())
+            .collect();
+        let on_disk = walk_find(&cache_dir, &|n| {
+            n.starts_with("run-") && n.ends_with(".parquet")
+        });
+        for f in &on_disk {
+            let n = f.file_name().unwrap().to_str().unwrap();
+            assert!(named.contains(n), "orphaned run left on disk: {n}");
+        }
+        assert_eq!(on_disk.len(), live, "disk and manifest must agree");
     }
 
     /// Under the DEFAULT seal target, four days of a handful of rows each never

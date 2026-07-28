@@ -181,36 +181,27 @@ struct CollapseCandidate {
     node_id: String,
 }
 
-/// Number of same-size-class runs merged into one run of the next class.
+/// How many adjacent same-class versions collapse into one run.
 ///
-/// This is the fanout of a size-tiered (LSM-style) compaction: each byte is
-/// rewritten once per class it is promoted through, so total write volume is
-/// `O(N log_F N)` rather than the `O(N^2)` of repeatedly rewriting the whole
-/// series.
-///
-/// The value trades write volume against read cost. A larger fanout writes
-/// slightly less but leaves up to `F - 1` live runs per class, and reads pay
-/// per live segment. At `F = 10` a series holds at most a few dozen live
-/// segments across all classes -- fewer than the ~100 loose versions the old
-/// scheme allowed between collapses -- while keeping write amplification to a
-/// small constant.
-pub const COLLAPSE_FANOUT: usize = 10;
+/// Re-exported from the shared size-tiered policy so that series collapse and
+/// the rollup cache's segment compaction cannot drift apart.
+pub use provider::size_tier::MERGE_FANOUT as COLLAPSE_FANOUT;
 
-/// Size class of a run, i.e. its magnitude in units of [`COLLAPSE_FANOUT`].
+/// Choose the contiguous window of live rows to merge, or `None` for a no-op.
 ///
-/// Runs merge only with runs of the same class, which is what keeps a large
-/// accumulated run from being rewritten every time a few small versions arrive.
-fn size_class(bytes: u64) -> u32 {
-    let mut class = 0u32;
-    let mut bound = COLLAPSE_FANOUT as u64;
-    while bytes >= bound {
-        class += 1;
-        match bound.checked_mul(COLLAPSE_FANOUT as u64) {
-            Some(next) => bound = next,
-            None => break,
-        }
-    }
-    class
+/// Thin adapter over [`provider::size_tier::choose_merge_window`]: the policy
+/// depends on nothing but segment sizes, so all this does is project the sizes
+/// out of the oplog rows. `size` is a nullable `i64` on disk; a missing or
+/// negative size is treated as zero, which puts the row in the smallest class
+/// and so makes it a merge candidate rather than an obstacle.
+///
+/// `live` must be ordered oldest content first; the returned range indexes it.
+fn choose_collapse_window(live: &[&OplogEntry], max_live: usize) -> Option<Range<usize>> {
+    let sizes: Vec<u64> = live
+        .iter()
+        .map(|r| r.size.unwrap_or(0).max(0) as u64)
+        .collect();
+    provider::size_tier::choose_merge_window(&sizes, max_live)
 }
 
 /// Temporal overrides the merged run must carry forward.
@@ -233,70 +224,6 @@ fn inherited_overrides(records: &[OplogEntry], lo: i64, hi: i64) -> (Option<i64>
         .filter(|r| r.min_override.is_some() || r.max_override.is_some())
         .max_by_key(|r| r.version)
         .map_or((None, None), |r| (r.min_override, r.max_override))
-}
-
-/// Choose the contiguous window of live rows to merge, or `None` for a no-op.
-///
-/// Size-tiered policy: merge the oldest group of [`COLLAPSE_FANOUT`] *adjacent*
-/// rows sharing a size class. Merging only same-class neighbours is the whole
-/// point -- it is what stops a 96 MB accumulated run from being rewritten to
-/// absorb 10 KB of new data.
-///
-/// `max_live` is a backstop for read cost. If no same-class group exists but the
-/// series has drifted past `max_live` segments, `COLLAPSE_FANOUT` adjacent rows
-/// are merged regardless of class so segment count stays bounded.
-///
-/// The backstop merges the CHEAPEST such window, not the oldest. Taking the
-/// oldest looks natural but is the one choice that defeats tiering: after any
-/// previous collapse the oldest row IS the large accumulated run, so a backstop
-/// anchored at index 0 rewrites megabytes to absorb kilobytes -- precisely the
-/// `O(N^2)` behaviour size classes exist to prevent. It also fires more often
-/// than it appears to, because callers pass the same number as both the
-/// candidacy threshold (`HAVING COUNT(*) > threshold`) and `max_live`, so every
-/// candidate satisfies `live.len() > max_live` by construction. Choosing by
-/// total bytes bounds the segment count just as well while keeping write volume
-/// at the minimum any window could achieve.
-///
-/// Returns a half-open index range into `live` (which must be ordered oldest
-/// content first).
-fn choose_collapse_window(live: &[&OplogEntry], max_live: usize) -> Option<Range<usize>> {
-    if live.len() < 2 {
-        return None;
-    }
-
-    // Oldest same-class group of at least COLLAPSE_FANOUT adjacent rows.
-    let classes: Vec<u32> = live
-        .iter()
-        .map(|r| size_class(r.size.unwrap_or(0).max(0) as u64))
-        .collect();
-    let mut start = 0usize;
-    while start < classes.len() {
-        let mut end = start + 1;
-        while end < classes.len() && classes[end] == classes[start] {
-            end += 1;
-        }
-        if end - start >= COLLAPSE_FANOUT {
-            return Some(start..start + COLLAPSE_FANOUT);
-        }
-        start = end;
-    }
-
-    // Backstop: bound live segment count even when classes are ragged. Every
-    // window of this width reduces the segment count identically, so pick the
-    // one that rewrites the fewest bytes; ties resolve to the oldest.
-    if live.len() > max_live {
-        let width = COLLAPSE_FANOUT.min(live.len());
-        let cost = |start: usize| -> u128 {
-            live[start..start + width]
-                .iter()
-                .map(|r| r.size.unwrap_or(0).max(0) as u128)
-                .sum()
-        };
-        let best = (0..=live.len() - width).min_by_key(|&start| cost(start))?;
-        return Some(best..best + width);
-    }
-
-    None
 }
 
 /// One reconstructed write transaction recovered from the data Delta
@@ -5219,8 +5146,9 @@ mod series_bounds_tests {
 
 #[cfg(test)]
 mod collapse_window_tests {
-    use super::{COLLAPSE_FANOUT, choose_collapse_window, size_class};
+    use super::{COLLAPSE_FANOUT, choose_collapse_window};
     use crate::schema::OplogEntry;
+    use provider::size_tier::size_class;
 
     /// A live row of the given byte size; only `size` affects window choice.
     fn row(size: i64) -> OplogEntry {

@@ -281,6 +281,14 @@ pub fn list_glob_members(glob_dir: &Path) -> Result<Vec<PathBuf>> {
 /// making files genuinely large; this only has to stop the bleeding.
 pub const SEAL_TARGET_BYTES: u64 = 1024 * 1024;
 
+/// Maximum number of sealed runs to leave live in one resolution before
+/// compaction merges regardless of size class.
+///
+/// This bounds read fan-out: every query opens every live run plus hot, so the
+/// count is what a reader pays. Size-tiered merging keeps the number near
+/// `log(data)` on its own; this is the backstop for ragged inputs.
+pub const MAX_LIVE_RUNS: usize = 50;
+
 /// One immutable sealed run file and the half-open output-bucket range it
 /// covers, in epoch seconds. `lo_secs` is `None` for the genesis run (unbounded
 /// below); `hi_secs` is exclusive.
@@ -414,6 +422,29 @@ pub async fn write_sealed_manifest(res_dir: &Path, manifest: &SealedManifest) ->
     Ok(digest)
 }
 
+/// Delete run files that compaction superseded.
+///
+/// MUST be called only after the manifest naming their replacement has been
+/// durably written. Publishing the merged run first and deleting its inputs
+/// second means a crash in between leaves orphans rather than a hole, and
+/// orphans are harmless precisely because reads enumerate the manifest instead
+/// of listing the directory. Doing it the other way round would lose data.
+///
+/// Failures are logged and ignored: a leftover file costs disk, not
+/// correctness, and the next compaction is free to try again.
+pub async fn remove_superseded(files: &[PathBuf]) {
+    for f in files {
+        if let Err(e) = tokio::fs::remove_file(f).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            log::warn!(
+                "rollup compaction: could not remove superseded run {}: {e}",
+                f.display()
+            );
+        }
+    }
+}
+
 /// Remove an entire res dir (used when `allowed_lateness` changes or the
 /// coverage shrinks, forcing a rebuild from the retained partials).
 pub fn wipe_sealed_res_dir(res_dir: &Path) -> Result<()> {
@@ -466,12 +497,26 @@ pub async fn listing_table_for_res_dir(
     }
     files.push(hot);
 
+    listing_table_for_files(&files, res_dir, ts_column).await
+}
+
+/// Build a `ListingTable` over exactly `files`, in the order given.
+///
+/// The explicit list is the point: a directory-shaped table would also pick up
+/// orphans, which is the defect [`listing_table_for_res_dir`] exists to avoid.
+/// Compaction needs the same guarantee over a subset -- it reads only the runs
+/// it is merging -- so both go through here.
+pub async fn listing_table_for_files(
+    files: &[PathBuf],
+    fallback_dir: &Path,
+    ts_column: &str,
+) -> Result<Arc<dyn TableProvider>> {
     // Schema from the same explicit member list, so an orphan cannot contribute
     // a column either. `files` always holds at least the hot file, so the
     // empty-list directory fallback inside `merge_parquet_schemas` is unreachable.
-    let merged_schema = crate::version_cache::merge_parquet_schemas(&files, res_dir).await?;
+    let merged_schema = crate::version_cache::merge_parquet_schemas(files, fallback_dir).await?;
     let mut paths = Vec::with_capacity(files.len());
-    for p in &files {
+    for p in files {
         paths.push(ListingTableUrl::parse(format!("file://{}", p.display()))?);
     }
     // Every run and the hot file is written by a query ending in
