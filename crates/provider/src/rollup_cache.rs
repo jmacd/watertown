@@ -53,7 +53,7 @@ type Result<T> = std::result::Result<T, crate::error::Error>;
 ///
 /// The caller passes a canonical string built from those config fields.  The
 /// hash uses the same `DefaultHasher` convention as
-/// [`crate::format_cache::pattern_hash`]; stability across binaries is not
+/// the former `format_cache::pattern_hash`; stability across binaries is not
 /// required because the cache is throwaway.
 #[must_use]
 pub fn cfg_hash(canonical: &str) -> String {

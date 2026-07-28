@@ -461,10 +461,11 @@ pub async fn merge_parquet_schemas(files: &[PathBuf], fallback_dir: &Path) -> Re
 
 /// Merge the schemas of every `.parquet` directly under `dir`.
 ///
-/// Only for schema recovery and for genuinely directory-shaped caches (the
-/// symlink glob dir, which is rebuilt from the live set on every query). Never
-/// use it to decide which files a read scans.
-pub async fn merge_parquet_schemas_in_dir(dir: &Path) -> Result<SchemaRef> {
+/// Private, and deliberately so: this is schema RECOVERY for the case where no
+/// live member exists to describe the data, never a way to decide which files a
+/// read scans. The last directory-shaped reader (the symlink glob dir) is gone;
+/// keeping this unexported is what stops another one appearing.
+async fn merge_parquet_schemas_in_dir(dir: &Path) -> Result<SchemaRef> {
     let mut schemas = Vec::new();
     if dir.exists() {
         let mut entries = tokio::fs::read_dir(dir).await?;
