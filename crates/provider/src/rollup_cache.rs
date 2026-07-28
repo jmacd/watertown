@@ -73,36 +73,6 @@ pub fn cfg_hash(canonical: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-/// Where an older binary kept a node's per-source-version partials:
-/// `{cache_dir}/rollup_{cfg_hash}_{node_id}/`.
-///
-/// Nothing writes here. It exists only so [`drop_node_namespace`] and
-/// [`drop_all`] still clear a directory left behind by a pond built before the
-/// rollup aggregated its sources directly.
-#[must_use]
-fn legacy_partials_node_dir(cache_dir: &Path, cfg_hash: &str, node_id: &tinyfs::NodeID) -> PathBuf {
-    cache_dir.join(format!("rollup_{}_{}", cfg_hash, node_id))
-}
-
-/// Drop a node's entire rollup-cache namespace for one config, forcing the
-/// rollup to be recomputed from source on next read. Used by the `--rebuild`
-/// recovery path. Idempotent: a missing directory is not an error.
-pub fn drop_node_namespace(
-    cache_dir: &Path,
-    cfg_hash: &str,
-    node_id: &tinyfs::NodeID,
-) -> Result<()> {
-    let dir = legacy_partials_node_dir(cache_dir, cfg_hash, node_id);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).map_err(crate::error::Error::Io)?;
-    }
-    let mdir = merged_dir(cache_dir, cfg_hash, node_id);
-    if mdir.exists() {
-        std::fs::remove_dir_all(&mdir).map_err(crate::error::Error::Io)?;
-    }
-    Ok(())
-}
-
 /// Drop every rollup-cache namespace under `cache_dir`, forcing every
 /// temporal-reduce level to be recomputed from source on next read.  This is the
 /// global `--rebuild` recovery primitive.  The format cache and any other cache
@@ -120,7 +90,7 @@ pub fn drop_all(cache_dir: &Path) -> Result<usize> {
             && entry
                 .file_name()
                 .to_str()
-                .is_some_and(|n| n.starts_with("rollup_") || n.starts_with("merged_"));
+                .is_some_and(|n| n.starts_with("merged_"));
         if is_rollup {
             std::fs::remove_dir_all(&path).map_err(crate::error::Error::Io)?;
             dropped += 1;
@@ -509,7 +479,6 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use datafusion::execution::context::SessionContext;
     use std::sync::Arc;
-    use tinyfs::FileVersionInfo;
 
     fn partials_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -536,17 +505,6 @@ mod tests {
         .unwrap()
     }
 
-    fn test_version(version: u64, blake3: Option<&str>) -> FileVersionInfo {
-        FileVersionInfo {
-            version,
-            timestamp: 0,
-            size: 100,
-            blake3: blake3.map(str::to_string),
-            entry_type: tinyfs::EntryType::FilePhysicalVersion,
-            extended_metadata: None,
-        }
-    }
-
     fn test_node_id() -> tinyfs::NodeID {
         tinyfs::NodeID::new(uuid7::uuid7().to_string())
     }
@@ -559,51 +517,6 @@ mod tests {
         assert_eq!(a, b, "same config must hash identically");
         assert_ne!(a, c, "different resolution list must change the namespace");
         assert_eq!(a.len(), 16);
-    }
-
-    #[test]
-    fn test_legacy_partials_node_dir_layout() {
-        let cache_dir = Path::new("/tmp/pond/cache");
-        let node_id = test_node_id();
-        let dir = legacy_partials_node_dir(cache_dir, "deadbeef", &node_id);
-        let dir_str = dir.to_str().unwrap();
-        assert!(dir_str.starts_with("/tmp/pond/cache/rollup_deadbeef_"));
-        assert!(dir_str.contains(&node_id.to_string()));
-    }
-
-    /// Fold a cached set the way the read path does, returning
-    /// `(time_bucket, sum, count)` rows.
-    async fn merge_partials(set: &crate::version_cache::CachedSet) -> Vec<(i64, f64, i64)> {
-        let ctx = SessionContext::new();
-        let table = set.table_provider().await.unwrap();
-        _ = ctx.register_table("partials", table).unwrap();
-        let df = ctx
-            .sql(
-                "SELECT time_bucket, SUM(\"__p_sum_0\") AS s, SUM(\"__p_count_1\") AS c \
-                 FROM partials GROUP BY time_bucket ORDER BY time_bucket",
-            )
-            .await
-            .unwrap();
-        let batches = df.collect().await.unwrap();
-        let merged = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
-        let bucket = merged
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let s = merged
-            .column(1)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap();
-        let c = merged
-            .column(2)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        (0..merged.num_rows())
-            .map(|i| (bucket.value(i), s.value(i), c.value(i)))
-            .collect()
     }
 
     /// A stray Parquet in the res dir must not contribute rows: the manifest,
@@ -713,27 +626,6 @@ mod tests {
             "an unreferenced Parquet in the res dir was scanned; the read must \
              enumerate the manifest, not list the directory"
         );
-    }
-
-    #[tokio::test]
-    async fn test_drop_node_namespace() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cache_dir = tmp.path();
-        let node_id = test_node_id();
-        // Both namespaces: the live merged cache and the partials directory a
-        // pre-`segments-v3` binary would have left behind. `--rebuild` must
-        // clear both, or the stale one wastes disk forever.
-        let legacy = legacy_partials_node_dir(cache_dir, "cfg", &node_id);
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("v1.parquet"), b"stale").unwrap();
-        let merged = merged_dir(cache_dir, "cfg", &node_id);
-        std::fs::create_dir_all(&merged).unwrap();
-
-        drop_node_namespace(cache_dir, "cfg", &node_id).unwrap();
-        assert!(!legacy.exists());
-        assert!(!merged.exists());
-        // Idempotent.
-        drop_node_namespace(cache_dir, "cfg", &node_id).unwrap();
     }
 
     #[tokio::test]
