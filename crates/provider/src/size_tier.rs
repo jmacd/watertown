@@ -164,4 +164,36 @@ mod tests {
         let sizes = vec![10_000_000u64, 5, 6, 7];
         assert_eq!(choose_merge_window(&sizes, 100), None);
     }
+
+    #[test]
+    fn finds_a_full_group_that_does_not_start_at_the_oldest_segment() {
+        // A large accumulated segment, then twelve small ones. The scan must
+        // step OVER the ragged prefix and merge within the run behind it; a
+        // scan that only ever considered a group anchored at index 0 would
+        // find nothing here and leave the small segments to accumulate until
+        // the backstop fired.
+        let mut sizes = vec![10_000_000u64];
+        sizes.extend(std::iter::repeat_n(5u64, 12));
+        // The OLDEST ten OF THE RUN, not the newest ten and not the whole run.
+        assert_eq!(choose_merge_window(&sizes, 100), Some(1..11));
+    }
+
+    #[test]
+    fn same_class_segments_split_by_another_class_are_not_a_group() {
+        // Ten class-0 segments in total, but a large one sits between them.
+        // Adjacency is not a preference here: `sizes` is in content order and a
+        // merged segment inherits the range spanning its window, so merging
+        // across the interloper would produce a segment whose range covers data
+        // that still lives in the interloper -- an overlap, and a double count
+        // on read. Leaving them unmerged is the only correct answer.
+        let mut sizes = vec![5u64; 5];
+        sizes.push(10_000_000);
+        sizes.extend(std::iter::repeat_n(5u64, 5));
+        assert_eq!(
+            choose_merge_window(&sizes, 100),
+            None,
+            "non-adjacent same-class segments must not be merged across the \
+             segment separating them"
+        );
+    }
 }
