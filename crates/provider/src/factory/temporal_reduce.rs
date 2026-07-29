@@ -2751,6 +2751,23 @@ register_dynamic_factory!(
 /// A version with no recorded blake3 falls back to node+version, which is
 /// unstable across a collapse and so degrades to "looks changed" -- a rebuild,
 /// never a stale reuse.
+///
+/// The map this feeds is a set, so the key must also be UNIQUE across a single
+/// node's live versions, or two of them collapse into one member and an append
+/// becomes invisible -- `sources == now` would reuse a cache that counted the
+/// payload once while a series read counts it twice. Two facts outside this
+/// module make that safe, and neither is local enough to be obvious:
+///
+///  - For series entry types the stored blake3 is the CUMULATIVE hash over
+///    every version's content, not that version's own bytes, so re-appending
+///    identical bytes still yields a different digest (tlogfs
+///    `extract_blake3_from_outboard`).
+///  - A non-series source with more than one live version is rejected before
+///    this is ever called, since its versions are overlapping re-snapshots.
+///
+/// `test_identical_content_appended_twice_is_not_mistaken_for_no_change` pins
+/// the consequence, so a change to either fact fails a test here rather than
+/// silently freezing the cache.
 fn source_version_key(node_id: &tinyfs::NodeID, v: &tinyfs::FileVersionInfo) -> String {
     match &v.blake3 {
         Some(h) => format!("{}:{}", node_id, h),
@@ -5252,6 +5269,77 @@ mod tests {
         }
         _ = ctx.deregister_table("reduced").unwrap();
         Ok(rows)
+    }
+
+    /// Guards the invariant the freshness key rests on: a set of content
+    /// digests is only a sound identity for the live version set if two live
+    /// versions can never share a digest.
+    ///
+    /// `sources` is a `BTreeMap` keyed on blake3, so a genuine duplicate would
+    /// collapse into one member and the append would look like no change at all
+    /// -- `sources == now` → reuse → the cache keeps serving the single-copy
+    /// answer while a direct read of the series counts both. That cannot happen
+    /// today for the two reasons spelled out at `source_version_key`: a series
+    /// stores the CUMULATIVE hash, which strictly changes on every append, and
+    /// a non-series source with more than one live version is rejected outright.
+    ///
+    /// Both reasons live far from this cache -- one in tlogfs's outboard, one in
+    /// a guard several hundred lines up -- so this pins the consequence. Append
+    /// the same bytes twice: two live versions, identical payload, and the sum
+    /// must double. Max would hide it entirely (`max(x, x) == x`); only an
+    /// additive statistic can tell. If someone ever makes the stored hash
+    /// per-version content rather than cumulative, this fails instead of the
+    /// rollup silently freezing.
+    #[tokio::test]
+    async fn test_identical_content_appended_twice_is_not_mistaken_for_no_change() {
+        let _ = env_logger::try_init();
+        let persistence = tinyfs::MemoryPersistence::default();
+        let fs = tinyfs::FS::new(persistence.clone()).await.unwrap();
+        {
+            let root = fs.root().await.unwrap();
+            _ = root.create_dir_path("/ingest").await.unwrap();
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+
+        // Build 1: one copy of day 5.
+        append_day_series(&fs, "/ingest/weather.csv", 5).await;
+        let first = daily_max_col(
+            &reduce_ctx(&persistence, &cache_dir),
+            lateness_config(Some("0s")),
+            "temperature.sum",
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.len(), 1, "one daily bucket, got {:?}", first);
+        let approx = |a: f64, b: f64| (a - b).abs() < 1e-6;
+        assert!(
+            approx(first[0], expected_day_sum(5)),
+            "seed sum wrong: {:?}",
+            first
+        );
+
+        // Append the SAME bytes again: a second live version, identical content,
+        // identical blake3, identical recorded event range.
+        append_day_series(&fs, "/ingest/weather.csv", 5).await;
+
+        // Build 2 must see a change. Max would hide this entirely
+        // (max(x, x) == x); only an additive statistic can tell.
+        let second = daily_max_col(
+            &reduce_ctx(&persistence, &cache_dir),
+            lateness_config(Some("0s")),
+            "temperature.sum",
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.len(), 1, "still one daily bucket, got {:?}", second);
+        assert!(
+            approx(second[0], 2.0 * expected_day_sum(5)),
+            "a second live version with identical content is a real append and \
+             must be counted: got {:?}, want {}",
+            second,
+            2.0 * expected_day_sum(5)
+        );
     }
 
     fn walk_find(dir: &std::path::Path, pred: &dyn Fn(&str) -> bool) -> Vec<std::path::PathBuf> {
