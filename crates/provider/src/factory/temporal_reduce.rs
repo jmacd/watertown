@@ -5619,6 +5619,97 @@ mod tests {
         }
     }
 
+    /// A seal whose frozen span turns out to hold no buckets must advance the
+    /// watermark without leaving anything behind.
+    ///
+    /// The span `[sealed_hi, wm)` is chosen from the watermark alone, before
+    /// anything knows whether it contains data, so the seal writes a candidate
+    /// Parquet and only then learns it produced zero rows. This is routine, not
+    /// exotic: on a first build `sealed_hi` is `None` and `wm` is the newest
+    /// bucket, so a source whose data all sits in that newest bucket freezes an
+    /// empty span every time.
+    ///
+    /// Three things have to happen together, and each fails differently:
+    ///  - the candidate file is deleted, or it is an orphan -- unnamed by any
+    ///    manifest, so no later build will ever clean it up;
+    ///  - `next_seq` does not advance, so sequence numbers track real segments;
+    ///  - `sealed_hi` DOES advance to `wm`, or the same empty span is re-frozen
+    ///    and re-discarded on every subsequent build.
+    #[tokio::test]
+    async fn a_seal_that_freezes_no_rows_records_no_segment_and_leaves_no_file() {
+        let _ = env_logger::try_init();
+        let persistence = tinyfs::MemoryPersistence::default();
+        let fs = tinyfs::FS::new(persistence.clone()).await.unwrap();
+        {
+            let root = fs.root().await.unwrap();
+            _ = root.create_dir_path("/ingest").await.unwrap();
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+
+        // A single day, so the newest bucket IS the only bucket. With zero
+        // lateness the watermark lands on it, and the frozen span below it --
+        // everything before day 1 -- is empty.
+        append_day_series(&fs, "/ingest/weather.csv", 1).await;
+        let rows = daily_max(
+            &reduce_ctx(&persistence, &cache_dir),
+            lateness_config(Some("0s")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the one day still reads back, got {:?}",
+            rows
+        );
+
+        let manifests = walk_find(&cache_dir, &|n| n == "manifest.json");
+        assert_eq!(manifests.len(), 1, "one manifest for the single resolution");
+        let m: crate::rollup_cache::SegmentManifest =
+            serde_json::from_slice(&std::fs::read(&manifests[0]).unwrap()).unwrap();
+
+        assert!(
+            m.sealed_hi_secs.is_some(),
+            "the watermark must advance past the empty span, or every later \
+             build re-freezes and re-discards it"
+        );
+        assert!(
+            m.segments.is_empty(),
+            "an empty span must not be recorded as a segment: {:?}",
+            m.segments
+        );
+        assert_eq!(
+            m.next_seq, 0,
+            "a discarded candidate must not consume a sequence number"
+        );
+        let segs = walk_find(&cache_dir, &|n| {
+            n.starts_with("seg-") && n.ends_with(".parquet")
+        });
+        assert!(
+            segs.is_empty(),
+            "the zero-row candidate was left on disk as an orphan; no manifest \
+             names it, so nothing will ever delete it: {segs:?}"
+        );
+
+        // The layout stays usable: a later append seals normally on top of the
+        // watermark the empty seal advanced.
+        append_day_series(&fs, "/ingest/weather.csv", 2).await;
+        let rows = daily_max(
+            &reduce_ctx(&persistence, &cache_dir),
+            lateness_config(Some("0s")),
+        )
+        .await
+        .unwrap();
+        let approx = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert_eq!(rows.len(), 2, "both days, got {:?}", rows);
+        assert!(
+            approx(rows[0], 143.5) && approx(rows[1], 243.5),
+            "values wrong after sealing on top of an empty span: {:?}",
+            rows
+        );
+    }
+
     /// Compaction bounds the number of live segment files, and the merged segments
     /// answer exactly what the originals did.
     ///
