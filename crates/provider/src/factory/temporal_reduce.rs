@@ -961,10 +961,15 @@ impl TemporalReduceSqlFile {
         let hot_file = crate::rollup_cache::hot_path(res_dir);
         let (hot_digest, _rows) = self.write_merge_to(ctx, &hot_sql, &hot_file).await?;
         m.hot_digest = Some(hot_digest);
-        m.hot_bytes = tokio::fs::metadata(&hot_file)
-            .await
-            .map(|md| md.len())
-            .unwrap_or(0);
+        // Fatal, like the identical stat on a just-sealed segment above.
+        // `write_merge_to` has just written this path atomically and a zero-row
+        // result still produces a file, so there is no benign way for this to
+        // fail -- and the value is not a passing hint: it is PERSISTED, and the
+        // seal gate reads it. Defaulting to 0 would record "nothing worth
+        // freezing" in the manifest, which disables sealing on the next build
+        // and lets the hot window grow unbounded, silently undoing the bound
+        // that sealing exists to provide.
+        m.hot_bytes = tokio::fs::metadata(&hot_file).await.map_other()?.len();
 
         self.compact_segments(ctx, pieces, ts, output_interval, res_dir, m, policy)
             .await
@@ -5894,6 +5899,28 @@ mod tests {
         assert!(
             m["segments"].as_array().is_some_and(Vec::is_empty),
             "manifest must record no segments: {m}"
+        );
+
+        // The gate's INPUT must be the real size of hot, not a placeholder.
+        // Everything above here is equally satisfied by hot_bytes == 0, which is
+        // what a swallowed stat error used to record: the gate would then block
+        // every seal forever and the hot window would grow without bound, with
+        // this test still green. Pin the recorded value against the file.
+        let hots = walk_find(&cache_dir, &|n| n == "hot.parquet");
+        assert_eq!(hots.len(), 1, "one hot file for the single resolution");
+        let on_disk = std::fs::metadata(&hots[0]).unwrap().len();
+        assert!(
+            on_disk > 0,
+            "hot.parquet is never empty; it holds four days"
+        );
+        assert_eq!(
+            m["hot_bytes"].as_u64(),
+            Some(on_disk),
+            "manifest must record the hot file's actual size: {m}"
+        );
+        assert!(
+            on_disk < crate::rollup_cache::SEAL_TARGET_BYTES,
+            "the premise of this test is that hot is under the seal target"
         );
     }
 
