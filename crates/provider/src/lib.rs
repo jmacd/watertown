@@ -15,6 +15,7 @@ pub mod format_cache;
 mod format_registry;
 mod provider_api;
 pub mod rollup_cache;
+pub mod size_tier;
 mod sql_transform;
 mod table_creation;
 mod table_provider_options;

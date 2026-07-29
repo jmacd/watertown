@@ -1,3 +1,21 @@
+> **SUPERSEDED (see `docs/rollup-storage-redesign.md`).** Kept for history.
+>
+> Two of this document's load-bearing claims are no longer true of the code:
+>
+> - *"No watermark, no mutable state file."* There is a watermark and a
+>   `manifest.json` per resolution. Content addressing alone bounded neither the
+>   file count nor the per-build merge cost.
+> - *"Enabling invariant: sequential input."* The rollup no longer requires it.
+>   The cache is keyed by the time range each file covers, so late data unseals
+>   the segments covering it and recomputes them. The sequentiality frontier and
+>   the `--rebuild` recovery it needed are both gone; `--rebuild` survives only
+>   as a maintenance escape hatch.
+>
+> Its instruction to "mirror `format_cache.rs` **exactly**, in a new sibling
+> module" is also worth not repeating: the copies drifted, and the resulting
+> mechanisms were individually incomplete rather than redundant, so correctness
+> depended on all of them agreeing with nothing forcing it.
+
 # Incremental temporal-reduce rollup: repair design and plan
 
 Status: design + implementation plan. Phase 1 (decomposable-aggregate

@@ -17,10 +17,6 @@
 
 use arrow::datatypes::SchemaRef;
 use datafusion::catalog::TableProvider;
-use datafusion::datasource::file_format::parquet::ParquetFormat;
-use datafusion::datasource::listing::{
-    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
-};
 use datafusion::execution::context::SessionContext;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -65,6 +61,14 @@ pub fn cache_version_path(
 }
 
 /// Check which of a node's live versions are missing from the cache.
+///
+/// Adds only; never deletes. Use it when `versions` may be a SUBSET of the
+/// node's live versions -- notably the dynamic-file path, which synthesizes a
+/// single version from metadata because such nodes have no persistence records.
+/// Reconciling against a subset would delete the sidecars of every version not
+/// in it. Callers holding the full live set should use
+/// [`reconcile_cached_versions`] instead, so the cache stays a projection of
+/// what is live rather than growing forever.
 #[must_use]
 pub fn find_uncached_versions(
     cache_dir: &Path,
@@ -74,6 +78,42 @@ pub fn find_uncached_versions(
 ) -> Vec<FileVersionInfo> {
     let live = LiveVersions::from_persistence(*node_id, versions.to_vec());
     node_sidecars(cache_dir, scheme, node_id).missing(&live)
+}
+
+/// Make a node's cache directory a projection of its live versions: delete the
+/// sidecars of versions that are no longer live, and report which live versions
+/// still need writing.
+///
+/// This is the collection step the format cache never had. Every other property
+/// in this module's header held -- per-version files are immutable, so there was
+/// nothing to INVALIDATE -- but nothing ever removed them, so the directory grew
+/// by one Parquet for every version ever written and was never bounded. Version
+/// collapse makes that worse than mere disk cost: it replaces a run of versions
+/// with one merged version carrying the same content, so the superseded
+/// sidecars are duplicates of data the merged one already holds.
+///
+/// Reads are what keep it bounded, because reads are what happen. Deleting is
+/// safe: a sidecar is derived data, regenerable from the source version.
+///
+/// `versions` MUST be the node's complete live set, as returned by
+/// `list_file_versions`. Passing a subset deletes the rest.
+pub fn reconcile_cached_versions(
+    cache_dir: &Path,
+    scheme: &str,
+    node_id: &tinyfs::NodeID,
+    versions: &[FileVersionInfo],
+) -> Result<Vec<FileVersionInfo>> {
+    let live = LiveVersions::from_persistence(*node_id, versions.to_vec());
+    let rec = node_sidecars(cache_dir, scheme, node_id).reconcile(&live)?;
+    if !rec.removed.is_empty() {
+        log::debug!(
+            "[SWEEP] format cache: removed {} superseded sidecar(s) for {}_{}",
+            rec.removed.len(),
+            scheme,
+            node_id
+        );
+    }
+    Ok(rec.missing)
 }
 
 /// Write a single version's format output to cache as Parquet.
@@ -99,7 +139,7 @@ pub async fn cache_write_version(
 /// without event-time bounds return `None` (and are always retained by an
 /// event-time bound -- a missing bound must never drop data).
 #[must_use]
-fn version_max_event_time(v: &FileVersionInfo) -> Option<i64> {
+pub fn version_max_event_time(v: &FileVersionInfo) -> Option<i64> {
     v.extended_metadata
         .as_ref()?
         .get("max_event_time")?
@@ -138,109 +178,62 @@ pub async fn listing_table_from_cache_bounded(
         .await
 }
 
-/// Directory for a glob-scoped unified cache (all files matching a pattern).
+/// The cached Parquets of the live versions of EVERY node matched by a glob,
+/// as one explicit [`CachedSet`].
 ///
-/// Returns `{cache_dir}/{scheme}_glob_{pattern_hash}/`
+/// Replaces a symlink farm. The former mechanism built
+/// `{cache_dir}/{scheme}_glob_{hash}/` full of symlinks to per-node cache files
+/// and then pointed a `ListingTable` at the DIRECTORY. That worked only while
+/// three separate conventions all held: the caller wiped the directory first,
+/// the versions handed in were live, and nothing else wrote there. Two call
+/// sites performed that ritual by hand, and the wipe-then-repopulate step raced
+/// any concurrent reader of the same pattern, which takes no lock.
+///
+/// Naming the files makes the guarantee structural instead of ritual, and it is
+/// the same mechanism the rollup uses to accumulate several source nodes into
+/// one scan. Schema evolution is preserved: [`CachedSet::table_provider`] merges
+/// schemas across exactly these files, so a column that appears only in some
+/// members is present and NULL-filled elsewhere (the UNION-ALL-BY-NAME property
+/// the glob directory existed to provide).
+///
+/// Each `versions` slice must be that node's LIVE versions, as returned by
+/// `list_file_versions`, which already hides collapse-superseded ones.
 #[must_use]
-pub fn cache_glob_dir(cache_dir: &Path, scheme: &str, pattern_hash: &str) -> PathBuf {
-    cache_dir.join(format!("{}_glob_{}", scheme, pattern_hash))
-}
-
-/// Compute a deterministic hash for a glob pattern string.
-#[must_use]
-pub fn pattern_hash(pattern: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    pattern.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
-/// Ensure symlinks exist in the glob directory for all cached versions of a node.
-///
-/// Creates symlinks from `{glob_dir}/{node_id}_v{version}_{blake3}.parquet`
-/// to the per-node cache directory files.
-///
-/// Returns the number of new symlinks created.
-pub fn ensure_glob_symlinks(
+pub fn glob_cached_set(
     cache_dir: &Path,
     scheme: &str,
-    node_id: &tinyfs::NodeID,
-    versions: &[FileVersionInfo],
-    glob_dir: &Path,
-) -> Result<usize> {
-    let mut created = 0;
-    for version in versions {
-        let source = cache_version_path(cache_dir, scheme, node_id, version);
-        if !source.exists() {
-            continue; // Skip versions not yet cached
-        }
-
-        let key = match version.blake3.as_deref() {
-            Some(hash) => hash.to_string(),
-            None => node_id.to_short_string(),
-        };
-        let link_name = glob_dir.join(format!("{}_v{}_{}.parquet", node_id, version.version, key));
-
-        if !link_name.exists() {
-            #[cfg(unix)]
-            {
-                std::os::unix::fs::symlink(&source, &link_name).map_err(crate::error::Error::Io)?;
-            }
-            #[cfg(not(unix))]
-            {
-                // On non-Unix, fall back to hard link or copy
-                std::fs::hard_link(&source, &link_name)
-                    .or_else(|_| std::fs::copy(&source, &link_name).map(|_| ()))
-                    .map_err(crate::error::Error::Io)?;
-            }
-            created += 1;
-        }
-    }
-    Ok(created)
+    nodes: &[(tinyfs::NodeID, Vec<FileVersionInfo>)],
+) -> crate::version_cache::CachedSet {
+    glob_cached_set_bounded(cache_dir, scheme, nodes, &tinyfs::SeriesReadBounds::NONE)
 }
 
-/// Clean a glob directory by removing all existing symlinks, then recreating it.
+/// [`glob_cached_set`], pruned by a per-version event-time bound.
 ///
-/// This is used before populating with fresh symlinks each query to ensure
-/// deleted versions or changed file sets are not stale.
-pub fn reset_glob_dir(glob_dir: &Path) -> Result<()> {
-    if glob_dir.exists() {
-        std::fs::remove_dir_all(glob_dir).map_err(crate::error::Error::Io)?;
+/// The multi-node analogue of [`listing_table_from_cache_bounded`], and the
+/// reason the rollup needs no per-version partial cache: an incremental rebuild
+/// of recent buckets scans only the source versions that can reach them, which
+/// is the same "skip old inputs" property the partials directory provided, from
+/// metadata tlogfs already records.
+#[must_use]
+pub fn glob_cached_set_bounded(
+    cache_dir: &Path,
+    scheme: &str,
+    nodes: &[(tinyfs::NodeID, Vec<FileVersionInfo>)],
+    bounds: &tinyfs::SeriesReadBounds,
+) -> crate::version_cache::CachedSet {
+    // Falls back to the cache root only for schema recovery when no member is
+    // cached yet, which is the same "no data to describe" case the glob
+    // directory reported as an error.
+    let mut set = crate::version_cache::CachedSet::empty_in(cache_dir.to_path_buf());
+    for (node_id, versions) in nodes {
+        let live = LiveVersions::from_persistence(*node_id, versions.clone());
+        set.extend(
+            node_sidecars(cache_dir, scheme, node_id).cached_set(&live, |v| {
+                bounds.retains(version_max_event_time(v), v.version as i64)
+            }),
+        );
     }
-    std::fs::create_dir_all(glob_dir).map_err(crate::error::Error::Io)?;
-    Ok(())
-}
-
-/// Build a `ListingTable` over a glob directory containing symlinks to
-/// per-node cached Parquet files from multiple source files.
-///
-/// This replaces the UNION ALL BY NAME pattern: instead of N separate
-/// MemTables unioned via SQL, a single ListingTable scans all files
-/// in the glob directory. Schema evolution (different columns per file)
-/// is handled by `ListingTable`'s schema adapter.
-pub async fn listing_table_from_glob_cache(
-    glob_dir: &Path,
-    _ctx: &SessionContext,
-) -> Result<Arc<dyn TableProvider>> {
-    let dir_url = format!("file://{}/", glob_dir.display());
-
-    let table_url = ListingTableUrl::parse(&dir_url)?;
-    let listing_options =
-        ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
-
-    // Merge schemas from ALL parquet files in the glob directory.
-    // DataFusion's infer_schema only samples a subset of files, which loses
-    // columns that appear in later files (e.g., sensors added over time).
-    // This is the glob-cache equivalent of UNION ALL BY NAME's schema merge.
-    let merged_schema = crate::version_cache::merge_parquet_schemas_in_dir(glob_dir).await?;
-
-    let config = ListingTableConfig::new(table_url)
-        .with_listing_options(listing_options)
-        .with_schema(merged_schema);
-
-    let table = ListingTable::try_new(config)?;
-    Ok(Arc::new(table))
+    set
 }
 
 #[cfg(test)]
@@ -301,6 +294,73 @@ mod tests {
 
     fn test_node_id() -> tinyfs::NodeID {
         tinyfs::NodeID::new(uuid7::uuid7().to_string())
+    }
+
+    /// Reconciling retires the sidecars of versions that are no longer live and
+    /// reports nothing missing when every live version is already cached.
+    ///
+    /// This is the collection step the format cache lacked entirely: its files
+    /// are immutable, so there was never anything to invalidate, but nothing
+    /// removed them either and the directory grew by one Parquet per version
+    /// ever written. Collapse is what makes that a correctness concern and not
+    /// just disk: it replaces versions 1..3 with a single merged version, and
+    /// the superseded sidecars hold the very rows the merged one now carries.
+    #[tokio::test]
+    async fn reconcile_retires_sidecars_a_collapse_superseded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path();
+        let node_id = test_node_id();
+        let schema = test_schema();
+
+        let before = vec![
+            test_version(1, "h1"),
+            test_version(2, "h2"),
+            test_version(3, "h3"),
+        ];
+        for v in &before {
+            let batch = test_batch(&schema, &[v.version as i64], &["x"]);
+            let stream: crate::version_cache::BatchStream =
+                Box::pin(futures::stream::once(async move { Ok(batch) }));
+            let _ = cache_write_version(cache_dir, "csv", &node_id, v, schema.clone(), stream)
+                .await
+                .unwrap();
+        }
+        let dir = cache_node_dir(cache_dir, "csv", &node_id);
+        let count = |d: &Path| std::fs::read_dir(d).unwrap().count();
+        assert_eq!(count(&dir), 3, "three versions cached");
+
+        // A collapse merges 1..3 into one new, higher-numbered version with the
+        // same content. `list_file_versions` would now return only version 4.
+        let after = vec![test_version(4, "merged")];
+        let missing = reconcile_cached_versions(cache_dir, "csv", &node_id, &after).unwrap();
+
+        assert_eq!(
+            missing.len(),
+            1,
+            "the merged version is not cached yet, so it must be reported missing"
+        );
+        assert_eq!(missing[0].version, 4);
+        assert_eq!(
+            count(&dir),
+            0,
+            "all three superseded sidecars must be gone; a cache that only adds \
+             is how they survived to be double-counted"
+        );
+
+        // Cache the merged version, then reconcile again: steady state is a
+        // no-op, neither deleting a live sidecar nor reporting it missing.
+        let batch = test_batch(&schema, &[4], &["x"]);
+        let stream: crate::version_cache::BatchStream =
+            Box::pin(futures::stream::once(async move { Ok(batch) }));
+        let _ = cache_write_version(cache_dir, "csv", &node_id, &after[0], schema, stream)
+            .await
+            .unwrap();
+        let missing = reconcile_cached_versions(cache_dir, "csv", &node_id, &after).unwrap();
+        assert!(
+            missing.is_empty(),
+            "live cached version must not be missing"
+        );
+        assert_eq!(count(&dir), 1, "live sidecar must survive reconciliation");
     }
 
     #[test]
@@ -587,87 +647,8 @@ mod tests {
         assert_eq!(c, 1);
     }
 
-    #[test]
-    fn test_pattern_hash_deterministic() {
-        let h1 = pattern_hash("/sensors/**/*.json");
-        let h2 = pattern_hash("/sensors/**/*.json");
-        assert_eq!(h1, h2);
-        assert_eq!(h1.len(), 16); // 16 hex chars
-
-        // Different pattern => different hash
-        let h3 = pattern_hash("/other/**/*.csv");
-        assert_ne!(h1, h3);
-    }
-
-    #[test]
-    fn test_cache_glob_dir() {
-        let dir = cache_glob_dir(Path::new("/tmp/cache"), "oteljson", "abc123");
-        assert_eq!(dir, Path::new("/tmp/cache/oteljson_glob_abc123"));
-    }
-
-    #[test]
-    fn test_reset_glob_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let glob_dir = tmp.path().join("test_glob");
-
-        // Create dir with a file in it
-        std::fs::create_dir_all(&glob_dir).unwrap();
-        std::fs::write(glob_dir.join("old.parquet"), b"old data").unwrap();
-        assert!(glob_dir.join("old.parquet").exists());
-
-        // Reset should remove old contents
-        reset_glob_dir(&glob_dir).unwrap();
-        assert!(glob_dir.exists());
-        assert!(!glob_dir.join("old.parquet").exists());
-    }
-
     #[tokio::test]
-    async fn test_ensure_glob_symlinks() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cache_dir = tmp.path();
-        let node_id = test_node_id();
-        let versions = vec![test_version(1, "aaa"), test_version(2, "bbb")];
-
-        let schema = test_schema();
-
-        // Write both versions to per-node cache
-        for v in &versions {
-            let batch = test_batch(&schema, &[1000], &["x"]);
-            let stream: Pin<
-                Box<
-                    dyn Stream<Item = std::result::Result<RecordBatch, crate::error::Error>> + Send,
-                >,
-            > = Box::pin(futures::stream::once({
-                let batch = batch;
-                async move { Ok(batch) }
-            }));
-            let _ = cache_write_version(cache_dir, "oteljson", &node_id, v, schema.clone(), stream)
-                .await
-                .unwrap();
-        }
-
-        // Create glob dir and build symlinks
-        let glob_dir = tmp.path().join("glob_test");
-        std::fs::create_dir_all(&glob_dir).unwrap();
-        let created =
-            ensure_glob_symlinks(cache_dir, "oteljson", &node_id, &versions, &glob_dir).unwrap();
-        assert_eq!(created, 2);
-
-        // Verify symlinks exist
-        let entries: Vec<_> = std::fs::read_dir(&glob_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
-        assert_eq!(entries.len(), 2);
-
-        // Calling again should create 0 new symlinks (idempotent)
-        let created2 =
-            ensure_glob_symlinks(cache_dir, "oteljson", &node_id, &versions, &glob_dir).unwrap();
-        assert_eq!(created2, 0);
-    }
-
-    #[tokio::test]
-    async fn test_listing_table_from_glob_cache() {
+    async fn glob_cached_set_scans_every_matched_node() {
         let tmp = tempfile::tempdir().unwrap();
         let cache_dir = tmp.path();
 
@@ -697,29 +678,11 @@ mod tests {
                 .unwrap();
         }
 
-        // Create glob dir, symlink both nodes' versions in
-        let glob_dir = tmp.path().join("my_glob");
-        std::fs::create_dir_all(&glob_dir).unwrap();
-        let _ = ensure_glob_symlinks(
-            cache_dir,
-            "csv",
-            &node1,
-            std::slice::from_ref(&v1),
-            &glob_dir,
-        )
-        .unwrap();
-        let _ = ensure_glob_symlinks(
-            cache_dir,
-            "csv",
-            &node2,
-            std::slice::from_ref(&v2),
-            &glob_dir,
-        )
-        .unwrap();
-
-        // Build listing table over glob dir
+        // One explicit scan over both nodes' live versions.
+        let nodes = vec![(node1, vec![v1.clone()]), (node2, vec![v2.clone()])];
         let ctx = SessionContext::new();
-        let table = listing_table_from_glob_cache(&glob_dir, &ctx)
+        let table = glob_cached_set(cache_dir, "csv", &nodes)
+            .table_provider()
             .await
             .unwrap();
 
@@ -739,12 +702,12 @@ mod tests {
         assert_eq!(cnt, 2); // One row from each node
     }
 
-    /// Verify that listing_table_from_glob_cache merges schemas across files
+    /// Verify that the glob scan merges schemas across files
     /// with different columns (UNION ALL BY NAME semantics).  This catches the
     /// bug where schema inference from a single file drops columns that only
     /// exist in later files (e.g., sensors added over time).
     #[tokio::test]
-    async fn test_listing_table_glob_cache_schema_merge() {
+    async fn glob_cached_set_merges_schemas_across_members() {
         let tmp = tempfile::tempdir().unwrap();
         let cache_dir = tmp.path();
 
@@ -805,29 +768,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Create glob dir with symlinks to both nodes
-        let glob_dir = tmp.path().join("merge_glob");
-        std::fs::create_dir_all(&glob_dir).unwrap();
-        let _ = ensure_glob_symlinks(
-            cache_dir,
-            "csv",
-            &node1,
-            std::slice::from_ref(&v1),
-            &glob_dir,
-        )
-        .unwrap();
-        let _ = ensure_glob_symlinks(
-            cache_dir,
-            "csv",
-            &node2,
-            std::slice::from_ref(&v2),
-            &glob_dir,
-        )
-        .unwrap();
-
-        // Build listing table -- should have merged schema with all 3 columns
+        // Merged schema must carry all 3 columns across the two members.
+        let nodes = vec![(node1, vec![v1.clone()]), (node2, vec![v2.clone()])];
         let ctx = SessionContext::new();
-        let table = listing_table_from_glob_cache(&glob_dir, &ctx)
+        let table = glob_cached_set(cache_dir, "csv", &nodes)
+            .table_provider()
             .await
             .unwrap();
 

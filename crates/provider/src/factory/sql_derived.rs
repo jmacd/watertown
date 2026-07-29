@@ -913,7 +913,6 @@ impl SqlDerivedFile {
     async fn build_format_provider_table(
         &self,
         pattern_name: &str,
-        pattern: &crate::Url,
         scheme: &str,
         queryable_files: &[tinyfs::NodePath],
     ) -> TinyFSResult<Arc<dyn TableProvider>> {
@@ -970,29 +969,23 @@ impl SqlDerivedFile {
                 let format_provider = crate::FormatRegistry::get_provider(scheme)
                     .ok_or_else(|| tinyfs::Error::Other(format!("Unknown format: {}", scheme)))?;
 
-                let pat_hash = crate::format_cache::pattern_hash(&pattern.to_string());
-                let glob_dir = crate::format_cache::cache_glob_dir(cache_dir, scheme, &pat_hash);
-                crate::format_cache::reset_glob_dir(&glob_dir).map_other()?;
-
+                let mut nodes = Vec::with_capacity(queryable_files.len());
                 for node_path in queryable_files {
                     let file_url_str = Self::node_file_url(scheme, node_path);
                     let file_url = crate::Url::parse(&file_url_str).map_other()?;
 
-                    let (node_id, versions) = provider_api
-                        .ensure_url_cached(&file_url, format_provider.as_ref(), cache_dir)
-                        .await
-                        .map_other()?;
-
-                    let _ = crate::format_cache::ensure_glob_symlinks(
-                        cache_dir, scheme, &node_id, &versions, &glob_dir,
-                    )
-                    .map_other()?;
+                    nodes.push(
+                        provider_api
+                            .ensure_url_cached(&file_url, format_provider.as_ref(), cache_dir)
+                            .await
+                            .map_other()?,
+                    );
                 }
 
-                let provider =
-                    crate::format_cache::listing_table_from_glob_cache(&glob_dir, &datafusion_ctx)
-                        .await
-                        .map_other()?;
+                let provider = crate::format_cache::glob_cached_set(cache_dir, scheme, &nodes)
+                    .table_provider()
+                    .await
+                    .map_other()?;
 
                 debug!(
                     "[OK] SQL-DERIVED: Glob cache ListingTable for {} files (pattern '{}')",
@@ -1309,7 +1302,7 @@ impl SqlDerivedFile {
         let is_format_provider = crate::FormatRegistry::get_provider(scheme).is_some();
 
         let listing_table_provider = if is_format_provider {
-            self.build_format_provider_table(pattern_name, pattern, scheme, &queryable_files)
+            self.build_format_provider_table(pattern_name, scheme, &queryable_files)
                 .await?
         } else if queryable_files.len() == 1 {
             self.build_single_file_provider(pattern_name, &queryable_files[0], context)
@@ -3088,6 +3081,10 @@ query: ""
                 }],
                 transforms: None,
                 allowed_lateness: None,
+                // Seal on every advance, as before the size gate existed: these
+                // tests assert seal MECHANICS on datasets far under any real target.
+                seal_target_bytes: Some(0),
+                max_live_segments: None,
             };
 
             TemporalReduceDirectory::new(config, context).unwrap()
@@ -3387,6 +3384,10 @@ query: ""
                 }],
                 transforms: None,
                 allowed_lateness: None,
+                // Seal on every advance, as before the size gate existed: these
+                // tests assert seal MECHANICS on datasets far under any real target.
+                seal_target_bytes: Some(0),
+                max_live_segments: None,
             };
 
             // Create temporal reduce directory within the same transaction that will access it

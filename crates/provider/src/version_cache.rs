@@ -283,15 +283,15 @@ impl SidecarDir {
         live: &LiveVersions,
         retain: impl Fn(&FileVersionInfo) -> bool,
     ) -> CachedSet {
-        let files = live
+        let (files, missing) = live
             .as_slice()
             .iter()
             .filter(|v| retain(v))
             .map(|v| self.sidecar_path(live.node_id(), v))
-            .filter(|p| p.exists())
-            .collect();
+            .partition(|p| p.exists());
         CachedSet {
             files,
+            missing,
             fallback_dir: self.dir.clone(),
         }
     }
@@ -309,7 +309,9 @@ impl SidecarDir {
     ) -> Result<PathBuf> {
         tokio::fs::create_dir_all(&self.dir).await?;
         let final_path = self.sidecar_path(node_id, version);
-        write_parquet_stream(&final_path, schema, stream).await?;
+        // The sidecar's identity is its filename (node, version, blake3 of the
+        // SOURCE), so the digest of the written Parquet is not recorded here.
+        let _digest = write_parquet_atomic(&final_path, schema, stream).await?;
         log::debug!("[SAVE] sidecar cache: wrote {}", final_path.display());
         Ok(final_path)
     }
@@ -323,6 +325,10 @@ impl SidecarDir {
 #[derive(Debug, Clone)]
 pub struct CachedSet {
     files: Vec<PathBuf>,
+    /// Live versions that were retained by the caller's predicate but whose
+    /// sidecar is not on disk. Silently reading fewer rows is never correct, so
+    /// this is reported rather than dropped; see [`CachedSet::missing`].
+    missing: Vec<PathBuf>,
     /// Used only to recover a schema when no live sidecar is present yet.
     fallback_dir: PathBuf,
 }
@@ -338,6 +344,20 @@ impl CachedSet {
         self.files.is_empty()
     }
 
+    /// Retained live versions with no sidecar on disk.
+    ///
+    /// Normally empty: the caller caches every live version before reading. It
+    /// is non-empty when a concurrent reconciler deleted a sidecar this reader
+    /// still considers live (neither takes a lock), and it matters because a
+    /// caller that RECORDS what it read -- the rollup manifest names the live
+    /// source digests it covered -- would otherwise publish coverage it does not
+    /// have, and then reuse that undercount forever because the record agrees
+    /// with itself.
+    #[must_use]
+    pub fn missing(&self) -> &[PathBuf] {
+        &self.missing
+    }
+
     /// Absorb another node's cached set from the same directory.
     ///
     /// A [`SidecarNaming::NodeScoped`] directory is read as one table spanning
@@ -346,6 +366,7 @@ impl CachedSet {
     /// live versions, which is what keeps a superseded sidecar out.
     pub fn extend(&mut self, other: CachedSet) {
         self.files.extend(other.files);
+        self.missing.extend(other.missing);
     }
 
     /// An empty set that falls back to `dir` for schema recovery.
@@ -353,6 +374,7 @@ impl CachedSet {
     pub fn empty_in(dir: PathBuf) -> Self {
         Self {
             files: Vec::new(),
+            missing: Vec::new(),
             fallback_dir: dir,
         }
     }
@@ -387,16 +409,25 @@ impl CachedSet {
     }
 }
 
-/// Stream `stream` into a Parquet file at `path`, atomically.
-pub async fn write_parquet_stream(
+/// Stream `stream` into a Parquet file at `path` atomically (tmp + rename), and
+/// return the blake3 digest of the bytes written.
+///
+/// The single Parquet writer for every on-disk cache in this crate: the
+/// per-version sidecars, the rollup's sealed runs, and its hot file. They had
+/// diverged into two byte-identical copies differing only in whether the digest
+/// was returned, which is the shape of duplication that later drifts apart.
+/// Callers with nothing to record simply drop the digest.
+pub async fn write_parquet_atomic(
     path: &Path,
     schema: SchemaRef,
     mut stream: BatchStream,
-) -> Result<()> {
+) -> Result<String> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let tmp_path = path.with_extension("parquet.tmp");
+    // Deliberately NOT `{stem}.parquet.tmp`: a partial write must not end in
+    // `.parquet`, or a `ListingTable` filtering on that extension would scan it.
+    let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
     let file = tokio::fs::File::create(&tmp_path).await?;
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(parquet::basic::ZstdLevel::default()))
@@ -416,8 +447,18 @@ pub async fn write_parquet_stream(
         .await
         .map_err(|e| crate::error::Error::Arrow(e.to_string()))?;
 
+    // Digest the temp file, before the rename publishes it.
+    let digest = file_blake3(&tmp_path)?;
     tokio::fs::rename(&tmp_path, path).await?;
-    Ok(())
+    Ok(digest)
+}
+
+/// Hex blake3 digest of a file's bytes.
+pub fn file_blake3(path: &Path) -> Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    let mut file = std::fs::File::open(path).map_err(crate::error::Error::Io)?;
+    let _copied = std::io::copy(&mut file, &mut hasher).map_err(crate::error::Error::Io)?;
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// Read and merge the Arrow schemas of an explicit list of Parquet files.
@@ -440,10 +481,11 @@ pub async fn merge_parquet_schemas(files: &[PathBuf], fallback_dir: &Path) -> Re
 
 /// Merge the schemas of every `.parquet` directly under `dir`.
 ///
-/// Only for schema recovery and for genuinely directory-shaped caches (the
-/// symlink glob dir, which is rebuilt from the live set on every query). Never
-/// use it to decide which files a read scans.
-pub async fn merge_parquet_schemas_in_dir(dir: &Path) -> Result<SchemaRef> {
+/// Private, and deliberately so: this is schema RECOVERY for the case where no
+/// live member exists to describe the data, never a way to decide which files a
+/// read scans. The last directory-shaped reader (the symlink glob dir) is gone;
+/// keeping this unexported is what stops another one appearing.
+async fn merge_parquet_schemas_in_dir(dir: &Path) -> Result<SchemaRef> {
     let mut schemas = Vec::new();
     if dir.exists() {
         let mut entries = tokio::fs::read_dir(dir).await?;
@@ -640,6 +682,32 @@ mod tests {
         // v2 has no file yet, and the dead sidecar is not reachable at all.
         assert_eq!(set.files().len(), 1);
         assert!(set.files()[0].ends_with("v1_aaa.parquet"));
+
+        // v2 is live but absent, so it is REPORTED rather than silently
+        // dropped: a caller that records what it covered must not claim it.
+        assert_eq!(set.missing().len(), 1, "v2 is live with no sidecar");
+        assert!(set.missing()[0].ends_with("v2_bbb.parquet"));
+    }
+
+    #[test]
+    fn missing_excludes_versions_the_predicate_pruned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = SidecarDir::new(tmp.path().to_path_buf(), SidecarNaming::NodeOwned);
+        let n = node(1);
+        let v1 = version(1, Some("aaa"));
+        let v2 = version(2, Some("bbb"));
+        touch(&dir.sidecar_path(&n, &v1));
+
+        // v2 has no sidecar, but the predicate excluded it, so it was never
+        // going to be read: pruning for a query's bounds is not a lost race.
+        let live = LiveVersions::from_persistence(n, vec![v1, v2]);
+        let set = dir.cached_set(&live, |v| v.version < 2);
+        assert_eq!(set.files().len(), 1);
+        assert!(
+            set.missing().is_empty(),
+            "a pruned version is not missing: {:?}",
+            set.missing()
+        );
     }
 
     #[test]

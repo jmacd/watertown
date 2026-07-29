@@ -596,9 +596,11 @@ impl Provider {
             )));
         }
 
-        // Find uncached versions
+        // Reconcile, not merely check: `versions` is this node's complete live
+        // set, so this is the one place that can also retire the sidecars of
+        // versions a collapse superseded. Without it the cache only ever grew.
         let uncached =
-            crate::format_cache::find_uncached_versions(cache_dir, scheme, &node_id, &versions);
+            crate::format_cache::reconcile_cached_versions(cache_dir, scheme, &node_id, &versions)?;
 
         if uncached.is_empty() {
             log::debug!(
@@ -703,26 +705,21 @@ impl Provider {
                 return self.create_table_provider(&file_url_str, ctx).await;
             }
 
-            // Multi-file: cache each, symlink into glob dir, ListingTable
-            let pat_hash = crate::format_cache::pattern_hash(url_str);
-            let glob_dir = crate::format_cache::cache_glob_dir(cache_dir, scheme, &pat_hash);
-            crate::format_cache::reset_glob_dir(&glob_dir)?;
-
+            // Multi-file: cache each, then scan every live version explicitly.
+            let mut nodes = Vec::with_capacity(matches.len());
             for (node_path, _) in &matches {
                 let file_url_str = format!("{}://{}", scheme, node_path.path().display());
                 let file_url = Url::parse(&file_url_str)?;
 
-                let (node_id, versions) = self
-                    .ensure_url_cached(&file_url, format_provider.as_ref(), cache_dir)
-                    .await?;
-
-                let _ = crate::format_cache::ensure_glob_symlinks(
-                    cache_dir, scheme, &node_id, &versions, &glob_dir,
-                )?;
+                nodes.push(
+                    self.ensure_url_cached(&file_url, format_provider.as_ref(), cache_dir)
+                        .await?,
+                );
             }
 
-            let provider =
-                crate::format_cache::listing_table_from_glob_cache(&glob_dir, ctx).await?;
+            let provider = crate::format_cache::glob_cached_set(cache_dir, scheme, &nodes)
+                .table_provider()
+                .await?;
 
             log::debug!(
                 "[OK] Glob cache ListingTable for {} files (pattern '{}')",
