@@ -744,7 +744,11 @@ mod tests {
         // Truncated mid-write, as an interrupted writer would leave it. The
         // atomic tmp+rename in `write_segment_manifest` is what prevents this,
         // so reaching it means that guarantee was broken from outside.
-        std::fs::write(res_dir.join("manifest.json"), b"{\"format\":\"partials-v2\",").unwrap();
+        std::fs::write(
+            res_dir.join("manifest.json"),
+            b"{\"format\":\"partials-v2\",",
+        )
+        .unwrap();
 
         let err = read_segment_manifest(&res_dir)
             .expect_err("a present but unparseable manifest is corruption");
@@ -759,7 +763,10 @@ mod tests {
 
         let err = read_verified_segment_manifest(&res_dir)
             .expect_err("the verifying wrapper must not swallow corruption into a rebuild");
-        assert!(matches!(err, crate::error::Error::CacheCorrupt(_)), "{err:?}");
+        assert!(
+            matches!(err, crate::error::Error::CacheCorrupt(_)),
+            "{err:?}"
+        );
     }
 
     /// The mirror of `listing_table_ignores_a_parquet_the_manifest_does_not_name`:

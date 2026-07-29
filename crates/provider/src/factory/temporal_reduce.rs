@@ -1201,21 +1201,7 @@ impl TemporalReduceSqlFile {
         // what `seal_and_recompute` folds, so it plays exactly the role the
         // partials directory used to -- as a query, not as a file population.
         let source_set = bounded_source_set(cache_dir, scheme, source_nodes, read_lo_us);
-        // This build is about to record `now` as the coverage of what it wrote.
-        // A live version whose sidecar vanished (a concurrent reconciler deleted
-        // it; neither side locks) would contribute no rows, and the manifest
-        // would then claim it was covered -- an undercount that agrees with
-        // itself forever, because the next build sees `sources == now` and
-        // reuses. Fail the build instead; the retry re-caches and succeeds.
-        if !source_set.missing().is_empty() {
-            return Err(tinyfs::Error::Other(format!(
-                "temporal-reduce rollup: {} live source version(s) have no cached \
-                 Parquet (first: {}). This is a lost race with cache \
-                 reconciliation, not a data error; re-run the read.",
-                source_set.missing().len(),
-                source_set.missing()[0].display(),
-            )));
-        }
+        require_complete_coverage(&source_set)?;
         let provider = source_set.table_provider().await.map_other()?;
         let available: std::collections::HashSet<String> = provider
             .schema()
@@ -2909,6 +2895,37 @@ fn bounded_source_set(
         tinyfs::SeriesReadBounds::from_event_time_lo(lo)
     });
     crate::format_cache::glob_cached_set_bounded(cache_dir, scheme, source_nodes, &bounds)
+}
+
+/// Reject a source set that does not cover every live version it will claim.
+///
+/// The build that follows records `now` -- the digest of every LIVE source
+/// version -- as the coverage of what it wrote. A live version whose sidecar
+/// vanished contributes no rows, so the manifest would assert coverage the
+/// cache does not have. That undercount then agrees with itself forever: the
+/// next build compares `sources == now`, finds them equal, reuses, and never
+/// recomputes. Failing here is what keeps a lost race from becoming permanent
+/// wrong output; the retry re-caches the version and succeeds.
+///
+/// It is a race, not a data error. `ensure_url_cached` writes a sidecar for
+/// every live version before this point, so a single build cannot reach this by
+/// itself -- only a concurrent reconciler deleting a sidecar this reader still
+/// considers live can, and neither side takes a lock.
+///
+/// Split out from the call site so the check has a name and a test: the
+/// condition it guards is by construction unreachable in-process, which is
+/// exactly the kind of guard that rots unnoticed.
+fn require_complete_coverage(set: &crate::version_cache::CachedSet) -> TinyFSResult<()> {
+    if set.missing().is_empty() {
+        return Ok(());
+    }
+    Err(tinyfs::Error::Other(format!(
+        "temporal-reduce rollup: {} live source version(s) have no cached \
+         Parquet (first: {}). This is a lost race with cache \
+         reconciliation, not a data error; re-run the read.",
+        set.missing().len(),
+        set.missing()[0].display(),
+    )))
 }
 
 /// Epoch microseconds -> epoch seconds, rounding DOWN (toward -inf, so it holds
@@ -5339,6 +5356,77 @@ mod tests {
              must be counted: got {:?}, want {}",
             second,
             2.0 * expected_day_sum(5)
+        );
+    }
+
+    /// The rollup aborts rather than aggregate a source set that is missing a
+    /// live version's sidecar.
+    ///
+    /// The condition is a lost race with cache reconciliation, so a single build
+    /// cannot produce it: `ensure_url_cached` writes a sidecar for every live
+    /// version before the read. That unreachability is why this is tested at the
+    /// check rather than through a build -- the alternative is no coverage at
+    /// all for a guard whose whole value is preventing a permanent undercount.
+    ///
+    /// Built through `glob_cached_set_bounded`, the same constructor the build
+    /// uses, so the sidecar naming and the retention filter are exercised too:
+    /// a hand-built `CachedSet` would prove only that the `if` works.
+    #[test]
+    fn a_source_set_missing_a_live_sidecar_aborts_the_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+        let node_id = tinyfs::NodeID::new("00000000-0000-7000-8000-00000000002a".to_string());
+
+        let mk = |v: u64, hash: &str| tinyfs::FileVersionInfo {
+            version: v,
+            timestamp: 1_700_000_000_000_000,
+            size: 128,
+            blake3: Some(hash.to_string()),
+            entry_type: EntryType::FilePhysicalSeries,
+            extended_metadata: None,
+        };
+        let versions = vec![mk(1, "aaa"), mk(2, "bbb")];
+        let nodes = vec![(node_id, versions.clone())];
+
+        // Both live versions cached: the ordinary state, and the build proceeds.
+        for v in &versions {
+            let p = crate::format_cache::cache_version_path(&cache_dir, "csv", &node_id, v);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"parquet").unwrap();
+        }
+        let set = bounded_source_set(&cache_dir, "csv", &nodes, None);
+        assert_eq!(set.files().len(), 2, "both sidecars are present");
+        assert!(
+            require_complete_coverage(&set).is_ok(),
+            "a fully cached source set must not abort"
+        );
+
+        // A concurrent reconciler deletes one, mid-read.
+        let gone =
+            crate::format_cache::cache_version_path(&cache_dir, "csv", &node_id, &versions[1]);
+        std::fs::remove_file(&gone).unwrap();
+
+        let set = bounded_source_set(&cache_dir, "csv", &nodes, None);
+        assert_eq!(
+            set.files().len(),
+            1,
+            "the surviving sidecar would still aggregate -- silently, and short \
+             by one version"
+        );
+        let err = require_complete_coverage(&set)
+            .expect_err("a live version with no sidecar must abort, not undercount");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no cached"),
+            "message must say what is wrong: {msg}"
+        );
+        assert!(
+            msg.contains(&gone.display().to_string()),
+            "message must name the missing sidecar: {msg}"
+        );
+        assert!(
+            msg.contains("re-run"),
+            "the operator must be told this is retryable, not a data error: {msg}"
         );
     }
 
