@@ -718,6 +718,160 @@ mod tests {
         assert!(read_segment_manifest(&res_dir).unwrap().is_some());
     }
 
+    /// An absent manifest and an unparseable one mean opposite things, and the
+    /// difference must survive the read: absent is a cold cache (build it), while
+    /// present-but-garbage means something wrote or truncated a file this code
+    /// owns. Collapsing the latter into `Ok(None)` would look like a harmless
+    /// rebuild while quietly discarding a res dir whose segments are still
+    /// referenced -- corruption that repairs itself into data loss.
+    ///
+    /// The check that matters is on `read_verified_segment_manifest`, the
+    /// wrapper the build path actually calls: it converts a hot-file
+    /// disagreement into `Ok(None)` (a legitimate rebuild), so it must NOT do
+    /// the same to a corrupt manifest.
+    #[tokio::test]
+    async fn an_unparseable_manifest_is_corruption_not_a_cold_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let res_dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(&res_dir).unwrap();
+
+        // Absent: a cold cache, not an error.
+        assert!(
+            read_segment_manifest(&res_dir).unwrap().is_none(),
+            "no manifest yet is a cold cache"
+        );
+
+        // Truncated mid-write, as an interrupted writer would leave it. The
+        // atomic tmp+rename in `write_segment_manifest` is what prevents this,
+        // so reaching it means that guarantee was broken from outside.
+        std::fs::write(res_dir.join("manifest.json"), b"{\"format\":\"partials-v2\",").unwrap();
+
+        let err = read_segment_manifest(&res_dir)
+            .expect_err("a present but unparseable manifest is corruption");
+        assert!(
+            matches!(err, crate::error::Error::CacheCorrupt(_)),
+            "must be CacheCorrupt, not an IO or serde error: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("--rebuild"),
+            "the message must tell the operator how to recover: {err}"
+        );
+
+        let err = read_verified_segment_manifest(&res_dir)
+            .expect_err("the verifying wrapper must not swallow corruption into a rebuild");
+        assert!(matches!(err, crate::error::Error::CacheCorrupt(_)), "{err:?}");
+    }
+
+    /// The mirror of `listing_table_ignores_a_parquet_the_manifest_does_not_name`:
+    /// a file the manifest does not name is ignored, but a file it DOES name and
+    /// that is absent is a hard error. Both rules exist to make the manifest the
+    /// single authority on membership -- an extra file must not be summed, and a
+    /// missing one must not become a silent hole in the series.
+    ///
+    /// Skipping the missing member would be the more dangerous half: the gap
+    /// lands in whatever bucket range that segment held, the manifest still
+    /// agrees with itself, and an unchanged source makes every later build reuse
+    /// it, so the hole is served indefinitely.
+    #[tokio::test]
+    async fn listing_table_rejects_a_manifest_member_missing_from_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let res_dir = tmp.path().join("res60");
+        let schema = partials_schema();
+        let s: BatchStream = Box::pin(futures::stream::iter(vec![Ok(partials_batch(
+            &schema,
+            &[120],
+            &[40.0],
+            &[4],
+        ))]));
+        let hot_digest = write_parquet_atomic(&hot_path(&res_dir), schema.clone(), s)
+            .await
+            .unwrap();
+
+        // The manifest names a segment that was never written (or was deleted
+        // out from under the cache).
+        let manifest = SegmentManifest {
+            format: SEALED_FORMAT.to_string(),
+            allowed_lateness_secs: 0,
+            sealed_hi_secs: Some(120),
+            next_seq: 1,
+            segments: vec![Segment {
+                name: "seg-00000000.parquet".to_string(),
+                lo_secs: None,
+                hi_secs: 120,
+                digest: "0".repeat(64),
+                bytes: 0,
+            }],
+            hot_digest: Some(hot_digest),
+            hot_bytes: 0,
+            sources: BTreeMap::new(),
+            source_digest: None,
+        };
+
+        let err = listing_table_for_res_dir(&res_dir, &manifest, "time_bucket")
+            .await
+            .expect_err("a manifest member missing on disk must not be skipped");
+        assert!(
+            matches!(err, crate::error::Error::CacheCorrupt(_)),
+            "must be CacheCorrupt so the operator sees a corrupt cache rather \
+             than a short read: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("seg-00000000.parquet"),
+            "the message must name the missing member: {err}"
+        );
+    }
+
+    /// The hot file is a mandatory member of every res dir -- it holds the open
+    /// window `[sealed_hi, inf)`, i.e. the most recent data. Reading the sealed
+    /// segments alone would succeed and return a series that simply stops at the
+    /// watermark, which looks like "no recent data" rather than like a fault.
+    #[tokio::test]
+    async fn listing_table_rejects_a_res_dir_with_no_hot_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let res_dir = tmp.path().join("res60");
+        let schema = partials_schema();
+        let seg_name = "seg-00000000.parquet";
+        let s: BatchStream = Box::pin(futures::stream::iter(vec![Ok(partials_batch(
+            &schema,
+            &[0, 60],
+            &[10.0, 20.0],
+            &[1, 2],
+        ))]));
+        let seg_digest = write_parquet_atomic(&segment_path(&res_dir, seg_name), schema.clone(), s)
+            .await
+            .unwrap();
+
+        let manifest = SegmentManifest {
+            format: SEALED_FORMAT.to_string(),
+            allowed_lateness_secs: 0,
+            sealed_hi_secs: Some(120),
+            next_seq: 1,
+            segments: vec![Segment {
+                name: seg_name.to_string(),
+                lo_secs: None,
+                hi_secs: 120,
+                digest: seg_digest,
+                bytes: 0,
+            }],
+            hot_digest: None,
+            hot_bytes: 0,
+            sources: BTreeMap::new(),
+            source_digest: None,
+        };
+
+        let err = listing_table_for_res_dir(&res_dir, &manifest, "time_bucket")
+            .await
+            .expect_err("a res dir without hot must not read as a truncated series");
+        assert!(
+            matches!(err, crate::error::Error::CacheCorrupt(_)),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().contains("hot"),
+            "the message must identify the missing hot file: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_merged_cache_drop_all_removes_merged_dir() {
         let tmp = tempfile::tempdir().unwrap();
