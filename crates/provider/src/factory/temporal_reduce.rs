@@ -1037,6 +1037,17 @@ impl TemporalReduceSqlFile {
                 // Cannot happen for non-empty segments (an empty segment is never
                 // recorded), but if it did, dropping the inputs would delete
                 // data. Leave the layout untouched and stop.
+                //
+                // The invariant that makes this unreachable is enforced in the
+                // seal path, not here, so assert it: a build that starts
+                // recording empty segments should fail loudly under test rather
+                // than quietly stop compacting and grow its segment count.
+                debug_assert!(
+                    rows > 0,
+                    "compaction of {} non-empty segments produced no rows; \
+                     an empty segment must never be recorded",
+                    inputs.len()
+                );
                 tokio::fs::remove_file(&out).await.map_other()?;
                 log::warn!(
                     "rollup compaction: merge of {} segments produced no rows; leaving them alone",
@@ -5144,6 +5155,34 @@ mod tests {
         w.shutdown().await.unwrap();
     }
 
+    /// Give the version just appended by [`append_day_series`] the event-time
+    /// bounds tlogfs records on a real series version.
+    ///
+    /// `MemoryPersistence` records none, so `source_range` returns `UNKNOWN` for
+    /// every version and `dirty_lo_us` is therefore always `None` -- "the dirty
+    /// range reaches the beginning of time". That is safe (it degrades to
+    /// reading everything) but it makes an append unseal the ENTIRE history, so
+    /// a test built on the bare helper never accumulates more than one segment
+    /// and can never reach compaction. Setting the bounds restores the partial
+    /// unsealing the branch exists to provide.
+    ///
+    /// Only the latest version is touched, which is the one the append just
+    /// created; earlier versions keep the bounds they were given.
+    async fn set_day_bounds(fs: &tinyfs::FS, path: &str, day: u32) {
+        let day_start_secs = i64::from(day - 1) * 86_400;
+        let mut attrs = HashMap::new();
+        _ = attrs.insert(
+            "min_event_time".to_string(),
+            (day_start_secs * 1_000_000).to_string(),
+        );
+        _ = attrs.insert(
+            "max_event_time".to_string(),
+            ((day_start_secs + 23 * 3600) * 1_000_000).to_string(),
+        );
+        let root = fs.root().await.unwrap();
+        root.set_extended_attributes(path, attrs).await.unwrap();
+    }
+
     fn lateness_config(lateness: Option<&str>) -> TemporalReduceConfig {
         TemporalReduceConfig {
             in_pattern: crate::Url::parse("csv:///ingest/weather.csv").unwrap(),
@@ -5728,6 +5767,11 @@ mod tests {
     /// bit-for-bit the same answer as leaving them apart. If it did not, the
     /// symptom would be a silently wrong aggregate, which is why the check is on
     /// every day's maximum rather than on the shape of the cache.
+    ///
+    /// Each append is given real event-time bounds ([`set_day_bounds`]). Without
+    /// them the dirty range is unbounded, every append unseals the whole
+    /// history, and the cache never holds two segments at once -- so nothing
+    /// reaches compaction and this test asserts nothing about it.
     #[tokio::test]
     async fn compaction_bounds_segment_count_without_changing_answers() {
         let _ = env_logger::try_init();
@@ -5750,6 +5794,7 @@ mod tests {
 
         for day in 1..=DAYS {
             append_day_series(&fs, "/ingest/weather.csv", day).await;
+            set_day_bounds(&fs, "/ingest/weather.csv", day).await;
             let rows = daily_max(&reduce_ctx(&persistence, &cache_dir), compacting())
                 .await
                 .expect("append within lateness window must succeed");
@@ -5803,9 +5848,19 @@ mod tests {
         // completion. A loose bound like `live < DAYS` would pass even with
         // compaction disabled entirely, since sealing alone yields one run per
         // day -- which is exactly the growth this phase exists to stop.
-        assert!(
-            live <= 2,
-            "compaction left {live} runs; max_live_segments was 2 (after {DAYS} days)"
+        //
+        // Equality, not `<=`, and for a second reason. This test used to be
+        // vacuous: without per-version event-time bounds every append unsealed
+        // the whole history, so the cache never held two segments at once,
+        // choose_merge_window always returned None, and the count was 1 for a
+        // reason that had nothing to do with compaction -- a `panic!` at the top
+        // of the merge did not fire anywhere in the provider suite. Landing
+        // exactly ON the limit is the fingerprint of accumulate-then-merge;
+        // landing below it means the segments never accumulated at all.
+        assert_eq!(
+            live, 2,
+            "compaction left {live} runs; max_live_segments was 2 (after {DAYS} days). \
+             Fewer than 2 means segments never accumulated and the merge never ran."
         );
 
         // Superseded inputs were actually deleted, not merely unlinked from the
