@@ -4,7 +4,7 @@
 
 //! Per-version Parquet sidecar caches.
 //!
-//! Both [`crate::format_cache`] and [`crate::rollup_cache`] maintain the same
+//! Both [`crate::format_cache`] and [`crate::partial_aggregate_cache`] maintain the same
 //! thing: a directory holding one Parquet sidecar per *version* of a node,
 //! keyed by the version's content hash, written once and reused until the node
 //! changes. That shape was copy-pasted rather than named, and the cost was a
@@ -349,7 +349,7 @@ impl CachedSet {
     /// Normally empty: the caller caches every live version before reading. It
     /// is non-empty when a concurrent reconciler deleted a sidecar this reader
     /// still considers live (neither takes a lock), and it matters because a
-    /// caller that RECORDS what it read -- the rollup manifest names the live
+    /// caller that RECORDS what it read -- the partial-aggregate manifest names the live
     /// source digests it covered -- would otherwise publish coverage it does not
     /// have, and then reuse that undercount forever because the record agrees
     /// with itself.
@@ -413,7 +413,8 @@ impl CachedSet {
 /// return the blake3 digest of the bytes written.
 ///
 /// The single Parquet writer for every on-disk cache in this crate: the
-/// per-version sidecars, the rollup's sealed runs, and its hot file. They had
+/// per-version sidecars, and the partial-aggregate cache's sealed runs and its
+/// hot file. They had
 /// diverged into two byte-identical copies differing only in whether the digest
 /// was returned, which is the shape of duplication that later drifts apart.
 /// Callers with nothing to record simply drop the digest.
@@ -590,7 +591,7 @@ mod tests {
     }
 
     /// A shared glob dir holds one sidecar per (source node, version). Sweeping
-    /// node A must not touch node B: the rollup cache's dir is shared by every
+    /// node A must not touch node B: the partial-aggregate cache's dir is shared by every
     /// file a pattern matched.
     #[test]
     fn reconcile_is_node_scoped_in_a_shared_directory() {

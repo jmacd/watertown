@@ -140,7 +140,7 @@ pub struct TemporalReduceConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transforms: Option<Vec<String>>,
 
-    /// Maximum allowed lateness for the segment rollup cache: how far behind
+    /// Maximum allowed lateness for the segment partial-aggregate cache: how far behind
     /// the newest bucket a late/backfilled sample may still land before its
     /// output bucket is treated as sealed. Buckets older than
     /// `newest_bucket - allowed_lateness` are frozen into immutable segment files and
@@ -155,7 +155,7 @@ pub struct TemporalReduceConfig {
 
     /// Minimum accumulated size before frozen buckets are sealed into an
     /// immutable segment file. Accepts a byte count; defaults to
-    /// [`crate::rollup_cache::SEAL_TARGET_BYTES`].
+    /// [`crate::partial_aggregate_cache::SEAL_TARGET_BYTES`].
     ///
     /// Unlike `allowed_lateness`, changing this does NOT invalidate the cache:
     /// a segment already sealed is correct at any target, so the new value simply
@@ -167,7 +167,7 @@ pub struct TemporalReduceConfig {
 
     /// Maximum number of segment files to leave live per resolution before
     /// compaction merges them regardless of size class. Defaults to
-    /// [`crate::rollup_cache::MAX_LIVE_SEGMENTS`]. Like `seal_target_bytes`, changing
+    /// [`crate::partial_aggregate_cache::MAX_LIVE_SEGMENTS`]. Like `seal_target_bytes`, changing
     /// it invalidates nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_live_segments: Option<usize>,
@@ -211,18 +211,18 @@ impl TemporalReduceConfig {
     }
 
     /// Resolve the seal threshold in bytes, defaulting to
-    /// [`crate::rollup_cache::SEAL_TARGET_BYTES`].
+    /// [`crate::partial_aggregate_cache::SEAL_TARGET_BYTES`].
     fn seal_target_bytes(&self) -> u64 {
         self.seal_target_bytes
-            .unwrap_or(crate::rollup_cache::SEAL_TARGET_BYTES)
+            .unwrap_or(crate::partial_aggregate_cache::SEAL_TARGET_BYTES)
     }
 
     /// Resolve the compaction backstop, defaulting to
-    /// [`crate::rollup_cache::MAX_LIVE_SEGMENTS`]. Clamped to at least 1 so a
+    /// [`crate::partial_aggregate_cache::MAX_LIVE_SEGMENTS`]. Clamped to at least 1 so a
     /// nonsense setting cannot make compaction spin.
     fn max_live_segments(&self) -> usize {
         self.max_live_segments
-            .unwrap_or(crate::rollup_cache::MAX_LIVE_SEGMENTS)
+            .unwrap_or(crate::partial_aggregate_cache::MAX_LIVE_SEGMENTS)
             .max(1)
     }
 }
@@ -525,9 +525,9 @@ impl TemporalReduceSqlFile {
         Ok(modified_config)
     }
 
-    /// Attempt to serve this resolution from the incremental rollup cache,
-    /// returning `Ok(None)` to fall back to the single-pass delegate when the
-    /// rollup preconditions are not met.
+    /// Attempt to serve this resolution from the incremental partial-aggregate
+    /// cache, returning `Ok(None)` to fall back to the single-pass delegate
+    /// when the rollup preconditions are not met.
     ///
     /// The rollup computes decomposable partials once per immutable source
     /// version, caches them on disk, and merges them by time bucket. A new
@@ -537,9 +537,11 @@ impl TemporalReduceSqlFile {
     /// - a pond cache directory is configured;
     /// - the input has no transforms, so partials can be computed directly from
     ///   the parsed source rows;
-    /// - the input scheme is a format provider whose parsed leaves are cached
-    ///   per version by the format cache, which the partials read.
-    async fn try_rollup_table_provider(
+    /// - the input's parsed rows are reachable per version -- either the scheme
+    ///   is a format provider whose leaves the format cache memoizes, or the
+    ///   source is already pond-native Parquet (`series:///`, `table:///`),
+    ///   which needs no parse and therefore no cache.
+    async fn try_partial_aggregate_provider(
         &self,
         id: tinyfs::FileID,
         context: &tinyfs::ProviderContext,
@@ -558,14 +560,49 @@ impl TemporalReduceSqlFile {
         }
 
         let scheme = self.config.in_pattern.scheme();
-        let Some(format_provider) = crate::FormatRegistry::get_provider(scheme) else {
+
+        // A format provider memoizes its parse in the format cache, and the
+        // partials are computed from those cached leaves. A pond-native Parquet
+        // source has no parse to memoize: it is already columnar, so its own
+        // version files ARE the leaves. Both reach the same place; only the
+        // route differs.
+        let format_provider = crate::FormatRegistry::get_provider(scheme);
+        let builtin_scheme = matches!(scheme, "file" | "series" | "table" | "data");
+        if format_provider.is_none() && !builtin_scheme {
             return Ok(None);
-        };
+        }
 
         let source_files = self.resolve_source_files().await?;
         if source_files.is_empty() {
             return Ok(None);
         }
+
+        // A builtin source must actually be Parquet to be read without a format
+        // provider. Anything else (a raw byte series, a directory) has no
+        // columnar leaves to aggregate, so fall back to the single-pass
+        // delegate rather than failing.
+        //
+        // It must also be durable. A dynamic node is Parquet-shaped but
+        // ephemeral: it has no oplog records, so it has no versions to enumerate
+        // and nothing stable to key a cache on. Materializing it once per level
+        // would recompute it every pass, so the delegate's single pass is
+        // strictly better.
+        if format_provider.is_none()
+            && !source_files.iter().all(|np| {
+                let et = np.id().entry_type();
+                et.is_parquet_file() && !et.is_dynamic()
+            })
+        {
+            return Ok(None);
+        }
+
+        // Non-`None` selects the pond-native route: these nodes' own version
+        // files are the leaves the partials are computed from.
+        let builtin_source_ids: Option<Vec<tinyfs::FileID>> = if format_provider.is_none() {
+            Some(source_files.iter().map(tinyfs::NodePath::id).collect())
+        } else {
+            None
+        };
 
         // The finest resolution aggregates the sources directly; every coarser
         // resolution folds the next-finer resolution's segments, so no level
@@ -578,7 +615,7 @@ impl TemporalReduceSqlFile {
 
         let filled = self.filled_config().await?;
         let pieces = AggSqlPieces::build(&filled)?;
-        let cfg_hash = crate::rollup_cache::cfg_hash(&rollup_cfg_canonical(
+        let cfg_hash = crate::partial_aggregate_cache::cfg_hash(&partial_aggregate_cfg_canonical(
             &filled,
             finest_interval,
             &self.pattern_url,
@@ -600,17 +637,27 @@ impl TemporalReduceSqlFile {
         // (design §5.3); nothing here is keyed by a version number or filename.
         let mut source_nodes: Vec<(tinyfs::NodeID, Vec<tinyfs::FileVersionInfo>)> =
             Vec::with_capacity(source_files.len());
-        let mut now: std::collections::BTreeMap<String, crate::rollup_cache::SourceRange> =
-            std::collections::BTreeMap::new();
+        let mut now: std::collections::BTreeMap<
+            String,
+            crate::partial_aggregate_cache::SourceRange,
+        > = std::collections::BTreeMap::new();
 
         for node_path in &source_files {
             let file_url_str = node_file_url(scheme, node_path);
             let file_url = crate::Url::parse(&file_url_str).map_other()?;
 
-            let (source_node_id, versions) = provider_api
-                .ensure_url_cached(&file_url, format_provider.as_ref(), &cache_dir)
-                .await
-                .map_other()?;
+            let (source_node_id, versions) = match format_provider.as_ref() {
+                Some(fp) => provider_api
+                    .ensure_url_cached(&file_url, fp.as_ref(), &cache_dir)
+                    .await
+                    .map_other()?,
+                // Pond-native Parquet: the node's own version files are already
+                // the leaves, so only the version list is needed.
+                None => provider_api
+                    .list_url_versions(&file_url)
+                    .await
+                    .map_other()?,
+            };
 
             // The rollup sums every live version of a source. Series entry types
             // (FilePhysicalSeries, TablePhysicalSeries) store append-only deltas
@@ -694,7 +741,8 @@ impl TemporalReduceSqlFile {
             target_bytes: filled.seal_target_bytes(),
             max_segments: filled.max_live_segments(),
         };
-        let merged_dir = crate::rollup_cache::merged_dir(&cache_dir, &cfg_hash, &site_node_id);
+        let merged_dir =
+            crate::partial_aggregate_cache::merged_dir(&cache_dir, &cfg_hash, &site_node_id);
 
         // Levels to build: finest .. this file's resolution (inclusive).
         let levels: Vec<Duration> = resolution_durations
@@ -711,7 +759,8 @@ impl TemporalReduceSqlFile {
         let mut final_level: Option<LevelBuild> = None;
 
         for (idx, level) in levels.iter().copied().enumerate() {
-            let res_dir = crate::rollup_cache::segment_res_dir(&merged_dir, level.as_secs());
+            let res_dir =
+                crate::partial_aggregate_cache::segment_res_dir(&merged_dir, level.as_secs());
             let built = if idx == 0 {
                 // Finest resolution: aggregate the sources directly.
                 self.build_level_from_source(
@@ -723,6 +772,8 @@ impl TemporalReduceSqlFile {
                     &cache_dir,
                     scheme,
                     &source_nodes,
+                    builtin_source_ids.as_deref(),
+                    context,
                     &now,
                     &source_table,
                     policy,
@@ -890,7 +941,7 @@ impl TemporalReduceSqlFile {
         res_dir: &std::path::Path,
         input_table: &str,
         in_bucket_col: &str,
-        m: &mut crate::rollup_cache::SegmentManifest,
+        m: &mut crate::partial_aggregate_cache::SegmentManifest,
         policy: SealPolicy,
     ) -> TinyFSResult<Vec<std::path::PathBuf>> {
         // Event-time frontier: newest output bucket over the input (epoch
@@ -927,11 +978,11 @@ impl TemporalReduceSqlFile {
                 Some(wm),
             );
             let name = format!("seg-{:08}.parquet", m.next_seq);
-            let seg_file = crate::rollup_cache::segment_path(res_dir, &name);
+            let seg_file = crate::partial_aggregate_cache::segment_path(res_dir, &name);
             let (seg_digest, rows) = self.write_merge_to(ctx, &seal_sql, &seg_file).await?;
             if rows > 0 {
                 let bytes = tokio::fs::metadata(&seg_file).await.map_other()?.len();
-                m.segments.push(crate::rollup_cache::Segment {
+                m.segments.push(crate::partial_aggregate_cache::Segment {
                     name,
                     lo_secs: m.sealed_hi_secs,
                     hi_secs: wm,
@@ -958,7 +1009,7 @@ impl TemporalReduceSqlFile {
             m.sealed_hi_secs,
             None,
         );
-        let hot_file = crate::rollup_cache::hot_path(res_dir);
+        let hot_file = crate::partial_aggregate_cache::hot_path(res_dir);
         let (hot_digest, _rows) = self.write_merge_to(ctx, &hot_sql, &hot_file).await?;
         m.hot_digest = Some(hot_digest);
         // Fatal, like the identical stat on a just-sealed segment above.
@@ -992,7 +1043,7 @@ impl TemporalReduceSqlFile {
     ///
     /// Superseded files are NOT deleted here. They are returned so the caller can
     /// delete them only after the manifest naming their replacement is durable;
-    /// see [`crate::rollup_cache::remove_superseded`].
+    /// see [`crate::partial_aggregate_cache::remove_superseded`].
     #[allow(clippy::too_many_arguments)]
     async fn compact_segments(
         &self,
@@ -1001,7 +1052,7 @@ impl TemporalReduceSqlFile {
         ts: &str,
         output_interval: Duration,
         res_dir: &std::path::Path,
-        m: &mut crate::rollup_cache::SegmentManifest,
+        m: &mut crate::partial_aggregate_cache::SegmentManifest,
         policy: SealPolicy,
     ) -> TinyFSResult<Vec<std::path::PathBuf>> {
         let mut superseded: Vec<std::path::PathBuf> = Vec::new();
@@ -1014,11 +1065,12 @@ impl TemporalReduceSqlFile {
 
             let inputs: Vec<std::path::PathBuf> = m.segments[window.clone()]
                 .iter()
-                .map(|r| crate::rollup_cache::segment_path(res_dir, &r.name))
+                .map(|r| crate::partial_aggregate_cache::segment_path(res_dir, &r.name))
                 .collect();
-            let table = crate::rollup_cache::listing_table_for_files(&inputs, res_dir, ts)
-                .await
-                .map_other()?;
+            let table =
+                crate::partial_aggregate_cache::listing_table_for_files(&inputs, res_dir, ts)
+                    .await
+                    .map_other()?;
 
             // Re-merge the partials of just these segments. Merging partials is
             // associative, so folding a window of segments into one gives exactly
@@ -1028,7 +1080,7 @@ impl TemporalReduceSqlFile {
             _ = ctx.register_table(&table_name, table).map_other()?;
             let sql = pieces.merge_partials_sql(output_interval, ts, &table_name, ts, None, None);
             let name = format!("seg-{:08}.parquet", m.next_seq);
-            let out = crate::rollup_cache::segment_path(res_dir, &name);
+            let out = crate::partial_aggregate_cache::segment_path(res_dir, &name);
             let merged = self.write_merge_to(ctx, &sql, &out).await;
             _ = ctx.deregister_table(&table_name).map_other()?;
             let (digest, rows) = merged?;
@@ -1057,7 +1109,7 @@ impl TemporalReduceSqlFile {
             }
 
             let bytes = tokio::fs::metadata(&out).await.map_other()?.len();
-            let replacement = crate::rollup_cache::Segment {
+            let replacement = crate::partial_aggregate_cache::Segment {
                 name,
                 lo_secs: m.segments[window.start].lo_secs,
                 hi_secs: m.segments[window.end - 1].hi_secs,
@@ -1095,24 +1147,27 @@ impl TemporalReduceSqlFile {
         cache_dir: &std::path::Path,
         scheme: &str,
         source_nodes: &[(tinyfs::NodeID, Vec<tinyfs::FileVersionInfo>)],
-        now: &std::collections::BTreeMap<String, crate::rollup_cache::SourceRange>,
+        builtin_sources: Option<&[tinyfs::FileID]>,
+        provider_context: &tinyfs::ProviderContext,
+        now: &std::collections::BTreeMap<String, crate::partial_aggregate_cache::SourceRange>,
         source_table: &str,
         policy: SealPolicy,
     ) -> TinyFSResult<LevelBuild> {
-        let manifest =
-            match crate::rollup_cache::read_verified_segment_manifest(res_dir).map_other()? {
+        let manifest = match crate::partial_aggregate_cache::read_verified_segment_manifest(res_dir)
+            .map_other()?
+        {
+            Some(m)
+                if m.allowed_lateness_secs == policy.lateness_secs
+                    && m.format == crate::partial_aggregate_cache::SEALED_FORMAT =>
+            {
                 Some(m)
-                    if m.allowed_lateness_secs == policy.lateness_secs
-                        && m.format == crate::rollup_cache::SEALED_FORMAT =>
-                {
-                    Some(m)
-                }
-                Some(_) => {
-                    crate::rollup_cache::wipe_segment_res_dir(res_dir).map_other()?;
-                    None
-                }
-                None => None,
-            };
+            }
+            Some(_) => {
+                crate::partial_aggregate_cache::wipe_segment_res_dir(res_dir).map_other()?;
+                None
+            }
+            None => None,
+        };
 
         enum Plan {
             Reuse,
@@ -1139,10 +1194,11 @@ impl TemporalReduceSqlFile {
 
         if let Plan::Reuse = plan {
             let m = manifest.as_ref().expect("reuse implies a manifest");
-            let provider = crate::rollup_cache::listing_table_for_res_dir(res_dir, m, ts)
-                .await
-                .map_other()?;
-            let digest = crate::rollup_cache::segment_manifest_digest(m).map_other()?;
+            let provider =
+                crate::partial_aggregate_cache::listing_table_for_res_dir(res_dir, m, ts)
+                    .await
+                    .map_other()?;
+            let digest = crate::partial_aggregate_cache::segment_manifest_digest(m).map_other()?;
             return Ok(LevelBuild {
                 provider,
                 digest,
@@ -1189,10 +1245,10 @@ impl TemporalReduceSqlFile {
                 (m, unsealed, changed)
             }
             _ => {
-                crate::rollup_cache::wipe_segment_res_dir(res_dir).map_other()?;
+                crate::partial_aggregate_cache::wipe_segment_res_dir(res_dir).map_other()?;
                 (
-                    crate::rollup_cache::SegmentManifest {
-                        format: crate::rollup_cache::SEALED_FORMAT.to_string(),
+                    crate::partial_aggregate_cache::SegmentManifest {
+                        format: crate::partial_aggregate_cache::SEALED_FORMAT.to_string(),
                         allowed_lateness_secs: policy.lateness_secs,
                         ..Default::default()
                     },
@@ -1216,9 +1272,16 @@ impl TemporalReduceSqlFile {
         // Aggregate the sources into partial columns on the fly. This view is
         // what `seal_and_recompute` folds, so it plays exactly the role the
         // partials directory used to -- as a query, not as a file population.
-        let source_set = bounded_source_set(cache_dir, scheme, source_nodes, read_lo_us);
-        require_complete_coverage(&source_set)?;
-        let provider = source_set.table_provider().await.map_other()?;
+        let provider = match builtin_sources {
+            None => {
+                let source_set = bounded_source_set(cache_dir, scheme, source_nodes, read_lo_us);
+                require_complete_coverage(&source_set)?;
+                source_set.table_provider().await.map_other()?
+            }
+            // Pond-native Parquet has no sidecars to be missing, so there is no
+            // coverage race to defend against here.
+            Some(ids) => builtin_source_provider(provider_context, ids, read_lo_us).await?,
+        };
         let available: std::collections::HashSet<String> = provider
             .schema()
             .fields()
@@ -1261,13 +1324,13 @@ impl TemporalReduceSqlFile {
         m.sources = now.clone();
         m.source_digest = None;
 
-        let digest = crate::rollup_cache::write_segment_manifest(res_dir, &m)
+        let digest = crate::partial_aggregate_cache::write_segment_manifest(res_dir, &m)
             .await
             .map_other()?;
         // Only now that the manifest naming the merged segments is durable.
         unsealed.extend(superseded);
-        crate::rollup_cache::remove_superseded(&unsealed).await;
-        let provider = crate::rollup_cache::listing_table_for_res_dir(res_dir, &m, ts)
+        crate::partial_aggregate_cache::remove_superseded(&unsealed).await;
+        let provider = crate::partial_aggregate_cache::listing_table_for_res_dir(res_dir, &m, ts)
             .await
             .map_other()?;
         Ok(LevelBuild {
@@ -1314,23 +1377,24 @@ impl TemporalReduceSqlFile {
         finer_digest: &str,
         finer_rebuilt: bool,
         finer_changed: LevelChange,
-        now: &std::collections::BTreeMap<String, crate::rollup_cache::SourceRange>,
+        now: &std::collections::BTreeMap<String, crate::partial_aggregate_cache::SourceRange>,
         policy: SealPolicy,
     ) -> TinyFSResult<LevelBuild> {
-        let manifest =
-            match crate::rollup_cache::read_verified_segment_manifest(res_dir).map_other()? {
+        let manifest = match crate::partial_aggregate_cache::read_verified_segment_manifest(res_dir)
+            .map_other()?
+        {
+            Some(m)
+                if m.allowed_lateness_secs == policy.lateness_secs
+                    && m.format == crate::partial_aggregate_cache::SEALED_FORMAT =>
+            {
                 Some(m)
-                    if m.allowed_lateness_secs == policy.lateness_secs
-                        && m.format == crate::rollup_cache::SEALED_FORMAT =>
-                {
-                    Some(m)
-                }
-                Some(_) => {
-                    crate::rollup_cache::wipe_segment_res_dir(res_dir).map_other()?;
-                    None
-                }
-                None => None,
-            };
+            }
+            Some(_) => {
+                crate::partial_aggregate_cache::wipe_segment_res_dir(res_dir).map_other()?;
+                None
+            }
+            None => None,
+        };
 
         // Reuse: the finer level was reused (not rebuilt) and its digest matches
         // what this level last folded, so nothing downstream changed.
@@ -1338,10 +1402,11 @@ impl TemporalReduceSqlFile {
             && let Some(m) = &manifest
             && m.source_digest.as_deref() == Some(finer_digest)
         {
-            let provider = crate::rollup_cache::listing_table_for_res_dir(res_dir, m, ts)
-                .await
-                .map_other()?;
-            let digest = crate::rollup_cache::segment_manifest_digest(m).map_other()?;
+            let provider =
+                crate::partial_aggregate_cache::listing_table_for_res_dir(res_dir, m, ts)
+                    .await
+                    .map_other()?;
+            let digest = crate::partial_aggregate_cache::segment_manifest_digest(m).map_other()?;
             return Ok(LevelBuild {
                 provider,
                 digest,
@@ -1420,10 +1485,10 @@ impl TemporalReduceSqlFile {
             };
             (m, unsealed, changed, false)
         } else {
-            crate::rollup_cache::wipe_segment_res_dir(res_dir).map_other()?;
+            crate::partial_aggregate_cache::wipe_segment_res_dir(res_dir).map_other()?;
             (
-                crate::rollup_cache::SegmentManifest {
-                    format: crate::rollup_cache::SEALED_FORMAT.to_string(),
+                crate::partial_aggregate_cache::SegmentManifest {
+                    format: crate::partial_aggregate_cache::SEALED_FORMAT.to_string(),
                     allowed_lateness_secs: policy.lateness_secs,
                     ..Default::default()
                 },
@@ -1449,13 +1514,13 @@ impl TemporalReduceSqlFile {
         m.sources = now.clone();
         m.source_digest = Some(finer_digest.to_string());
 
-        let digest = crate::rollup_cache::write_segment_manifest(res_dir, &m)
+        let digest = crate::partial_aggregate_cache::write_segment_manifest(res_dir, &m)
             .await
             .map_other()?;
         // Only now that the manifest naming the merged segments is durable.
         unsealed.extend(superseded);
-        crate::rollup_cache::remove_superseded(&unsealed).await;
-        let provider = crate::rollup_cache::listing_table_for_res_dir(res_dir, &m, ts)
+        crate::partial_aggregate_cache::remove_superseded(&unsealed).await;
+        let provider = crate::partial_aggregate_cache::listing_table_for_res_dir(res_dir, &m, ts)
             .await
             .map_other()?;
         Ok(LevelBuild {
@@ -1634,10 +1699,10 @@ impl tinyfs::QueryableFile for TemporalReduceSqlFile {
             return Ok(cached);
         }
 
-        // Prefer the incremental rollup cache. A rollup error is propagated
-        // rather than masked by the single-pass delegate, so any rollup bug
-        // surfaces instead of silently degrading to O(history) reads.
-        if let Some(provider) = self.try_rollup_table_provider(id, context).await? {
+        // Prefer the incremental partial-aggregate cache. A rollup error is
+        // propagated rather than masked by the single-pass delegate, so any
+        // rollup bug surfaces instead of silently degrading to O(history) reads.
+        if let Some(provider) = self.try_partial_aggregate_provider(id, context).await? {
             return Ok(provider);
         }
 
@@ -1663,12 +1728,12 @@ fn node_file_url(scheme: &str, node_path: &tinyfs::NodePath) -> String {
 /// Canonical string over the parts of a temporal-reduce config that change the
 /// meaning of the cached partials: the source pattern, the finest resolution at
 /// which partials are stored, the time column, and the schema-filled
-/// aggregation set. Feeds [`crate::rollup_cache::cfg_hash`].
+/// aggregation set. Feeds [`crate::partial_aggregate_cache::cfg_hash`].
 ///
 /// The output resolution is deliberately excluded: partials are stored once at
 /// the finest resolution and shared across every coarser resolution of the same
 /// site, which re-bin them at merge time.
-fn rollup_cfg_canonical(
+fn partial_aggregate_cfg_canonical(
     filled: &TemporalReduceConfig,
     finest_interval: Duration,
     pattern_url: &str,
@@ -2046,7 +2111,7 @@ fn date_bin_expr(interval: &str, ts: &str) -> String {
 /// partials (`Sum`, `Count`, `Min`, `Max`, `COUNT(*)`), and reconstructs the
 /// requested output columns, including `Avg = Sum / Count`. Output column
 /// names, ordering, and values are identical to a direct `AVG/MIN/MAX/...`
-/// GROUP BY. This form is used when no rollup cache is available.
+/// GROUP BY. This form is used when no partial-aggregate cache is available.
 async fn generate_temporal_sql(
     config: &TemporalReduceConfig,
     interval: Duration,
@@ -2190,7 +2255,7 @@ impl AggSqlPieces {
 
     /// Comma-separated list of the stored partial columns (`__p_*` aliases), in
     /// declaration order. This is the on-disk column set of a segment / hot
-    /// file under [`crate::rollup_cache::SEALED_FORMAT`] = `partials-v1`, and the
+    /// file under [`crate::partial_aggregate_cache::SEALED_FORMAT`] = `partials-v1`, and the
     /// input columns the read-time reconstruction ([`reconstruct_sql`]) consumes.
     fn partial_column_list(&self) -> String {
         self.partials
@@ -2783,15 +2848,17 @@ fn source_version_key(node_id: &tinyfs::NodeID, v: &tinyfs::FileVersionInfo) -> 
 /// A version without recorded bounds gets the whole axis. That is not a special
 /// case to test for later: it makes any dirty range containing it unbounded, so
 /// the build falls back to reading everything -- correct, merely not pruned.
-fn source_range(v: &tinyfs::FileVersionInfo) -> crate::rollup_cache::SourceRange {
+fn source_range(v: &tinyfs::FileVersionInfo) -> crate::partial_aggregate_cache::SourceRange {
     let md = v.extended_metadata.as_ref();
     let get = |k: &str| {
         md.and_then(|m| m.get(k))
             .and_then(|s| s.parse::<i64>().ok())
     };
     match (get("min_event_time"), get("max_event_time")) {
-        (Some(min_us), Some(max_us)) => crate::rollup_cache::SourceRange { min_us, max_us },
-        _ => crate::rollup_cache::SourceRange::UNKNOWN,
+        (Some(min_us), Some(max_us)) => {
+            crate::partial_aggregate_cache::SourceRange { min_us, max_us }
+        }
+        _ => crate::partial_aggregate_cache::SourceRange::UNKNOWN,
     }
 }
 
@@ -2802,11 +2869,11 @@ fn source_range(v: &tinyfs::FileVersionInfo) -> crate::rollup_cache::SourceRange
 /// The SYMMETRIC difference matters: a digest that disappeared invalidates the
 /// buckets it fed just as much as a new one does.
 fn dirty_lo_us(
-    before: &std::collections::BTreeMap<String, crate::rollup_cache::SourceRange>,
-    after: &std::collections::BTreeMap<String, crate::rollup_cache::SourceRange>,
+    before: &std::collections::BTreeMap<String, crate::partial_aggregate_cache::SourceRange>,
+    after: &std::collections::BTreeMap<String, crate::partial_aggregate_cache::SourceRange>,
 ) -> Option<i64> {
     let mut lo: Option<i64> = None;
-    let mut note = |r: &crate::rollup_cache::SourceRange| {
+    let mut note = |r: &crate::partial_aggregate_cache::SourceRange| {
         lo = Some(match lo {
             Some(cur) => cur.min(r.min_us),
             None => r.min_us,
@@ -2843,7 +2910,7 @@ fn dirty_lo_us(
 /// `dirty_lo_secs = None` means the dirty range reaches the beginning of time, so
 /// everything unseals -- which is a rebuild, expressed in the same terms.
 fn unseal_from(
-    m: &mut crate::rollup_cache::SegmentManifest,
+    m: &mut crate::partial_aggregate_cache::SegmentManifest,
     dirty_lo_secs: Option<i64>,
     res_dir: &std::path::Path,
 ) -> TinyFSResult<Vec<std::path::PathBuf>> {
@@ -2856,7 +2923,7 @@ fn unseal_from(
     }
 
     // A segment covers [lo, hi); it is dirty iff it holds any bucket >= dirty_lo.
-    let dirty = |r: &crate::rollup_cache::Segment| match dirty_lo_secs {
+    let dirty = |r: &crate::partial_aggregate_cache::Segment| match dirty_lo_secs {
         Some(lo) => r.hi_secs > lo,
         None => true,
     };
@@ -2895,12 +2962,69 @@ fn unseal_from(
 
     Ok(dropped
         .iter()
-        .map(|r| crate::rollup_cache::segment_path(res_dir, &r.name))
+        .map(|r| crate::partial_aggregate_cache::segment_path(res_dir, &r.name))
         .collect())
 }
 
 /// The cached source Parquets to aggregate, pruned to versions that can reach
 /// `read_lo_us` (epoch µs). `None` reads every live version.
+/// A provider over the pond-native Parquet source versions that a rebuild of
+/// the current range can reach.
+///
+/// The format-cache route scans sidecar Parquets, because a text source must be
+/// parsed before it can be aggregated. A pond-native source needs no sidecar:
+/// its own version files are already the columnar leaves, and re-encoding them
+/// into the cache would store the same rows twice. Both routes prune by the
+/// same event-time bound, so the "do not rescan old versions" property that
+/// makes the build incremental is identical -- only the files differ.
+async fn builtin_source_provider(
+    context: &tinyfs::ProviderContext,
+    source_ids: &[tinyfs::FileID],
+    read_lo_us: Option<i64>,
+) -> TinyFSResult<Arc<dyn datafusion::catalog::TableProvider>> {
+    let bounds = read_lo_us.map_or(
+        tinyfs::SeriesReadBounds::NONE,
+        tinyfs::SeriesReadBounds::from_event_time_lo,
+    );
+
+    // One source is the common case and takes the direct path, which also
+    // applies that node's per-file temporal bounds (data-quality filtering).
+    // The multi-URL path cannot carry per-file bounds, exactly as the
+    // format-cache route cannot.
+    if let [only] = source_ids {
+        return crate::create_table_provider(
+            *only,
+            context,
+            crate::TableProviderOptions {
+                bounds,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_other();
+    }
+
+    let mut urls = Vec::new();
+    for id in source_ids {
+        if let Some(u) = crate::pruned_version_urls(*id, context, bounds)
+            .await
+            .map_other()?
+        {
+            urls.extend(u);
+        }
+    }
+    crate::create_table_provider(
+        source_ids[0],
+        context,
+        crate::TableProviderOptions {
+            additional_urls: urls,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_other()
+}
+
 fn bounded_source_set(
     cache_dir: &std::path::Path,
     scheme: &str,
@@ -3000,6 +3124,28 @@ mod tests {
             agg_type: t,
             columns: Some(cols.iter().map(|c| c.to_string()).collect()),
         }
+    }
+
+    /// The canonical config string is the INPUT to `cfg_hash`, and the hash
+    /// names the on-disk `merged_{cfg_hash}_{node}` directory that every
+    /// deployed pond already has. Renaming this function from
+    /// `rollup_cfg_canonical` must not change a byte it emits.
+    ///
+    /// The failure mode is silent: a perturbed string yields a fresh namespace,
+    /// the old directories are simply never looked at again, and the only
+    /// symptom is that every pond recomputes its whole history once and the
+    /// stale directories leak.
+    #[test]
+    fn cfg_canonical_string_is_pinned() {
+        let cfg = cfg_with_aggs(vec![
+            agg(AggregationType::Sum, &["depth", "temp"]),
+            agg(AggregationType::Count, &["depth"]),
+        ]);
+        assert_eq!(
+            partial_aggregate_cfg_canonical(&cfg, Duration::from_secs(3600), "series:///sources/*"),
+            "src=series:///sources/*;finest=3600s;ts=timestamp;\
+             agg=SUM:depth,temp,;agg=COUNT:depth,;"
+        );
     }
 
     fn lowering_context() -> crate::FactoryContext {
@@ -3863,7 +4009,7 @@ mod tests {
         }
     }
 
-    /// Phase 2: the incremental rollup cache must produce the same aggregated
+    /// Phase 2: the incremental partial-aggregate cache must produce the same aggregated
     /// values as the single-pass delegate, and a second read over an unchanged
     /// source must reuse the cached partials without recomputing any.
     #[tokio::test]
@@ -4059,9 +4205,10 @@ mod tests {
             1,
             "one manifest, for the single resolution"
         );
-        let m = crate::rollup_cache::read_segment_manifest(manifests[0].parent().unwrap())
-            .unwrap()
-            .unwrap();
+        let m =
+            crate::partial_aggregate_cache::read_segment_manifest(manifests[0].parent().unwrap())
+                .unwrap()
+                .unwrap();
         assert_eq!(m.sources.len(), 2, "one source entry per source file");
 
         // A second read over an unchanged source, with a fresh session but the
@@ -4354,7 +4501,7 @@ mod tests {
                 .and_then(|n| n.strip_prefix("res"))
                 .and_then(|s| s.parse().ok())
                 .unwrap();
-            let m = crate::rollup_cache::read_segment_manifest(res_dir)
+            let m = crate::partial_aggregate_cache::read_segment_manifest(res_dir)
                 .unwrap()
                 .unwrap();
             if secs == 3600 {
@@ -4375,13 +4522,13 @@ mod tests {
         }
     }
 
-    fn range(min_us: i64, max_us: i64) -> crate::rollup_cache::SourceRange {
-        crate::rollup_cache::SourceRange { min_us, max_us }
+    fn range(min_us: i64, max_us: i64) -> crate::partial_aggregate_cache::SourceRange {
+        crate::partial_aggregate_cache::SourceRange { min_us, max_us }
     }
 
     fn source_map(
-        entries: &[(&str, crate::rollup_cache::SourceRange)],
-    ) -> std::collections::BTreeMap<String, crate::rollup_cache::SourceRange> {
+        entries: &[(&str, crate::partial_aggregate_cache::SourceRange)],
+    ) -> std::collections::BTreeMap<String, crate::partial_aggregate_cache::SourceRange> {
         entries
             .iter()
             .map(|(k, r)| ((*k).to_string(), *r))
@@ -4427,7 +4574,7 @@ mod tests {
         let unknown = source_map(&[
             ("a", a),
             ("b", b),
-            ("c", crate::rollup_cache::SourceRange::UNKNOWN),
+            ("c", crate::partial_aggregate_cache::SourceRange::UNKNOWN),
         ]);
         assert_eq!(dirty_lo_us(&before, &unknown), None);
     }
@@ -4437,15 +4584,15 @@ mod tests {
     /// ordinary seal path recomputes those buckets from source.
     #[test]
     fn test_unseal_from_drops_segments_covering_the_dirty_point() {
-        let seg = |name: &str, lo: Option<i64>, hi: i64| crate::rollup_cache::Segment {
+        let seg = |name: &str, lo: Option<i64>, hi: i64| crate::partial_aggregate_cache::Segment {
             name: name.to_string(),
             lo_secs: lo,
             hi_secs: hi,
             digest: "d".to_string(),
             bytes: 100,
         };
-        let base = crate::rollup_cache::SegmentManifest {
-            format: crate::rollup_cache::SEALED_FORMAT.to_string(),
+        let base = crate::partial_aggregate_cache::SegmentManifest {
+            format: crate::partial_aggregate_cache::SEALED_FORMAT.to_string(),
             sealed_hi_secs: Some(300),
             segments: vec![
                 seg("seg-0", None, 100),
@@ -4483,7 +4630,7 @@ mod tests {
         // A watermark advanced over an empty span records no segment file. The
         // watermark must still fall back to the dirty point, or the buckets
         // between them would be neither sealed nor recomputed -- silently lost.
-        let mut m = crate::rollup_cache::SegmentManifest {
+        let mut m = crate::partial_aggregate_cache::SegmentManifest {
             sealed_hi_secs: Some(500),
             segments: vec![seg("seg-0", None, 100)],
             ..Default::default()
@@ -4500,7 +4647,7 @@ mod tests {
         // filters on a bucket START), dropping that bucket and the very rows
         // that made it dirty.
         let interval = Duration::from_secs(100);
-        let mut m = crate::rollup_cache::SegmentManifest {
+        let mut m = crate::partial_aggregate_cache::SegmentManifest {
             sealed_hi_secs: Some(500),
             segments: vec![seg("seg-0", None, 100)],
             ..Default::default()
@@ -5710,7 +5857,7 @@ mod tests {
 
         let manifests = walk_find(&cache_dir, &|n| n == "manifest.json");
         assert_eq!(manifests.len(), 1, "one manifest for the single resolution");
-        let m: crate::rollup_cache::SegmentManifest =
+        let m: crate::partial_aggregate_cache::SegmentManifest =
             serde_json::from_slice(&std::fs::read(&manifests[0]).unwrap()).unwrap();
 
         assert!(
@@ -5928,7 +6075,7 @@ mod tests {
             segs.is_empty(),
             "a few rows per day is far under {} bytes, so nothing should have \
              been sealed; found {:?}",
-            crate::rollup_cache::SEAL_TARGET_BYTES,
+            crate::partial_aggregate_cache::SEAL_TARGET_BYTES,
             segs
         );
 
@@ -5974,7 +6121,7 @@ mod tests {
             "manifest must record the hot file's actual size: {m}"
         );
         assert!(
-            on_disk < crate::rollup_cache::SEAL_TARGET_BYTES,
+            on_disk < crate::partial_aggregate_cache::SEAL_TARGET_BYTES,
             "the premise of this test is that hot is under the seal target"
         );
     }

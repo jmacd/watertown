@@ -109,9 +109,10 @@ impl Provider {
     /// As [`Provider::create_table_provider`], but for append-only series read
     /// the supplied [`tinyfs::SeriesReadBounds`] prune versions (event-time
     /// lower bound and/or version watermark) so a bounded reader never
-    /// materializes old history. The bounds apply to both the no-cache MemTable
-    /// path (`async_reader_bounded`) and the cached-`ListingTable` path (only
-    /// the retained version Parquets are listed).
+    /// materializes old history. The bounds apply to the no-cache MemTable
+    /// path (`async_reader_bounded`), the cached-`ListingTable` path and the
+    /// builtin pond path (in both, only the retained version Parquets are
+    /// listed).
     pub async fn create_table_provider_bounded(
         &self,
         url_str: &str,
@@ -171,7 +172,7 @@ impl Provider {
                 ))
             })?;
             return self
-                .create_builtin_table_provider(&url, provider_context)
+                .create_builtin_table_provider(&url, provider_context, bounds)
                 .await;
         }
 
@@ -330,6 +331,7 @@ impl Provider {
         &self,
         url: &Url,
         provider_context: &tinyfs::ProviderContext,
+        bounds: tinyfs::SeriesReadBounds,
     ) -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
         use tinyfs::Lookup;
 
@@ -363,7 +365,7 @@ impl Provider {
         })?;
 
         let table_provider = queryable_file
-            .as_table_provider(node_path.id(), provider_context)
+            .as_table_provider_bounded(node_path.id(), provider_context, bounds)
             .await
             .map_err(|e| Error::InvalidUrl(format!("Failed to create table provider: {}", e)))?;
 
@@ -485,28 +487,94 @@ impl Provider {
     ///
     /// Resolves the URL to a `FileID`, lists all versions, and caches any
     /// uncached versions by streaming them through the format provider.
-    pub(crate) async fn ensure_url_cached(
-        &self,
-        url: &Url,
-        format_provider: &dyn FormatProvider,
-        cache_dir: &std::path::Path,
-    ) -> Result<(tinyfs::NodeID, Vec<tinyfs::FileVersionInfo>)> {
+    /// Resolve a URL's path to the node it names.
+    async fn resolve_url_node(&self, url: &Url) -> Result<tinyfs::NodePath> {
         use tinyfs::Lookup;
 
-        let scheme = url.scheme();
         let path = url.path();
-
-        // Resolve URL path to FileID
         let root = self.root().await?;
         let (_, lookup_result) = root
             .resolve_path(path)
             .await
             .map_err(|e| Error::InvalidUrl(format!("Failed to resolve path '{}': {}", path, e)))?;
 
-        let node_path = match lookup_result {
-            Lookup::Found(np) => np,
-            _ => return Err(Error::InvalidUrl(format!("File not found: {}", path))),
-        };
+        match lookup_result {
+            Lookup::Found(np) => Ok(np),
+            _ => Err(Error::InvalidUrl(format!("File not found: {}", path))),
+        }
+    }
+
+    /// The live versions of the node a URL names, WITHOUT touching the format
+    /// cache.
+    ///
+    /// This is the builtin-scheme counterpart of [`Self::ensure_url_cached`].
+    /// A pond-native Parquet node (`series:///`, `table:///`) is already
+    /// columnar, so there is no parse to memoize -- the format cache would only
+    /// re-encode the same rows. What a caller actually needs from
+    /// `ensure_url_cached` is the version list, which this returns directly.
+    pub(crate) async fn list_url_versions(
+        &self,
+        url: &Url,
+    ) -> Result<(tinyfs::NodeID, Vec<tinyfs::FileVersionInfo>)> {
+        let node_path = self.resolve_url_node(url).await?;
+        let file_id = node_path.id();
+        let node_id = file_id.node_id();
+
+        // Dynamic nodes have no persistence records; synthesize the one version
+        // their metadata describes, as the cached path does.
+        if file_id.entry_type().is_dynamic() {
+            let file_node = node_path
+                .as_file()
+                .await
+                .map_err(|e| Error::InvalidUrl(format!("Dynamic node is not a file: {}", e)))?;
+            let metadata = file_node
+                .metadata()
+                .await
+                .map_err(|e| Error::InvalidUrl(format!("Failed to get metadata: {}", e)))?;
+            return Ok((
+                node_id,
+                vec![tinyfs::FileVersionInfo {
+                    version: metadata.version,
+                    timestamp: metadata.timestamp,
+                    size: metadata.size.unwrap_or(0),
+                    blake3: None,
+                    entry_type: metadata.entry_type,
+                    extended_metadata: None,
+                }],
+            ));
+        }
+
+        let persistence = self
+            .provider_context
+            .as_ref()
+            .expect("version listing requires ProviderContext");
+
+        let versions = persistence
+            .persistence
+            .list_file_versions(file_id)
+            .await
+            .map_err(|e| Error::InvalidUrl(format!("Failed to list versions: {}", e)))?;
+
+        if versions.is_empty() {
+            return Err(Error::InvalidUrl(format!(
+                "No versions found for file: {}",
+                url.path()
+            )));
+        }
+
+        Ok((node_id, versions))
+    }
+
+    pub(crate) async fn ensure_url_cached(
+        &self,
+        url: &Url,
+        format_provider: &dyn FormatProvider,
+        cache_dir: &std::path::Path,
+    ) -> Result<(tinyfs::NodeID, Vec<tinyfs::FileVersionInfo>)> {
+        let scheme = url.scheme();
+        let path = url.path();
+
+        let node_path = self.resolve_url_node(url).await?;
 
         let file_id = node_path.id();
         let node_id = file_id.node_id();

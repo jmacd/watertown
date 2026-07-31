@@ -2,7 +2,7 @@
 //!
 //! Two places in this codebase accumulate immutable, range-ordered segments and
 //! must periodically merge them to keep their count bounded: tlogfs series
-//! collapse, and the rollup cache's segments. The policy for choosing WHICH
+//! collapse, and the partial-aggregate cache's segments. The policy for choosing WHICH
 //! segments to merge is identical in both, and depends on nothing but their
 //! sizes -- so it lives here once and is called from both, rather than being
 //! reimplemented alongside each store.

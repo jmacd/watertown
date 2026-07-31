@@ -729,4 +729,24 @@ impl tinyfs::QueryableFile for OpLogFile {
             .await
             .map_other()
     }
+
+    /// Prune the scanned versions to those the bounds can reach.
+    async fn as_table_provider_bounded(
+        &self,
+        id: FileID,
+        context: &tinyfs::ProviderContext,
+        bounds: tinyfs::SeriesReadBounds,
+    ) -> tinyfs::Result<Arc<dyn datafusion::catalog::TableProvider>> {
+        log::debug!("DELEGATING bounded OpLogFile to provider::create_table_provider: id={id}");
+        provider::create_table_provider(
+            id,
+            context,
+            provider::TableProviderOptions {
+                bounds,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_other()
+    }
 }

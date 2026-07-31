@@ -21,7 +21,7 @@ impl<T: AsyncRead + AsyncSeek + Send + Unpin> AsyncReadSeek for T {}
 /// combined with AND; a `None` field imposes no constraint. Non-series backends
 /// (and files without per-version metadata) ignore these bounds. The all-`None`
 /// value ([`SeriesReadBounds::NONE`]) reads the full series, unchanged.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct SeriesReadBounds {
     /// Retain only versions whose recorded `max_event_time` is at or above this
     /// value (epoch microseconds). Versions lacking a recorded bound are always
@@ -159,6 +159,22 @@ pub trait QueryableFile: File {
         id: crate::FileID,
         context: &crate::ProviderContext,
     ) -> error::Result<Arc<dyn datafusion::catalog::TableProvider>>;
+
+    /// As [`QueryableFile::as_table_provider`], but for append-only series the
+    /// supplied [`SeriesReadBounds`] prune which versions are scanned, so an
+    /// incremental reader does not pay for the whole retained history.
+    ///
+    /// The bounds are a conservative superset filter, never a correctness
+    /// filter, so ignoring them is always safe. The default does exactly that,
+    /// which keeps every non-series and metadata-less backend correct.
+    async fn as_table_provider_bounded(
+        &self,
+        id: crate::FileID,
+        context: &crate::ProviderContext,
+        _bounds: SeriesReadBounds,
+    ) -> error::Result<Arc<dyn datafusion::catalog::TableProvider>> {
+        self.as_table_provider(id, context).await
+    }
 }
 
 impl Handle {

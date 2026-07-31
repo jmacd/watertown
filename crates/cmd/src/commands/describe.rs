@@ -464,6 +464,7 @@ async fn describe_file_series_versions(
         let options = provider::TableProviderOptions {
             version_selection: provider::VersionSelection::SpecificVersion(version_info.version),
             additional_urls: vec![],
+            bounds: tinyfs::SeriesReadBounds::NONE,
         };
 
         let listing_result =

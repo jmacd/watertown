@@ -13,8 +13,8 @@ mod error;
 mod format;
 pub mod format_cache;
 mod format_registry;
+pub mod partial_aggregate_cache;
 mod provider_api;
-pub mod rollup_cache;
 pub mod size_tier;
 mod sql_transform;
 mod table_creation;
@@ -38,6 +38,7 @@ pub use registry::{
 pub use sql_transform::transform_sql;
 pub use table_creation::{
     create_latest_table_provider, create_listing_table_provider, create_table_provider,
+    pruned_version_urls,
 };
 pub use table_provider_options::{TableProviderKey, TableProviderOptions};
 pub use tinyfs::{FactoryContext, PondMetadata, ProviderContext};
