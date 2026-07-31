@@ -537,8 +537,10 @@ impl TemporalReduceSqlFile {
     /// - a pond cache directory is configured;
     /// - the input has no transforms, so partials can be computed directly from
     ///   the parsed source rows;
-    /// - the input scheme is a format provider whose parsed leaves are cached
-    ///   per version by the format cache, which the partials read.
+    /// - the input's parsed rows are reachable per version -- either the scheme
+    ///   is a format provider whose leaves the format cache memoizes, or the
+    ///   source is already pond-native Parquet (`series:///`, `table:///`),
+    ///   which needs no parse and therefore no cache.
     async fn try_rollup_table_provider(
         &self,
         id: tinyfs::FileID,
@@ -558,14 +560,42 @@ impl TemporalReduceSqlFile {
         }
 
         let scheme = self.config.in_pattern.scheme();
-        let Some(format_provider) = crate::FormatRegistry::get_provider(scheme) else {
+
+        // A format provider memoizes its parse in the format cache, and the
+        // partials are computed from those cached leaves. A pond-native Parquet
+        // source has no parse to memoize: it is already columnar, so its own
+        // version files ARE the leaves. Both reach the same place; only the
+        // route differs.
+        let format_provider = crate::FormatRegistry::get_provider(scheme);
+        let builtin_scheme = matches!(scheme, "file" | "series" | "table" | "data");
+        if format_provider.is_none() && !builtin_scheme {
             return Ok(None);
-        };
+        }
 
         let source_files = self.resolve_source_files().await?;
         if source_files.is_empty() {
             return Ok(None);
         }
+
+        // A builtin source must actually be Parquet to be read without a format
+        // provider. Anything else (a raw byte series, a directory) has no
+        // columnar leaves to aggregate, so fall back to the single-pass
+        // delegate rather than failing.
+        if format_provider.is_none()
+            && !source_files
+                .iter()
+                .all(|np| np.id().entry_type().is_parquet_file())
+        {
+            return Ok(None);
+        }
+
+        // Non-`None` selects the pond-native route: these nodes' own version
+        // files are the leaves the partials are computed from.
+        let builtin_source_ids: Option<Vec<tinyfs::FileID>> = if format_provider.is_none() {
+            Some(source_files.iter().map(tinyfs::NodePath::id).collect())
+        } else {
+            None
+        };
 
         // The finest resolution aggregates the sources directly; every coarser
         // resolution folds the next-finer resolution's segments, so no level
@@ -607,10 +637,18 @@ impl TemporalReduceSqlFile {
             let file_url_str = node_file_url(scheme, node_path);
             let file_url = crate::Url::parse(&file_url_str).map_other()?;
 
-            let (source_node_id, versions) = provider_api
-                .ensure_url_cached(&file_url, format_provider.as_ref(), &cache_dir)
-                .await
-                .map_other()?;
+            let (source_node_id, versions) = match format_provider.as_ref() {
+                Some(fp) => provider_api
+                    .ensure_url_cached(&file_url, fp.as_ref(), &cache_dir)
+                    .await
+                    .map_other()?,
+                // Pond-native Parquet: the node's own version files are already
+                // the leaves, so only the version list is needed.
+                None => provider_api
+                    .list_url_versions(&file_url)
+                    .await
+                    .map_other()?,
+            };
 
             // The rollup sums every live version of a source. Series entry types
             // (FilePhysicalSeries, TablePhysicalSeries) store append-only deltas
@@ -723,6 +761,8 @@ impl TemporalReduceSqlFile {
                     &cache_dir,
                     scheme,
                     &source_nodes,
+                    builtin_source_ids.as_deref(),
+                    context,
                     &now,
                     &source_table,
                     policy,
@@ -1095,6 +1135,8 @@ impl TemporalReduceSqlFile {
         cache_dir: &std::path::Path,
         scheme: &str,
         source_nodes: &[(tinyfs::NodeID, Vec<tinyfs::FileVersionInfo>)],
+        builtin_sources: Option<&[tinyfs::FileID]>,
+        provider_context: &tinyfs::ProviderContext,
         now: &std::collections::BTreeMap<String, crate::rollup_cache::SourceRange>,
         source_table: &str,
         policy: SealPolicy,
@@ -1216,9 +1258,16 @@ impl TemporalReduceSqlFile {
         // Aggregate the sources into partial columns on the fly. This view is
         // what `seal_and_recompute` folds, so it plays exactly the role the
         // partials directory used to -- as a query, not as a file population.
-        let source_set = bounded_source_set(cache_dir, scheme, source_nodes, read_lo_us);
-        require_complete_coverage(&source_set)?;
-        let provider = source_set.table_provider().await.map_other()?;
+        let provider = match builtin_sources {
+            None => {
+                let source_set = bounded_source_set(cache_dir, scheme, source_nodes, read_lo_us);
+                require_complete_coverage(&source_set)?;
+                source_set.table_provider().await.map_other()?
+            }
+            // Pond-native Parquet has no sidecars to be missing, so there is no
+            // coverage race to defend against here.
+            Some(ids) => builtin_source_provider(provider_context, ids, read_lo_us).await?,
+        };
         let available: std::collections::HashSet<String> = provider
             .schema()
             .fields()
@@ -2901,6 +2950,63 @@ fn unseal_from(
 
 /// The cached source Parquets to aggregate, pruned to versions that can reach
 /// `read_lo_us` (epoch µs). `None` reads every live version.
+/// A provider over the pond-native Parquet source versions that a rebuild of
+/// the current range can reach.
+///
+/// The format-cache route scans sidecar Parquets, because a text source must be
+/// parsed before it can be aggregated. A pond-native source needs no sidecar:
+/// its own version files are already the columnar leaves, and re-encoding them
+/// into the cache would store the same rows twice. Both routes prune by the
+/// same event-time bound, so the "do not rescan old versions" property that
+/// makes the build incremental is identical -- only the files differ.
+async fn builtin_source_provider(
+    context: &tinyfs::ProviderContext,
+    source_ids: &[tinyfs::FileID],
+    read_lo_us: Option<i64>,
+) -> TinyFSResult<Arc<dyn datafusion::catalog::TableProvider>> {
+    let bounds = read_lo_us.map_or(
+        tinyfs::SeriesReadBounds::NONE,
+        tinyfs::SeriesReadBounds::from_event_time_lo,
+    );
+
+    // One source is the common case and takes the direct path, which also
+    // applies that node's per-file temporal bounds (data-quality filtering).
+    // The multi-URL path cannot carry per-file bounds, exactly as the
+    // format-cache route cannot.
+    if let [only] = source_ids {
+        return crate::create_table_provider(
+            *only,
+            context,
+            crate::TableProviderOptions {
+                bounds,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_other();
+    }
+
+    let mut urls = Vec::new();
+    for id in source_ids {
+        if let Some(u) = crate::pruned_version_urls(*id, context, bounds)
+            .await
+            .map_other()?
+        {
+            urls.extend(u);
+        }
+    }
+    crate::create_table_provider(
+        source_ids[0],
+        context,
+        crate::TableProviderOptions {
+            additional_urls: urls,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_other()
+}
+
 fn bounded_source_set(
     cache_dir: &std::path::Path,
     scheme: &str,

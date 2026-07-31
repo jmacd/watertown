@@ -50,6 +50,45 @@ use crate::{
 /// };
 /// let provider = create_table_provider(file_id, &context, options).await?;
 /// ```
+/// The tinyfs URLs of exactly those version Parquets of `file_id` that a read
+/// bounded by `bounds` can reach, or `None` when the node has no versions to
+/// prune (the caller should fall back to the whole-version pattern).
+///
+/// This shares one predicate with the read path and the format cache
+/// (`tinyfs::SeriesReadBounds::retains`), so all three prune identically.
+///
+/// The prune is a conservative superset, never a correctness filter: a version
+/// with no recorded `max_event_time` is retained, and the caller still applies
+/// its own time predicate. When it would retain nothing, the newest live
+/// version is kept so an empty result still carries a real schema and an idle
+/// pass does not fall back to rescanning all history.
+pub async fn pruned_version_urls(
+    file_id: FileID,
+    context: &ProviderContext,
+    bounds: tinyfs::SeriesReadBounds,
+) -> Result<Option<Vec<String>>> {
+    let versions = context.persistence.list_file_versions(file_id).await?;
+    let mut urls: Vec<String> = versions
+        .iter()
+        .filter(|v| {
+            bounds.retains(
+                crate::format_cache::version_max_event_time(v),
+                v.version as i64,
+            )
+        })
+        .map(|v| crate::TinyFsPathBuilder::url_specific_version(&file_id, v.version))
+        .collect();
+    if urls.is_empty()
+        && let Some(newest) = versions.iter().max_by_key(|v| v.version)
+    {
+        urls.push(crate::TinyFsPathBuilder::url_specific_version(
+            &file_id,
+            newest.version,
+        ));
+    }
+    Ok(if urls.is_empty() { None } else { Some(urls) })
+}
+
 pub async fn create_table_provider(
     file_id: FileID,
     context: &ProviderContext,
@@ -88,39 +127,9 @@ pub async fn create_table_provider(
         debug!("[WARN] CACHE BYPASS: additional_urls present, creating fresh TableProvider");
     }
 
-    // Bounded reads list only the version Parquets the bounds can reach,
-    // instead of the whole version history. This shares one predicate with the
-    // read path and the format cache (`tinyfs::SeriesReadBounds::retains`), so
-    // all three prune identically.
-    //
-    // The prune is a conservative superset: versions with no recorded
-    // `max_event_time` are retained, and the caller still applies its own time
-    // predicate. When it would retain nothing, the newest live version is kept
-    // so the (empty) result still carries a real schema without rescanning
-    // history.
     let pruned_urls: Option<Vec<String>> =
         if options.additional_urls.is_empty() && options.bounds != tinyfs::SeriesReadBounds::NONE {
-            let versions = context.persistence.list_file_versions(file_id).await?;
-            let mut urls: Vec<String> = versions
-                .iter()
-                .filter(|v| {
-                    options.bounds.retains(
-                        crate::format_cache::version_max_event_time(v),
-                        v.version as i64,
-                    )
-                })
-                .map(|v| crate::TinyFsPathBuilder::url_specific_version(&file_id, v.version))
-                .collect();
-            if urls.is_empty() {
-                if let Some(newest) = versions.iter().max_by_key(|v| v.version) {
-                    urls.push(crate::TinyFsPathBuilder::url_specific_version(
-                        &file_id,
-                        newest.version,
-                    ));
-                }
-            }
-            // No versions at all: nothing to prune, fall through to the pattern.
-            if urls.is_empty() { None } else { Some(urls) }
+            pruned_version_urls(file_id, context, options.bounds).await?
         } else {
             None
         };
