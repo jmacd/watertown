@@ -2,7 +2,18 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Rollup aggregate cache -- on-disk storage for `temporal-reduce` levels.
+//! Partial-aggregate cache -- on-disk storage for `temporal-reduce` levels.
+//!
+//! **Naming.** This module stores *partial aggregates*: per-bucket `sum`,
+//! `count`, `min`, `max` from which the output columns are reconstructed at
+//! read time. "Rollup" is the ALGORITHM that computes and folds them (see
+//! `factory::temporal_reduce`), not the thing stored here. The two are kept
+//! distinct deliberately: the on-disk artifact is the partial-aggregate cache,
+//! and the rollup is how it gets filled.
+//!
+//! Note that the on-disk directory prefix is still `merged_{cfg_hash}_{node}`.
+//! That name is a compatibility contract with every deployed pond, so it is not
+//! spelled like either concept and must not be changed casually.
 //!
 //! `temporal-reduce` downsamples a source series into per-resolution
 //! aggregations. Without caching, every read recomputes a full
@@ -48,7 +59,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Result type for rollup cache operations.
+/// Result type for partial-aggregate cache operations.
 type Result<T> = std::result::Result<T, crate::error::Error>;
 
 /// Compute a stable namespace hash over the parts of a temporal-reduce config
@@ -73,7 +84,7 @@ pub fn cfg_hash(canonical: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-/// Drop every rollup-cache namespace under `cache_dir`, forcing every
+/// Drop every partial-aggregate-cache namespace under `cache_dir`, forcing every
 /// temporal-reduce level to be recomputed from source on next read.  This is the
 /// global `--rebuild` recovery primitive.  The format cache and any other cache
 /// content are left untouched.  Idempotent: a missing `cache_dir` is not an
@@ -86,12 +97,12 @@ pub fn drop_all(cache_dir: &Path) -> Result<usize> {
     for entry in std::fs::read_dir(cache_dir).map_err(crate::error::Error::Io)? {
         let entry = entry.map_err(crate::error::Error::Io)?;
         let path = entry.path();
-        let is_rollup = path.is_dir()
+        let is_partial_aggregate = path.is_dir()
             && entry
                 .file_name()
                 .to_str()
                 .is_some_and(|n| n.starts_with("merged_"));
-        if is_rollup {
+        if is_partial_aggregate {
             std::fs::remove_dir_all(&path).map_err(crate::error::Error::Io)?;
             dropped += 1;
         }
@@ -327,8 +338,9 @@ pub fn read_segment_manifest(res_dir: &Path) -> Result<Option<SegmentManifest>> 
     };
     serde_json::from_slice(&bytes).map(Some).map_err(|e| {
         crate::error::Error::CacheCorrupt(format!(
-            "segment manifest '{}' is present but unparseable ({}); the rollup \
-             cache is corrupt. Re-run the export with --rebuild to recompute it.",
+            "segment manifest '{}' is present but unparseable ({}); the \
+             partial-aggregate cache is corrupt. Re-run the export with \
+             --rebuild to recompute it.",
             path.display(),
             e
         ))
@@ -463,7 +475,7 @@ pub async fn listing_table_for_res_dir(
         if !p.exists() {
             return Err(crate::error::Error::CacheCorrupt(format!(
                 "segment '{}' recorded in the manifest is missing on disk; the \
-                 rollup cache is corrupt. Re-run the export with --rebuild.",
+                 partial-aggregate cache is corrupt. Re-run the export with --rebuild.",
                 p.display()
             )));
         }
@@ -472,7 +484,7 @@ pub async fn listing_table_for_res_dir(
     let hot = hot_path(res_dir);
     if !hot.exists() {
         return Err(crate::error::Error::CacheCorrupt(format!(
-            "hot file '{}' is missing; the rollup cache is corrupt. \
+            "hot file '{}' is missing; the partial-aggregate cache is corrupt. \
              Re-run the export with --rebuild.",
             hot.display()
         )));
@@ -571,6 +583,37 @@ mod tests {
         assert_eq!(a, b, "same config must hash identically");
         assert_ne!(a, c, "different resolution list must change the namespace");
         assert_eq!(a.len(), 16);
+    }
+
+    /// The on-disk namespace is a compatibility contract with every deployed
+    /// pond: `merged_{cfg_hash}_{node_id}`. Renaming this module and its
+    /// functions to "partial-aggregate" must not move a single byte of it --
+    /// a perturbed `cfg_hash` orphans every existing cache directory, and the
+    /// symptom is not an error but a silent full recompute that then looks
+    /// like the cache simply never helped.
+    ///
+    /// `test_cfg_hash_stable_and_distinct` only checks self-consistency, so it
+    /// passes happily after such a change. This pins the actual bytes.
+    ///
+    /// It also pins something the rename did not introduce: `cfg_hash` uses
+    /// `DefaultHasher`, whose output std explicitly does NOT guarantee across
+    /// toolchains. If a Rust upgrade ever changes it, every deployed pond
+    /// silently re-derives its whole cache. This test is the tripwire.
+    #[test]
+    fn merged_dir_naming_is_pinned() {
+        assert_eq!(
+            cfg_hash("avg|timestamp|1h,1d"),
+            "f25d1ac9a335b8ea",
+            "cfg_hash bytes are a deployed-pond compatibility contract"
+        );
+        let node = tinyfs::NodeID::new("0192f00d-0000-7000-8000-00000000abcd".to_string());
+        assert_eq!(
+            merged_dir(Path::new("/pond/cache"), "cafef00d12345678", &node)
+                .to_string_lossy()
+                .as_ref(),
+            format!("/pond/cache/merged_cafef00d12345678_{node}").as_str(),
+            "directory prefix must stay `merged_`"
+        );
     }
 
     /// A stray Parquet in the res dir must not contribute rows: the manifest,

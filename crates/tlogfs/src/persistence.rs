@@ -184,7 +184,7 @@ struct CollapseCandidate {
 /// How many adjacent same-class versions collapse into one run.
 ///
 /// Re-exported from the shared size-tiered policy so that series collapse and
-/// the rollup cache's segment compaction cannot drift apart.
+/// the partial-aggregate cache's segment compaction cannot drift apart.
 pub use provider::size_tier::MERGE_FANOUT as COLLAPSE_FANOUT;
 
 /// Choose the contiguous window of live rows to merge, or `None` for a no-op.

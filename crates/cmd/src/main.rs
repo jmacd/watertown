@@ -480,7 +480,7 @@ enum Commands {
         /// Time range end (human-readable, e.g., "2024-12-31 23:59:59", "2024-12-31T23:59:59Z")
         #[arg(long)]
         end_time: Option<String>,
-        /// Drop the temporal-reduce rollup cache before exporting, forcing a
+        /// Drop the temporal-reduce partial-aggregate cache before exporting, forcing a
         /// full recompute. A maintenance escape hatch: the cache is derived
         /// state, so discarding it can only cost time.
         #[arg(long)]

@@ -68,17 +68,17 @@ pub async fn export_command(
     print_export_start(patterns, output_dir, temporal);
     validate_export_inputs(patterns, output_dir, temporal)?;
 
-    // --rebuild drops the throwaway rollup aggregate cache so the next read
+    // --rebuild drops the throwaway partial-aggregate cache so the next read
     // recomputes every temporal-reduce level from source. The cache is derived
     // state and is now self-correcting -- late data unseals the segments it
     // affects rather than failing -- so this is a maintenance escape hatch, not
     // a required recovery step.
     if rebuild {
         let cache_dir = ship_context.resolve_pond_path()?.join("cache");
-        let dropped = provider::rollup_cache::drop_all(&cache_dir)
-            .map_err(|e| anyhow::anyhow!("Failed to drop rollup cache: {}", e))?;
+        let dropped = provider::partial_aggregate_cache::drop_all(&cache_dir)
+            .map_err(|e| anyhow::anyhow!("Failed to drop partial-aggregate cache: {}", e))?;
         log::info!(
-            "[REBUILD] Dropped {} rollup cache namespace(s) under {}",
+            "[REBUILD] Dropped {} partial-aggregate cache namespace(s) under {}",
             dropped,
             cache_dir.display()
         );
