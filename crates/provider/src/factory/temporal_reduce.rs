@@ -581,10 +581,17 @@ impl TemporalReduceSqlFile {
         // provider. Anything else (a raw byte series, a directory) has no
         // columnar leaves to aggregate, so fall back to the single-pass
         // delegate rather than failing.
+        //
+        // It must also be durable. A dynamic node is Parquet-shaped but
+        // ephemeral: it has no oplog records, so it has no versions to enumerate
+        // and nothing stable to key a cache on. Materializing it once per level
+        // would recompute it every pass, so the delegate's single pass is
+        // strictly better.
         if format_provider.is_none()
-            && !source_files
-                .iter()
-                .all(|np| np.id().entry_type().is_parquet_file())
+            && !source_files.iter().all(|np| {
+                let et = np.id().entry_type();
+                et.is_parquet_file() && !et.is_dynamic()
+            })
         {
             return Ok(None);
         }
