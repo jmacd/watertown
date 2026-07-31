@@ -65,8 +65,12 @@ pub async fn create_table_provider(
 
     // Check cache first (only for simple cases without additional_urls)
     if options.additional_urls.is_empty() {
-        let cache_key =
-            TableProviderKey::new(file_id, options.version_selection.clone()).to_cache_string();
+        let cache_key = TableProviderKey::with_bounds(
+            file_id,
+            options.version_selection.clone(),
+            options.bounds,
+        )
+        .to_cache_string();
 
         if let Some(cached_provider) = context.get_table_provider_cache(&cache_key) {
             debug!(
@@ -84,8 +88,56 @@ pub async fn create_table_provider(
         debug!("[WARN] CACHE BYPASS: additional_urls present, creating fresh TableProvider");
     }
 
+    // Bounded reads list only the version Parquets the bounds can reach,
+    // instead of the whole version history. This shares one predicate with the
+    // read path and the format cache (`tinyfs::SeriesReadBounds::retains`), so
+    // all three prune identically.
+    //
+    // The prune is a conservative superset: versions with no recorded
+    // `max_event_time` are retained, and the caller still applies its own time
+    // predicate. When it would retain nothing, the newest live version is kept
+    // so the (empty) result still carries a real schema without rescanning
+    // history.
+    let pruned_urls: Option<Vec<String>> =
+        if options.additional_urls.is_empty() && options.bounds != tinyfs::SeriesReadBounds::NONE {
+            let versions = context.persistence.list_file_versions(file_id).await?;
+            let mut urls: Vec<String> = versions
+                .iter()
+                .filter(|v| {
+                    options.bounds.retains(
+                        crate::format_cache::version_max_event_time(v),
+                        v.version as i64,
+                    )
+                })
+                .map(|v| crate::TinyFsPathBuilder::url_specific_version(&file_id, v.version))
+                .collect();
+            if urls.is_empty() {
+                if let Some(newest) = versions.iter().max_by_key(|v| v.version) {
+                    urls.push(crate::TinyFsPathBuilder::url_specific_version(
+                        &file_id,
+                        newest.version,
+                    ));
+                }
+            }
+            // No versions at all: nothing to prune, fall through to the pattern.
+            if urls.is_empty() { None } else { Some(urls) }
+        } else {
+            None
+        };
+
     // Create ListingTable URL(s) - either from options.additional_urls or pattern generation
-    let (config, debug_info) = if options.additional_urls.is_empty() {
+    let (config, debug_info) = if let Some(urls) = &pruned_urls {
+        let mut table_urls = Vec::with_capacity(urls.len());
+        for url_str in urls {
+            table_urls.push(ListingTableUrl::parse(url_str)?);
+        }
+
+        let file_format = Arc::new(ParquetFormat::default());
+        let listing_options = ListingOptions::new(file_format);
+        let config = ListingTableConfig::new_with_multi_paths(table_urls)
+            .with_listing_options(listing_options);
+        (config, format!("bounded: {} version URL(s)", urls.len()))
+    } else if options.additional_urls.is_empty() {
         // Default behavior: single URL from pattern
         let url_pattern = options.version_selection.to_url_pattern(&file_id);
         let table_url = ListingTableUrl::parse(&url_pattern)?;
@@ -178,8 +230,12 @@ pub async fn create_table_provider(
 
     // Cache the result (only for simple cases without additional_urls)
     if options.additional_urls.is_empty() {
-        let cache_key =
-            TableProviderKey::new(file_id, options.version_selection.clone()).to_cache_string();
+        let cache_key = TableProviderKey::with_bounds(
+            file_id,
+            options.version_selection.clone(),
+            options.bounds,
+        )
+        .to_cache_string();
 
         context.set_table_provider_cache(cache_key, table_provider.clone())?;
         debug!("[SAVE] CACHED: Stored TableProvider for file_id: {file_id}");
@@ -200,6 +256,7 @@ pub async fn create_listing_table_provider(
     let options = TableProviderOptions {
         version_selection: VersionSelection::AllVersions,
         additional_urls: vec![],
+        bounds: tinyfs::SeriesReadBounds::NONE,
     };
     create_table_provider(file_id, context, options).await
 }
@@ -213,6 +270,7 @@ pub async fn create_latest_table_provider(
     let options = TableProviderOptions {
         version_selection: VersionSelection::LatestVersion,
         additional_urls: vec![],
+        bounds: tinyfs::SeriesReadBounds::NONE,
     };
     create_table_provider(file_id, context, options).await
 }

@@ -158,6 +158,7 @@ async fn detect_overlaps_impl(
                 provider::TableProviderOptions {
                     version_selection: provider::VersionSelection::SpecificVersion(version as u64),
                     additional_urls: Vec::new(),
+                    bounds: tinyfs::SeriesReadBounds::NONE,
                 },
             )
             .await

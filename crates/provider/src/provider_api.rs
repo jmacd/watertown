@@ -109,9 +109,10 @@ impl Provider {
     /// As [`Provider::create_table_provider`], but for append-only series read
     /// the supplied [`tinyfs::SeriesReadBounds`] prune versions (event-time
     /// lower bound and/or version watermark) so a bounded reader never
-    /// materializes old history. The bounds apply to both the no-cache MemTable
-    /// path (`async_reader_bounded`) and the cached-`ListingTable` path (only
-    /// the retained version Parquets are listed).
+    /// materializes old history. The bounds apply to the no-cache MemTable
+    /// path (`async_reader_bounded`), the cached-`ListingTable` path and the
+    /// builtin pond path (in both, only the retained version Parquets are
+    /// listed).
     pub async fn create_table_provider_bounded(
         &self,
         url_str: &str,
@@ -171,7 +172,7 @@ impl Provider {
                 ))
             })?;
             return self
-                .create_builtin_table_provider(&url, provider_context)
+                .create_builtin_table_provider(&url, provider_context, bounds)
                 .await;
         }
 
@@ -330,6 +331,7 @@ impl Provider {
         &self,
         url: &Url,
         provider_context: &tinyfs::ProviderContext,
+        bounds: tinyfs::SeriesReadBounds,
     ) -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
         use tinyfs::Lookup;
 
@@ -363,7 +365,7 @@ impl Provider {
         })?;
 
         let table_provider = queryable_file
-            .as_table_provider(node_path.id(), provider_context)
+            .as_table_provider_bounded(node_path.id(), provider_context, bounds)
             .await
             .map_err(|e| Error::InvalidUrl(format!("Failed to create table provider: {}", e)))?;
 

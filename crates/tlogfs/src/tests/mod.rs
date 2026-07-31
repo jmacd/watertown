@@ -2651,6 +2651,197 @@ async fn table_series_rows(persistence: &mut OpLogPersistence, file_path: &str) 
     rows
 }
 
+/// Total row count of a series as seen through its table provider, with the
+/// version scan pruned by `bounds`.
+async fn table_series_rows_bounded(
+    persistence: &mut OpLogPersistence,
+    file_path: &str,
+    bounds: tinyfs::SeriesReadBounds,
+) -> usize {
+    use futures::StreamExt;
+    let tx = persistence.begin_test().await.expect("begin read tx");
+    let wd = tx.root().await.expect("root");
+    let id = wd.get_node_path(file_path).await.expect("node").id();
+    let state = tx.state().expect("state");
+    let context = state.as_provider_context();
+    let table_provider = provider::create_table_provider(
+        id,
+        &context,
+        provider::TableProviderOptions {
+            bounds,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("table provider");
+    let session = &context.datafusion_session;
+    let plan = table_provider
+        .scan(&session.state(), None, &[], None)
+        .await
+        .expect("scan");
+    let mut stream = plan.execute(0, session.task_ctx()).expect("execute");
+    let mut rows = 0usize;
+    while let Some(batch) = stream.next().await {
+        rows += batch.expect("batch").num_rows();
+    }
+    tx.commit_test().await.expect("commit read");
+    rows
+}
+
+/// A bounded read of a `TablePhysicalSeries` must list only the version
+/// parquets the bounds can reach, so an incremental consumer does not pay for
+/// the whole retained history on every pass.
+///
+/// This is the table-provider analogue of the `FilePhysicalSeries` reader
+/// prune: both delegate to `SeriesReadBounds::retains`, so the read path, the
+/// format cache and the builtin pond path prune identically.
+#[tokio::test]
+async fn table_series_bounded_provider_scans_only_retained_versions() {
+    use tinyfs::SeriesReadBounds;
+
+    let store_path = test_dir();
+    let mut persistence = OpLogPersistence::create_test(&store_path)
+        .await
+        .expect("create pond");
+    let file_path = "readings.series";
+
+    // Four versions, two rows each, at strictly increasing event times: version
+    // i covers [i*100, i*100+1].
+    for i in 1..=4i64 {
+        append_table_series_version(
+            &mut persistence,
+            file_path,
+            vec![i * 100, i * 100 + 1],
+            vec![i as f64, i as f64],
+        )
+        .await;
+    }
+
+    assert_eq!(
+        table_series_rows_bounded(&mut persistence, file_path, SeriesReadBounds::NONE).await,
+        8,
+        "unbounded read sees every version"
+    );
+
+    // Event-time floor of 300 can only be reached by versions 3 and 4.
+    assert_eq!(
+        table_series_rows_bounded(
+            &mut persistence,
+            file_path,
+            SeriesReadBounds::from_event_time_lo(300)
+        )
+        .await,
+        4,
+        "event-time floor drops the two oldest versions"
+    );
+
+    // A version watermark prunes the same way, by a different field.
+    assert_eq!(
+        table_series_rows_bounded(
+            &mut persistence,
+            file_path,
+            SeriesReadBounds::from_version_gt(3)
+        )
+        .await,
+        2,
+        "version watermark keeps only versions above it"
+    );
+
+    // A floor above all recorded event times retains nothing, so the newest
+    // version is kept to preserve the schema. The prune is a conservative
+    // superset filter, so this is a row-count ceiling, not a correctness claim.
+    assert_eq!(
+        table_series_rows_bounded(
+            &mut persistence,
+            file_path,
+            SeriesReadBounds::from_event_time_lo(10_000)
+        )
+        .await,
+        2,
+        "empty prune falls back to the newest version, not to full history"
+    );
+}
+
+/// The TableProvider cache is keyed per file+version-selection, so a bounded
+/// provider and an unbounded one for the same file collide unless the bounds
+/// are part of the key. Serving the cached unbounded provider to a bounded
+/// request would silently defeat the prune; serving the cached *bounded* one to
+/// an unbounded request would silently drop rows.
+///
+/// Both providers must therefore be built inside one context, which is what
+/// makes this a cache test rather than a repeat of the prune test.
+#[tokio::test]
+async fn bounded_and_unbounded_providers_do_not_share_a_cache_entry() {
+    use futures::StreamExt;
+    use tinyfs::SeriesReadBounds;
+
+    let store_path = test_dir();
+    let mut persistence = OpLogPersistence::create_test(&store_path)
+        .await
+        .expect("create pond");
+    let file_path = "readings.series";
+
+    for i in 1..=4i64 {
+        append_table_series_version(
+            &mut persistence,
+            file_path,
+            vec![i * 100, i * 100 + 1],
+            vec![i as f64, i as f64],
+        )
+        .await;
+    }
+
+    let tx = persistence.begin_test().await.expect("begin read tx");
+    let wd = tx.root().await.expect("root");
+    let id = wd.get_node_path(file_path).await.expect("node").id();
+    let state = tx.state().expect("state");
+    let context = state.as_provider_context();
+
+    async fn rows(
+        context: &tinyfs::ProviderContext,
+        id: tinyfs::FileID,
+        bounds: SeriesReadBounds,
+    ) -> usize {
+        let table_provider = provider::create_table_provider(
+            id,
+            context,
+            provider::TableProviderOptions {
+                bounds,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("table provider");
+        let session = &context.datafusion_session;
+        let plan = table_provider
+            .scan(&session.state(), None, &[], None)
+            .await
+            .expect("scan");
+        let mut stream = plan.execute(0, session.task_ctx()).expect("execute");
+        let mut n = 0usize;
+        while let Some(batch) = stream.next().await {
+            n += batch.expect("batch").num_rows();
+        }
+        n
+    }
+
+    // Unbounded first, so it is the entry a key collision would hand back.
+    assert_eq!(rows(&context, id, SeriesReadBounds::NONE).await, 8);
+    assert_eq!(
+        rows(&context, id, SeriesReadBounds::from_event_time_lo(300)).await,
+        4,
+        "bounded request must not be served the cached unbounded provider"
+    );
+    // And back the other way: the bounded entry must not shadow the unbounded one.
+    assert_eq!(
+        rows(&context, id, SeriesReadBounds::NONE).await,
+        8,
+        "unbounded request must not be served the cached bounded provider"
+    );
+
+    tx.commit_test().await.expect("commit read");
+}
+
 /// A `TablePhysicalSeries` accumulates one parquet file per version, so reads
 /// cost O(versions) no matter how few rows each version carries. Collapsing
 /// must merge them into a single version by re-encoding (parquet files cannot

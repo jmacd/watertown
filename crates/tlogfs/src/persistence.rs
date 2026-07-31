@@ -1743,6 +1743,7 @@ impl State {
             provider::TableProviderOptions {
                 version_selection: provider::VersionSelection::AllVersions,
                 additional_urls,
+                bounds: tinyfs::SeriesReadBounds::NONE,
             },
         )
         .await

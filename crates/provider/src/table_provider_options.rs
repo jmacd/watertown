@@ -22,6 +22,15 @@ pub struct TableProviderOptions {
     /// Multiple file URLs/paths to combine into a single table
     /// If empty, will use the node_id/part_id pattern (existing behavior)
     pub additional_urls: Vec<String>,
+
+    /// Per-version prune for append-only series: only the version Parquets a
+    /// bounded read can reach are listed, instead of the whole version history.
+    ///
+    /// This is a conservative *superset* filter, never a correctness filter: a
+    /// version with no recorded `max_event_time` is always retained, and the
+    /// caller still applies its own time predicate. [`tinyfs::SeriesReadBounds::NONE`]
+    /// (the default) lists every live version, unchanged.
+    pub bounds: tinyfs::SeriesReadBounds,
 }
 
 /// Cache key for TableProvider instances
@@ -35,28 +44,58 @@ pub struct TableProviderKey {
 
     /// Version selection strategy
     pub version_selection: VersionSelection,
+
+    /// Per-version series prune in effect. Part of the key because a bounded
+    /// provider lists only a subset of the version Parquets: serving one to an
+    /// unbounded request (or to a differently-bounded one) would silently drop
+    /// rows.
+    pub bounds: tinyfs::SeriesReadBounds,
 }
 
 impl TableProviderKey {
-    /// Create a new cache key
+    /// Create a new cache key for an unbounded (full-history) read.
     #[must_use]
     pub fn new(file_id: FileID, version_selection: VersionSelection) -> Self {
+        Self::with_bounds(file_id, version_selection, tinyfs::SeriesReadBounds::NONE)
+    }
+
+    /// Create a new cache key for a read pruned by `bounds`.
+    #[must_use]
+    pub fn with_bounds(
+        file_id: FileID,
+        version_selection: VersionSelection,
+        bounds: tinyfs::SeriesReadBounds,
+    ) -> Self {
         Self {
             file_id,
             version_selection,
+            bounds,
         }
     }
 
     /// Convert to string for HashMap-based caching
     ///
-    /// Format: "file_id:node_id:part_id:version_selection"
-    /// Example: "12345:node123:part456:latest"
+    /// Format: "file_id:version_selection", with a `:b<lo>/<gt>` suffix only
+    /// when a prune is in effect. Unbounded keys keep their historical spelling
+    /// so existing cache entries stay addressable.
+    ///
+    /// Example: "12345:latest", "12345:latest:b1700000000000000/-"
     #[must_use]
     pub fn to_cache_string(&self) -> String {
-        format!(
+        let base = format!(
             "{}:{}",
             self.file_id,
             self.version_selection.to_cache_string()
+        );
+        if self.bounds == tinyfs::SeriesReadBounds::NONE {
+            return base;
+        }
+        let part = |v: Option<i64>| v.map_or_else(|| "-".to_string(), |n| n.to_string());
+        format!(
+            "{}:b{}/{}",
+            base,
+            part(self.bounds.event_time_lo),
+            part(self.bounds.version_gt)
         )
     }
 }
