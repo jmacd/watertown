@@ -1215,15 +1215,7 @@ impl State {
         }
 
         // Assess current versions and pick the window to merge.
-        let (
-            versions_before,
-            window,
-            temporal,
-            inherited_bao,
-            newest_version,
-            store_path,
-            options,
-        ) = {
+        let (versions_before, window, temporal, inherited_bao, newest_version, store_path, options) = {
             let mut inner = self.inner.lock().await;
             let records = inner.query_records(id).await?;
             let live: Vec<&OplogEntry> = crate::schema::live_series_entries(&records)
@@ -2278,7 +2270,6 @@ impl State {
             .expect("Failed to acquire table provider cache lock")
             .insert(key, value);
     }
-
 }
 
 /// Parse Parquet `content`, resolve the timestamp column (explicit or
