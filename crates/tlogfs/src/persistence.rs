@@ -104,8 +104,11 @@ pub struct InnerState {
     pending_mtimes: HashMap<FileID, i64>,
     /// Track pre-allocated version numbers for async writes in progress
     allocated_versions: HashMap<FileID, Vec<i64>>,
-    /// Transaction poisoned flag - if true, commit must fail
-    poisoned: bool,
+    /// Reason the transaction was poisoned by a failed write, if any. Commit
+    /// must fail while this is set, and it carries the originating message so
+    /// the commit error can say what actually went wrong rather than only that
+    /// something did.
+    poisoned: Option<String>,
     session_context: Arc<SessionContext>,
     txn_seq: i64,
     /// Options for large file storage (compression, etc.)
@@ -2450,7 +2453,7 @@ impl InnerState {
             pending_files: HashMap::new(),
             pending_mtimes: HashMap::new(),
             allocated_versions: HashMap::new(),
-            poisoned: false,
+            poisoned: None,
             session_context: ctx,
             txn_seq,
             large_file_options,
@@ -2794,9 +2797,9 @@ impl InnerState {
 
     /// Poison the transaction due to write failure
     async fn poison_transaction(&mut self, reason: String) {
-        if !self.poisoned {
+        if self.poisoned.is_none() {
             warn!("[TEST] TRANSACTION POISONED: {reason}");
-            self.poisoned = true;
+            self.poisoned = Some(reason);
         }
     }
 
@@ -3046,10 +3049,11 @@ impl InnerState {
         pond_id: String,
     ) -> Result<Option<deltalake::kernel::transaction::FinalizedCommit>, TLogFSError> {
         // Check if transaction is poisoned (failed write)
-        if self.poisoned {
+        if let Some(reason) = &self.poisoned {
             return Err(TLogFSError::Transaction {
-                message: "Cannot commit poisoned transaction - a write operation failed"
-                    .to_string(),
+                message: format!(
+                    "Cannot commit poisoned transaction - a write operation failed: {reason}"
+                ),
             });
         }
 

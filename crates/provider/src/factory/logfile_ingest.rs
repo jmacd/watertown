@@ -258,17 +258,60 @@ fn fold_timestamps(value: &Value, field: &str, acc: &mut Option<(i64, i64)>) -> 
     }
 }
 
+/// The portion of `slice` that should be stored now.
+///
+/// An actively-written log is tailed by byte offset, so a slice taken from it
+/// routinely ends mid-line -- the station is still writing that record. Storing
+/// such a slice verbatim splits one record across two versions, and neither
+/// version can then read its own timestamps: the first cannot parse its
+/// trailing fragment, the second cannot parse its leading one.
+///
+/// Holding the fragment back instead keeps every stored version a whole number
+/// of records, so bounds are always computable and the next version always
+/// starts at a record boundary. Nothing is lost: appends are detected by
+/// comparing the host size against the pond's cumulative size, so the withheld
+/// bytes simply appear as growth on the next tick, once the writer has finished
+/// the line.
+///
+/// Two cases are deliberately exempt and are stored byte-for-byte:
+///
+/// - No `timestamp_field`. The operator has not said these are records, so the
+///   file is an opaque byte stream -- possibly with no newlines at all, in
+///   which case aligning would withhold it forever.
+/// - A final file. Once rotated or archived it is no longer being appended to,
+///   so its last line is complete whether or not it ends in a newline.
+fn ingestible_slice<'a>(
+    config: &LogfileIngestConfig,
+    slice: &'a [u8],
+    final_file: bool,
+) -> &'a [u8] {
+    if final_file || config.timestamp_field.is_none() {
+        return slice;
+    }
+    complete_lines(slice)
+}
+
+/// The prefix of `slice` up to and including the last newline.
+fn complete_lines(slice: &[u8]) -> &[u8] {
+    match slice.iter().rposition(|&b| b == b'\n') {
+        Some(idx) => &slice[..=idx],
+        None => &[],
+    }
+}
+
 /// Record event-time bounds on a version about to be finalized, when the
 /// config asks for them.
 ///
 /// Must be called after the content is written and before `shutdown`, which is
 /// when the metadata is folded into the oplog entry.
 ///
-/// A slice whose bounds cannot be determined is written without them and warns
-/// rather than failing: ingest keeping the data flowing matters more than the
-/// downstream rollup staying pruned, and the rollup degrades to a correct (if
-/// expensive) full recompute. The warning is there because that degradation is
-/// otherwise invisible -- it shows up only as a slow, memory-hungry build.
+/// Naming a `timestamp_field` is the operator saying "this node carries logs or
+/// metrics", so the requirement is declared on the writer before the scan runs.
+/// A slice whose bounds cannot then be determined fails the write rather than
+/// storing an unbounded version: with line-aligned slices the benign cause (a
+/// torn trailing line) can no longer occur, so what remains is a real problem
+/// -- the wrong field name, the wrong unit, or corrupt input -- and silently
+/// degrading it only reappears later as a slow, memory-hungry rollup.
 fn attach_temporal_bounds(
     writer: &mut std::pin::Pin<Box<dyn tinyfs::FileMetadataWriter>>,
     config: &LogfileIngestConfig,
@@ -279,22 +322,14 @@ fn attach_temporal_bounds(
         return;
     };
 
-    match scan_temporal_bounds(content, field, config.timestamp_unit) {
-        Some((min_us, max_us)) => {
-            debug!(
-                "Temporal bounds for {}: [{}, {}] us from '{}'",
-                pond_dest, min_us, max_us, field
-            );
-            writer.set_temporal_metadata(min_us, max_us, field.to_string());
-        }
-        None => warn!(
-            "No usable '{}' timestamps in {} bytes for {}; writing without event-time bounds \
-             (downstream temporal-reduce will treat this version as spanning all time and \
-             recompute its cache in full)",
-            field,
-            content.len(),
-            pond_dest
-        ),
+    writer.require_temporal_metadata(field.to_string());
+
+    if let Some((min_us, max_us)) = scan_temporal_bounds(content, field, config.timestamp_unit) {
+        debug!(
+            "Temporal bounds for {}: [{}, {}] us from '{}'",
+            pond_dest, min_us, max_us, field
+        );
+        writer.set_temporal_metadata(min_us, max_us, field.to_string());
     }
 }
 
@@ -885,9 +920,9 @@ async fn process_active_file(
                 "Ingesting new file: {} ({} bytes)",
                 filename, host_file.size
             );
-            ingest_new_file(context, config, host_file).await?;
+            let written = ingest_new_file(context, config, host_file, false).await?;
             stats.new_files.0 += 1;
-            stats.new_files.1 += host_file.size;
+            stats.new_files.1 += written;
         }
         Some(pond_state) => {
             // Existing file: detect append
@@ -898,9 +933,9 @@ async fn process_active_file(
                     filename, new_bytes, pond_state.cumulative_size, host_file.size
                 );
 
-                ingest_append(context, config, host_file, pond_state).await?;
+                let written = ingest_append(context, config, host_file, pond_state).await?;
                 stats.appended.0 += 1;
-                stats.appended.1 += new_bytes;
+                stats.appended.1 += written;
             } else if host_file.size < pond_state.cumulative_size {
                 warn!(
                     "Active file {} SHRUNK from {} to {} bytes - unexpected!",
@@ -941,9 +976,9 @@ async fn process_archived_file(
                 "Ingesting new archived file: {} ({} bytes)",
                 filename, host_file.size
             );
-            ingest_new_file(context, config, host_file).await?;
+            let written = ingest_new_file(context, config, host_file, true).await?;
             stats.new_files.0 += 1;
-            stats.new_files.1 += host_file.size;
+            stats.new_files.1 += written;
         }
         Some(pond_state) => {
             // Verify archived file hasn't changed (should be immutable)
@@ -978,23 +1013,36 @@ async fn ingest_new_file(
     context: &FactoryContext,
     config: &LogfileIngestConfig,
     host_file: &HostFileState,
-) -> Result<(), tinyfs::Error> {
-    let content = std::fs::read(&host_file.path).map_other()?;
+    final_file: bool,
+) -> Result<u64, tinyfs::Error> {
+    let raw = std::fs::read(&host_file.path).map_other()?;
     let filename = host_file
         .path
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| tinyfs::Error::Other("Invalid filename".to_string()))?;
 
-    let blake3_hash = blake3::hash(&content);
+    let content = ingestible_slice(config, &raw, final_file);
+
+    if content.is_empty() {
+        debug!(
+            "New file {} has no complete line yet ({} bytes buffered); deferring",
+            host_file.path.display(),
+            raw.len()
+        );
+        return Ok(0);
+    }
+
+    let blake3_hash = blake3::hash(content);
 
     let pond_dest = format!("{}/{}", config.pond_path, filename);
 
     info!(
-        "Ingesting new file: {} -> {} ({} bytes, blake3={})",
+        "Ingesting new file: {} -> {} ({} of {} bytes, blake3={})",
         host_file.path.display(),
         pond_dest,
         content.len(),
+        raw.len(),
         &blake3_hash.to_hex()[..16]
     );
 
@@ -1012,13 +1060,13 @@ async fn ingest_new_file(
         .await?;
 
     // Write content and finalize
-    writer.write_all(&content).await.map_other()?;
-    attach_temporal_bounds(&mut writer, config, &content, &pond_dest);
+    writer.write_all(content).await.map_other()?;
+    attach_temporal_bounds(&mut writer, config, content, &pond_dest);
     writer.shutdown().await.map_other()?;
 
     info!("Wrote file to pond: {}", pond_dest);
 
-    Ok(())
+    Ok(content.len() as u64)
 }
 
 /// Ingest an append to an existing active file
@@ -1027,7 +1075,7 @@ async fn ingest_append(
     config: &LogfileIngestConfig,
     host_file: &HostFileState,
     pond_state: &PondFileState,
-) -> Result<(), tinyfs::Error> {
+) -> Result<u64, tinyfs::Error> {
     let filename = host_file
         .path
         .file_name()
@@ -1084,23 +1132,38 @@ async fn ingest_append(
     // Write new version as FilePhysicalSeries
     // TinyFS automatically maintains cumulative blake3 and bao_outboard
     use tokio::io::AsyncWriteExt;
+
+    // The active file is still being written, so the slice may end mid-record.
+    // Withhold that fragment: the next tick sees it as growth and picks it up
+    // once the line is complete.
+    let new_content = ingestible_slice(config, &new_content, false);
+    if new_content.is_empty() {
+        debug!(
+            "Append to {} contains no complete line yet ({} bytes buffered); deferring",
+            filename, bytes_to_read
+        );
+        return Ok(0);
+    }
+
     let mut writer = root
         .async_writer_path_with_type(&pond_dest, EntryType::FilePhysicalSeries)
         .await?;
 
     // Write only the new content (as a new version in the FilePhysicalSeries)
     // The ChainedReader will concatenate all versions when reading
-    writer.write_all(&new_content).await.map_other()?;
-    attach_temporal_bounds(&mut writer, config, &new_content, &pond_dest);
+    writer.write_all(new_content).await.map_other()?;
+    attach_temporal_bounds(&mut writer, config, new_content, &pond_dest);
     writer.shutdown().await.map_other()?;
 
     info!(
-        "Wrote append to pond: {} version {}",
+        "Wrote append to pond: {} version {} ({} of {} new bytes)",
         pond_dest,
-        pond_state.version + 1
+        pond_state.version + 1,
+        new_content.len(),
+        bytes_to_read
     );
 
-    Ok(())
+    Ok(new_content.len() as u64)
 }
 
 /// Find which archived file matches the pond's tracked content (for rotation detection)
@@ -1409,8 +1472,10 @@ mod tests {
 
     #[test]
     fn an_unparseable_line_abandons_the_scan() {
-        // A torn write must not yield bounds covering only the lines that did
-        // parse -- the rest of the slice would then be outside its own range.
+        // Bounds covering only the lines that parsed would leave the rest of
+        // the slice outside its own range. Since slices are line-aligned before
+        // they are written, reaching this case means genuinely corrupt input,
+        // and the declared temporal requirement turns it into a failed write.
         let content = format!("{}\n{{\"resourceMetrics\":\n", otlp_line(&["1000000000"]));
         assert_eq!(
             scan_temporal_bounds(
@@ -1536,5 +1601,104 @@ mod tests {
             timestamp_unit: TimestampUnit::default(),
         };
         assert!(config.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod line_alignment_tests {
+    use super::*;
+
+    fn timestamped() -> LogfileIngestConfig {
+        LogfileIngestConfig {
+            active_pattern: String::new(),
+            archived_pattern: String::new(),
+            pond_path: "/ingest".to_string(),
+            timestamp_field: Some("timeUnixNano".to_string()),
+            timestamp_unit: Default::default(),
+        }
+    }
+
+    fn opaque() -> LogfileIngestConfig {
+        LogfileIngestConfig {
+            timestamp_field: None,
+            ..timestamped()
+        }
+    }
+
+    #[test]
+    fn an_opaque_stream_is_never_withheld() {
+        // Without a timestamp_field the operator has not said these are
+        // records, and the file may contain no newline at all -- aligning
+        // would withhold it forever rather than merely until the next tick.
+        let no_newline = &b"\x00\x01binary"[..];
+        assert_eq!(ingestible_slice(&opaque(), no_newline, false), no_newline);
+
+        let partial = &b"{\"a\":1}\n{\"b\":"[..];
+        assert_eq!(ingestible_slice(&opaque(), partial, false), partial);
+    }
+
+    #[test]
+    fn a_final_file_is_never_withheld() {
+        // A rotated or archived file is no longer appended to, so its last
+        // line is complete with or without a trailing newline.
+        let unterminated = &b"{\"a\":1}\n{\"b\":2}"[..];
+        assert_eq!(
+            ingestible_slice(&timestamped(), unterminated, true),
+            unterminated
+        );
+        assert_eq!(
+            ingestible_slice(&timestamped(), unterminated, false),
+            b"{\"a\":1}\n"
+        );
+    }
+
+    #[test]
+    fn a_trailing_partial_line_is_withheld() {
+        let slice = b"{\"a\":1}\n{\"b\":2}\n{\"c\":";
+        assert_eq!(complete_lines(slice), b"{\"a\":1}\n{\"b\":2}\n");
+    }
+
+    #[test]
+    fn a_slice_ending_on_a_newline_is_kept_whole() {
+        let slice = b"{\"a\":1}\n{\"b\":2}\n";
+        assert_eq!(complete_lines(slice), slice);
+    }
+
+    #[test]
+    fn a_slice_with_no_newline_yet_yields_nothing() {
+        // One record still being written. Deferring keeps the pond's cumulative
+        // size behind the host's, so the next tick sees it as growth.
+        assert_eq!(complete_lines(b"{\"a\":"), b"");
+        assert_eq!(complete_lines(b""), b"");
+    }
+
+    #[test]
+    fn successive_aligned_slices_reconstruct_the_source() {
+        // The property the pond depends on: withholding a fragment must lose no
+        // bytes and must leave every slice starting at a record boundary.
+        let source = b"{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n";
+        let mut consumed = 0usize;
+        let mut versions: Vec<&[u8]> = Vec::new();
+
+        // Feed the source in awkward chunks that mostly split mid-record.
+        for end in [3usize, 9, 12, 17, 20, source.len()] {
+            let slice = complete_lines(&source[consumed..end]);
+            if slice.is_empty() {
+                continue;
+            }
+            versions.push(slice);
+            consumed += slice.len();
+        }
+
+        assert_eq!(consumed, source.len());
+        assert_eq!(versions.concat(), source);
+        for version in &versions {
+            assert!(version.ends_with(b"\n"));
+            // Every version is independently parseable, which is what makes
+            // its temporal bounds computable.
+            for line in std::str::from_utf8(version).unwrap().lines() {
+                assert!(serde_json::from_str::<Value>(line).is_ok(), "line: {line}");
+            }
+        }
     }
 }
