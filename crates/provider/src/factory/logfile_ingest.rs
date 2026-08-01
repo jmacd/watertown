@@ -81,6 +81,80 @@ pub struct LogfileIngestConfig {
     /// Destination path within the pond (relative to pond root)
     /// Example: "logs/casparwater"
     pub pond_path: String,
+
+    /// JSON key holding the event time of a record, looked up at any depth in
+    /// each line. Example: "timeUnixNano" for OTLP metrics JSON.
+    ///
+    /// Absent by default, which leaves versions without event-time bounds.
+    /// That is not free: `temporal-reduce` reads these bounds to decide which
+    /// cached segments a new source version can have touched, and a version
+    /// without them is taken to span all of time (`SourceRange::UNKNOWN`), so
+    /// every build unseals every segment and recomputes the whole history from
+    /// source. Setting this is what keeps an incremental build incremental.
+    #[serde(default)]
+    pub timestamp_field: Option<String>,
+
+    /// Unit of the `timestamp_field` values. OTLP's `timeUnixNano` is
+    /// nanoseconds; journald's `__REALTIME_TIMESTAMP` is microseconds.
+    #[serde(default)]
+    pub timestamp_unit: TimestampUnit,
+}
+
+/// Unit of the values found under `timestamp_field`.
+///
+/// tlogfs records event times in microseconds, so everything is converted to
+/// that. Microseconds is the default because it is what tlogfs itself uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TimestampUnit {
+    Seconds,
+    Milliseconds,
+    #[default]
+    Microseconds,
+    Nanoseconds,
+}
+
+impl TimestampUnit {
+    /// Microseconds per unit.
+    fn per_micro(self) -> (i64, bool) {
+        // (factor, divide) -- divide when the unit is finer than a microsecond.
+        match self {
+            TimestampUnit::Seconds => (1_000_000, false),
+            TimestampUnit::Milliseconds => (1_000, false),
+            TimestampUnit::Microseconds => (1, false),
+            TimestampUnit::Nanoseconds => (1_000, true),
+        }
+    }
+
+    /// Convert to microseconds, rounding DOWN.
+    ///
+    /// Rounding direction matters: these bounds gate which cached buckets get
+    /// recomputed, so each end must round outward. A lower bound that rounded
+    /// up could place a record after the range that claims to contain it, and
+    /// the buckets it feeds would never be invalidated.
+    fn to_micros_floor(self, raw: i64) -> Option<i64> {
+        let (factor, divide) = self.per_micro();
+        if divide {
+            Some(raw.div_euclid(factor))
+        } else {
+            raw.checked_mul(factor)
+        }
+    }
+
+    /// Convert to microseconds, rounding UP. See `to_micros_floor`.
+    fn to_micros_ceil(self, raw: i64) -> Option<i64> {
+        let (factor, divide) = self.per_micro();
+        if divide {
+            let q = raw.div_euclid(factor);
+            if raw.rem_euclid(factor) == 0 {
+                Some(q)
+            } else {
+                q.checked_add(1)
+            }
+        } else {
+            raw.checked_mul(factor)
+        }
+    }
 }
 
 impl LogfileIngestConfig {
@@ -104,7 +178,123 @@ impl LogfileIngestConfig {
             ));
         }
 
+        if self.timestamp_field.as_deref() == Some("") {
+            return Err(tinyfs::Error::Other(
+                "timestamp_field cannot be empty".to_string(),
+            ));
+        }
+
         Ok(())
+    }
+}
+
+/// Event-time bounds of one version's content, in microseconds, `max`
+/// inclusive -- the shape `set_temporal_metadata` wants.
+///
+/// Returns `None` when bounds cannot be established for the whole slice, and
+/// the caller then writes the version without them. That is the safe
+/// direction: a missing bound makes the downstream rollup pessimistic (it
+/// recomputes everything), whereas a bound that is too narrow would let it
+/// skip buckets this content belongs to and silently keep stale aggregates.
+/// So every uncertainty here -- an unparseable line, a timestamp that is not
+/// an integer, an overflowing conversion -- abandons the scan rather than
+/// guessing.
+///
+/// Cost is proportional to the bytes being written, not to the file: the
+/// append path passes only the new tail.
+fn scan_temporal_bounds(content: &[u8], field: &str, unit: TimestampUnit) -> Option<(i64, i64)> {
+    let text = std::str::from_utf8(content).ok()?;
+    let mut acc: Option<(i64, i64)> = None;
+
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(line).ok()?;
+        if !fold_timestamps(&value, field, &mut acc) {
+            return None;
+        }
+    }
+
+    let (min_raw, max_raw) = acc?;
+    Some((
+        unit.to_micros_floor(min_raw)?,
+        unit.to_micros_ceil(max_raw)?,
+    ))
+}
+
+/// Fold every value stored under `field`, at any depth of `value`, into `acc`
+/// as a running (min, max).
+///
+/// Returns false if a value under that key is not an integer, which abandons
+/// the scan -- see `scan_temporal_bounds` for why that is preferred to
+/// skipping it.
+fn fold_timestamps(value: &Value, field: &str, acc: &mut Option<(i64, i64)>) -> bool {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if key == field {
+                    // OTLP writes 64-bit times as JSON strings; journald and
+                    // plain numeric logs write them as numbers.
+                    let Some(ts) = (match child {
+                        Value::String(s) => s.parse::<i64>().ok(),
+                        Value::Number(n) => n.as_i64(),
+                        _ => None,
+                    }) else {
+                        return false;
+                    };
+                    *acc = Some(match *acc {
+                        Some((lo, hi)) => (lo.min(ts), hi.max(ts)),
+                        None => (ts, ts),
+                    });
+                } else if !fold_timestamps(child, field, acc) {
+                    return false;
+                }
+            }
+            true
+        }
+        Value::Array(items) => items.iter().all(|v| fold_timestamps(v, field, acc)),
+        _ => true,
+    }
+}
+
+/// Record event-time bounds on a version about to be finalized, when the
+/// config asks for them.
+///
+/// Must be called after the content is written and before `shutdown`, which is
+/// when the metadata is folded into the oplog entry.
+///
+/// A slice whose bounds cannot be determined is written without them and warns
+/// rather than failing: ingest keeping the data flowing matters more than the
+/// downstream rollup staying pruned, and the rollup degrades to a correct (if
+/// expensive) full recompute. The warning is there because that degradation is
+/// otherwise invisible -- it shows up only as a slow, memory-hungry build.
+fn attach_temporal_bounds(
+    writer: &mut std::pin::Pin<Box<dyn tinyfs::FileMetadataWriter>>,
+    config: &LogfileIngestConfig,
+    content: &[u8],
+    pond_dest: &str,
+) {
+    let Some(field) = config.timestamp_field.as_deref() else {
+        return;
+    };
+
+    match scan_temporal_bounds(content, field, config.timestamp_unit) {
+        Some((min_us, max_us)) => {
+            debug!(
+                "Temporal bounds for {}: [{}, {}] us from '{}'",
+                pond_dest, min_us, max_us, field
+            );
+            writer.set_temporal_metadata(min_us, max_us, field.to_string());
+        }
+        None => warn!(
+            "No usable '{}' timestamps in {} bytes for {}; writing without event-time bounds \
+             (downstream temporal-reduce will treat this version as spanning all time and \
+             recompute its cache in full)",
+            field,
+            content.len(),
+            pond_dest
+        ),
     }
 }
 
@@ -823,6 +1013,7 @@ async fn ingest_new_file(
 
     // Write content and finalize
     writer.write_all(&content).await.map_other()?;
+    attach_temporal_bounds(&mut writer, config, &content, &pond_dest);
     writer.shutdown().await.map_other()?;
 
     info!("Wrote file to pond: {}", pond_dest);
@@ -900,6 +1091,7 @@ async fn ingest_append(
     // Write only the new content (as a new version in the FilePhysicalSeries)
     // The ChainedReader will concatenate all versions when reading
     writer.write_all(&new_content).await.map_other()?;
+    attach_temporal_bounds(&mut writer, config, &new_content, &pond_dest);
     writer.shutdown().await.map_other()?;
 
     info!(
@@ -998,6 +1190,7 @@ async fn append_to_active_pond_file(
         .await?;
 
     writer.write_all(new_data).await.map_other()?;
+    attach_temporal_bounds(&mut writer, config, new_data, &pond_dest);
     writer.shutdown().await.map_other()?;
 
     info!("Appended missed bytes to pond file: {}", pond_dest);
@@ -1034,6 +1227,8 @@ mod tests {
             archived_pattern: "/var/log/test-*.json".to_string(),
             active_pattern: "/var/log/test.json".to_string(),
             pond_path: "logs/test".to_string(),
+            timestamp_field: None,
+            timestamp_unit: TimestampUnit::default(),
         };
 
         assert!(config.validate().is_ok());
@@ -1045,6 +1240,8 @@ mod tests {
             archived_pattern: "/var/log/test-*.json".to_string(),
             active_pattern: "/var/log/test.json".to_string(),
             pond_path: "".to_string(),
+            timestamp_field: None,
+            timestamp_unit: TimestampUnit::default(),
         };
 
         assert!(config.validate().is_err());
@@ -1145,5 +1342,199 @@ mod tests {
         mutated[BLOCK_SIZE / 2] ^= 0x01;
         let host = write_host(&mutated);
         assert!(!verify_prefix_matches(host.path(), &state).unwrap().0);
+    }
+
+    // ---- event-time bounds -------------------------------------------------
+    //
+    // These bounds are what keeps `temporal-reduce` from unsealing its whole
+    // cache on every build, so the cases that matter most are the ones where a
+    // bound must NOT be produced: a wrong-but-plausible bound is worse than no
+    // bound, because it silently suppresses a recompute.
+
+    /// One OTLP metrics line, shaped like the real ingest input.
+    fn otlp_line(times_ns: &[&str]) -> String {
+        let points: Vec<String> = times_ns
+            .iter()
+            .map(|t| format!(r#"{{"timeUnixNano":"{}","asDouble":1.5}}"#, t))
+            .collect();
+        format!(
+            r#"{{"resourceMetrics":[{{"resource":{{}},"scopeMetrics":[{{"scope":{{"name":"modbus"}},"metrics":[{{"name":"m","gauge":{{"dataPoints":[{}]}}}}]}}]}}]}}"#,
+            points.join(",")
+        )
+    }
+
+    #[test]
+    fn nanosecond_bounds_round_outward() {
+        // 1779907425563251857ns = 1779907425563251.857us: the low end must
+        // floor and the high end must ceil, so neither can land inside the
+        // data it is supposed to enclose.
+        let line = otlp_line(&["1779907425563251857"]);
+        let (min_us, max_us) =
+            scan_temporal_bounds(line.as_bytes(), "timeUnixNano", TimestampUnit::Nanoseconds)
+                .expect("bounds");
+        assert_eq!(min_us, 1779907425563251);
+        assert_eq!(max_us, 1779907425563252);
+    }
+
+    #[test]
+    fn bounds_span_every_line_and_every_point() {
+        let content = format!(
+            "{}\n{}\n",
+            otlp_line(&["2000000000", "5000000000"]),
+            otlp_line(&["1000000000", "3000000000"])
+        );
+        let (min_us, max_us) = scan_temporal_bounds(
+            content.as_bytes(),
+            "timeUnixNano",
+            TimestampUnit::Nanoseconds,
+        )
+        .expect("bounds");
+        assert_eq!(min_us, 1_000_000);
+        assert_eq!(max_us, 5_000_000);
+    }
+
+    #[test]
+    fn blank_lines_are_skipped_not_fatal() {
+        // A trailing newline is normal for an appended slice.
+        let content = format!("{}\n\n", otlp_line(&["1000000000"]));
+        assert!(
+            scan_temporal_bounds(
+                content.as_bytes(),
+                "timeUnixNano",
+                TimestampUnit::Nanoseconds
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn an_unparseable_line_abandons_the_scan() {
+        // A torn write must not yield bounds covering only the lines that did
+        // parse -- the rest of the slice would then be outside its own range.
+        let content = format!("{}\n{{\"resourceMetrics\":\n", otlp_line(&["1000000000"]));
+        assert_eq!(
+            scan_temporal_bounds(
+                content.as_bytes(),
+                "timeUnixNano",
+                TimestampUnit::Nanoseconds
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_non_integer_timestamp_abandons_the_scan() {
+        let content =
+            r#"{"resourceMetrics":[{"gauge":{"dataPoints":[{"timeUnixNano":"not-a-number"}]}}]}"#;
+        assert_eq!(
+            scan_temporal_bounds(
+                content.as_bytes(),
+                "timeUnixNano",
+                TimestampUnit::Nanoseconds
+            ),
+            None
+        );
+
+        let nested = r#"{"timeUnixNano":{"oops":1}}"#;
+        assert_eq!(
+            scan_temporal_bounds(
+                nested.as_bytes(),
+                "timeUnixNano",
+                TimestampUnit::Nanoseconds
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_line_without_the_field_yields_no_bounds() {
+        let content = r#"{"resourceMetrics":[{"scopeMetrics":[]}]}"#;
+        assert_eq!(
+            scan_temporal_bounds(
+                content.as_bytes(),
+                "timeUnixNano",
+                TimestampUnit::Nanoseconds
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn numeric_and_string_timestamps_are_both_accepted() {
+        // journald writes microseconds as a string; other logs use a number.
+        let as_number = r#"{"ts":1700000000000000}"#;
+        let as_string = r#"{"ts":"1700000000000000"}"#;
+        let expected = Some((1700000000000000, 1700000000000000));
+        assert_eq!(
+            scan_temporal_bounds(as_number.as_bytes(), "ts", TimestampUnit::Microseconds),
+            expected
+        );
+        assert_eq!(
+            scan_temporal_bounds(as_string.as_bytes(), "ts", TimestampUnit::Microseconds),
+            expected
+        );
+    }
+
+    #[test]
+    fn coarser_units_scale_up() {
+        assert_eq!(
+            scan_temporal_bounds(br#"{"ts":1700000000}"#, "ts", TimestampUnit::Seconds),
+            Some((1_700_000_000_000_000, 1_700_000_000_000_000))
+        );
+        assert_eq!(
+            scan_temporal_bounds(
+                br#"{"ts":1700000000000}"#,
+                "ts",
+                TimestampUnit::Milliseconds
+            ),
+            Some((1_700_000_000_000_000, 1_700_000_000_000_000))
+        );
+    }
+
+    #[test]
+    fn an_overflowing_conversion_yields_no_bounds() {
+        let content = format!(r#"{{"ts":{}}}"#, i64::MAX);
+        assert_eq!(
+            scan_temporal_bounds(content.as_bytes(), "ts", TimestampUnit::Seconds),
+            None
+        );
+    }
+
+    #[test]
+    fn config_without_timestamp_fields_still_parses() {
+        // Every deployed config predates these fields; none may start failing
+        // validation, and all must keep today's no-bounds behaviour.
+        let yaml = "archived_pattern: /data/x-*.json\n\
+                    active_pattern: /data/x.json\n\
+                    pond_path: /ingest\n";
+        let parsed = validate_config(yaml.as_bytes()).expect("valid");
+        let config: LogfileIngestConfig = serde_json::from_value(parsed).expect("round-trip");
+        assert_eq!(config.timestamp_field, None);
+        assert_eq!(config.timestamp_unit, TimestampUnit::Microseconds);
+    }
+
+    #[test]
+    fn config_with_timestamp_fields_parses() {
+        let yaml = "archived_pattern: /data/x-*.json\n\
+                    active_pattern: /data/x.json\n\
+                    pond_path: /ingest\n\
+                    timestamp_field: timeUnixNano\n\
+                    timestamp_unit: nanoseconds\n";
+        let parsed = validate_config(yaml.as_bytes()).expect("valid");
+        let config: LogfileIngestConfig = serde_json::from_value(parsed).expect("round-trip");
+        assert_eq!(config.timestamp_field.as_deref(), Some("timeUnixNano"));
+        assert_eq!(config.timestamp_unit, TimestampUnit::Nanoseconds);
+    }
+
+    #[test]
+    fn an_empty_timestamp_field_is_rejected() {
+        let config = LogfileIngestConfig {
+            archived_pattern: "/var/log/test-*.json".to_string(),
+            active_pattern: "/var/log/test.json".to_string(),
+            pond_path: "logs/test".to_string(),
+            timestamp_field: Some("".to_string()),
+            timestamp_unit: TimestampUnit::default(),
+        };
+        assert!(config.validate().is_err());
     }
 }
