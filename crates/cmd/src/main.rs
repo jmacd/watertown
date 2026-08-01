@@ -441,28 +441,6 @@ enum Commands {
         #[arg(num_args = 0..)]
         args: Vec<String>,
     },
-    /// Detect temporal overlaps using complete time series data analysis
-    DetectOverlaps {
-        /// Series file patterns to analyze (e.g., "/sensors/*.series")
-        patterns: Vec<String>,
-        /// Show detailed overlap analysis with row-level data
-        #[arg(long)]
-        verbose: bool,
-        /// Output format [default: summary] [possible values: summary, full]
-        #[arg(long, default_value = "summary")]
-        format: String,
-    },
-    /// Set temporal bounds override for files
-    SetTemporalBounds {
-        /// File pattern to apply bounds to
-        pattern: String,
-        /// Minimum timestamp (human-readable, e.g., "2024-01-01 00:00:00", "2024-01-01T00:00:00Z")
-        #[arg(long)]
-        min_time: Option<String>,
-        /// Maximum timestamp (human-readable, e.g., "2024-12-31 23:59:59", "2024-12-31T23:59:59Z")
-        #[arg(long)]
-        max_time: Option<String>,
-    },
     /// Export pond data to external Parquet files with time partitioning
     Export {
         /// File patterns to export (e.g., "/sensors/*.series")
@@ -788,18 +766,6 @@ async fn main() -> Result<()> {
         Commands::ListFactories => commands::list_factories_command().await,
         Commands::Apply { files } => commands::apply_command(&ship_context, &files).await,
         Commands::Run { path, args } => commands::run_command(&ship_context, &path, args).await,
-        Commands::DetectOverlaps {
-            patterns,
-            verbose,
-            format,
-        } => commands::detect_overlaps_command(&ship_context, &patterns, verbose, &format).await,
-        Commands::SetTemporalBounds {
-            pattern,
-            min_time,
-            max_time,
-        } => {
-            commands::set_temporal_bounds_command(&ship_context, pattern, min_time, max_time).await
-        }
         Commands::Export {
             pattern,
             dir,

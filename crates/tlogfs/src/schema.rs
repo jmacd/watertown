@@ -24,8 +24,6 @@ pub struct ExtendedAttributes {
 /// Watertown system metadata key constants
 pub mod watertown {
     pub const TIMESTAMP_COLUMN: &str = "watertown.timestamp_column";
-    pub const MIN_TEMPORAL_OVERRIDE: &str = "watertown.min_temporal_override";
-    pub const MAX_TEMPORAL_OVERRIDE: &str = "watertown.max_temporal_override";
 }
 
 impl ExtendedAttributes {
@@ -56,45 +54,6 @@ impl ExtendedAttributes {
             .get(watertown::TIMESTAMP_COLUMN)
             .map(|s| s.as_str())
             .unwrap_or("Timestamp") // Default column name
-    }
-
-    /// Set temporal overrides (convenience method for setting both min/max)
-    pub fn set_temporal_overrides(
-        &mut self,
-        min_override: Option<i64>,
-        max_override: Option<i64>,
-    ) -> &mut Self {
-        if let Some(min) = min_override {
-            _ = self.attributes.insert(
-                watertown::MIN_TEMPORAL_OVERRIDE.to_string(),
-                min.to_string(),
-            );
-        }
-        if let Some(max) = max_override {
-            _ = self.attributes.insert(
-                watertown::MAX_TEMPORAL_OVERRIDE.to_string(),
-                max.to_string(),
-            );
-        }
-        self
-    }
-
-    /// Get temporal overrides from extended attributes
-    #[must_use]
-    pub fn temporal_overrides(&self) -> Option<(i64, i64)> {
-        let min = self
-            .attributes
-            .get(watertown::MIN_TEMPORAL_OVERRIDE)
-            .and_then(|s| s.parse::<i64>().ok());
-        let max = self
-            .attributes
-            .get(watertown::MAX_TEMPORAL_OVERRIDE)
-            .and_then(|s| s.parse::<i64>().ok());
-
-        match (min, max) {
-            (Some(min), Some(max)) => Some((min, max)),
-            _ => None,
-        }
     }
 
     /// Set/get raw attributes (for future extensibility)
@@ -257,12 +216,6 @@ pub struct OplogEntry {
     /// Maximum timestamp from data column for fast SQL range queries
     /// Some() for FileSeries entries, None for other entry types
     pub max_event_time: Option<i64>,
-    /// Manual override for minimum timestamp (temporal overlap resolution)
-    /// Some() when user manually restricts the temporal range, None for auto-detected bounds
-    pub min_override: Option<i64>,
-    /// Manual override for maximum timestamp (temporal overlap resolution)
-    /// Some() when user manually restricts the temporal range, None for auto-detected bounds
-    pub max_override: Option<i64>,
     /// Extended attributes - immutable metadata set at file creation
     /// JSON-encoded key-value pairs for application-specific metadata
     /// For FileSeries: includes timestamp column name and other series metadata
@@ -489,8 +442,6 @@ impl ForArrow for OplogEntry {
             // NEW: Temporal metadata fields for FileSeries support
             Arc::new(Field::new("min_event_time", DataType::Int64, true)), // Min timestamp from data for fast queries
             Arc::new(Field::new("max_event_time", DataType::Int64, true)), // Max timestamp from data for fast queries
-            Arc::new(Field::new("min_override", DataType::Int64, true)), // Manual override for temporal bounds
-            Arc::new(Field::new("max_override", DataType::Int64, true)), // Manual override for temporal bounds
             Arc::new(Field::new("extended_attributes", DataType::Utf8, true)), // JSON-encoded application metadata
             Arc::new(Field::new("factory", DataType::Utf8, true)), // Factory type for dynamic files/directories
             Arc::new(Field::new("format", DataType::Utf8, false)), // Storage format - required field
@@ -539,8 +490,6 @@ impl OplogEntry {
             // Temporal metadata - None for non-series files
             min_event_time: None,
             max_event_time: None,
-            min_override: None,
-            max_override: None,
             extended_attributes: None,
             factory: None,
             format: StorageFormat::Inline, // Small files use inline storage
@@ -582,8 +531,6 @@ impl OplogEntry {
             // Temporal metadata - None for non-series files
             min_event_time: None,
             max_event_time: None,
-            min_override: None,
-            max_override: None,
             extended_attributes: None,
             factory: None,
             format: StorageFormat::Inline, // Large files use inline format (content is external)
@@ -623,8 +570,6 @@ impl OplogEntry {
             // Temporal metadata - None for directories and symlinks
             min_event_time: None,
             max_event_time: None,
-            min_override: None,
-            max_override: None,
             extended_attributes: None,
             factory: None,
             format: StorageFormat::Inline, // Symlinks and small metadata use inline storage
@@ -682,8 +627,6 @@ impl OplogEntry {
             // Temporal metadata for efficient DataFusion queries
             min_event_time: Some(min_event_time),
             max_event_time: Some(max_event_time),
-            min_override: None, // No overrides by default
-            max_override: None, // No overrides by default
             extended_attributes: Some(extended_attributes.to_json().unwrap_or_default()),
             factory: None,                 // Physical file, no factory
             format: StorageFormat::Inline, // Small FileSeries use inline storage
@@ -733,8 +676,6 @@ impl OplogEntry {
             // Temporal metadata for efficient DataFusion queries
             min_event_time: Some(min_event_time),
             max_event_time: Some(max_event_time),
-            min_override: None, // No overrides by default
-            max_override: None, // No overrides by default
             extended_attributes: Some(extended_attributes.to_json().unwrap_or_default()),
             factory: None,                 // Physical file, no factory
             format: StorageFormat::Inline, // Large FileSeries use inline format (content is external)
@@ -767,39 +708,6 @@ impl OplogEntry {
             (Some(min), Some(max)) => Some((min, max)),
             _ => None,
         }
-    }
-
-    /// Get temporal overrides if set
-    #[must_use]
-    pub fn temporal_overrides(&self) -> Option<(i64, i64)> {
-        match (self.min_override, self.max_override) {
-            (Some(min), Some(max)) => Some((min, max)),
-            _ => None,
-        }
-    }
-
-    /// Get effective temporal range (overrides take precedence over auto-detected range)
-    /// This is the key method for temporal overlap detection and resolution
-    #[must_use]
-    pub fn effective_temporal_range(&self) -> Option<(i64, i64)> {
-        // Use overrides if available, otherwise fall back to auto-detected range
-        if let Some(overrides) = self.temporal_overrides() {
-            Some(overrides)
-        } else {
-            self.temporal_range()
-        }
-    }
-
-    /// Set temporal overrides (for command-line tools)
-    pub fn set_temporal_overrides(&mut self, min_override: Option<i64>, max_override: Option<i64>) {
-        self.min_override = min_override;
-        self.max_override = max_override;
-    }
-
-    /// Clear temporal overrides (reset to auto-detected bounds)
-    pub fn clear_temporal_overrides(&mut self) {
-        self.min_override = None;
-        self.max_override = None;
     }
 
     /// Extract consolidated metadata
@@ -860,8 +768,6 @@ impl OplogEntry {
             size: None,
             min_event_time: None,
             max_event_time: None,
-            min_override: None,
-            max_override: None,
             extended_attributes: None,
             factory: Some(factory_type.to_string()), // Factory type identifier
             format: StorageFormat::Inline,           // Config is always inline
@@ -1057,8 +963,6 @@ impl OplogEntry {
             size: None,
             min_event_time: None,
             max_event_time: None,
-            min_override: None,
-            max_override: None,
             extended_attributes: None,
             factory: None,
             format: StorageFormat::FullDir, // Full directory snapshot

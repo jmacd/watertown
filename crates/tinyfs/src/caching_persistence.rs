@@ -269,12 +269,6 @@ impl<P: PersistenceLayer + Send + Sync + 'static> PersistenceLayer for CachingPe
 
         self.inner.set_extended_attributes(id, attributes).await
     }
-
-    async fn get_temporal_bounds(&self, id: FileID) -> Result<Option<(i64, i64)>> {
-        // Temporal bounds are immutable per version, so no caching/invalidation needed
-        // Just pass through to inner persistence layer
-        self.inner.get_temporal_bounds(id).await
-    }
 }
 
 #[cfg(test)]

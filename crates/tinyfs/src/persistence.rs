@@ -99,20 +99,4 @@ pub trait PersistenceLayer: Send + Sync {
         id: FileID,
         attributes: HashMap<String, String>,
     ) -> Result<()>;
-
-    /// Get temporal bounds for a FileSeries node
-    ///
-    /// Returns the time range (min_time, max_time) that this FileSeries covers,
-    /// used for data quality filtering at the Parquet reader level.
-    ///
-    /// This is similar to node metadata but optimized for performance:
-    /// - tlogfs stores temporal bounds in dedicated OplogEntry columns (not in attributes map)
-    /// - This allows efficient queries without deserializing JSON metadata
-    /// - Common use case: filter out garbage data outside valid time range
-    ///
-    /// Returns:
-    /// - Ok(Some((min, max))) if the node is a FileSeries with temporal bounds
-    /// - Ok(None) if the node has no temporal bounds or is not a FileSeries
-    /// - Err(_) if the query fails
-    async fn get_temporal_bounds(&self, id: FileID) -> Result<Option<(i64, i64)>>;
 }

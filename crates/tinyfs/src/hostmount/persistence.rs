@@ -297,9 +297,4 @@ impl PersistenceLayer for HostmountPersistence {
         log::debug!("set_extended_attributes is a no-op on hostmount");
         Ok(())
     }
-
-    async fn get_temporal_bounds(&self, _id: FileID) -> Result<Option<(i64, i64)>> {
-        // Host files don't have temporal bounds metadata
-        Ok(None)
-    }
 }

@@ -82,17 +82,6 @@ async fn test_metadata_root() {
 }
 
 #[tokio::test]
-async fn test_temporal_bounds_always_none() {
-    let dir = create_test_tree();
-    let persistence = HostmountPersistence::new(dir.path().to_path_buf()).unwrap();
-    let bounds = persistence
-        .get_temporal_bounds(FileID::root())
-        .await
-        .unwrap();
-    assert!(bounds.is_none());
-}
-
-#[tokio::test]
 async fn test_symlinks_not_supported() {
     let dir = create_test_tree();
     let persistence = HostmountPersistence::new(dir.path().to_path_buf()).unwrap();
