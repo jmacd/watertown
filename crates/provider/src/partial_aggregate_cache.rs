@@ -326,9 +326,11 @@ pub fn segment_path(res_dir: &Path, name: &str) -> PathBuf {
     res_dir.join(name)
 }
 
-/// Read the segment manifest. `Ok(None)` when absent (fresh cache). A
-/// present-but-unparseable manifest is a hard error rather than a silent
-/// rebuild, matching the frontier/merged-cache corruption discipline.
+/// Read the segment manifest. `Ok(None)` when absent (fresh cache) or when the
+/// manifest was written under a different [`SEALED_FORMAT`], which the caller
+/// treats as a rebuild. A manifest claiming the CURRENT format but failing to
+/// parse is a hard error rather than a silent rebuild, matching the
+/// frontier/merged-cache corruption discipline.
 pub fn read_segment_manifest(res_dir: &Path) -> Result<Option<SegmentManifest>> {
     let path = segment_manifest_path(res_dir);
     let bytes = match std::fs::read(&path) {
@@ -336,6 +338,45 @@ pub fn read_segment_manifest(res_dir: &Path) -> Result<Option<SegmentManifest>> 
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(crate::error::Error::Io(e)),
     };
+
+    // Read the format tag BEFORE binding to the current struct shape.
+    //
+    // A manifest written by an older build is a DIFFERENT SCHEMA, not a corrupt
+    // one: deserializing it against today's struct fails on a missing required
+    // field. `format` carries `#[serde(default)]` precisely so a legacy manifest
+    // can be recognised and rebuilt, but that never got a chance to run -- the
+    // strict parse aborted first and the whole pond wedged on an artifact that
+    // is documented as safe to delete. Every pond carrying a cache across a
+    // format change hit this.
+    //
+    // Genuine corruption still errors: only a well-formed JSON object bearing a
+    // foreign format tag is downgraded to a rebuild. Unparseable bytes, or a
+    // manifest claiming the current format that will not bind, stay hard errors.
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(v) => {
+            let tag = v.get("format").and_then(serde_json::Value::as_str);
+            if tag != Some(SEALED_FORMAT) {
+                log::warn!(
+                    "segment manifest '{}' has format {:?}, expected '{}'; \
+                     discarding and rebuilding this resolution",
+                    path.display(),
+                    tag.unwrap_or("<absent>"),
+                    SEALED_FORMAT
+                );
+                return Ok(None);
+            }
+        }
+        Err(e) => {
+            return Err(crate::error::Error::CacheCorrupt(format!(
+                "segment manifest '{}' is not valid JSON ({}); the \
+                 partial-aggregate cache is corrupt. Re-run the export with \
+                 --rebuild to recompute it.",
+                path.display(),
+                e
+            )));
+        }
+    }
+
     serde_json::from_slice(&bytes).map(Some).map_err(|e| {
         crate::error::Error::CacheCorrupt(format!(
             "segment manifest '{}' is present but unparseable ({}); the \
@@ -613,6 +654,59 @@ mod tests {
                 .as_ref(),
             format!("/pond/cache/merged_cafef00d12345678_{node}").as_str(),
             "directory prefix must stay `merged_`"
+        );
+    }
+
+    /// A manifest from an older build must rebuild, not wedge the pond.
+    ///
+    /// This is the watershop site-staging outage: #123 changed the manifest
+    /// schema, every pond carrying a pre-#123 cache failed to deserialize it
+    /// ("missing field `segments`"), and because that was classed as corruption
+    /// the sitegen export aborted on every run for two days. The cache is
+    /// documented as throwaway -- `rm -rf {POND}/cache/` is always safe -- so
+    /// refusing to start over an old copy of it is never the right answer.
+    ///
+    /// The body below is the real shape site-staging choked on, not a
+    /// hand-minimised one: a `runs` array where `segments` now lives.
+    #[test]
+    fn a_manifest_from_an_older_format_rebuilds_instead_of_erroring() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            segment_manifest_path(dir.path()),
+            br#"{"allowed_lateness_secs":1209600,"sealed_hi_secs":1784142000,
+                "next_seq":7,"runs":[{"name":"run-00000001.parquet","hi_secs":1784142000}],
+                "hot_digest":"abc123","sources":{}}"#,
+        )
+        .unwrap();
+
+        assert!(
+            read_segment_manifest(dir.path()).unwrap().is_none(),
+            "a legacy-format manifest must read as absent so the caller wipes \
+             and rebuilds; erroring here wedges the pond on a throwaway file"
+        );
+    }
+
+    /// The flip side: relaxing the above must not blind us to real corruption.
+    /// A manifest that is not JSON at all, and one that claims the CURRENT
+    /// format but will not bind, both stay hard errors.
+    #[test]
+    fn corruption_is_still_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+
+        std::fs::write(segment_manifest_path(dir.path()), b"\x00\xff not json").unwrap();
+        assert!(
+            read_segment_manifest(dir.path()).is_err(),
+            "unparseable bytes are corruption, not a format migration"
+        );
+
+        std::fs::write(
+            segment_manifest_path(dir.path()),
+            format!(r#"{{"format":"{SEALED_FORMAT}","segments":"not-an-array"}}"#).as_bytes(),
+        )
+        .unwrap();
+        assert!(
+            read_segment_manifest(dir.path()).is_err(),
+            "a manifest claiming the current format must bind or fail loudly"
         );
     }
 
