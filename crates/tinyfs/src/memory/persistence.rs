@@ -43,10 +43,6 @@ pub struct State {
 
     // Non-file nodes (directories, symlinks): (node_id, part_id) -> Node
     nodes: HashMap<FileID, Node>,
-
-    // Temporal bounds for FileSeries nodes: FileID -> (min_time, max_time)
-    // Parallel to tlogfs OplogEntry.min_time/max_time columns
-    temporal_bounds: HashMap<FileID, (i64, i64)>,
 }
 
 impl Default for State {
@@ -58,7 +54,6 @@ impl Default for State {
         Self {
             file_versions: HashMap::new(),
             nodes: HashMap::from([(root_dir.id, root_dir)]),
-            temporal_bounds: HashMap::new(),
         }
     }
 }
@@ -171,26 +166,9 @@ impl PersistenceLayer for MemoryPersistence {
             .set_extended_attributes(id, attributes)
             .await
     }
-
-    async fn get_temporal_bounds(&self, id: FileID) -> Result<Option<(i64, i64)>> {
-        Ok(self.state.lock().await.temporal_bounds.get(&id).copied())
-    }
 }
 
 impl MemoryPersistence {
-    /// Set temporal bounds for a FileSeries node (for testing)
-    ///
-    /// Parallel to tlogfs OplogEntry.min_time/max_time columns.
-    /// Used to test low-level temporal filtering at the table provider level.
-    pub async fn set_temporal_bounds(&self, id: FileID, min_time: i64, max_time: i64) {
-        _ = self
-            .state
-            .lock()
-            .await
-            .temporal_bounds
-            .insert(id, (min_time, max_time));
-    }
-
     /// Store a file version for testing
     ///
     /// Adds a new version of a file to the in-memory storage. Versions are stored

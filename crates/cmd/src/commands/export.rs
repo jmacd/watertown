@@ -2,7 +2,6 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::commands::temporal::parse_timestamp_seconds;
 use crate::common::ShipContext;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -20,6 +19,45 @@ pub use provider::export::{
 
 // TODO: the timestamps are confusingly local and/or UTC. do not trust the
 // CLI arguments --start-time "2024-03-01 00:00:00" --end-time "2024-08-01 00:00:00"
+
+/// Parse a human-readable timestamp into whole seconds since the Unix epoch.
+fn parse_timestamp_seconds(timestamp_str: &str) -> Result<i64> {
+    // Try multiple common timestamp formats
+    let formats = [
+        "%Y-%m-%d %H:%M:%S",   // "2024-01-01 00:00:00"
+        "%Y-%m-%dT%H:%M:%S",   // "2024-01-01T00:00:00"
+        "%Y-%m-%dT%H:%M:%SZ",  // "2024-01-01T00:00:00Z"
+        "%Y-%m-%dT%H:%M:%S%z", // "2024-01-01T00:00:00+00:00"
+        "%Y-%m-%d",            // "2024-01-01" (assumes 00:00:00)
+    ];
+
+    for format in &formats {
+        // Try parsing as naive datetime first, then assume UTC
+        if let Ok(naive_dt) = chrono::NaiveDateTime::parse_from_str(timestamp_str, format) {
+            let utc_dt =
+                chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive_dt, chrono::Utc);
+            return Ok(utc_dt.timestamp());
+        }
+
+        // Try parsing as datetime with timezone
+        if let Ok(dt) = chrono::DateTime::parse_from_str(timestamp_str, format) {
+            return Ok(dt.timestamp());
+        }
+    }
+
+    // Try parsing date-only format and assume 00:00:00 UTC
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(timestamp_str, "%Y-%m-%d") {
+        let naive_dt = date.and_hms_opt(0, 0, 0).expect("midnight is always valid");
+        let utc_dt =
+            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive_dt, chrono::Utc);
+        return Ok(utc_dt.timestamp());
+    }
+
+    Err(anyhow::anyhow!(
+        "Could not parse timestamp '{}'. Supported formats: YYYY-MM-DD HH:MM:SS, YYYY-MM-DDTHH:MM:SS[Z], YYYY-MM-DD",
+        timestamp_str
+    ))
+}
 
 /// Export summary for managing metadata across multiple patterns (for display/reporting only)
 #[derive(Serialize, Clone, Default)]

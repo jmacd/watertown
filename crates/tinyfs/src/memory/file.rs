@@ -243,25 +243,6 @@ impl crate::file::QueryableFile for MemoryFile {
         let listing_table = ListingTable::try_new(config_with_schema)
             .map_other_context("ListingTable creation failed")?;
 
-        // Get temporal bounds for filtering (if any)
-        let (min_time, max_time) = context
-            .persistence
-            .get_temporal_bounds(id)
-            .await?
-            .unwrap_or((i64::MIN, i64::MAX));
-
-        // Wrap in TemporalFilteredListingTable for consistent behavior with tlogfs
-        // Note: Need to import TemporalFilteredListingTable from provider crate
-        // For now, return ListingTable directly - temporal filtering can be added when needed
-        if min_time != i64::MIN || max_time != i64::MAX {
-            log::debug!(
-                "MemoryFile temporal bounds [{}, {}] available but TemporalFilteredListingTable not yet integrated",
-                min_time,
-                max_time
-            );
-            // TODO: Wrap in provider::TemporalFilteredListingTable once provider is accessible from tinyfs
-        }
-
         Ok(Arc::new(listing_table))
     }
 }

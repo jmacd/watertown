@@ -1116,7 +1116,7 @@ async fn scan_live_rows(
 /// [`OplogEntry`] (with `content`/`bao_outboard` left `None`).
 const NARROW_META_SQL: &str = "SELECT part_id, node_id, file_type, timestamp, version, \
      arrow_cast(NULL, 'Binary') AS content, blake3, size, min_event_time, max_event_time, \
-     min_override, max_override, extended_attributes, factory, format, txn_seq, pond_id, \
+     extended_attributes, factory, format, txn_seq, pond_id, \
      arrow_cast(NULL, 'Binary') AS bao_outboard, collapsed_through, collapsed_from \
      FROM content_live ORDER BY pond_id, part_id, node_id, version";
 

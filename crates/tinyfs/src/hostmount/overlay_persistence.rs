@@ -145,8 +145,4 @@ impl PersistenceLayer for OverlayPersistence {
     ) -> Result<()> {
         self.inner.set_extended_attributes(id, attributes).await
     }
-
-    async fn get_temporal_bounds(&self, id: FileID) -> Result<Option<(i64, i64)>> {
-        self.inner.get_temporal_bounds(id).await
-    }
 }

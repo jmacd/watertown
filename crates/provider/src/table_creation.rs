@@ -17,10 +17,7 @@ use std::sync::Arc;
 use tinyfs::{FileID, ProviderContext};
 
 use crate::Result;
-use crate::{
-    TableProviderKey, TableProviderOptions, VersionSelection,
-    transform::temporal_filter::TemporalFilteredListingTable,
-};
+use crate::{TableProviderKey, TableProviderOptions, VersionSelection};
 
 /// Create a TableProvider from a FileID with configurable options
 ///
@@ -28,12 +25,11 @@ use crate::{
 /// 1. Checks cache for existing providers (if no additional_urls)
 /// 2. Creates ListingTableConfig from URL pattern(s)
 /// 3. Infers schema using DataFusion (merges across versions, skips 0-byte files)
-/// 4. Wraps in TemporalFilteredListingTable for data quality filtering
-/// 5. Caches result for future queries (if no additional_urls)
+/// 4. Caches result for future queries (if no additional_urls)
 ///
 /// # Arguments
 /// * `file_id` - FileID containing node_id and part_id for partition pruning
-/// * `context` - ProviderContext for session access, caching, and temporal bounds
+/// * `context` - ProviderContext for session access and caching
 /// * `options` - Configuration (version_selection, additional_urls)
 ///
 /// # Returns
@@ -184,58 +180,9 @@ pub async fn create_table_provider(
         .infer_schema(&context.datafusion_session.state())
         .await?;
 
-    let listing_table = ListingTable::try_new(config_with_schema)?;
+    let table_provider = Arc::new(ListingTable::try_new(config_with_schema)?);
 
-    // Determine temporal bounds for TemporalFilteredListingTable wrapper
-    //
-    // NOTE: Temporal bounds are per-FileSeries metadata for data quality filtering
-    // (set via `pond set-temporal-bounds`). They filter out garbage data outside the
-    // file's valid time range.
-    //
-    // CURRENT: Only applied to single-file queries via TemporalFilteredListingTable
-    // FUTURE: Multi-file queries should have per-file bounds enforced at Parquet scan level
-    let (min_time, max_time) = if options.additional_urls.is_empty() {
-        // Single-file case: query temporal bounds from persistence layer
-        debug!(
-            "Querying temporal bounds from persistence for file_id={}",
-            file_id
-        );
-
-        // Use tinyfs persistence layer through context
-        let temporal_overrides = context.persistence.get_temporal_bounds(file_id).await?;
-
-        temporal_overrides.unwrap_or_else(|| {
-            debug!(
-                "No temporal bounds for FileSeries {} - using unbounded (no data quality filtering)",
-                file_id
-            );
-            (i64::MIN, i64::MAX)
-        })
-    } else {
-        // Multi-file case: no temporal filtering at this level
-        // TODO: Implement per-file temporal bounds at Parquet reader level
-        debug!(
-            "Multi-file query ({} URLs) - temporal bounds enforcement deferred to Parquet reader (not yet implemented)",
-            options.additional_urls.len()
-        );
-        (i64::MIN, i64::MAX)
-    };
-
-    debug!("Creating TemporalFilteredListingTable with bounds: {min_time} to {max_time}");
-
-    let table_provider = Arc::new(TemporalFilteredListingTable::new(
-        listing_table,
-        min_time,
-        max_time,
-    ));
-
-    log::debug!(
-        "[LIST] CREATED TableProvider: file_id={}, temporal_bounds=({}, {}), urls={}",
-        file_id,
-        min_time,
-        max_time,
-        debug_info
-    );
+    log::debug!("[LIST] CREATED TableProvider: file_id={file_id}, urls={debug_info}");
 
     // Cache the result (only for simple cases without additional_urls)
     if options.additional_urls.is_empty() {

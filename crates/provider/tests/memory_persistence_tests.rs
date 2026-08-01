@@ -2,79 +2,18 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Comprehensive tests for MemoryPersistence with QueryableFile and temporal filtering
+//! Tests for MemoryPersistence with QueryableFile
 //!
 //! These tests verify that MemoryPersistence properly supports:
 //! - File operations (read/write via FS API)
-//! - Temporal bounds metadata
+//! - Versioned Parquet storage via store_file_version/list_file_versions
 //! - QueryableFile interface (MemoryFile currently returns error)
-//! - TemporalFilteredListingTable integration
-//!
-//! **Current Status:**
-//! - [OK] Temporal bounds storage/retrieval works
-//! - [OK] CachingPersistence passthrough works
-//! - [ERR] MemoryFile::as_table_provider() not implemented (returns error)
-//! - [ERR] No ProviderContext test helper yet
-//! - [ERR] No Parquet data generation utilities
 //!
 //! **Action Items:**
 //! 1. Implement MemoryFile::as_table_provider() to support Parquet data
 //! 2. Add ProviderContext::new_for_testing() helper
-//! 3. Add test utilities for generating Parquet data in memory
-//! 4. Enable comprehensive temporal filtering tests
 
-use tinyfs::{CachingPersistence, FileID, MemoryPersistence, NodeID, PartID, PersistenceLayer};
-
-#[tokio::test]
-async fn test_memory_persistence_temporal_bounds() {
-    // [OK] This test works - temporal bounds storage is implemented
-    let persistence = MemoryPersistence::default();
-
-    // Create FileID using UUID-based constructor
-    let uuid_str = "01933eb8-7e8e-7000-8000-000000000001".to_string();
-    let node_id = NodeID::new(uuid_str.clone());
-    let part_id = PartID::new(uuid_str);
-    let file_id = FileID::new_from_ids(part_id, node_id, tinyfs::local_pond_uuid());
-
-    // Initially no temporal bounds
-    let bounds = persistence
-        .get_temporal_bounds(file_id)
-        .await
-        .expect("Should query temporal bounds");
-    assert_eq!(bounds, None);
-
-    // Set temporal bounds using test helper
-    persistence.set_temporal_bounds(file_id, 1000, 2000).await;
-
-    // Query temporal bounds
-    let bounds = persistence
-        .get_temporal_bounds(file_id)
-        .await
-        .expect("Should query temporal bounds");
-    assert_eq!(bounds, Some((1000, 2000)));
-}
-
-#[tokio::test]
-async fn test_memory_persistence_caching_passthrough() {
-    // [OK] This test works - CachingPersistence passes through to inner layer
-    let base = MemoryPersistence::default();
-    let caching = CachingPersistence::new(base.clone());
-
-    let uuid_str = "01933eb8-7e8e-7000-8000-000000000002".to_string();
-    let node_id = NodeID::new(uuid_str.clone());
-    let part_id = PartID::new(uuid_str);
-    let file_id = FileID::new_from_ids(part_id, node_id, tinyfs::local_pond_uuid());
-
-    // Set temporal bounds through base layer
-    base.set_temporal_bounds(file_id, 1000, 2000).await;
-
-    // Query through caching layer (should pass through)
-    let bounds = caching
-        .get_temporal_bounds(file_id)
-        .await
-        .expect("Should query through cache");
-    assert_eq!(bounds, Some((1000, 2000)));
-}
+use tinyfs::{FileID, PersistenceLayer};
 
 #[tokio::test]
 async fn test_memory_fs_create_read_file() {
@@ -126,15 +65,14 @@ async fn test_memory_file_queryable_interface() {
 }
 
 #[tokio::test]
-async fn test_temporal_filtered_listing_table_with_memory() {
+async fn test_store_and_list_file_versions_with_memory() {
     // [OK] Tests the new store_file_version() API for MemoryPersistence
+    use tinyfs::{EntryType, MemoryPersistence};
     use utilities::test_helpers::generate_parquet_with_timestamps;
 
     let persistence = MemoryPersistence::default();
 
     // Create a FileID for a FileSeries Parquet file
-    // FileID::new_physical_dir_id(tinyfs::local_pond_uuid()) creates a proper directory, then we create a series file in it
-    use tinyfs::EntryType;
     let dir_id = FileID::new_physical_dir_id(tinyfs::local_pond_uuid());
     let file_id = FileID::new_in_partition(
         dir_id.part_id(),
@@ -142,16 +80,10 @@ async fn test_temporal_filtered_listing_table_with_memory() {
         tinyfs::local_pond_uuid(),
     );
 
-    // Set temporal bounds for the file
-    persistence.set_temporal_bounds(file_id, 1000, 2000).await;
-
     // Create Parquet with timestamps
-    let parquet_bytes = generate_parquet_with_timestamps(vec![
-        (500, 10.0),  // Before range
-        (1500, 20.0), // Inside range
-        (2500, 30.0), // After range
-    ])
-    .expect("Generate parquet");
+    let parquet_bytes =
+        generate_parquet_with_timestamps(vec![(500, 10.0), (1500, 20.0), (2500, 30.0)])
+            .expect("Generate parquet");
 
     // Store the Parquet data as a file version using new API
     persistence

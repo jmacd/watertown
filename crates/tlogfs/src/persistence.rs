@@ -204,28 +204,6 @@ fn choose_collapse_window(live: &[&OplogEntry], max_live: usize) -> Option<Range
     provider::size_tier::choose_merge_window(&sizes, max_live)
 }
 
-/// Temporal overrides the merged run must carry forward.
-///
-/// `set-temporal-bounds` records manual bounds on a dedicated ZERO-BYTE version.
-/// Collapse deliberately excludes zero-byte rows from the merge window (they
-/// contribute no content), but the merged run's `[lo, hi]` range still SPANS
-/// their version numbers, so `is_superseded` retires them. Without inheriting
-/// their bounds here, a collapse silently deletes the override and every reader
-/// falls back to unbounded filtering -- re-admitting exactly the rows the
-/// operator excluded.
-///
-/// The newest override inside the window wins, matching "latest setting wins".
-/// A newer override outside the window still wins overall, because the merged
-/// run sorts at its range position, below that later row.
-fn inherited_overrides(records: &[OplogEntry], lo: i64, hi: i64) -> (Option<i64>, Option<i64>) {
-    records
-        .iter()
-        .filter(|r| r.version >= lo && r.version <= hi)
-        .filter(|r| r.min_override.is_some() || r.max_override.is_some())
-        .max_by_key(|r| r.version)
-        .map_or((None, None), |r| (r.min_override, r.max_override))
-}
-
 /// One reconstructed write transaction recovered from the data Delta
 /// table's commit history by [`OpLogPersistence::reconstruct_txn_history`].
 ///
@@ -554,7 +532,7 @@ impl OpLogPersistence {
         // Create the Delta table structure
         let config: HashMap<String, Option<String>> = vec![(
             "delta.dataSkippingStatsColumns".to_string(),
-            Some("node_id,name,parent_id,entry_type,file_type,timestamp,version,blake3,size,min_event_time,max_event_time,min_override,max_override,extended_attributes,factory,txn_seq".to_string())
+            Some("node_id,name,parent_id,entry_type,file_type,timestamp,version,blake3,size,min_event_time,max_event_time,extended_attributes,factory,txn_seq".to_string())
         )]
         .into_iter()
         .collect();
@@ -668,7 +646,7 @@ impl OpLogPersistence {
                     "delta.dataSkippingStatsColumns".to_string(),
                     // pond_id and part_id are partition columns (in the file path);
                     // partition columns do not need data-skipping stats.
-                    Some("node_id,name,parent_id,entry_type,file_type,timestamp,version,blake3,size,min_event_time,max_event_time,min_override,max_override,extended_attributes,factory,txn_seq,collapsed_through,collapsed_from".to_string())
+                    Some("node_id,name,parent_id,entry_type,file_type,timestamp,version,blake3,size,min_event_time,max_event_time,extended_attributes,factory,txn_seq,collapsed_through,collapsed_from".to_string())
                 )]
                 .into_iter()
                 .collect();
@@ -1243,7 +1221,6 @@ impl State {
             temporal,
             inherited_bao,
             newest_version,
-            overrides,
             store_path,
             options,
         ) = {
@@ -1284,23 +1261,12 @@ impl State {
             let inherited_bao = newest.bao_outboard.clone();
             let newest_version = newest.version;
 
-            // Zero-byte override rows are filtered out of `window` above, but
-            // the merged range still spans them, so carry their bounds forward.
-            let overrides = {
-                let lo = crate::schema::CollapseRange::of(&window[0]).lo;
-                let hi =
-                    crate::schema::CollapseRange::of(window.last().expect("window is non-empty"))
-                        .hi;
-                inherited_overrides(&records, lo, hi)
-            };
-
             (
                 live.len(),
                 window,
                 temporal,
                 inherited_bao,
                 newest_version,
-                overrides,
                 inner.path.clone(),
                 inner.large_file_options.clone(),
             )
@@ -1432,7 +1398,6 @@ impl State {
             entry.set_bao_outboard(bao_outboard);
             entry.collapsed_from = Some(lo);
             entry.collapsed_through = Some(hi);
-            (entry.min_override, entry.max_override) = overrides;
             inner.records.push(entry);
             version
         };
@@ -1537,7 +1502,6 @@ impl State {
             min_event,
             max_event,
             timestamp_column,
-            overrides,
             store_path,
             options,
         ) = {
@@ -1584,10 +1548,6 @@ impl State {
                 .expect("window is non-empty");
             let window_versions: Vec<i64> = window.iter().map(|r| r.version).collect();
 
-            // Zero-byte override rows are filtered out of `window` above, but
-            // the merged range still spans them, so carry their bounds forward.
-            let overrides = inherited_overrides(&records, lo, hi);
-
             (
                 live.len(),
                 window_versions,
@@ -1596,7 +1556,6 @@ impl State {
                 min_event,
                 max_event,
                 timestamp_column,
-                overrides,
                 inner.path.clone(),
                 inner.large_file_options.clone(),
             )
@@ -1683,7 +1642,6 @@ impl State {
             entry.set_bao_outboard(bao_outboard);
             entry.collapsed_from = Some(lo);
             entry.collapsed_through = Some(hi);
-            (entry.min_override, entry.max_override) = overrides;
             inner.records.push(entry);
             version
         };
@@ -2159,12 +2117,6 @@ impl PersistenceLayer for State {
             .set_extended_attributes(id, attributes)
             .await
     }
-
-    async fn get_temporal_bounds(&self, id: FileID) -> TinyFSResult<Option<(i64, i64)>> {
-        self.get_temporal_overrides_for_node_id(id)
-            .await
-            .map_other()
-    }
 }
 
 impl State {
@@ -2327,133 +2279,6 @@ impl State {
             .insert(key, value);
     }
 
-    /// FAIL-FAST: Get temporal overrides for a FileSeries node
-    /// This method replaces the fallback-riddled direct SQL approach with proper error handling
-    /// and consistent data access through the persistence layer.
-    pub async fn get_temporal_overrides_for_node_id(
-        &self,
-        id: FileID,
-    ) -> Result<Option<(i64, i64)>, TLogFSError> {
-        debug!("[SEARCH] TEMPORAL: Looking up temporal overrides for node_id: {id}");
-
-        // FAIL-FAST: Use consistent data access by duplicating query_records logic
-        // This ensures we see the same data that persistence operations work with
-        let inner = self.inner.lock().await;
-
-        // Query for committed records from Delta Lake
-        let sql = format!(
-            "SELECT * FROM delta_table WHERE part_id = '{}' AND node_id = '{}' ORDER BY timestamp DESC",
-            id.part_id(),
-            id.node_id(),
-        );
-
-        let committed_records = match inner.session_context.sql(&sql).await {
-            Ok(df) => match df.collect().await {
-                Ok(batches) => {
-                    let mut records = Vec::new();
-                    for batch in batches {
-                        match serde_arrow::from_record_batch(&batch) {
-                            Ok(batch_records) => {
-                                let batch_records: Vec<OplogEntry> = batch_records;
-                                records.extend(batch_records);
-                            }
-                            Err(e) => {
-                                debug!(
-                                    "[ERR] FAIL-FAST: Failed to deserialize temporal override records: {e}"
-                                );
-                                return Err(TLogFSError::Transaction {
-                                    message: format!(
-                                        "Temporal override deserialization failed for {id}: {e}"
-                                    ),
-                                });
-                            }
-                        }
-                    }
-                    records
-                }
-                Err(e) => {
-                    debug!("[ERR] FAIL-FAST: Failed to collect temporal override records: {e}");
-                    return Err(TLogFSError::Transaction {
-                        message: format!("Temporal override collection failed for {id}: {e}"),
-                    });
-                }
-            },
-            Err(e) => {
-                debug!("[ERR] FAIL-FAST: Failed to query temporal overrides SQL: {e}");
-                return Err(TLogFSError::Transaction {
-                    message: format!("Temporal override SQL query failed for {id}: {e}"),
-                });
-            }
-        };
-
-        // Add pending records (same logic as query_records)
-        let mut all_records = committed_records;
-        for record in &inner.records {
-            if record.part_id == id.part_id() && record.node_id == id.node_id() {
-                all_records.push(record.clone());
-            }
-        }
-
-        // Release the lock before processing
-        drop(inner);
-
-        // FAIL-FAST: Filter for FileSeries explicitly and validate file_type
-        let file_series_records: Vec<_> = all_records
-            .into_iter()
-            .filter(|record| record.file_type.is_series_file())
-            .collect();
-
-        debug!(
-            "[SEARCH] TEMPORAL: Found {} FileSeries records for node_id {id}",
-            file_series_records.len()
-        );
-
-        if file_series_records.is_empty() {
-            debug!(
-                "[WARN] TEMPORAL: No FileSeries records found for node_id {id} - temporal overrides not available"
-            );
-            return Ok(None);
-        }
-
-        // Resolve over LIVE rows in range order, not by raw version.
-        //
-        // A collapse output takes a fresh highest version while standing for
-        // content in the middle of the stream, so `max_by_key(version)` selects
-        // the merged run rather than the real tail. Merged runs never carry
-        // overrides (the merge constructors do not copy them), so that lookup
-        // returns None and the caller falls back to (i64::MIN, i64::MAX) --
-        // silently disabling the filtering `set-temporal-bounds` established.
-        // Take the newest live row that actually carries an override.
-        let live = crate::schema::live_series_entries(&file_series_records);
-        let Some(latest_override) = live
-            .iter()
-            .rev()
-            .find(|r| r.temporal_overrides().is_some())
-            .copied()
-        else {
-            debug!("[WARN] TEMPORAL: No live record carries temporal overrides for node_id {id}");
-            return Ok(None);
-        };
-
-        let version = latest_override.version;
-        let temporal_overrides = latest_override.temporal_overrides();
-        let has_overrides = temporal_overrides.is_some();
-        debug!(
-            "[SEARCH] TEMPORAL: Latest version {version} has temporal overrides: {has_overrides}"
-        );
-
-        if let Some((min_time, max_time)) = temporal_overrides {
-            debug!(
-                "[OK] TEMPORAL: Found temporal overrides in latest version {version}: {min_time} to {max_time}"
-            );
-            Ok(Some((min_time, max_time)))
-        } else {
-            debug!(
-                "[WARN] TEMPORAL: Latest version {version} has no temporal overrides - this may be expected"
-            );
-            Ok(None)
-        }
-    }
 }
 
 /// Parse Parquet `content`, resolve the timestamp column (explicit or
@@ -4689,76 +4514,14 @@ impl InnerState {
             ))
         })?;
 
-        // Check for special temporal override attributes and handle them separately
-        let mut remaining_attributes = attributes;
-        let mut min_override = None;
-        let mut max_override = None;
-
-        let attrs_count = remaining_attributes.len();
+        let attrs_count = attributes.len();
         info!(
             "set_extended_attributes processing attributes for node {id} at index {index}, attrs_count: {attrs_count}"
         );
 
-        // Extract temporal overrides if present
-        if let Some(min_val) =
-            remaining_attributes.remove(crate::schema::watertown::MIN_TEMPORAL_OVERRIDE)
-        {
-            info!("set_extended_attributes found min_temporal_override: {min_val}");
-            match min_val.parse::<i64>() {
-                Ok(timestamp) => {
-                    min_override = Some(timestamp);
-                    info!(
-                        "set_extended_attributes parsed min_temporal_override timestamp: {timestamp}"
-                    );
-                }
-                Err(e) => {
-                    return Err(tinyfs::Error::Other(format!(
-                        "Invalid min_temporal_override value '{}': {}",
-                        min_val, e
-                    )));
-                }
-            }
-        }
-
-        if let Some(max_val) =
-            remaining_attributes.remove(crate::schema::watertown::MAX_TEMPORAL_OVERRIDE)
-        {
-            info!("set_extended_attributes found max_temporal_override: {max_val}");
-            match max_val.parse::<i64>() {
-                Ok(timestamp) => {
-                    max_override = Some(timestamp);
-                    info!(
-                        "set_extended_attributes parsed max_temporal_override timestamp: {timestamp}"
-                    );
-                }
-                Err(e) => {
-                    return Err(tinyfs::Error::Other(format!(
-                        "Invalid max_temporal_override value '{}': {}",
-                        max_val, e
-                    )));
-                }
-            }
-        }
-
-        // Set the temporal override fields directly in the OplogEntry
-        if let Some(min_ts) = min_override {
-            info!("set_extended_attributes setting min_override to {min_ts} for node {id}");
-            self.records[index].min_override = Some(min_ts);
-        }
-        if let Some(max_ts) = max_override {
-            info!("set_extended_attributes setting max_override to {max_ts} for node {id}");
-            self.records[index].max_override = Some(max_ts);
-        }
-
-        if min_override.is_some() || max_override.is_some() {
-            info!(
-                "set_extended_attributes final record state for node {id} - temporal overrides set"
-            );
-        }
-
         // Store remaining attributes as JSON (if any)
-        if !remaining_attributes.is_empty() {
-            let attributes_json = serde_json::to_string(&remaining_attributes)
+        if !attributes.is_empty() {
+            let attributes_json = serde_json::to_string(&attributes)
                 .map_other_context("Failed to serialize extended attributes")?;
             self.records[index].extended_attributes = Some(attributes_json);
         }
