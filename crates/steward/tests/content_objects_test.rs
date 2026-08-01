@@ -8,6 +8,7 @@
 use std::collections::BTreeSet;
 
 use steward::{ObjectKind, Ship, inventory_content_objects};
+use sync_store::ContentRemote;
 use tempfile::tempdir;
 use tinyfs::async_helpers::convenience::create_file_path;
 use tlogfs::PondUserMetadata;
@@ -49,6 +50,36 @@ async fn new_pond(label: &str) -> (tempfile::TempDir, Ship) {
     (tmp, ship)
 }
 
+/// Build a genuine replica of `src`.
+///
+/// Replication is the only way to obtain a second pond with identical content:
+/// a version's metadata -- when it was created, the event-time range it covers
+/// -- is data about that immutable version, and the directory entry commits to
+/// it.  Two ponds written independently from the same bytes therefore do *not*
+/// have identical content.  A replica adopts the source's metadata verbatim,
+/// so it does.
+async fn replica_of(src: &Ship, label: &str) -> (tempfile::TempDir, tempfile::TempDir, Ship) {
+    let pond_id = uuid::Uuid::parse_str(src.data_persistence().pond_id()).expect("pond id");
+    let remote_dir = tempdir().expect("remote dir");
+    let mut remote = ContentRemote::create_at(remote_dir.path().join("remote"), pond_id)
+        .await
+        .expect("create remote");
+    let _ = steward::push_content_to_remote(src, &mut remote, "main")
+        .await
+        .expect("push");
+    let graph = steward::fetch_object_graph(&remote, "main")
+        .await
+        .expect("fetch");
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), label)
+        .await
+        .expect("create replica");
+    let _ = steward::rebuild_pond(&mut dst, &remote, &graph)
+        .await
+        .expect("rebuild");
+    (remote_dir, dst_dir, dst)
+}
+
 /// The inventory contains the root tree plus a tree object per physical
 /// directory and a blob per file version.
 #[tokio::test]
@@ -76,16 +107,14 @@ async fn inventory_covers_trees_and_blobs() {
     assert!(blobs >= 2, "expected two file blobs, got {blobs}");
 }
 
-/// Two identical ponds produce identical inventories, so the set difference is
-/// empty in both directions (a clone needs nothing transferred).
+/// A pond and its replica produce identical inventories, so the set difference
+/// is empty in both directions (a clone needs nothing transferred).
 #[tokio::test]
-async fn identical_ponds_have_no_object_difference() {
+async fn replica_has_no_object_difference() {
     let (_ta, mut a) = new_pond("pond-a").await;
-    let (_tb, mut b) = new_pond("pond-b").await;
-    for ship in [&mut a, &mut b] {
-        write_file(ship, "/a.txt", b"same").await;
-        mkdir_and_file(ship, "/d", "/d/c.txt", b"more").await;
-    }
+    write_file(&mut a, "/a.txt", b"same").await;
+    mkdir_and_file(&mut a, "/d", "/d/c.txt", b"more").await;
+    let (_rt, _dt, b) = replica_of(&a, "pond-b").await;
 
     let inv_a = inventory_content_objects(&a).await.expect("a");
     let inv_b = inventory_content_objects(&b).await.expect("b");

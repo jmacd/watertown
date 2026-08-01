@@ -100,7 +100,12 @@ impl PersistenceLayer for MemoryPersistence {
         self.state.lock().await.create_directory_node(id).await
     }
 
-    async fn create_symlink_node(&self, id: FileID, target: &std::path::Path) -> Result<Node> {
+    async fn create_symlink_node(
+        &self,
+        id: FileID,
+        target: &std::path::Path,
+        _mtime: Option<i64>,
+    ) -> Result<Node> {
         self.state
             .lock()
             .await
@@ -113,6 +118,7 @@ impl PersistenceLayer for MemoryPersistence {
         id: FileID,
         factory_type: &str,
         config_content: Vec<u8>,
+        _mtime: Option<i64>,
     ) -> Result<Node> {
         // Store the config content as a file version
         self.state

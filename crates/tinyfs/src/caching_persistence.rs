@@ -176,13 +176,18 @@ impl<P: PersistenceLayer + Send + Sync + 'static> PersistenceLayer for CachingPe
     }
 
     /// Create symlink node with caching
-    async fn create_symlink_node(&self, id: FileID, target: &Path) -> Result<Node> {
+    async fn create_symlink_node(
+        &self,
+        id: FileID,
+        target: &Path,
+        mtime: Option<i64>,
+    ) -> Result<Node> {
         debug!(
             "CachingPersistence: create_symlink_node({}, {:?})",
             id, target
         );
 
-        let node = self.inner.create_symlink_node(id, target).await?;
+        let node = self.inner.create_symlink_node(id, target, mtime).await?;
 
         // Cache the created node
         self.cache_node(id, node.clone()).await;
@@ -196,6 +201,7 @@ impl<P: PersistenceLayer + Send + Sync + 'static> PersistenceLayer for CachingPe
         id: FileID,
         factory_type: &str,
         config_content: Vec<u8>,
+        mtime: Option<i64>,
     ) -> Result<Node> {
         debug!(
             "CachingPersistence: create_dynamic_node({}, factory={})",
@@ -204,7 +210,7 @@ impl<P: PersistenceLayer + Send + Sync + 'static> PersistenceLayer for CachingPe
 
         let node = self
             .inner
-            .create_dynamic_node(id, factory_type, config_content)
+            .create_dynamic_node(id, factory_type, config_content, mtime)
             .await?;
 
         // Cache the created node

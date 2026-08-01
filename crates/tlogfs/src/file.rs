@@ -330,6 +330,9 @@ pub struct OpLogFileWriter {
     completion_future: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     entry_type: tinyfs::EntryType,
     precomputed_metadata: Option<crate::file_writer::FileMetadata>,
+    /// An explicit mtime to persist instead of the current wall clock, set by
+    /// replication so a mirrored version keeps the source's timestamp.
+    precomputed_mtime: Option<i64>,
     /// Pre-allocated version number for this write (allocated at writer creation)
     allocated_version: i64,
     /// When set, the persisted row carries a `collapsed_through` sentinel equal
@@ -360,6 +363,7 @@ impl OpLogFileWriter {
             completion_future: None,
             entry_type,
             precomputed_metadata: None,
+            precomputed_mtime: None,
             allocated_version,
             collapse_prior,
         }
@@ -374,6 +378,10 @@ impl FileMetadataWriter for OpLogFileWriter {
             max_timestamp: max,
             timestamp_column,
         });
+    }
+
+    fn set_mtime(&mut self, timestamp: i64) {
+        self.precomputed_mtime = Some(timestamp);
     }
 
     async fn infer_temporal_bounds(&mut self) -> tinyfs::Result<(i64, i64, String)> {
@@ -516,6 +524,7 @@ impl AsyncWrite for OpLogFileWriter {
             let transaction_state = this.transaction_state.clone();
             let entry_type = this.entry_type;
             let precomputed_metadata = this.precomputed_metadata.clone();
+            let precomputed_mtime = this.precomputed_mtime;
             let allocated_version = this.allocated_version;
             let collapse_prior = this.collapse_prior;
 
@@ -660,7 +669,7 @@ impl AsyncWrite for OpLogFileWriter {
                     // version as superseding every earlier one it wrote.
                     let collapsed_through = collapse_prior.then(|| allocated_version - 1);
 
-                    state.store_file_content_ref(file_id, content_ref, metadata, Some(allocated_version), bao_outboard, collapsed_through).await
+                    state.store_file_content_ref(file_id, content_ref, metadata, Some(allocated_version), bao_outboard, collapsed_through, precomputed_mtime).await
                         .map_other_context("Failed to store file")
                 }.await;
 

@@ -52,7 +52,10 @@ const POND_ID_KEY: &str = "pond_id";
 /// All rows are written under the source pond's `pond_id`, matching the
 /// store's per-`pond_id` physical partitioning.  Object hashes are
 /// content-only and lineage-independent, so two ponds with identical content
-/// produce identical object bytes under identical keys.
+/// produce identical object bytes under identical keys.  A node's content
+/// includes the metadata its directory entry commits to, so a pond and its
+/// replica share keys while two independently written ponds share only their
+/// blobs.
 pub struct ContentRemote {
     store: Store,
     pond_id: Uuid,

@@ -8,6 +8,7 @@
 //! through `parent_commit_hash == previous commit_hash`.
 
 use steward::Ship;
+use sync_store::ContentRemote;
 use tempfile::tempdir;
 use tinyfs::async_helpers::convenience::create_file_path;
 use tlogfs::PondUserMetadata;
@@ -25,6 +26,36 @@ async fn write_file(ship: &mut Ship, path: &str, bytes: &[u8]) {
     })
     .await
     .expect("write transaction");
+}
+
+/// Build a genuine replica of `src`.
+///
+/// Replication is the only way to obtain a second pond with identical content:
+/// a version's metadata -- when it was created, the event-time range it covers
+/// -- is data about that immutable version, and the directory entry commits to
+/// it.  Two ponds written independently from the same bytes therefore do *not*
+/// have identical content.  A replica adopts the source's metadata verbatim,
+/// so it does.
+async fn replica_of(src: &Ship, label: &str) -> (tempfile::TempDir, tempfile::TempDir, Ship) {
+    let pond_id = uuid::Uuid::parse_str(src.data_persistence().pond_id()).expect("pond id");
+    let remote_dir = tempdir().expect("remote dir");
+    let mut remote = ContentRemote::create_at(remote_dir.path().join("remote"), pond_id)
+        .await
+        .expect("create remote");
+    let _ = steward::push_content_to_remote(src, &mut remote, "main")
+        .await
+        .expect("push");
+    let graph = steward::fetch_object_graph(&remote, "main")
+        .await
+        .expect("fetch");
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), label)
+        .await
+        .expect("create replica");
+    let _ = steward::rebuild_pond(&mut dst, &remote, &graph)
+        .await
+        .expect("rebuild");
+    (remote_dir, dst_dir, dst)
 }
 
 /// The persisted `root_tree_hash` for the latest commit equals the read-side
@@ -107,22 +138,18 @@ async fn successive_commits_chain_through_parent_hash() {
     );
 }
 
-/// Two ponds with identical content produce identical persisted
-/// `root_tree_hash` values, even though their `commit_hash` values differ
-/// (provenance differs by pond_id and time).
+/// A pond and its replica produce identical persisted `root_tree_hash` values,
+/// even though their `commit_hash` values differ (provenance differs by pond_id
+/// and time).
 #[tokio::test]
-async fn identical_content_same_root_hash_different_commit_hash() {
+async fn replica_same_root_hash_different_commit_hash() {
     let tmp_a = tempdir().expect("tempdir a");
-    let tmp_b = tempdir().expect("tempdir b");
     let mut ship_a = Ship::create_pond(tmp_a.path().join("pond"), "pond-a")
         .await
         .expect("create pond a");
-    let mut ship_b = Ship::create_pond(tmp_b.path().join("pond"), "pond-b")
-        .await
-        .expect("create pond b");
 
     write_file(&mut ship_a, "/a.txt", b"same content").await;
-    write_file(&mut ship_b, "/a.txt", b"same content").await;
+    let (_rt, _dt, ship_b) = replica_of(&ship_a, "pond-b").await;
 
     let seq_a = ship_a.last_write_seq();
     let seq_b = ship_b.last_write_seq();

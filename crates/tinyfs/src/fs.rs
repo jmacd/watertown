@@ -140,7 +140,9 @@ impl FS {
         let id = parent_id.new_child_id(EntryType::Symlink);
 
         let target_path = std::path::Path::new(target);
-        self.persistence.create_symlink_node(id, target_path).await
+        self.persistence
+            .create_symlink_node(id, target_path, None)
+            .await
     }
 
     /// List all versions of a file
@@ -160,9 +162,10 @@ impl FS {
         id: FileID,
         factory_type: &str,
         config_content: Vec<u8>,
+        mtime: Option<i64>,
     ) -> Result<Node> {
         self.persistence
-            .create_dynamic_node(id, factory_type, config_content)
+            .create_dynamic_node(id, factory_type, config_content, mtime)
             .await
     }
 

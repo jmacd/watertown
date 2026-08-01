@@ -88,6 +88,17 @@ pub trait FileMetadataWriter: AsyncWrite + Send + Unpin {
     /// Set temporal metadata for series files (used when metadata is known at write time)
     fn set_temporal_metadata(&mut self, min: i64, max: i64, timestamp_column: String);
 
+    /// Adopt an explicit modification time (microseconds since the Unix epoch)
+    /// instead of stamping the version with the current wall clock.
+    ///
+    /// Replication uses this so a mirrored version keeps the mtime the source
+    /// recorded, the way `rsync -t` or `cp -p` preserve it. Without it every
+    /// replicated node would claim to have been modified at pull time, and two
+    /// ponds holding identical data would never agree on their metadata.
+    ///
+    /// The default is a no-op, for backends that do not persist an mtime.
+    fn set_mtime(&mut self, _timestamp: i64) {}
+
     /// Infer temporal bounds from the written parquet file by reading only the footer.
     /// After calling this, further writes will fail. Calls shutdown() internally.
     /// Returns (min_timestamp, max_timestamp, timestamp_column_name)

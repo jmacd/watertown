@@ -226,7 +226,7 @@ pub async fn fsck(ship: &Ship, opts: FsckOptions) -> Result<FsckReport, StewardE
             });
         }
 
-        pond_root_entries.push(TreeEntry::new(
+        pond_root_entries.push(TreeEntry::bare(
             pond_id.clone(),
             EntryType::DirectoryPhysical,
             index.root_tree_hash,

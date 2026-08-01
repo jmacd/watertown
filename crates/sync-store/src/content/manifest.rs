@@ -20,16 +20,17 @@
 
 use tinyfs::EntryType;
 
-use super::{Cursor, ObjectHash, push_len_prefixed};
+use super::tree::{push_version_metas, take_version_metas};
+use super::{Cursor, ObjectHash, VersionMeta, push_len_prefixed};
 
 /// Magic header distinguishing a serialized node manifest from a raw blob (D2).
-const MANIFEST_MAGIC: &[u8] = b"dp.manifest.1\n";
+const MANIFEST_MAGIC: &[u8] = b"dp.manifest.2\n";
 
 /// Minimum on-wire size of a single manifest entry: three length-prefixed
 /// strings (4-byte length each, all empty), a 1-byte entry-type discriminant,
 /// and a 32-byte child hash. Used to bound decode pre-allocation against a
 /// hostile element count.
-const MANIFEST_ENTRY_MIN_BYTES: usize = 4 + 4 + 4 + 1 + 32;
+const MANIFEST_ENTRY_MIN_BYTES: usize = 4 + 4 + 4 + 1 + 32 + 4;
 
 /// One node's identity record in a manifest.
 ///
@@ -50,6 +51,10 @@ pub struct ManifestEntry {
     /// The node's content address (the same `child_hash` its tree entry
     /// carries; for the root, its `tree_hash`).
     pub child_hash: ObjectHash,
+    /// Node metadata for this node's live versions, oldest first -- the same
+    /// list its tree entry carries, mirrored here so an incremental pull can
+    /// diff and reapply it from the `node_id`-keyed manifest alone.
+    pub versions: Vec<VersionMeta>,
 }
 
 impl ManifestEntry {
@@ -61,6 +66,7 @@ impl ManifestEntry {
         name: impl Into<String>,
         entry_type: EntryType,
         child_hash: ObjectHash,
+        versions: Vec<VersionMeta>,
     ) -> Self {
         Self {
             node_id: node_id.into(),
@@ -68,7 +74,27 @@ impl ManifestEntry {
             name: name.into(),
             entry_type,
             child_hash,
+            versions,
         }
+    }
+
+    /// Construct a manifest entry whose node metadata is unknown.
+    #[must_use]
+    pub fn bare(
+        node_id: impl Into<String>,
+        parent_node_id: impl Into<String>,
+        name: impl Into<String>,
+        entry_type: EntryType,
+        child_hash: ObjectHash,
+    ) -> Self {
+        Self::new(
+            node_id,
+            parent_node_id,
+            name,
+            entry_type,
+            child_hash,
+            Vec::new(),
+        )
     }
 }
 
@@ -85,6 +111,7 @@ impl ManifestEntry {
 ///   u32 LE  name length + name bytes (UTF-8)
 ///   u8      entry_type discriminant
 ///   32      child_hash bytes
+///   u32 LE  version count, then that many VersionMeta records
 /// ```
 ///
 /// Entries are sorted by `node_id` so the encoding is canonical regardless of
@@ -118,6 +145,7 @@ pub fn encode_manifest(entries: &[ManifestEntry]) -> Result<Vec<u8>, String> {
         push_len_prefixed(&mut buf, entry.name.as_bytes());
         buf.push(entry.entry_type as u8);
         buf.extend_from_slice(entry.child_hash.as_bytes());
+        push_version_metas(&mut buf, &entry.versions);
     }
     Ok(buf)
 }
@@ -153,12 +181,14 @@ pub fn decode_manifest(bytes: &[u8]) -> Result<Vec<ManifestEntry>, String> {
         let name = cur.take_len_prefixed_string()?;
         let entry_type = EntryType::try_from(cur.take_u8()?)?;
         let child_hash = cur.take_hash()?;
+        let versions = take_version_metas(&mut cur)?;
         entries.push(ManifestEntry::new(
             node_id,
             parent_node_id,
             name,
             entry_type,
             child_hash,
+            versions,
         ));
     }
     if !cur.is_empty() {
@@ -179,7 +209,7 @@ mod tests {
     }
 
     fn file(node_id: &str, parent: &str, name: &str) -> ManifestEntry {
-        ManifestEntry::new(
+        ManifestEntry::bare(
             node_id,
             parent,
             name,
@@ -198,7 +228,7 @@ mod tests {
     #[test]
     fn manifest_hash_changes_with_child_hash() {
         let base = vec![file("n1", "root", "a")];
-        let changed = vec![ManifestEntry::new(
+        let changed = vec![ManifestEntry::bare(
             "n1",
             "root",
             "a",
@@ -216,7 +246,7 @@ mod tests {
         // Same node_id and content, different name -- a rename must change the
         // manifest hash so the consumer detects it.
         let before = vec![file("n1", "root", "old")];
-        let after = vec![ManifestEntry::new(
+        let after = vec![ManifestEntry::bare(
             "n1",
             "root",
             "new",
@@ -248,13 +278,13 @@ mod tests {
     #[test]
     fn decode_round_trips_encode() {
         let entries = vec![
-            ManifestEntry::new("root", "", "", EntryType::DirectoryPhysical, h("roottree")),
+            ManifestEntry::bare("root", "", "", EntryType::DirectoryPhysical, h("roottree")),
             file("n2", "root", "b"),
             file("n1", "root", "a"),
-            ManifestEntry::new("n3", "root", "d", EntryType::DirectoryPhysical, h("dir")),
-            ManifestEntry::new("n4", "root", "s", EntryType::Symlink, h("target")),
-            ManifestEntry::new("n5", "n3", "v", EntryType::TablePhysicalSeries, h("ser")),
-            ManifestEntry::new("n6", "n3", "dyn", EntryType::TableDynamic, h("recipe")),
+            ManifestEntry::bare("n3", "root", "d", EntryType::DirectoryPhysical, h("dir")),
+            ManifestEntry::bare("n4", "root", "s", EntryType::Symlink, h("target")),
+            ManifestEntry::bare("n5", "n3", "v", EntryType::TablePhysicalSeries, h("ser")),
+            ManifestEntry::bare("n6", "n3", "dyn", EntryType::TableDynamic, h("recipe")),
         ];
         let bytes = encode_manifest(&entries).unwrap();
         let decoded = decode_manifest(&bytes).unwrap();
@@ -273,7 +303,7 @@ mod tests {
 
     #[test]
     fn root_entry_has_empty_parent_and_name() {
-        let entries = vec![ManifestEntry::new(
+        let entries = vec![ManifestEntry::bare(
             "root",
             "",
             "",
@@ -326,14 +356,14 @@ mod tests {
     fn length_prefix_prevents_field_ambiguity() {
         // Moving a character across the node_id/parent boundary must change the
         // hash, proving the framing is unambiguous.
-        let a = vec![ManifestEntry::new(
+        let a = vec![ManifestEntry::bare(
             "ab",
             "c",
             "n",
             EntryType::FilePhysicalVersion,
             h("x"),
         )];
-        let b = vec![ManifestEntry::new(
+        let b = vec![ManifestEntry::bare(
             "a",
             "bc",
             "n",

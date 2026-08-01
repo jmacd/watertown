@@ -8,6 +8,7 @@
 //! to the minimal set of divergent paths.
 
 use steward::{DiffKind, Ship, compare_content_trees};
+use sync_store::ContentRemote;
 use tempfile::tempdir;
 use tinyfs::async_helpers::convenience::create_file_path;
 use tlogfs::PondUserMetadata;
@@ -49,10 +50,62 @@ async fn new_pond(label: &str) -> (tempfile::TempDir, Ship) {
     (tmp, ship)
 }
 
-/// Identical content across two ponds compares equal with no differences,
-/// regardless of pond identity or lineage.
+/// Build a genuine replica of `src`.
+///
+/// Replication is the only way to obtain a second pond with identical content:
+/// a version's metadata -- when it was created, the event-time range it covers
+/// -- is data about that immutable version, and the directory entry commits to
+/// it.  Two ponds written independently from the same bytes therefore do *not*
+/// have identical content.  A replica adopts the source's metadata verbatim,
+/// so it does.
+async fn replica_of(src: &Ship, label: &str) -> (tempfile::TempDir, tempfile::TempDir, Ship) {
+    let pond_id = uuid::Uuid::parse_str(src.data_persistence().pond_id()).expect("pond id");
+    let remote_dir = tempdir().expect("remote dir");
+    let mut remote = ContentRemote::create_at(remote_dir.path().join("remote"), pond_id)
+        .await
+        .expect("create remote");
+    let _ = steward::push_content_to_remote(src, &mut remote, "main")
+        .await
+        .expect("push");
+    let graph = steward::fetch_object_graph(&remote, "main")
+        .await
+        .expect("fetch");
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), label)
+        .await
+        .expect("create replica");
+    let _ = steward::rebuild_pond(&mut dst, &remote, &graph)
+        .await
+        .expect("rebuild");
+    (remote_dir, dst_dir, dst)
+}
+
+/// A replica compares equal to its source with no differences, regardless of
+/// pond identity or lineage.
 #[tokio::test]
-async fn identical_ponds_compare_equal() {
+async fn replica_compares_equal_to_source() {
+    let (_ta, mut a) = new_pond("pond-a").await;
+    write_file(&mut a, "/a.txt", b"hello").await;
+    mkdir_and_file(&mut a, "/sub", "/sub/b.txt", b"world").await;
+
+    let (_rt, _dt, b) = replica_of(&a, "pond-b").await;
+
+    let cmp = compare_content_trees(&a, &b).await.expect("compare");
+    assert!(
+        cmp.equal,
+        "a replica must compare equal to its source: {:?}",
+        cmp.differences
+    );
+    assert!(cmp.differences.is_empty());
+}
+
+/// Two ponds written independently from the same bytes are not equal, because
+/// their versions were created at different times -- and the divergence must be
+/// *reported*.  Pruning the descent on `child_hash` alone once let the roots
+/// differ while the diff listed nothing, which is the least useful answer a
+/// comparison can give.
+#[tokio::test]
+async fn independently_written_ponds_differ_by_metadata() {
     let (_ta, mut a) = new_pond("pond-a").await;
     let (_tb, mut b) = new_pond("pond-b").await;
 
@@ -62,8 +115,20 @@ async fn identical_ponds_compare_equal() {
     }
 
     let cmp = compare_content_trees(&a, &b).await.expect("compare");
-    assert!(cmp.equal, "identical content must compare equal");
-    assert!(cmp.differences.is_empty());
+    assert!(
+        !cmp.equal,
+        "independent writes do not share version metadata"
+    );
+    let paths: Vec<&str> = cmp.differences.iter().map(|d| d.path.as_str()).collect();
+    assert!(
+        paths.contains(&"/a.txt") && paths.contains(&"/sub/b.txt"),
+        "every differing leaf is reported, got {paths:?}"
+    );
+    assert!(
+        cmp.differences.iter().all(|d| d.kind == DiffKind::Modified),
+        "same bytes, different metadata is a modification, got {:?}",
+        cmp.differences
+    );
 }
 
 /// A single differing file is reported as exactly one `Modified` path; the
@@ -71,12 +136,12 @@ async fn identical_ponds_compare_equal() {
 #[tokio::test]
 async fn single_modified_file_is_isolated() {
     let (_ta, mut a) = new_pond("pond-a").await;
-    let (_tb, mut b) = new_pond("pond-b").await;
+    write_file(&mut a, "/shared.txt", b"same").await;
+    mkdir_and_file(&mut a, "/sub", "/sub/keep.txt", b"identical").await;
+    // The shared base must be *replicated* rather than rewritten, or every
+    // common path would differ by its version metadata too.
+    let (_rt, _dt, mut b) = replica_of(&a, "pond-b").await;
 
-    for ship in [&mut a, &mut b] {
-        write_file(ship, "/shared.txt", b"same").await;
-        mkdir_and_file(ship, "/sub", "/sub/keep.txt", b"identical").await;
-    }
     // Diverge one nested file only.
     write_file(&mut a, "/sub/diff.txt", b"left").await;
     write_file(&mut b, "/sub/diff.txt", b"right").await;
@@ -92,12 +157,10 @@ async fn single_modified_file_is_isolated() {
 #[tokio::test]
 async fn added_and_removed_entries_are_classified() {
     let (_ta, mut a) = new_pond("pond-a").await;
-    let (_tb, mut b) = new_pond("pond-b").await;
+    // Common base, replicated so it is genuinely common.
+    write_file(&mut a, "/common.txt", b"base").await;
+    let (_rt, _dt, mut b) = replica_of(&a, "pond-b").await;
 
-    // Common base.
-    for ship in [&mut a, &mut b] {
-        write_file(ship, "/common.txt", b"base").await;
-    }
     // Only-left and only-right files.
     write_file(&mut a, "/only_left.txt", b"L").await;
     write_file(&mut b, "/only_right.txt", b"R").await;

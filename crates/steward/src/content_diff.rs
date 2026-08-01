@@ -115,8 +115,14 @@ fn by_name<'a>(index: &'a ContentTreeIndex, key: &NodeKey) -> BTreeMap<&'a str, 
 /// Recursively diff two physical directories whose tree hashes already differ.
 ///
 /// `prefix` is the slash-rooted path of the directory itself (empty for the
-/// root).  Only subtrees whose `child_hash` differs are descended into; equal
-/// child hashes prune the whole subtree.
+/// root).  Only subtrees that differ are descended into; an entry whose
+/// `child_hash` *and* node metadata both match prunes the whole subtree.
+///
+/// Metadata counts as content here.  A version's metadata -- when it was
+/// written, the event-time range it covers -- is data about that immutable
+/// version, committed to by the directory entry, so two entries that agree on
+/// bytes but disagree on metadata are `Modified`.  Pruning on `child_hash`
+/// alone would let the roots differ while the descent reported nothing.
 fn diff_dir(
     prefix: &str,
     left_key: &NodeKey,
@@ -149,8 +155,8 @@ fn diff_dir(
                 kind: DiffKind::Added,
             }),
             (Some(lc), Some(rc)) => {
-                if lc.child_hash == rc.child_hash {
-                    continue; // identical subtree -- prune.
+                if lc.child_hash == rc.child_hash && lc.versions == rc.versions {
+                    continue; // identical subtree and metadata -- prune.
                 }
                 if lc.entry_type != rc.entry_type {
                     out.push(ContentDiff {
@@ -160,9 +166,13 @@ fn diff_dir(
                     continue;
                 }
                 match (&lc.child_dir_key, &rc.child_dir_key) {
-                    // Both physical directories: descend for path-level detail.
-                    (Some(lk), Some(rk)) => diff_dir(&path, lk, left, rk, right, out),
-                    // Same non-directory kind with differing content.
+                    // Both physical directories with differing subtrees:
+                    // descend for path-level detail.
+                    (Some(lk), Some(rk)) if lc.child_hash != rc.child_hash => {
+                        diff_dir(&path, lk, left, rk, right, out);
+                    }
+                    // Same kind, differing content -- either differing bytes or
+                    // identical bytes with differing node metadata.
                     _ => out.push(ContentDiff {
                         path,
                         kind: DiffKind::Modified,

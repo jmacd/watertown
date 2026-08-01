@@ -260,14 +260,21 @@ fn flip_bit(key: &mut [u8; 32], depth: usize) {
 /// the key, not part of the value.
 ///
 /// `blake3(entry_type || len-prefixed name || len-prefixed parent_node_id ||
-/// child_hash)`; the length prefixes keep the `name`/`parent` boundary
-/// unambiguous, mirroring [`super::encode_manifest`].
+/// child_hash || version metadata)`; the length prefixes keep the
+/// `name`/`parent` boundary unambiguous, mirroring [`super::encode_manifest`].
+///
+/// The per-version metadata is part of the value because a metadata-only change
+/// leaves `child_hash` untouched: the node's content is the same bytes, only
+/// what is known *about* those bytes changed. Omitting it would make such a
+/// change invisible to the node-keyed diff, so a replica holding stale metadata
+/// would never be told to repair it.
 fn entry_value(entry: &ManifestEntry) -> [u8; 32] {
     let mut buf = Vec::with_capacity(1 + 8 + entry.name.len() + entry.parent_node_id.len() + 32);
     buf.push(entry.entry_type as u8);
     push_len_prefixed(&mut buf, entry.name.as_bytes());
     push_len_prefixed(&mut buf, entry.parent_node_id.as_bytes());
     buf.extend_from_slice(entry.child_hash.as_bytes());
+    super::tree::push_version_metas(&mut buf, &entry.versions);
     *blake3::hash(&buf).as_bytes()
 }
 
@@ -327,7 +334,7 @@ mod tests {
     }
 
     fn entry(node_id: &str, parent: &str, name: &str, child: &str) -> ManifestEntry {
-        ManifestEntry::new(
+        ManifestEntry::bare(
             node_id,
             parent,
             name,

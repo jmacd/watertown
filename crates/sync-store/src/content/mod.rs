@@ -10,9 +10,22 @@
 //! - **blob** -- the exact stored bytes of one file version.  A blob's
 //!   identity is simply `blake3(bytes)`; there is no dedicated type because a
 //!   blob *is* its bytes.  Use [`ObjectHash::of_bytes`].
-//! - **tree** -- a directory as its sorted entries (see [`tree`]).
+//! - **tree** -- a directory as its sorted entries, each carrying the node
+//!   metadata that directory records for its child (see [`tree`]).
 //! - **commit** -- one transaction, the only object carrying lineage (see
 //!   [`commit`]).
+//!
+//! # Metadata is content
+//!
+//! A version's metadata -- when it was created, the event-time range it
+//! covers, its extended attributes -- is data about an immutable version, not
+//! an annotation on the side, so a tree entry commits to it along with the
+//! child's hash (see [`VersionMeta`]).  Two consequences follow.  A replica,
+//! which adopts the source's metadata verbatim, has an identical root tree
+//! hash; but two ponds written independently from the same bytes do *not*,
+//! because their versions were created at different times.  Blobs stay purely
+//! byte-addressed, so identical bytes are still stored and transferred once no
+//! matter how many entries describe them.
 //!
 //! # The store invariant
 //!
@@ -40,8 +53,8 @@ pub use commit::{Commit, Provenance};
 pub use manifest::{ManifestEntry, decode_manifest, encode_manifest, manifest_hash};
 pub use node_merkle::{NodeMerkle, rebuild_root as node_merkle_rebuild_root};
 pub use tree::{
-    TreeEntry, decode_recipe, decode_series, decode_tree, encode_recipe, encode_series,
-    encode_tree, recipe_hash, series_hash, tree_hash,
+    TreeEntry, VersionMeta, decode_recipe, decode_series, decode_tree, encode_recipe,
+    encode_series, encode_tree, recipe_hash, series_hash, tree_hash,
 };
 
 use std::fmt;

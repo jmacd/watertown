@@ -176,7 +176,12 @@ impl PersistenceLayer for HostmountPersistence {
         }
     }
 
-    async fn create_symlink_node(&self, _id: FileID, _target: &Path) -> Result<Node> {
+    async fn create_symlink_node(
+        &self,
+        _id: FileID,
+        _target: &Path,
+        _mtime: Option<i64>,
+    ) -> Result<Node> {
         Err(Error::Other(
             "Symlinks are not supported on hostmount".to_string(),
         ))
@@ -187,6 +192,7 @@ impl PersistenceLayer for HostmountPersistence {
         _id: FileID,
         _factory_type: &str,
         _config_content: Vec<u8>,
+        _mtime: Option<i64>,
     ) -> Result<Node> {
         Err(Error::Other(
             "Dynamic nodes are not supported on hostmount".to_string(),
