@@ -664,6 +664,22 @@ impl AsyncWrite for OpLogFileWriter {
                                      timestamp field matches the records being ingested."
                                 )));
                             } else {
+                                // No extractor: nothing declared this series
+                                // temporal and no bounds were supplied, so the
+                                // version is stored with a null range. That is
+                                // correct for an opaque byte stream, but it is
+                                // also what a downstream temporal-reduce must
+                                // read as "spans all time", so say so rather
+                                // than letting it vanish -- an unbounded
+                                // version is otherwise visible only as a slow,
+                                // memory-hungry rollup much later.
+                                debug!(
+                                    "OpLogFileWriter::poll_shutdown() - FilePhysicalSeries {file_id} \
+                                     version {allocated_version} stored with null temporal bounds \
+                                     ({content_len} bytes): no timestamp extractor was provided. \
+                                     Callers carrying logs or metrics should declare one with \
+                                     FileMetadataWriter::require_temporal_metadata()."
+                                );
                                 crate::file_writer::FileMetadata::Data
                             }
                         }

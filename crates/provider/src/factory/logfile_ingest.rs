@@ -319,6 +319,13 @@ fn attach_temporal_bounds(
     pond_dest: &str,
 ) {
     let Some(field) = config.timestamp_field.as_deref() else {
+        debug!(
+            "No timestamp_field configured for {}; storing {} bytes with null event-time bounds. \
+             A downstream temporal-reduce reads a null range as spanning all time and recomputes \
+             its cache in full, so set timestamp_field if these records carry logs or metrics.",
+            pond_dest,
+            content.len()
+        );
         return;
     };
 

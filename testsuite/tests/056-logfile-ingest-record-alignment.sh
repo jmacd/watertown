@@ -158,8 +158,6 @@ check "[ '$UNBOUNDED_WRONG' -eq 0 ]" \
 echo ""
 echo "--- An opaque stream is not withheld ---"
 mkdir -p /var/log/opaque
-# No newline anywhere: aligning this would withhold it forever.
-printf 'no-newline-anywhere-at-all' > /var/log/opaque/blob.log
 
 cat > /tmp/056-opaque.yaml << 'EOF'
 archived_pattern: /var/log/opaque/blob.log.*
@@ -168,11 +166,24 @@ pond_path: /opaque
 EOF
 
 pond mkdir -p /opaque >/dev/null
+# mknod runs the factory as a post-commit hook, so the file is created after
+# the node: otherwise the ingest happens during mknod and the run below has
+# nothing left to write.
 pond mknod logfile-ingest /system/run/30-opaque --config-path /tmp/056-opaque.yaml >/dev/null
-pond run /system/run/30-opaque >/dev/null 2>&1
+
+# No newline anywhere: aligning this would withhold it forever.
+printf 'no-newline-anywhere-at-all' > /var/log/opaque/blob.log
+RUST_LOG=debug pond run /system/run/30-opaque > /tmp/056-opaque-log.txt 2>&1
 
 pond cat /opaque/blob.log > /tmp/056-opaque.txt 2>/dev/null || true
 check "diff -q /tmp/056-opaque.txt /var/log/opaque/blob.log" \
   "a stream with no newline and no timestamp_field is stored byte-exact"
+
+# Storing a null range is correct here, but it is the same state a downstream
+# temporal-reduce reads as "spans all time", so it must not be silent: an
+# unbounded version is otherwise visible only as a slow rollup much later.
+check_contains /tmp/056-opaque-log.txt \
+  "storing null bounds without an extractor is logged, not silent" \
+  'null event-time bounds'
 
 check_finish
