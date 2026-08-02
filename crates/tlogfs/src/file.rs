@@ -330,6 +330,14 @@ pub struct OpLogFileWriter {
     completion_future: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     entry_type: tinyfs::EntryType,
     precomputed_metadata: Option<crate::file_writer::FileMetadata>,
+    /// An explicit mtime to persist instead of the current wall clock, set by
+    /// replication so a mirrored version keeps the source's timestamp.
+    precomputed_mtime: Option<i64>,
+    /// Names the timestamp field the caller expects to find, set by
+    /// [`FileMetadataWriter::require_temporal_metadata`]. When present,
+    /// finalizing a non-empty `FilePhysicalSeries` without temporal bounds is
+    /// an error rather than a silent downgrade to `FileMetadata::Data`.
+    required_timestamp_column: Option<String>,
     /// Pre-allocated version number for this write (allocated at writer creation)
     allocated_version: i64,
     /// When set, the persisted row carries a `collapsed_through` sentinel equal
@@ -360,6 +368,8 @@ impl OpLogFileWriter {
             completion_future: None,
             entry_type,
             precomputed_metadata: None,
+            precomputed_mtime: None,
+            required_timestamp_column: None,
             allocated_version,
             collapse_prior,
         }
@@ -374,6 +384,14 @@ impl FileMetadataWriter for OpLogFileWriter {
             max_timestamp: max,
             timestamp_column,
         });
+    }
+
+    fn set_mtime(&mut self, timestamp: i64) {
+        self.precomputed_mtime = Some(timestamp);
+    }
+
+    fn require_temporal_metadata(&mut self, timestamp_column: String) {
+        self.required_timestamp_column = Some(timestamp_column);
     }
 
     async fn infer_temporal_bounds(&mut self) -> tinyfs::Result<(i64, i64, String)> {
@@ -516,6 +534,8 @@ impl AsyncWrite for OpLogFileWriter {
             let transaction_state = this.transaction_state.clone();
             let entry_type = this.entry_type;
             let precomputed_metadata = this.precomputed_metadata.clone();
+            let precomputed_mtime = this.precomputed_mtime;
+            let required_timestamp_column = this.required_timestamp_column.clone();
             let allocated_version = this.allocated_version;
             let collapse_prior = this.collapse_prior;
 
@@ -627,7 +647,39 @@ impl AsyncWrite for OpLogFileWriter {
                             // tracking), otherwise fall through to Data.
                             if let Some(precomputed) = precomputed_metadata {
                                 precomputed
+                            } else if let Some(column) = required_timestamp_column
+                                .filter(|_| !content.is_empty() || content_len > 0)
+                            {
+                                // The caller declared this version carries
+                                // event-timestamped records, so storing it
+                                // unbounded is not a safe degradation: every
+                                // downstream temporal-reduce would treat it as
+                                // spanning all time and rebuild its whole cache.
+                                // Symmetric with TablePhysicalSeries above.
+                                return Err(tinyfs::Error::Other(format!(
+                                    "FilePhysicalSeries declared temporal via \
+                                     FileMetadataWriter::require_temporal_metadata('{column}') but \
+                                     was finalized without bounds: no usable '{column}' timestamp \
+                                     was found in {content_len} bytes. Check that the configured \
+                                     timestamp field matches the records being ingested."
+                                )));
                             } else {
+                                // No extractor: nothing declared this series
+                                // temporal and no bounds were supplied, so the
+                                // version is stored with a null range. That is
+                                // correct for an opaque byte stream, but it is
+                                // also what a downstream temporal-reduce must
+                                // read as "spans all time", so say so rather
+                                // than letting it vanish -- an unbounded
+                                // version is otherwise visible only as a slow,
+                                // memory-hungry rollup much later.
+                                debug!(
+                                    "OpLogFileWriter::poll_shutdown() - FilePhysicalSeries {file_id} \
+                                     version {allocated_version} stored with null temporal bounds \
+                                     ({content_len} bytes): no timestamp extractor was provided. \
+                                     Callers carrying logs or metrics should declare one with \
+                                     FileMetadataWriter::require_temporal_metadata()."
+                                );
                                 crate::file_writer::FileMetadata::Data
                             }
                         }
@@ -660,7 +712,7 @@ impl AsyncWrite for OpLogFileWriter {
                     // version as superseding every earlier one it wrote.
                     let collapsed_through = collapse_prior.then(|| allocated_version - 1);
 
-                    state.store_file_content_ref(file_id, content_ref, metadata, Some(allocated_version), bao_outboard, collapsed_through).await
+                    state.store_file_content_ref(file_id, content_ref, metadata, Some(allocated_version), bao_outboard, collapsed_through, precomputed_mtime).await
                         .map_other_context("Failed to store file")
                 }.await;
 

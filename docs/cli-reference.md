@@ -1775,6 +1775,13 @@ archived_pattern: /var/log/app/app.log.*
 active_pattern: /var/log/app/app.log
 # Destination path within the pond
 pond_path: /logs/app
+# Optional: JSON field holding each record's event time. Setting it declares
+# that this node carries logs or metrics, which makes ingest record per-version
+# event-time bounds. Omit it for opaque byte streams.
+timestamp_field: timeUnixNano
+# Unit of that field: seconds | milliseconds | microseconds | nanoseconds
+# (default: microseconds)
+timestamp_unit: nanoseconds
 ```
 
 **Usage:**
@@ -1794,6 +1801,18 @@ pond run 10-ingest b3sum
 - **Archived files** (matching `archived_pattern`): Immutable - ingested once, verified unchanged
 - **Active file** (matching `active_pattern`): Append-only - detects new bytes via cumulative bao-tree hash
 - **Rotation detection**: When active file shrinks or content prefix changes, searches for matching archived file
+
+**Event-time bounds (`timestamp_field`):**
+
+`temporal-reduce` keys its partial-aggregate cache on each source version's event-time range. A version stored without one is taken to span *all* of time, so every sealed segment is dropped and the rollup recomputes its whole history on every build — visible only as a slow, memory-hungry build.
+
+Setting `timestamp_field` declares the node temporal and changes three things:
+
+- Each written version records the min/max of that field across its records.
+- Slices taken from the **active** file are cut at the last newline, so a version never contains a half-written record. The withheld bytes are stored on the next run, once the writer has finished the line; appends are detected by size, so nothing is lost. Archived and rotated files are final and are always stored whole.
+- A version whose bounds cannot be determined **fails the write** rather than being stored unbounded. Reaching that point means the configured field or unit does not match the records.
+
+Leaving `timestamp_field` unset keeps the file an opaque byte stream: no bounds, no alignment, stored byte-for-byte. Use that for anything without one record per line.
 
 **Important:** Files >64KB are stored externally in parquet (not inline in oplog). See `docs/large-file-storage-implementation.md`.
 

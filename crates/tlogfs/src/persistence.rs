@@ -96,10 +96,19 @@ pub struct InnerState {
     directories: HashMap<FileID, DirectoryState>,
     /// Track files that exist in directories but haven't been written yet (pending write)
     pending_files: HashMap<FileID, EntryType>,
+    /// Explicit mtimes to adopt for nodes created but not yet persisted.
+    ///
+    /// A symlink is built in memory by `create_symlink_node` and written by a
+    /// later `store_node`, so a replicated mtime has to survive the gap; it is
+    /// consumed when the row is written.
+    pending_mtimes: HashMap<FileID, i64>,
     /// Track pre-allocated version numbers for async writes in progress
     allocated_versions: HashMap<FileID, Vec<i64>>,
-    /// Transaction poisoned flag - if true, commit must fail
-    poisoned: bool,
+    /// Reason the transaction was poisoned by a failed write, if any. Commit
+    /// must fail while this is set, and it carries the originating message so
+    /// the commit error can say what actually went wrong rather than only that
+    /// something did.
+    poisoned: Option<String>,
     session_context: Arc<SessionContext>,
     txn_seq: i64,
     /// Options for large file storage (compression, etc.)
@@ -2041,11 +2050,16 @@ impl PersistenceLayer for State {
             .map_err(error_utils::to_tinyfs_error)
     }
 
-    async fn create_symlink_node(&self, id: FileID, target: &Path) -> TinyFSResult<Node> {
+    async fn create_symlink_node(
+        &self,
+        id: FileID,
+        target: &Path,
+        mtime: Option<i64>,
+    ) -> TinyFSResult<Node> {
         self.inner
             .lock()
             .await
-            .create_symlink_node(id, target, self.clone())
+            .create_symlink_node(id, target, self.clone(), mtime)
             .await
     }
 
@@ -2054,11 +2068,12 @@ impl PersistenceLayer for State {
         id: FileID,
         factory_type: &str,
         config_content: Vec<u8>,
+        mtime: Option<i64>,
     ) -> TinyFSResult<Node> {
         self.inner
             .lock()
             .await
-            .create_dynamic_node(id, factory_type, config_content, self.clone())
+            .create_dynamic_node(id, factory_type, config_content, self.clone(), mtime)
             .await
             .map_err(error_utils::to_tinyfs_error)
     }
@@ -2188,6 +2203,7 @@ impl State {
         pre_allocated_version: Option<i64>,
         bao_outboard: Option<Vec<u8>>,
         collapsed_through: Option<i64>,
+        mtime: Option<i64>,
     ) -> Result<(), TLogFSError> {
         self.inner
             .lock()
@@ -2199,6 +2215,7 @@ impl State {
                 pre_allocated_version,
                 bao_outboard,
                 collapsed_through,
+                mtime,
             )
             .await
     }
@@ -2434,8 +2451,9 @@ impl InnerState {
             records: Vec::new(),
             directories: HashMap::new(),
             pending_files: HashMap::new(),
+            pending_mtimes: HashMap::new(),
             allocated_versions: HashMap::new(),
-            poisoned: false,
+            poisoned: None,
             session_context: ctx,
             txn_seq,
             large_file_options,
@@ -2779,9 +2797,9 @@ impl InnerState {
 
     /// Poison the transaction due to write failure
     async fn poison_transaction(&mut self, reason: String) {
-        if !self.poisoned {
+        if self.poisoned.is_none() {
             warn!("[TEST] TRANSACTION POISONED: {reason}");
-            self.poisoned = true;
+            self.poisoned = Some(reason);
         }
     }
 
@@ -3031,10 +3049,11 @@ impl InnerState {
         pond_id: String,
     ) -> Result<Option<deltalake::kernel::transaction::FinalizedCommit>, TLogFSError> {
         // Check if transaction is poisoned (failed write)
-        if self.poisoned {
+        if let Some(reason) = &self.poisoned {
             return Err(TLogFSError::Transaction {
-                message: "Cannot commit poisoned transaction - a write operation failed"
-                    .to_string(),
+                message: format!(
+                    "Cannot commit poisoned transaction - a write operation failed: {reason}"
+                ),
             });
         }
 
@@ -3273,11 +3292,14 @@ impl InnerState {
         pre_allocated_version: Option<i64>,
         bao_outboard: Option<Vec<u8>>,
         collapsed_through: Option<i64>,
+        mtime: Option<i64>,
     ) -> Result<(), TLogFSError> {
         debug!("store_file_content_ref_transactional called for node_id={id}");
 
-        // Create OplogEntry from content reference
-        let now = Utc::now().timestamp_micros();
+        // Create OplogEntry from content reference.  Replication supplies the
+        // source's mtime so a mirrored version keeps the timestamp it was
+        // originally written with; a local write stamps the wall clock.
+        let now = mtime.unwrap_or_else(|| Utc::now().timestamp_micros());
 
         // Use pre-allocated version if provided, otherwise calculate next version
         let version = if let Some(allocated) = pre_allocated_version {
@@ -3654,6 +3676,7 @@ impl InnerState {
         factory_type: &str,
         config_content: Vec<u8>,
         state: State,
+        mtime: Option<i64>,
     ) -> Result<Node, TLogFSError> {
         debug!(
             "create_dynamic_node: id={}, entry_type={:?}, factory_type='{}', txn_seq={}",
@@ -3663,7 +3686,7 @@ impl InnerState {
             self.txn_seq
         );
 
-        let now = Utc::now().timestamp_micros();
+        let now = mtime.unwrap_or_else(|| Utc::now().timestamp_micros());
         let next_version = self.get_next_version_for_node(id).await?;
 
         // Create dynamic node OplogEntry with factory field
@@ -4146,7 +4169,10 @@ impl InnerState {
             }
         };
 
-        let now = Utc::now().timestamp_micros();
+        let now = self
+            .pending_mtimes
+            .remove(&id)
+            .unwrap_or_else(|| Utc::now().timestamp_micros());
 
         let next_version = self
             .get_next_version_for_node(id)
@@ -4218,8 +4244,13 @@ impl InnerState {
         id: FileID,
         target: &Path,
         state: State,
+        mtime: Option<i64>,
     ) -> TinyFSResult<Node> {
-        // Create symlink node in memory only - store_node will persist it
+        // Create symlink node in memory only - store_node will persist it,
+        // consuming any explicit mtime recorded here.
+        if let Some(mtime) = mtime {
+            _ = self.pending_mtimes.insert(id, mtime);
+        }
         node_factory::create_symlink_node(id, target, state)
     }
 

@@ -7,6 +7,7 @@
 //! Section 8.4 / Decision D7).
 
 use steward::{Ship, inventory_content_objects, materialize_content_objects};
+use sync_store::ContentRemote;
 use sync_store::content::ObjectHash;
 use tempfile::tempdir;
 use tinyfs::async_helpers::convenience::create_file_path;
@@ -47,6 +48,36 @@ async fn new_pond(label: &str) -> (tempfile::TempDir, Ship) {
         .await
         .expect("create pond");
     (tmp, ship)
+}
+
+/// Build a genuine replica of `src`.
+///
+/// Replication is the only way to obtain a second pond with identical content:
+/// a version's metadata -- when it was created, the event-time range it covers
+/// -- is data about that immutable version, and the directory entry commits to
+/// it.  Two ponds written independently from the same bytes therefore do *not*
+/// have identical content.  A replica adopts the source's metadata verbatim,
+/// so it does.
+async fn replica_of(src: &Ship, label: &str) -> (tempfile::TempDir, tempfile::TempDir, Ship) {
+    let pond_id = uuid::Uuid::parse_str(src.data_persistence().pond_id()).expect("pond id");
+    let remote_dir = tempdir().expect("remote dir");
+    let mut remote = ContentRemote::create_at(remote_dir.path().join("remote"), pond_id)
+        .await
+        .expect("create remote");
+    let _ = steward::push_content_to_remote(src, &mut remote, "main")
+        .await
+        .expect("push");
+    let graph = steward::fetch_object_graph(&remote, "main")
+        .await
+        .expect("fetch");
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), label)
+        .await
+        .expect("create replica");
+    let _ = steward::rebuild_pond(&mut dst, &remote, &graph)
+        .await
+        .expect("rebuild");
+    (remote_dir, dst_dir, dst)
 }
 
 /// The content-addressing invariant: every inline object's bytes hash to its
@@ -103,16 +134,14 @@ async fn materialized_hashes_match_inventory() {
     );
 }
 
-/// Two ponds with identical content materialize identical object maps -- the
-/// property that lets one clone the other by transferring only missing hashes.
+/// A pond and its replica materialize identical object maps -- the property
+/// that lets one clone the other by transferring only missing hashes.
 #[tokio::test]
-async fn identical_ponds_materialize_identical_objects() {
+async fn replica_materializes_identical_objects() {
     let (_ta, mut a) = new_pond("pond-a").await;
-    let (_tb, mut b) = new_pond("pond-b").await;
-    for ship in [&mut a, &mut b] {
-        write_file(ship, "/a.txt", b"same").await;
-        mkdir_and_file(ship, "/d", "/d/c.txt", b"more").await;
-    }
+    write_file(&mut a, "/a.txt", b"same").await;
+    mkdir_and_file(&mut a, "/d", "/d/c.txt", b"more").await;
+    let (_rt, _dt, b) = replica_of(&a, "pond-b").await;
 
     let ma = materialize_content_objects(&a).await.expect("a");
     let mb = materialize_content_objects(&b).await.expect("b");

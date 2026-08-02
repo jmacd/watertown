@@ -403,7 +403,13 @@ async fn write_entries(
 
         writer.write_all(content.as_bytes()).await.map_other()?;
 
-        // Set temporal metadata if we have bounds for this file
+        // Record the event-time bounds computed from the records themselves.
+        // journald output is read whole rather than tailed by byte offset, and
+        // every entry carries __REALTIME_TIMESTAMP, so a group without bounds
+        // means the configured field does not match the records -- declare the
+        // requirement and let the write fail rather than store an unbounded
+        // version that forces downstream rollups to recompute all history.
+        writer.require_temporal_metadata(config.timestamp_field.clone());
         if let Some(bounds) = file_bounds.get(filename) {
             writer.set_temporal_metadata(
                 bounds.min_timestamp,

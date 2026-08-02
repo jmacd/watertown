@@ -3882,3 +3882,87 @@ async fn test_corruption_read_pending_bytes_walks_range_order() {
     }
     tx.commit_test().await.expect("commit read");
 }
+
+/// A caller that declares a FilePhysicalSeries temporal must supply bounds.
+///
+/// This is the byte-oriented counterpart of the TablePhysicalSeries rule.
+/// A parquet series gets its bounds from the footer, so one without them is
+/// already rejected; a byte series has no footer, and the storage layer cannot
+/// tell a timestamped log from an opaque blob. Ingest factories say so
+/// explicitly whenever their config names a timestamp field, and this test
+/// pins the resulting guarantee: declaring the requirement and then failing to
+/// set bounds fails the write instead of silently storing an unbounded version
+/// that would force every downstream rollup to recompute all history.
+#[tokio::test]
+async fn declared_temporal_file_series_without_bounds_is_rejected() {
+    let store_path = test_dir();
+    let mut persistence = OpLogPersistence::create_test(&store_path)
+        .await
+        .expect("Failed to create persistence");
+
+    let tx = persistence
+        .begin_test()
+        .await
+        .expect("Failed to begin transaction");
+    let wd = tx.root().await.expect("Failed to get root");
+
+    use tokio::io::AsyncWriteExt;
+    let mut writer = wd
+        .async_writer_path_with_type("logs.jsonl", tinyfs::EntryType::FilePhysicalSeries)
+        .await
+        .expect("Failed to create writer");
+    writer
+        .write_all(b"{\"msg\":\"no timestamp here\"}\n")
+        .await
+        .expect("Failed to write");
+    writer.require_temporal_metadata("timeUnixNano".to_string());
+
+    // A failed write poisons the transaction rather than surfacing at
+    // shutdown, so the rejection is observed at commit -- the same path that
+    // reports a TablePhysicalSeries written without bounds.
+    let _ = writer.shutdown().await;
+
+    let err = tx
+        .commit_test()
+        .await
+        .expect_err("commit must reject a declared-temporal series lacking bounds");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("timeUnixNano"),
+        "error should name the field that was looked for, got: {msg}"
+    );
+}
+
+/// The same write succeeds, and stays unbounded, when nothing declared it
+/// temporal -- FilePhysicalSeries remains usable for opaque byte streams.
+#[tokio::test]
+async fn undeclared_file_series_without_bounds_is_still_allowed() {
+    let store_path = test_dir();
+    let mut persistence = OpLogPersistence::create_test(&store_path)
+        .await
+        .expect("Failed to create persistence");
+
+    let tx = persistence
+        .begin_test()
+        .await
+        .expect("Failed to begin transaction");
+    let wd = tx.root().await.expect("Failed to get root");
+
+    use tokio::io::AsyncWriteExt;
+    let mut writer = wd
+        .async_writer_path_with_type("blob.bin", tinyfs::EntryType::FilePhysicalSeries)
+        .await
+        .expect("Failed to create writer");
+    writer
+        .write_all(b"opaque bytes\n")
+        .await
+        .expect("Failed to write");
+    writer
+        .shutdown()
+        .await
+        .expect("an undeclared byte series must still be storable without bounds");
+
+    tx.commit_test()
+        .await
+        .expect("an undeclared byte series must commit without bounds");
+}

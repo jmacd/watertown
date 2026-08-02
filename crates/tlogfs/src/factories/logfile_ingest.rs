@@ -23,6 +23,8 @@ mod tests {
             archived_pattern: "/var/log/test-*.json".to_string(),
             active_pattern: "/var/log/test.json".to_string(),
             pond_path: "logs/test".to_string(),
+            timestamp_field: None,
+            timestamp_unit: Default::default(),
         };
 
         assert!(config.validate().is_ok());
@@ -34,6 +36,8 @@ mod tests {
             archived_pattern: "/var/log/test-*.json".to_string(),
             active_pattern: "/var/log/test.json".to_string(),
             pond_path: "".to_string(),
+            timestamp_field: None,
+            timestamp_unit: Default::default(),
         };
 
         assert!(config.validate().is_err());
@@ -343,6 +347,8 @@ mod integration_tests {
             active_pattern: logfile.path().to_string_lossy().to_string(),
             archived_pattern: "".to_string(), // No archived files for this test
             pond_path: "logs/test_app".to_string(),
+            timestamp_field: None,
+            timestamp_unit: Default::default(),
         };
 
         // Create pond with the config (creates real config file with FileID)
@@ -480,6 +486,8 @@ mod integration_tests {
             active_pattern: logfile.path().to_string_lossy().to_string(),
             archived_pattern: "".to_string(),
             pond_path: "logs/test_app".to_string(),
+            timestamp_field: None,
+            timestamp_unit: Default::default(),
         };
 
         // Create pond with config (gets real FileID)
@@ -552,6 +560,8 @@ mod integration_tests {
             active_pattern: active_path.to_string_lossy().to_string(),
             archived_pattern: archived_pattern.clone(),
             pond_path: "logs/test_app".to_string(),
+            timestamp_field: None,
+            timestamp_unit: Default::default(),
         };
 
         // Create pond
@@ -899,6 +909,8 @@ mod integration_tests {
             active_pattern: active_path.to_string_lossy().to_string(),
             archived_pattern: archived_pattern.clone(),
             pond_path: "logs/blake3_test".to_string(),
+            timestamp_field: None,
+            timestamp_unit: Default::default(),
         };
 
         let pond = PondSimulator::new(&config).await.unwrap();
@@ -1061,6 +1073,8 @@ mod integration_tests {
             active_pattern: active_path.to_string_lossy().to_string(),
             archived_pattern: archived_pattern.clone(),
             pond_path: "logs/large_test".to_string(),
+            timestamp_field: None,
+            timestamp_unit: Default::default(),
         };
 
         let pond = PondSimulator::new(&config).await.unwrap();
@@ -1151,6 +1165,8 @@ mod integration_tests {
             active_pattern: active_path.to_string_lossy().to_string(),
             archived_pattern: "".to_string(),
             pond_path: "logs/boundary_test".to_string(),
+            timestamp_field: None,
+            timestamp_unit: Default::default(),
         };
 
         let pond = PondSimulator::new(&config).await.unwrap();
@@ -1262,6 +1278,8 @@ mod integration_tests {
                 active_pattern: active_path.to_string_lossy().to_string(),
                 archived_pattern: archived_pattern.clone(),
                 pond_path: format!("logs/{}", test_name),
+                timestamp_field: None,
+                timestamp_unit: Default::default(),
             };
 
             let pond = PondSimulator::new(&config).await?;

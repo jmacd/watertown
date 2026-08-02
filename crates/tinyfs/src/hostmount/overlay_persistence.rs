@@ -96,8 +96,13 @@ impl PersistenceLayer for OverlayPersistence {
         self.inner.create_directory_node(id).await
     }
 
-    async fn create_symlink_node(&self, id: FileID, target: &Path) -> Result<Node> {
-        self.inner.create_symlink_node(id, target).await
+    async fn create_symlink_node(
+        &self,
+        id: FileID,
+        target: &Path,
+        mtime: Option<i64>,
+    ) -> Result<Node> {
+        self.inner.create_symlink_node(id, target, mtime).await
     }
 
     async fn create_dynamic_node(
@@ -105,9 +110,10 @@ impl PersistenceLayer for OverlayPersistence {
         id: FileID,
         factory_type: &str,
         config_content: Vec<u8>,
+        mtime: Option<i64>,
     ) -> Result<Node> {
         self.inner
-            .create_dynamic_node(id, factory_type, config_content)
+            .create_dynamic_node(id, factory_type, config_content, mtime)
             .await
     }
 

@@ -62,13 +62,30 @@ pub trait PersistenceLayer: Send + Sync {
         Ok(())
     }
 
-    async fn create_symlink_node(&self, id: FileID, target: &Path) -> Result<Node>;
+    /// Create a symlink node pointing at `target`.
+    ///
+    /// `mtime` sets the node's timestamp explicitly, in microseconds since the
+    /// Unix epoch; `None` means now.  Replication passes the source's value so
+    /// a mirrored node keeps the time it was originally written rather than
+    /// claiming to have been modified at pull time.
+    async fn create_symlink_node(
+        &self,
+        id: FileID,
+        target: &Path,
+        mtime: Option<i64>,
+    ) -> Result<Node>;
 
+    /// Create a dynamic node from its factory type and config.
+    ///
+    /// `mtime` behaves as in [`create_symlink_node`].
+    ///
+    /// [`create_symlink_node`]: PersistenceLayer::create_symlink_node
     async fn create_dynamic_node(
         &self,
         id: FileID,
         factory_type: &str,
         config_content: Vec<u8>,
+        mtime: Option<i64>,
     ) -> Result<Node>;
 
     async fn get_dynamic_node_config(&self, id: FileID) -> Result<Option<(String, Vec<u8>)>>; // (factory_type, config)

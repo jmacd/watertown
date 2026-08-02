@@ -437,11 +437,16 @@ impl WD {
     /// Adopt a symlink child under `name` with an explicit `node_id`, pointing
     /// at `target`.  `name` must be a direct child of this directory and must
     /// not already exist.
+    ///
+    /// `mtime` sets the node's timestamp explicitly (microseconds since the
+    /// Unix epoch); `None` means now.  Replication passes the source's mtime so
+    /// the mirrored node keeps it.
     pub async fn insert_symlink_with_id(
         &self,
         name: &str,
         node_id: NodeID,
         target: &str,
+        mtime: Option<i64>,
     ) -> Result<()> {
         self.check_writable()?;
         if self.dref.get(name).await?.is_some() {
@@ -451,7 +456,7 @@ impl WD {
         let node = self
             .fs
             .persistence
-            .create_symlink_node(id, Path::new(target))
+            .create_symlink_node(id, Path::new(target), mtime)
             .await?;
         self.fs.persistence.store_node(&node).await?;
         self.dref.insert(name.to_string(), node).await?;
@@ -461,12 +466,17 @@ impl WD {
     /// Adopt a dynamic child under `name` with an explicit `node_id`, from its
     /// factory type and config.  `name` must be a direct child of this
     /// directory and must not already exist.
+    ///
+    /// `mtime` behaves as in [`insert_symlink_with_id`].
+    ///
+    /// [`insert_symlink_with_id`]: WD::insert_symlink_with_id
     pub async fn insert_dynamic_with_id(
         &self,
         name: &str,
         node_id: NodeID,
         factory_type: &str,
         config_content: Vec<u8>,
+        mtime: Option<i64>,
     ) -> Result<()> {
         self.check_writable()?;
         if self.dref.get(name).await?.is_some() {
@@ -475,7 +485,7 @@ impl WD {
         let id = self.id().child_id(node_id);
         let node = self
             .fs
-            .create_dynamic_node(id, factory_type, config_content)
+            .create_dynamic_node(id, factory_type, config_content, mtime)
             .await?;
         self.dref.insert(name.to_string(), node).await?;
         Ok(())
@@ -1387,7 +1397,7 @@ impl WD {
                         let id = wd.id().new_child_id(entry_type);
                         let node = wd
                             .fs
-                            .create_dynamic_node(id, factory_type, config_content)
+                            .create_dynamic_node(id, factory_type, config_content, None)
                             .await?;
 
                         // Insert into parent directory with the given name

@@ -39,9 +39,9 @@ use std::sync::Arc;
 use datafusion::execution::context::SessionContext;
 
 use sync_store::content::{
-    Commit, ManifestEntry, ObjectHash, Provenance, TreeEntry, decode_manifest, encode_manifest,
-    encode_recipe, encode_series, encode_tree, manifest_hash, node_merkle_rebuild_root,
-    recipe_hash, series_hash,
+    Commit, ManifestEntry, ObjectHash, Provenance, TreeEntry, VersionMeta, decode_manifest,
+    encode_manifest, encode_recipe, encode_series, encode_tree, manifest_hash,
+    node_merkle_rebuild_root, recipe_hash, series_hash,
 };
 use tinyfs::{EntryType, ROOT_UUID};
 use tlogfs::schema::{CollapseRange, OplogEntry, decode_directory_entries, live_series_versions};
@@ -109,7 +109,11 @@ pub(crate) async fn materialize_tlog(
 #[derive(Debug, Clone)]
 pub struct ContentTreeReport {
     /// The content hash of the local pond's root directory tree.  Equal roots
-    /// mean byte-identical content across the whole pond.
+    /// mean identical content across the whole pond -- identical bytes *and*
+    /// the node metadata the directory entries commit to, since a version's
+    /// metadata is data about that version.  A replica has an equal root; two
+    /// ponds written independently from the same bytes do not, because their
+    /// versions were created at different times.
     pub root_tree_hash: ObjectHash,
     /// Number of distinct nodes folded into the root.
     pub nodes_hashed: usize,
@@ -185,6 +189,10 @@ pub(crate) struct ChildRef {
     /// The child directory's node key, present only when the child is a
     /// physical directory (the only kind a diff can descend into).
     pub child_dir_key: Option<NodeKey>,
+    /// Node metadata for the child's live versions, oldest first: one entry for
+    /// a single-version node, one per version for a series, none for a
+    /// directory (whose state is its subtree).
+    pub versions: Vec<VersionMeta>,
 }
 
 /// An in-memory index of a pond's content tree: the root hash plus, for every
@@ -226,6 +234,9 @@ struct NodeFacts {
     /// into the recipe hash so the content commits to the factory, not just its
     /// config (Decision D4).
     factory: Option<String>,
+    /// The node metadata of this node's latest version, carried on the parent
+    /// directory's entry so a replica can restore it.
+    meta: VersionMeta,
 }
 
 /// One version of a series: its blob hash plus the inline bytes when the
@@ -234,6 +245,7 @@ struct NodeFacts {
 struct VersionBlob {
     hash: ObjectHash,
     content: Option<Vec<u8>>,
+    meta: VersionMeta,
 }
 
 /// Compute the local pond's `root_tree_hash` from its live filesystem state.
@@ -309,7 +321,7 @@ pub(crate) async fn build_content_tree_for_table(
 pub(crate) fn node_manifest_entries(index: &ContentTreeIndex) -> Vec<ManifestEntry> {
     let local_pond = &index.root_key.0;
     let mut entries = Vec::with_capacity(index.nodes_hashed.max(1));
-    entries.push(ManifestEntry::new(
+    entries.push(ManifestEntry::bare(
         index.root_key.1.clone(),
         String::new(),
         String::new(),
@@ -328,6 +340,7 @@ pub(crate) fn node_manifest_entries(index: &ContentTreeIndex) -> Vec<ManifestEnt
                 child.name.clone(),
                 child.entry_type,
                 child.child_hash,
+                child.versions.clone(),
             ));
         }
     }
@@ -512,11 +525,16 @@ pub(crate) async fn incremental_spine_inputs(
     // Baseline drawn from the prior manifest: every node's current child_hash,
     // type, parent, and each directory's content-child listing.
     let mut child_hash: HashMap<String, ObjectHash> = HashMap::new();
+    // Node metadata per node, seeded from the prior manifest and replaced for
+    // every node this transaction touched.  Carried alongside `child_hash`
+    // because a metadata-only change leaves the content hash untouched.
+    let mut child_versions: HashMap<String, Vec<VersionMeta>> = HashMap::new();
     let mut etype_of: HashMap<String, EntryType> = HashMap::new();
     let mut parent_of: HashMap<String, String> = HashMap::new();
     let mut dir_children: HashMap<String, Vec<ChildLite>> = HashMap::new();
     for e in &prior {
         let _ = child_hash.insert(e.node_id.clone(), e.child_hash);
+        let _ = child_versions.insert(e.node_id.clone(), e.versions.clone());
         let _ = etype_of.insert(e.node_id.clone(), e.entry_type);
         if e.node_id == ROOT_UUID {
             continue;
@@ -536,7 +554,7 @@ pub(crate) async fn incremental_spine_inputs(
     // the latest leaf row, and the accumulated series version blobs per node.
     let mut dir_rows: HashMap<String, (i64, Vec<u8>)> = HashMap::new();
     let mut leaf_latest: HashMap<String, OplogEntry> = HashMap::new();
-    let mut series_new: HashMap<String, BTreeMap<i64, ObjectHash>> = HashMap::new();
+    let mut series_new: HashMap<String, BTreeMap<i64, (ObjectHash, VersionMeta)>> = HashMap::new();
     let mut series_ranges: HashMap<String, Vec<(i64, CollapseRange)>> = HashMap::new();
     let mut changed: BTreeSet<String> = BTreeSet::new();
     for row in uncommitted {
@@ -552,10 +570,18 @@ pub(crate) async fn incremental_spine_inputs(
         match row.file_type {
             EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries => {
                 let hash = row_blob_hash(&row.blake3, row.content.as_deref());
-                let _ = series_new
-                    .entry(node.clone())
-                    .or_default()
-                    .insert(row.version, hash);
+                let _ = series_new.entry(node.clone()).or_default().insert(
+                    row.version,
+                    (
+                        hash,
+                        version_meta(
+                            row.timestamp,
+                            row.min_event_time,
+                            row.max_event_time,
+                            row.extended_attributes.as_ref(),
+                        ),
+                    ),
+                );
                 series_ranges
                     .entry(node)
                     .or_default()
@@ -604,6 +630,15 @@ pub(crate) async fn incremental_spine_inputs(
             }
         };
         let _ = child_hash.insert(node.clone(), hash);
+        let _ = child_versions.insert(
+            node.clone(),
+            vec![version_meta(
+                row.timestamp,
+                row.min_event_time,
+                row.max_event_time,
+                row.extended_attributes.as_ref(),
+            )],
+        );
     }
 
     // New content hash of every touched series: its committed version blobs
@@ -613,19 +648,21 @@ pub(crate) async fn incremental_spine_inputs(
     for (node, appended) in &series_new {
         let (mut versions, mut ranges) =
             read_series_committed(committed_table.clone(), local_pond_id, node).await?;
-        for (version, hash) in appended {
-            let _ = versions.insert(*version, *hash);
+        for (version, version_obj) in appended {
+            let _ = versions.insert(*version, version_obj.clone());
         }
         // This transaction's rows shadow the committed rows of the same version.
         if let Some(new_ranges) = series_ranges.get(node) {
             ranges.retain(|(v, _)| !new_ranges.iter().any(|(nv, _)| nv == v));
             ranges.extend(new_ranges.iter().copied());
         }
-        let ordered: Vec<ObjectHash> = live_series_versions(&ranges)
+        let ordered: Vec<(ObjectHash, VersionMeta)> = live_series_versions(&ranges)
             .into_iter()
-            .filter_map(|version| versions.get(&version).copied())
+            .filter_map(|version| versions.get(&version).cloned())
             .collect();
-        let _ = child_hash.insert(node.clone(), series_hash(&ordered));
+        let hashes: Vec<ObjectHash> = ordered.iter().map(|(h, _)| *h).collect();
+        let _ = child_hash.insert(node.clone(), series_hash(&hashes));
+        let _ = child_versions.insert(node.clone(), ordered.into_iter().map(|(_, m)| m).collect());
     }
 
     // Replace the listing of every modified directory, skipping the entries the
@@ -692,7 +729,11 @@ pub(crate) async fn incremental_spine_inputs(
                     kid.node_id
                 ))
             })?;
-            tree_entries.push(TreeEntry::new(kid.name, kid.entry_type, *ch));
+            let versions = child_versions
+                .get(&kid.node_id)
+                .cloned()
+                .unwrap_or_default();
+            tree_entries.push(TreeEntry::new(kid.name, kid.entry_type, *ch, versions));
         }
         let encoded = encode_tree(&tree_entries).map_err(StewardError::Content)?;
         let _ = child_hash.insert(dir, ObjectHash::of_bytes(&encoded));
@@ -705,7 +746,7 @@ pub(crate) async fn incremental_spine_inputs(
     // Rebuild the manifest by walking the live tree from the root, so deleted
     // (now-unreachable) subtrees drop out and only live nodes are recorded.
     let mut manifest: Vec<ManifestEntry> = Vec::with_capacity(prior.len());
-    manifest.push(ManifestEntry::new(
+    manifest.push(ManifestEntry::bare(
         ROOT_UUID.to_string(),
         String::new(),
         String::new(),
@@ -731,6 +772,10 @@ pub(crate) async fn incremental_spine_inputs(
                 kid.name,
                 kid.entry_type,
                 *ch,
+                child_versions
+                    .get(&kid.node_id)
+                    .cloned()
+                    .unwrap_or_default(),
             ));
             if kid.entry_type == EntryType::DirectoryPhysical {
                 stack.push(kid.node_id);
@@ -786,13 +831,20 @@ async fn read_series_committed(
     table: deltalake::DeltaTable,
     pond_id: &str,
     node_id: &str,
-) -> Result<(BTreeMap<i64, ObjectHash>, Vec<(i64, CollapseRange)>), StewardError> {
+) -> Result<
+    (
+        BTreeMap<i64, (ObjectHash, VersionMeta)>,
+        Vec<(i64, CollapseRange)>,
+    ),
+    StewardError,
+> {
     let ctx = SessionContext::new();
     let _previous = ctx
         .register_table("series_live", Arc::new(table))
         .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
     let sql = format!(
-        "SELECT version, blake3, content, collapsed_from, collapsed_through FROM series_live \
+        "SELECT version, timestamp, blake3, content, collapsed_from, collapsed_through, \
+         min_event_time, max_event_time, extended_attributes FROM series_live \
          WHERE pond_id = '{pond_id}' AND node_id = '{node_id}' ORDER BY version",
     );
     let batches = ctx
@@ -817,25 +869,38 @@ async fn read_series_committed(
             )
         })
         .collect();
-    let mut versions: BTreeMap<i64, ObjectHash> = BTreeMap::new();
+    let mut versions: BTreeMap<i64, (ObjectHash, VersionMeta)> = BTreeMap::new();
     for row in rows {
         let _ = versions.insert(
             row.version,
-            row_blob_hash(&row.blake3, row.content.as_deref()),
+            (
+                row_blob_hash(&row.blake3, row.content.as_deref()),
+                version_meta(
+                    row.timestamp,
+                    row.min_event_time,
+                    row.max_event_time,
+                    row.extended_attributes.as_ref(),
+                ),
+            ),
         );
     }
     Ok((versions, ranges))
 }
 
 /// One committed series version row: its version and the fields
-/// [`row_blob_hash`] needs, plus the collapse range columns.
+/// [`row_blob_hash`] needs, plus the collapse range columns and the node
+/// metadata a replica cannot recompute.
 #[derive(serde::Deserialize)]
 struct SeriesVersionRow {
     version: i64,
+    timestamp: i64,
     blake3: Option<String>,
     content: Option<Vec<u8>>,
     collapsed_from: Option<i64>,
     collapsed_through: Option<i64>,
+    min_event_time: Option<i64>,
+    max_event_time: Option<i64>,
+    extended_attributes: Option<String>,
 }
 
 /// Read the reserved commit-log node's leaves from `table` in commit order:
@@ -1227,6 +1292,12 @@ fn fold_rows(
                 VersionBlob {
                     hash,
                     content: row.content.clone(),
+                    meta: version_meta(
+                        row.timestamp,
+                        row.min_event_time,
+                        row.max_event_time,
+                        row.extended_attributes.as_ref(),
+                    ),
                 },
             );
             series_ranges
@@ -1238,6 +1309,12 @@ fn fold_rows(
         let _ = latest.insert(
             key,
             NodeFacts {
+                meta: version_meta(
+                    row.timestamp,
+                    row.min_event_time,
+                    row.max_event_time,
+                    row.extended_attributes.as_ref(),
+                ),
                 content: row.content,
                 blake3: row.blake3,
                 factory: row.factory,
@@ -1320,6 +1397,43 @@ fn row_blob_hash(blake3: &Option<String>, content: Option<&[u8]>) -> ObjectHash 
     ObjectHash::of_bytes(content.unwrap_or(&[]))
 }
 
+/// Canonicalize an extended-attributes JSON object so two ponds holding the
+/// same attributes serialize them identically.
+///
+/// The stored form comes from `serde_json` over a `HashMap`, whose key order is
+/// nondeterministic. That is harmless while the string is only ever read back
+/// locally, but a directory entry *hashes* it: if a source and its mirror
+/// emitted different key orders for equal attributes, their `tree_hash` would
+/// never converge and every pull would rewrite the series forever. Re-encoding
+/// through a `BTreeMap` sorts the keys and makes the encoding canonical.
+///
+/// Anything that does not parse as a flat JSON object is passed through
+/// verbatim -- an unrecognized shape is still node state and must not be lost.
+fn canonical_attributes(attrs: Option<&String>) -> Option<String> {
+    let raw = attrs?;
+    match serde_json::from_str::<BTreeMap<String, String>>(raw) {
+        Ok(sorted) => serde_json::to_string(&sorted)
+            .ok()
+            .or_else(|| Some(raw.clone())),
+        Err(_) => Some(raw.clone()),
+    }
+}
+
+/// Extract the node metadata a replica cannot recompute from content bytes.
+fn version_meta(
+    timestamp: i64,
+    min_event_time: Option<i64>,
+    max_event_time: Option<i64>,
+    extended_attributes: Option<&String>,
+) -> VersionMeta {
+    VersionMeta {
+        timestamp: Some(timestamp),
+        min_event_time,
+        max_event_time,
+        extended_attributes: canonical_attributes(extended_attributes),
+    }
+}
+
 /// Fold one directory (by key) into its recursive [`tree_hash`], recording its
 /// child list into `dirs` for later comparison.  When `sink` is `Some`, the
 /// encoded tree object bytes (and, via `hash_child`, descendant object bytes)
@@ -1383,7 +1497,7 @@ fn hash_directory(
         if child_key.1 == tinyfs::INDEX_NODE_UUID || child_key.1 == tinyfs::LOG_NODE_UUID {
             continue;
         }
-        let child_hash = hash_child(
+        let (child_hash, versions) = hash_child(
             &child_key,
             entry.entry_type,
             latest,
@@ -1405,8 +1519,14 @@ fn hash_directory(
             child_hash,
             child_node_id,
             child_dir_key,
+            versions: versions.clone(),
         });
-        tree_entries.push(TreeEntry::new(entry.name, entry.entry_type, child_hash));
+        tree_entries.push(TreeEntry::new(
+            entry.name,
+            entry.entry_type,
+            child_hash,
+            versions,
+        ));
     }
 
     let _ = in_progress.pop();
@@ -1434,16 +1554,20 @@ fn hash_child(
     in_progress: &mut Vec<NodeKey>,
     dirs: &mut HashMap<NodeKey, Vec<ChildRef>>,
     sink: Option<&mut MaterializedObjects>,
-) -> Result<ObjectHash, StewardError> {
+) -> Result<(ObjectHash, Vec<VersionMeta>), StewardError> {
     match entry_type {
         EntryType::DirectoryPhysical => {
-            hash_directory(key, latest, series_versions, memo, in_progress, dirs, sink)
+            // A directory carries no metadata of its own: its state is the
+            // subtree its tree_hash already commits to.
+            let hash = hash_directory(key, latest, series_versions, memo, in_progress, dirs, sink)?;
+            Ok((hash, Vec::new()))
         }
         EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries => {
             let versions = series_versions.get(key).ok_or_else(|| {
                 StewardError::DeltaLake(format!("missing series node {}/{}", key.0, key.1))
             })?;
             let ordered: Vec<ObjectHash> = versions.iter().map(|v| v.hash).collect();
+            let metas: Vec<VersionMeta> = versions.iter().map(|v| v.meta.clone()).collect();
             let series = series_hash(&ordered);
             if let Some(sink) = sink {
                 // The series manifest object, plus each version blob: small
@@ -1453,7 +1577,7 @@ fn hash_child(
                     record_blob(sink, v.hash, v.content.as_deref());
                 }
             }
-            Ok(series)
+            Ok((series, metas))
         }
         // Symlinks hash their target bytes; dynamic nodes hash their recipe
         // (factory type plus config), so the content commits to the factory and
@@ -1466,7 +1590,7 @@ fn hash_child(
                 // Symlink targets are small; always inline.
                 sink.put_inline(hash, bytes.to_vec());
             }
-            Ok(hash)
+            Ok((hash, vec![facts.meta.clone()]))
         }
         EntryType::DirectoryDynamic | EntryType::FileDynamic | EntryType::TableDynamic => {
             let facts = leaf_facts(key, latest)?;
@@ -1482,7 +1606,7 @@ fn hash_child(
                 // Recipes (factory + config) are small; always inline.
                 sink.put_inline(hash, encode_recipe(factory, config));
             }
-            Ok(hash)
+            Ok((hash, vec![facts.meta.clone()]))
         }
         // Single-version physical file or table: the version blob hash.
         EntryType::FilePhysicalVersion | EntryType::TablePhysicalVersion => {
@@ -1491,7 +1615,7 @@ fn hash_child(
             if let Some(sink) = sink {
                 record_blob(sink, hash, facts.content.as_deref());
             }
-            Ok(hash)
+            Ok((hash, vec![facts.meta.clone()]))
         }
     }
 }

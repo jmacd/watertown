@@ -22,8 +22,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use crate::content_source::ContentSource;
 use sync_store::content::{
-    Commit, ManifestEntry, ObjectHash, TreeEntry, decode_manifest, decode_recipe, decode_series,
-    decode_tree,
+    Commit, ManifestEntry, ObjectHash, TreeEntry, VersionMeta, decode_manifest, decode_recipe,
+    decode_series, decode_tree,
 };
 use tinyfs::{EntryType, NodeID, WD};
 use tlogfs::PondUserMetadata;
@@ -352,6 +352,24 @@ enum VersionSource {
     External(ObjectHash),
 }
 
+/// One version to write during a rebuild: where its bytes come from, plus the
+/// node metadata the source recorded for it.
+///
+/// The metadata rides alongside the bytes because a replica cannot derive it:
+/// a raw JSON-lines blob's event-time range depends on the *source pond's*
+/// ingest configuration (which field, which unit), which the replica never
+/// sees. Without carrying it, every replicated series version would land with
+/// NULL bounds, and consumers that key off those bounds -- notably the
+/// temporal-reduce rollup cache -- would treat each one as spanning all time
+/// and rebuild all history on every run.
+#[derive(Debug, Clone)]
+struct PlannedVersion {
+    /// Where this version's bytes come from.
+    source: VersionSource,
+    /// Node metadata to reapply on the replica.
+    meta: VersionMeta,
+}
+
 /// One filesystem operation in an incremental rebuild plan, in apply order.
 ///
 /// The plan is a `node_id`-keyed diff of the fetched source manifest against
@@ -387,7 +405,7 @@ enum ApplyOp {
         node_id: String,
         create: bool,
         entry_type: EntryType,
-        versions: Vec<VersionSource>,
+        versions: Vec<PlannedVersion>,
         /// When set, the first written version replaces (collapses) every
         /// version the target already held -- replicating a source-side series
         /// compaction. `versions` then holds the full post-collapse list, not an
@@ -402,6 +420,8 @@ enum ApplyOp {
         node_id: String,
         create: bool,
         target: String,
+        /// The source's mtime, adopted verbatim (see [`VersionMeta::timestamp`]).
+        mtime: Option<i64>,
     },
     /// Create (adopting `node_id`) or rewrite a dynamic node from its recipe.
     Dynamic {
@@ -411,6 +431,8 @@ enum ApplyOp {
         create: bool,
         factory: String,
         config: Vec<u8>,
+        /// The source's mtime, adopted verbatim (see [`VersionMeta::timestamp`]).
+        mtime: Option<i64>,
     },
     /// Unlink a target node that is absent from the source.
     Delete { parent_path: String, name: String },
@@ -961,7 +983,11 @@ fn plan_one(
                 outcome.files += 1;
             }
             let versions = if content_changed {
-                vec![version_source(graph, entry.child_hash)?]
+                vec![planned_version(
+                    graph,
+                    entry.child_hash,
+                    entry.versions.first(),
+                )?]
             } else {
                 Vec::new()
             };
@@ -1006,6 +1032,7 @@ fn plan_one(
                     node_id: entry.node_id.clone(),
                     create,
                     target,
+                    mtime: replicated_mtime(entry),
                 });
             }
         }
@@ -1025,11 +1052,21 @@ fn plan_one(
                     create,
                     factory,
                     config,
+                    mtime: replicated_mtime(entry),
                 });
             }
         }
     }
     Ok(())
+}
+
+/// The mtime a single-version node (symlink, dynamic recipe) should adopt.
+///
+/// Such a node has exactly one [`VersionMeta`], so the last entry is the node's
+/// current state; a node whose source recorded no mtime gets the local clock,
+/// as before.
+fn replicated_mtime(entry: &ManifestEntry) -> Option<i64> {
+    entry.versions.last().and_then(|meta| meta.timestamp)
 }
 
 /// Decide which series version blobs to write and whether the first replaces the
@@ -1049,8 +1086,23 @@ fn plan_series_versions(
     graph: &FetchedGraph,
     target_series: &HashMap<String, Vec<ObjectHash>>,
     existing_child_hash: Option<ObjectHash>,
-) -> Result<(Vec<VersionSource>, bool), StewardError> {
-    let incoming = series_hashes(graph, entry.child_hash)?;
+) -> Result<(Vec<PlannedVersion>, bool), StewardError> {
+    let incoming = series_versions(graph, entry.child_hash)?;
+
+    // The manifest entry carries one VersionMeta per live version, in the same
+    // order as the series object's hashes. A mismatch means the two objects
+    // disagree about the node's shape, so the metadata cannot be aligned with
+    // the bytes it describes; rebuilding from it would silently attach the
+    // wrong bounds to a version.
+    if !entry.versions.is_empty() && entry.versions.len() != incoming.len() {
+        return Err(StewardError::Content(format!(
+            "series node {} has {} version(s) but its entry carries {} metadata record(s)",
+            entry.node_id,
+            incoming.len(),
+            entry.versions.len()
+        )));
+    }
+    let meta_at = |index: usize| entry.versions.get(index);
 
     let held = match existing_child_hash {
         None => &[][..],
@@ -1071,7 +1123,8 @@ fn plan_series_versions(
     if incoming.len() >= held.len() && incoming[..held.len()] == *held {
         let suffix = incoming[held.len()..]
             .iter()
-            .map(|hash| version_source(graph, *hash))
+            .enumerate()
+            .map(|(offset, hash)| planned_version(graph, *hash, meta_at(held.len() + offset)))
             .collect::<Result<Vec<_>, _>>()?;
         return Ok((suffix, false));
     }
@@ -1081,7 +1134,8 @@ fn plan_series_versions(
     // the first version collapses everything the target held.
     let full = incoming
         .iter()
-        .map(|hash| version_source(graph, *hash))
+        .enumerate()
+        .map(|(index, hash)| planned_version(graph, *hash, meta_at(index)))
         .collect::<Result<Vec<_>, _>>()?;
     Ok((full, true))
 }
@@ -1171,12 +1225,13 @@ async fn apply_ops(
                 node_id,
                 create,
                 target,
+                mtime,
             } => {
                 let pwd = parent_wd(&dir_wd, parent)?;
                 if !create {
                     pwd.remove_entry(name).await?;
                 }
-                pwd.insert_symlink_with_id(name, parse_node_id(node_id)?, target)
+                pwd.insert_symlink_with_id(name, parse_node_id(node_id)?, target, *mtime)
                     .await?;
             }
             ApplyOp::Dynamic {
@@ -1186,13 +1241,20 @@ async fn apply_ops(
                 create,
                 factory,
                 config,
+                mtime,
             } => {
                 let pwd = parent_wd(&dir_wd, parent)?;
                 if !create {
                     pwd.remove_entry(name).await?;
                 }
-                pwd.insert_dynamic_with_id(name, parse_node_id(node_id)?, factory, config.clone())
-                    .await?;
+                pwd.insert_dynamic_with_id(
+                    name,
+                    parse_node_id(node_id)?,
+                    factory,
+                    config.clone(),
+                    *mtime,
+                )
+                .await?;
             }
         }
     }
@@ -1205,11 +1267,11 @@ async fn apply_ops(
 /// large blob never lands in a single buffer (D7).
 async fn write_version(
     mut writer: std::pin::Pin<Box<dyn tinyfs::FileMetadataWriter>>,
-    version: &VersionSource,
+    version: &PlannedVersion,
     entry_type: EntryType,
     remote: &dyn ContentSource,
 ) -> Result<(), StewardError> {
-    match version {
+    match &version.source {
         VersionSource::Inline(bytes) => {
             writer.write_all(bytes).await?;
         }
@@ -1217,7 +1279,7 @@ async fn write_version(
             stream_external_blob(&mut writer, *hash, remote).await?;
         }
     }
-    finalize_writer(writer, entry_type).await
+    finalize_writer(writer, entry_type, &version.meta).await
 }
 
 /// Stream a large external blob from the remote blob store into `writer` in
@@ -1263,19 +1325,44 @@ async fn stream_external_blob(
     Ok(())
 }
 
-/// Finalize a version writer: a table series infers its temporal bounds from
-/// the parquet footer (which also shuts the writer down); every other kind just
-/// closes.
+/// Finalize a version writer, reapplying the node metadata the source recorded.
+///
+/// The mtime, when carried, is adopted verbatim so the mirrored version keeps
+/// the timestamp it was originally written with rather than claiming to have
+/// been modified at pull time. When the source recorded an event-time range,
+/// the replica sets it explicitly so the replicated node carries the same
+/// bounds as the original. Otherwise a table series can still recover its range
+/// from the parquet footer it just wrote (which also shuts the writer down);
+/// every other kind just closes, leaving the bounds NULL as before.
 async fn finalize_writer(
     mut writer: std::pin::Pin<Box<dyn tinyfs::FileMetadataWriter>>,
     entry_type: EntryType,
+    meta: &VersionMeta,
 ) -> Result<(), StewardError> {
-    if entry_type == EntryType::TablePhysicalSeries {
+    if let Some(mtime) = meta.timestamp {
+        writer.set_mtime(mtime);
+    }
+    if let Some((min, max)) = meta.bounds() {
+        writer.set_temporal_metadata(min, max, timestamp_column(meta));
+        writer.shutdown().await?;
+    } else if entry_type == EntryType::TablePhysicalSeries {
         let _ = writer.infer_temporal_bounds().await?;
     } else {
         writer.shutdown().await?;
     }
     Ok(())
+}
+
+/// The timestamp column named by a version's replicated extended attributes,
+/// falling back to the system default when they say nothing.
+fn timestamp_column(meta: &VersionMeta) -> String {
+    meta.extended_attributes
+        .as_deref()
+        .and_then(|json| tlogfs::schema::ExtendedAttributes::from_json(json).ok())
+        .map_or_else(
+            || "Timestamp".to_string(),
+            |attrs| attrs.timestamp_column().to_string(),
+        )
 }
 
 /// Look up a parent directory's working directory by `node_id`, erroring if it
@@ -1366,8 +1453,21 @@ fn version_source(graph: &FetchedGraph, hash: ObjectHash) -> Result<VersionSourc
     }
 }
 
-/// Resolve a series object to its ordered list of version blob hashes.
-fn series_hashes(
+/// Resolve a planned series version: its bytes source plus the node metadata
+/// the source's directory entry recorded for it.
+fn planned_version(
+    graph: &FetchedGraph,
+    hash: ObjectHash,
+    meta: Option<&VersionMeta>,
+) -> Result<PlannedVersion, StewardError> {
+    Ok(PlannedVersion {
+        source: version_source(graph, hash)?,
+        meta: meta.cloned().unwrap_or_default(),
+    })
+}
+
+/// Resolve a series object to its ordered versions (blob hash plus metadata).
+fn series_versions(
     graph: &FetchedGraph,
     series_hash: ObjectHash,
 ) -> Result<&[ObjectHash], StewardError> {

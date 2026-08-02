@@ -88,6 +88,40 @@ pub trait FileMetadataWriter: AsyncWrite + Send + Unpin {
     /// Set temporal metadata for series files (used when metadata is known at write time)
     fn set_temporal_metadata(&mut self, min: i64, max: i64, timestamp_column: String);
 
+    /// Declare that this version carries event-timestamped records, making it
+    /// an error to finalize it without temporal bounds.
+    ///
+    /// `TablePhysicalSeries` gets this guarantee for free: its bounds come from
+    /// the parquet footer, so a version without them is already rejected. A
+    /// byte-oriented `FilePhysicalSeries` has no footer to consult, and the
+    /// storage layer cannot tell a timestamped log from an opaque blob -- so
+    /// the writer has to say. Ingest factories call this whenever their config
+    /// names a timestamp field, which is precisely "we know we are carrying
+    /// logs or metrics".
+    ///
+    /// Without it, a version whose timestamps could not be read is stored with
+    /// no bounds at all, which downstream `temporal-reduce` must treat as
+    /// spanning all of time -- so it drops every sealed segment and recomputes
+    /// its whole history on every build. That degradation is invisible except
+    /// as a slow, memory-hungry build, which is exactly how it went unnoticed.
+    ///
+    /// `timestamp_column` names the configured field, so the failure can say
+    /// which one it looked for.
+    ///
+    /// The default is a no-op, for backends that do not persist bounds.
+    fn require_temporal_metadata(&mut self, _timestamp_column: String) {}
+
+    /// Adopt an explicit modification time (microseconds since the Unix epoch)
+    /// instead of stamping the version with the current wall clock.
+    ///
+    /// Replication uses this so a mirrored version keeps the mtime the source
+    /// recorded, the way `rsync -t` or `cp -p` preserve it. Without it every
+    /// replicated node would claim to have been modified at pull time, and two
+    /// ponds holding identical data would never agree on their metadata.
+    ///
+    /// The default is a no-op, for backends that do not persist an mtime.
+    fn set_mtime(&mut self, _timestamp: i64) {}
+
     /// Infer temporal bounds from the written parquet file by reading only the footer.
     /// After calling this, further writes will fail. Calls shutdown() internally.
     /// Returns (min_timestamp, max_timestamp, timestamp_column_name)

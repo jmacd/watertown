@@ -86,7 +86,7 @@ async fn test_symlinks_not_supported() {
     let dir = create_test_tree();
     let persistence = HostmountPersistence::new(dir.path().to_path_buf()).unwrap();
     let result = persistence
-        .create_symlink_node(FileID::root(), std::path::Path::new("/tmp"))
+        .create_symlink_node(FileID::root(), std::path::Path::new("/tmp"), None)
         .await;
     assert!(result.is_err());
 }
@@ -96,7 +96,7 @@ async fn test_dynamic_nodes_not_supported() {
     let dir = create_test_tree();
     let persistence = HostmountPersistence::new(dir.path().to_path_buf()).unwrap();
     let result = persistence
-        .create_dynamic_node(FileID::root(), "test", vec![])
+        .create_dynamic_node(FileID::root(), "test", vec![], None)
         .await;
     assert!(result.is_err());
 }
