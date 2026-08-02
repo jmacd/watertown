@@ -191,29 +191,64 @@ impl LogfileIngestConfig {
 /// Event-time bounds of one version's content, in microseconds, `max`
 /// inclusive -- the shape `set_temporal_metadata` wants.
 ///
-/// Returns `None` when bounds cannot be established for the whole slice, and
-/// the caller then writes the version without them. That is the safe
-/// direction: a missing bound makes the downstream rollup pessimistic (it
-/// recomputes everything), whereas a bound that is too narrow would let it
-/// skip buckets this content belongs to and silently keep stale aggregates.
-/// So every uncertainty here -- an unparseable line, a timestamp that is not
-/// an integer, an overflowing conversion -- abandons the scan rather than
-/// guessing.
+/// Returns `None` only when *no* line yielded a usable timestamp, and the
+/// caller then writes the version without them (or fails, if the node declared
+/// itself temporal).
+///
+/// The correctness condition is that the bounds cover every record the reader
+/// will actually produce from this content -- not every byte. Bounds that are
+/// too narrow would let the rollup skip buckets this content belongs to and
+/// silently keep stale aggregates, so this scan must not be *looser* than the
+/// reader. But it must not be *stricter* either: a line the reader discards
+/// contributes to no bucket, so excluding its unknown timestamp cannot narrow
+/// the bounds below the data that exists.
+///
+/// So this mirrors `format::batch::read_clean_lines` exactly -- same NUL
+/// stripping, same trim, same per-line skip -- and a corrupt line is dropped
+/// from the scan rather than abandoning it. That matters on real data: a
+/// single torn record in a 100 MB rotation (NUL padding from a crashed write,
+/// which the reader strips and recovers) would otherwise discard the event
+/// times of every other record in the file.
 ///
 /// Cost is proportional to the bytes being written, not to the file: the
 /// append path passes only the new tail.
 fn scan_temporal_bounds(content: &[u8], field: &str, unit: TimestampUnit) -> Option<(i64, i64)> {
-    let text = std::str::from_utf8(content).ok()?;
+    // Lossy rather than strict: invalid UTF-8 is corruption of the same kind
+    // as a torn line, and borrows without copying in the common valid case.
+    let text = String::from_utf8_lossy(content);
     let mut acc: Option<(i64, i64)> = None;
+    let mut skipped: u64 = 0;
 
     for line in text.lines() {
-        if line.trim().is_empty() {
+        // Strip NUL bytes (flash-storage corruption), as the reader does.
+        let cleaned: String = line.chars().filter(|c| *c != '\0').collect();
+        let trimmed = cleaned.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        let value: Value = serde_json::from_str(line).ok()?;
-        if !fold_timestamps(&value, field, &mut acc) {
-            return None;
+
+        // Fold into a per-line accumulator so a line carrying a malformed
+        // timestamp contributes nothing rather than a partial range.
+        let mut line_acc: Option<(i64, i64)> = None;
+        let parsed = serde_json::from_str::<Value>(trimmed)
+            .ok()
+            .filter(|value| fold_timestamps(value, field, &mut line_acc));
+
+        match parsed.and(line_acc) {
+            Some((lo, hi)) => {
+                acc = Some(match acc {
+                    Some((alo, ahi)) => (alo.min(lo), ahi.max(hi)),
+                    None => (lo, hi),
+                });
+            }
+            None => skipped += 1,
         }
+    }
+
+    if skipped > 0 {
+        log::warn!(
+            "logfile-ingest: skipped {skipped} corrupt or timestamp-less line(s) while scanning event-time bounds for '{field}'"
+        );
     }
 
     let (min_raw, max_raw) = acc?;
@@ -226,9 +261,9 @@ fn scan_temporal_bounds(content: &[u8], field: &str, unit: TimestampUnit) -> Opt
 /// Fold every value stored under `field`, at any depth of `value`, into `acc`
 /// as a running (min, max).
 ///
-/// Returns false if a value under that key is not an integer, which abandons
-/// the scan -- see `scan_temporal_bounds` for why that is preferred to
-/// skipping it.
+/// Returns false if a value under that key is not an integer, which drops the
+/// line from the scan -- see `scan_temporal_bounds` for why that is preferred
+/// to guessing.
 fn fold_timestamps(value: &Value, field: &str, acc: &mut Option<(i64, i64)>) -> bool {
     match value {
         Value::Object(map) => {
@@ -1478,11 +1513,14 @@ mod tests {
     }
 
     #[test]
-    fn an_unparseable_line_abandons_the_scan() {
-        // Bounds covering only the lines that parsed would leave the rest of
-        // the slice outside its own range. Since slices are line-aligned before
-        // they are written, reaching this case means genuinely corrupt input,
-        // and the declared temporal requirement turns it into a failed write.
+    fn an_unparseable_line_is_skipped_not_fatal() {
+        // The reader (format::batch::read_clean_lines) skips corrupt lines and
+        // warns, so a corrupt line contributes to no bucket and dropping it
+        // here cannot narrow the bounds below the data that exists. Abandoning
+        // the whole scan instead would discard the event times of every good
+        // record in the slice -- on a 100 MB rotation, tens of thousands of
+        // them -- and, for a node that declared itself temporal, turn routine
+        // corruption into a failed write.
         let content = format!("{}\n{{\"resourceMetrics\":\n", otlp_line(&["1000000000"]));
         assert_eq!(
             scan_temporal_bounds(
@@ -1490,12 +1528,30 @@ mod tests {
                 "timeUnixNano",
                 TimestampUnit::Nanoseconds
             ),
-            None
+            Some((1_000_000, 1_000_000))
         );
     }
 
     #[test]
-    fn a_non_integer_timestamp_abandons_the_scan() {
+    fn nul_padding_is_stripped_as_the_reader_does() {
+        // Observed in production: a crashed write left a run of NUL bytes in
+        // front of an otherwise-complete record in a 2022 rotation. The reader
+        // strips NULs and recovers that record, so the scan must see it too.
+        let mut content = "\0".repeat(2048);
+        content.push_str(&otlp_line(&["1661233155151580973"]));
+        content.push('\n');
+        assert_eq!(
+            scan_temporal_bounds(
+                content.as_bytes(),
+                "timeUnixNano",
+                TimestampUnit::Nanoseconds
+            ),
+            Some((1_661_233_155_151_580, 1_661_233_155_151_581))
+        );
+    }
+
+    #[test]
+    fn a_non_integer_timestamp_drops_the_line() {
         let content =
             r#"{"resourceMetrics":[{"gauge":{"dataPoints":[{"timeUnixNano":"not-a-number"}]}}]}"#;
         assert_eq!(

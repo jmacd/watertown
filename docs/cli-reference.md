@@ -1808,9 +1808,9 @@ pond run 10-ingest b3sum
 
 Setting `timestamp_field` declares the node temporal and changes three things:
 
-- Each written version records the min/max of that field across its records.
+- Each written version records the min/max of that field across its records. Corrupt lines are skipped and counted, matching what the reader does with them (NUL padding is stripped, unparseable lines are dropped), so one torn record in a large rotation does not discard the event times of every other record in it.
 - Slices taken from the **active** file are cut at the last newline, so a version never contains a half-written record. The withheld bytes are stored on the next run, once the writer has finished the line; appends are detected by size, so nothing is lost. Archived and rotated files are final and are always stored whole.
-- A version whose bounds cannot be determined **fails the write** rather than being stored unbounded. Reaching that point means the configured field or unit does not match the records.
+- A version in which *no* record yields a usable timestamp **fails the write** rather than being stored unbounded. Reaching that point means the configured field or unit does not match the records.
 
 Leaving `timestamp_field` unset keeps the file an opaque byte stream: no bounds, no alignment, stored byte-for-byte. Use that for anything without one record per line.
 
