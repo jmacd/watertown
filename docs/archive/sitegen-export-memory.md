@@ -231,13 +231,43 @@ pairwise. DataFusion does not materialize CTEs, so that window pipeline is
 re-evaluated per reference and each join builds a hash table over the full
 event history.
 
+### Measurement noise: read this before trusting any number here
+
+Peak heap on the analysis stage varies **±30% run to run for a byte-identical
+query**. Six interleaved repetitions of `drawdown-by-month` on unchanged
+staging data gave 390, 398, 400, 401, 474 and 515 MB (median 400.6).
+
+Consequently **single-shot A/B comparisons of this stage are meaningless**, and
+several earlier entries in this document that were taken as single samples
+should be read as "no measured difference" rather than as the small deltas they
+report. Always interleave at least six repetitions and compare medians.
+
 ### What was tried and rejected
 
-Bounding the windows with `PARTITION BY month` (adding a `month_start` column
-and partitioning the three full-history windows) measured **475.07 MB against a
-442.55 MB baseline -- slightly worse.** DataFusion does not infer that
-`date_trunc('month', timestamp)` is monotone in `timestamp`, so it sorts on
-`[month_start, timestamp]` and still materializes, now with a wider sort key.
+**Fusing the four qualifier CTEs (rejected).** `long_enough`, `clean_start`,
+`real_drawdown` and `not_stale` are all
+`SELECT pump_event_id FROM with_meta GROUP BY pump_event_id HAVING <pred>`,
+each joined back to `with_meta` on that same key. They collapse into a single
+grouped aggregate with the four predicates ANDed (using
+`MIN/MAX/SUM(CASE WHEN ... END)` so no `FILTER` support is required), taking
+`with_meta` from five scans to two and from four hash joins to one.
+
+Output equivalence was verified exactly: wrapping both variants in an
+order-independent integer digest (`COUNT(*)`, summed `elapsed_s`, summed `n`,
+and the three percentile columns summed as `CAST(ROUND(x*1e6) AS BIGINT)`)
+produced identical values on all eight columns over 5924 output rows.
+
+Despite doing strictly less relational work, its peak heap measured **higher**:
+median 467.5 MB against a 400.6 MB baseline over six interleaved repetitions.
+Peak heap on this stage is evidently not proportional to the amount of
+relational work, so the rewrite was not adopted.
+
+**Bounding the windows with `PARTITION BY month` (rejected).** Measured 475 MB
+against a 442 MB baseline -- but as a single sample, i.e. inside the noise band,
+so the honest reading is "no improvement demonstrated". DataFusion does not
+infer that `date_trunc('month', timestamp)` is monotone in `timestamp`, so it
+sorts on `[month_start, timestamp]` and still materializes, now with a wider
+sort key.
 
 That rewrite is also non-trivial to make *correct*: `pump_event_id` is a running
 `SUM` over all history, so partitioning it by month restarts the counter and
@@ -246,22 +276,33 @@ makes January's event 1 collide with February's event 1 in every downstream
 `epoch(month_start) * 1000000 + pump_seq`, and `WHERE pump_event_id > 0` must
 become `WHERE pump_seq > 0` once the key is unconditionally positive.
 
-### Open lead
+### Declaring a source ordering: ruled out
 
-Nothing in the chain advertises its output ordering:
-`NullPaddingExec::compute_properties` (`transform/null_padding.rs`) and
-`ColumnRenameExec` (`transform/column_rename.rs`) both build
-`EquivalenceProperties::new(schema)` -- empty -- explicitly preserving
-partitioning, emission type and boundedness while discarding any child
-ordering. Both operators are row-preserving (null padding only adds columns;
-rename only renames them), so propagating the child's ordering through them,
-mapped across the schema change, should be sound and would let the windows'
-required `ORDER BY timestamp` stream. `factory/temporal_reduce.rs` already
-treats declared `output_ordering` as the mechanism for streaming a
-full-history `ORDER BY`, and `partial_aggregate_cache.rs` already uses
-`with_file_sort_order`.
+It looked promising to propagate output ordering through the row-preserving
+`NullPaddingExec` and `ColumnRenameExec` (both build an empty
+`EquivalenceProperties::new(schema)`, discarding any child ordering) so the
+windows' `ORDER BY timestamp` could stream instead of sorting.
 
-**Prerequisite before acting on this:** declaring an ordering that does not
-hold silently corrupts results. Series versions are appended in time order, but
-whether a concatenated multi-version series is *globally* sorted by timestamp
-(no cross-version overlap) has not been established. Settle that first.
+**This is unsound for these sources.** The concatenated multi-version ingest
+series are only *mostly* timestamp-sorted; there are genuinely out-of-order
+sections, which is why the rollups carry a max-late-arrival setting.
+`allowed_lateness` cannot be borrowed as a disorder bound either: it is a
+cache-freezing policy that explicitly tolerates being violated -- "Data
+arriving older than the sealed watermark is not an error: the segments covering
+it are unsealed and recomputed from source" (`factory/temporal_reduce.rs`).
+Declaring an ordering that does not actually hold would silently corrupt window
+results.
+
+It would also not be worth much: the sort is not the expensive part. The source
+scan streams at 9 MB and adding one unbounded window costs only 84 MB, against
+a ~400 MB total.
+
+### Where this leaves the analysis stage
+
+No query-shape change tried so far moves the peak outside the noise band, and
+peak RSS for pond runs is well under the tracked-heap figure anyway (§ the
+2026-08-03 update). The analysis stage sits at roughly 400-500 MB tracked heap
+and is not currently the thing preventing a 1-2 GB machine from working.
+Further effort here should start by establishing a *repeatable* measurement
+(medians over interleaved repetitions, ideally with `target_partitions` pinned
+so scheduling variance is removed) before any more rewrites are attempted.
