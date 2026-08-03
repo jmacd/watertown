@@ -1,11 +1,13 @@
 # Sitegen full-site build: memory profile and incremental-export plan
 
-Status: analysis. Code-grounded as of 2026-07-01. Measurements taken on
-watershop against a copy of the prod site pond (pond 0.52.0). Citations use
-`crate/file.rs:line`. Nothing here is implemented yet.
+Status: partly implemented; see the 2026-08-03 update below for what has landed
+and what these measurements no longer describe. Code-grounded as of 2026-07-01.
+Measurements taken on watershop against a copy of the prod site pond
+(pond 0.52.0). Citations use `crate/file.rs:line`.
 
-Update 2026-08-03: two of the items below have since landed, and the §1
-measurements no longer describe current behaviour.
+Update 2026-08-03: the plan in §5 has been worked through -- two items landed,
+one was measured and rejected, and the remaining one is characterized in §6.
+The §1 measurements no longer describe current behaviour.
 
 - Incremental export landed: deterministic per-partition `data.parquet` names
   plus an `.export-manifest.json` of digests let a build reuse unchanged
@@ -15,9 +17,25 @@ measurements no longer describe current behaviour.
   build no longer holds ~1400 partition writers open at once. Re-measured on
   prod data, peak scales as ~50 MB + ~1.4 MB per open writer, which matches the
   2148 MB / 1381 writers recorded in §1.
-- P0 (allocator tuning, `MALLOC_ARENA_MAX`) is still NOT implemented, and the
-  `analysis` stage's O(history) recompute (P1/P5) is still unmeasured. Those
-  remain the open levers on peak RSS.
+- P0 (allocator tuning, `MALLOC_ARENA_MAX`) was implemented and measured, and
+  **did not reproduce the predicted win, so it was not adopted.** Running the
+  same 1412-partition single-series export with and without
+  `MALLOC_ARENA_MAX=2` / `MALLOC_TRIM_THRESHOLD_=131072` /
+  `MALLOC_MMAP_THRESHOLD_=131072` gave peak RSS of 431 MB both times. The
+  variables were confirmed present in the container's environment, and the
+  runtime is glibc 2.36 with `PanicOnLargeAlloc` wrapping the system allocator,
+  so the tunables were genuinely active and genuinely inert.
+- That experiment also showed **tracked heap badly overstates RSS on the export
+  path**: the same run reported 2016 MB of PEAK_ALLOC heap but only 431 MB of
+  peak RSS (cgroup `memory.peak`). The per-partition parquet writer buffers are
+  largely allocated-but-untouched pages. So on this workload the ~2 GB figure
+  was never resident memory, and the effective ceiling was the
+  `PanicOnLargeAlloc::new(3000)` accounting guard rather than RAM.
+- Caveat: the §1 "~2629 MB RSS" was a *full* site build across all series with
+  ~60 threads, not the single-series export measured above. Full-build RSS has
+  not been re-measured, so §1's RSS-above-heap relationship may still hold there.
+- P1 (the `analysis` stage) is now measured, and it is the remaining peak once
+  exports are bounded -- see §6.
 
 Goal: run the whole Caspar Water site build (sitegen exporting from the site
 pond, which imports the water/septic/noyo subponds) on a low-memory machine.
@@ -189,3 +207,61 @@ still hold the peak after export and merge are fixed -- confirm its share first.
 Note: the noyo subsite recomputes cold every build (~15 s/series, ~340 s of wall
 time) -- a TIME cost, not a memory-peak cost. Separate optimization (a subsite
 export cache).
+
+---
+
+## 6. The analysis stage (measured 2026-08-03)
+
+With exports bounded, the `analysis` stage sets the peak for a warm build.
+Measured on prod/staging data via `pond cat` on each series (each `pond run`
+step is its own process, so `Peak memory usage` attributes per step):
+
+| Query | Tracked heap peak |
+| --- | --- |
+| `COUNT(*)` over the same source | 9.16 MB |
+| one `SUM(...) OVER (ORDER BY timestamp ROWS UNBOUNDED PRECEDING)` | 83.57 MB |
+| `horner-by-month` | 402.05 MB |
+| `drawdown-by-month` | 442.55 MB (staging) / 482.41 MB (prod) |
+
+Reading: the source scan streams (9 MB), and the sort plus a single unbounded
+window costs ~75 MB more. Neither explains 442 MB. The cost is the *shape* of
+`drawdown-by-month`: a `with_meta` CTE (itself three unbounded windows) is
+referenced five times -- by four filter CTEs that are then joined back
+pairwise. DataFusion does not materialize CTEs, so that window pipeline is
+re-evaluated per reference and each join builds a hash table over the full
+event history.
+
+### What was tried and rejected
+
+Bounding the windows with `PARTITION BY month` (adding a `month_start` column
+and partitioning the three full-history windows) measured **475.07 MB against a
+442.55 MB baseline -- slightly worse.** DataFusion does not infer that
+`date_trunc('month', timestamp)` is monotone in `timestamp`, so it sorts on
+`[month_start, timestamp]` and still materializes, now with a wider sort key.
+
+That rewrite is also non-trivial to make *correct*: `pump_event_id` is a running
+`SUM` over all history, so partitioning it by month restarts the counter and
+makes January's event 1 collide with February's event 1 in every downstream
+`PARTITION BY pump_event_id`. A correct version needs a composite key such as
+`epoch(month_start) * 1000000 + pump_seq`, and `WHERE pump_event_id > 0` must
+become `WHERE pump_seq > 0` once the key is unconditionally positive.
+
+### Open lead
+
+Nothing in the chain advertises its output ordering:
+`NullPaddingExec::compute_properties` (`transform/null_padding.rs`) and
+`ColumnRenameExec` (`transform/column_rename.rs`) both build
+`EquivalenceProperties::new(schema)` -- empty -- explicitly preserving
+partitioning, emission type and boundedness while discarding any child
+ordering. Both operators are row-preserving (null padding only adds columns;
+rename only renames them), so propagating the child's ordering through them,
+mapped across the schema change, should be sound and would let the windows'
+required `ORDER BY timestamp` stream. `factory/temporal_reduce.rs` already
+treats declared `output_ordering` as the mechanism for streaming a
+full-history `ORDER BY`, and `partial_aggregate_cache.rs` already uses
+`with_file_sort_order`.
+
+**Prerequisite before acting on this:** declaring an ordering that does not
+hold silently corrupts results. Series versions are appended in time order, but
+whether a concatenated multi-version series is *globally* sorted by timestamp
+(no cross-version overlap) has not been established. Settle that first.
