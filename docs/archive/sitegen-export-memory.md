@@ -4,6 +4,21 @@ Status: analysis. Code-grounded as of 2026-07-01. Measurements taken on
 watershop against a copy of the prod site pond (pond 0.52.0). Citations use
 `crate/file.rs:line`. Nothing here is implemented yet.
 
+Update 2026-08-03: two of the items below have since landed, and the §1
+measurements no longer describe current behaviour.
+
+- Incremental export landed: deterministic per-partition `data.parquet` names
+  plus an `.export-manifest.json` of digests let a build reuse unchanged
+  partitions. Warm site builds now peak at ~405 MB rather than ~2.1 GB.
+- The full-rewrite fan-out is now bounded. `full_rewrite_partitioned` splits the
+  rewrite into chunks of at most `MAX_OPEN_PARTITIONS` partitions, so a cold
+  build no longer holds ~1400 partition writers open at once. Re-measured on
+  prod data, peak scales as ~50 MB + ~1.4 MB per open writer, which matches the
+  2148 MB / 1381 writers recorded in §1.
+- P0 (allocator tuning, `MALLOC_ARENA_MAX`) is still NOT implemented, and the
+  `analysis` stage's O(history) recompute (P1/P5) is still unmeasured. Those
+  remain the open levers on peak RSS.
+
 Goal: run the whole Caspar Water site build (sitegen exporting from the site
 pond, which imports the water/septic/noyo subponds) on a low-memory machine.
 This document captures what was measured, how to reproduce the sampling, the
