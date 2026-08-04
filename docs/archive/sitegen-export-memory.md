@@ -29,8 +29,10 @@ The §1 measurements no longer describe current behaviour.
   path**: the same run reported 2016 MB of PEAK_ALLOC heap but only 431 MB of
   peak RSS (cgroup `memory.peak`). The per-partition parquet writer buffers are
   largely allocated-but-untouched pages. So on this workload the ~2 GB figure
-  was never resident memory, and the effective ceiling was the
-  `PanicOnLargeAlloc::new(3000)` accounting guard rather than RAM.
+  was never resident memory.
+- Note that `PanicOnLargeAlloc::new(3000)` is **not** a total-memory ceiling: it
+  compares `layout.size()` per allocation, so it only trips on a single
+  allocation above 3 GB. Nothing in the process caps cumulative heap.
 - Caveat: the §1 "~2629 MB RSS" was a *full* site build across all series with
   ~60 threads, not the single-series export measured above. Full-build RSS has
   not been re-measured, so §1's RSS-above-heap relationship may still hold there.
@@ -303,6 +305,24 @@ No query-shape change tried so far moves the peak outside the noise band, and
 peak RSS for pond runs is well under the tracked-heap figure anyway (§ the
 2026-08-03 update). The analysis stage sits at roughly 400-500 MB tracked heap
 and is not currently the thing preventing a 1-2 GB machine from working.
-Further effort here should start by establishing a *repeatable* measurement
-(medians over interleaved repetitions, ideally with `target_partitions` pinned
-so scheduling variance is removed) before any more rewrites are attempted.
+
+Note what the production session already does (`tlogfs/src/persistence.rs`, in
+the persistence `new()` that builds the single shared `SessionContext`):
+
+- a `FairSpillPool` sized by `POND_MEMORY_LIMIT_MB`, **defaulting to 512 MiB**.
+  Only selfmon overrides it (to 2048, for the journal's external sort); water,
+  septic, noyo and site all run at the 512 MiB default.
+- `with_target_partitions(2)` -- parallelism is already pinned low, so the
+  ~30% run-to-run variance above is *not* explained by partition scheduling at
+  full core count, and "pin target_partitions" is not an available improvement.
+
+The important gap is that **window operators are invisible to the pool.** In
+DataFusion 51 neither `WindowAggExec` nor `BoundedWindowAggExec` contains a
+single `MemoryReservation`, `MemoryConsumer` or `try_grow`: `WindowAggExec`
+accumulates every input batch into a `Vec<RecordBatch>` and then
+`concat_batches` copies the whole thing into one contiguous batch, holding both
+at once. So the 512 MiB pool neither bounds nor spills the analysis stage's
+windows -- they allocate outside it entirely, which is why this stage can sit
+near or above the configured pool size without ever reporting
+`ResourcesExhausted`.
+
