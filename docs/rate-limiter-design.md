@@ -664,6 +664,76 @@ line per limiter (used / limit / window / next reset), sourced from
 `Limiter::state()`. A silent throttle would replicate the original failure
 mode with the sign flipped.
 
+### 4.5 Measuring what we govern (Decision L12)
+
+A limit is only as good as the number it is set from, and we do not yet know
+what a normal day of pond→remote traffic costs (§6, Phase 1). The plan is to
+set limits generously, measure against them, and tighten later -- which
+requires the *usage* to be visible, not just the *refusals*.
+
+The window in the control table cannot serve that purpose. It is per-replica
+and disposable by design (§1), so it is exactly the wrong place to keep a
+number you intend to chart: a `rebuild-control` erases it, and nothing about it
+survives to be compared week over week. Enforcement wants ephemeral state;
+monitoring wants durable state. They are different requirements and they get
+different homes.
+
+So spending is also recorded into the pond, at a single shared series:
+
+```
+/sys/limits/usage
+```
+
+| column | meaning |
+|--------|---------|
+| `timestamp` | when the spending happened (event-time column, µs UTC) |
+| `limiter` | pond path of the governing node, e.g. `/sys/limits/backup-bytes` |
+| `unit` | `bytes` or `ops` |
+| `amount` | units spent by that activity -- **already a delta** |
+| `used` | sliding-window total afterwards |
+| `limit` | the budget in force at the time |
+| `window_secs` | the window length |
+
+One series rather than one per limiter: monitoring wants a single table to
+group by `limiter`, and a per-limiter series would multiply pond nodes with
+every policy added. `amount` is a delta rather than a running total, so it
+charts as a rate directly and is immune to the window being reset underneath
+it; `used`/`limit` give the headroom figure to alert on. Carrying `limit` in
+every row keeps a chart honest across a retune, rather than plotting last
+week's usage against this week's budget.
+
+**Why the emission is deferred.** Spending happens during the post-commit
+push, and a push cannot write the pond: writing would commit, which would
+push, which would spend, which would write. The accumulated samples are
+therefore parked in the control table under `limiter-usage-pending` and
+flushed into the pond at the **start of the next write transaction** --
+piggybacking on a write the caller was going to do anyway.
+
+That breaks the recursion and is self-limiting: the write that emits sample
+*N* triggers a push that queues sample *N+1*, emitted by the following write.
+A pond that stops being written stops emitting, which is correct, because an
+idle pond is also not spending. (The pending key is capped so a long-idle pond
+cannot grow it without bound; the newest samples win.)
+
+**Why the queue drains at commit, not at read.** The rows are written through
+the transaction, so they are durable only if that transaction commits -- and
+that is exactly when the queue is drained. An aborted write re-emits its
+samples next time rather than dropping them. The drain removes the emitted
+prefix rather than clearing the key, so samples queued in between (notably by
+the post-commit push that runs moments later) survive.
+
+**A metric must never cause an outage.** Every failure on this path -- an
+unreadable queue, a failed series append -- is logged and dropped. Refusing a
+user's write because a counter could not be recorded would trade a monitoring
+gap for exactly the kind of unavailability §4.4 is at pains to avoid.
+
+Note that this makes the limiter's *first* pond write, which §3 said would
+never happen. The rule it does not break is the one that matters: **the
+limiter still never writes the pond as part of governing an action.** It
+governs, records to control, and a later unrelated transaction carries the
+observation out. Enforcement remains a pure function of pond-resident policy
+and control-resident state.
+
 ---
 
 ## 5. Generalizing: the second limiter
@@ -853,3 +923,4 @@ sequencing reasons, not design ones.
 | L9 | Limiter state is reported by `pond status`; a silent throttle is not acceptable. |
 | L10 | Callers declare the unit they spend at `Limiter::open`; a mismatch with the node's configured unit is a bind-time error. |
 | L11 | Limiter bindings are authored in YAML via new `pond apply` `kind: backup` / `kind: remote` resources routed through the existing attach validation -- not via CLI flags. |
+| L12 | Spending is *also* emitted into the pond as a durable metric series at `/sys/limits/usage`, flushed at the start of the next write transaction. |

@@ -210,6 +210,13 @@ impl Buckets {
         }
     }
 
+    /// Every charge held, regardless of age.
+    fn total(&self) -> u64 {
+        self.buckets
+            .values()
+            .fold(0_u64, |a, v| a.saturating_add(*v))
+    }
+
     #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.buckets.values().all(|v| *v == 0)
@@ -453,9 +460,25 @@ impl Limiter {
         control: &mut ControlTable,
         now_us: i64,
     ) -> Result<(), LimiterError> {
+        let sample = self.commit_window_at(control, now_us).await?;
+        crate::limiter_usage::queue(control, sample.as_slice()).await;
+        Ok(())
+    }
+
+    /// Persist the window and report what was spent, without queueing it.
+    ///
+    /// Split from [`Self::commit_at`] so a [`LimiterSet`] can persist several
+    /// windows and then queue all their samples in **one** control write
+    /// rather than one per limiter (Decision L2).
+    async fn commit_window_at(
+        &mut self,
+        control: &mut ControlTable,
+        now_us: i64,
+    ) -> Result<Option<crate::limiter_usage::UsageSample>, LimiterError> {
         if !self.dirty {
-            return Ok(());
+            return Ok(None);
         }
+        let spent = self.spent();
         let window_us = window_micros(self.spec.window);
         let bucket_us = bucket_micros(self.spec.window);
 
@@ -485,7 +508,29 @@ impl Limiter {
         self.loaded = merged;
         self.pending = Buckets::default();
         self.dirty = false;
-        Ok(())
+
+        if spent == 0 {
+            return Ok(None);
+        }
+        // Reported after the merge, so `used` is the window total including
+        // this spending -- the number a headroom alert wants.
+        let state = self.state_at(now_us);
+        Ok(Some(crate::limiter_usage::UsageSample {
+            at_us: now_us,
+            limiter: state.path,
+            unit: state.unit.as_str().to_string(),
+            amount: spent,
+            used: state.used,
+            limit: state.limit,
+            window_us,
+        }))
+    }
+
+    /// Units charged through this limiter since it was opened, not yet
+    /// reflected in any emitted metric.
+    #[must_use]
+    pub fn spent(&self) -> u64 {
+        self.pending.total()
     }
 
     /// Current position, for `pond status` (Decision L9).
@@ -673,9 +718,26 @@ impl LimiterSet {
     ///
     /// Returns [`LimiterError::Control`] if a window cannot be written.
     pub async fn commit(&mut self, control: &mut ControlTable) -> Result<(), LimiterError> {
+        self.commit_at(control, now_micros()).await
+    }
+
+    /// [`Self::commit`] against an explicit clock, for deterministic tests.
+    pub async fn commit_at(
+        &mut self,
+        control: &mut ControlTable,
+        now_us: i64,
+    ) -> Result<(), LimiterError> {
+        let mut samples = Vec::new();
         for l in &mut self.bound {
-            l.commit(control).await?;
+            if let Some(sample) = l.commit_window_at(control, now_us).await? {
+                samples.push(sample);
+            }
         }
+
+        // Queue for the pond in one write, so spending becomes a durable
+        // metric and not just enforcement state that a control rebuild erases
+        // (Decision L12).
+        crate::limiter_usage::queue(control, &samples).await;
         Ok(())
     }
 

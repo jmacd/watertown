@@ -27,6 +27,7 @@ mod guard;
 mod host;
 mod inner_control;
 pub mod limiter;
+pub mod limiter_usage;
 pub mod maintenance;
 mod rebuild;
 pub mod reclaim;
@@ -56,6 +57,9 @@ pub use guard::StewardTransactionGuard;
 pub use host::{HostSteward, HostTransaction};
 pub use limiter::{
     LIMITER_KEY_PREFIX, Limiter, LimiterError, LimiterSet, LimiterState, limiter_key,
+};
+pub use limiter_usage::{
+    LIMITER_USAGE_PENDING_KEY, LIMITER_USAGE_SERIES, LimiterUsageRow, UsageSample,
 };
 pub use rebuild::{RebuildReport, rebuild_control_table};
 pub use remote_config::{RemoteAttachment, RemoteConfigError, RemoteMode};

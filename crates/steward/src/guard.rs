@@ -61,6 +61,11 @@ pub struct StewardTransactionGuard<'a> {
     /// `None` for read transactions (no exclusion needed).
     #[allow(dead_code)]
     write_lock: Option<WriteLockGuard>,
+    /// Number of queued limiter-usage samples written into the pond at the
+    /// start of this transaction (Decision L12).  They are dropped from the
+    /// control queue only once this transaction commits, so an aborted write
+    /// re-emits rather than losing them.
+    emitted_usage: std::sync::atomic::AtomicUsize,
 }
 
 impl<'a> StewardTransactionGuard<'a> {
@@ -82,6 +87,7 @@ impl<'a> StewardTransactionGuard<'a> {
             pond_path: path.as_ref().to_path_buf(),
             committed: false,
             write_lock,
+            emitted_usage: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -287,6 +293,13 @@ impl<'a> StewardTransactionGuard<'a> {
     /// Returns the data-FS Delta version number on a successful write
     /// commit (`Ok(Some(v))`); returns `Ok(None)` for a read transaction
     /// or a write that produced no changes.
+    /// Record that `count` queued usage samples were written into the pond by
+    /// this transaction.
+    pub fn note_emitted_usage(&self, count: usize) {
+        self.emitted_usage
+            .store(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub async fn commit(mut self) -> Result<Option<i64>, StewardError> {
         let args_fmt = format!("{:?}", self.txn_meta.user.args);
         debug!(
@@ -399,6 +412,18 @@ impl<'a> StewardTransactionGuard<'a> {
 
                 // Mark as committed
                 self.committed = true;
+
+                // The usage rows emitted at begin are now durable, so drop
+                // them from the control queue.  This happens before the
+                // post-commit push below, which will queue fresh samples of
+                // its own -- and `drop_emitted` removes a prefix rather than
+                // clearing, so those survive.
+                let emitted = self
+                    .emitted_usage
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if emitted > 0 {
+                    crate::limiter_usage::drop_emitted(self.control_table, emitted).await;
+                }
 
                 // Run post-commit factories for write transactions
                 // This happens AFTER commit but uses a NEW transaction
