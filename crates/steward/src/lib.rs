@@ -39,7 +39,9 @@ pub use content_objects::{ObjectInventory, ObjectKind, inventory_content_objects
 pub use content_pull::{
     FetchedGraph, FetchedObject, RebuildOutcome, fetch_object_graph, import_pond, rebuild_pond,
 };
-pub use content_push::{ContentPushOutcome, push_content_to_remote};
+pub use content_push::{
+    ContentPushOutcome, push_content_to_remote, push_content_to_remote_limited,
+};
 pub use content_source::{BlobReader, ContentSource, LocalPondSource};
 pub use content_tree::{
     ContentTreeReport, MaterializedObjects, compute_content_tree, compute_content_tree_for_table,
@@ -52,7 +54,9 @@ pub use fsck::{FsckError, FsckOptions, FsckReport, PartitionDigest, fsck};
 pub use graft::{GraftPin, SYS_GRAFTS_DIR};
 pub use guard::StewardTransactionGuard;
 pub use host::{HostSteward, HostTransaction};
-pub use limiter::{LIMITER_KEY_PREFIX, Limiter, LimiterError, LimiterState, limiter_key};
+pub use limiter::{
+    LIMITER_KEY_PREFIX, Limiter, LimiterError, LimiterSet, LimiterState, limiter_key,
+};
 pub use rebuild::{RebuildReport, rebuild_control_table};
 pub use remote_config::{RemoteAttachment, RemoteConfigError, RemoteMode};
 pub use ship::{CollapseReport, CompactOutcome, Ship};
@@ -77,6 +81,12 @@ pub enum StewardError {
 
     #[error("Transaction aborted: {0}")]
     Aborted(String),
+
+    /// A rate limiter refused the action.  Distinct from [`Self::Aborted`] so
+    /// callers can tell a governed throttle -- expected, transient, and safe to
+    /// retry once the window slides -- from a genuine failure.
+    #[error("{0}")]
+    RateLimited(LimiterError),
 
     #[error("Transaction sequence mismatch: expected {expected}, found {actual}")]
     TransactionSequenceMismatch { expected: i64, actual: i64 },

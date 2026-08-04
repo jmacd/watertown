@@ -111,7 +111,15 @@ impl LimiterError {
 
 impl From<LimiterError> for StewardError {
     fn from(e: LimiterError) -> Self {
-        StewardError::Aborted(e.to_string())
+        // An exhausted budget is a throttle, not a fault: the pond is healthy
+        // and the action is safe to retry later.  Everything else -- a missing
+        // node, a wrong unit, an unreadable window -- is a misconfiguration
+        // that will not fix itself.
+        if e.is_exceeded() {
+            StewardError::RateLimited(e)
+        } else {
+            StewardError::Aborted(e.to_string())
+        }
     }
 }
 
@@ -558,6 +566,124 @@ fn burst_span_micros(spec: &RateSpec, window_us: i64) -> i64 {
 #[must_use]
 pub fn now_micros() -> i64 {
     chrono::Utc::now().timestamp_micros()
+}
+
+// ============================================================================
+// LimiterSet
+// ============================================================================
+
+/// The limiters governing one activity, one per dimension it spends in.
+///
+/// A single action usually costs in more than one currency -- a blob push
+/// spends both bytes and requests -- and each dimension is governed by its own
+/// node.  `LimiterSet` binds them together so the consumer states a dimension
+/// at each charge rather than juggling `Option<Limiter>` locals.
+///
+/// The dimension passed to [`Self::check`] and [`Self::record`] is looked up,
+/// not trusted: an unbound dimension is simply ungoverned, which is what an
+/// absent `limits` key means.
+///
+/// Binding happens up front so a misconfiguration -- a missing node, or a node
+/// governing the wrong unit -- fails before any remote I/O rather than halfway
+/// through a transfer.
+#[derive(Debug, Default)]
+pub struct LimiterSet {
+    bound: Vec<Limiter>,
+}
+
+impl LimiterSet {
+    /// An empty set: every dimension ungoverned.  This is today's behavior for
+    /// an attachment that configures no limits, and it costs nothing -- no
+    /// pond read, no control read, no control write.
+    #[must_use]
+    pub fn unlimited() -> Self {
+        Self::default()
+    }
+
+    /// Bind every `(dimension, pond path)` pair.
+    ///
+    /// Each limiter is opened with its dimension as the caller's declaration,
+    /// so the node's configured `unit` is checked against what the operator
+    /// said it governs (Decision L10).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LimiterError::NotFound`] if a named node is missing,
+    /// [`LimiterError::NotRateLimit`] if it is not a `rate-limit` node,
+    /// [`LimiterError::UnitMismatch`] if its unit disagrees with the declared
+    /// dimension, and [`LimiterError::Control`] if the window cannot be read
+    /// or a dimension is bound twice.
+    pub async fn open(
+        ship: &mut Ship,
+        limits: &[(LimitUnit, String)],
+    ) -> Result<Self, LimiterError> {
+        let mut bound: Vec<Limiter> = Vec::with_capacity(limits.len());
+        for (unit, path) in limits {
+            if bound.iter().any(|l| l.spec().unit == *unit) {
+                return Err(LimiterError::Control {
+                    path: path.clone(),
+                    reason: format!("dimension `{unit}` is bound more than once"),
+                });
+            }
+            bound.push(Limiter::open(ship, path, *unit).await?);
+        }
+        Ok(Self { bound })
+    }
+
+    /// Nothing is governed, so no charge can ever be refused.
+    #[must_use]
+    pub fn is_unlimited(&self) -> bool {
+        self.bound.is_empty()
+    }
+
+    fn get(&self, unit: LimitUnit) -> Option<&Limiter> {
+        self.bound.iter().find(|l| l.spec().unit == unit)
+    }
+
+    fn get_mut(&mut self, unit: LimitUnit) -> Option<&mut Limiter> {
+        self.bound.iter_mut().find(|l| l.spec().unit == unit)
+    }
+
+    /// Would spending `amount` of `unit` exceed its policy?  Pure: no I/O.
+    ///
+    /// An unbound dimension always admits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LimiterError::Exceeded`] when the charge would breach the
+    /// budget or the burst allowance.
+    pub fn check(&self, unit: LimitUnit, amount: u64) -> Result<(), LimiterError> {
+        match self.get(unit) {
+            Some(l) => l.check(amount),
+            None => Ok(()),
+        }
+    }
+
+    /// Charge `amount` of `unit` after the action succeeded.  Pure: no I/O.
+    pub fn record(&mut self, unit: LimitUnit, amount: u64) {
+        if let Some(l) = self.get_mut(unit) {
+            l.record(amount);
+        }
+    }
+
+    /// Persist every dirty window: at most one control write per bound
+    /// limiter, and none at all for a set that spent nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LimiterError::Control`] if a window cannot be written.
+    pub async fn commit(&mut self, control: &mut ControlTable) -> Result<(), LimiterError> {
+        for l in &mut self.bound {
+            l.commit(control).await?;
+        }
+        Ok(())
+    }
+
+    /// Current position of every bound limiter, for `pond status`.
+    #[must_use]
+    pub fn states(&self) -> Vec<LimiterState> {
+        self.bound.iter().map(Limiter::state).collect()
+    }
 }
 
 /// Read a pond node's bytes at `path`.

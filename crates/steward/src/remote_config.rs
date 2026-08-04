@@ -10,8 +10,9 @@
 //! post-commit auto-push dispatcher (in [`crate::guard`]) need to read
 //! attachment YAML and dispatch by mode.
 
+use provider::factory::rate_limit::LimitUnit;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use thiserror::Error;
 
 /// Errors from parsing or interpreting remote-related metadata.
@@ -25,6 +26,16 @@ pub enum RemoteConfigError {
 
     #[error("environment variable substitution failed in remote config: {0}")]
     EnvSubst(String),
+
+    #[error(
+        "remote attachment `limits` has unknown dimension key `{key}`: {reason}. \
+         The key names the unit this transfer spends and is checked against the \
+         limiter node's configured `unit`."
+    )]
+    InvalidLimitDimension { key: String, reason: String },
+
+    #[error("remote attachment `limits.{key}` must name a pond path, got `{value}`")]
+    InvalidLimitPath { key: String, value: String },
 }
 
 /// Portable, on-disk YAML config for one remote attachment.  Stored at
@@ -62,6 +73,29 @@ pub struct RemoteAttachment {
     /// Allow plain HTTP (required for local MinIO).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_http: bool,
+
+    /// Limiters governing transfers to this remote, keyed by the unit the
+    /// push/pull path spends: `bytes` and/or `ops`.  Each value is the pond
+    /// path of a `rate-limit` factory node, whose configured `unit` must agree
+    /// with the key (Decision L7/L10).
+    ///
+    /// **The key is the caller's declaration, written by the operator.**
+    /// `limits.bytes` binds as [`LimitUnit::Bytes`] and the node's `unit:` is
+    /// verified against it, so a limiter node retuned from `MiB/day` to
+    /// `iops/second` is rejected rather than silently charged in the wrong
+    /// dimension.
+    ///
+    /// An absent key means that dimension is ungoverned; an empty map is
+    /// today's unlimited behavior and serializes away entirely, so existing
+    /// `/sys/remotes/<name>` documents are byte-identical.
+    ///
+    /// ```yaml
+    /// limits:
+    ///   bytes: /sys/limits/backup-bytes
+    ///   ops:   /sys/limits/backup-ops
+    /// ```
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub limits: BTreeMap<String, String>,
 }
 
 impl RemoteAttachment {
@@ -124,8 +158,45 @@ impl RemoteAttachment {
     }
 
     /// Parse from raw YAML bytes (as stored under `/sys/remotes/<name>`).
+    ///
+    /// The `limits` map is validated here rather than at use time, so a
+    /// misspelled dimension (`limits: {byte: ...}`) is a loud configuration
+    /// error at attach and at read, never a silently unenforced policy.
     pub fn from_yaml_bytes(bytes: &[u8]) -> Result<Self, RemoteConfigError> {
-        Ok(serde_yaml::from_slice(bytes)?)
+        let parsed: Self = serde_yaml::from_slice(bytes)?;
+        let _ = parsed.resolved_limits()?;
+        Ok(parsed)
+    }
+
+    /// The configured limiters as (declared dimension, pond path) pairs.
+    ///
+    /// The map key is the dimension the transfer path intends to spend; it is
+    /// resolved to a [`LimitUnit`] here and passed to `Limiter::open` as the
+    /// caller's declaration, where it is checked against the node's configured
+    /// `unit`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RemoteConfigError::InvalidLimitDimension`] for a key that is
+    /// not a known dimension, and [`RemoteConfigError::InvalidLimitPath`] for
+    /// a value that is not an absolute pond path.
+    pub fn resolved_limits(&self) -> Result<Vec<(LimitUnit, String)>, RemoteConfigError> {
+        let mut out = Vec::with_capacity(self.limits.len());
+        for (key, path) in &self.limits {
+            let unit =
+                LimitUnit::parse(key).map_err(|e| RemoteConfigError::InvalidLimitDimension {
+                    key: key.clone(),
+                    reason: e.to_string(),
+                })?;
+            if !path.starts_with('/') {
+                return Err(RemoteConfigError::InvalidLimitPath {
+                    key: key.clone(),
+                    value: path.clone(),
+                });
+            }
+            out.push((unit, path.clone()));
+        }
+        Ok(out)
     }
 }
 
@@ -207,6 +278,7 @@ mod tests {
             secret_access_key: String::new(),
             endpoint: String::new(),
             allow_http: false,
+            limits: BTreeMap::new(),
         };
         let s = serde_yaml::to_string(&a).unwrap();
         // Only `url:` should be present for file://.
@@ -226,6 +298,7 @@ mod tests {
             secret_access_key: "s".to_string(),
             endpoint: String::new(),
             allow_http: true,
+            limits: BTreeMap::new(),
         };
         // File URLs ignore all S3 options.
         assert!(a.to_storage_options().unwrap().is_empty());
@@ -240,6 +313,7 @@ mod tests {
             secret_access_key: "s".to_string(),
             endpoint: "http://minio:9000".to_string(),
             allow_http: true,
+            limits: BTreeMap::new(),
         };
         let opts = a.to_storage_options().unwrap();
         assert_eq!(opts.get("region").map(String::as_str), Some("us-east-2"));
@@ -266,6 +340,7 @@ mod tests {
             secret_access_key: "${env:POND_RC_TEST_UNSET:-resolved-secret}".to_string(),
             endpoint: String::new(),
             allow_http: false,
+            limits: BTreeMap::new(),
         };
         let opts = a.to_storage_options().unwrap();
         // Literal values pass through; ${env:VAR} is resolved locally.
@@ -289,12 +364,79 @@ mod tests {
             secret_access_key: "${env:POND_RC_TEST_DEFINITELY_UNSET_XYZ}".to_string(),
             endpoint: String::new(),
             allow_http: false,
+            limits: BTreeMap::new(),
         };
         // An unset env reference must surface as an error, never silently
         // forward the unresolved placeholder to S3.
         assert!(matches!(
             a.to_storage_options(),
             Err(RemoteConfigError::EnvSubst(_))
+        ));
+    }
+
+    /// An attachment with no limits must serialize byte-identically to a
+    /// pre-limiter one, so existing /sys/remotes/<name> documents -- which are
+    /// replicated -- are untouched by this schema addition.
+    #[test]
+    fn absent_limits_serialize_away_entirely() {
+        let a = RemoteAttachment {
+            url: "file:///tmp/x".to_string(),
+            region: String::new(),
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
+            endpoint: String::new(),
+            allow_http: false,
+            limits: BTreeMap::new(),
+        };
+        let s = serde_yaml::to_string(&a).unwrap();
+        assert_eq!(s, "url: file:///tmp/x\n");
+    }
+
+    /// Old YAML must keep parsing under the new binary: `limits` defaults.
+    #[test]
+    fn yaml_without_limits_still_parses() {
+        let a = RemoteAttachment::from_yaml_bytes(b"url: file:///tmp/x\n").unwrap();
+        assert!(a.limits.is_empty());
+        assert!(a.resolved_limits().unwrap().is_empty());
+    }
+
+    #[test]
+    fn limits_roundtrip_and_resolve_to_declared_dimensions() {
+        let yaml = "url: file:///tmp/x\nlimits:\n  bytes: /sys/limits/b\n  ops: /sys/limits/o\n";
+        let a = RemoteAttachment::from_yaml_bytes(yaml.as_bytes()).unwrap();
+        assert_eq!(
+            a.resolved_limits().unwrap(),
+            vec![
+                (LimitUnit::Bytes, "/sys/limits/b".to_string()),
+                (LimitUnit::Ops, "/sys/limits/o".to_string()),
+            ]
+        );
+        // The map round-trips, so `pond apply` of a dumped attachment is a
+        // no-op rather than a silent policy drop.
+        let again =
+            RemoteAttachment::from_yaml_bytes(serde_yaml::to_string(&a).unwrap().as_bytes())
+                .unwrap();
+        assert_eq!(again.limits, a.limits);
+    }
+
+    /// A misspelled dimension is a configuration error, not an unenforced
+    /// policy: the whole point of the limiter is that it cannot fail open by
+    /// accident.
+    #[test]
+    fn unknown_limit_dimension_is_rejected_at_parse() {
+        let yaml = "url: file:///tmp/x\nlimits:\n  byte: /sys/limits/b\n";
+        assert!(matches!(
+            RemoteAttachment::from_yaml_bytes(yaml.as_bytes()),
+            Err(RemoteConfigError::InvalidLimitDimension { .. })
+        ));
+    }
+
+    #[test]
+    fn relative_limiter_path_is_rejected() {
+        let yaml = "url: file:///tmp/x\nlimits:\n  bytes: sys/limits/b\n";
+        assert!(matches!(
+            RemoteAttachment::from_yaml_bytes(yaml.as_bytes()),
+            Err(RemoteConfigError::InvalidLimitPath { .. })
         ));
     }
 }

@@ -63,6 +63,16 @@ async fn push_one(ship: &mut steward::Steward, name: &str) -> Result<()> {
     }
     let storage_options = attachment.to_storage_options()?;
 
+    // Bind the limiters before touching the network, so a missing node or a
+    // wrong unit fails for free rather than halfway through a transfer.
+    let limit_spec = attachment.resolved_limits()?;
+    let ship_mut = ship
+        .as_pond_mut()
+        .ok_or_else(|| anyhow!("push requires a pond steward (not a host steward)"))?;
+    let mut limits = steward::LimiterSet::open(ship_mut, &limit_spec)
+        .await
+        .map_err(|e| anyhow!("bind limiters for remote `{}`: {}", name, e))?;
+
     let ship_ref = ship
         .as_pond()
         .ok_or_else(|| anyhow!("push requires a pond steward (not a host steward)"))?;
@@ -71,9 +81,25 @@ async fn push_one(ship: &mut steward::Steward, name: &str) -> Result<()> {
         .await
         .map_err(|e| anyhow!("open remote `{}` ({}): {}", name, attachment.url, e))?;
 
-    let outcome = steward::push_content_to_remote(ship_ref, &mut remote, "main")
-        .await
-        .map_err(|e| anyhow!("push {} ({}): {}", name, attachment.url, e))?;
+    let pushed =
+        steward::push_content_to_remote_limited(ship_ref, &mut remote, "main", &mut limits).await;
+
+    // Persist the windows whether or not the push succeeded: a push that
+    // failed partway still transferred what it transferred, and a budget that
+    // forgets the spending of failed attempts is a budget a retry loop can
+    // spend without bound -- the exact failure this exists to prevent.
+    let ship_mut = ship
+        .as_pond_mut()
+        .ok_or_else(|| anyhow!("push requires a pond steward (not a host steward)"))?;
+    if let Err(e) = limits.commit(ship_mut.control_table_mut()).await {
+        log::warn!(
+            "[WARN] push {}: failed to record limiter usage: {}",
+            name,
+            e
+        );
+    }
+
+    let outcome = pushed.map_err(|e| anyhow!("push {} ({}): {}", name, attachment.url, e))?;
 
     let tip_hex = outcome.tip.to_hex();
     log::info!(

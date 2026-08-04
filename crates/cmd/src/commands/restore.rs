@@ -67,6 +67,9 @@ pub async fn restore_command(
         secret_access_key: secret_access_key.clone().unwrap_or_default(),
         endpoint: endpoint.clone().unwrap_or_default(),
         allow_http,
+        // A restore bootstraps a fresh replica by reading; it spends no
+        // governed budget and outlives this function only as storage options.
+        limits: std::collections::BTreeMap::new(),
     };
     if url.starts_with("s3://") {
         sync_store::register_s3_handlers();

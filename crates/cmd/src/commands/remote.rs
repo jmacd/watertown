@@ -19,6 +19,7 @@
 
 use crate::common::ShipContext;
 use anyhow::{Result, anyhow};
+use std::collections::BTreeMap;
 use steward::{REMOTE_MODE_PREFIX, REMOTE_MOUNT_PATH_PREFIX, SYS_DIR, SYS_REMOTES_DIR};
 use tinyfs::EntryType;
 use tokio::io::AsyncWriteExt;
@@ -88,17 +89,20 @@ pub async fn add_remote_command(
             path
         ));
     }
-    add_remote_attachment_internal(
+    attach_remote(
         ship_context,
         name,
-        url,
+        RemoteAttachment {
+            url: url.to_string(),
+            region: region.unwrap_or_default(),
+            access_key_id: access_key_id.unwrap_or_default(),
+            secret_access_key: secret_access_key.unwrap_or_default(),
+            endpoint: endpoint.unwrap_or_default(),
+            allow_http,
+            limits: BTreeMap::new(),
+        },
         RemoteMode::Pull,
         Some(path),
-        region,
-        access_key_id,
-        secret_access_key,
-        endpoint,
-        allow_http,
         overwrite,
     )
     .await
@@ -127,51 +131,56 @@ pub async fn add_backup_command(
     } else {
         RemoteMode::Push
     };
-    add_remote_attachment_internal(
+    attach_remote(
         ship_context,
         name,
-        url,
+        RemoteAttachment {
+            url: url.to_string(),
+            region: region.unwrap_or_default(),
+            access_key_id: access_key_id.unwrap_or_default(),
+            secret_access_key: secret_access_key.unwrap_or_default(),
+            endpoint: endpoint.unwrap_or_default(),
+            allow_http,
+            limits: BTreeMap::new(),
+        },
         mode,
         None,
-        region,
-        access_key_id,
-        secret_access_key,
-        endpoint,
-        allow_http,
         overwrite,
     )
     .await
 }
 
-/// Shared body for `add_remote_command` (pull) and `add_backup_command`
-/// (push/both).  Persists the attachment YAML, records mode and -- for
-/// pull -- the mount path, and auto-initializes the remote Delta table.
-#[allow(clippy::too_many_arguments)]
-async fn add_remote_attachment_internal(
+/// Attach `attachment` as the remote named `name`.
+///
+/// The single writer of `/sys/remotes/<name>`.  Every route in -- `pond remote
+/// add` (pull), `pond backup add` (push/both), and `pond apply` with
+/// `kind: remote`/`kind: backup` -- funnels through here, so all three get the
+/// same secret discipline, the same mount-conflict and store_id checks, and
+/// the same live remote initialization.  That was the point of D6, and it is
+/// preserved by widening this function rather than adding a second writer
+/// (Decision L11).
+///
+/// Persists the attachment YAML, records mode and -- for pull -- the mount
+/// path, and auto-initializes the remote Delta table.
+pub async fn attach_remote(
     ship_context: &ShipContext,
     name: &str,
-    url: &str,
+    attachment: RemoteAttachment,
     mode: RemoteMode,
     mount_path: Option<&str>,
-    region: Option<String>,
-    access_key_id: Option<String>,
-    secret_access_key: Option<String>,
-    endpoint: Option<String>,
-    allow_http: bool,
     overwrite: bool,
 ) -> Result<()> {
     validate_name(name)?;
+    let url = attachment.url.as_str();
     let _parsed =
         url::Url::parse(url).map_err(|e| anyhow!("invalid remote URL `{}`: {}", url, e))?;
 
-    let attachment = RemoteAttachment {
-        url: url.to_string(),
-        region: region.unwrap_or_default(),
-        access_key_id: access_key_id.unwrap_or_default(),
-        secret_access_key: secret_access_key.unwrap_or_default(),
-        endpoint: endpoint.unwrap_or_default(),
-        allow_http,
-    };
+    // Reject an unknown dimension key or a relative limiter path here, at
+    // attach time, rather than at the first push.  A limiter that silently
+    // fails to bind is worse than no limiter at all.
+    let _limits = attachment
+        .resolved_limits()
+        .map_err(|e| anyhow!("remote `{}`: {}", name, e))?;
 
     // The attachment YAML at /sys/remotes/<name> is an oplog row that
     // `pond push` replicates to every backup.  A literal secret would

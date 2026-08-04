@@ -1286,7 +1286,48 @@ impl<'a> StewardTransactionGuard<'a> {
                     continue;
                 }
             };
-            match crate::push_content_to_remote(ship, &mut remote, "main").await {
+            // Bind before any network work: a limiter that names a missing
+            // node or governs the wrong unit is a misconfiguration, and it
+            // should surface without having spent anything first.
+            let limit_spec = match attachment.resolved_limits() {
+                Ok(v) => v,
+                Err(e) => {
+                    log::error!("post-commit auto-push: {} bad limits: {}", name, e);
+                    continue;
+                }
+            };
+            // Boxed to break an async recursion cycle: this runs from
+            // `commit()`, and binding a limiter opens a read transaction whose
+            // own `commit()` closes the loop.  The recursion is not real --
+            // a read transaction runs no post-commit work -- but the future
+            // type is infinitely sized without an indirection here.
+            let mut limits = match Box::pin(crate::LimiterSet::open(ship, &limit_spec)).await {
+                Ok(l) => l,
+                Err(e) => {
+                    log::error!(
+                        "post-commit auto-push: {} could not bind limiters: {}",
+                        name,
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let pushed =
+                crate::push_content_to_remote_limited(ship, &mut remote, "main", &mut limits).await;
+
+            // Record usage regardless of outcome: a push that failed partway
+            // still spent what it spent, and an unattended retry every commit
+            // would otherwise never be charged for its failures.
+            if let Err(e) = limits.commit(ship.control_table_mut()).await {
+                log::warn!(
+                    "post-commit auto-push: {} failed to record limiter usage: {}",
+                    name,
+                    e
+                );
+            }
+
+            match pushed {
                 Ok(outcome) => {
                     let tip_hex = outcome.tip.to_hex();
                     info!(
