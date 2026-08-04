@@ -38,18 +38,22 @@ pub async fn push_command(ship_context: &ShipContext, name: Option<String>) -> R
         return Ok(());
     }
 
-    let mut had_error = false;
+    // Carry the causes, not just the count.  A push can now fail for a
+    // reason the operator is expected to act on -- an exhausted budget, with
+    // a retry time -- and burying that in the log while returning "one or
+    // more pushes failed" makes a routine throttle look like an outage.
+    let mut failures: Vec<String> = Vec::new();
     for name in targets {
         if let Err(e) = push_one(&mut ship, &name).await {
             log::error!("[ERR] push {}: {}", name, e);
-            had_error = true;
+            failures.push(format!("{}: {}", name, e));
         }
     }
 
-    if had_error {
-        Err(anyhow!("one or more pushes failed"))
-    } else {
+    if failures.is_empty() {
         Ok(())
+    } else {
+        Err(anyhow!("push failed -- {}", failures.join("; ")))
     }
 }
 
