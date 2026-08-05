@@ -173,7 +173,11 @@ async fn pull_one(ship: &mut steward::Steward, name: &str) -> Result<()> {
         .as_pond_mut()
         .ok_or_else(|| anyhow!("pull requires a pond steward (not a host steward)"))?;
     if let Err(e) = limits.commit(ship_mut.control_table_mut()).await {
-        log::warn!("[WARN] pull {}: failed to record limiter usage: {}", name, e);
+        log::warn!(
+            "[WARN] pull {}: failed to record limiter usage: {}",
+            name,
+            e
+        );
     }
 
     result

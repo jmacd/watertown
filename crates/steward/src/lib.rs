@@ -22,11 +22,11 @@ mod content_verify;
 mod control_table;
 mod dispatch;
 pub mod fsck;
+pub mod governed_source;
 mod graft;
 mod guard;
 mod host;
 mod inner_control;
-pub mod governed_source;
 pub mod limiter;
 pub mod limiter_usage;
 pub mod maintenance;
@@ -46,7 +46,6 @@ pub use content_push::{
     ContentPushOutcome, push_content_to_remote, push_content_to_remote_limited,
 };
 pub use content_source::{BlobReader, ContentSource, LocalPondSource};
-pub use governed_source::GovernedSource;
 pub use content_tree::{
     ContentTreeReport, MaterializedObjects, compute_content_tree, compute_content_tree_for_table,
     materialize_content_objects,
@@ -55,6 +54,7 @@ pub use content_verify::{ContentVerifyReport, ContentVerifyState, verify_content
 pub use control_table::{CommitSpine, ControlTable};
 pub use dispatch::{Steward, Transaction};
 pub use fsck::{FsckError, FsckOptions, FsckReport, PartitionDigest, fsck};
+pub use governed_source::GovernedSource;
 pub use graft::{GraftPin, SYS_GRAFTS_DIR};
 pub use guard::StewardTransactionGuard;
 pub use host::{HostSteward, HostTransaction};

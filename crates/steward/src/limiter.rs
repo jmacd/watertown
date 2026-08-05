@@ -978,11 +978,7 @@ mod tests {
         let reported = set.discard_ignored_spending();
         assert_eq!(
             reported,
-            vec![(
-                "/sys/limits/b".to_string(),
-                "bytes",
-                10 * 1024 * 1024_u64
-            )],
+            vec![("/sys/limits/b".to_string(), "bytes", 10 * 1024 * 1024_u64)],
             "the ungoverned spending must be reported, not silently dropped"
         );
         assert_eq!(set.bound[0].spent(), 0, "and must not remain pending");
