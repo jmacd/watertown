@@ -129,6 +129,7 @@ impl ResolvedStorage {
     }
 
     /// The profile's kind, as written in `pond apply`.
+    #[must_use]
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Minio { .. } => "storage-minio",
@@ -136,6 +137,7 @@ impl ResolvedStorage {
     }
 
     /// The pond path this profile was read from.
+    #[must_use]
     pub fn path(&self) -> &str {
         match self {
             Self::Minio { path, .. } => path,
@@ -144,6 +146,7 @@ impl ResolvedStorage {
 
     /// A one-line summary for `pond status`.  Never includes a credential,
     /// resolved or otherwise.
+    #[must_use]
     pub fn describe(&self) -> String {
         match self {
             Self::Minio { config, .. } => format!("minio, {}", config.endpoint),
@@ -154,6 +157,7 @@ impl ResolvedStorage {
     ///
     /// Checked at attach time so a mismatched pairing is a configuration
     /// error, not a confusing failure on the first push.
+    #[must_use]
     pub fn serves_scheme(&self, url: &str) -> bool {
         match self {
             Self::Minio { .. } => url.starts_with("s3://") || url.starts_with("s3a://"),

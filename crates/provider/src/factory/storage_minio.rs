@@ -120,6 +120,7 @@ impl std::error::Error for StorageMinioError {}
 
 impl StorageMinioConfig {
     /// The region actually used, applying [`DEFAULT_REGION`].
+    #[must_use]
     pub fn region(&self) -> &str {
         match self.region.as_deref() {
             Some(r) if !r.is_empty() => r,
@@ -253,6 +254,7 @@ pub const REDACTED: &str = "<redacted>";
 /// read this text; they bind from the raw stored config
 /// (`steward::storage_profile`), which still holds the references.  So nothing
 /// depends on this output parsing back, and it is free to be safe to print.
+#[must_use]
 pub fn render(cfg: &StorageMinioConfig) -> Vec<u8> {
     let normalized = StorageMinioConfig {
         endpoint: cfg.endpoint.clone(),
