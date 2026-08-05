@@ -12,6 +12,7 @@ use crate::commands::remote::{
 };
 use crate::common::ShipContext;
 use anyhow::{Result, anyhow};
+use std::collections::HashMap;
 use steward::{REMOTE_MOUNT_PATH_PREFIX, StewardError};
 use uuid::Uuid;
 
@@ -88,8 +89,11 @@ async fn already_at_tip(
 /// resolves to a producer pond clone on local disk
 /// ([`steward::LocalPondSource`]) for the local develop-and-preview workflow;
 /// any other URL (`s3://`, `file://`) opens a content-addressed remote store.
+/// `storage_options` is resolved by the caller (Decision A5), since reading a
+/// storage profile needs the pond and this function must not.
 async fn open_content_source(
     attachment: &steward::RemoteAttachment,
+    storage_options: HashMap<String, String>,
 ) -> Result<Box<dyn steward::ContentSource>> {
     if let Some(path) = attachment.url.strip_prefix("pond://") {
         let source = steward::LocalPondSource::open(path)
@@ -97,7 +101,6 @@ async fn open_content_source(
             .map_err(|e| anyhow!("open local pond source at `{}`: {}", path, e))?;
         Ok(Box::new(source))
     } else {
-        let storage_options = attachment.to_storage_options()?;
         let remote = sync_store::ContentRemote::open_at_url(&attachment.url, storage_options)
             .await
             .map_err(|e| anyhow!("open content remote at `{}`: {}", attachment.url, e))?;
@@ -108,9 +111,15 @@ async fn open_content_source(
 async fn pull_one(ship: &mut steward::Steward, name: &str) -> Result<()> {
     let attachment = load_remote_attachment(ship, name).await?;
 
-    if attachment.url.starts_with("s3://") {
-        sync_store::register_s3_handlers();
-    }
+    // One dispatch, from the profile when there is one (Decision A8).  A
+    // `pond://` source uses no storage options at all, but resolving here
+    // keeps the rule in one place.
+    let storage_options = {
+        let pond = ship
+            .as_pond_mut()
+            .ok_or_else(|| anyhow!("pull requires a pond steward (not a host steward)"))?;
+        steward::storage_profile::prepare_storage(pond, &attachment).await?
+    };
 
     let ship_pre = ship
         .as_pond()
@@ -127,10 +136,10 @@ async fn pull_one(ship: &mut steward::Steward, name: &str) -> Result<()> {
     // (non-root mount): fetch the foreign content graph and rebuild it under
     // the foreign pond_id, then mount it.
     if mount_path.is_none() {
-        return pull_mirror(ship, name, &attachment).await;
+        return pull_mirror(ship, name, &attachment, storage_options).await;
     }
 
-    let source = open_content_source(&attachment)
+    let source = open_content_source(&attachment, storage_options)
         .await
         .map_err(|e| anyhow!("open remote `{}` ({}): {}", name, attachment.url, e))?;
     let remote: &dyn steward::ContentSource = source.as_ref();
@@ -222,8 +231,9 @@ async fn pull_mirror(
     ship: &mut steward::Steward,
     name: &str,
     attachment: &steward::RemoteAttachment,
+    storage_options: HashMap<String, String>,
 ) -> Result<()> {
-    let source = open_content_source(attachment)
+    let source = open_content_source(attachment, storage_options)
         .await
         .map_err(|e| anyhow!("open remote `{}` ({}): {}", name, attachment.url, e))?;
     let remote: &dyn steward::ContentSource = source.as_ref();

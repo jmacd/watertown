@@ -62,10 +62,12 @@ pub async fn push_command(ship_context: &ShipContext, name: Option<String>) -> R
 async fn push_one(ship: &mut steward::Steward, name: &str) -> Result<()> {
     let attachment = load_remote_attachment(ship, name).await?;
 
-    if attachment.url.starts_with("s3://") {
-        sync_store::register_s3_handlers();
-    }
-    let storage_options = attachment.to_storage_options()?;
+    // One dispatch, from the profile when there is one and from the URL only
+    // when there is not (Decision A8).
+    let ship_pre = ship
+        .as_pond_mut()
+        .ok_or_else(|| anyhow!("push requires a pond steward (not a host steward)"))?;
+    let storage_options = steward::storage_profile::prepare_storage(ship_pre, &attachment).await?;
 
     // Bind the limiters before touching the network, so a missing node or a
     // wrong unit fails for free rather than halfway through a transfer.

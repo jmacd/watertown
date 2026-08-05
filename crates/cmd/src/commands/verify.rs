@@ -69,11 +69,12 @@ pub async fn verify_command(ship_context: &ShipContext, name: Option<String>) ->
 async fn verify_one(ship: &mut steward::Steward, name: &str) -> Result<ContentVerifyReport> {
     let attachment = load_remote_attachment(ship, name).await?;
 
-    if attachment.url.starts_with("s3://") {
-        sync_store::register_s3_handlers();
-    }
-
-    let storage_options = attachment.to_storage_options()?;
+    let storage_options = {
+        let pond = ship
+            .as_pond_mut()
+            .ok_or_else(|| anyhow!("verify requires a pond steward (not a host steward)"))?;
+        steward::storage_profile::prepare_storage(pond, &attachment).await?
+    };
     let remote = ContentRemote::open_at_url(&attachment.url, storage_options)
         .await
         .map_err(|e| anyhow!("open remote `{}` ({}): {}", name, attachment.url, e))?;

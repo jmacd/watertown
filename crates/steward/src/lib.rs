@@ -33,6 +33,7 @@ mod rebuild;
 pub mod reclaim;
 mod remote_config;
 mod ship;
+pub mod storage_profile;
 mod write_lock;
 
 pub use content_diff::{ContentComparison, ContentDiff, DiffKind, compare_content_trees};
@@ -64,6 +65,7 @@ pub use limiter_usage::{
 pub use rebuild::{RebuildReport, rebuild_control_table};
 pub use remote_config::{RemoteAttachment, RemoteConfigError, RemoteMode};
 pub use ship::{CollapseReport, CompactOutcome, Ship};
+pub use storage_profile::{ResolvedStorage, StorageProfileError};
 pub use tlogfs::{PondMetadata, PondTxnMetadata, PondUserMetadata};
 
 /// Recovery command result

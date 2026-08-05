@@ -70,6 +70,10 @@ pub async fn restore_command(
         // A restore bootstraps a fresh replica by reading; it spends no
         // governed budget and outlives this function only as storage options.
         limits: std::collections::BTreeMap::new(),
+        // Restore takes its connection from CLI arguments: the pond it is
+        // bootstrapping does not exist yet, so there is no profile node to
+        // read one from.
+        storage: None,
     };
     if url.starts_with("s3://") {
         sync_store::register_s3_handlers();

@@ -100,6 +100,9 @@ pub async fn add_remote_command(
             endpoint: endpoint.unwrap_or_default(),
             allow_http,
             limits: BTreeMap::new(),
+            // The CLI verbs author inline attachments only; storage profiles
+            // are a `pond apply` surface (Decision A2/L11).
+            storage: None,
         },
         RemoteMode::Pull,
         Some(path),
@@ -142,6 +145,9 @@ pub async fn add_backup_command(
             endpoint: endpoint.unwrap_or_default(),
             allow_http,
             limits: BTreeMap::new(),
+            // The CLI verbs author inline attachments only; storage profiles
+            // are a `pond apply` surface (Decision A2/L11).
+            storage: None,
         },
         mode,
         None,
@@ -180,6 +186,10 @@ pub async fn attach_remote(
     // fails to bind is worse than no limiter at all.
     let _limits = attachment
         .resolved_limits()
+        .map_err(|e| anyhow!("remote `{}`: {}", name, e))?;
+
+    attachment
+        .check_storage_profile()
         .map_err(|e| anyhow!("remote `{}`: {}", name, e))?;
 
     // The attachment YAML at /sys/remotes/<name> is an oplog row that
@@ -241,10 +251,16 @@ pub async fn attach_remote(
     //     - pull:      refuse (consumer cannot bootstrap an empty
     //       upstream; operator should set up the upstream pond first).
     let local_pond_id = ship.control_table().pond_id_uuid();
-    if attachment.url.starts_with("s3://") {
-        sync_store::register_s3_handlers();
-    }
-    let storage_options = attachment.to_storage_options()?;
+    // One dispatch (Decision A8).  This also validates the profile reference
+    // -- it must exist, parse, and serve this URL's scheme -- before any
+    // pond-side state changes, on the same principle as the limiter check
+    // above: a binding that silently fails to resolve is worse than none.
+    let storage_options = {
+        let pond = ship
+            .as_pond_mut()
+            .ok_or_else(|| anyhow!("attach requires a pond steward (not a host steward)"))?;
+        steward::storage_profile::prepare_storage(pond, &attachment).await?
+    };
     let is_import = mode == RemoteMode::Pull && matches!(mount_path, Some(p) if p != "/");
     if is_import {
         // Cross-pond import: content-addressed pull (graph fetch + foreign-pond
@@ -528,10 +544,17 @@ async fn validate_no_foreign_store_id_collision(
             continue;
         }
         // Probe the existing remote to learn its store_id.
-        let storage_options = attachment.to_storage_options()?;
-        if attachment.url.starts_with("s3://") {
-            sync_store::register_s3_handlers();
-        }
+        let pond = match ship.as_pond_mut() {
+            Some(p) => p,
+            None => continue,
+        };
+        let storage_options =
+            match steward::storage_profile::prepare_storage(pond, &attachment).await {
+                Ok(o) => o,
+                // A probe that cannot be configured tells us nothing about a
+                // mount conflict; the attachment's own validation reports it.
+                Err(_) => continue,
+            };
         let existing_store_id =
             match sync_store::ContentRemote::open_at_url(&attachment.url, storage_options).await {
                 Ok(r) => r.pond_id(),

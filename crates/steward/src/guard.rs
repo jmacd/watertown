@@ -1289,16 +1289,19 @@ impl<'a> StewardTransactionGuard<'a> {
 
         for (name, attachment) in to_push {
             info!("post-commit auto-push: {} -> {}", name, attachment.url);
-            if attachment.url.starts_with("s3://") {
-                sync_store::register_s3_handlers();
-            }
-            let storage_options = match attachment.to_storage_options() {
-                Ok(o) => o,
-                Err(e) => {
-                    log::error!("post-commit auto-push: {} bad storage options: {}", name, e);
-                    continue;
-                }
-            };
+            // One dispatch (Decision A8).  Boxed for the same reason the
+            // limiter bind below is: reading a profile opens a read
+            // transaction, and the compiler cannot see that a read
+            // transaction runs no post-commit work, so the cycle it infers
+            // is not a real one.
+            let storage_options =
+                match Box::pin(crate::storage_profile::prepare_storage(ship, &attachment)).await {
+                    Ok(o) => o,
+                    Err(e) => {
+                        log::error!("post-commit auto-push: {} bad storage options: {}", name, e);
+                        continue;
+                    }
+                };
             let mut remote = match sync_store::ContentRemote::open_at_url(
                 &attachment.url,
                 storage_options,

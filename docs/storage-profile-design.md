@@ -142,11 +142,32 @@ credentials in one obvious place is a real benefit for management and a real
 hazard if the place ever holds plaintext.
 
 **Decision A1.** Every credential field on a storage profile MUST be an
-`${env:...}` reference, validated at `mknod` time -- not just the secret. The
+`${env:...}` reference, validated at creation time -- not just the secret. The
 current rule covers `secret_access_key` alone; an access key id is a weaker
 secret but still an identity, and an Azure account key is as sensitive as an S3
-secret. `render` redacts credential fields regardless, so a profile node reads
-as `account_key: ${env:AZURE_STORAGE_KEY}` and never as a value.
+secret.
+
+**A1a -- the rule must be checked on the *raw* config.** `mknod` and `pond
+apply` both **validate the expanded config and store the raw one**, so that
+secrets live in the environment and only references are persisted. That split
+means a factory's ordinary `validate_config`, which receives expanded bytes,
+*cannot* express this rule: expansion is precisely what turns a reference into a
+literal, so after it the distinction no longer exists. Factories therefore gain
+an optional `validate_raw_config`, run on the pre-expansion text before anything
+is written. Checking on first use instead would be too late: by then the
+plaintext is already in replicated, append-only history, where it cannot be
+withdrawn.
+
+**A1b -- consumers bind from the stored config, and the node's content is
+redacted.** These are the same decision. `FactoryRegistry::create_file`
+env-expands a stored config before handing it to the factory, so the node's
+rendered content is built from *resolved* values -- the real secret. It follows
+that (i) the rendered content MUST redact credentials, and (ii) consumers MUST
+NOT bind from it, because a resolved value is exactly what a profile must not
+hand out, and because a replica resolving as the *writer* would defeat A6.
+`ResolvedStorage` therefore reads the raw stored config via
+`get_dynamic_node_config`. So `pond cat` shows a safe, deliberately unusable
+view (`secret_access_key: <redacted>`), while enforcement reads the references.
 
 ---
 
@@ -450,7 +471,7 @@ to replace.
 | Phase | Work | Verifies |
 |---|---|---|
 | A0 | `storage-minio` factory, `ResolvedStorage`, `storage:` field; inline path untouched | The whole idea, against the one provider actually in use |
-| A1 | Attach-time validation, `pond status` line, redaction | The failure modes, before any deployment depends on them |
+| A1 | Attach-time validation, `pond status` line | The failure modes, before any deployment depends on them |
 | A2 | Convert `attach-remotes.sh` to `pond apply` documents | §0.1 -- the thing that motivated this |
 | A3 | `storage-azure`: `object_store` azure feature, `azure_registration.rs`, the factory, dispatch | §0.2, and that the abstraction survives a genuinely different provider |
 | -- | `storage-s3` / `storage-r2` | Deferred indefinitely; see §3.3 |
@@ -514,7 +535,9 @@ introduced. That is worth deciding before A3 rather than during it.
 
 | # | Decision |
 |---|---|
-| A1 | Every credential field on a profile must be an `${env:...}` reference, validated at `mknod` time and redacted by `render` -- stricter than today's `secret_access_key`-only rule. |
+| A1 | Every credential field on a profile must be an `${env:...}` reference -- stricter than today's `secret_access_key`-only rule. |
+| A1a | That rule is checked on the **raw** config via a new `validate_raw_config` factory hook, because the ordinary validator only ever sees expanded text, and because catching a literal at first use is too late to withdraw it from replicated history. |
+| A1b | The node's rendered content is built from expanded values, so it redacts credentials and is not parseable back; consumers bind from the raw stored config instead, which is what keeps per-replica resolution (A6) intact. |
 | A2 | The node is a *storage profile* (connection + credentials), not an auth block: the misplaced fields that motivated this are not credentials, and dispatch needs the node to know its provider. Nodes at `/sys/storage/<name>`. |
 | A3 | One factory per provider. MinIO and Azure do not differ in the values of a shared field set; they differ in what the field set is. Only `storage-minio` and `storage-azure` are proposed. |
 | A4 | Naming a profile alongside any inline connection field is a hard error, never a precedence rule. Likewise an Azure profile must carry exactly one credential shape. |

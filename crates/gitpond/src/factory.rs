@@ -277,6 +277,7 @@ static FACTORY_GIT_INGEST: provider::registry::DynamicFactory =
         create_directory: Some(create_directory),
         create_file: None,
         validate_config,
+        validate_raw_config: None,
         try_as_queryable: None,
         initialize: Some(initialize_wrapper),
         execute: Some(execute_wrapper),

@@ -36,6 +36,14 @@ pub enum RemoteConfigError {
 
     #[error("remote attachment `limits.{key}` must name a pond path, got `{value}`")]
     InvalidLimitPath { key: String, value: String },
+
+    #[error("remote attachment `storage` must name a pond path, got `{value}`")]
+    InvalidStoragePath { value: String },
+
+    #[error(
+        "remote attachment names storage profile `{path}` but also sets inline connection          field(s): {fields}. A profile replaces them; keeping both would leave it ambiguous          which storage is actually in use. Remove the inline field(s), or drop `storage`."
+    )]
+    StorageConflict { path: String, fields: String },
 }
 
 /// Portable, on-disk YAML config for one remote attachment.  Stored at
@@ -96,6 +104,25 @@ pub struct RemoteAttachment {
     /// ```
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub limits: BTreeMap<String, String>,
+
+    /// Storage profile describing *how* to reach [`Self::url`], as the pond
+    /// path of a `storage-*` factory node (Decision A2).
+    ///
+    /// Mutually exclusive with the inline connection fields above, and the
+    /// conflict is a hard error rather than a precedence rule (Decision A4):
+    /// an attachment that names a profile while still carrying a stale inline
+    /// endpoint has no unambiguous intent, and silently preferring one would
+    /// produce a working pond talking to the wrong storage.
+    ///
+    /// Absent by default and serializes away entirely, so every existing
+    /// `/sys/remotes/<name>` document stays byte-identical.
+    ///
+    /// ```yaml
+    /// url: s3://water-staging
+    /// storage: /sys/storage/minio
+    /// ```
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<String>,
 }
 
 impl RemoteAttachment {
@@ -165,7 +192,53 @@ impl RemoteAttachment {
     pub fn from_yaml_bytes(bytes: &[u8]) -> Result<Self, RemoteConfigError> {
         let parsed: Self = serde_yaml::from_slice(bytes)?;
         let _ = parsed.resolved_limits()?;
+        parsed.check_storage_profile()?;
         Ok(parsed)
+    }
+
+    /// Names of the inline connection fields this attachment sets.
+    ///
+    /// Used to enforce Decision A4; also what an operator needs listed back
+    /// when the conflict is reported.
+    fn inline_connection_fields(&self) -> Vec<&'static str> {
+        let mut set = Vec::new();
+        if !self.region.is_empty() {
+            set.push("region");
+        }
+        if !self.access_key_id.is_empty() {
+            set.push("access_key_id");
+        }
+        if !self.secret_access_key.is_empty() {
+            set.push("secret_access_key");
+        }
+        if !self.endpoint.is_empty() {
+            set.push("endpoint");
+        }
+        if self.allow_http {
+            set.push("allow_http");
+        }
+        set
+    }
+
+    /// Enforce Decision A4: a profile and inline connection fields cannot
+    /// both be present, and a profile path must be absolute.
+    pub fn check_storage_profile(&self) -> Result<(), RemoteConfigError> {
+        let Some(path) = self.storage.as_deref() else {
+            return Ok(());
+        };
+        if !path.starts_with('/') {
+            return Err(RemoteConfigError::InvalidStoragePath {
+                value: path.to_string(),
+            });
+        }
+        let inline = self.inline_connection_fields();
+        if !inline.is_empty() {
+            return Err(RemoteConfigError::StorageConflict {
+                path: path.to_string(),
+                fields: inline.join(", "),
+            });
+        }
+        Ok(())
     }
 
     /// The configured limiters as (declared dimension, pond path) pairs.
@@ -279,6 +352,7 @@ mod tests {
             endpoint: String::new(),
             allow_http: false,
             limits: BTreeMap::new(),
+            storage: None,
         };
         let s = serde_yaml::to_string(&a).unwrap();
         // Only `url:` should be present for file://.
@@ -299,6 +373,7 @@ mod tests {
             endpoint: String::new(),
             allow_http: true,
             limits: BTreeMap::new(),
+            storage: None,
         };
         // File URLs ignore all S3 options.
         assert!(a.to_storage_options().unwrap().is_empty());
@@ -314,6 +389,7 @@ mod tests {
             endpoint: "http://minio:9000".to_string(),
             allow_http: true,
             limits: BTreeMap::new(),
+            storage: None,
         };
         let opts = a.to_storage_options().unwrap();
         assert_eq!(opts.get("region").map(String::as_str), Some("us-east-2"));
@@ -341,6 +417,7 @@ mod tests {
             endpoint: String::new(),
             allow_http: false,
             limits: BTreeMap::new(),
+            storage: None,
         };
         let opts = a.to_storage_options().unwrap();
         // Literal values pass through; ${env:VAR} is resolved locally.
@@ -365,6 +442,7 @@ mod tests {
             endpoint: String::new(),
             allow_http: false,
             limits: BTreeMap::new(),
+            storage: None,
         };
         // An unset env reference must surface as an error, never silently
         // forward the unresolved placeholder to S3.
@@ -387,6 +465,7 @@ mod tests {
             endpoint: String::new(),
             allow_http: false,
             limits: BTreeMap::new(),
+            storage: None,
         };
         let s = serde_yaml::to_string(&a).unwrap();
         assert_eq!(s, "url: file:///tmp/x\n");
@@ -438,5 +517,72 @@ mod tests {
             RemoteAttachment::from_yaml_bytes(yaml.as_bytes()),
             Err(RemoteConfigError::InvalidLimitPath { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod storage_profile_tests {
+    use super::*;
+
+    #[test]
+    fn a_profile_alone_is_accepted() {
+        let yaml = "url: s3://bucket\nstorage: /sys/storage/minio\n";
+        let a = RemoteAttachment::from_yaml_bytes(yaml.as_bytes()).expect("parse");
+        assert_eq!(a.storage.as_deref(), Some("/sys/storage/minio"));
+    }
+
+    /// Decision A4.  An attachment naming a profile while still carrying a
+    /// stale inline endpoint has no unambiguous intent; silently preferring
+    /// one would produce a working pond talking to the wrong storage.
+    #[test]
+    fn a_profile_plus_an_inline_field_is_refused() {
+        for inline in [
+            "endpoint: http://x:9000",
+            "region: us-east-1",
+            "access_key_id: ${env:A}",
+            "secret_access_key: ${env:B}",
+            "allow_http: true",
+        ] {
+            let yaml = format!("url: s3://bucket\nstorage: /sys/storage/minio\n{inline}\n");
+            let err = RemoteAttachment::from_yaml_bytes(yaml.as_bytes())
+                .expect_err("must refuse conflicting authoring styles");
+            assert!(
+                matches!(err, RemoteConfigError::StorageConflict { .. }),
+                "{inline}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_relative_profile_path_is_refused() {
+        let yaml = "url: s3://bucket\nstorage: sys/storage/minio\n";
+        let err = RemoteAttachment::from_yaml_bytes(yaml.as_bytes()).expect_err("must refuse");
+        assert!(matches!(err, RemoteConfigError::InvalidStoragePath { .. }));
+    }
+
+    /// The inline path is untouched: existing documents must keep working
+    /// exactly as they did, and must serialize byte-identically.
+    #[test]
+    fn an_inline_attachment_is_unaffected() {
+        // Field order follows the struct, not the source document.
+        let yaml = "url: s3://bucket\naccess_key_id: ${env:A}\nendpoint: http://x:9000\n";
+        let a = RemoteAttachment::from_yaml_bytes(yaml.as_bytes()).expect("parse");
+        assert!(a.storage.is_none());
+        assert_eq!(serde_yaml::to_string(&a).unwrap(), yaml);
+    }
+
+    #[test]
+    fn an_absent_profile_serializes_away_entirely() {
+        let a = RemoteAttachment {
+            url: "file:///tmp/x".to_string(),
+            region: String::new(),
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
+            endpoint: String::new(),
+            allow_http: false,
+            limits: BTreeMap::new(),
+            storage: None,
+        };
+        assert_eq!(serde_yaml::to_string(&a).unwrap(), "url: file:///tmp/x\n");
     }
 }

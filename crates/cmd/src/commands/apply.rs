@@ -294,6 +294,20 @@ fn parse_kind(doc: &ResourceDoc, source_file: &str, index: usize) -> Result<Appl
                 )
             })?;
 
+            // Rules that only the raw (pre-expansion) form can express, such
+            // as "this credential must remain an ${env:...} reference".
+            FactoryRegistry::validate_raw_config(&mknod.factory, raw_config.as_bytes()).map_err(
+                |e| {
+                    anyhow!(
+                        "{}[{}]: invalid config for factory '{}': {}",
+                        source_file,
+                        index,
+                        mknod.factory,
+                        e
+                    )
+                },
+            )?;
+
             let expanded = env_substitution::substitute_env_vars(&raw_config)
                 .map_err(|e| anyhow!("{}[{}]: env expansion failed: {}", source_file, index, e))?;
 
@@ -440,6 +454,12 @@ fn parse_remote_kind(doc: &ResourceDoc, source_file: &str, index: usize) -> Resu
 
     let _limits = attachment
         .resolved_limits()
+        .map_err(|e| anyhow!("{}[{}]: {}", source_file, index, e))?;
+
+    // Decision A4: a profile and inline connection fields together have no
+    // unambiguous meaning, so the document is refused rather than given one.
+    attachment
+        .check_storage_profile()
         .map_err(|e| anyhow!("{}[{}]: {}", source_file, index, e))?;
 
     let mode = if is_backup {

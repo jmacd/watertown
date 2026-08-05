@@ -24,6 +24,18 @@ pub async fn mknod_command(
     let config_content = fs::read_to_string(config_path)
         .map_err(|e| anyhow!("Failed to read config file '{}': {}", config_path, e))?;
 
+    // Some factories additionally constrain the *raw* form -- e.g. a storage
+    // profile requires that its credentials still be references, a rule that
+    // is invisible after expansion.  Check it before anything is written: a
+    // literal caught on first use would already be in replicated history.
+    FactoryRegistry::validate_raw_config(factory_type, config_content.as_bytes()).map_err(|e| {
+        anyhow!(
+            "Invalid configuration for factory '{}': {}",
+            factory_type,
+            e
+        )
+    })?;
+
     // Expand env references for validation and initialization only.
     // The raw content (with ${env:...} references) is stored in the
     // pond so that secrets are never persisted.

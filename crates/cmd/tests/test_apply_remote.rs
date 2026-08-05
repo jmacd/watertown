@@ -360,3 +360,152 @@ async fn bidirectional_selects_both_on_a_backup_and_is_refused_on_a_remote() {
         "unexpected error: {err:#}"
     );
 }
+
+// ===========================================================================
+// Storage profiles (docs/storage-profile-design.md)
+// ===========================================================================
+
+/// A profile and an inline connection field together must be refused at apply
+/// time (Decision A4).  Silently preferring one would give an operator a
+/// working pond talking to the wrong storage.
+#[tokio::test]
+async fn a_profile_plus_inline_credentials_is_refused() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let pond = tmp.path().join("pond");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "test-host").await.expect("init");
+
+    let err = apply_yaml(
+        &ctx,
+        tmp.path(),
+        "version: v1\nkind: backup\nmetadata:\n  path: /sys/remotes/origin\nspec:\n  url: s3://bucket\n  storage: /sys/storage/minio\n  endpoint: http://elsewhere:9000\n",
+    )
+    .await
+    .expect_err("conflicting authoring styles must be refused");
+    assert!(
+        format!("{err:#}").contains("endpoint"),
+        "the conflicting field should be named: {err:#}"
+    );
+}
+
+/// A literal credential in a profile must be refused at `pond apply` time
+/// (Decision A1).  A profile node is replicated, and is more inviting to
+/// `pond cat` than an attachment ever was.
+#[tokio::test]
+async fn a_literal_credential_in_a_profile_is_refused() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let pond = tmp.path().join("pond");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "test-host").await.expect("init");
+
+    let err = apply_yaml(
+        &ctx,
+        tmp.path(),
+        "version: v1\nkind: mknod\nmetadata:\n  path: /sys/storage/minio\nspec:\n  factory: storage-minio\n  config:\n    endpoint: http://watershop:9000\n    access_key_id: ${env:S3_ACCESS_KEY}\n    secret_access_key: hunter2\n",
+    )
+    .await
+    .expect_err("a literal secret must be refused");
+    assert!(
+        format!("{err:#}").contains("secret_access_key"),
+        "unexpected error: {err:#}"
+    );
+}
+
+/// A `storage-minio` profile does not serve a `file://` URL, and saying so at
+/// attach time beats an opaque failure on the first push.
+#[tokio::test]
+async fn a_profile_that_does_not_serve_the_url_is_refused_at_attach() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let pond = tmp.path().join("pond");
+    let remote = tmp.path().join("remote");
+    std::fs::create_dir_all(&remote).expect("mkdir remote");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "test-host").await.expect("init");
+
+    let err = apply_yaml(
+        &ctx,
+        tmp.path(),
+        &format!(
+            "version: v1\nkind: mknod\nmetadata:\n  path: /sys/storage/minio\nspec:\n  factory: storage-minio\n  config:\n    endpoint: http://watershop:9000\n    access_key_id: ${{env:PATH}}\n    secret_access_key: ${{env:PATH}}\n---\nversion: v1\nkind: backup\nmetadata:\n  path: /sys/remotes/origin\nspec:\n  url: file://{}\n  storage: /sys/storage/minio\n",
+            remote.display()
+        ),
+    )
+    .await
+    .expect_err("a minio profile must not serve file://");
+    assert!(
+        format!("{err:#}").contains("does not serve"),
+        "unexpected error: {err:#}"
+    );
+}
+
+/// Naming a profile that does not exist must fail loudly rather than fall
+/// back to running without credentials.
+#[tokio::test]
+async fn a_missing_profile_is_refused_at_attach() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let pond = tmp.path().join("pond");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "test-host").await.expect("init");
+
+    let err = apply_yaml(
+        &ctx,
+        tmp.path(),
+        "version: v1\nkind: backup\nmetadata:\n  path: /sys/remotes/origin\nspec:\n  url: s3://bucket\n  storage: /sys/storage/nope\n",
+    )
+    .await
+    .expect_err("a missing profile must be refused");
+    assert!(
+        format!("{err:#}").contains("/sys/storage/nope"),
+        "unexpected error: {err:#}"
+    );
+
+    let mut ship = ctx.open_pond().await.expect("open");
+    assert!(
+        list_remote_names(&mut ship).await.expect("list").is_empty(),
+        "a refused attachment must leave no trace"
+    );
+}
+
+/// Binding reads the *stored* config, where the `${env:...}` references
+/// survive, not the node's rendered content, which is expanded and redacted.
+/// This is what lets one replicated profile document authenticate each replica
+/// as itself (Decision A6).
+#[tokio::test]
+async fn a_profile_binds_from_the_stored_reference_not_the_rendered_view() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let pond = tmp.path().join("pond");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "test-host").await.expect("init");
+
+    apply_yaml(
+        &ctx,
+        tmp.path(),
+        "version: v1\nkind: mknod\nmetadata:\n  path: /sys/storage/minio\nspec:\n  factory: storage-minio\n  config:\n    endpoint: http://watershop:9000\n    access_key_id: ${env:PATH}\n    secret_access_key: ${env:PATH}\n",
+    )
+    .await
+    .expect("apply profile");
+
+    let mut ship = ctx.open_pond().await.expect("open");
+    let pond = ship.as_pond_mut().expect("pond steward");
+    let profile = steward::ResolvedStorage::open(pond, "/sys/storage/minio")
+        .await
+        .expect("read profile back");
+    assert_eq!(profile.kind(), "storage-minio");
+    assert!(profile.describe().contains("watershop:9000"));
+    assert!(profile.serves_scheme("s3://bucket"));
+
+    // The credential reference survived replication as text, and resolves
+    // here rather than having been baked in at apply time (Decision A6).
+    let opts = profile.to_storage_options().expect("resolve");
+    let path = std::env::var("PATH").expect("PATH is set");
+    assert_eq!(
+        opts.get("secret_access_key").map(String::as_str),
+        Some(path.as_str())
+    );
+    assert_eq!(opts.get("allow_http").map(String::as_str), Some("true"));
+}
