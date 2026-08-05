@@ -275,8 +275,50 @@ impl ContentRemote {
         object_store::path::Path::from(format!("_blobs/blob={}", hash.to_hex()))
     }
 
+    /// Every external blob the remote holds, as one listing of the `_blobs/`
+    /// prefix.
+    ///
+    /// This exists because presence is asked about in bulk.  A push must know,
+    /// for each blob its content closure references, whether the remote already
+    /// holds it -- and [`Self::has_blob`] answers that with one `HEAD` per
+    /// blob.  That cost is proportional to the pond's accumulated history
+    /// rather than to the work being done: a pond holding 180 blobs pays 180
+    /// billed requests on every push, including a push that transfers nothing.
+    /// Measured on a staging pond, hourly pushes came to ~4300 requests a day
+    /// purely to re-confirm blobs that had not changed.
+    ///
+    /// One listing answers the same question. `object_store` paginates
+    /// internally at 1000 keys per request, so this is a single request for any
+    /// realistic blob count, and it reads live remote state exactly as the
+    /// per-blob `HEAD`s did -- it is not a cache.
+    pub async fn list_blobs(&self) -> Result<std::collections::HashSet<ObjectHash>> {
+        use futures::StreamExt;
+
+        let prefix = object_store::path::Path::from("_blobs");
+        let mut stream = self.store.object_store().list(Some(&prefix));
+        let mut out = std::collections::HashSet::new();
+        while let Some(meta) = stream.next().await {
+            let meta = meta.map_err(|e| StoreError::Invariant(format!("list blobs: {e}")))?;
+            // Keys are `_blobs/blob=<hex>`; anything else under the prefix is
+            // not ours and is skipped rather than guessed at.
+            let Some(name) = meta.location.filename() else {
+                continue;
+            };
+            let Some(hex) = name.strip_prefix("blob=") else {
+                continue;
+            };
+            if let Ok(hash) = ObjectHash::from_hex(hex) {
+                let _ = out.insert(hash);
+            }
+        }
+        Ok(out)
+    }
+
     /// True if the external blob `hash` is already present in the remote blob
     /// store, so a producer can skip re-uploading it.
+    ///
+    /// Prefer [`Self::list_blobs`] when asking about more than a couple of
+    /// blobs: this is one billed request per call.
     pub async fn has_blob(&self, hash: ObjectHash) -> Result<bool> {
         match self.store.object_store().head(&Self::blob_path(hash)).await {
             Ok(_) => Ok(true),

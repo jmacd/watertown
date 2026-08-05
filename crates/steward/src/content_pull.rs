@@ -168,7 +168,10 @@ async fn descend_from_tip(
     if let Some((_, tip_commit)) = graph.commits.first() {
         let root = tip_commit.root_tree_hash;
         let manifest_hash = tip_commit.node_manifest_hash;
-        fetch_tree(remote, root, &mut graph).await?;
+        // Populated on first use by `fetch_blob`, so a closure with no external
+        // blobs never spends a request asking about them.
+        let mut blob_index: Option<std::collections::HashSet<ObjectHash>> = None;
+        fetch_tree(remote, root, &mut graph, &mut blob_index).await?;
         graph.manifest = fetch_manifest(remote, manifest_hash).await?;
     }
 
@@ -190,6 +193,7 @@ async fn fetch_tree(
     remote: &dyn ContentSource,
     tree_hash: ObjectHash,
     graph: &mut FetchedGraph,
+    blob_index: &mut Option<std::collections::HashSet<ObjectHash>>,
 ) -> Result<(), StewardError> {
     // Iterative worklist to avoid async recursion on the directory tree.
     let mut stack = vec![tree_hash];
@@ -209,7 +213,7 @@ async fn fetch_tree(
             match entry.entry_type {
                 EntryType::DirectoryPhysical => stack.push(entry.child_hash),
                 EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries => {
-                    fetch_series(remote, entry.child_hash, graph).await?;
+                    fetch_series(remote, entry.child_hash, graph, blob_index).await?;
                 }
                 EntryType::FilePhysicalVersion
                 | EntryType::TablePhysicalVersion
@@ -217,7 +221,7 @@ async fn fetch_tree(
                 | EntryType::DirectoryDynamic
                 | EntryType::FileDynamic
                 | EntryType::TableDynamic => {
-                    fetch_blob(remote, entry.child_hash, graph).await?;
+                    fetch_blob(remote, entry.child_hash, graph, blob_index).await?;
                 }
             }
         }
@@ -230,6 +234,7 @@ async fn fetch_series(
     remote: &dyn ContentSource,
     series_hash: ObjectHash,
     graph: &mut FetchedGraph,
+    blob_index: &mut Option<std::collections::HashSet<ObjectHash>>,
 ) -> Result<(), StewardError> {
     if graph.objects.contains_key(&series_hash) {
         return Ok(());
@@ -242,7 +247,7 @@ async fn fetch_series(
         .insert(series_hash, FetchedObject::Series(versions.clone()));
     let _ = graph.bytes.insert(series_hash, bytes);
     for version in versions {
-        fetch_blob(remote, version, graph).await?;
+        fetch_blob(remote, version, graph, blob_index).await?;
     }
     Ok(())
 }
@@ -256,6 +261,7 @@ async fn fetch_blob(
     remote: &dyn ContentSource,
     hash: ObjectHash,
     graph: &mut FetchedGraph,
+    blob_index: &mut Option<std::collections::HashSet<ObjectHash>>,
 ) -> Result<(), StewardError> {
     if graph.objects.contains_key(&hash) {
         return Ok(());
@@ -275,11 +281,21 @@ async fn fetch_blob(
     // Not an inline row: it must be a large external blob in the remote blob
     // store.  Confirm its presence now so a missing object still fails the fetch
     // early, but do not download it -- its bytes stream at rebuild time.
-    if !remote
-        .has_blob(hash)
-        .await
-        .map_err(|e| StewardError::Content(e.to_string()))?
-    {
+    //
+    // Presence comes from a single listing taken on first use, not a probe per
+    // blob: probing costs a request for every blob in the closure, which is a
+    // cost proportional to the pond's history rather than to what the pull
+    // actually transfers.
+    let index = match blob_index {
+        Some(index) => index,
+        none => none.insert(
+            remote
+                .list_blobs()
+                .await
+                .map_err(|e| StewardError::Content(e.to_string()))?,
+        ),
+    };
+    if !index.contains(&hash) {
         return Err(StewardError::Content(format!(
             "object {} is absent from the remote (inline and blob store)",
             hash.to_hex()

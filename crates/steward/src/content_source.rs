@@ -47,7 +47,19 @@ pub trait ContentSource: Send + Sync {
     async fn get_object(&self, hash: ObjectHash) -> Result<Option<Vec<u8>>, StewardError>;
 
     /// True if the source holds the external blob with `hash`.
+    ///
+    /// Prefer [`Self::list_blobs`] when asking about more than a couple of
+    /// blobs: against a remote store this is one billed request per call.
     async fn has_blob(&self, hash: ObjectHash) -> Result<bool, StewardError>;
+
+    /// Every external blob the source holds, as one listing.
+    ///
+    /// Presence is asked about in bulk -- once per blob in a content closure --
+    /// and answering it per blob costs a request proportional to the pond's
+    /// accumulated history rather than to the work being done.  One listing
+    /// answers the whole question, and reads live state exactly as the
+    /// per-blob probes did.
+    async fn list_blobs(&self) -> Result<std::collections::HashSet<ObjectHash>, StewardError>;
 
     /// A bounded streaming reader over the external blob with `hash`, or `None`
     /// if the source does not hold it.
@@ -83,6 +95,12 @@ impl ContentSource for ContentRemote {
 
     async fn has_blob(&self, hash: ObjectHash) -> Result<bool, StewardError> {
         ContentRemote::has_blob(self, hash)
+            .await
+            .map_err(|e| StewardError::Content(e.to_string()))
+    }
+
+    async fn list_blobs(&self) -> Result<std::collections::HashSet<ObjectHash>, StewardError> {
+        ContentRemote::list_blobs(self)
             .await
             .map_err(|e| StewardError::Content(e.to_string()))
     }
@@ -218,6 +236,11 @@ impl ContentSource for LocalPondSource {
 
     async fn has_blob(&self, hash: ObjectHash) -> Result<bool, StewardError> {
         Ok(self.external_blobs.contains(&hash))
+    }
+
+    async fn list_blobs(&self) -> Result<std::collections::HashSet<ObjectHash>, StewardError> {
+        // Already resolved in memory when the producer clone was opened.
+        Ok(self.external_blobs.iter().copied().collect())
     }
 
     async fn get_blob_reader(&self, hash: ObjectHash) -> Result<Option<BlobReader>, StewardError> {

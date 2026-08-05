@@ -151,14 +151,29 @@ pub async fn push_content_to_remote_limited(
     // streamed local->remote into the remote's content-addressed blob store,
     // keyed by its content hash, never loading the whole blob into memory.  Skip
     // blobs the remote already holds so re-pushes stay cheap.
-    for hash in &materialized.external_blobs {
+    // Ask which blobs the remote already holds ONCE, as a listing, rather than
+    // with a HEAD per blob.  Per-blob probing costs a billed request for every
+    // blob in the pond's accumulated history on every push, including pushes
+    // that upload nothing -- measured at ~180 requests per push on a staging
+    // pond, or ~4300 a day at an hourly cadence, to re-confirm blobs that had
+    // not changed.  That is a cost proportional to history rather than to work,
+    // and it is exactly the kind of quiet spending the budgets exist to catch.
+    // (It was in fact the budget that caught it.)
+    let present_blobs = if materialized.external_blobs.is_empty() {
+        // Nothing to ask about, so do not spend a request asking.
+        std::collections::HashSet::new()
+    } else {
         limits.check(LimitUnit::Ops, 1)?;
-        let present = remote
-            .has_blob(*hash)
+        let listed = remote
+            .list_blobs()
             .await
             .map_err(|e| StewardError::Content(e.to_string()))?;
         limits.record(LimitUnit::Ops, 1);
-        if present {
+        listed
+    };
+
+    for hash in &materialized.external_blobs {
+        if present_blobs.contains(hash) {
             continue;
         }
         // Opening the reader is local and free, and it yields the exact number

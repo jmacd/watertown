@@ -1014,6 +1014,52 @@ that forgets failed attempts is one a retry loop can spend without bound.
 
 ---
 
+## 8c. The first thing the budget caught was not a runaway (Decision L15)
+
+The budgets went out to watershop staging expecting to sit idle -- they were set
+generously, to observe rather than to bite. The first push after the deploy was
+refused:
+
+```
+rate limit /sys/limits/backup-ops exceeded: 200/200 ops used in the last 8640s
+```
+
+That is the `burst` constraint, not the daily one: with `limit: 2000/day` and
+`burst: 200`, the burst window is `200/2000 x 86400 = 8640s`, exactly as
+reported. The instructive part is what it had spent 200 operations *on*. The
+pond held 180 external blobs, and `push_content_to_remote` confirmed each one's
+presence with its own `has_blob` HEAD request before deciding it had nothing to
+upload. The push transferred **86.5 KiB and spent 200 requests doing it**, and
+would have spent the same 200 again an hour later having changed nothing.
+
+The shape of the cost is the real problem. It was proportional to the pond's
+accumulated *history* rather than to the work in front of it, so it grew forever
+and was worst precisely on the quiet ponds that transfer nothing. At the hourly
+timer cadence that is ~4300 billed requests a day against a 2000/day budget, for
+no data movement at all. Nothing was broken; nothing looked wrong in any log;
+the only symptom was a bill.
+
+The fix is that all blob keys share the `_blobs/` prefix, so one listing answers
+the same question the 180 probes answered. `ContentRemote::list_blobs` returns
+the set once; presence is then an in-memory lookup. `object_store` paginates
+internally at 1000 keys, so 180 blobs cost one request. The same probe-per-blob
+loop existed on the pull side in `fetch_blob`, where the listing is taken
+lazily, so a closure with no external blobs still spends nothing asking about
+them.
+
+Two things worth keeping:
+
+- **This is not caching.** The listing reads live remote state in the same
+  round-trip the HEADs would have; it is not a local record of what we believe
+  the remote holds. A budget must never be satisfied by a stale belief.
+- **A budget is a measurement instrument before it is a control.** We installed
+  these limits to stop a runaway, and their first real catch was an inefficiency
+  that had been quietly running the whole time. That is an argument for setting
+  limits early and generously rather than waiting until they can be tuned
+  precisely: an unenforced number nobody is measuring against teaches nothing.
+
+---
+
 ## 9. Summary of decisions
 
 | ID | Decision |
@@ -1033,3 +1079,4 @@ that forgets failed attempts is one a retry loop can spend without bound.
 | L12 | Spending is *also* emitted into the pond as a durable metric series at `/sys/limits/usage`, flushed at the start of the next write transaction. |
 | L13 | `POND_IGNORE_LIMITS` suspends enforcement (not binding) for a seeding import; it logs loudly and discards rather than records what it spent, so an exceptional transfer cannot exhaust the window that governs ordinary traffic. |
 | L14 | Pulls are governed by decorating `ContentSource` (`GovernedSource`), so every ingress path is charged at the remote boundary; a pull refuses to *begin* a transfer on a spent budget rather than checking an unknowable size in advance. |
+| L15 | Remote blob presence is answered by one listing of the `_blobs/` prefix, not a probe per blob: probing costs a billed request for every blob in the pond's history on every push or pull, including ones that transfer nothing. |
