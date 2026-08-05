@@ -43,6 +43,7 @@
 //!   region: "${env:S3_REGION}"
 //! ```
 
+use crate::commands::remote::{RemoteMode, attach_remote};
 use crate::common::ShipContext;
 use anyhow::{Result, anyhow};
 use provider::FactoryRegistry;
@@ -88,6 +89,13 @@ struct MknodSpec {
     config: serde_yaml::Value,
 }
 
+/// Control fields for `kind: remote` / `kind: backup`, stripped from the spec
+/// before the remainder is read as a [`RemoteAttachment`].
+///
+/// These describe *how to attach*, not *what to attach to*, which is why they
+/// are not part of the replicated attachment document.
+const REMOTE_CONTROL_KEYS: [&str; 3] = ["mount", "bidirectional", "overwrite"];
+
 /// Spec for `kind: copy`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -117,6 +125,17 @@ enum ApplyKind {
         raw_config: String,
         /// Expanded config YAML (for validation and initialization)
         expanded_config: String,
+    },
+    /// Attach a remote (`kind: remote`, pull) or a backup (`kind: backup`,
+    /// push/both).  Applied outside the main transaction because attaching
+    /// performs live remote validation and runs its own write.
+    Remote {
+        name: String,
+        attachment: steward::RemoteAttachment,
+        mode: RemoteMode,
+        /// Mount path, pull-mode only.
+        mount: Option<String>,
+        overwrite: bool,
     },
 }
 
@@ -275,6 +294,20 @@ fn parse_kind(doc: &ResourceDoc, source_file: &str, index: usize) -> Result<Appl
                 )
             })?;
 
+            // Rules that only the raw (pre-expansion) form can express, such
+            // as "this credential must remain an ${env:...} reference".
+            FactoryRegistry::validate_raw_config(&mknod.factory, raw_config.as_bytes()).map_err(
+                |e| {
+                    anyhow!(
+                        "{}[{}]: invalid config for factory '{}': {}",
+                        source_file,
+                        index,
+                        mknod.factory,
+                        e
+                    )
+                },
+            )?;
+
             let expanded = env_substitution::substitute_env_vars(&raw_config)
                 .map_err(|e| anyhow!("{}[{}]: env expansion failed: {}", source_file, index, e))?;
 
@@ -296,13 +329,191 @@ fn parse_kind(doc: &ResourceDoc, source_file: &str, index: usize) -> Result<Appl
                 expanded_config: expanded,
             })
         }
+        "remote" | "backup" => parse_remote_kind(doc, source_file, index),
         other => Err(anyhow!(
-            "{}[{}]: unknown kind '{}', expected 'mkdir', 'copy', or 'mknod'",
+            "{}[{}]: unknown kind '{}', expected 'mkdir', 'copy', 'mknod', \
+             'remote', or 'backup'",
             source_file,
             index,
             other
         )),
     }
+}
+
+/// Parse `kind: remote` (pull) or `kind: backup` (push/both).
+///
+/// The spec is the attachment document itself plus a few attach-time control
+/// fields.  Those control fields are removed first and the remainder is read
+/// as a [`steward::RemoteAttachment`], which is `deny_unknown_fields` -- so a
+/// typo in a credential field is an error here rather than a silently dropped
+/// setting, and the apply schema cannot drift from the attachment schema
+/// because there is only one schema.
+fn parse_remote_kind(doc: &ResourceDoc, source_file: &str, index: usize) -> Result<ApplyKind> {
+    let is_backup = doc.kind == "backup";
+
+    // The resource *is* the pond path the attachment lives at, so the name is
+    // read from it rather than duplicated in the spec.  This also makes the
+    // duplicate-path check cover remotes for free.
+    let name = doc
+        .metadata
+        .path
+        .strip_prefix(&format!("{}/", steward::SYS_REMOTES_DIR))
+        .filter(|n| !n.is_empty() && !n.contains('/'))
+        .ok_or_else(|| {
+            anyhow!(
+                "{}[{}]: kind '{}' requires metadata.path of the form '{}/<name>', got '{}'",
+                source_file,
+                index,
+                doc.kind,
+                steward::SYS_REMOTES_DIR,
+                doc.metadata.path
+            )
+        })?
+        .to_string();
+
+    let spec_value = doc.spec.as_ref().ok_or_else(|| {
+        anyhow!(
+            "{}[{}]: kind '{}' requires a spec with 'url'",
+            source_file,
+            index,
+            doc.kind
+        )
+    })?;
+
+    let serde_yaml::Value::Mapping(mut mapping) = spec_value.clone() else {
+        return Err(anyhow!(
+            "{}[{}]: kind '{}' spec must be a mapping",
+            source_file,
+            index,
+            doc.kind
+        ));
+    };
+
+    let mut control: std::collections::HashMap<&str, serde_yaml::Value> =
+        std::collections::HashMap::new();
+    for key in REMOTE_CONTROL_KEYS {
+        if let Some(v) = mapping.remove(serde_yaml::Value::String(key.to_string())) {
+            let _ = control.insert(key, v);
+        }
+    }
+
+    let as_bool = |key: &str| -> Result<bool> {
+        match control.get(key) {
+            None => Ok(false),
+            Some(serde_yaml::Value::Bool(b)) => Ok(*b),
+            Some(other) => Err(anyhow!(
+                "{}[{}]: '{}' must be true or false, got {:?}",
+                source_file,
+                index,
+                key,
+                other
+            )),
+        }
+    };
+    let bidirectional = as_bool("bidirectional")?;
+    let overwrite = as_bool("overwrite")?;
+
+    let mount = match control.get("mount") {
+        None => None,
+        Some(serde_yaml::Value::String(p)) => Some(p.clone()),
+        Some(other) => {
+            return Err(anyhow!(
+                "{}[{}]: 'mount' must be a string path, got {:?}",
+                source_file,
+                index,
+                other
+            ));
+        }
+    };
+
+    let mut attachment: steward::RemoteAttachment =
+        serde_yaml::from_value(serde_yaml::Value::Mapping(mapping)).map_err(|e| {
+            anyhow!(
+                "{}[{}]: invalid {} spec: {}",
+                source_file,
+                index,
+                doc.kind,
+                e
+            )
+        })?;
+
+    // Expand `${env:...}` in the URL only.  The URL is needed *here*, at
+    // attach time, to open and validate the remote.  Every other field is
+    // deliberately left as written: `to_storage_options` resolves references
+    // per-replica at use time, so storing the reference rather than the value
+    // keeps credentials out of the replicated attachment document -- the same
+    // discipline D6 enforces for `secret_access_key`, applied to all of them.
+    attachment.url = env_substitution::substitute_env_vars(&attachment.url).map_err(|e| {
+        anyhow!(
+            "{}[{}]: env expansion failed for url: {}",
+            source_file,
+            index,
+            e
+        )
+    })?;
+
+    let _limits = attachment
+        .resolved_limits()
+        .map_err(|e| anyhow!("{}[{}]: {}", source_file, index, e))?;
+
+    // Decision A4: a profile and inline connection fields together have no
+    // unambiguous meaning, so the document is refused rather than given one.
+    attachment
+        .check_storage_profile()
+        .map_err(|e| anyhow!("{}[{}]: {}", source_file, index, e))?;
+
+    let mode = if is_backup {
+        if mount.is_some() {
+            return Err(anyhow!(
+                "{}[{}]: 'mount' is not valid for kind 'backup': a backup mirrors the \
+                 whole pond, so the local pond IS the source",
+                source_file,
+                index
+            ));
+        }
+        if bidirectional {
+            RemoteMode::Both
+        } else {
+            RemoteMode::Push
+        }
+    } else {
+        if bidirectional {
+            return Err(anyhow!(
+                "{}[{}]: 'bidirectional' is not valid for kind 'remote': remotes are \
+                 always pull-mode. Use kind 'backup' with bidirectional: true.",
+                source_file,
+                index
+            ));
+        }
+        RemoteMode::Pull
+    };
+
+    if mode == RemoteMode::Pull {
+        let mount_path = mount.as_deref().ok_or_else(|| {
+            anyhow!(
+                "{}[{}]: kind 'remote' requires 'mount' ('/' for a mirror restart, \
+                 '/imports/<name>' for a cross-pond import)",
+                source_file,
+                index
+            )
+        })?;
+        if !mount_path.starts_with('/') {
+            return Err(anyhow!(
+                "{}[{}]: 'mount' must be absolute, got '{}'",
+                source_file,
+                index,
+                mount_path
+            ));
+        }
+    }
+
+    Ok(ApplyKind::Remote {
+        name,
+        attachment,
+        mode,
+        mount,
+        overwrite,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -347,12 +558,16 @@ pub async fn apply_command(ship_context: &ShipContext, files: &[String]) -> Resu
         }
     }
 
-    // Sort: mkdir first, then copy, then mknod; within each group by path depth
+    // Sort: mkdir first, then copy, then mknod, then remotes; within each
+    // group by path depth.  Remotes come last because an attachment may name
+    // limiter nodes created by a `mknod` in the same apply, and attaching
+    // validates those names -- so the nodes must be committed first.
     specs.sort_by(|a, b| {
         let order = |k: &ApplyKind| match k {
             ApplyKind::Mkdir => 0,
             ApplyKind::Copy(_) => 1,
             ApplyKind::Mknod { .. } => 2,
+            ApplyKind::Remote { .. } => 3,
         };
         order(&a.kind)
             .cmp(&order(&b.kind))
@@ -364,6 +579,13 @@ pub async fn apply_command(ship_context: &ShipContext, files: &[String]) -> Resu
             })
             .then(a.path.cmp(&b.path))
     });
+
+    // Remotes are applied after -- and outside -- the main transaction:
+    // attaching opens the remote to validate its store_id and runs its own
+    // write, so it cannot be folded into a transaction that is still open.
+    let (remote_specs, specs): (Vec<ApplySpec>, Vec<ApplySpec>) = specs
+        .into_iter()
+        .partition(|s| matches!(s.kind, ApplyKind::Remote { .. }));
 
     // Phase 2: Open transaction and apply
     let mut ship = ship_context.open_pond().await?;
@@ -441,6 +663,47 @@ pub async fn apply_command(ship_context: &ShipContext, files: &[String]) -> Resu
             "apply: all {} resource(s) unchanged, no transaction committed",
             unchanged
         );
+        drop(tx);
+    }
+
+    // Phase 3: attach remotes.  `attach_remote` is the single writer of
+    // /sys/remotes/<name> (Decision L11), so `pond apply` gets exactly the
+    // same secret discipline, mount-conflict checks, and live remote
+    // initialization as `pond backup add`.
+    //
+    // `ship` is dropped first: attaching opens the pond itself, and the pond
+    // lock is not reentrant.
+    drop(ship);
+    for spec in &remote_specs {
+        let ApplyKind::Remote {
+            name,
+            attachment,
+            mode,
+            mount,
+            overwrite,
+        } = &spec.kind
+        else {
+            continue;
+        };
+        attach_remote(
+            ship_context,
+            name,
+            attachment.clone(),
+            *mode,
+            mount.as_deref(),
+            *overwrite,
+        )
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "{}: attach {} `{}`: {}",
+                spec.source_file,
+                mode.as_str(),
+                name,
+                e
+            )
+        })?;
+        log::info!("  attached  {}", spec.path);
     }
 
     Ok(())
@@ -465,6 +728,8 @@ async fn apply_one(
             })?;
             apply_copy(fs, &spec.path, config, host_tx).await
         }
+        // Attached after the transaction closes; see `apply_command` phase 3.
+        ApplyKind::Remote { .. } => Ok(ApplyResult::Unchanged),
         ApplyKind::Mknod {
             factory_type,
             raw_config,

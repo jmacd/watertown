@@ -18,10 +18,12 @@
 //! sends it as a blob object keyed by its content hash, so the closure is
 //! complete.
 
+use provider::factory::rate_limit::LimitUnit;
 use sync_store::ContentRemote;
 use sync_store::content::ObjectHash;
 
 use crate::content_tree::materialize_content_objects;
+use crate::limiter::LimiterSet;
 use crate::{Ship, StewardError};
 
 /// The result of a successful content-graph push.
@@ -63,6 +65,42 @@ pub async fn push_content_to_remote(
     ship: &Ship,
     remote: &mut ContentRemote,
     ref_name: &str,
+) -> Result<ContentPushOutcome, StewardError> {
+    let mut unlimited = LimiterSet::unlimited();
+    push_content_to_remote_limited(ship, remote, ref_name, &mut unlimited).await
+}
+
+/// [`push_content_to_remote`], governed by `limits`.
+///
+/// Every remote interaction is charged before it happens and recorded after it
+/// succeeds, so a push that fails costs nothing and a push is never started
+/// that the budget cannot cover.  Two dimensions are spent:
+///
+/// - [`LimitUnit::Ops`] -- one per remote request: each `has_blob` probe, each
+///   `put_blob`, and the final batched `push_commit`.
+/// - [`LimitUnit::Bytes`] -- the blob bytes streamed to the remote, plus the
+///   inline object bytes in the commit batch.
+///
+/// `limits` is bound by the caller (see [`LimiterSet::open`]) because binding
+/// needs mutable pond access while the push itself does not; charging is pure,
+/// so the borrow ends before this call.  The caller is also responsible for
+/// [`LimiterSet::commit`] afterwards -- this function never writes the control
+/// table, so a failed push leaves no partial accounting beyond what was
+/// actually spent.
+///
+/// # Errors
+///
+/// In addition to [`push_content_to_remote`]'s errors, returns
+/// [`StewardError::RateLimited`] when a budget is exhausted.  The pond's data
+/// commit has already happened and is durable; a push is a mirror operation
+/// that is safe to retry, and because the closure is recomputed each push and
+/// `has_blob` skips what the remote already holds, a retry resumes rather than
+/// restarts (Decision L8).
+pub async fn push_content_to_remote_limited(
+    ship: &Ship,
+    remote: &mut ContentRemote,
+    ref_name: &str,
+    limits: &mut LimiterSet,
 ) -> Result<ContentPushOutcome, StewardError> {
     let seq = ship
         .control_table()
@@ -114,22 +152,34 @@ pub async fn push_content_to_remote(
     // keyed by its content hash, never loading the whole blob into memory.  Skip
     // blobs the remote already holds so re-pushes stay cheap.
     for hash in &materialized.external_blobs {
-        if remote
+        limits.check(LimitUnit::Ops, 1)?;
+        let present = remote
             .has_blob(*hash)
             .await
-            .map_err(|e| StewardError::Content(e.to_string()))?
-        {
+            .map_err(|e| StewardError::Content(e.to_string()))?;
+        limits.record(LimitUnit::Ops, 1);
+        if present {
             continue;
         }
+        // Opening the reader is local and free, and it yields the exact number
+        // of raw content bytes that `put_blob` will stream (the parquet
+        // wrapper is not sent).  Charging that figure means the budget is
+        // spent in the same units the remote bills in, with no extra stat and
+        // no remote round-trip to learn the size.
         let reader = ship
             .data_persistence()
             .open_large_file_reader_by_hash(&hash.to_hex())
             .await
             .map_err(|e| StewardError::Content(format!("open external blob: {e}")))?;
+        let size = reader.total_size();
+        limits.check(LimitUnit::Bytes, size)?;
+        limits.check(LimitUnit::Ops, 1)?;
         remote
             .put_blob(*hash, reader)
             .await
             .map_err(|e| StewardError::Content(format!("stream external blob: {e}")))?;
+        limits.record(LimitUnit::Bytes, size);
+        limits.record(LimitUnit::Ops, 1);
     }
     // The node manifest the commit references (Section 4.5); a consumer fetches
     // it to adopt the source's node_ids.  Verify it hashes to the commit's
@@ -150,10 +200,16 @@ pub async fn push_content_to_remote(
     objects.push((manifest_hash, manifest_bytes));
     objects.push((tip, commit_bytes));
 
+    // The batched commit is one remote request carrying every inline object.
+    let inline_bytes: u64 = objects.iter().map(|(_, b)| b.len() as u64).sum();
+    limits.check(LimitUnit::Bytes, inline_bytes)?;
+    limits.check(LimitUnit::Ops, 1)?;
     let remote_txn_seq = remote
         .push_commit(&objects, ref_name, tip)
         .await
         .map_err(|e| StewardError::Content(e.to_string()))?;
+    limits.record(LimitUnit::Bytes, inline_bytes);
+    limits.record(LimitUnit::Ops, 1);
 
     Ok(ContentPushOutcome {
         ref_name: ref_name.to_string(),

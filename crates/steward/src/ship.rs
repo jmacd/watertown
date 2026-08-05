@@ -641,16 +641,41 @@ impl Ship {
                 .map_err(StewardError::DataInit)?
         };
 
+        // Limiter usage queued by an earlier push rides out on this write
+        // (Decision L12).  Spending happens during the post-commit push, which
+        // cannot write the pond without recursing, so the samples wait in the
+        // control table for a write that was going to happen anyway.  Read
+        // transactions carry nothing.
+        let pending_usage = if is_write {
+            crate::limiter_usage::read_pending(&self.control_table).await
+        } else {
+            Vec::new()
+        };
+
         // Create steward transaction guard with sequence tracking
         // Pass pond_path so guard can reload OpLogPersistence for post-commit
-        Ok(StewardTransactionGuard::new(
+        let guard = StewardTransactionGuard::new(
             data_tx,
             &txn_meta,
             transaction_type,
             &mut self.control_table,
             &self.pond_path,
             write_lock,
-        ))
+        );
+
+        if !pending_usage.is_empty() {
+            // The rows go through this transaction, so they are durable only
+            // if it commits -- which is also when the queue is drained.  A
+            // failure here is logged and dropped: refusing a user's write
+            // because a metric could not be recorded would trade a monitoring
+            // gap for an outage.
+            match crate::limiter_usage::emit(&guard, &pending_usage).await {
+                Ok(()) => guard.note_emitted_usage(pending_usage.len()),
+                Err(e) => log::warn!("limiter usage: failed to emit into the pond: {e}"),
+            }
+        }
+
+        Ok(guard)
     }
 
     /// Replay a transaction from backup with a specific sequence number

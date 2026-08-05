@@ -12,6 +12,7 @@ use crate::commands::remote::{
 };
 use crate::common::ShipContext;
 use anyhow::{Result, anyhow};
+use std::collections::HashMap;
 use steward::{REMOTE_MOUNT_PATH_PREFIX, StewardError};
 use uuid::Uuid;
 
@@ -41,18 +42,23 @@ pub async fn pull_command(ship_context: &ShipContext, name: Option<String>) -> R
         return Ok(());
     }
 
-    let mut had_error = false;
+    // Carry the causes, not just the count -- the same reason `pond push`
+    // does.  Now that ingress is governed, a pull can fail for a reason the
+    // operator is expected to act on (an exhausted budget, with a retry time),
+    // and burying that in the log while returning "one or more pulls failed"
+    // makes a routine throttle look like an outage.
+    let mut failures: Vec<String> = Vec::new();
     for name in targets {
         if let Err(e) = pull_one(&mut ship, &name).await {
             log::error!("[ERR] pull {}: {}", name, e);
-            had_error = true;
+            failures.push(format!("{}: {}", name, e));
         }
     }
 
-    if had_error {
-        Err(anyhow!("one or more pulls failed"))
-    } else {
+    if failures.is_empty() {
         Ok(())
+    } else {
+        Err(anyhow!("pull failed -- {}", failures.join("; ")))
     }
 }
 
@@ -88,8 +94,11 @@ async fn already_at_tip(
 /// resolves to a producer pond clone on local disk
 /// ([`steward::LocalPondSource`]) for the local develop-and-preview workflow;
 /// any other URL (`s3://`, `file://`) opens a content-addressed remote store.
+/// `storage_options` is resolved by the caller (Decision A5), since reading a
+/// storage profile needs the pond and this function must not.
 async fn open_content_source(
     attachment: &steward::RemoteAttachment,
+    storage_options: HashMap<String, String>,
 ) -> Result<Box<dyn steward::ContentSource>> {
     if let Some(path) = attachment.url.strip_prefix("pond://") {
         let source = steward::LocalPondSource::open(path)
@@ -97,7 +106,6 @@ async fn open_content_source(
             .map_err(|e| anyhow!("open local pond source at `{}`: {}", path, e))?;
         Ok(Box::new(source))
     } else {
-        let storage_options = attachment.to_storage_options()?;
         let remote = sync_store::ContentRemote::open_at_url(&attachment.url, storage_options)
             .await
             .map_err(|e| anyhow!("open content remote at `{}`: {}", attachment.url, e))?;
@@ -108,9 +116,25 @@ async fn open_content_source(
 async fn pull_one(ship: &mut steward::Steward, name: &str) -> Result<()> {
     let attachment = load_remote_attachment(ship, name).await?;
 
-    if attachment.url.starts_with("s3://") {
-        sync_store::register_s3_handlers();
-    }
+    // One dispatch, from the profile when there is one (Decision A8).  A
+    // `pond://` source uses no storage options at all, but resolving here
+    // keeps the rule in one place.
+    let storage_options = {
+        let pond = ship
+            .as_pond_mut()
+            .ok_or_else(|| anyhow!("pull requires a pond steward (not a host steward)"))?;
+        steward::storage_profile::prepare_storage(pond, &attachment).await?
+    };
+
+    // Bind the limiters before touching the network, so a missing node or a
+    // wrong unit fails for free rather than halfway through a transfer.
+    let limit_spec = attachment.resolved_limits()?;
+    let ship_mut = ship
+        .as_pond_mut()
+        .ok_or_else(|| anyhow!("pull requires a pond steward (not a host steward)"))?;
+    let limits = steward::LimiterSet::open(ship_mut, &limit_spec)
+        .await
+        .map_err(|e| anyhow!("bind limiters for remote `{}`: {}", name, e))?;
 
     let ship_pre = ship
         .as_pond()
@@ -122,19 +146,52 @@ async fn pull_one(ship: &mut steward::Steward, name: &str) -> Result<()> {
         .map_err(|e| anyhow!("read mount_path for `{}`: {}", name, e))?
         .filter(|s| !s.is_empty() && s != "/");
 
+    // Open once, here, so both modes below share one source -- and one
+    // governed wrapper.  Every remote read either mode performs goes through
+    // it, which is what makes ingress governed by construction rather than by
+    // remembering to charge at each call site.
+    let source = open_content_source(&attachment, storage_options)
+        .await
+        .map_err(|e| anyhow!("open remote `{}` ({}): {}", name, attachment.url, e))?;
+    let governed = steward::GovernedSource::new(source.as_ref(), limits);
+
     // Mirror restart / backup restore (root or no mount): pull the full
     // content graph and rebuild the local pond by node_id.  Cross-pond import
     // (non-root mount): fetch the foreign content graph and rebuild it under
     // the foreign pond_id, then mount it.
-    if mount_path.is_none() {
-        return pull_mirror(ship, name, &attachment).await;
+    let result = match mount_path {
+        None => pull_mirror(ship, name, &attachment, &governed).await,
+        Some(mount_path) => pull_import(ship, name, &attachment, &governed, &mount_path).await,
+    };
+
+    // Persist the windows whether or not the pull succeeded, for the same
+    // reason a push does: a pull that failed partway still transferred what it
+    // transferred, and a budget that forgets the spending of failed attempts is
+    // a budget a retry loop can spend without bound.
+    let mut limits = governed.into_limits();
+    let ship_mut = ship
+        .as_pond_mut()
+        .ok_or_else(|| anyhow!("pull requires a pond steward (not a host steward)"))?;
+    if let Err(e) = limits.commit(ship_mut.control_table_mut()).await {
+        log::warn!(
+            "[WARN] pull {}: failed to record limiter usage: {}",
+            name,
+            e
+        );
     }
 
-    let source = open_content_source(&attachment)
-        .await
-        .map_err(|e| anyhow!("open remote `{}` ({}): {}", name, attachment.url, e))?;
-    let remote: &dyn steward::ContentSource = source.as_ref();
+    result
+}
 
+/// Cross-pond import: fetch the foreign content graph, rebuild it under the
+/// foreign pond_id, and mount it at `mount_path` (guaranteed non-root).
+async fn pull_import(
+    ship: &mut steward::Steward,
+    name: &str,
+    attachment: &steward::RemoteAttachment,
+    remote: &dyn steward::ContentSource,
+    mount_path: &str,
+) -> Result<()> {
     let ship_ref = ship
         .as_pond_mut()
         .ok_or_else(|| anyhow!("pull requires a pond steward (not a host steward)"))?;
@@ -142,8 +199,6 @@ async fn pull_one(ship: &mut steward::Steward, name: &str) -> Result<()> {
     let local_pond_id = ship_ref.control_table().pond_id_uuid();
     let foreign_pond_id = remote.pond_id();
 
-    // This is the import path: mount_path is guaranteed non-root here.
-    let mount_path = mount_path.expect("import path requires a non-root mount_path");
     if foreign_pond_id == local_pond_id {
         return Err(anyhow!(
             "remote `{}` has mount_path `{}` but its store_id matches this pond's \
@@ -195,7 +250,7 @@ async fn pull_one(ship: &mut steward::Steward, name: &str) -> Result<()> {
     materialize_mount(
         ship_ref,
         name,
-        &mount_path,
+        mount_path,
         foreign_pond_id,
         &pinned_tip.to_hex(),
     )
@@ -222,12 +277,8 @@ async fn pull_mirror(
     ship: &mut steward::Steward,
     name: &str,
     attachment: &steward::RemoteAttachment,
+    remote: &dyn steward::ContentSource,
 ) -> Result<()> {
-    let source = open_content_source(attachment)
-        .await
-        .map_err(|e| anyhow!("open remote `{}` ({}): {}", name, attachment.url, e))?;
-    let remote: &dyn steward::ContentSource = source.as_ref();
-
     let ship_ref = ship
         .as_pond_mut()
         .ok_or_else(|| anyhow!("pull requires a pond steward (not a host steward)"))?;

@@ -153,8 +153,23 @@ pub struct DynamicFactory {
         ) -> Pin<Box<dyn Future<Output = TinyFSResult<FileHandle>> + Send>>,
     >,
 
-    /// Validate and process configuration (all factories must provide this)
+    /// Validate and process configuration (all factories must provide this).
+    ///
+    /// Receives the **env-expanded** config, so it can check structure and
+    /// resolved values but can never observe an `${env:...}` reference.
     pub validate_config: fn(config: &[u8]) -> TinyFSResult<Value>,
+
+    /// Validate the **raw** config, as it will be stored in the pond, before
+    /// env expansion (optional).
+    ///
+    /// `mknod` and `pond apply` validate the expanded config but store the raw
+    /// one, so that secrets live in the environment and only references are
+    /// persisted.  That split leaves one rule unexpressible in
+    /// [`Self::validate_config`]: "this field must *remain* a reference".  A
+    /// factory holding credentials (`storage-*`) needs it enforced at creation
+    /// time -- catching it on first use is too late, because the plaintext is
+    /// by then already in replicated, append-only history.
+    pub validate_raw_config: Option<fn(config: &[u8]) -> TinyFSResult<()>>,
 
     /// Try to cast a File to QueryableFile (for SQL-based factories)
     pub try_as_queryable: Option<fn(&dyn File) -> Option<&dyn QueryableFile>>,
@@ -358,6 +373,19 @@ impl FactoryRegistry {
         (factory.validate_config)(config)
     }
 
+    /// Validate the raw, pre-expansion config for factories that constrain it.
+    ///
+    /// A no-op for factories that declare no `validate_raw_config`.
+    pub fn validate_raw_config(factory_name: &str, config: &[u8]) -> TinyFSResult<()> {
+        let factory = Self::get_factory(factory_name)
+            .ok_or_else(|| tinyfs::Error::Other(format!("Unknown factory: {}", factory_name)))?;
+
+        match factory.validate_raw_config {
+            Some(validate) => validate(config),
+            None => Ok(()),
+        }
+    }
+
     /// Determine whether a factory creates directories or files
     pub fn factory_creates_directory(factory_name: &str) -> TinyFSResult<bool> {
         let factory = Self::get_factory(factory_name)
@@ -471,6 +499,39 @@ macro_rules! register_dynamic_factory {
                 create_directory: Some($dir_fn),
                 create_file: None,
                 validate_config: $validate_fn,
+                validate_raw_config: None,
+                try_as_queryable: None,
+                initialize: None,
+                execute: None,
+                apply_table_transform: None,
+            };
+        }
+    };
+
+    (
+        name: $name:expr,
+        description: $description:expr,
+        file: $file_fn:expr,
+        validate: $validate_fn:expr,
+        validate_raw: $validate_raw_fn:expr
+    ) => {
+        paste::paste! {
+            fn [<file_wrapper_ $name:snake>](
+                config: serde_json::Value,
+                context: $crate::FactoryContext,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = tinyfs::Result<tinyfs::FileHandle>> + Send>> {
+                Box::pin(async move { $file_fn(config, context) })
+            }
+
+            #[allow(unsafe_code)]
+            #[linkme::distributed_slice($crate::registry::DYNAMIC_FACTORIES)]
+            static [<FACTORY_ $name:snake:upper>]: $crate::registry::DynamicFactory = $crate::registry::DynamicFactory {
+                name: $name,
+                description: $description,
+                create_directory: None,
+                create_file: Some([<file_wrapper_ $name:snake>]),
+                validate_config: $validate_fn,
+                validate_raw_config: Some($validate_raw_fn),
                 try_as_queryable: None,
                 initialize: None,
                 execute: None,
@@ -501,6 +562,7 @@ macro_rules! register_dynamic_factory {
                 create_directory: None,
                 create_file: Some([<file_wrapper_ $name:snake>]),
                 validate_config: $validate_fn,
+                validate_raw_config: None,
                 try_as_queryable: None,
                 initialize: None,
                 execute: None,
@@ -532,6 +594,7 @@ macro_rules! register_dynamic_factory {
                 create_directory: None,
                 create_file: Some([<file_wrapper_ $name:snake>]),
                 validate_config: $validate_fn,
+                validate_raw_config: None,
                 try_as_queryable: Some($queryable_fn),
                 initialize: None,
                 execute: None,
@@ -579,6 +642,7 @@ macro_rules! register_executable_factory {
                 create_directory: None,
                 create_file: None,
                 validate_config: $validate_fn,
+                validate_raw_config: None,
                 try_as_queryable: None,
                 initialize: Some([<initialize_wrapper_ $name:snake>]),
                 execute: Some([<execute_wrapper_ $name:snake>]),
@@ -615,6 +679,7 @@ macro_rules! register_table_transform_factory {
                 create_directory: None,
                 create_file: None,
                 validate_config: $validate_fn,
+                validate_raw_config: None,
                 try_as_queryable: None,
                 initialize: None,
                 execute: None,

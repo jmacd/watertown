@@ -61,6 +61,11 @@ pub struct StewardTransactionGuard<'a> {
     /// `None` for read transactions (no exclusion needed).
     #[allow(dead_code)]
     write_lock: Option<WriteLockGuard>,
+    /// Number of queued limiter-usage samples written into the pond at the
+    /// start of this transaction (Decision L12).  They are dropped from the
+    /// control queue only once this transaction commits, so an aborted write
+    /// re-emits rather than losing them.
+    emitted_usage: std::sync::atomic::AtomicUsize,
 }
 
 impl<'a> StewardTransactionGuard<'a> {
@@ -82,6 +87,7 @@ impl<'a> StewardTransactionGuard<'a> {
             pond_path: path.as_ref().to_path_buf(),
             committed: false,
             write_lock,
+            emitted_usage: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -287,6 +293,13 @@ impl<'a> StewardTransactionGuard<'a> {
     /// Returns the data-FS Delta version number on a successful write
     /// commit (`Ok(Some(v))`); returns `Ok(None)` for a read transaction
     /// or a write that produced no changes.
+    /// Record that `count` queued usage samples were written into the pond by
+    /// this transaction.
+    pub fn note_emitted_usage(&self, count: usize) {
+        self.emitted_usage
+            .store(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub async fn commit(mut self) -> Result<Option<i64>, StewardError> {
         let args_fmt = format!("{:?}", self.txn_meta.user.args);
         debug!(
@@ -399,6 +412,18 @@ impl<'a> StewardTransactionGuard<'a> {
 
                 // Mark as committed
                 self.committed = true;
+
+                // The usage rows emitted at begin are now durable, so drop
+                // them from the control queue.  This happens before the
+                // post-commit push below, which will queue fresh samples of
+                // its own -- and `drop_emitted` removes a prefix rather than
+                // clearing, so those survive.
+                let emitted = self
+                    .emitted_usage
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if emitted > 0 {
+                    crate::limiter_usage::drop_emitted(self.control_table, emitted).await;
+                }
 
                 // Run post-commit factories for write transactions
                 // This happens AFTER commit but uses a NEW transaction
@@ -1264,16 +1289,19 @@ impl<'a> StewardTransactionGuard<'a> {
 
         for (name, attachment) in to_push {
             info!("post-commit auto-push: {} -> {}", name, attachment.url);
-            if attachment.url.starts_with("s3://") {
-                sync_store::register_s3_handlers();
-            }
-            let storage_options = match attachment.to_storage_options() {
-                Ok(o) => o,
-                Err(e) => {
-                    log::error!("post-commit auto-push: {} bad storage options: {}", name, e);
-                    continue;
-                }
-            };
+            // One dispatch (Decision A8).  Boxed for the same reason the
+            // limiter bind below is: reading a profile opens a read
+            // transaction, and the compiler cannot see that a read
+            // transaction runs no post-commit work, so the cycle it infers
+            // is not a real one.
+            let storage_options =
+                match Box::pin(crate::storage_profile::prepare_storage(ship, &attachment)).await {
+                    Ok(o) => o,
+                    Err(e) => {
+                        log::error!("post-commit auto-push: {} bad storage options: {}", name, e);
+                        continue;
+                    }
+                };
             let mut remote = match sync_store::ContentRemote::open_at_url(
                 &attachment.url,
                 storage_options,
@@ -1286,7 +1314,48 @@ impl<'a> StewardTransactionGuard<'a> {
                     continue;
                 }
             };
-            match crate::push_content_to_remote(ship, &mut remote, "main").await {
+            // Bind before any network work: a limiter that names a missing
+            // node or governs the wrong unit is a misconfiguration, and it
+            // should surface without having spent anything first.
+            let limit_spec = match attachment.resolved_limits() {
+                Ok(v) => v,
+                Err(e) => {
+                    log::error!("post-commit auto-push: {} bad limits: {}", name, e);
+                    continue;
+                }
+            };
+            // Boxed to break an async recursion cycle: this runs from
+            // `commit()`, and binding a limiter opens a read transaction whose
+            // own `commit()` closes the loop.  The recursion is not real --
+            // a read transaction runs no post-commit work -- but the future
+            // type is infinitely sized without an indirection here.
+            let mut limits = match Box::pin(crate::LimiterSet::open(ship, &limit_spec)).await {
+                Ok(l) => l,
+                Err(e) => {
+                    log::error!(
+                        "post-commit auto-push: {} could not bind limiters: {}",
+                        name,
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let pushed =
+                crate::push_content_to_remote_limited(ship, &mut remote, "main", &mut limits).await;
+
+            // Record usage regardless of outcome: a push that failed partway
+            // still spent what it spent, and an unattended retry every commit
+            // would otherwise never be charged for its failures.
+            if let Err(e) = limits.commit(ship.control_table_mut()).await {
+                log::warn!(
+                    "post-commit auto-push: {} failed to record limiter usage: {}",
+                    name,
+                    e
+                );
+            }
+
+            match pushed {
                 Ok(outcome) => {
                     let tip_hex = outcome.tip.to_hex();
                     info!(

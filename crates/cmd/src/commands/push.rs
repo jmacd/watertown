@@ -38,18 +38,22 @@ pub async fn push_command(ship_context: &ShipContext, name: Option<String>) -> R
         return Ok(());
     }
 
-    let mut had_error = false;
+    // Carry the causes, not just the count.  A push can now fail for a
+    // reason the operator is expected to act on -- an exhausted budget, with
+    // a retry time -- and burying that in the log while returning "one or
+    // more pushes failed" makes a routine throttle look like an outage.
+    let mut failures: Vec<String> = Vec::new();
     for name in targets {
         if let Err(e) = push_one(&mut ship, &name).await {
             log::error!("[ERR] push {}: {}", name, e);
-            had_error = true;
+            failures.push(format!("{}: {}", name, e));
         }
     }
 
-    if had_error {
-        Err(anyhow!("one or more pushes failed"))
-    } else {
+    if failures.is_empty() {
         Ok(())
+    } else {
+        Err(anyhow!("push failed -- {}", failures.join("; ")))
     }
 }
 
@@ -58,10 +62,22 @@ pub async fn push_command(ship_context: &ShipContext, name: Option<String>) -> R
 async fn push_one(ship: &mut steward::Steward, name: &str) -> Result<()> {
     let attachment = load_remote_attachment(ship, name).await?;
 
-    if attachment.url.starts_with("s3://") {
-        sync_store::register_s3_handlers();
-    }
-    let storage_options = attachment.to_storage_options()?;
+    // One dispatch, from the profile when there is one and from the URL only
+    // when there is not (Decision A8).
+    let ship_pre = ship
+        .as_pond_mut()
+        .ok_or_else(|| anyhow!("push requires a pond steward (not a host steward)"))?;
+    let storage_options = steward::storage_profile::prepare_storage(ship_pre, &attachment).await?;
+
+    // Bind the limiters before touching the network, so a missing node or a
+    // wrong unit fails for free rather than halfway through a transfer.
+    let limit_spec = attachment.resolved_limits()?;
+    let ship_mut = ship
+        .as_pond_mut()
+        .ok_or_else(|| anyhow!("push requires a pond steward (not a host steward)"))?;
+    let mut limits = steward::LimiterSet::open(ship_mut, &limit_spec)
+        .await
+        .map_err(|e| anyhow!("bind limiters for remote `{}`: {}", name, e))?;
 
     let ship_ref = ship
         .as_pond()
@@ -71,9 +87,25 @@ async fn push_one(ship: &mut steward::Steward, name: &str) -> Result<()> {
         .await
         .map_err(|e| anyhow!("open remote `{}` ({}): {}", name, attachment.url, e))?;
 
-    let outcome = steward::push_content_to_remote(ship_ref, &mut remote, "main")
-        .await
-        .map_err(|e| anyhow!("push {} ({}): {}", name, attachment.url, e))?;
+    let pushed =
+        steward::push_content_to_remote_limited(ship_ref, &mut remote, "main", &mut limits).await;
+
+    // Persist the windows whether or not the push succeeded: a push that
+    // failed partway still transferred what it transferred, and a budget that
+    // forgets the spending of failed attempts is a budget a retry loop can
+    // spend without bound -- the exact failure this exists to prevent.
+    let ship_mut = ship
+        .as_pond_mut()
+        .ok_or_else(|| anyhow!("push requires a pond steward (not a host steward)"))?;
+    if let Err(e) = limits.commit(ship_mut.control_table_mut()).await {
+        log::warn!(
+            "[WARN] push {}: failed to record limiter usage: {}",
+            name,
+            e
+        );
+    }
+
+    let outcome = pushed.map_err(|e| anyhow!("push {} ({}): {}", name, attachment.url, e))?;
 
     let tip_hex = outcome.tip.to_hex();
     log::info!(
