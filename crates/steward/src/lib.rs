@@ -26,6 +26,7 @@ mod graft;
 mod guard;
 mod host;
 mod inner_control;
+pub mod governed_source;
 pub mod limiter;
 pub mod limiter_usage;
 pub mod maintenance;
@@ -45,6 +46,7 @@ pub use content_push::{
     ContentPushOutcome, push_content_to_remote, push_content_to_remote_limited,
 };
 pub use content_source::{BlobReader, ContentSource, LocalPondSource};
+pub use governed_source::GovernedSource;
 pub use content_tree::{
     ContentTreeReport, MaterializedObjects, compute_content_tree, compute_content_tree_for_table,
     materialize_content_objects,

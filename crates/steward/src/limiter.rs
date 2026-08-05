@@ -533,6 +533,15 @@ impl Limiter {
         self.pending.total()
     }
 
+    /// Drop everything charged since opening, without persisting it.
+    ///
+    /// Only an ignored run does this: enforcement was suspended, so this
+    /// spending was never governed and must not be charged to a window that
+    /// governs later, ordinary traffic.
+    pub fn discard_pending(&mut self) {
+        self.pending = Buckets::default();
+    }
+
     /// Current position, for `pond status` (Decision L9).
     #[must_use]
     pub fn state(&self) -> LimiterState {
@@ -634,6 +643,39 @@ pub fn now_micros() -> i64 {
 #[derive(Debug, Default)]
 pub struct LimiterSet {
     bound: Vec<Limiter>,
+    /// Enforcement suspended for this process by [`IGNORE_LIMITS_ENV`].
+    ignored: bool,
+}
+
+/// Setting this suspends limit *enforcement* for the process.
+///
+/// It exists for one situation: seeding a new or rebuilt pond.  An initial
+/// import is nothing like steady state -- measured, one pond's first push was
+/// 11.4 GB in about two minutes against a steady state of ~12 MB/day -- so no
+/// single budget both permits a legitimate rebuild and constrains a runaway.
+/// Rather than pretend one number can, the operator says explicitly that this
+/// transfer is the exception.
+pub const IGNORE_LIMITS_ENV: &str = "POND_IGNORE_LIMITS";
+
+/// Whether [`IGNORE_LIMITS_ENV`] is set to something affirmative.
+///
+/// Anything else -- unset, empty, `0`, `false` -- enforces.  An unrecognized
+/// value enforces too: the safe reading of an ambiguous setting is the one
+/// that keeps the guard on.
+#[must_use]
+pub fn limits_ignored() -> bool {
+    ignore_setting(std::env::var(IGNORE_LIMITS_ENV).ok().as_deref())
+}
+
+/// The truth test for [`IGNORE_LIMITS_ENV`], split out from the environment
+/// read so it can be exercised directly (setting a process environment
+/// variable is `unsafe` and this workspace forbids `unsafe`).
+#[must_use]
+fn ignore_setting(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"),
+        None => false,
+    }
 }
 
 impl LimiterSet {
@@ -672,7 +714,24 @@ impl LimiterSet {
             }
             bound.push(Limiter::open(ship, path, *unit).await?);
         }
-        Ok(Self { bound })
+
+        // Bind even when ignoring, so the configuration is still validated: a
+        // missing node or a wrong unit must not be hidden by the override.
+        let ignored = limits_ignored();
+        if ignored && !bound.is_empty() {
+            log::warn!(
+                "[WARN] {} is set: {} limiter(s) bound but NOT enforced -- {}",
+                IGNORE_LIMITS_ENV,
+                bound.len(),
+                bound
+                    .iter()
+                    .map(|l| l.spec().unit.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
+        Ok(Self { bound, ignored })
     }
 
     /// Nothing is governed, so no charge can ever be refused.
@@ -698,10 +757,40 @@ impl LimiterSet {
     /// Returns [`LimiterError::Exceeded`] when the charge would breach the
     /// budget or the burst allowance.
     pub fn check(&self, unit: LimitUnit, amount: u64) -> Result<(), LimiterError> {
+        if self.ignored {
+            return Ok(());
+        }
         match self.get(unit) {
             Some(l) => l.check(amount),
             None => Ok(()),
         }
+    }
+
+    /// Whether enforcement is suspended by [`IGNORE_LIMITS_ENV`].
+    #[must_use]
+    pub fn is_ignored(&self) -> bool {
+        self.ignored
+    }
+
+    /// Suspend enforcement without consulting the environment, so the ignored
+    /// paths are reachable from tests.
+    #[cfg(test)]
+    fn force_ignored(&mut self) {
+        self.ignored = true;
+    }
+
+    /// Drop what an ignored run charged, returning `(path, unit, amount)` for
+    /// every limiter that spent anything so the caller can report it.  Pure.
+    fn discard_ignored_spending(&mut self) -> Vec<(String, &'static str, u64)> {
+        let mut reported = Vec::new();
+        for l in &mut self.bound {
+            let spent = l.spent();
+            if spent > 0 {
+                reported.push((l.path().to_string(), l.spec().unit.as_str(), spent));
+            }
+            l.discard_pending();
+        }
+        reported
     }
 
     /// Charge `amount` of `unit` after the action succeeded.  Pure: no I/O.
@@ -727,6 +816,21 @@ impl LimiterSet {
         control: &mut ControlTable,
         now_us: i64,
     ) -> Result<(), LimiterError> {
+        // An ignored run does not persist its windows.  A seeding import can be
+        // three orders of magnitude larger than a normal day, so folding it into
+        // the sliding window would leave the budget exhausted and refuse routine
+        // traffic for a full period -- the override would create the outage it
+        // was invoked to avoid.  The spend is reported instead of recorded, so
+        // it is accounted for in the log even though it is not charged.
+        if self.ignored {
+            for (path, unit, spent) in self.discard_ignored_spending() {
+                log::warn!(
+                    "[WARN] {IGNORE_LIMITS_ENV} spent {spent} {unit} ungoverned (not charged to `{path}`)"
+                );
+            }
+            return Ok(());
+        }
+
         let mut samples = Vec::new();
         for l in &mut self.bound {
             if let Some(sample) = l.commit_window_at(control, now_us).await? {
@@ -817,6 +921,75 @@ mod tests {
             pending: Buckets::default(),
             dirty: false,
         }
+    }
+
+    // -------- the ignore-limits override (Section 8b.1) --------
+
+    #[test]
+    fn only_affirmative_settings_suspend_enforcement() {
+        for v in ["1", "true", "TRUE", "yes", " true "] {
+            assert!(ignore_setting(Some(v)), "{v:?} should suspend enforcement");
+        }
+    }
+
+    #[test]
+    fn anything_unrecognized_keeps_enforcing() {
+        // The dangerous mistake is a setting that reads as "off" to the
+        // operator but disables the guard, so only the three affirmative
+        // spellings count and everything else -- including nonsense -- keeps
+        // the limits on.
+        for v in ["0", "false", "no", "", "  ", "on", "please", "2"] {
+            assert!(!ignore_setting(Some(v)), "{v:?} should keep enforcing");
+        }
+        assert!(!ignore_setting(None), "unset should keep enforcing");
+    }
+
+    #[test]
+    fn an_ignored_set_admits_a_charge_that_would_otherwise_be_refused() {
+        let mut set = LimiterSet {
+            bound: vec![limiter("/sys/limits/b", spec("MiB/day", 1.0, None))],
+            ignored: false,
+        };
+        let over = 10 * 1024 * 1024;
+        assert!(
+            set.check(LimitUnit::Bytes, over).is_err(),
+            "10 MiB against a 1 MiB/day budget must be refused while enforcing"
+        );
+        set.force_ignored();
+        assert!(
+            set.check(LimitUnit::Bytes, over).is_ok(),
+            "the same charge must be admitted once enforcement is suspended"
+        );
+    }
+
+    #[test]
+    fn an_ignored_run_discards_its_spending_instead_of_charging_it() {
+        // The point of the override is seeding an import that dwarfs steady
+        // state.  If that spending were folded into the window, the next
+        // ordinary transfer would be refused -- the override would cause the
+        // outage it exists to prevent.  So commit drops it.
+        let mut set = LimiterSet {
+            bound: vec![limiter("/sys/limits/b", spec("MiB/day", 1.0, None))],
+            ignored: true,
+        };
+        set.record(LimitUnit::Bytes, 10 * 1024 * 1024);
+        assert_eq!(set.bound[0].spent(), 10 * 1024 * 1024);
+
+        let reported = set.discard_ignored_spending();
+        assert_eq!(
+            reported,
+            vec![(
+                "/sys/limits/b".to_string(),
+                "bytes",
+                10 * 1024 * 1024_u64
+            )],
+            "the ungoverned spending must be reported, not silently dropped"
+        );
+        assert_eq!(set.bound[0].spent(), 0, "and must not remain pending");
+
+        set.ignored = false;
+        set.check(LimitUnit::Bytes, 1024)
+            .expect("a later ordinary charge must not be blocked by ignored spending");
     }
 
     // -------- the unit contract (Decision L10) --------

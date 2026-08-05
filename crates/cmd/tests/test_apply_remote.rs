@@ -14,7 +14,7 @@
 //! All remotes are `file://`, so nothing here touches the network.
 
 use cmd::commands::{
-    apply_command, init_command, push_command, remote::list_remote_names,
+    apply_command, init_command, pull_command, push_command, remote::list_remote_names,
     remote::load_remote_attachment, status_command,
 };
 use cmd::common::ShipContext;
@@ -72,6 +72,71 @@ async fn write_small_file(ctx: &ShipContext, path: &str, bytes: &[u8]) -> anyhow
 
 /// One document creating a generous byte budget, one creating an ops budget,
 /// and one attaching a backup governed by both.
+/// Build a real upstream pond in `tmp` and push it to a `file://` content
+/// store, returning that URL.  A pull-mode remote must point at an existing
+/// pond, so an empty directory cannot stand in for one.
+async fn publish_upstream(tmp: &TempDir) -> String {
+    let producer = tmp.path().join("producer");
+    let store = tmp.path().join("upstream-store");
+    std::fs::create_dir_all(&store).expect("mkdir upstream store");
+    let url = format!("file://{}", store.display());
+
+    let ctx = ctx_for(&producer, vec!["pond", "init"]);
+    init_command(&ctx, "producer-host")
+        .await
+        .expect("init producer");
+    write_small_file(&ctx, "/hello.txt", b"content for a governed consumer")
+        .await
+        .expect("write");
+    // Generous budgets: this push is scaffolding, not the thing under test.
+    apply_yaml(&ctx, tmp.path(), &governed_backup_yaml(&url, 1024, 100_000))
+        .await
+        .expect("apply producer backup");
+    push_command(&ctx, Some("origin".to_string()))
+        .await
+        .expect("publish upstream");
+    url
+}
+
+/// A pull-mode attachment governed by a byte and an ops limiter.
+fn governed_pull_yaml(url: &str, mib_per_day: u64, ops_per_hour: u64) -> String {
+    format!(
+        r#"version: v1
+kind: mknod
+metadata:
+  path: /sys/limits/pull-bytes
+spec:
+  factory: rate-limit
+  config:
+    unit: MiB/day
+    limit: {mib_per_day}
+    burst: 1
+---
+version: v1
+kind: mknod
+metadata:
+  path: /sys/limits/pull-ops
+spec:
+  factory: rate-limit
+  config:
+    unit: ops/hour
+    limit: {ops_per_hour}
+    burst: 1
+---
+version: v1
+kind: remote
+metadata:
+  path: /sys/remotes/upstream
+spec:
+  url: {url}
+  mount: /sources/upstream
+  limits:
+    bytes: /sys/limits/pull-bytes
+    ops: /sys/limits/pull-ops
+"#
+    )
+}
+
 fn governed_backup_yaml(url: &str, mib_per_day: u64, ops_per_hour: u64) -> String {
     format!(
         r#"version: v1
@@ -553,38 +618,89 @@ async fn status_renders_on_a_pond_holding_a_profile() {
 /// nothing -- a claimed protection that does not exist is worse than an
 /// obviously absent one.
 #[tokio::test]
-async fn limits_on_a_pull_only_remote_are_refused() {
+async fn limits_on_a_pull_only_remote_are_accepted() {
+    // Ingress is governed too: a pull charges the same budget a push does, via
+    // the governed content source.  So limits on a pull-only remote are a real
+    // claim and must attach, not be refused as an empty one.
     init_log();
     let tmp = TempDir::new().expect("tmp");
-    let pond = tmp.path().join("pond");
+    let url = publish_upstream(&tmp).await;
+
+    let pond = tmp.path().join("consumer");
     let ctx = ctx_for(&pond, vec!["pond", "init"]);
-    init_command(&ctx, "test-host").await.expect("init");
+    init_command(&ctx, "consumer-host").await.expect("init");
 
-    let upstream = tmp.path().join("upstream");
-    std::fs::create_dir_all(&upstream).expect("mkdir");
+    apply_yaml(&ctx, tmp.path(), &governed_pull_yaml(&url, 10, 100))
+        .await
+        .expect("a governed pull-only remote should attach");
 
-    let err = apply_yaml(
-        &ctx,
-        tmp.path(),
-        &format!(
-            "version: v1\nkind: mknod\nmetadata:\n  path: /sys/limits/backup-bytes\nspec:\n  factory: rate-limit\n  config:\n    unit: MiB/day\n    limit: 10\n    burst: 1\n---\nversion: v1\nkind: remote\nmetadata:\n  path: /sys/remotes/upstream\nspec:\n  url: file://{}\n  mount: /sources/upstream\n  limits:\n    bytes: /sys/limits/backup-bytes\n",
-            upstream.display()
-        ),
-    )
-    .await
-    .expect_err("a pull-only remote must not claim limits");
-
-    let text = err.to_string();
-    assert!(
-        text.contains("only enforced on pushes"),
-        "unexpected error: {text}"
-    );
-
-    assert!(
+    assert_eq!(
         list_remote_names(&mut ctx.open_pond().await.expect("open"))
             .await
-            .expect("list")
-            .is_empty(),
-        "a refused attachment must leave no trace"
+            .expect("list"),
+        vec!["upstream".to_string()],
+    );
+}
+
+/// Governing ingress must not break it: with budgets above what the transfer
+/// needs, the pull still completes and the imported subtree is mounted.  This
+/// is the regression guard for the governed source itself -- charging ops for
+/// reads served from the preloaded snapshot, for instance, would exhaust a
+/// realistic budget and turn a working pull into a throttled one.
+#[tokio::test]
+async fn a_governed_pull_within_budget_still_succeeds() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let url = publish_upstream(&tmp).await;
+
+    let pond = tmp.path().join("consumer");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+
+    apply_yaml(&ctx, tmp.path(), &governed_pull_yaml(&url, 1024, 100_000))
+        .await
+        .expect("apply");
+
+    pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect("a pull inside its budget must succeed");
+
+    let ship = ctx.open_pond().await.expect("open");
+    let tip = ship
+        .control_table()
+        .raw_config_get(&format!("last_pulled_tip:{url}"))
+        .await
+        .expect("read watermark");
+    assert!(
+        tip.is_some_and(|t| !t.is_empty()),
+        "a successful governed pull must record the tip it pulled"
+    );
+}
+
+/// The other half of the claim: an attached pull remote is not merely allowed
+/// to name limiters, it is actually stopped by them.  A budget of one remote
+/// operation per hour cannot cover a graph fetch, so the pull must be refused
+/// -- the same proof `an_applied_backup_is_actually_governed` makes for egress.
+#[tokio::test]
+async fn an_applied_pull_remote_is_actually_governed() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let url = publish_upstream(&tmp).await;
+
+    let pond = tmp.path().join("consumer");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+
+    apply_yaml(&ctx, tmp.path(), &governed_pull_yaml(&url, 100, 1))
+        .await
+        .expect("apply");
+
+    let err = pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect_err("pull must be refused by the ops budget");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("rate limit") || msg.contains("retry in"),
+        "expected a rate-limit refusal, got: {msg}"
     );
 }

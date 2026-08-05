@@ -184,24 +184,13 @@ pub async fn attach_remote(
     // Reject an unknown dimension key or a relative limiter path here, at
     // attach time, rather than at the first push.  A limiter that silently
     // fails to bind is worse than no limiter at all.
-    let limits = attachment
+    // Limits bind in both directions: a push charges its budget inline, and a
+    // pull charges the same budget through the governed content source.  So a
+    // pull-only remote may carry `limits` and they will be enforced -- egress
+    // was the first bill to arrive, but ingress is billed too.
+    let _ = attachment
         .resolved_limits()
         .map_err(|e| anyhow!("remote `{}`: {}", name, e))?;
-
-    // Only pushes are governed today.  A pull-only remote carrying `limits`
-    // would parse, validate, and even appear in `pond status` while enforcing
-    // nothing -- config that claims a protection it does not provide, which is
-    // the failure this validation exists to prevent.  Refuse it until pulls are
-    // governed too.
-    if !limits.is_empty() && !mode.pushes() {
-        return Err(anyhow!(
-            "remote `{}`: `limits` is only enforced on pushes, and `{}` is pull-only. \
-             Remove the limits, or attach it as a backup or bidirectional remote. \
-             (Pull bandwidth is not governed yet.)",
-            name,
-            name
-        ));
-    }
 
     attachment
         .check_storage_profile()

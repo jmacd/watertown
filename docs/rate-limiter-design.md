@@ -942,28 +942,75 @@ is tempting and should be rejected: an empty remote is also what an accidental
 bucket deletion looks like, so the one case that would silently re-upload 11 GB
 is exactly the case that would be exempt.
 
-That leaves an explicit, deliberate override. The interim mechanism is to raise
-the instance's `BACKUP_MIB_PER_DAY`, push, and put it back -- adequate, but it
-relies on remembering to revert, which is the classic way a temporary exemption
-becomes permanent. The shape worth designing is a **one-shot grant recorded in
-the disposable control state**, not in pond config: it cannot be replicated, it
-disappears with the control table, it is visible in `pond status` while active,
-and it makes "spend 11 GB" an act someone performs on purpose. Not yet
-designed; see also §10.
+That leaves an explicit, deliberate override, which is Decision **L13**:
+setting `POND_IGNORE_LIMITS` to `1`, `true`, or `yes` suspends enforcement for
+the process.
 
-### 8b.2 Pulls are not governed at all
+Four properties make it safe enough to exist:
 
-Only `push` binds limiters. A pull-mode remote carrying `limits` used to parse,
-validate, and appear in `pond status` while enforcing nothing. That is worse
-than an absent limit, so it is now refused at attach time
-(`remote.rs`, `limits_on_a_pull_only_remote_are_refused`).
+1. **It suspends enforcement, not binding.** Limiters are still opened, so a
+   missing node or a wrong unit still fails. The override cannot be used to
+   hide a broken configuration.
+2. **It is loud.** Binding logs a warning naming every limiter that is bound
+   but not enforced, and the commit logs what each one spent ungoverned.
+3. **It does not record what it spends.** An ignored run discards its pending
+   windows instead of persisting them. This is the non-obvious choice and it
+   is deliberate: folding an 11.4 GB seeding import into a window sized for
+   12 MB days would leave the budget exhausted and refuse ordinary traffic for
+   a full period -- the override would cause the very outage it was invoked to
+   avoid. The spending is reported rather than charged.
+4. **Only affirmative spellings count.** `0`, `false`, `no`, empty, and
+   anything unrecognized all keep enforcing. The dangerous failure is a value
+   that reads as "off" to an operator while disabling the guard, so an
+   ambiguous setting resolves toward keeping the guard on.
 
-The refusal makes the gap loud; it does not close it. The site pond imports all
-three producers read-through, and on a metered provider **egress is typically
-the expensive direction** -- so the ungoverned side may be the costlier one.
-Governing pulls is unscheduled work, and the reason it was not simply added
-here is that a pull's cost is not known before the transfer in the way a push's
-is.
+The residual risk is that it is left set -- in a generated env file, say. It is
+a process environment variable and not pond configuration, so it is never
+replicated and never outlives the process, but nothing stops an operator from
+baking it into a unit file. The warnings are the mitigation.
+
+### 8b.2 Pulls are governed too (Decision L14)
+
+Only `push` bound limiters originally, so a pull-mode remote carrying `limits`
+parsed, validated, and appeared in `pond status` while enforcing nothing. That
+was briefly refused at attach time to make the gap loud. The gap is now closed
+and the refusal is gone: a pull-only remote may name limiters and they are
+enforced.
+
+**Where enforcement lives.** Not threaded through the pull path, but wrapped
+around it. `ContentSource` is already exactly the set of operations that reach
+the remote, so `GovernedSource` decorates it and charges there. Every existing
+pull path -- mirror rebuild, cross-pond import, the incremental tip check, and
+external blob streaming -- is governed without changing its signature, and a
+pull path added later is governed because it has no other way to reach the
+remote. Threading a `&mut LimiterSet` through the half-dozen intervening
+frames would instead have made *ungoverned* the default for new code.
+
+**What a pull can promise.** A push checks the exact cost before paying it,
+because it holds the bytes it is about to send. A pull learns a transfer's size
+only by performing it: `BlobReader` is an opaque stream with no length. So a
+pull enforces the weaker rule -- **refuse to begin a transfer once the budget
+is spent**, and charge each transfer once it lands. A pull can therefore
+overshoot, but by at most one object or one 8 MiB read chunk, rather than by
+the unbounded amount that going ungoverned allows.
+
+Two details follow from measuring at the real boundary:
+
+- **Ops are charged per remote round-trip, not per call.** After
+  `preload_objects` snapshots the object partition, `get_object` is an
+  in-memory lookup. Charging it as an operation would exhaust a realistic ops
+  budget on a pull that made one request. The decorator tracks the preload
+  state and charges ops only for genuine round-trips; the bytes are still
+  charged, because they did cross the wire during the preload.
+- **Large blobs are charged as they stream.** A blob is the one transfer big
+  enough to blow a budget by itself and the only one whose size is unknown in
+  advance, so the reader checks before each chunk and charges after. A runaway
+  multi-gigabyte download is cut off partway through instead of after it
+  completes -- finer granularity than the push side, which charges per blob.
+
+As on the push side, windows are persisted whether or not the pull succeeded: a
+pull that failed partway still transferred what it transferred, and a budget
+that forgets failed attempts is one a retry loop can spend without bound.
 
 ---
 
@@ -984,3 +1031,5 @@ is.
 | L10 | Callers declare the unit they spend at `Limiter::open`; a mismatch with the node's configured unit is a bind-time error. |
 | L11 | Limiter bindings are authored in YAML via new `pond apply` `kind: backup` / `kind: remote` resources routed through the existing attach validation -- not via CLI flags. |
 | L12 | Spending is *also* emitted into the pond as a durable metric series at `/sys/limits/usage`, flushed at the start of the next write transaction. |
+| L13 | `POND_IGNORE_LIMITS` suspends enforcement (not binding) for a seeding import; it logs loudly and discards rather than records what it spent, so an exceptional transfer cannot exhaust the window that governs ordinary traffic. |
+| L14 | Pulls are governed by decorating `ContentSource` (`GovernedSource`), so every ingress path is charged at the remote boundary; a pull refuses to *begin* a transfer on a spent budget rather than checking an unknowable size in advance. |
