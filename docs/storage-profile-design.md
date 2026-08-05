@@ -5,11 +5,14 @@
 > pattern this reuses: a factory node declares a policy, a consumer names it by
 > path, and the binding is validated at attach time.
 >
-> This document proposes a family of **storage-profile factories**
-> (`storage-s3`, `storage-minio`, `storage-r2`, and later `storage-azure`) whose
-> nodes live at `/sys/storage/<name>`, and an optional `storage:` field on
-> `RemoteAttachment` that names one instead of carrying its own copy of the
-> connection.
+> **Targets:** MinIO is what runs today. **Azure is the next real backend.**
+> AWS S3 and Cloudflare R2 are hypothetical and are *not* proposed for
+> implementation -- they appear only where they are evidence that the shape
+> extends.
+>
+> This document proposes **storage-profile factories** whose nodes live at
+> `/sys/storage/<name>`, and an optional `storage:` field on `RemoteAttachment`
+> that names one instead of carrying its own copy of the connection.
 
 ---
 
@@ -33,7 +36,7 @@ attachments, so the same five facts appear three times. Across the watershop
 station there are roughly ten copies. Rotating an endpoint means editing every
 one of them and getting all of them right.
 
-### 0.1 The concrete trigger
+### 0.1 The trigger: a bool that had nowhere to go
 
 Converting `caspar.water/config/scripts/attach-remotes.sh` from CLI verbs to
 declarative `pond apply` documents (Decision L11) ran aground on one field.
@@ -43,29 +46,67 @@ document and resolve per-replica at use time (`apply.rs:425-440`). But
 `allow_http` is a `bool`, so `allow_http: ${env:S3_ALLOW_HTTP}` cannot even
 parse, and the shell script's `S3_ALLOW_HTTP` switch has nowhere to go.
 
-The instinct is to add bool env-expansion. That would be fixing the symptom.
-The real problem is that **`allow_http` is not a property of a remote.**
-"Plain HTTP is acceptable" is a fact about the MinIO deployment on watershop.
-It is not a fact about "the origin backup of the water pond," which is what
-`/sys/remotes/origin` is supposed to describe. The field could not be expressed
-per-environment because it was stored per-*remote*, in the wrong place
-entirely.
+The tempting fix is to add bool env-expansion. That would be fixing the
+symptom. The real problem is that **`allow_http` is not a property of a
+remote.** "Plain HTTP is acceptable" is a fact about the MinIO deployment on
+watershop. It is not a fact about "the origin backup of the water pond," which
+is what `/sys/remotes/origin` is supposed to describe. The field could not be
+expressed per-environment because it was stored per-*remote*, in the wrong
+place entirely.
 
-### 0.2 What we want
+### 0.2 The bigger problem, now that Azure is next
+
+The URL scheme currently drives every storage decision in the codebase, by
+string comparison, in eight places:
+
+| Site | Test |
+|---|---|
+| `remote_config.rs:130` | `if self.url.starts_with("s3://")` -- gates **all** storage options |
+| `push.rs:65`, `pull.rs:111`, `verify.rs:72`, `restore.rs:74` | gates `register_s3_handlers()` |
+| `remote.rs:244`, `remote.rs:532` | gates `register_s3_handlers()` |
+| `guard.rs:1292` | gates `register_s3_handlers()` on the auto-push path |
+
+Adding Azure means finding and correctly amending all eight. Two of them are
+worse than merely tedious:
+
+1. **`remote_config.rs:130` fails silently.** `to_storage_options` returns an
+   **empty map** for any URL that is not `s3://`. An `az://` attachment would
+   therefore drop every credential it was given and surface as an opaque
+   authentication failure, with the configuration looking perfectly correct.
+   This is exactly the class of failure
+   [`fallback-antipattern-philosophy.md`](fallback-antipattern-philosophy.md)
+   exists to reject, sitting in the code today, latent until the first non-S3
+   backend arrives.
+
+2. **`register_s3_handlers` is a process-global side effect**
+   (`sync-store/src/s3_registration.rs:72`) that inserts factories into
+   delta-rs's scheme registry. Azure needs a parallel registration built on
+   `MicrosoftAzureBuilder`, plus the `azure` feature on `object_store`
+   (`Cargo.toml:78` currently enables `aws` only). Deciding *which* to call by
+   sniffing a URL prefix at eight call sites is a worse arrangement than
+   asking the profile, which already knows.
+
+**A profile knows its provider.** That is the thing a URL prefix is being made
+to approximate. Replacing eight scheme comparisons with one dispatch on the
+profile kind is a larger practical payoff than the deduplication in §0, and it
+is the reason to do this *before* Azure rather than after.
+
+### 0.3 What we want
 
 1. One place to say "this is the MinIO on watershop," named by path.
-2. Attachments that carry only what is genuinely theirs: the URL, the mode,
-   the mount, the limits.
-3. Illegal combinations that cannot be written down, rather than combinations
-   that are merely discouraged by comments.
-4. No weakening of the rule that keeps secrets out of replicated documents --
+2. Attachments that carry only what is genuinely theirs: URL, mode, mount,
+   limits.
+3. Provider dispatch driven by a declared kind, not by string-matching a URL.
+4. Illegal combinations that cannot be written down, rather than combinations
+   discouraged by comments.
+5. No weakening of the rule that keeps secrets out of replicated documents --
    in fact, a strengthening of it.
-5. Full backward compatibility: every existing attachment document keeps
-   working, unmodified.
+6. Full backward compatibility: every existing attachment keeps working,
+   unmodified.
 
 ---
 
-## 1. Why a pond node, and why not just a config key
+## 1. Why a pond node, and why not a config key
 
 The control table (`pond config set`) is the other candidate home, and it is
 the wrong one for the same reason it was the *right* one for limiter state, run
@@ -101,11 +142,11 @@ credentials in one obvious place is a real benefit for management and a real
 hazard if the place ever holds plaintext.
 
 **Decision A1.** Every credential field on a storage profile MUST be an
-`${env:...}` reference, validated at `mknod` time, not just the secret. The
+`${env:...}` reference, validated at `mknod` time -- not just the secret. The
 current rule covers `secret_access_key` alone; an access key id is a weaker
-secret but still an identity, and there is no reason to accept a literal one.
-`render` redacts credential fields regardless, so a profile node reads as
-`secret_access_key: ${env:S3_SECRET_KEY}` and never as a value.
+secret but still an identity, and an Azure account key is as sensitive as an S3
+secret. `render` redacts credential fields regardless, so a profile node reads
+as `account_key: ${env:AZURE_STORAGE_KEY}` and never as a value.
 
 ---
 
@@ -116,13 +157,14 @@ is a trap, because it invites exactly the wrong scope.
 
 If the node holds credentials only, then `endpoint`, `region`, and `allow_http`
 stay on the attachment -- and §0.1, the thing that motivated the work, is not
-fixed. Those three fields are not credentials, but they are precisely the
-fields that were in the wrong place.
+fixed. Nor is §0.2: a credentials-only node does not know its provider, so the
+eight scheme comparisons survive. Those fields are not credentials, but they
+are precisely the fields in the wrong place.
 
 There is good precedent for the wider scope. An AWS **profile** in
-`~/.aws/config` contains exactly this set: credentials, region, and endpoint,
-under one name, referenced by name from everything that connects. That is the
-same shape, solving the same problem.
+`~/.aws/config` contains exactly this set -- credentials, region, and endpoint,
+under one name, referenced by name from everything that connects. Azure's
+**connection string** is the same idea with the same contents.
 
 **Decision A2.** The node is a *storage profile*: the complete description of
 how to reach a storage system, credentials included. Nodes live at
@@ -135,27 +177,25 @@ how to reach a storage system, credentials included. Nodes live at
 **Decision A3.** One factory per provider, not one `storage` factory with
 optional fields.
 
-The honest counter-argument first: `storage-s3`, `storage-minio`, and
-`storage-r2` are three profiles over *one* protocol, differing only in which
-knobs they fix and which they expose. A single `storage-s3` factory with
-optional `endpoint` and `allow_http` would cover all three with less code.
+MinIO and Azure settle this on their own, without appeal to hypotheticals.
+They do not differ in the *values* of a shared field set; they differ in what
+the field set **is**. MinIO is an endpoint plus an access-key/secret pair.
+Azure is an account name plus *one of* an account key, a SAS token, or a
+service-principal triple -- and it reaches storage through a different
+`object_store` builder, under different URL schemes. A single factory spanning
+both would carry a dozen optional fields of which any given profile uses four,
+which is a union type wearing a struct's clothes: it can express
+`account_key` alongside `endpoint`, and has to reject at runtime what it should
+not have been able to represent.
 
-The reason to split them anyway is that optional fields make illegal states
-representable. With one factory, `region: auto` (a Cloudflare-ism) combined
-with an AWS endpoint parses fine and fails later; `allow_http: true` on an R2
-profile parses fine and silently permits cleartext credentials to a service
-that never needs it. With separate kinds, `storage-r2` fixes `region: auto` and
-has no `allow_http` field at all, so neither mistake can be written down. That
-is the same reasoning that made byte scales binary-only in the rate-limit unit
-grammar (`rate_limit.rs:38-40`) and it follows
-[`fallback-antipattern-philosophy.md`](fallback-antipattern-philosophy.md).
+Separate kinds also make dispatch trivial (§0.2): the kind *is* the provider,
+so it selects the handler registration and the option builder directly.
 
-Azure settles it independently: its credentials are an account name plus key,
-or a SAS token, or a connection string -- not an access-key/secret pair at all.
-A single factory covering both would be a union type wearing a struct's
-clothes.
+**Only `storage-minio` and `storage-azure` are proposed.** `storage-s3` and
+`storage-r2` are sketched in §3.3 solely as evidence that the shape extends;
+building them before there is a bucket to point them at would be speculation.
 
-### 3.1 `storage-minio`
+### 3.1 `storage-minio` (today)
 
 ```yaml
 version: v1
@@ -171,68 +211,92 @@ spec:
     secret_access_key: ${env:S3_SECRET_KEY}
 ```
 
-`endpoint` is **required** (a MinIO without one is not a MinIO). `allow_http`
+`endpoint` is **required** -- a MinIO without one is not a MinIO. `allow_http`
 does not appear: a `storage-minio` profile permits plain HTTP by definition,
-which is the whole reason the kind exists. An operator running MinIO behind
+which is the entire reason the kind exists. An operator running MinIO behind
 TLS simply writes an `https://` endpoint; permitting HTTP does not require it.
 
-This is where `S3_ALLOW_HTTP` goes: it stops being a variable and becomes the
+This is where `S3_ALLOW_HTTP` goes. It stops being a variable and becomes the
 choice of `kind`.
 
-### 3.2 `storage-s3`
+Path-style addressing is likewise a property of the kind rather than a side
+effect. Today `to_storage_options` sets `virtual_hosted_style_request: false`
+whenever an endpoint happens to be non-empty (`remote_config.rs:148-151`),
+which is a MinIO accommodation applied by coincidence of another field's
+emptiness.
+
+Registration reuses `register_s3_handlers` unchanged
+(`sync-store/src/s3_registration.rs:72`), which already covers S3-compatible
+backends.
+
+### 3.2 `storage-azure` (next)
 
 ```yaml
+version: v1
+kind: mknod
+metadata:
+  path: /sys/storage/azure
 spec:
-  factory: storage-s3
+  factory: storage-azure
   config:
-    region: ${env:AWS_REGION}
-    access_key_id: ${env:AWS_ACCESS_KEY_ID}
-    secret_access_key: ${env:AWS_SECRET_ACCESS_KEY}
+    account_name: ${env:AZURE_STORAGE_ACCOUNT}
+    account_key: ${env:AZURE_STORAGE_KEY}
 ```
 
-No `endpoint` (AWS is the endpoint) and no `allow_http` (never correct against
-AWS). Virtual-hosted-style addressing, the AWS default -- note that today
-`to_storage_options` sets `virtual_hosted_style_request: false` whenever an
-endpoint is present (`remote_config.rs:148-151`), which is a MinIO
-accommodation currently applied by side effect of a field being non-empty.
-Under profiles it becomes a property of the kind.
-
-### 3.3 `storage-r2`
+Or, with a SAS token instead:
 
 ```yaml
-spec:
-  factory: storage-r2
-  config:
-    account_id: ${env:R2_ACCOUNT_ID}
-    access_key_id: ${env:R2_ACCESS_KEY_ID}
-    secret_access_key: ${env:R2_SECRET_KEY}
+    account_name: ${env:AZURE_STORAGE_ACCOUNT}
+    sas_token: ${env:AZURE_STORAGE_SAS}
 ```
 
-`region` is fixed to `auto` and is not a field. The endpoint is *derived* from
-`account_id` (`https://<account>.r2.cloudflarestorage.com`) rather than pasted,
-which removes a copy-paste failure mode that currently produces an
-authentication error rather than a clear one. No `allow_http`.
+Or a service principal:
 
-This directly serves the `prod_s3` block in
-`caspar.water/terraform/station/watershop/watershop.tf:17-23`, which is
-retained for a future R2 re-enable and today differs from staging in exactly
-the three ways this kind fixes.
+```yaml
+    account_name: ${env:AZURE_STORAGE_ACCOUNT}
+    service_principal:
+      client_id: ${env:AZURE_CLIENT_ID}
+      client_secret: ${env:AZURE_CLIENT_SECRET}
+      tenant_id: ${env:AZURE_TENANT_ID}
+```
 
-### 3.4 `storage-azure` (later)
+**Exactly one** credential shape must be present. Zero is an error, and so is
+two -- a profile with both an account key and a SAS token has no unambiguous
+intent, and silently preferring one would be the same anti-pattern as a
+precedence rule in §4.1. This is the concrete reason Azure cannot be optional
+fields on a shared struct: "exactly one of three groups" is not something a
+flat field set can state.
 
-Listed to confirm the abstraction generalizes, not proposed for the first
-implementation. Its config is an account name plus one of several credential
-shapes, which is why it is a separate kind rather than an option set.
+Implementation notes, all of which are new work rather than configuration:
 
-### 3.5 Registration
+- `object_store` needs its `azure` feature (`Cargo.toml:78` enables `aws`
+  only).
+- A `sync-store/src/azure_registration.rs` mirroring `s3_registration.rs`,
+  built on `MicrosoftAzureBuilder`/`AzureConfigKey`, registering the `az`,
+  `azure`, `abfs`, and `abfss` schemes.
+- The URL scheme accepted by an attachment must be validated against the
+  profile kind (§4.2), so an `s3://` URL with an Azure profile is refused at
+  attach rather than producing a confusing failure at first push.
+
+### 3.3 `storage-s3` and `storage-r2` (not proposed)
+
+Recorded as evidence for A3, not as planned work. AWS S3 would have no
+`endpoint` and no `allow_http`. R2 would fix `region: auto` and *derive* its
+endpoint from an `account_id` rather than have it pasted in, since a mistyped
+R2 endpoint currently produces an authentication error rather than a clear one.
+Both would serve the `prod_s3` block retained in
+`caspar.water/terraform/station/watershop/watershop.tf:17-23` for a possible R2
+re-enable. Neither should be built until that re-enable is real.
+
+### 3.4 Registration
 
 Each is a **leaf config node**, exactly like `rate-limit`: no content to
-compute, nothing to execute, registered through
-`register_dynamic_factory!` with a `validate` function that rejects a bad
-profile at `pond apply` time rather than at first use
-(`rate_limit.rs:398-403`). A shared `spec_from_config_bytes`-style entry point
-gives the factory and its consumers exactly one interpretation of a node's
-config, as `rate_limit.rs:391` does for budgets.
+compute, nothing to execute, registered through `register_dynamic_factory!`
+with a `validate` function that rejects a bad profile at `pond apply` time
+rather than at first use (`rate_limit.rs:398-403`). A shared
+`spec_from_config_bytes`-style entry point gives the factory and its consumers
+exactly one interpretation of a node's config, as `rate_limit.rs:391` does for
+budgets.
 
 ---
 
@@ -241,7 +305,7 @@ config, as `rate_limit.rs:391` does for budgets.
 ### 4.1 Schema change
 
 ```rust
-/// Storage profile governing how to reach `url`, as a pond path
+/// Storage profile describing how to reach `url`, as a pond path
 /// (e.g. `/sys/storage/minio`).
 ///
 /// Mutually exclusive with the inline `region` / `endpoint` /
@@ -256,9 +320,9 @@ stays byte-identical.
 
 **Decision A4.** Naming a profile *and* setting any inline connection field is
 a hard error, not a precedence rule. A precedence rule means an operator who
-adds a profile to an attachment that still has a stale inline endpoint gets a
-working pond talking to the wrong storage. There is no reading of that document
-whose intent is unambiguous, so it should not have a meaning.
+adds a profile to an attachment that still carries a stale inline endpoint gets
+a working pond talking to the wrong storage. There is no reading of that
+document whose intent is unambiguous, so it should not have a meaning.
 
 An attachment reduces to what is actually its own:
 
@@ -277,13 +341,29 @@ spec:
 
 ### 4.2 Validation at attach time
 
-Attach already validates the limiter bindings before touching pond state, on
-the principle that a binding which silently fails to resolve is worse than no
+Attach already validates limiter bindings before touching pond state, on the
+principle that a binding which silently fails to resolve is worse than no
 binding (`remote.rs:179-183`). The profile reference gets the same treatment:
-the node must exist, be a `storage-*` node, and be a kind compatible with the
-URL scheme. A `pond://` or `file://` URL with a profile is an error -- neither
-uses storage options at all, and accepting one would let an operator believe
-credentials were in play when they were not.
+the node must exist, must be a `storage-*` node, and its kind must accept the
+URL's scheme -- `storage-minio` accepts `s3://`/`s3a://`, `storage-azure`
+accepts `az://`/`abfss://` and friends.
+
+A `pond://` or `file://` URL with a profile is an error. Neither uses storage
+options at all, and accepting one would let an operator believe credentials
+were in play when they were not.
+
+### 4.3 Dispatch (the §0.2 payoff)
+
+The eight scheme comparisons collapse into the profile. Resolving a profile
+yields a value that knows both how to register its handlers and how to build
+its options, so each call site becomes one unconditional call rather than a
+prefix test plus an S3-specific branch. The `starts_with("s3://")` gate in
+`to_storage_options` (`remote_config.rs:130`), which today silently discards
+credentials for any non-S3 URL, disappears entirely rather than being extended
+with a second prefix.
+
+Attachments with **no** profile keep exactly today's behavior, scheme sniffing
+included -- the legacy path is preserved, not rewritten (§7).
 
 ---
 
@@ -302,12 +382,12 @@ risks the same async-recursion cycle the limiter hit (`guard.commit` →
 there only by boxing.
 
 **Decision A5.** Resolve the profile **once**, at the call site, into a
-`ResolvedStorage`; keep `to_storage_options(&ResolvedStorage)` pure.
+`ResolvedStorage`; keep option-building pure.
 
 Every one of the six call sites already holds a `Ship`, so this is a local
 change at each, and the transfer path stays synchronous and `Ship`-free. It is
-precisely the pattern the limiter used: bind up front with `&mut Ship`, pass
-the resolved value into pure helpers
+precisely the pattern the limiter used: bind up front with `&mut Ship`, then
+pass the resolved value into pure helpers
 (`content_push.rs::push_content_to_remote_limited`).
 
 **Decision A6.** `${env:...}` resolution stays at **use time**, per replica.
@@ -337,10 +417,12 @@ reference:
       bytes [/sys/limits/backup-bytes]: 4.0 MiB / 10.0 MiB (40%) per 1d
 ```
 
-Credential fields are never printed, resolved or otherwise. A missing or
-malformed profile is *reported* rather than propagated, as a broken limiter is,
-because a broken profile is exactly when an operator needs `pond status` to
-still work.
+Credential fields are never printed, resolved or otherwise; for Azure the line
+should name the credential *shape* (`account_key`, `sas_token`,
+`service_principal`) without hinting at its value, since which shape is in use
+is a genuine configuration question. A missing or malformed profile is
+*reported* rather than propagated, as a broken limiter is, because a broken
+profile is exactly when an operator needs `pond status` to still work.
 
 ---
 
@@ -356,7 +438,10 @@ it.
 Inline fields are not deprecated on any schedule. They remain the only way to
 express a one-off remote, they are what every existing document uses, and there
 is no migration pressure -- an attachment converts when someone has a reason to
-touch it.
+touch it. Concretely, the inline path stays S3-only forever: **Azure is
+reachable only through a profile**, which is a feature, since the alternative
+is extending eight scheme comparisons to keep a path alive that profiles exist
+to replace.
 
 ---
 
@@ -364,15 +449,16 @@ touch it.
 
 | Phase | Work | Verifies |
 |---|---|---|
-| A0 | `storage-minio` factory + `ResolvedStorage` + `storage:` field, inline path untouched | The whole idea, against the one provider actually in use |
-| A1 | Attach-time validation, `pond status` line, redaction | The failure modes, before any deployment depends on it |
-| A2 | Convert `attach-remotes.sh` to `pond apply` documents | §0.1, the thing that motivated this |
-| A3 | `storage-s3` and `storage-r2` | The decomposition, against the `prod_s3` block that is waiting for it |
-| A4 | `storage-azure` | The abstraction, if and when it is needed |
+| A0 | `storage-minio` factory, `ResolvedStorage`, `storage:` field; inline path untouched | The whole idea, against the one provider actually in use |
+| A1 | Attach-time validation, `pond status` line, redaction | The failure modes, before any deployment depends on them |
+| A2 | Convert `attach-remotes.sh` to `pond apply` documents | §0.1 -- the thing that motivated this |
+| A3 | `storage-azure`: `object_store` azure feature, `azure_registration.rs`, the factory, dispatch | §0.2, and that the abstraction survives a genuinely different provider |
+| -- | `storage-s3` / `storage-r2` | Deferred indefinitely; see §3.3 |
 
-A2 is the payoff and should not be pulled earlier: converting the script before
-profiles exist means writing YAML with duplicated inline credentials that A0
-would immediately rewrite.
+A2 is the MinIO payoff and should not be pulled earlier: converting the script
+before profiles exist means writing YAML with duplicated inline credentials
+that A0 would immediately rewrite. A3 is the Azure enablement and depends on
+A0's dispatch existing, but not on A2.
 
 ---
 
@@ -383,38 +469,44 @@ each test should pin a *behavior we would regret losing*:
 
 - A profile and an inline field together are refused -- the ambiguity in A4
   never acquires a meaning by accident.
-- A literal credential in a profile is refused at `mknod` time, for each kind.
+- A literal credential in a profile is refused at `mknod` time, per kind.
 - `render` and `pond status` never emit a resolved credential.
-- An attachment naming a missing or wrong-kind profile is refused at attach.
+- An attachment naming a missing, wrong-kind, or scheme-incompatible profile is
+  refused at attach.
 - A `storage-minio` profile and the equivalent inline attachment produce
-  **identical** storage options -- the refactor is a move, not a rewrite.
+  **identical** storage options -- A0 is a move, not a rewrite.
+- An Azure profile with zero credential shapes, or with two, is refused at
+  `mknod` time.
 - A profile resolves per-replica: two replicas with different environments
   authenticate differently from the same replicated document.
 - An existing attachment with no `storage:` field serializes byte-identically.
 - End-to-end: `pond apply` a profile and a backup referencing it in one
   document, then push -- the ordering case, as limiters have.
 
+Azure has no `file://`-style local stand-in, so A3's end-to-end coverage stops
+at option construction and scheme dispatch unless an Azurite container is
+introduced. That is worth deciding before A3 rather than during it.
+
 ---
 
 ## 10. Open questions
 
 1. **`/sys/storage` vs. `/sys/auth`.** §2 argues for `storage` because the node
-   carries connection facts that are not credentials, and calling it `auth`
-   would invite someone to move them back out. If the credential emphasis is
-   preferred, `/sys/auth` with the same wide scope is workable; only the name
+   carries connection facts that are not credentials, and because dispatch
+   (§4.3) needs it to know its provider. If the credential emphasis is
+   preferred, `/sys/auth` with the same wide scope works; only the name
    changes.
-2. **Should a profile carry `limits`?** "This is the MinIO on watershop" and
+2. **Azurite for A3 testing.** See §9. Without it, Azure coverage is unit-level
+   only.
+3. **Should a profile carry `limits`?** "This is the MinIO on watershop" and
    "this is what we will spend against it" are arguably one fact, and a
-   station-wide byte budget shared by every attachment is a plausible thing to
-   want. Against: limits are currently per-remote and a shared budget changes
-   the enforcement model (one window, many spenders, cross-remote starvation).
-   Recommend deferring until §A2 has produced real measurements.
-3. **Should `url` move into the profile?** No -- the bucket is the one thing
-   that genuinely differs per attachment. Noted only to record that it was
-   considered.
-4. **Anonymous / instance-role credentials.** Neither is used today. A profile
-   kind with no credential fields at all is the natural expression if they
-   ever are.
+   station-wide byte budget shared by every attachment is plausible. Against:
+   limits are per-remote today, and a shared budget changes the enforcement
+   model (one window, many spenders, cross-remote starvation). Recommend
+   deferring until A2 has produced real measurements.
+4. **Should `url` move into the profile?** No -- the bucket or container is the
+   one thing that genuinely differs per attachment. Recorded only to note it
+   was considered.
 
 ---
 
@@ -423,9 +515,10 @@ each test should pin a *behavior we would regret losing*:
 | # | Decision |
 |---|---|
 | A1 | Every credential field on a profile must be an `${env:...}` reference, validated at `mknod` time and redacted by `render` -- stricter than today's `secret_access_key`-only rule. |
-| A2 | The node is a *storage profile* (connection + credentials), not an auth block, because the misplaced fields that motivated this are not credentials. Nodes at `/sys/storage/<name>`. |
-| A3 | One factory per provider rather than one factory with optional fields, so that `region: auto` on AWS or `allow_http` on R2 cannot be written down. |
-| A4 | Naming a profile alongside any inline connection field is a hard error, never a precedence rule. |
-| A5 | Profiles resolve **once at the call site** into a `ResolvedStorage`; `to_storage_options` stays pure, so the transfer path stays synchronous and `Ship`-free. |
+| A2 | The node is a *storage profile* (connection + credentials), not an auth block: the misplaced fields that motivated this are not credentials, and dispatch needs the node to know its provider. Nodes at `/sys/storage/<name>`. |
+| A3 | One factory per provider. MinIO and Azure do not differ in the values of a shared field set; they differ in what the field set is. Only `storage-minio` and `storage-azure` are proposed. |
+| A4 | Naming a profile alongside any inline connection field is a hard error, never a precedence rule. Likewise an Azure profile must carry exactly one credential shape. |
+| A5 | Profiles resolve **once at the call site** into a `ResolvedStorage`; option-building stays pure, so the transfer path stays synchronous and `Ship`-free. |
 | A6 | `${env:...}` resolution stays at **use time, per replica**; a profile is never inlined into an attachment at attach time. |
-| A7 | Inline connection fields remain supported indefinitely; rollout is binaries-first, config-second, and conversion is opportunistic. |
+| A7 | Inline connection fields remain supported indefinitely but stay S3-only; Azure is reachable only through a profile. Rollout is binaries-first, config-second. |
+| A8 | Provider dispatch (handler registration and option building) keys off the profile kind, replacing the eight `starts_with("s3://")` comparisons -- including the one that today silently discards credentials for non-S3 URLs. |
