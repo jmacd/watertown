@@ -167,6 +167,12 @@ impl ContentSource for GovernedSource<'_> {
         self.inner.has_blob(hash).await
     }
 
+    async fn list_blobs(&self) -> Result<std::collections::HashSet<ObjectHash>, StewardError> {
+        // One listing, one charge -- the point of asking this way.
+        self.begin_op()?;
+        self.inner.list_blobs().await
+    }
+
     async fn get_blob_reader(&self, hash: ObjectHash) -> Result<Option<BlobReader>, StewardError> {
         self.begin_op()?;
         self.check_any_left(LimitUnit::Bytes)?;

@@ -292,3 +292,69 @@ async fn each_dimension_reports_separately() {
     assert_eq!(rows[1].unit, "ops");
     assert_eq!(rows[1].amount, 3);
 }
+
+/// A re-push must not cost a request per blob the pond has ever retained.
+///
+/// Confirming blob presence with a probe per blob makes every push cost a
+/// billed request for each blob in the accumulated history, even when the push
+/// uploads nothing at all -- a bill proportional to how long the pond has
+/// existed rather than to what it just did.  A single listing answers the same
+/// question, so a no-op re-push spends a small constant regardless of how many
+/// blobs are retained.  This is the finding the ops budget surfaced in staging;
+/// the test exists so it cannot come back unnoticed.
+#[tokio::test]
+async fn a_re_push_does_not_pay_per_retained_blob() {
+    const BLOBS: usize = 8;
+
+    let (_t, mut ship) = new_pond("limiter-push-listing").await;
+    // Generous enough that nothing is refused: the point here is what is
+    // *spent*, not what is denied.
+    write_limiter(&mut ship, "/ops", "ops/day", 100_000.0, None).await;
+
+    // Each file must exceed the 64 KB inline threshold to become an external
+    // blob (Decision D7); distinct contents keep their hashes distinct.
+    for i in 0..BLOBS {
+        let body = vec![b'a' + u8::try_from(i).expect("small index"); 100 * 1024];
+        write_file(&mut ship, &format!("/big{i}.bin"), &body).await;
+    }
+
+    let pond_id = uuid::Uuid::parse_str(ship.data_persistence().pond_id()).expect("pond id");
+    let remote_dir = tempdir().expect("remote dir");
+    let mut remote = ContentRemote::create_at(remote_dir.path().join("remote"), pond_id)
+        .await
+        .expect("create remote");
+
+    // First push: uploads are genuine work and are expected to cost per blob.
+    let mut limits = LimiterSet::open(&mut ship, &[(LimitUnit::Ops, "/ops".to_string())])
+        .await
+        .expect("bind");
+    let _ = push_content_to_remote_limited(&ship, &mut remote, "main", &mut limits)
+        .await
+        .expect("first push");
+    let after_first = limits.states()[0].used;
+    assert!(
+        after_first >= BLOBS as u64,
+        "the first push should have uploaded {BLOBS} blobs, spent {after_first}"
+    );
+    limits
+        .commit(ship.control_table_mut())
+        .await
+        .expect("commit");
+
+    // Second push: the remote already holds every blob, so nothing is
+    // transferred and the cost must not scale with how many are held.
+    let mut limits = LimiterSet::open(&mut ship, &[(LimitUnit::Ops, "/ops".to_string())])
+        .await
+        .expect("rebind");
+    let before_second = limits.states()[0].used;
+    let _ = push_content_to_remote_limited(&ship, &mut remote, "main", &mut limits)
+        .await
+        .expect("second push");
+    let spent = limits.states()[0].used - before_second;
+
+    assert!(
+        spent < BLOBS as u64,
+        "a no-op re-push spent {spent} ops across {BLOBS} retained blobs, \
+         which is the per-blob probing this listing replaced"
+    );
+}
