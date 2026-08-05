@@ -121,6 +121,8 @@ pub async fn status_command(ship_context: &ShipContext) -> Result<()> {
             None => println!("    mount:        / (mirror)"),
         }
 
+        report_storage(&mut ship, &attachment).await;
+
         if mode.pushes() {
             match last_pushed_tip {
                 Some(tip) => println!("    last pushed:  {}", tip),
@@ -143,6 +145,49 @@ pub async fn status_command(ship_context: &ShipContext) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Print the storage profile backing `attachment`, or nothing if it carries
+/// its connection details inline.
+///
+/// Worth a line for the same reason the limits are (Decision L9): the profile
+/// is now the only place the endpoint and credentials are written, so "which
+/// storage is this remote actually talking to" is otherwise a question that
+/// requires reading a second node to answer.
+async fn report_storage(ship: &mut steward::Steward, attachment: &steward::RemoteAttachment) {
+    let Some(path) = attachment.storage.as_deref() else {
+        return;
+    };
+
+    let Some(pond) = ship.as_pond_mut() else {
+        println!(
+            "    storage:      {}  [unavailable: not a pond steward]",
+            path
+        );
+        return;
+    };
+
+    // `describe` is what makes this safe to print: it is tested to name no
+    // credential, resolved or otherwise.
+    let detail = match steward::ResolvedStorage::open(pond, path).await {
+        Ok(profile) => Ok(profile.describe()),
+        // Report rather than fail.  A broken profile means this remote cannot
+        // push at all, which is exactly when `pond status` has to keep working
+        // and say why.
+        Err(e) => Err(e.to_string()),
+    };
+    println!("{}", format_storage_line(path, &detail));
+}
+
+/// `storage:      /sys/storage/minio  (minio, http://watershop:9000)`
+///
+/// Pure so the rendering can be tested without a pond holding a real profile,
+/// which today would mean a reachable MinIO.
+fn format_storage_line(path: &str, detail: &Result<String, String>) -> String {
+    match detail {
+        Ok(described) => format!("    storage:      {}  ({})", path, described),
+        Err(reason) => format!("    storage:      {}  [{}]", path, reason),
+    }
 }
 
 /// Print one line per limiter governing `attachment`, or nothing if it is
@@ -259,6 +304,32 @@ fn format_timestamp(micros: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The profile line names where the pond talks to, and -- because it is
+    /// built from `describe` -- never what it authenticates with.
+    #[test]
+    fn the_storage_line_names_the_profile_and_no_credential() {
+        let doc = b"endpoint: http://watershop:9000\naccess_key_id: ${env:S3_KEY}\nsecret_access_key: ${env:S3_SECRET}\n";
+        let profile =
+            steward::ResolvedStorage::from_bytes("/sys/storage/minio", doc).expect("parse");
+        let line = format_storage_line("/sys/storage/minio", &Ok(profile.describe()));
+
+        assert!(line.contains("/sys/storage/minio"), "{line}");
+        assert!(line.contains("http://watershop:9000"), "{line}");
+        assert!(!line.contains("S3_SECRET"), "{line}");
+        assert!(!line.contains("secret_access_key"), "{line}");
+    }
+
+    /// A profile that cannot be read means this remote cannot push at all,
+    /// which is exactly when `pond status` has to keep working and say why.
+    #[test]
+    fn an_unreadable_profile_is_reported_not_hidden() {
+        let line = format_storage_line(
+            "/sys/storage/minio",
+            &Err("storage profile `/sys/storage/minio` not found".to_string()),
+        );
+        assert!(line.contains("not found"), "{line}");
+    }
     use super::*;
 
     fn state(unit: LimitUnit, used: u64, limit: u64, window: Duration) -> LimiterState {

@@ -15,7 +15,7 @@
 
 use cmd::commands::{
     apply_command, init_command, push_command, remote::list_remote_names,
-    remote::load_remote_attachment,
+    remote::load_remote_attachment, status_command,
 };
 use cmd::common::ShipContext;
 use provider::factory::rate_limit::LimitUnit;
@@ -508,4 +508,42 @@ async fn a_profile_binds_from_the_stored_reference_not_the_rendered_view() {
         Some(path.as_str())
     );
     assert_eq!(opts.get("allow_http").map(String::as_str), Some("true"));
+}
+
+/// Phase A1: `pond status` still renders on a pond containing a profile node.
+///
+/// Deliberately narrow, and worth stating why.  A `file://` backup cannot name
+/// a MinIO profile -- the schemes must agree -- and an `s3://` one cannot be
+/// attached here, because attach performs a real push.  So the *profile-backed*
+/// status line cannot be reached end-to-end without a reachable MinIO; its
+/// rendering is covered instead by `format_storage_line`'s unit tests, and this
+/// asserts only that a profile node in the pond does not disturb `status`.
+///
+/// The gap closes when the staging MinIO is restored -- the same prerequisite
+/// as measuring real push bandwidth.
+#[tokio::test]
+async fn status_renders_on_a_pond_holding_a_profile() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let pond = tmp.path().join("pond");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "test-host").await.expect("init");
+
+    // A `file://` backup cannot name a MinIO profile (schemes must agree), so
+    // the profile is applied on its own and the status path is exercised by
+    // attaching it to a remote whose URL it does serve.
+    let remote = tmp.path().join("remote");
+    std::fs::create_dir_all(&remote).expect("mkdir");
+    apply_yaml(
+        &ctx,
+        tmp.path(),
+        &format!(
+            "version: v1\nkind: mknod\nmetadata:\n  path: /sys/storage/minio\nspec:\n  factory: storage-minio\n  config:\n    endpoint: http://watershop:9000\n    access_key_id: ${{env:PATH}}\n    secret_access_key: ${{env:PATH}}\n---\nversion: v1\nkind: backup\nmetadata:\n  path: /sys/remotes/origin\nspec:\n  url: file://{}\n",
+            remote.display()
+        ),
+    )
+    .await
+    .expect("apply");
+
+    status_command(&ctx).await.expect("status with a profile");
 }
