@@ -907,6 +907,66 @@ sequencing reasons, not design ones.
 
 ---
 
+## 8b. Measured traffic, and the two gaps it exposed
+
+Measured 2026-08-04 against the live MinIO on watershop, by aggregating object
+`LastModified` and size per bucket. This is the first real data the budgets can
+be sized from, rather than guesses.
+
+Steady state, full days (2026-08-03 / 2026-08-04):
+
+| pond | bytes/day | objects/day |
+|---|---|---|
+| water | 12.4 MB, 12.0 MB | 123, 97 |
+| septic | 1.8 MB, 3.6 MB | 72, 72 |
+| noyo | 0.90 MB, 0.98 MB | 18, 18 |
+
+No bucket holds anything before 2026-08-02, so that day is an initial backfill
+after a reset. On it, `water-staging` wrote **11.41 GB in 155 objects** -- 109
+of them ~100 MiB blobs, landing in **112 seconds** (7.53 GB in minute 16:09,
+3.88 GB in 16:10). That is ~125 MB/s, roughly **950x a normal day, delivered in
+under two minutes**.
+
+### 8b.1 Initial import needs an override, and `burst` is not it
+
+There is no single number that permits that backfill and also constrains a
+runaway: a budget above 16 GiB/day protects nothing, while one sized for
+steady operation refuses a legitimate rebuild.
+
+`burst` cannot express this. A burst only ever makes a limit **stricter** --
+when `burst < amount` it adds a second, tighter constraint over a shorter span
+(`limiter.rs:412`). It has no form that grants extra allowance.
+
+An automatic exemption for "the remote is empty, so this must be a first push"
+is tempting and should be rejected: an empty remote is also what an accidental
+bucket deletion looks like, so the one case that would silently re-upload 11 GB
+is exactly the case that would be exempt.
+
+That leaves an explicit, deliberate override. The interim mechanism is to raise
+the instance's `BACKUP_MIB_PER_DAY`, push, and put it back -- adequate, but it
+relies on remembering to revert, which is the classic way a temporary exemption
+becomes permanent. The shape worth designing is a **one-shot grant recorded in
+the disposable control state**, not in pond config: it cannot be replicated, it
+disappears with the control table, it is visible in `pond status` while active,
+and it makes "spend 11 GB" an act someone performs on purpose. Not yet
+designed; see also §10.
+
+### 8b.2 Pulls are not governed at all
+
+Only `push` binds limiters. A pull-mode remote carrying `limits` used to parse,
+validate, and appear in `pond status` while enforcing nothing. That is worse
+than an absent limit, so it is now refused at attach time
+(`remote.rs`, `limits_on_a_pull_only_remote_are_refused`).
+
+The refusal makes the gap loud; it does not close it. The site pond imports all
+three producers read-through, and on a metered provider **egress is typically
+the expensive direction** -- so the ungoverned side may be the costlier one.
+Governing pulls is unscheduled work, and the reason it was not simply added
+here is that a pull's cost is not known before the transfer in the way a push's
+is.
+
+---
+
 ## 9. Summary of decisions
 
 | ID | Decision |

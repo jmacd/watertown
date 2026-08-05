@@ -547,3 +547,44 @@ async fn status_renders_on_a_pond_holding_a_profile() {
 
     status_command(&ctx).await.expect("status with a profile");
 }
+
+/// Only pushes are governed.  A pull-only remote carrying `limits` would
+/// otherwise parse, validate, and appear in `pond status` while enforcing
+/// nothing -- a claimed protection that does not exist is worse than an
+/// obviously absent one.
+#[tokio::test]
+async fn limits_on_a_pull_only_remote_are_refused() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let pond = tmp.path().join("pond");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "test-host").await.expect("init");
+
+    let upstream = tmp.path().join("upstream");
+    std::fs::create_dir_all(&upstream).expect("mkdir");
+
+    let err = apply_yaml(
+        &ctx,
+        tmp.path(),
+        &format!(
+            "version: v1\nkind: mknod\nmetadata:\n  path: /sys/limits/backup-bytes\nspec:\n  factory: rate-limit\n  config:\n    unit: MiB/day\n    limit: 10\n    burst: 1\n---\nversion: v1\nkind: remote\nmetadata:\n  path: /sys/remotes/upstream\nspec:\n  url: file://{}\n  mount: /sources/upstream\n  limits:\n    bytes: /sys/limits/backup-bytes\n",
+            upstream.display()
+        ),
+    )
+    .await
+    .expect_err("a pull-only remote must not claim limits");
+
+    let text = err.to_string();
+    assert!(
+        text.contains("only enforced on pushes"),
+        "unexpected error: {text}"
+    );
+
+    assert!(
+        list_remote_names(&mut ctx.open_pond().await.expect("open"))
+            .await
+            .expect("list")
+            .is_empty(),
+        "a refused attachment must leave no trace"
+    );
+}
