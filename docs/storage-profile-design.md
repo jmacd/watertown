@@ -54,6 +54,53 @@ is what `/sys/remotes/origin` is supposed to describe. The field could not be
 expressed per-environment because it was stored per-*remote*, in the wrong
 place entirely.
 
+### 0.1a Why it had nowhere to go: two configuration paths
+
+The bool is a symptom of a split one level down. `pond apply` has **two
+unrelated ways** to write configuration into a pond, and they follow different
+rules about environment references.
+
+**The `mknod` path (factories).** `mknod` and `kind: mknod` expand a copy of the
+config for *validation only* and store the **raw** text, references intact
+(`mknod.rs:28-58`, `apply.rs:288-330`). `FactoryRegistry::create_file` and
+`create_directory` then expand again at every node materialization
+(`registry.rs:314-366`). The invariant is: **expand at each use, never persist a
+resolved value.** Any scalar can be a reference, because expansion happens on
+text before it is ever typed.
+
+**The remote path (attachments).** `kind: remote` / `kind: backup` never touches
+the factory registry. `parse_remote_kind` deserializes a `RemoteAttachment`
+straight into a typed struct and stores it as its own document. It expands
+exactly one field, `url`, and stores that one **resolved**.
+
+That is why `allow_http` had nowhere to go. On the mknod path the question never
+arises -- `allow_http: ${env:S3_ALLOW_HTTP}` is just text until the moment it is
+used. On the remote path the value is parsed as a `bool` before any expansion
+could apply, so the reference cannot even be written down. The field was not
+merely in the wrong struct; it was on the side of the split that cannot express
+references at all.
+
+So this design has a second purpose beyond §0.2. A storage profile is a real
+factory node, which brings the *connection* half of a remote back onto the mknod
+path and under its invariant. What remains on the attachment is only what is
+genuinely per-attachment: `url`, `mount`, direction, `limits`, and the `storage:`
+pointer itself. That is a narrowing of the special surface, in the direction of
+all configuration being uniform, inspectable, infrastructure-as-code.
+
+Two things it does **not** fix, recorded so they are not mistaken for done:
+
+1. **The attachment is still not a factory node.** Profiles shrink the bespoke
+   surface; they do not remove it. Making remotes true `mknod` nodes is a much
+   larger change and is not proposed here -- but it is the direction this points,
+   and worth deciding deliberately rather than drifting into.
+
+2. **`url` is still stored resolved.** Defensible when written -- the URL is
+   needed at attach time to open and validate the remote, and it is not a secret
+   -- but it is the one place the "never persist a resolved value" invariant is
+   knowingly broken. The cost is that an attachment document is not portable
+   across replicas whose URL differs by environment, which is precisely the
+   property replication is supposed to give. See §10.
+
 ### 0.2 The bigger problem, now that Azure is next
 
 The URL scheme currently drives every storage decision in the codebase, by
@@ -473,6 +520,7 @@ to replace.
 | A0 | `storage-minio` factory, `ResolvedStorage`, `storage:` field; inline path untouched | The whole idea, against the one provider actually in use |
 | A1 | Attach-time validation, `pond status` line | The failure modes, before any deployment depends on them |
 | A2 | Convert `attach-remotes.sh` to `pond apply` documents | §0.1 -- the thing that motivated this |
+| -- | Store `url` raw, expand at use | §0.1a; separate change, see §10.5 |
 | A3 | `storage-azure`: `object_store` azure feature, `azure_registration.rs`, the factory, dispatch | §0.2, and that the abstraction survives a genuinely different provider |
 | -- | `storage-s3` / `storage-r2` | Deferred indefinitely; see §3.3 |
 
@@ -528,6 +576,19 @@ introduced. That is worth deciding before A3 rather than during it.
 4. **Should `url` move into the profile?** No -- the bucket or container is the
    one thing that genuinely differs per attachment. Recorded only to note it
    was considered.
+5. **Should `url` be stored raw and expanded at use?** (§0.1a) It is the one
+   knowingly resolved-at-write field left. Storing the reference and expanding
+   at each use would put the remote path back under the mknod invariant and make
+   an attachment document portable across replicas whose endpoint differs by
+   environment. The work is small and the shape is already proven by A1b. The
+   reason to hold: it changes the meaning of existing stored attachments, so it
+   wants its own change with its own compatibility note (§7), not a rider on A0.
+6. **Should attachments become factory nodes outright?** (§0.1a) The endpoint of
+   the "all configuration through `mknod`" goal, and the only version of this
+   that removes the special surface rather than narrowing it. Large, and it
+   would have to preserve the attach-time validation and mount-conflict rules
+   that currently live in `remote_config`. Named here so the direction is a
+   decision rather than a drift.
 
 ---
 
