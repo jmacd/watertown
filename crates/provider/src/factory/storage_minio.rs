@@ -58,6 +58,11 @@ use tinyfs::FileHandle;
 use tinyfs::Result as TinyFSResult;
 use tinyfs::ResultExt;
 
+/// The factory name this kind registers under.  Named once here so consumers
+/// that dispatch on it (`steward::storage_profile`) cannot drift from the
+/// registration below.
+pub const FACTORY_NAME: &str = "storage-minio";
+
 /// MinIO's own default, and what `object_store` signs with when a region is
 /// not supplied.  MinIO ignores the region for placement but SigV4 requires
 /// one, so this is a genuine default rather than a guess.
@@ -309,7 +314,7 @@ fn validate_storage_minio_raw_config(config: &[u8]) -> TinyFSResult<()> {
 }
 
 crate::register_dynamic_factory!(
-    name: "storage-minio",
+    name: FACTORY_NAME,
     description: "Declare how to reach a MinIO deployment (endpoint + credentials), referenced by path from remotes",
     file: create_storage_minio_handle,
     validate: validate_storage_minio_config,

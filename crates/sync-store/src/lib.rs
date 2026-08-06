@@ -23,6 +23,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+mod azure_registration;
 pub mod checksum;
 pub mod content;
 pub mod content_remote;
@@ -32,6 +33,7 @@ pub mod schema;
 mod store;
 pub mod tlog;
 
+pub use azure_registration::{AZURE_SCHEMES, register_azure_handlers};
 pub use s3_registration::register_s3_handlers;
 
 pub use content::{

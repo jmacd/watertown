@@ -704,3 +704,112 @@ async fn an_applied_pull_remote_is_actually_governed() {
         "expected a rate-limit refusal, got: {msg}"
     );
 }
+
+/// Phase A3, end to end: an Azure profile survives `pond apply` and reads back
+/// as an Azure profile.
+///
+/// The round trip is the point.  Dispatch keys off the factory recorded on the
+/// node (Decision A9), so this is what proves the name is actually stored and
+/// returned -- a unit test can only assert that a name it supplied is honoured.
+#[tokio::test]
+async fn an_azure_profile_applies_and_reads_back_as_azure() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let pond = tmp.path().join("pond");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "test-host").await.expect("init");
+
+    apply_yaml(
+        &ctx,
+        tmp.path(),
+        "version: v1\nkind: mknod\nmetadata:\n  path: /sys/storage/azure\nspec:\n  factory: storage-azure\n  config:\n    account_name: casparwater\n    account_key: ${env:PATH}\n",
+    )
+    .await
+    .expect("apply azure profile");
+
+    let mut ship = ctx.open_pond().await.expect("open");
+    let pond = ship.as_pond_mut().expect("pond steward");
+    let profile = steward::ResolvedStorage::open(pond, "/sys/storage/azure")
+        .await
+        .expect("read profile back");
+
+    assert_eq!(profile.kind(), "storage-azure");
+    assert!(profile.serves_scheme("az://container/prefix"));
+    assert!(
+        !profile.serves_scheme("s3://bucket"),
+        "an azure profile must not claim an s3 URL"
+    );
+
+    // The reference survived as text and resolves here, not at apply time
+    // (Decision A6).
+    let opts = profile.to_storage_options().expect("resolve");
+    let path = std::env::var("PATH").expect("PATH is set");
+    assert_eq!(
+        opts.get("account_key").map(String::as_str),
+        Some(path.as_str())
+    );
+    assert_eq!(
+        opts.get("account_name").map(String::as_str),
+        Some("casparwater")
+    );
+}
+
+/// An Azure profile with two credential shapes is refused at `pond apply`,
+/// not stored and left to fail on first push (Decision A4).
+#[tokio::test]
+async fn an_ambiguous_azure_profile_is_refused_at_apply() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let pond = tmp.path().join("pond");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "test-host").await.expect("init");
+
+    let err = apply_yaml(
+        &ctx,
+        tmp.path(),
+        "version: v1\nkind: mknod\nmetadata:\n  path: /sys/storage/azure\nspec:\n  factory: storage-azure\n  config:\n    account_name: casparwater\n    account_key: ${env:PATH}\n    sas_token: ${env:PATH}\n",
+    )
+    .await
+    .expect_err("two credentials must be refused");
+    assert!(format!("{err:#}").contains("exactly one"), "{err:#}");
+}
+
+/// An Azure profile with no credential is refused at apply too: authenticating
+/// with nothing is an outage deferred to first push.
+#[tokio::test]
+async fn an_azure_profile_without_a_credential_is_refused_at_apply() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let pond = tmp.path().join("pond");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "test-host").await.expect("init");
+
+    let err = apply_yaml(
+        &ctx,
+        tmp.path(),
+        "version: v1\nkind: mknod\nmetadata:\n  path: /sys/storage/azure\nspec:\n  factory: storage-azure\n  config:\n    account_name: casparwater\n",
+    )
+    .await
+    .expect_err("no credential must be refused");
+    assert!(format!("{err:#}").contains("exactly one"), "{err:#}");
+}
+
+/// A literal Azure credential must be refused at apply, exactly as a literal
+/// S3 secret is: the node replicates to every backup.
+#[tokio::test]
+async fn a_literal_azure_credential_is_refused_at_apply() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let pond = tmp.path().join("pond");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "test-host").await.expect("init");
+
+    let err = apply_yaml(
+        &ctx,
+        tmp.path(),
+        "version: v1\nkind: mknod\nmetadata:\n  path: /sys/storage/azure\nspec:\n  factory: storage-azure\n  config:\n    account_name: casparwater\n    account_key: hunter2\n",
+    )
+    .await
+    .expect_err("a literal secret must be refused");
+    assert!(format!("{err:#}").contains("account_key"), "{err:#}");
+}

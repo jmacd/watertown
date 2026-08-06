@@ -34,6 +34,7 @@
 
 use crate::PondUserMetadata;
 use crate::Ship;
+use provider::factory::storage_azure::StorageAzureConfig;
 use provider::factory::storage_minio::StorageMinioConfig;
 use std::collections::HashMap;
 use std::fmt;
@@ -97,42 +98,94 @@ pub enum ResolvedStorage {
         path: String,
         config: Box<StorageMinioConfig>,
     },
+    /// A `storage-azure` profile.
+    Azure {
+        path: String,
+        config: Box<StorageAzureConfig>,
+    },
 }
 
 impl ResolvedStorage {
     /// Read and parse the profile node at `path`.
     pub async fn open(ship: &mut Ship, path: &str) -> Result<Self, StorageProfileError> {
-        let bytes = read_node_bytes(ship, path).await?;
-        Self::from_bytes(path, &bytes)
+        let (factory, bytes) = read_node_bytes(ship, path).await?;
+        Self::from_bytes(path, &factory, &bytes)
     }
 
-    /// Parse an already-read profile document.
+    /// Parse an already-read profile document, given the factory that created
+    /// the node.
     ///
     /// Split out from [`Self::open`] so the parse and scheme rules can be
     /// exercised without a pond.
-    pub fn from_bytes(path: &str, bytes: &[u8]) -> Result<Self, StorageProfileError> {
-        // Only one kind exists today.  When `storage-azure` lands it is
-        // dispatched here, on the document's shape -- the node does not record
-        // which factory produced it, so each kind's parse must be strict
-        // enough to reject the others.  `deny_unknown_fields` on every config
-        // is what makes that safe.
-        match provider::factory::storage_minio::config_from_bytes(bytes) {
-            Ok(config) => Ok(Self::Minio {
+    ///
+    /// # Why the factory name and not the document's shape
+    ///
+    /// Dispatching on shape -- trying each kind's parser until one succeeds --
+    /// requires every profile kind to stay parse-disjoint from every other one
+    /// for good.  That holds today only because `storage-minio` requires an
+    /// `endpoint` that `storage-azure` does not have, and `storage-r2` (§3.3)
+    /// would immediately strain it by being MinIO-shaped without an endpoint.
+    /// Worse, the failure is silent misattribution rather than an error: a
+    /// document read as the wrong kind registers the wrong handlers and
+    /// surfaces as an opaque authentication failure on first push, which is
+    /// the class of bug profiles exist to remove.
+    ///
+    /// The node records the factory that created it -- `get_dynamic_node_config`
+    /// returns it, and this code previously discarded it -- so the kind is a
+    /// known fact rather than something to infer.  Knowing it also means a
+    /// malformed document reports *its own* kind's complaint.
+    pub fn from_bytes(
+        path: &str,
+        factory: &str,
+        bytes: &[u8],
+    ) -> Result<Self, StorageProfileError> {
+        match factory {
+            provider::factory::storage_azure::FACTORY_NAME => {
+                let config = provider::factory::storage_azure::config_from_bytes(bytes).map_err(
+                    |reason| StorageProfileError::NotAProfile {
+                        path: path.to_string(),
+                        reason,
+                    },
+                )?;
+                Ok(Self::Azure {
+                    path: path.to_string(),
+                    config: Box::new(config),
+                })
+            }
+            provider::factory::storage_minio::FACTORY_NAME => {
+                let config = provider::factory::storage_minio::config_from_bytes(bytes).map_err(
+                    |reason| StorageProfileError::NotAProfile {
+                        path: path.to_string(),
+                        reason,
+                    },
+                )?;
+                Ok(Self::Minio {
+                    path: path.to_string(),
+                    config: Box::new(config),
+                })
+            }
+            other => Err(StorageProfileError::NotAProfile {
                 path: path.to_string(),
-                config: Box::new(config),
-            }),
-            Err(reason) => Err(StorageProfileError::NotAProfile {
-                path: path.to_string(),
-                reason,
+                reason: format!(
+                    "`{other}` is not a storage profile factory; expected one of: {}",
+                    Self::KINDS.join(", ")
+                ),
             }),
         }
     }
+
+    /// Every factory name that names a storage profile, for error messages.
+    const KINDS: &'static [&'static str] = &[
+        provider::factory::storage_minio::FACTORY_NAME,
+        provider::factory::storage_azure::FACTORY_NAME,
+    ];
 
     /// The profile's kind, as written in `pond apply`.
     #[must_use]
     pub fn kind(&self) -> &'static str {
         match self {
-            Self::Minio { .. } => "storage-minio",
+            Self::Minio { .. } => provider::factory::storage_minio::FACTORY_NAME,
+            Self::Azure { .. } => provider::factory::storage_azure::FACTORY_NAME,
         }
     }
 
@@ -140,7 +193,7 @@ impl ResolvedStorage {
     #[must_use]
     pub fn path(&self) -> &str {
         match self {
-            Self::Minio { path, .. } => path,
+            Self::Minio { path, .. } | Self::Azure { path, .. } => path,
         }
     }
 
@@ -150,6 +203,13 @@ impl ResolvedStorage {
     pub fn describe(&self) -> String {
         match self {
             Self::Minio { config, .. } => format!("minio, {}", config.endpoint),
+            // The credential *shape* is named because it is what an operator
+            // rotating a key needs to see; the value never appears.
+            Self::Azure { config, .. } => format!(
+                "azure, account {} ({})",
+                config.account_name,
+                config.credential().map_or("no credential", |c| c.shape())
+            ),
         }
     }
 
@@ -161,6 +221,9 @@ impl ResolvedStorage {
     pub fn serves_scheme(&self, url: &str) -> bool {
         match self {
             Self::Minio { .. } => url.starts_with("s3://") || url.starts_with("s3a://"),
+            Self::Azure { .. } => sync_store::AZURE_SCHEMES
+                .iter()
+                .any(|s| url.starts_with(&format!("{s}://"))),
         }
     }
 
@@ -184,6 +247,7 @@ impl ResolvedStorage {
     pub fn register_handlers(&self) {
         match self {
             Self::Minio { .. } => sync_store::register_s3_handlers(),
+            Self::Azure { .. } => sync_store::register_azure_handlers(),
         }
     }
 
@@ -192,6 +256,14 @@ impl ResolvedStorage {
     pub fn to_storage_options(&self) -> Result<HashMap<String, String>, StorageProfileError> {
         match self {
             Self::Minio { path, config } => {
+                config
+                    .to_storage_options()
+                    .map_err(|reason| StorageProfileError::Unresolvable {
+                        path: path.clone(),
+                        reason,
+                    })
+            }
+            Self::Azure { path, config } => {
                 config
                     .to_storage_options()
                     .map_err(|reason| StorageProfileError::Unresolvable {
@@ -215,7 +287,10 @@ impl ResolvedStorage {
 /// hand to a consumer.  Binding therefore reads the stored config, where the
 /// `${env:...}` references survive, so each replica resolves as itself
 /// (Decision A6).
-async fn read_node_bytes(ship: &mut Ship, path: &str) -> Result<Vec<u8>, StorageProfileError> {
+async fn read_node_bytes(
+    ship: &mut Ship,
+    path: &str,
+) -> Result<(String, Vec<u8>), StorageProfileError> {
     let meta = PondUserMetadata::new(vec!["internal".to_string(), "storage-open".to_string()]);
     let tx = ship
         .begin_read(&meta)
@@ -250,7 +325,7 @@ async fn read_node_bytes(ship: &mut Ship, path: &str) -> Result<Vec<u8>, Storage
         };
 
         match tx.get_dynamic_node_config(node.id()).await {
-            Ok(Some((_factory, config))) => Ok(config),
+            Ok(Some((factory, config))) => Ok((factory, config)),
             Ok(None) => Err(StorageProfileError::NotAProfile {
                 path: path.to_string(),
                 reason: "not a factory node; a storage profile is created by \
@@ -312,12 +387,14 @@ pub async fn prepare_storage(
 mod tests {
     use super::*;
 
+    const MINIO: &str = provider::factory::storage_minio::FACTORY_NAME;
+
     const DOC: &[u8] =
         b"endpoint: http://watershop:9000\naccess_key_id: ${env:PATH}\nsecret_access_key: ${env:PATH}\n";
 
     #[test]
     fn a_minio_document_parses() {
-        let p = ResolvedStorage::from_bytes("/sys/storage/minio", DOC).expect("parse");
+        let p = ResolvedStorage::from_bytes("/sys/storage/minio", MINIO, DOC).expect("parse");
         assert_eq!(p.kind(), "storage-minio");
         assert_eq!(p.path(), "/sys/storage/minio");
         assert!(p.describe().contains("watershop:9000"));
@@ -327,7 +404,7 @@ mod tests {
     /// which is what `pond status` prints.
     #[test]
     fn describe_names_no_credential() {
-        let p = ResolvedStorage::from_bytes("/sys/storage/minio", DOC).expect("parse");
+        let p = ResolvedStorage::from_bytes("/sys/storage/minio", MINIO, DOC).expect("parse");
         let d = p.describe();
         assert!(!d.contains("access_key"), "{d}");
         assert!(!d.contains("secret"), "{d}");
@@ -338,7 +415,7 @@ mod tests {
     /// profile, and a mismatched URL is refused rather than half-working.
     #[test]
     fn scheme_compatibility_is_checked() {
-        let p = ResolvedStorage::from_bytes("/sys/storage/minio", DOC).expect("parse");
+        let p = ResolvedStorage::from_bytes("/sys/storage/minio", MINIO, DOC).expect("parse");
         p.check_scheme("s3://bucket").expect("s3 is served");
         p.check_scheme("s3a://bucket").expect("s3a is served");
 
@@ -355,7 +432,7 @@ mod tests {
 
     #[test]
     fn a_malformed_document_is_not_a_profile() {
-        let err = ResolvedStorage::from_bytes("/sys/storage/x", b"not: a: profile\n")
+        let err = ResolvedStorage::from_bytes("/sys/storage/x", MINIO, b"not: a: profile\n")
             .expect_err("must refuse");
         assert!(matches!(err, StorageProfileError::NotAProfile { .. }));
     }
@@ -367,6 +444,7 @@ mod tests {
     fn a_literal_credential_is_refused_on_read() {
         let err = ResolvedStorage::from_bytes(
             "/sys/storage/minio",
+            MINIO,
             b"endpoint: http://x:9000\naccess_key_id: ${env:PATH}\nsecret_access_key: hunter2\n",
         )
         .expect_err("must refuse");
@@ -375,7 +453,7 @@ mod tests {
 
     #[test]
     fn options_resolve_at_use_time() {
-        let p = ResolvedStorage::from_bytes("/sys/storage/minio", DOC).expect("parse");
+        let p = ResolvedStorage::from_bytes("/sys/storage/minio", MINIO, DOC).expect("parse");
         let opts = p.to_storage_options().expect("resolve");
         let path = std::env::var("PATH").expect("PATH is set");
         assert_eq!(
@@ -389,11 +467,111 @@ mod tests {
     fn an_unresolvable_reference_reports_the_profile_path() {
         let p = ResolvedStorage::from_bytes(
             "/sys/storage/minio",
+            MINIO,
             b"endpoint: http://x:9000\naccess_key_id: ${env:NOT_SET_XYZZY_A}\nsecret_access_key: ${env:NOT_SET_XYZZY_B}\n",
         )
         .expect("parse");
         let err = p.to_storage_options().expect_err("must fail");
         assert!(matches!(err, StorageProfileError::Unresolvable { .. }));
         assert!(format!("{err}").contains("/sys/storage/minio"), "{err}");
+    }
+
+    /// The kind comes from the node's recorded factory, not from guessing at
+    /// the document.  A node created by some other factory is refused by name
+    /// rather than parsed hopefully -- which is what stops a future profile
+    /// kind that happens to parse as MinIO from being served with the wrong
+    /// handlers.
+    #[test]
+    fn a_foreign_factory_is_refused_by_name() {
+        let err = ResolvedStorage::from_bytes("/sys/limits/backup-bytes", "rate-limit", DOC)
+            .expect_err("a rate-limit node is not a storage profile");
+        let msg = format!("{err}");
+        assert!(msg.contains("rate-limit"), "{msg}");
+        assert!(
+            msg.contains("storage-minio"),
+            "should name what is expected: {msg}"
+        );
+    }
+
+    const AZURE: &str = provider::factory::storage_azure::FACTORY_NAME;
+
+    const AZ_DOC: &[u8] = b"account_name: casparwater\naccount_key: ${env:PATH}\n";
+
+    #[test]
+    fn an_azure_document_parses() {
+        let p = ResolvedStorage::from_bytes("/sys/storage/azure", AZURE, AZ_DOC).expect("parse");
+        assert_eq!(p.kind(), "storage-azure");
+        assert_eq!(p.path(), "/sys/storage/azure");
+        assert!(p.describe().contains("casparwater"), "{}", p.describe());
+    }
+
+    /// `describe` feeds `pond status`.  It names the credential shape, which is
+    /// operationally useful, and never the credential.
+    #[test]
+    fn azure_describe_names_the_shape_and_no_credential() {
+        let p = ResolvedStorage::from_bytes("/sys/storage/azure", AZURE, AZ_DOC).expect("parse");
+        let d = p.describe();
+        assert!(d.contains("account_key"), "{d}");
+        let path = std::env::var("PATH").expect("PATH is set");
+        assert!(!d.contains(&path), "{d}");
+        assert!(!d.contains("${env"), "{d}");
+    }
+
+    /// §3.2: an Azure profile paired with an `s3://` URL is refused at attach,
+    /// rather than producing a confusing authentication failure at first push.
+    /// This is the whole reason the profile's kind, not the URL, picks the
+    /// provider.
+    #[test]
+    fn an_azure_profile_refuses_an_s3_url() {
+        let p = ResolvedStorage::from_bytes("/sys/storage/azure", AZURE, AZ_DOC).expect("parse");
+        for url in ["az://c/p", "azure://c/p", "abfs://c/p", "abfss://c/p"] {
+            p.check_scheme(url).unwrap_or_else(|e| panic!("{url}: {e}"));
+        }
+        for url in ["s3://bucket", "s3a://bucket", "file:///tmp/x"] {
+            assert!(
+                matches!(
+                    p.check_scheme(url),
+                    Err(StorageProfileError::SchemeMismatch { .. })
+                ),
+                "{url} must be refused by an azure profile"
+            );
+        }
+    }
+
+    /// The two kinds must not be confusable in either direction.  With dispatch
+    /// on the recorded factory (A9) this holds by construction rather than by
+    /// the documents happening to stay parse-disjoint.
+    #[test]
+    fn the_kinds_do_not_parse_as_each_other() {
+        assert!(ResolvedStorage::from_bytes("/sys/storage/x", AZURE, DOC).is_err());
+        assert!(ResolvedStorage::from_bytes("/sys/storage/x", MINIO, AZ_DOC).is_err());
+    }
+
+    #[test]
+    fn azure_options_resolve_at_use_time() {
+        let p = ResolvedStorage::from_bytes("/sys/storage/azure", AZURE, AZ_DOC).expect("parse");
+        let opts = p.to_storage_options().expect("resolve");
+        let path = std::env::var("PATH").expect("PATH is set");
+        assert_eq!(
+            opts.get("account_key").map(String::as_str),
+            Some(path.as_str())
+        );
+        assert_eq!(
+            opts.get("account_name").map(String::as_str),
+            Some("casparwater")
+        );
+    }
+
+    /// An Azure profile carrying two credential shapes must be refused on read,
+    /// not silently resolved to one of them (Decision A4).
+    #[test]
+    fn an_ambiguous_azure_profile_is_refused_on_read() {
+        let err = ResolvedStorage::from_bytes(
+            "/sys/storage/azure",
+            AZURE,
+            b"account_name: casparwater\naccount_key: ${env:PATH}\nsas_token: ${env:PATH}\n",
+        )
+        .expect_err("must refuse");
+        assert!(format!("{err}").contains("exactly one"), "{err}");
     }
 }
