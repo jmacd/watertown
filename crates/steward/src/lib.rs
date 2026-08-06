@@ -34,6 +34,7 @@ mod rebuild;
 pub mod reclaim;
 mod remote_config;
 mod ship;
+pub mod storage_meter;
 pub mod storage_profile;
 mod write_lock;
 

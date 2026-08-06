@@ -118,10 +118,13 @@ async fn a_generous_limit_does_not_disturb_the_push() {
     write_file(&mut ship, "/a.txt", b"alpha").await;
 
     let pond_id = uuid::Uuid::parse_str(ship.data_persistence().pond_id()).expect("pond id");
-    let remote_dir = tempdir().expect("remote dir");
-    let mut remote = ContentRemote::create_at(remote_dir.path().join("remote"), pond_id)
-        .await
-        .expect("create remote");
+    let mut remote = ContentRemote::create_at_url(
+        &sync_store::testing::in_memory_remote_url("push-ok"),
+        pond_id,
+        [].into(),
+    )
+    .await
+    .expect("create remote");
 
     let mut limits = LimiterSet::open(&mut ship, &[(LimitUnit::Bytes, "/quota".to_string())])
         .await
@@ -150,10 +153,13 @@ async fn an_exhausted_budget_stops_the_push() {
     write_file(&mut ship, "/a.txt", b"alpha").await;
 
     let pond_id = uuid::Uuid::parse_str(ship.data_persistence().pond_id()).expect("pond id");
-    let remote_dir = tempdir().expect("remote dir");
-    let mut remote = ContentRemote::create_at(remote_dir.path().join("remote"), pond_id)
-        .await
-        .expect("create remote");
+    let mut remote = ContentRemote::create_at_url(
+        &sync_store::testing::in_memory_remote_url("push-denied"),
+        pond_id,
+        [].into(),
+    )
+    .await
+    .expect("create remote");
 
     let mut limits = LimiterSet::open(&mut ship, &[(LimitUnit::Bytes, "/quota".to_string())])
         .await
@@ -319,10 +325,13 @@ async fn a_re_push_does_not_pay_per_retained_blob() {
     }
 
     let pond_id = uuid::Uuid::parse_str(ship.data_persistence().pond_id()).expect("pond id");
-    let remote_dir = tempdir().expect("remote dir");
-    let mut remote = ContentRemote::create_at(remote_dir.path().join("remote"), pond_id)
-        .await
-        .expect("create remote");
+    let mut remote = ContentRemote::create_at_url(
+        &sync_store::testing::in_memory_remote_url("push-listing"),
+        pond_id,
+        [].into(),
+    )
+    .await
+    .expect("create remote");
 
     // First push: uploads are genuine work and are expected to cost per blob.
     let mut limits = LimiterSet::open(&mut ship, &[(LimitUnit::Ops, "/ops".to_string())])
@@ -354,7 +363,7 @@ async fn a_re_push_does_not_pay_per_retained_blob() {
 
     assert!(
         spent < BLOBS as u64,
-        "a no-op re-push spent {spent} ops across {BLOBS} retained blobs, \
-         which is the per-blob probing this listing replaced"
+        "a no-op re-push spent {spent} physical requests across {BLOBS} retained \
+         blobs, which is the per-blob probing this listing replaced"
     );
 }

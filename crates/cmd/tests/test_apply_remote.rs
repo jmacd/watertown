@@ -187,9 +187,7 @@ async fn apply_creates_a_governed_backup_in_one_document() {
     init_log();
     let tmp = TempDir::new().expect("tmp");
     let pond = tmp.path().join("pond");
-    let remote = tmp.path().join("remote");
-    std::fs::create_dir_all(&remote).expect("mkdir remote");
-    let url = format!("file://{}", remote.display());
+    let url = sync_store::testing::in_memory_remote_url("apply-governed-ok");
 
     let ctx = ctx_for(&pond, vec!["pond", "init"]);
     init_command(&ctx, "test-host").await.expect("init");
@@ -239,9 +237,7 @@ async fn an_applied_backup_is_actually_governed() {
     init_log();
     let tmp = TempDir::new().expect("tmp");
     let pond = tmp.path().join("pond");
-    let remote = tmp.path().join("remote");
-    std::fs::create_dir_all(&remote).expect("mkdir remote");
-    let url = format!("file://{}", remote.display());
+    let url = sync_store::testing::in_memory_remote_url("apply-governed-denied");
 
     let ctx = ctx_for(&pond, vec!["pond", "init"]);
     init_command(&ctx, "test-host").await.expect("init");

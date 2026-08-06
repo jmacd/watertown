@@ -18,7 +18,6 @@
 //! sends it as a blob object keyed by its content hash, so the closure is
 //! complete.
 
-use provider::factory::rate_limit::LimitUnit;
 use sync_store::ContentRemote;
 use sync_store::content::ObjectHash;
 
@@ -72,14 +71,19 @@ pub async fn push_content_to_remote(
 
 /// [`push_content_to_remote`], governed by `limits`.
 ///
-/// Every remote interaction is charged before it happens and recorded after it
-/// succeeds, so a push that fails costs nothing and a push is never started
-/// that the budget cannot cover.  Two dimensions are spent:
+/// Charging happens beneath this function, in the object store the remote is
+/// built on, so what is spent is what physically crossed the wire:
 ///
-/// - [`LimitUnit::Ops`] -- one per remote request: each `has_blob` probe, each
-///   `put_blob`, and the final batched `push_commit`.
-/// - [`LimitUnit::Bytes`] -- the blob bytes streamed to the remote, plus the
-///   inline object bytes in the commit batch.
+/// - [`provider::factory::rate_limit::LimitUnit::Ops`] -- one per storage
+///   request, including the log reads and parquet writes a Delta commit
+///   performs internally.
+/// - [`provider::factory::rate_limit::LimitUnit::Bytes`] -- bytes in **both**
+///   directions, because a provider bills egress and that is the direction a
+///   runaway read spends.
+///
+/// An earlier version charged one op per `ContentRemote` call here; a traced
+/// push showed that undercounted requests by ~600x and ignored every received
+/// byte.  See [`sync_store::metered_store`].
 ///
 /// `limits` is bound by the caller (see [`LimiterSet::open`]) because binding
 /// needs mutable pond access while the push itself does not; charging is pure,
@@ -101,6 +105,20 @@ pub async fn push_content_to_remote_limited(
     remote: &mut ContentRemote,
     ref_name: &str,
     limits: &mut LimiterSet,
+) -> Result<ContentPushOutcome, StewardError> {
+    crate::storage_meter::metered_op(limits, push_content_inner(ship, remote, ref_name)).await
+}
+
+/// The push itself.
+///
+/// No charging appears in this function on purpose.  Every request it makes
+/// passes through a metered object store (see [`sync_store::metered_store`]),
+/// so the hundreds of requests a Delta commit actually performs are counted
+/// instead of the single call that started them.
+async fn push_content_inner(
+    ship: &Ship,
+    remote: &mut ContentRemote,
+    ref_name: &str,
 ) -> Result<ContentPushOutcome, StewardError> {
     let seq = ship
         .control_table()
@@ -163,38 +181,28 @@ pub async fn push_content_to_remote_limited(
         // Nothing to ask about, so do not spend a request asking.
         std::collections::HashSet::new()
     } else {
-        limits.check(LimitUnit::Ops, 1)?;
-        let listed = remote
+        remote
             .list_blobs()
             .await
-            .map_err(|e| StewardError::Content(e.to_string()))?;
-        limits.record(LimitUnit::Ops, 1);
-        listed
+            .map_err(|e| StewardError::Content(e.to_string()))?
     };
 
     for hash in &materialized.external_blobs {
         if present_blobs.contains(hash) {
             continue;
         }
-        // Opening the reader is local and free, and it yields the exact number
-        // of raw content bytes that `put_blob` will stream (the parquet
-        // wrapper is not sent).  Charging that figure means the budget is
-        // spent in the same units the remote bills in, with no extra stat and
-        // no remote round-trip to learn the size.
+        // Opening the reader is local and free.  The bytes it streams are
+        // charged by the object store as they cross the wire, which also
+        // catches whatever framing the provider adds on top of them.
         let reader = ship
             .data_persistence()
             .open_large_file_reader_by_hash(&hash.to_hex())
             .await
             .map_err(|e| StewardError::Content(format!("open external blob: {e}")))?;
-        let size = reader.total_size();
-        limits.check(LimitUnit::Bytes, size)?;
-        limits.check(LimitUnit::Ops, 1)?;
         remote
             .put_blob(*hash, reader)
             .await
             .map_err(|e| StewardError::Content(format!("stream external blob: {e}")))?;
-        limits.record(LimitUnit::Bytes, size);
-        limits.record(LimitUnit::Ops, 1);
     }
     // The node manifest the commit references (Section 4.5); a consumer fetches
     // it to adopt the source's node_ids.  Verify it hashes to the commit's
@@ -215,16 +223,12 @@ pub async fn push_content_to_remote_limited(
     objects.push((manifest_hash, manifest_bytes));
     objects.push((tip, commit_bytes));
 
-    // The batched commit is one remote request carrying every inline object.
-    let inline_bytes: u64 = objects.iter().map(|(_, b)| b.len() as u64).sum();
-    limits.check(LimitUnit::Bytes, inline_bytes)?;
-    limits.check(LimitUnit::Ops, 1)?;
+    // The batched commit is one call carrying every inline object; what it
+    // costs is whatever the resulting Delta transaction actually performs.
     let remote_txn_seq = remote
         .push_commit(&objects, ref_name, tip)
         .await
         .map_err(|e| StewardError::Content(e.to_string()))?;
-    limits.record(LimitUnit::Bytes, inline_bytes);
-    limits.record(LimitUnit::Ops, 1);
 
     Ok(ContentPushOutcome {
         ref_name: ref_name.to_string(),
