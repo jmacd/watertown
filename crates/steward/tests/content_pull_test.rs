@@ -143,6 +143,30 @@ async fn write_dynamic(
     .expect("dynamic transaction");
 }
 
+/// Rewrite an existing dynamic node with the same factory and config.  The
+/// recipe bytes are unchanged, so the node's content hash is unchanged, but the
+/// rewrite mints a new version carrying a fresh mtime.
+async fn rewrite_dynamic(
+    ship: &mut Ship,
+    path: &str,
+    entry_type: tinyfs::EntryType,
+    factory: &str,
+    config: &[u8],
+) {
+    let path = path.to_string();
+    let factory = factory.to_string();
+    let config = config.to_vec();
+    ship.write_transaction(&meta("re-mknod"), async move |fs| {
+        let root = fs.root().await?;
+        let _ = root
+            .create_dynamic_path_with_overwrite(&path, entry_type, &factory, config, true)
+            .await?;
+        Ok(())
+    })
+    .await
+    .expect("dynamic rewrite transaction");
+}
+
 async fn push(ship: &Ship) -> (tempfile::TempDir, ContentRemote) {
     let pond_id = uuid::Uuid::parse_str(ship.data_persistence().pond_id()).expect("pond id");
     let remote_dir = tempdir().expect("remote dir");
@@ -938,5 +962,71 @@ async fn tampered_manifest_is_rejected_before_commit() {
         root_hash(&dst).await,
         empty_root,
         "a rejected pull must not mutate the target pond"
+    );
+}
+
+/// A source-side change to a node's *metadata alone* replicates.
+///
+/// Rewriting a dynamic node with byte-identical config leaves its content hash
+/// untouched but mints a new version with a fresh mtime.  Because the fold
+/// commits to version metadata as well as bytes, the source's root tree hash
+/// moves; a consumer that planned its diff on content alone would copy nothing,
+/// and the post-apply fold -- which runs *after* the import transaction has
+/// committed -- would then fail on this and on every subsequent pull, because
+/// each retry re-diffs against the same stale metadata.
+///
+/// This is the failure that stalled a production consumer for days: an
+/// unchanging dynamic directory whose mtime kept advancing on the producer.
+#[tokio::test]
+async fn metadata_only_change_replicates() {
+    let (_t, mut src) = new_pond("meta-src").await;
+    write_file(&mut src, "/a.txt", b"alpha").await;
+    write_dynamic(
+        &mut src,
+        "/budget",
+        tinyfs::EntryType::FileDynamic,
+        "rate-limit",
+        b"unit: ops/day\nlimit: 10\nburst: 5\n",
+    )
+    .await;
+
+    let (_rt, mut remote) = push(&src).await;
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "meta-dst")
+        .await
+        .expect("create dst");
+    let graph = fetch_object_graph(&remote, "main").await.expect("fetch");
+    let _ = steward::rebuild_pond(&mut dst, &remote, &graph)
+        .await
+        .expect("rebuild");
+    assert_eq!(root_hash(&dst).await, root_hash(&src).await);
+
+    // Rewrite with identical config: same recipe bytes, new mtime.
+    let before = root_hash(&src).await;
+    rewrite_dynamic(
+        &mut src,
+        "/budget",
+        tinyfs::EntryType::FileDynamic,
+        "rate-limit",
+        b"unit: ops/day\nlimit: 10\nburst: 5\n",
+    )
+    .await;
+    let after = root_hash(&src).await;
+    assert_ne!(
+        before, after,
+        "a metadata-only rewrite must move the source root tree hash, \
+         otherwise this test cannot observe the bug it guards"
+    );
+
+    repush(&src, &mut remote).await;
+    let graph = fetch_object_graph(&remote, "main").await.expect("fetch");
+    let _ = steward::rebuild_pond(&mut dst, &remote, &graph)
+        .await
+        .expect("re-pull after metadata-only change");
+
+    assert_eq!(
+        root_hash(&dst).await,
+        after,
+        "consumer must adopt the source's new metadata, not keep the stale mtime"
     );
 }

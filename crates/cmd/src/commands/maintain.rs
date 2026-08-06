@@ -17,6 +17,10 @@ use log::info;
 /// vacuum reclaims it in the SAME pass (no extra ship open / read txn).
 /// Collapse likewise runs before the checkpoint + vacuum, since its
 /// reclamation phase deletes the rows that collapse superseded.
+///
+/// When `dry_run` is true nothing is modified: the command reports what
+/// collapse and prune *would* do and returns.
+#[allow(clippy::fn_params_excessive_bools)]
 pub async fn maintain_command(
     ship_context: &ShipContext,
     compact: bool,
@@ -24,6 +28,7 @@ pub async fn maintain_command(
     prune: bool,
     keep_txns: i64,
     allow_no_remote: bool,
+    dry_run: bool,
 ) -> Result<()> {
     let pond_path = ship_context.resolve_pond_path()?;
     info!("Running maintenance on pond: {}", pond_path.display());
@@ -32,6 +37,17 @@ pub async fn maintain_command(
         .open_pond()
         .await
         .map_err(|e| anyhow!("Failed to open pond: {}", e))?;
+
+    if dry_run {
+        return report_dry_run(
+            &mut ship,
+            collapse_versions,
+            prune,
+            keep_txns,
+            allow_no_remote,
+        )
+        .await;
+    }
 
     // Prune BEFORE maintain so the deletion's tombstones are reclaimed by
     // the checkpoint + vacuum below, in the same maintenance pass.
@@ -93,4 +109,110 @@ pub async fn maintain_command(
 
     info!("[OK] Maintenance completed");
     Ok(())
+}
+
+/// Report what maintenance would do, changing nothing.
+///
+/// Collapse is the operation worth previewing.  It rewrites every live version
+/// of a series into one merged run, and that merged run is new content: it
+/// replicates like any other write, so the next push carries the whole series
+/// again.  Nothing deletes the superseded blobs from the remote, so the space
+/// is spent permanently, and a series larger than the byte budget can reach a
+/// state the limiter will never admit.  Reporting the size beforehand is how
+/// that is caught while it is still a number rather than a bill.
+async fn report_dry_run(
+    ship: &mut steward::Steward,
+    collapse_versions: usize,
+    prune: bool,
+    keep_txns: i64,
+    allow_no_remote: bool,
+) -> Result<()> {
+    let horizon = if prune {
+        Some(
+            crate::commands::control::compute_prune_horizon(ship, keep_txns, allow_no_remote)
+                .await?,
+        )
+    } else {
+        None
+    };
+
+    // Resolve node identities to paths so the report names files rather than
+    // UUIDs.  Done only when there is something to name.
+    let candidates = if collapse_versions > 0 {
+        ship.survey_collapsible_series(collapse_versions).await?
+    } else {
+        Vec::new()
+    };
+    let paths = if candidates.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        ship.node_paths().await?
+    };
+
+    #[allow(clippy::print_stdout)]
+    {
+        println!("Dry run: nothing was modified.");
+
+        if let Some(h) = horizon {
+            if h.horizon < 1 {
+                println!("  control prune: nothing to prune (horizon < 1)");
+            } else {
+                println!(
+                    "  control prune: would delete rows at/below seq {} (last committed {})",
+                    h.horizon, h.last_committed
+                );
+            }
+        }
+
+        if collapse_versions == 0 {
+            println!("  collapse: not requested (pass --collapse-versions N)");
+        } else if candidates.is_empty() {
+            println!("  collapse: no series exceeds {collapse_versions} live versions");
+        } else {
+            let total: u64 = candidates.iter().map(|c| c.total_bytes).sum();
+            println!(
+                "  collapse: {} series exceed {} live versions",
+                candidates.len(),
+                collapse_versions
+            );
+            let mut rows: Vec<_> = candidates.iter().collect();
+            rows.sort_by_key(|c| std::cmp::Reverse(c.total_bytes));
+            for c in rows {
+                let name = paths
+                    .get(&c.file_id)
+                    .map_or_else(|| c.file_id.node_id().to_string(), |p| p.clone());
+                println!(
+                    "    {name}: {} versions -> 1, {}",
+                    c.live_versions,
+                    human_bytes(c.total_bytes)
+                );
+            }
+            println!(
+                "  collapse would rewrite {} as new content, which the next push \n  \
+                 must carry and the remote keeps permanently",
+                human_bytes(total)
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Render a byte count the way the limiter reports its budgets, so a dry-run
+/// figure can be compared against `pond status` without arithmetic.
+fn human_bytes(n: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let bytes = n as f64;
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes / KIB)
+    } else {
+        format!("{n} B")
+    }
 }

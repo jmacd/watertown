@@ -982,6 +982,17 @@ fn plan_one(
 
     let content_changed = existing.is_none_or(|t| t.child_hash != entry.child_hash);
 
+    // The fold commits to each version's metadata -- mtime, event-time bounds,
+    // extended attributes -- alongside its bytes, so a source-side change to
+    // metadata alone still moves this entry's contribution to its parent's tree
+    // hash and every ancestor's.  Pruning on `child_hash` alone would plan no
+    // op at all, leave the replica holding stale metadata, and then fail the
+    // post-apply fold -- durably, because the commit lands before the fold runs,
+    // so every retry re-diffs against the same stale state and fails again.
+    // (`content_diff::diff_dir` prunes on both for the same reason.)
+    let meta_changed = existing.is_none_or(|t| t.versions != entry.versions);
+    let needs_write = create || content_changed || meta_changed;
+
     match entry.entry_type {
         EntryType::DirectoryPhysical => {
             if create {
@@ -998,7 +1009,7 @@ fn plan_one(
             if create {
                 outcome.files += 1;
             }
-            let versions = if content_changed {
+            let versions = if needs_write {
                 vec![planned_version(
                     graph,
                     entry.child_hash,
@@ -1037,7 +1048,7 @@ fn plan_one(
             if create {
                 outcome.symlinks += 1;
             }
-            if create || content_changed {
+            if needs_write {
                 let bytes = blob_bytes(graph, entry.child_hash)?;
                 let target = String::from_utf8(bytes).map_err(|e| {
                     StewardError::Content(format!("symlink target is not utf-8: {e}"))
@@ -1056,7 +1067,7 @@ fn plan_one(
             if create {
                 outcome.dynamic += 1;
             }
-            if create || content_changed {
+            if needs_write {
                 let bytes = blob_bytes(graph, entry.child_hash)?;
                 let (factory, config) = decode_recipe(&bytes).map_err(|e| {
                     StewardError::Content(format!("decode recipe for {}: {e}", entry.name))

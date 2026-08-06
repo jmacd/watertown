@@ -310,8 +310,12 @@ mod tests {
     #[test]
     fn the_storage_line_names_the_profile_and_no_credential() {
         let doc = b"endpoint: http://watershop:9000\naccess_key_id: ${env:S3_KEY}\nsecret_access_key: ${env:S3_SECRET}\n";
-        let profile =
-            steward::ResolvedStorage::from_bytes("/sys/storage/minio", doc).expect("parse");
+        let profile = steward::ResolvedStorage::from_bytes(
+            "/sys/storage/minio",
+            provider::factory::storage_minio::FACTORY_NAME,
+            doc,
+        )
+        .expect("parse");
         let line = format_storage_line("/sys/storage/minio", &Ok(profile.describe()));
 
         assert!(line.contains("/sys/storage/minio"), "{line}");

@@ -240,6 +240,11 @@ enum Commands {
         /// (retention-only; pruned history is then unrecoverable).
         #[arg(long)]
         allow_no_remote: bool,
+        /// Report what maintenance would do -- which series collapse would
+        /// merge and how many bytes that would push -- without changing
+        /// anything.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Show pond contents
     Show {
@@ -566,6 +571,7 @@ async fn main() -> Result<()> {
             prune,
             keep_txns,
             allow_no_remote,
+            dry_run,
         } => {
             commands::maintain_command(
                 &ship_context,
@@ -574,6 +580,7 @@ async fn main() -> Result<()> {
                 prune,
                 keep_txns,
                 allow_no_remote,
+                dry_run,
             )
             .await
         }

@@ -21,7 +21,7 @@ use log::{debug, info, warn};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use provider::{FactoryContext, FactoryRegistry};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -188,6 +188,25 @@ struct CollapseCandidate {
     pond_id: String,
     part_id: String,
     node_id: String,
+    live_versions: i64,
+    total_bytes: i64,
+}
+
+/// A series that collapse would merge, with the cost of merging it.
+///
+/// Collapse rewrites every live version into one merged run, so `total_bytes`
+/// is both the payload a push must then carry and the storage the remote gains
+/// permanently -- the superseded blobs are never deleted remotely.  Reporting
+/// it is what lets an operator see the bill before it arrives rather than
+/// after (see `docs/rate-limiter-design.md`, Decision L15).
+#[derive(Debug, Clone)]
+pub struct CollapsibleSeries {
+    /// Identity of the series node.
+    pub file_id: FileID,
+    /// Live versions that would be merged into one.
+    pub live_versions: usize,
+    /// Total live bytes across those versions: the merged run's size.
+    pub total_bytes: u64,
 }
 
 /// How many adjacent same-class versions collapse into one run.
@@ -1775,6 +1794,78 @@ impl State {
         &self,
         threshold: usize,
     ) -> Result<Vec<FileID>, TLogFSError> {
+        Ok(self
+            .survey_collapsible_series(threshold)
+            .await?
+            .into_iter()
+            .map(|c| c.file_id)
+            .collect())
+    }
+
+    /// Map every node in the pond to its path, reading directory rows only.
+    ///
+    /// This deliberately does NOT walk the filesystem.  A glob walk has to
+    /// instantiate each node it passes, which for a dynamic node means running
+    /// its factory and expanding its config -- so naming files would fail on a
+    /// pond whose `/sys/remotes/*` config references an environment variable
+    /// that is not set, which is most real ponds.  Reporting must not be able
+    /// to fail for a reason unrelated to what it reports, so this descends the
+    /// stored directory entries and touches no node.
+    ///
+    /// Dynamic directories are not descended: their children are produced by a
+    /// factory at read time and have no stored rows to name.
+    ///
+    /// # Errors
+    /// Returns an error if a directory's entries cannot be loaded.
+    pub async fn node_paths(&self) -> Result<HashMap<FileID, String>, TLogFSError> {
+        let root = FileID::root_for(self.pond_uuid());
+        let mut paths: HashMap<FileID, String> = HashMap::new();
+        let mut queue = vec![(root, String::new())];
+        let mut seen: HashSet<FileID> = HashSet::new();
+        _ = seen.insert(root);
+
+        while let Some((dir_id, prefix)) = queue.pop() {
+            self.ensure_directory_loaded(dir_id).await?;
+            for entry in self.get_all_directory_entries(dir_id).await? {
+                let child_pond_id = entry
+                    .pond_id
+                    .as_ref()
+                    .and_then(|s| s.parse::<uuid7::Uuid>().ok())
+                    .unwrap_or_else(|| dir_id.pond_id());
+                // Same rule the directory itself uses to form a child's
+                // identity; sharing it is what keeps these paths addressing
+                // the same nodes the rest of the system does.
+                let child_id = if entry.entry_type == EntryType::DirectoryPhysical {
+                    FileID::from_physical_dir_node_id(entry.child_node_id, child_pond_id)
+                } else {
+                    FileID::new_from_ids(dir_id.part_id(), entry.child_node_id, child_pond_id)
+                };
+
+                let path = format!("{prefix}/{}", entry.name);
+                _ = paths.insert(child_id, path.clone());
+
+                if entry.entry_type == EntryType::DirectoryPhysical && seen.insert(child_id) {
+                    queue.push((child_id, path));
+                }
+            }
+        }
+
+        Ok(paths)
+    }
+
+    /// Discover collapse candidates *and* what collapsing each would cost.
+    ///
+    /// This is the same discovery `list_collapsible_series` uses -- it is the
+    /// single implementation of both -- so a dry-run report cannot describe a
+    /// different set of candidates than the collapse that follows it.
+    ///
+    /// # Errors
+    /// Returns an error if the discovery query fails or a returned identifier
+    /// cannot be parsed back into a [`FileID`].
+    pub async fn survey_collapsible_series(
+        &self,
+        threshold: usize,
+    ) -> Result<Vec<CollapsibleSeries>, TLogFSError> {
         let inner = self.inner.lock().await;
         let file_series = EntryType::FilePhysicalSeries.as_str();
         let table_series = EntryType::TablePhysicalSeries.as_str();
@@ -1784,9 +1875,11 @@ impl State {
         // collapsed, so it is excluded from candidacy here.
         let log_node = tinyfs::LOG_NODE_UUID;
         let sql = format!(
-            "SELECT pond_id, part_id, node_id FROM ( \
+            "SELECT pond_id, part_id, node_id, \
+                     COUNT(*) AS live_versions, \
+                     CAST(COALESCE(SUM(size), 0) AS BIGINT) AS total_bytes FROM ( \
                  SELECT t.pond_id AS pond_id, t.part_id AS part_id, t.node_id AS node_id, \
-                        t.version AS version, \
+                        t.version AS version, t.size AS size, \
                         CASE WHEN t.collapsed_through IS NULL THEN t.version \
                              ELSE COALESCE(t.collapsed_from, 0) END AS lo, \
                         CASE WHEN t.collapsed_through IS NULL THEN t.version \
@@ -1846,7 +1939,11 @@ impl State {
                                 row.pond_id
                             ),
                         })?;
-                ids.push(FileID::new_from_ids(part_id, node_id, pond_id));
+                ids.push(CollapsibleSeries {
+                    file_id: FileID::new_from_ids(part_id, node_id, pond_id),
+                    live_versions: usize::try_from(row.live_versions).unwrap_or(0),
+                    total_bytes: u64::try_from(row.total_bytes).unwrap_or(0),
+                });
             }
         }
         Ok(ids)
@@ -4347,7 +4444,7 @@ impl InnerState {
         // [collapsed_from, collapsed_through], so rows inside that range are no
         // longer independently readable. Rows of other entry types carry no
         // range and are left unchanged.
-        let live: std::collections::HashSet<i64> = crate::schema::live_series_entries(&records)
+        let live: HashSet<i64> = crate::schema::live_series_entries(&records)
             .into_iter()
             .map(|r| r.version)
             .collect();
