@@ -75,11 +75,9 @@ async fn write_small_file(ctx: &ShipContext, path: &str, bytes: &[u8]) -> anyhow
 /// Build a real upstream pond in `tmp` and push it to a `file://` content
 /// store, returning that URL.  A pull-mode remote must point at an existing
 /// pond, so an empty directory cannot stand in for one.
-async fn publish_upstream(tmp: &TempDir) -> String {
+async fn publish_upstream(tmp: &TempDir, name: &str) -> String {
     let producer = tmp.path().join("producer");
-    let store = tmp.path().join("upstream-store");
-    std::fs::create_dir_all(&store).expect("mkdir upstream store");
-    let url = format!("file://{}", store.display());
+    let url = sync_store::testing::in_memory_remote_url(name);
 
     let ctx = ctx_for(&producer, vec!["pond", "init"]);
     init_command(&ctx, "producer-host")
@@ -620,7 +618,7 @@ async fn limits_on_a_pull_only_remote_are_accepted() {
     // claim and must attach, not be refused as an empty one.
     init_log();
     let tmp = TempDir::new().expect("tmp");
-    let url = publish_upstream(&tmp).await;
+    let url = publish_upstream(&tmp, "pull-accepted").await;
 
     let pond = tmp.path().join("consumer");
     let ctx = ctx_for(&pond, vec!["pond", "init"]);
@@ -647,7 +645,7 @@ async fn limits_on_a_pull_only_remote_are_accepted() {
 async fn a_governed_pull_within_budget_still_succeeds() {
     init_log();
     let tmp = TempDir::new().expect("tmp");
-    let url = publish_upstream(&tmp).await;
+    let url = publish_upstream(&tmp, "pull-within-budget").await;
 
     let pond = tmp.path().join("consumer");
     let ctx = ctx_for(&pond, vec!["pond", "init"]);
@@ -681,7 +679,7 @@ async fn a_governed_pull_within_budget_still_succeeds() {
 async fn an_applied_pull_remote_is_actually_governed() {
     init_log();
     let tmp = TempDir::new().expect("tmp");
-    let url = publish_upstream(&tmp).await;
+    let url = publish_upstream(&tmp, "pull-refused").await;
 
     let pond = tmp.path().join("consumer");
     let ctx = ctx_for(&pond, vec!["pond", "init"]);

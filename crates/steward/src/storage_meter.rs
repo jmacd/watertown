@@ -80,6 +80,84 @@ impl StorageMeter for LimiterMeter {
     }
 }
 
+/// A budget lent to the storage layer for the duration of some work.
+///
+/// Holding the borrow in a value, rather than only in the body of
+/// [`metered_op`], lets a caller install the meter around many small calls
+/// instead of around one large future -- which is what
+/// [`crate::metered_source::MeteredSource`] needs, and what keeps the pull
+/// path's futures small enough to hold on a thread stack.
+pub struct MeterGuard {
+    shared: Arc<Mutex<LimiterSet>>,
+    meter: Arc<LimiterMeter>,
+}
+
+impl MeterGuard {
+    /// Take `limits` for the guard's lifetime, leaving the caller's set empty.
+    pub fn new(limits: &mut LimiterSet) -> Self {
+        let shared = Arc::new(Mutex::new(std::mem::replace(
+            limits,
+            LimiterSet::unlimited(),
+        )));
+        let meter = Arc::new(LimiterMeter {
+            limits: Arc::clone(&shared),
+            refusal: Mutex::new(None),
+        });
+        Self { shared, meter }
+    }
+
+    /// Run `fut` with every physical storage request it makes charged here.
+    pub async fn scope<F: Future>(&self, fut: F) -> F::Output {
+        sync_store::with_meter(Arc::clone(&self.meter) as Arc<dyn StorageMeter>, fut).await
+    }
+
+    /// The refusal that stopped the work, if a budget has said no.
+    ///
+    /// Peeks rather than takes: a wrapper asks after every failed call, and
+    /// the same refusal may be reported to more than one of them.
+    pub fn refusal(&self) -> Option<StewardError> {
+        self.meter
+            .refusal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .map(StewardError::RateLimited)
+    }
+
+    /// Return the spending to `limits` and report the refusal, if any, that
+    /// stopped the work.
+    ///
+    /// The spending comes back whether the work succeeded or not, so the
+    /// caller can commit the usage either way.
+    pub fn finish(self, limits: &mut LimiterSet) -> Option<StewardError> {
+        let refusal = self
+            .meter
+            .refusal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(self.meter);
+
+        // Put the spending back where the caller left it.  A stream that
+        // outlived the scope would still hold a reference; take the contents
+        // in place rather than failing, because losing the accounting is
+        // worse than losing the allocation.
+        *limits = match Arc::try_unwrap(self.shared) {
+            Ok(m) => m
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Err(still_shared) => std::mem::replace(
+                &mut *still_shared
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                LimiterSet::unlimited(),
+            ),
+        };
+
+        refusal.map(StewardError::RateLimited)
+    }
+}
+
 /// Run `fut` with every physical storage request charged to `limits`.
 ///
 /// `limits` is left holding everything the operation spent, whether it
@@ -90,44 +168,21 @@ pub async fn metered_op<F, T>(limits: &mut LimiterSet, fut: F) -> Result<T, Stew
 where
     F: Future<Output = Result<T, StewardError>>,
 {
-    let shared = Arc::new(Mutex::new(std::mem::replace(
-        limits,
-        LimiterSet::unlimited(),
-    )));
-    let meter = Arc::new(LimiterMeter {
-        limits: Arc::clone(&shared),
-        refusal: Mutex::new(None),
-    });
+    metered_op_with(limits, fut).await
+}
 
-    let outcome = sync_store::with_meter(meter.clone(), fut).await;
-
-    let refusal = meter
-        .refusal
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
-    drop(meter);
-
-    // Put the spending back where the caller left it.  A stream that outlived
-    // the scope would still hold a reference; take the contents in place
-    // rather than failing, because losing the accounting is worse than losing
-    // the allocation.
-    *limits = match Arc::try_unwrap(shared) {
-        Ok(m) => m
-            .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-        Err(still_shared) => std::mem::replace(
-            &mut *still_shared
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            LimiterSet::unlimited(),
-        ),
-    };
+/// [`metered_op`] for callers whose error type is not [`StewardError`].
+pub async fn metered_op_with<F, T, E>(limits: &mut LimiterSet, fut: F) -> Result<T, E>
+where
+    F: Future<Output = Result<T, E>>,
+    E: From<StewardError>,
+{
+    let guard = MeterGuard::new(limits);
+    let outcome = guard.scope(fut).await;
+    let refusal = guard.finish(limits);
 
     match outcome {
-        Err(_) if refusal.is_some() => Err(StewardError::RateLimited(
-            refusal.expect("checked as Some in the guard"),
-        )),
+        Err(_) if refusal.is_some() => Err(E::from(refusal.expect("checked as Some in the guard"))),
         other => other,
     }
 }

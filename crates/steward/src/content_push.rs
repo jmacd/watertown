@@ -106,7 +106,10 @@ pub async fn push_content_to_remote_limited(
     ref_name: &str,
     limits: &mut LimiterSet,
 ) -> Result<ContentPushOutcome, StewardError> {
-    crate::storage_meter::metered_op(limits, push_content_inner(ship, remote, ref_name)).await
+    // Boxed: the push future is large, and the scope that installs the meter
+    // would otherwise hold it by value on the caller's stack.
+    crate::storage_meter::metered_op(limits, Box::pin(push_content_inner(ship, remote, ref_name)))
+        .await
 }
 
 /// The push itself.
