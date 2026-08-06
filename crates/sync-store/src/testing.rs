@@ -90,3 +90,8 @@ pub fn in_memory_remote_url(name: &str) -> String {
     register_in_memory_backend();
     format!("gs://watertown-test/{name}/remote")
 }
+
+/// The backing store, for tests that need to inspect what was written.
+pub fn in_memory_backing() -> Arc<InMemory> {
+    BACKING.clone()
+}

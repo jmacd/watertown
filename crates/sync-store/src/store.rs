@@ -16,7 +16,7 @@ use deltalake::DeltaTable;
 use deltalake::kernel::schema::partitions::{PartitionFilter, PartitionValue};
 use deltalake::operations::optimize::OptimizeType;
 use deltalake::protocol::SaveMode;
-use log::debug;
+use log::{debug, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -67,6 +67,10 @@ pub struct Store {
 }
 
 const TABLE_NAME: &str = "source";
+
+/// Write a checkpoint every this many versions, matching the Delta default
+/// and `steward::maintenance`, which does the same for local tables.
+const CHECKPOINT_INTERVAL: u64 = 10;
 
 impl Store {
     /// Create a new store at `path`.  The directory is created if missing.
@@ -313,8 +317,32 @@ impl Store {
 
         // Re-build session context against the new table version.
         self.session_ctx = build_session_ctx(&self.table)?;
+        self.checkpoint_if_due().await;
 
         Ok(())
+    }
+
+    /// Write a checkpoint when the version reaches an interval boundary.
+    ///
+    /// Without this a remote's `_delta_log/_last_checkpoint` never appears,
+    /// and every reader replays the entire commit history to learn the
+    /// current state.  A traced push of a production pond spent 609 of its
+    /// 1198 requests re-reading `_delta_log` for exactly this reason, and the
+    /// count grows with the table's age rather than with the work being done
+    /// -- a bill for how long the pond has existed.  A checkpoint collapses
+    /// that replay into one read.
+    ///
+    /// Best-effort: a checkpoint is an optimisation, and failing to write one
+    /// must not fail the commit that earned it.
+    async fn checkpoint_if_due(&mut self) {
+        let version = self.table.version().unwrap_or(0);
+        if version <= 0 || !(version as u64).is_multiple_of(CHECKPOINT_INTERVAL) {
+            return;
+        }
+        match deltalake::checkpoints::create_checkpoint(&self.table, None).await {
+            Ok(()) => debug!("store checkpoint written at version {version}"),
+            Err(e) => warn!("store checkpoint failed at version {version}: {e}"),
+        }
     }
 
     /// Convenience: write a single Put using the next available `txn_seq`
@@ -639,6 +667,7 @@ impl Store {
 
         self.table = new_table;
         self.session_ctx = build_session_ctx(&self.table)?;
+        self.checkpoint_if_due().await;
 
         Ok(CompactMetrics {
             num_files_added: metrics.num_files_added,
@@ -726,6 +755,7 @@ impl Store {
             .await?;
         self.table.update_state().await?;
         self.session_ctx = build_session_ctx(&self.table)?;
+        self.checkpoint_if_due().await;
         Ok(self.table.version().unwrap_or(0))
     }
 
@@ -774,6 +804,7 @@ impl Store {
             .await?;
         self.table = new_table;
         self.session_ctx = build_session_ctx(&self.table)?;
+        self.checkpoint_if_due().await;
         Ok(self.table.version().unwrap_or(0))
     }
 }
