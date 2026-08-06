@@ -201,6 +201,38 @@ impl Steward {
         }
     }
 
+    /// Report which series collapse would merge at `threshold`, and what
+    /// merging them would cost, without merging anything.
+    ///
+    /// Returns an empty survey for Host stewards, which hold no series.
+    ///
+    /// # Errors
+    /// Returns an error if the read transaction or discovery query fails.
+    pub async fn survey_collapsible_series(
+        &mut self,
+        threshold: usize,
+    ) -> Result<Vec<tlogfs::CollapsibleSeries>, StewardError> {
+        match self {
+            Steward::Pond(ship) => ship.survey_collapsible_series(threshold).await,
+            Steward::Host(_) => Ok(Vec::new()),
+        }
+    }
+
+    /// Map every node in the pond to its path, from stored directory rows.
+    ///
+    /// Host stewards hold no pond tree, so they map nothing.
+    ///
+    /// # Errors
+    /// Returns an error if the read transaction or the directory scan fails.
+    pub async fn node_paths(
+        &mut self,
+    ) -> Result<std::collections::HashMap<tinyfs::FileID, String>, StewardError> {
+        match self {
+            Steward::Pond(ship) => ship.node_paths().await,
+            Steward::Host(_) => Ok(std::collections::HashMap::new()),
+        }
+    }
+
     /// Collapse multi-version `data:series` files whose live version count
     /// exceeds `threshold` into a single merged version.
     ///

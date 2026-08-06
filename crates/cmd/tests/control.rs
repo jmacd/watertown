@@ -1703,7 +1703,7 @@ async fn test_maintain_prune_shrinks_in_one_pass() {
     assert!(below_before > 0);
 
     // compact=false, collapse=0, prune=true, keep_txns, allow_no_remote=true.
-    maintain_command(&setup.ship_context, false, 0, true, keep_txns, true)
+    maintain_command(&setup.ship_context, false, 0, true, keep_txns, true, false)
         .await
         .expect("maintain --prune");
 

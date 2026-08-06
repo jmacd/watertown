@@ -858,6 +858,59 @@ impl Ship {
         report
     }
 
+    /// Report which series collapse would merge at `threshold`, and what
+    /// merging them would cost, without merging anything.
+    ///
+    /// Runs only phase 1 of [`Ship::collapse_versions`] -- the same discovery,
+    /// under a read transaction that takes no control-table records and
+    /// consumes no sequence number -- so asking is free and leaves no trace.
+    /// Sharing the discovery is the point: a preview that computed candidacy
+    /// its own way could disagree with the collapse it claims to predict.
+    ///
+    /// # Errors
+    /// Returns an error if the read transaction or the discovery query fails.
+    pub async fn survey_collapsible_series(
+        &mut self,
+        threshold: usize,
+    ) -> Result<Vec<tlogfs::CollapsibleSeries>, StewardError> {
+        let meta = PondUserMetadata::new(vec![
+            "pond".to_string(),
+            "maintain".to_string(),
+            "--dry-run".to_string(),
+        ]);
+        let tx = self.begin_read(&meta).await?;
+        let found = {
+            let state = tx.state()?;
+            state.survey_collapsible_series(threshold).await?
+        };
+        _ = tx.commit().await?;
+        Ok(found)
+    }
+
+    /// Map every node in the pond to its path, from stored directory rows.
+    ///
+    /// Reporting-only: it instantiates no node, so it cannot fail because some
+    /// unrelated dynamic node's config does not expand.
+    ///
+    /// # Errors
+    /// Returns an error if the read transaction or the directory scan fails.
+    pub async fn node_paths(
+        &mut self,
+    ) -> Result<std::collections::HashMap<tinyfs::FileID, String>, StewardError> {
+        let meta = PondUserMetadata::new(vec!["pond".to_string(), "node-paths".to_string()]);
+        let tx = self.begin_read(&meta).await?;
+        let result = async {
+            let state = tx.state()?;
+            Ok::<_, StewardError>(state.node_paths().await?)
+        }
+        .await;
+        // Close the read transaction on both paths: a preview that leaves an
+        // incomplete transaction behind has modified the pond it promised not
+        // to touch.
+        _ = tx.commit().await?;
+        result
+    }
+
     /// Collapse every `FilePhysicalSeries` node with more than `threshold` live
     /// versions into a single merged version, so subsequent reads are O(1)
     /// instead of O(versions).
