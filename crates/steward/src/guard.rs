@@ -1302,18 +1302,6 @@ impl<'a> StewardTransactionGuard<'a> {
                         continue;
                     }
                 };
-            let mut remote = match sync_store::ContentRemote::open_at_url(
-                &attachment.url,
-                storage_options,
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    log::error!("post-commit auto-push: {} open failed: {}", name, e);
-                    continue;
-                }
-            };
             // Bind before any network work: a limiter that names a missing
             // node or governs the wrong unit is a misconfiguration, and it
             // should surface without having spent anything first.
@@ -1341,8 +1329,16 @@ impl<'a> StewardTransactionGuard<'a> {
                 }
             };
 
-            let pushed =
-                crate::push_content_to_remote_limited(ship, &mut remote, "main", &mut limits).await;
+            // Open inside the budget, not before it: opening a Delta table
+            // reads the log, and that is the larger half of a tick's traffic.
+            let pushed = crate::open_and_push_to_remote_limited(
+                ship,
+                &attachment.url,
+                storage_options,
+                "main",
+                &mut limits,
+            )
+            .await;
 
             // Record usage regardless of outcome: a push that failed partway
             // still spent what it spent, and an unattended retry every commit

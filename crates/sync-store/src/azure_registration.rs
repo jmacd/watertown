@@ -46,7 +46,15 @@ impl ObjectStoreFactory for AzureStoreFactory {
         let store = builder.build().map_err(|e| DeltaTableError::GenericError {
             source: Box::new(e),
         })?;
-        Ok((Arc::new(store), prefix))
+        // Charged identically to S3: the budget is a property of the traffic,
+        // not of the provider.
+        Ok((
+            Arc::new(crate::MeteredStore::new(
+                Arc::new(store),
+                crate::RemoteKey::new(url.as_str()),
+            )),
+            prefix,
+        ))
     }
 }
 

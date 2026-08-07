@@ -22,7 +22,6 @@ mod content_verify;
 mod control_table;
 mod dispatch;
 pub mod fsck;
-pub mod governed_source;
 mod graft;
 mod guard;
 mod host;
@@ -30,10 +29,12 @@ mod inner_control;
 pub mod limiter;
 pub mod limiter_usage;
 pub mod maintenance;
+pub mod metered_source;
 mod rebuild;
 pub mod reclaim;
 mod remote_config;
 mod ship;
+pub mod storage_meter;
 pub mod storage_profile;
 mod write_lock;
 
@@ -43,7 +44,8 @@ pub use content_pull::{
     FetchedGraph, FetchedObject, RebuildOutcome, fetch_object_graph, import_pond, rebuild_pond,
 };
 pub use content_push::{
-    ContentPushOutcome, push_content_to_remote, push_content_to_remote_limited,
+    ContentPushOutcome, open_and_push_to_remote_limited, push_content_to_remote,
+    push_content_to_remote_limited,
 };
 pub use content_source::{BlobReader, ContentSource, LocalPondSource};
 pub use content_tree::{
@@ -54,7 +56,6 @@ pub use content_verify::{ContentVerifyReport, ContentVerifyState, verify_content
 pub use control_table::{CommitSpine, ControlTable};
 pub use dispatch::{Steward, Transaction};
 pub use fsck::{FsckError, FsckOptions, FsckReport, PartitionDigest, fsck};
-pub use governed_source::GovernedSource;
 pub use graft::{GraftPin, SYS_GRAFTS_DIR};
 pub use guard::StewardTransactionGuard;
 pub use host::{HostSteward, HostTransaction};

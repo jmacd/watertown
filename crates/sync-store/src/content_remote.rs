@@ -154,6 +154,12 @@ impl ContentRemote {
         Ok(())
     }
 
+    /// The URL this remote lives at, which is the identity its storage budget
+    /// is bound to.
+    pub fn url(&self) -> String {
+        self.store.url()
+    }
+
     /// The pond whose objects this remote holds.
     pub fn pond_id(&self) -> Uuid {
         self.pond_id
