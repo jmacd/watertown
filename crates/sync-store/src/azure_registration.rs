@@ -48,7 +48,13 @@ impl ObjectStoreFactory for AzureStoreFactory {
         })?;
         // Charged identically to S3: the budget is a property of the traffic,
         // not of the provider.
-        Ok((Arc::new(crate::MeteredStore::new(Arc::new(store))), prefix))
+        Ok((
+            Arc::new(crate::MeteredStore::new(
+                Arc::new(store),
+                crate::RemoteKey::new(url.as_str()),
+            )),
+            prefix,
+        ))
     }
 }
 

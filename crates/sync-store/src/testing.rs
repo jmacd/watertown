@@ -48,7 +48,13 @@ impl ObjectStoreFactory for InMemoryGcsFactory {
         // into the prefix to keep buckets distinct in the one backing store.
         let bucket = url.host_str().unwrap_or("bucket");
         let prefix = Path::parse(format!("{bucket}{}", url.path()))?;
-        Ok((Arc::new(MeteredStore::new(BACKING.clone())), prefix))
+        Ok((
+            Arc::new(MeteredStore::new(
+                BACKING.clone(),
+                crate::RemoteKey::new(url.as_str()),
+            )),
+            prefix,
+        ))
     }
 }
 

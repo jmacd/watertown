@@ -11,17 +11,27 @@
 //!
 //! # Why the budget is moved rather than borrowed
 //!
-//! A meter must be `'static` to live in a task-local, but a `LimiterSet` is
+//! A meter must be `'static` to be bound to a remote, but a `LimiterSet` is
 //! owned by the caller and must be returned so it can be committed to the
 //! control table.  So [`metered_op`] takes the set, shares it for the duration
 //! of the operation, and puts it back afterwards -- the caller keeps its
 //! `&mut` and never sees the difference.
+//!
+//! # Why a guard, not a scope
+//!
+//! The budget is bound to the *remote*, by URL, for as long as the guard
+//! lives (see [`sync_store::bind_meter`]).  Nothing needs to wrap the work:
+//! requests are charged because of where they go, not because of what was
+//! executing when they were made.  That is what makes the accounting survive
+//! the tasks the Delta layer spawns, and it is why a caller can hold the guard
+//! across many small calls -- which is what
+//! [`crate::metered_source::MeteredSource`] does.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use provider::factory::rate_limit::LimitUnit;
-use sync_store::StorageMeter;
+use sync_store::{RemoteKey, StorageMeter};
 
 use crate::StewardError;
 use crate::limiter::{LimiterError, LimiterSet};
@@ -80,24 +90,28 @@ impl StorageMeter for LimiterMeter {
     }
 }
 
-/// A budget lent to the storage layer for the duration of some work.
+/// A budget bound to one remote for the duration of some work.
 ///
-/// Holding the borrow in a value, rather than only in the body of
-/// [`metered_op`], lets a caller install the meter around many small calls
-/// instead of around one large future -- which is what
-/// [`crate::metered_source::MeteredSource`] needs, and what keeps the pull
-/// path's futures small enough to hold on a thread stack.
+/// While this value lives, every request any store makes to that remote is
+/// charged to `limits` -- including requests made from tasks the storage layer
+/// spawned, which is the failure mode an ambient meter had.
 pub struct MeterGuard {
+    key: RemoteKey,
     shared: Arc<Mutex<LimiterSet>>,
     meter: Arc<LimiterMeter>,
-    /// Physical traffic already seen when the guard was made, so the guard can
-    /// report what happened during its own lifetime by difference.
+    /// Unbinds the budget when the guard is dropped.
+    binding: Option<sync_store::MeterBinding>,
+    /// Physical traffic already seen for this remote when the guard was made,
+    /// so the guard can report what happened during its own lifetime by
+    /// difference.
     observed_at_start: (u64, u64),
 }
 
 impl MeterGuard {
-    /// Take `limits` for the guard's lifetime, leaving the caller's set empty.
-    pub fn new(limits: &mut LimiterSet) -> Self {
+    /// Govern the remote at `url` with `limits`, leaving the caller's set
+    /// empty until [`Self::finish`] returns it.
+    pub fn new(url: &str, limits: &mut LimiterSet) -> Self {
+        let key = RemoteKey::new(url);
         let shared = Arc::new(Mutex::new(std::mem::replace(
             limits,
             LimiterSet::unlimited(),
@@ -106,17 +120,24 @@ impl MeterGuard {
             limits: Arc::clone(&shared),
             refusal: Mutex::new(None),
         });
-        let o = sync_store::observed();
+        let before = sync_store::observed_under(&key);
+        let binding = sync_store::bind_meter(&key, Arc::clone(&meter) as Arc<dyn StorageMeter>);
+
+        // Arrears were observed before this guard existed but are charged to
+        // it, so the window they are measured against has to start early
+        // enough to contain them.  Otherwise settling a debt would read as a
+        // charge with no matching measurement.
+        let (owed_ops, owed_bytes) = binding.arrears();
         Self {
+            key,
             shared,
             meter,
-            observed_at_start: (o.ops(), o.bytes()),
+            binding: Some(binding),
+            observed_at_start: (
+                before.0.saturating_sub(owed_ops),
+                before.1.saturating_sub(owed_bytes),
+            ),
         }
-    }
-
-    /// Run `fut` with every physical storage request it makes charged here.
-    pub async fn scope<F: Future>(&self, fut: F) -> F::Output {
-        sync_store::with_meter(Arc::clone(&self.meter) as Arc<dyn StorageMeter>, fut).await
     }
 
     /// The refusal that stopped the work, if a budget has said no.
@@ -137,10 +158,14 @@ impl MeterGuard {
     ///
     /// The spending comes back whether the work succeeded or not, so the
     /// caller can commit the usage either way.
-    pub fn finish(self, limits: &mut LimiterSet) -> Option<StewardError> {
-        let o = sync_store::observed();
-        let observed_ops = o.ops().saturating_sub(self.observed_at_start.0);
-        let observed_bytes = o.bytes().saturating_sub(self.observed_at_start.1);
+    pub fn finish(mut self, limits: &mut LimiterSet) -> Option<StewardError> {
+        // Unbind first: traffic after this point belongs to whoever comes
+        // next, and must not land in the numbers reported below.
+        drop(self.binding.take());
+
+        let after = sync_store::observed_under(&self.key);
+        let observed_ops = after.0.saturating_sub(self.observed_at_start.0);
+        let observed_bytes = after.1.saturating_sub(self.observed_at_start.1);
 
         let refusal = self
             .meter
@@ -151,7 +176,7 @@ impl MeterGuard {
         drop(self.meter);
 
         // Put the spending back where the caller left it.  A stream that
-        // outlived the scope would still hold a reference; take the contents
+        // outlived the guard would still hold a reference; take the contents
         // in place rather than failing, because losing the accounting is
         // worse than losing the allocation.
         *limits = match Arc::try_unwrap(self.shared) {
@@ -175,27 +200,20 @@ impl MeterGuard {
     }
 }
 
-/// Run `fut` with every physical storage request charged to `limits`.
+/// Run `fut` with every request it makes to the remote at `url` charged to
+/// `limits`.
 ///
 /// `limits` is left holding everything the operation spent, whether it
 /// succeeded or not, so the caller can commit the usage either way.  A failure
 /// caused by a budget is returned as [`StewardError::RateLimited`] rather than
 /// as the opaque storage error the object store produced.
-pub async fn metered_op<F, T>(limits: &mut LimiterSet, fut: F) -> Result<T, StewardError>
-where
-    F: Future<Output = Result<T, StewardError>>,
-{
-    metered_op_with(limits, fut).await
-}
-
-/// [`metered_op`] for callers whose error type is not [`StewardError`].
-pub async fn metered_op_with<F, T, E>(limits: &mut LimiterSet, fut: F) -> Result<T, E>
+pub async fn metered_op<F, T, E>(url: &str, limits: &mut LimiterSet, fut: F) -> Result<T, E>
 where
     F: Future<Output = Result<T, E>>,
     E: From<StewardError>,
 {
-    let guard = MeterGuard::new(limits);
-    let outcome = guard.scope(fut).await;
+    let guard = MeterGuard::new(url, limits);
+    let outcome = fut.await;
     let refusal = guard.finish(limits);
 
     match outcome {

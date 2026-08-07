@@ -172,6 +172,15 @@ impl Store {
         &self.path
     }
 
+    /// The URL this store's table lives at.
+    ///
+    /// This is the identity a storage budget is bound to (see
+    /// [`crate::RemoteKey`]), so a caller that holds a store can find the
+    /// budget governing it without being told separately where it is.
+    pub fn url(&self) -> String {
+        self.table.table_url().to_string()
+    }
+
     /// The backing object store rooted at the Delta table directory.  Used to
     /// read and write sibling content under prefixes outside the Delta log
     /// (e.g. a content-addressed large-blob store), keeping multi-gigabyte

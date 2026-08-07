@@ -810,6 +810,35 @@ impl LimiterSet {
         reported
     }
 
+    /// What an ignored run measured, as samples that record the traffic
+    /// without charging it.  Pure.
+    ///
+    /// `amount` is zero because nothing was charged, and `observed` carries
+    /// what physically happened -- so a seeding import appears in the metric
+    /// as a spike far above `limit` that was deliberately let through.  A run
+    /// that measured nothing emits nothing, like any other.
+    fn ignored_samples_at(&self, now_us: i64) -> Vec<crate::limiter_usage::UsageSample> {
+        let mut samples = Vec::new();
+        for l in &self.bound {
+            let observed = self.observed(l.spec().unit);
+            if l.spent() == 0 && observed == 0 {
+                continue;
+            }
+            let state = l.state_at(now_us);
+            samples.push(crate::limiter_usage::UsageSample {
+                at_us: now_us,
+                limiter: state.path,
+                unit: state.unit.as_str().to_string(),
+                amount: 0,
+                observed,
+                used: state.used,
+                limit: state.limit,
+                window_us: window_micros(l.spec().window),
+            });
+        }
+        samples
+    }
+
     /// Charge `amount` of `unit` after the action succeeded.  Pure: no I/O.
     pub fn record(&mut self, unit: LimitUnit, amount: u64) {
         if let Some(l) = self.get_mut(unit) {
@@ -858,14 +887,24 @@ impl LimiterSet {
         // three orders of magnitude larger than a normal day, so folding it into
         // the sliding window would leave the budget exhausted and refuse routine
         // traffic for a full period -- the override would create the outage it
-        // was invoked to avoid.  The spend is reported instead of recorded, so
-        // it is accounted for in the log even though it is not charged.
+        // was invoked to avoid.
+        //
+        // The traffic is still *measured*.  Not charging it is the point of the
+        // override; not recording it would mean the largest transfer a pond
+        // ever makes is the one thing its metric cannot show.  So a sample is
+        // emitted with what was observed and an `amount` of zero: the spike is
+        // visible, exceeds the limit, and is plainly marked as having been
+        // let through rather than paid for.
         if self.ignored {
+            let samples = self.ignored_samples_at(now_us);
             for (path, unit, spent) in self.discard_ignored_spending() {
                 log::warn!(
                     "[WARN] {IGNORE_LIMITS_ENV} spent {spent} {unit} ungoverned (not charged to `{path}`)"
                 );
             }
+            self.observed_ops = 0;
+            self.observed_bytes = 0;
+            crate::limiter_usage::queue(control, &samples).await;
             return Ok(());
         }
 
@@ -1035,6 +1074,49 @@ mod tests {
         set.ignored = false;
         set.check(LimitUnit::Bytes, 1024)
             .expect("a later ordinary charge must not be blocked by ignored spending");
+    }
+
+    #[test]
+    fn an_ignored_run_still_records_what_it_measured() {
+        // Not charging a seeding import is the point of the override.  Not
+        // *recording* it would mean the largest transfer a pond ever makes is
+        // the one thing its metric cannot show, which is how an 11 GB backfill
+        // becomes invisible.
+        let mut set = LimiterSet {
+            observed_ops: 0,
+            observed_bytes: 0,
+            bound: vec![limiter("/sys/limits/b", spec("MiB/day", 1.0, None))],
+            ignored: true,
+        };
+        let spent = 10 * 1024 * 1024;
+        set.record(LimitUnit::Bytes, spent);
+        set.record_observed(LimitUnit::Bytes, spent);
+
+        let samples = set.ignored_samples_at(0);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(
+            samples[0].amount, 0,
+            "an ignored run charges nothing, and must say so"
+        );
+        assert_eq!(
+            samples[0].observed, spent,
+            "but what physically happened is still measured"
+        );
+        assert!(
+            samples[0].observed > samples[0].limit,
+            "and the whole point is that it exceeds the ceiling visibly"
+        );
+    }
+
+    #[test]
+    fn an_ignored_run_that_measured_nothing_emits_nothing() {
+        let set = LimiterSet {
+            observed_ops: 0,
+            observed_bytes: 0,
+            bound: vec![limiter("/sys/limits/b", spec("MiB/day", 1.0, None))],
+            ignored: true,
+        };
+        assert!(set.ignored_samples_at(0).is_empty());
     }
 
     // -------- the unit contract (Decision L10) --------

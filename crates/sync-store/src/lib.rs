@@ -45,7 +45,7 @@ pub use content::{
 pub use content_remote::ContentRemote;
 pub use error::{Result, StoreError};
 pub use metered_store::{
-    MeteredStore, Observation, StorageMeter, current_meter, observed, with_meter,
+    MeterBinding, MeteredStore, Observation, RemoteKey, StorageMeter, bind_meter, observed_under,
 };
 pub use store::{AddPath, CompactMetrics, Op, RemovePath, Store};
 pub use tlog::{

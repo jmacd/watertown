@@ -4,22 +4,21 @@
 
 //! A [`ContentSource`] whose physical storage traffic is charged to a budget.
 //!
-//! # Why a wrapper rather than one scope around the pull
+//! # What this wrapper is still for
 //!
-//! The meter is ambient (a task-local), so the obvious thing is to install it
-//! once around the whole pull.  Two reasons not to:
+//! Not for charging: the budget is bound to the remote's URL for as long as
+//! the guard lives, so every request the inner source makes is charged whether
+//! it passes through this type or not.  A pull also reads the *local* pond,
+//! and that traffic is structurally outside the budget because it goes to a
+//! different remote -- a fact of where the bytes go rather than of when the
+//! call was made.
 //!
-//! * A pull reads the local pond as well as the remote, and only the remote's
-//!   traffic is billed.  Installing the meter for the whole pull relies on the
-//!   local store not being wrapped; installing it only around calls to the
-//!   remote source makes the boundary structural.
-//! * The pull future is already large, and wrapping it adds to a value that
-//!   must live on a thread's stack.  Scoping many small calls costs nothing.
-//!
-//! A streaming read started inside a scope keeps charging after the scope
-//! ends: [`sync_store::metered_store`] captures the meter into the stream
-//! rather than looking it up per chunk.  So a [`BlobReader`] handed out here
-//! is still metered while it drains.
+//! What is left is translation.  A budget's refusal reaches a caller flattened
+//! into an `object_store` error, and [`Self::charged`] turns it back into
+//! [`StewardError::RateLimited`] so an exhausted limit reads as a throttle
+//! rather than as an outage.  Holding the guard here also ties the budget's
+//! lifetime to the source's, which is what keeps a [`BlobReader`] metered
+//! while it drains.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -42,10 +41,10 @@ pub struct MeteredSource {
 impl MeteredSource {
     /// Take `limits` for the wrapper's lifetime, leaving the caller's set
     /// empty until [`Self::finish`] returns it.
-    pub fn new(inner: Arc<dyn ContentSource>, limits: &mut LimiterSet) -> Self {
+    pub fn new(inner: Arc<dyn ContentSource>, url: &str, limits: &mut LimiterSet) -> Self {
         Self {
             inner,
-            guard: MeterGuard::new(limits),
+            guard: MeterGuard::new(url, limits),
         }
     }
 
@@ -86,32 +85,32 @@ impl ContentSource for MeteredSource {
     }
 
     async fn get_tip(&self, ref_name: &str) -> Result<Option<ObjectHash>, StewardError> {
-        let outcome = self.guard.scope(self.inner.get_tip(ref_name)).await;
+        let outcome = self.inner.get_tip(ref_name).await;
         self.charged(outcome)
     }
 
     async fn get_object(&self, hash: ObjectHash) -> Result<Option<Vec<u8>>, StewardError> {
-        let outcome = self.guard.scope(self.inner.get_object(hash)).await;
+        let outcome = self.inner.get_object(hash).await;
         self.charged(outcome)
     }
 
     async fn has_blob(&self, hash: ObjectHash) -> Result<bool, StewardError> {
-        let outcome = self.guard.scope(self.inner.has_blob(hash)).await;
+        let outcome = self.inner.has_blob(hash).await;
         self.charged(outcome)
     }
 
     async fn list_blobs(&self) -> Result<HashSet<ObjectHash>, StewardError> {
-        let outcome = self.guard.scope(self.inner.list_blobs()).await;
+        let outcome = self.inner.list_blobs().await;
         self.charged(outcome)
     }
 
     async fn get_blob_reader(&self, hash: ObjectHash) -> Result<Option<BlobReader>, StewardError> {
-        let outcome = self.guard.scope(self.inner.get_blob_reader(hash)).await;
+        let outcome = self.inner.get_blob_reader(hash).await;
         self.charged(outcome)
     }
 
     async fn preload_objects(&self) -> Result<(), StewardError> {
-        let outcome = self.guard.scope(self.inner.preload_objects()).await;
+        let outcome = self.inner.preload_objects().await;
         self.charged(outcome)
     }
 

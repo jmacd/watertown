@@ -106,10 +106,10 @@ pub async fn push_content_to_remote_limited(
     ref_name: &str,
     limits: &mut LimiterSet,
 ) -> Result<ContentPushOutcome, StewardError> {
-    // Boxed: the push future is large, and the scope that installs the meter
-    // would otherwise hold it by value on the caller's stack.
-    crate::storage_meter::metered_op(limits, Box::pin(push_content_inner(ship, remote, ref_name)))
-        .await
+    // The budget is bound to the remote's own URL, so the store charges it by
+    // identity however many tasks the Delta layer spreads the work across.
+    let url = remote.url();
+    crate::storage_meter::metered_op(&url, limits, push_content_inner(ship, remote, ref_name)).await
 }
 
 /// Open the remote at `url` and push to it, with both charged to `limits`.
@@ -129,7 +129,11 @@ pub async fn open_and_push_to_remote_limited(
     limits: &mut LimiterSet,
 ) -> Result<ContentPushOutcome, StewardError> {
     crate::storage_meter::metered_op(
+        url,
         limits,
+        // Boxed only to keep this future off the caller's stack: it holds an
+        // open remote plus the whole push, and the pull path shares a thread
+        // with it.
         Box::pin(async move {
             let mut remote = ContentRemote::open_at_url(url, storage_options)
                 .await

@@ -146,17 +146,13 @@ async fn pull_one(ship: &mut steward::Steward, name: &str) -> Result<()> {
         .map_err(|e| anyhow!("read mount_path for `{}`: {}", name, e))?
         .filter(|s| !s.is_empty() && s != "/");
 
-    // Open once, here, so both modes below share one source.  It is wrapped so
-    // every request either mode makes against the remote passes through a
-    // metered object store (see `sync_store::metered_store`) with the budget
-    // installed: ingress is governed by construction, counting the bytes a
-    // remote actually sends rather than the bytes a call site remembered to
-    // declare.  Wrapping the source rather than the whole pull keeps the local
-    // pond's own traffic structurally outside the remote's budget.
-    let guard = steward::storage_meter::MeterGuard::new(&mut limits);
-    let opened = guard
-        .scope(open_content_source(&attachment, storage_options))
-        .await;
+    // Bind the budget to the remote's URL before opening it, so the open is
+    // charged too: opening a Delta table lists the log and reads every commit
+    // since the last checkpoint, which is not a local act.  Charging follows
+    // the URL rather than the call, so the local pond's own traffic is
+    // structurally outside this budget -- it goes somewhere else.
+    let guard = steward::storage_meter::MeterGuard::new(&attachment.url, &mut limits);
+    let opened = open_content_source(&attachment, storage_options).await;
     let source = match opened {
         Ok(s) => steward::metered_source::MeteredSource::with_guard(s.into(), guard),
         Err(e) => {
