@@ -341,10 +341,17 @@ mod tests {
             path: "/sys/limits/backup".to_string(),
             unit,
             used,
+            observed: used,
+            observed_since_us: Some(0),
+            observed_window_complete: true,
             limit,
+            burst_used: used,
+            burst_observed: used,
             burst: limit,
             window,
+            burst_window: window,
             reset_in: Duration::from_secs(3600),
+            burst_reset_in: Duration::from_secs(3600),
         }
     }
 

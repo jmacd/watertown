@@ -114,7 +114,11 @@ impl tinyfs::arrow::schema::ForArrow for LimiterUsageRow {
             Arc::new(Field::new("limiter", DataType::Utf8, false)),
             Arc::new(Field::new("unit", DataType::Utf8, false)),
             Arc::new(Field::new("amount", DataType::UInt64, false)),
-            Arc::new(Field::new("observed", DataType::UInt64, false)),
+            // Added after the usage series was already live.  Old parquet
+            // files have no `observed` column, so schema evolution pads them
+            // with null.  Declaring the field non-nullable made every query of
+            // an upgraded pond fail before it could reach the new rows.
+            Arc::new(Field::new("observed", DataType::UInt64, true)),
             Arc::new(Field::new("used", DataType::UInt64, false)),
             Arc::new(Field::new("limit", DataType::UInt64, false)),
             Arc::new(Field::new("window_secs", DataType::UInt64, false)),
@@ -310,5 +314,9 @@ mod tests {
             DataType::Timestamp(TimeUnit::Microsecond, _)
         ));
         assert_eq!(fields.len(), 8);
+        assert!(
+            fields[4].is_nullable(),
+            "observed was added after the series went live, so old rows must be readable"
+        );
     }
 }
