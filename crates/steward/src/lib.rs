@@ -44,7 +44,8 @@ pub use content_pull::{
     FetchedGraph, FetchedObject, RebuildOutcome, fetch_object_graph, import_pond, rebuild_pond,
 };
 pub use content_push::{
-    ContentPushOutcome, push_content_to_remote, push_content_to_remote_limited,
+    ContentPushOutcome, open_and_push_to_remote_limited, push_content_to_remote,
+    push_content_to_remote_limited,
 };
 pub use content_source::{BlobReader, ContentSource, LocalPondSource};
 pub use content_tree::{

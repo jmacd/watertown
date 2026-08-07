@@ -520,6 +520,9 @@ impl Limiter {
             limiter: state.path,
             unit: state.unit.as_str().to_string(),
             amount: spent,
+            // Filled in by the set, which is what knows the measurement for
+            // this dimension; a limiter alone only knows what it charged.
+            observed: 0,
             used: state.used,
             limit: state.limit,
             window_us,
@@ -645,6 +648,15 @@ pub struct LimiterSet {
     bound: Vec<Limiter>,
     /// Enforcement suspended for this process by [`IGNORE_LIMITS_ENV`].
     ignored: bool,
+    /// Physical traffic observed during the governed activity: requests.
+    ///
+    /// What was *charged* is what enforcement saw; this is what actually
+    /// happened.  They should agree, and a durable record of both is what
+    /// turns "they disagree" from an invisible accounting error into a
+    /// number an operator can chart (see [`sync_store::Observation`]).
+    observed_ops: u64,
+    /// Physical traffic observed during the governed activity: bytes.
+    observed_bytes: u64,
 }
 
 /// Setting this suspends limit *enforcement* for the process.
@@ -731,7 +743,12 @@ impl LimiterSet {
             );
         }
 
-        Ok(Self { bound, ignored })
+        Ok(Self {
+            bound,
+            ignored,
+            observed_ops: 0,
+            observed_bytes: 0,
+        })
     }
 
     /// Nothing is governed, so no charge can ever be refused.
@@ -800,6 +817,27 @@ impl LimiterSet {
         }
     }
 
+    /// Note the physical traffic of `unit` observed during the activity.
+    ///
+    /// Unlike [`Self::record`] this charges nothing -- it is the measurement
+    /// the charge is supposed to match, carried into the usage sample so the
+    /// two can be compared after the fact.
+    pub fn record_observed(&mut self, unit: LimitUnit, amount: u64) {
+        match unit {
+            LimitUnit::Ops => self.observed_ops = amount,
+            LimitUnit::Bytes => self.observed_bytes = amount,
+        }
+    }
+
+    /// Physical traffic observed for `unit` during the activity.
+    #[must_use]
+    pub fn observed(&self, unit: LimitUnit) -> u64 {
+        match unit {
+            LimitUnit::Ops => self.observed_ops,
+            LimitUnit::Bytes => self.observed_bytes,
+        }
+    }
+
     /// Persist every dirty window: at most one control write per bound
     /// limiter, and none at all for a set that spent nothing.
     ///
@@ -833,10 +871,17 @@ impl LimiterSet {
 
         let mut samples = Vec::new();
         for l in &mut self.bound {
-            if let Some(sample) = l.commit_window_at(control, now_us).await? {
+            let observed = match l.spec().unit {
+                LimitUnit::Ops => self.observed_ops,
+                LimitUnit::Bytes => self.observed_bytes,
+            };
+            if let Some(mut sample) = l.commit_window_at(control, now_us).await? {
+                sample.observed = observed;
                 samples.push(sample);
             }
         }
+        self.observed_ops = 0;
+        self.observed_bytes = 0;
 
         // Queue for the pond in one write, so spending becomes a durable
         // metric and not just enforcement state that a control rebuild erases
@@ -947,6 +992,8 @@ mod tests {
     #[test]
     fn an_ignored_set_admits_a_charge_that_would_otherwise_be_refused() {
         let mut set = LimiterSet {
+            observed_ops: 0,
+            observed_bytes: 0,
             bound: vec![limiter("/sys/limits/b", spec("MiB/day", 1.0, None))],
             ignored: false,
         };
@@ -969,6 +1016,8 @@ mod tests {
         // ordinary transfer would be refused -- the override would cause the
         // outage it exists to prevent.  So commit drops it.
         let mut set = LimiterSet {
+            observed_ops: 0,
+            observed_bytes: 0,
             bound: vec![limiter("/sys/limits/b", spec("MiB/day", 1.0, None))],
             ignored: true,
         };

@@ -153,10 +153,33 @@ async fn pull_one(ship: &mut steward::Steward, name: &str) -> Result<()> {
     // remote actually sends rather than the bytes a call site remembered to
     // declare.  Wrapping the source rather than the whole pull keeps the local
     // pond's own traffic structurally outside the remote's budget.
-    let source = open_content_source(&attachment, storage_options)
-        .await
-        .map_err(|e| anyhow!("open remote `{}` ({}): {}", name, attachment.url, e))?;
-    let source = steward::metered_source::MeteredSource::new(source.into(), &mut limits);
+    let guard = steward::storage_meter::MeterGuard::new(&mut limits);
+    let opened = guard
+        .scope(open_content_source(&attachment, storage_options))
+        .await;
+    let source = match opened {
+        Ok(s) => steward::metered_source::MeteredSource::with_guard(s.into(), guard),
+        Err(e) => {
+            // The open spent whatever it spent before failing; return it
+            // before reporting, so a remote that fails to open on a timer
+            // cannot be retried for free.
+            let refusal = guard.finish(&mut limits);
+            let ship_mut = ship
+                .as_pond_mut()
+                .ok_or_else(|| anyhow!("pull requires a pond steward (not a host steward)"))?;
+            if let Err(e) = limits.commit(ship_mut.control_table_mut()).await {
+                log::warn!(
+                    "[WARN] pull {}: failed to record limiter usage: {}",
+                    name,
+                    e
+                );
+            }
+            return Err(match refusal {
+                Some(r) => anyhow::Error::new(r),
+                None => anyhow!("open remote `{}` ({}): {}", name, attachment.url, e),
+            });
+        }
+    };
 
     // Mirror restart / backup restore (root or no mount): pull the full
     // content graph and rebuild the local pond by node_id.  Cross-pond import

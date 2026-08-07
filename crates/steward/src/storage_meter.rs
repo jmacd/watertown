@@ -90,6 +90,9 @@ impl StorageMeter for LimiterMeter {
 pub struct MeterGuard {
     shared: Arc<Mutex<LimiterSet>>,
     meter: Arc<LimiterMeter>,
+    /// Physical traffic already seen when the guard was made, so the guard can
+    /// report what happened during its own lifetime by difference.
+    observed_at_start: (u64, u64),
 }
 
 impl MeterGuard {
@@ -103,7 +106,12 @@ impl MeterGuard {
             limits: Arc::clone(&shared),
             refusal: Mutex::new(None),
         });
-        Self { shared, meter }
+        let o = sync_store::observed();
+        Self {
+            shared,
+            meter,
+            observed_at_start: (o.ops(), o.bytes()),
+        }
     }
 
     /// Run `fut` with every physical storage request it makes charged here.
@@ -130,6 +138,10 @@ impl MeterGuard {
     /// The spending comes back whether the work succeeded or not, so the
     /// caller can commit the usage either way.
     pub fn finish(self, limits: &mut LimiterSet) -> Option<StewardError> {
+        let o = sync_store::observed();
+        let observed_ops = o.ops().saturating_sub(self.observed_at_start.0);
+        let observed_bytes = o.bytes().saturating_sub(self.observed_at_start.1);
+
         let refusal = self
             .meter
             .refusal
@@ -153,6 +165,11 @@ impl MeterGuard {
                 LimiterSet::unlimited(),
             ),
         };
+
+        // Recorded after the spending is returned, so the sample the limiter
+        // emits carries both numbers for the same operation.
+        limits.record_observed(LimitUnit::Ops, observed_ops);
+        limits.record_observed(LimitUnit::Bytes, observed_bytes);
 
         refusal.map(StewardError::RateLimited)
     }

@@ -68,6 +68,14 @@ pub struct UsageSample {
     /// Units spent by this activity.  Differencing is not required: this is
     /// already a delta, so it charts directly as a rate.
     pub amount: u64,
+    /// Physical traffic measured for this dimension during the same activity.
+    ///
+    /// `amount` is what enforcement charged; this is what the storage layer
+    /// actually saw.  They are recorded side by side because a budget that is
+    /// quietly not being charged looks exactly like a budget that is not being
+    /// spent, and only the comparison tells them apart.
+    #[serde(default)]
+    pub observed: u64,
     /// Sliding-window total after the spending, in the same units.
     pub used: u64,
     /// The configured budget at the time.  Carried per row so a chart stays
@@ -88,6 +96,7 @@ pub struct LimiterUsageRow {
     pub limiter: String,
     pub unit: String,
     pub amount: u64,
+    pub observed: u64,
     pub used: u64,
     pub limit: u64,
     /// Window length in seconds.
@@ -105,6 +114,7 @@ impl tinyfs::arrow::schema::ForArrow for LimiterUsageRow {
             Arc::new(Field::new("limiter", DataType::Utf8, false)),
             Arc::new(Field::new("unit", DataType::Utf8, false)),
             Arc::new(Field::new("amount", DataType::UInt64, false)),
+            Arc::new(Field::new("observed", DataType::UInt64, false)),
             Arc::new(Field::new("used", DataType::UInt64, false)),
             Arc::new(Field::new("limit", DataType::UInt64, false)),
             Arc::new(Field::new("window_secs", DataType::UInt64, false)),
@@ -119,6 +129,7 @@ impl From<&UsageSample> for LimiterUsageRow {
             limiter: s.limiter.clone(),
             unit: s.unit.clone(),
             amount: s.amount,
+            observed: s.observed,
             used: s.used,
             limit: s.limit,
             window_secs: u64::try_from(s.window_us).unwrap_or(0) / 1_000_000,
@@ -248,6 +259,7 @@ mod tests {
             limiter: "/sys/limits/backup-bytes".to_string(),
             unit: "bytes".to_string(),
             amount,
+            observed: amount,
             used: amount,
             limit: 10 * 1024 * 1024,
             window_us: 86_400_000_000,
@@ -297,6 +309,6 @@ mod tests {
             fields[0].data_type(),
             DataType::Timestamp(TimeUnit::Microsecond, _)
         ));
-        assert_eq!(fields.len(), 7);
+        assert_eq!(fields.len(), 8);
     }
 }

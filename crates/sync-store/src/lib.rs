@@ -44,7 +44,9 @@ pub use content::{
 };
 pub use content_remote::ContentRemote;
 pub use error::{Result, StoreError};
-pub use metered_store::{MeteredStore, StorageMeter, current_meter, with_meter};
+pub use metered_store::{
+    MeteredStore, Observation, StorageMeter, current_meter, observed, with_meter,
+};
 pub use store::{AddPath, CompactMetrics, Op, RemovePath, Store};
 pub use tlog::{
     Checkpoint, CheckpointError, LogHash, TileLog, TransparencyLog, checkpoint_history_path,

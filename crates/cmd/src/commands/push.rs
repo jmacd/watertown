@@ -83,12 +83,17 @@ async fn push_one(ship: &mut steward::Steward, name: &str) -> Result<()> {
         .as_pond()
         .ok_or_else(|| anyhow!("push requires a pond steward (not a host steward)"))?;
 
-    let mut remote = sync_store::ContentRemote::open_at_url(&attachment.url, storage_options)
-        .await
-        .map_err(|e| anyhow!("open remote `{}` ({}): {}", name, attachment.url, e))?;
-
-    let pushed =
-        steward::push_content_to_remote_limited(ship_ref, &mut remote, "main", &mut limits).await;
+    // Open inside the budget, not before it: opening a Delta table lists the
+    // log and reads every commit since the last checkpoint, which is the
+    // larger half of a push's traffic.
+    let pushed = steward::open_and_push_to_remote_limited(
+        ship_ref,
+        &attachment.url,
+        storage_options,
+        "main",
+        &mut limits,
+    )
+    .await;
 
     // Persist the windows whether or not the push succeeded: a push that
     // failed partway still transferred what it transferred, and a budget that

@@ -112,6 +112,34 @@ pub async fn push_content_to_remote_limited(
         .await
 }
 
+/// Open the remote at `url` and push to it, with both charged to `limits`.
+///
+/// Prefer this to opening a remote and then calling
+/// [`push_content_to_remote_limited`].  Opening a Delta table is not a local
+/// act: it lists the log, reads every commit since the last checkpoint, and
+/// reads the checkpoint itself.  Measured against MinIO, the open was the
+/// larger half of a tick's traffic -- so a budget that starts at the push
+/// governs the smaller half and lets the rest through for free, which is
+/// precisely the accounting error this whole mechanism exists to prevent.
+pub async fn open_and_push_to_remote_limited(
+    ship: &Ship,
+    url: &str,
+    storage_options: std::collections::HashMap<String, String>,
+    ref_name: &str,
+    limits: &mut LimiterSet,
+) -> Result<ContentPushOutcome, StewardError> {
+    crate::storage_meter::metered_op(
+        limits,
+        Box::pin(async move {
+            let mut remote = ContentRemote::open_at_url(url, storage_options)
+                .await
+                .map_err(|e| StewardError::Aborted(format!("open remote {}: {}", url, e)))?;
+            push_content_inner(ship, &mut remote, ref_name).await
+        }),
+    )
+    .await
+}
+
 /// The push itself.
 ///
 /// No charging appears in this function on purpose.  Every request it makes

@@ -49,6 +49,16 @@ impl MeteredSource {
         }
     }
 
+    /// Adopt a guard that is already charging, so the work that produced
+    /// `inner` is billed to the same budget as the work done through it.
+    ///
+    /// Opening a remote is not a local act -- it lists the log and reads every
+    /// commit since the last checkpoint -- so the open belongs inside the
+    /// budget rather than in front of it.
+    pub fn with_guard(inner: Arc<dyn ContentSource>, guard: MeterGuard) -> Self {
+        Self { inner, guard }
+    }
+
     /// Return the spending to `limits`, and report the refusal that stopped
     /// the work if a budget said no.
     pub fn finish(self, limits: &mut LimiterSet) -> Option<StewardError> {

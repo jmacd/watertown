@@ -62,7 +62,8 @@ use object_store::{
 };
 use std::fmt;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, RwLock};
 
 /// How many items a listing returns per underlying request.  S3 and Azure
 /// both page at 1000, so an `n`-item listing cost `ceil(n / 1000)` requests
@@ -94,13 +95,134 @@ pub async fn with_meter<F, T>(meter: Arc<dyn StorageMeter>, f: F) -> T
 where
     F: Future<Output = T>,
 {
+    // Nested scopes -- a metered source used inside a larger metered
+    // operation -- must not queue behind themselves.  The task-local says the
+    // caller already holds the gate.
+    if METER.try_with(|_| ()).is_ok() {
+        let _installed = ProcessMeter::install(Arc::clone(&meter));
+        return METER.scope(meter, f).await;
+    }
+    let _gate = GOVERNED.lock().await;
+    let _installed = ProcessMeter::install(Arc::clone(&meter));
     METER.scope(meter, f).await
 }
 
-/// The meter governing the current task, if any.
+/// Serializes governed operations within a process.
+///
+/// [`PROCESS_METER`] is a single slot, so two governed operations running at
+/// once would charge each other's budgets.  Rather than let that be a latent
+/// hazard, only one runs at a time -- which is what a pond process does
+/// anyway: it replicates to one remote, then the next.  Making the invariant
+/// hold by construction is what lets the process meter be trusted.
+static GOVERNED: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The meter installed for the whole process, as a backstop for the
+/// task-local one.
+///
+/// # Why a task-local is not enough
+///
+/// Measured against MinIO: a governed tick made 463 requests through this
+/// wrapper and only 26 of them found a task-local meter.  The Delta layer
+/// hands work to tasks it spawns, and a `tokio::task_local` does not cross
+/// that boundary -- so the great majority of a push was charged to nothing at
+/// all while appearing, from the budget's side, simply not to have happened.
+///
+/// A process-wide install closes that gap, and is honest about what a budget
+/// governs here: one pond process replicates to one remote at a time, so
+/// "this process is pushing" and "this operation is pushing" are the same
+/// statement.  The task-local is kept as the first lookup because when it is
+/// present it is exact.
+static PROCESS_METER: RwLock<Option<Arc<dyn StorageMeter>>> = RwLock::new(None);
+
+/// Restores whatever process meter was installed before, so nested scopes
+/// (a source wrapper inside a larger operation) unwind in order.
+struct ProcessMeter(Option<Arc<dyn StorageMeter>>);
+
+impl ProcessMeter {
+    fn install(meter: Arc<dyn StorageMeter>) -> Self {
+        let mut slot = PROCESS_METER
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self(slot.replace(meter))
+    }
+}
+
+impl Drop for ProcessMeter {
+    fn drop(&mut self) {
+        let mut slot = PROCESS_METER
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = self.0.take();
+    }
+}
+
+/// The meter governing the current work, if any.
+///
+/// The task-local first, because it is exact; the process meter second,
+/// because work that escaped the task is still work a budget must pay for.
 #[must_use]
 pub fn current_meter() -> Option<Arc<dyn StorageMeter>> {
-    METER.try_with(Arc::clone).ok()
+    if let Ok(meter) = METER.try_with(Arc::clone) {
+        return Some(meter);
+    }
+    PROCESS_METER
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Physical traffic seen by every metered store in this process.
+///
+/// # Why this is not the meter
+///
+/// The meter is ambient: it governs whichever task installed it, and it is
+/// therefore only as reliable as the task boundary.  Work handed to a spawned
+/// task -- which the Delta layer does freely -- escapes it silently, and a
+/// budget that is quietly not charged is indistinguishable from a budget that
+/// is not being spent.
+///
+/// These counters are bound to the store instead.  A request increments them
+/// because it happened, with no ambient state involved, so comparing them
+/// against what a budget charged makes such a blind spot visible in the pond
+/// rather than only in a provider's trace.
+#[derive(Debug, Default)]
+pub struct Observation {
+    ops: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl Observation {
+    /// Requests seen since the process started.
+    #[must_use]
+    pub fn ops(&self) -> u64 {
+        self.ops.load(Ordering::Relaxed)
+    }
+
+    /// Bytes transferred, in either direction, since the process started.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    fn add(&self, ops: u64, bytes: u64) {
+        let _ = self.ops.fetch_add(ops, Ordering::Relaxed);
+        let _ = self.bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+/// Process-wide totals, shared by every [`MeteredStore`].
+///
+/// One accumulator rather than one per store: a budget governs a remote, and
+/// a remote is reached through however many store instances the Delta layer
+/// decides to build.  Callers take a difference across an operation (see
+/// `steward::storage_meter::MeterGuard`), which is why an ever-increasing
+/// total is enough.
+static OBSERVED: LazyLock<Arc<Observation>> = LazyLock::new(Arc::default);
+
+/// The process-wide observation counters.
+#[must_use]
+pub fn observed() -> Arc<Observation> {
+    Arc::clone(&OBSERVED)
 }
 
 /// Refuse up front if the budget cannot cover this request.
@@ -124,6 +246,9 @@ fn check(meter: Option<&Arc<dyn StorageMeter>>, ops: u64, bytes: u64) -> ObjectS
 /// budgets exist to stop.  Charging only successes would make the worst case
 /// free.
 fn record(meter: Option<&Arc<dyn StorageMeter>>, ops: u64, bytes: u64) {
+    // Observed first and unconditionally: what happened is recorded whether or
+    // not anything was watching.
+    OBSERVED.add(ops, bytes);
     if let Some(meter) = meter {
         meter.record(ops, bytes);
     }
@@ -388,6 +513,11 @@ mod tests {
     /// unconditionally, so an ungoverned pond must not fail or panic.
     #[tokio::test]
     async fn no_meter_is_not_an_error() {
+        // Held for the same reason a governed operation holds it: the process
+        // meter is one slot, so "no meter is installed" is only a fact while
+        // nothing else is installing one.  A pond process satisfies this by
+        // doing one thing at a time; a test binary has to say so.
+        let _gate = GOVERNED.lock().await;
         let store = store();
         let path = ObjectPath::from("obj");
         store
