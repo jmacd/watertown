@@ -648,7 +648,10 @@ mod tests {
     /// two tests running at once shared one slot and had to be serialized.
     fn store(name: &str) -> (MeteredStore, RemoteKey) {
         let key = RemoteKey::new(&format!("mem://{name}"));
-        (MeteredStore::new(Arc::new(InMemory::new()), key.clone()), key)
+        (
+            MeteredStore::new(Arc::new(InMemory::new()), key.clone()),
+            key,
+        )
     }
 
     /// The point of the whole module: a read is charged for the bytes that
