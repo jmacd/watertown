@@ -151,7 +151,6 @@ pub fn apply_layout(name: &str, ctx: &LayoutContext) -> String {
     let markup = match name {
         "data" => data_layout(ctx),
         "logs" => logs_layout(ctx),
-        "limiters" => limiters_layout(ctx),
         "explore" => explore_layout(ctx),
         "page" => page_layout(ctx),
         "blog" => blog_layout(ctx),
@@ -246,36 +245,6 @@ fn logs_layout(ctx: &LayoutContext) -> Markup {
                 }
                 (build_footer(ctx.footer))
                 script src=(format!("{}log-viewer.js", ctx.root_base_url)) type="module" {}
-            }
-        }
-    }
-}
-
-/// Layout for the pond-grouped limiter utilization dashboard.
-fn limiters_layout(ctx: &LayoutContext) -> Markup {
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                (common_head(ctx))
-            }
-            body {
-                (build_header(ctx.header, ctx.base_url))
-                @if let Some(sidebar_html) = ctx.sidebar {
-                    nav class="sidebar" {
-                        (PreEscaped(sidebar_html))
-                    }
-                }
-                main class="content-page" {
-                    (top_bar(Some("Home"), Some(ctx.base_url), ctx.feed_url, ctx.github_url))
-                    article class="blog-post" {
-                        div class="blog-post-content" {
-                            (PreEscaped(ctx.content))
-                        }
-                    }
-                }
-                (build_footer(ctx.footer))
-                script src=(format!("{}limiters.js", ctx.root_base_url)) type="module" {}
             }
         }
     }
@@ -681,28 +650,6 @@ mod tests {
         assert!(html.contains("type=\"module\""), "Module script: {}", html);
         assert!(html.contains("class=\"sidebar\""), "Sidebar present");
         assert!(!html.contains("chart.js"), "No chart.js in logs layout");
-    }
-
-    #[test]
-    fn test_limiters_layout_loads_dedicated_renderer() {
-        let ctx = LayoutContext {
-            title: "Limiters",
-            site_title: "Watershop Selfmon",
-            base_url: "/selfmon/",
-            root_base_url: "/selfmon/",
-            content: "<div id=\"limiters\"></div>",
-            sidebar: Some("<ul><li>Limiters</li></ul>"),
-            date: None,
-            feed_url: None,
-            github_url: None,
-            footer: None,
-            header: None,
-        };
-        let html = apply_layout("limiters", &ctx);
-        assert!(html.contains("/selfmon/limiters.js"));
-        assert!(html.contains("type=\"module\""));
-        assert!(html.contains("class=\"sidebar\""));
-        assert!(!html.contains("log-viewer.js"));
     }
 
     #[test]

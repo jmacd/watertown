@@ -1620,7 +1620,6 @@ fn write_shared_assets(output_dir: &Path) -> Result<(), tinyfs::Error> {
     static VEGA_SHARED_JS: &str = include_str!("../assets/vega-shared.js");
     static OVERLAY_JS: &str = include_str!("../assets/overlay.js");
     static LOG_VIEWER_JS: &str = include_str!("../assets/log-viewer.js");
-    static LIMITERS_JS: &str = include_str!("../assets/limiters.js");
     static RELATIVE_TIME_JS: &str = include_str!("../assets/relative-time.js");
 
     for (name, content) in [
@@ -1631,7 +1630,6 @@ fn write_shared_assets(output_dir: &Path) -> Result<(), tinyfs::Error> {
         ("vega-shared.js", VEGA_SHARED_JS),
         ("overlay.js", OVERLAY_JS),
         ("log-viewer.js", LOG_VIEWER_JS),
-        ("limiters.js", LIMITERS_JS),
         ("relative-time.js", RELATIVE_TIME_JS),
     ] {
         let path = output_dir.join(name);
