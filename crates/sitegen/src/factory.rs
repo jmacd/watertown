@@ -470,7 +470,8 @@ async fn run_format_provider_export(
     config: &SiteConfig,
 ) -> Result<(BTreeMap<String, Vec<shortcodes::ExportedFile>>, Vec<String>), tinyfs::Error> {
     let fs = provider_ctx.filesystem();
-    let provider = provider::Provider::new(Arc::new(fs)).with_root(root.clone());
+    let provider = provider::Provider::with_context(Arc::new(fs), Arc::new(provider_ctx.clone()))
+        .with_root(root.clone());
 
     // Use UrlPatternMatcher to expand the pattern and get matched files
     let matcher = provider::UrlPatternMatcher::new(provider);
