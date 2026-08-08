@@ -311,6 +311,7 @@ spec:
   factory: storage-azure
   config:
     account_name: ${env:AZURE_STORAGE_ACCOUNT}
+    timeout: 2m
     account_key: ${env:AZURE_STORAGE_KEY}
 ```
 

@@ -87,6 +87,12 @@ pub struct StorageAzureConfig {
     /// without an account names nothing.  Not a credential (see module docs).
     pub account_name: String,
 
+    /// Per-request HTTP timeout accepted by `object_store` (for example `2m`).
+    /// Azure multipart uploads can otherwise exceed the 30-second default on a
+    /// constrained uplink when several parts are in flight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+
     /// Shared account key.  Must be an `${env:...}` reference (Decision A1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_key: Option<String>,
@@ -221,6 +227,9 @@ impl StorageAzureConfig {
                 field: "account_name",
             });
         }
+        if self.timeout.as_ref().is_some_and(|v| v.trim().is_empty()) {
+            return Err(StorageAzureError::Missing { field: "timeout" });
+        }
         if let Some(sp) = self.service_principal.as_ref() {
             for (field, value) in [
                 ("service_principal.client_id", &sp.client_id),
@@ -294,6 +303,9 @@ impl StorageAzureConfig {
 
         let mut out = HashMap::new();
         let _ = out.insert("account_name".to_string(), resolve(&self.account_name)?);
+        if let Some(timeout) = self.timeout.as_deref() {
+            let _ = out.insert("azure_timeout".to_string(), resolve(timeout)?);
+        }
         match credential {
             AzureCredential::AccountKey(k) => {
                 let _ = out.insert("account_key".to_string(), resolve(k)?);
@@ -348,6 +360,7 @@ pub fn render(cfg: &StorageAzureConfig) -> Vec<u8> {
     let shape = cfg.credential().map_or("none", |c| c.shape());
     let normalized = StorageAzureConfig {
         account_name: cfg.account_name.clone(),
+        timeout: cfg.timeout.clone(),
         account_key: cfg.account_key.as_ref().map(|_| REDACTED.to_string()),
         sas_token: cfg.sas_token.as_ref().map(|_| REDACTED.to_string()),
         service_principal: cfg.service_principal.as_ref().map(|_| ServicePrincipal {
@@ -430,6 +443,7 @@ mod tests {
     fn with_key() -> StorageAzureConfig {
         StorageAzureConfig {
             account_name: "casparwater".to_string(),
+            timeout: None,
             account_key: Some("${env:AZURE_STORAGE_KEY}".to_string()),
             sas_token: None,
             service_principal: None,
@@ -570,6 +584,17 @@ mod tests {
             !opts.contains_key("sas_token") && !opts.contains_key("client_id"),
             "an unused shape must not reach the builder: {opts:?}"
         );
+    }
+
+    #[test]
+    fn timeout_is_forwarded_as_an_azure_client_option() {
+        let cfg = StorageAzureConfig {
+            account_key: Some("${env:PATH}".to_string()),
+            timeout: Some("2m".to_string()),
+            ..with_key()
+        };
+        let opts = cfg.to_storage_options().expect("options");
+        assert_eq!(opts.get("azure_timeout").map(String::as_str), Some("2m"));
     }
 
     /// Options resolve at use time so each replica authenticates as itself
