@@ -665,6 +665,18 @@ const VIZ_LOGS: VizRenderer = VizRenderer {
     empty_msg: "No log files available.",
 };
 
+/// Current limiter utilization grouped by pond (limiters.js): manifest only.
+const VIZ_LIMITERS: VizRenderer = VizRenderer {
+    id: "limiters",
+    container_class: "limiter-dashboard",
+    data_class: "limiter-data",
+    include_registry: false,
+    include_default_range: false,
+    include_explore: false,
+    include_annotations: false,
+    empty_msg: "No limiter state available.",
+};
+
 /// Resolve a `renderer=` name (from the `{{ viz }}` shortcode) to its
 /// descriptor. Unknown names yield `None` so the shortcode can surface an error.
 fn viz_renderer(name: &str) -> Option<&'static VizRenderer> {
@@ -672,6 +684,7 @@ fn viz_renderer(name: &str) -> Option<&'static VizRenderer> {
         "chart" => Some(&VIZ_CHART),
         "overlay" => Some(&VIZ_OVERLAY),
         "logs" | "log" | "log-viewer" => Some(&VIZ_LOGS),
+        "limiters" => Some(&VIZ_LIMITERS),
         _ => None,
     }
 }
@@ -1936,6 +1949,7 @@ mod tests {
         assert!(viz_renderer("overlay").is_some());
         assert!(viz_renderer("logs").is_some());
         assert!(viz_renderer("log-viewer").is_some());
+        assert!(viz_renderer("limiters").is_some());
         assert!(viz_renderer("nope").is_none());
     }
 
