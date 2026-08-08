@@ -12,6 +12,7 @@ pub mod export;
 pub mod fsck;
 // pub mod hydrovu;  // Removed: replaced by factory-based `pond run` command
 pub mod init;
+pub mod limits;
 pub mod list;
 pub mod list_factories;
 pub mod maintain;
@@ -38,6 +39,7 @@ pub use describe::describe_command;
 pub use export::export_command;
 pub use fsck::fsck_command;
 pub use init::init_command;
+pub use limits::limits_command;
 pub use list::list_command;
 pub use list_factories::list_factories_command;
 pub use maintain::maintain_command;

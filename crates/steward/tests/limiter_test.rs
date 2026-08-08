@@ -78,12 +78,15 @@ async fn a_window_survives_rebinding_through_the_control_table() {
         .await
         .expect("open");
     l.record(4 * 1024 * 1024);
+    l.record_observed(5 * 1024 * 1024);
     l.commit(ship.control_table_mut()).await.expect("commit");
 
     let again = Limiter::open(&mut ship, "/quota", LimitUnit::Bytes)
         .await
         .expect("reopen");
     assert_eq!(again.state().used, 4 * 1024 * 1024);
+    assert_eq!(again.state().observed, 5 * 1024 * 1024);
+    assert!(again.state().observed_since_us.is_some());
     assert_eq!(again.state().limit, 10 * 1024 * 1024);
 }
 

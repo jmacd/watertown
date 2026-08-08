@@ -76,7 +76,7 @@ async fn write_small_file(ctx: &ShipContext, path: &str, bytes: &[u8]) -> anyhow
 /// store, returning that URL.  A pull-mode remote must point at an existing
 /// pond, so an empty directory cannot stand in for one.
 async fn publish_upstream(tmp: &TempDir, name: &str) -> String {
-    let producer = tmp.path().join("producer");
+    let producer = tmp.path().join(format!("producer-{name}"));
     let url = sync_store::testing::in_memory_remote_url(name);
 
     let ctx = ctx_for(&producer, vec!["pond", "init"]);
@@ -222,6 +222,84 @@ async fn apply_creates_a_governed_backup_in_one_document() {
     push_command(&ctx, Some("origin".to_string()))
         .await
         .expect("push under a generous budget must succeed");
+}
+
+/// The monitoring API reports one bounded row per configured limiter without
+/// opening the remote or scanning `/sys/limits/usage`.
+#[tokio::test]
+async fn limits_status_reports_governed_backup_by_path_and_unit() {
+    init_log();
+    let tmp = TempDir::new().expect("tempdir");
+    let pond = tmp.path().join("pond");
+    let url = sync_store::testing::in_memory_remote_url("limits-status");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "limits-status-pond")
+        .await
+        .expect("init");
+
+    apply_yaml(&ctx, tmp.path(), &governed_backup_yaml(&url, 1024, 100_000))
+        .await
+        .expect("apply governed backup");
+
+    let rows = cmd::commands::limits::collect_limiter_status(&ctx)
+        .await
+        .expect("collect limits");
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r.pond == "limits-status-pond"));
+    assert!(rows.iter().all(|r| r.remotes == "origin"));
+    assert!(rows.iter().all(|r| r.error.is_none()));
+    assert!(
+        rows.iter()
+            .any(|r| { r.limiter == "/sys/limits/backup-bytes" && r.unit == "bytes" })
+    );
+    assert!(
+        rows.iter()
+            .any(|r| { r.limiter == "/sys/limits/backup-ops" && r.unit == "ops" })
+    );
+}
+
+/// Several remotes may deliberately share one pond-wide budget.  Monitoring
+/// reports that limiter once, preserving the remote names as context instead
+/// of multiplying the same state by attachment count.
+#[tokio::test]
+async fn limits_status_deduplicates_a_shared_limiter() {
+    init_log();
+    let tmp = TempDir::new().expect("tempdir");
+    let upstream = publish_upstream(&tmp, "limits-shared-upstream-a").await;
+    let upstream2 = publish_upstream(&tmp, "limits-shared-upstream-b").await;
+    let pond = tmp.path().join("consumer");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "limits-shared-consumer")
+        .await
+        .expect("init");
+
+    let mut yaml = governed_pull_yaml(&upstream, 1024, 100_000);
+    yaml.push_str(&format!(
+        r#"---
+version: v1
+kind: remote
+metadata:
+  path: /sys/remotes/upstream2
+spec:
+  url: {upstream2}
+  mount: /sources/upstream2
+  limits:
+    bytes: /sys/limits/pull-bytes
+    ops: /sys/limits/pull-ops
+"#
+    ));
+    apply_yaml(&ctx, tmp.path(), &yaml)
+        .await
+        .expect("apply shared limits");
+
+    let rows = cmd::commands::limits::collect_limiter_status(&ctx)
+        .await
+        .expect("collect limits");
+    assert_eq!(rows.len(), 2, "shared byte/ops limiters must not repeat");
+    assert!(
+        rows.iter().all(|row| row.remotes == "upstream,upstream2"),
+        "{rows:?}"
+    );
 }
 
 /// The binding is not decorative: a backup attached by `pond apply` naming a
