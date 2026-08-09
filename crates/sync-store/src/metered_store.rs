@@ -601,16 +601,23 @@ struct MeteredUpload {
 impl MultipartUpload for MeteredUpload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
         let bytes = data.content_length() as u64;
+        if let Err(error) = check(self.meter.as_ref(), 1, bytes) {
+            return Box::pin(async move { Err(error) });
+        }
         record(&self.key, self.meter.as_ref(), 1, bytes);
         self.inner.put_part(data)
     }
 
     async fn complete(&mut self) -> ObjectStoreResult<PutResult> {
+        check(self.meter.as_ref(), 1, 0)?;
         record(&self.key, self.meter.as_ref(), 1, 0);
         self.inner.complete().await
     }
 
     async fn abort(&mut self) -> ObjectStoreResult<()> {
+        // Cleanup must remain possible after the request budget is exhausted:
+        // refusing an abort can leave staged multipart data accruing storage
+        // charges.  Account for the request, but deliberately do not admit it.
         record(&self.key, self.meter.as_ref(), 1, 0);
         self.inner.abort().await
     }
@@ -640,6 +647,54 @@ mod tests {
         fn record(&self, ops: u64, bytes: u64) {
             *self.ops.lock().unwrap() += ops;
             *self.bytes.lock().unwrap() += bytes;
+        }
+    }
+
+    #[derive(Debug)]
+    struct ByteBudget {
+        limit: u64,
+        used: Mutex<u64>,
+    }
+
+    impl StorageMeter for ByteBudget {
+        fn check(&self, _ops: u64, bytes: u64) -> Result<(), String> {
+            let used = *self.used.lock().unwrap();
+            if used.saturating_add(bytes) > self.limit {
+                return Err(format!(
+                    "byte budget exceeded: {used}/{} used, request for {bytes} denied",
+                    self.limit
+                ));
+            }
+            Ok(())
+        }
+
+        fn record(&self, _ops: u64, bytes: u64) {
+            let mut used = self.used.lock().unwrap();
+            *used = used.saturating_add(bytes);
+        }
+    }
+
+    #[derive(Debug)]
+    struct RequestBudget {
+        limit: u64,
+        used: Mutex<u64>,
+    }
+
+    impl StorageMeter for RequestBudget {
+        fn check(&self, ops: u64, _bytes: u64) -> Result<(), String> {
+            let used = *self.used.lock().unwrap();
+            if used.saturating_add(ops) > self.limit {
+                return Err(format!(
+                    "request budget exceeded: {used}/{} used, request for {ops} denied",
+                    self.limit
+                ));
+            }
+            Ok(())
+        }
+
+        fn record(&self, ops: u64, _bytes: u64) {
+            let mut used = self.used.lock().unwrap();
+            *used = used.saturating_add(ops);
         }
     }
 
@@ -693,6 +748,79 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("budget spent"), "{err}");
+    }
+
+    /// Every multipart part is a separate physical request, so it must be
+    /// admitted before reaching the provider.  Checking only when the upload
+    /// is opened lets one large blob overrun the entire budget before the next
+    /// object-store call notices.
+    #[tokio::test]
+    async fn a_multipart_upload_stops_before_exceeding_its_byte_budget() {
+        const MIB: u64 = 1024 * 1024;
+
+        let meter = Arc::new(ByteBudget {
+            limit: 6 * MIB,
+            used: Mutex::new(0),
+        });
+        let (store, key) = store("multipart-byte-budget");
+        let path = ObjectPath::from("large");
+        let binding = bind_meter(&key, meter.clone());
+        let upload = store.put_multipart(&path).await.unwrap();
+        let mut writer = object_store::WriteMultipart::new(upload);
+
+        // WriteMultipart emits 5 MiB parts.  The first fits; admitting the
+        // second would exceed the 6 MiB budget and must fail before upload.
+        writer.write(&vec![0u8; 12 * MIB as usize]);
+        let err = writer
+            .finish()
+            .await
+            .expect_err("second part must be denied");
+        drop(binding);
+
+        assert!(err.to_string().contains("byte budget exceeded"), "{err}");
+        assert_eq!(*meter.used.lock().unwrap(), 5 * MIB);
+        assert!(
+            store.head(&path).await.is_err(),
+            "a refused multipart upload must not publish a partial object"
+        );
+    }
+
+    /// Completing a multipart upload is itself a physical request.  It must
+    /// not slip past an exhausted IOPS budget, but the subsequent abort must
+    /// still reach the provider so staged parts do not become a storage cost.
+    #[tokio::test]
+    async fn multipart_completion_is_limited_but_cleanup_is_not_refused() {
+        let meter = Arc::new(RequestBudget {
+            limit: 2,
+            used: Mutex::new(0),
+        });
+        let (store, key) = store("multipart-request-budget");
+        let path = ObjectPath::from("large");
+        let binding = bind_meter(&key, meter.clone());
+        let mut upload = store.put_multipart(&path).await.unwrap();
+
+        upload
+            .put_part(PutPayload::from_static(b"part"))
+            .await
+            .unwrap();
+        let err = upload
+            .complete()
+            .await
+            .expect_err("completion must exceed the request budget");
+        assert!(err.to_string().contains("request budget exceeded"), "{err}");
+
+        upload.abort().await.expect("cleanup must remain possible");
+        drop(binding);
+
+        assert_eq!(
+            *meter.used.lock().unwrap(),
+            3,
+            "initiation, part, and mandatory cleanup are charged"
+        );
+        assert!(
+            store.head(&path).await.is_err(),
+            "a refused completion must not publish the object"
+        );
     }
 
     /// Unmetered work still functions: the wrapper is installed

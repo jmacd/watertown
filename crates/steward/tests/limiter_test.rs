@@ -180,6 +180,46 @@ async fn an_exhausted_budget_stops_the_push() {
     assert!(text.contains("retry in"), "{text}");
 }
 
+/// A large blob is admitted one multipart part at a time.  The provider must
+/// never receive the part that would cross either configured byte ceiling.
+#[tokio::test]
+async fn a_multipart_blob_cannot_overrun_its_window_or_burst() {
+    const MIB: usize = 1024 * 1024;
+
+    let (_t, mut ship) = new_pond("limiter-multipart-deny").await;
+    write_limiter(&mut ship, "/quota", "MiB/day", 6.0, Some(6.0)).await;
+    let body = vec![b'x'; 12 * MIB];
+    let hash = sync_store::content::ObjectHash::of_bytes(&body);
+    write_file(&mut ship, "/large.bin", &body).await;
+
+    let pond_id = uuid::Uuid::parse_str(ship.data_persistence().pond_id()).expect("pond id");
+    let mut remote = ContentRemote::create_at_url(
+        &sync_store::testing::in_memory_remote_url("push-multipart-denied"),
+        pond_id,
+        [].into(),
+    )
+    .await
+    .expect("create remote");
+
+    let mut limits = LimiterSet::open(&mut ship, &[(LimitUnit::Bytes, "/quota".to_string())])
+        .await
+        .expect("bind");
+    let err = push_content_to_remote_limited(&ship, &mut remote, "main", &mut limits)
+        .await
+        .expect_err("multipart blob must exceed its budget");
+
+    assert!(matches!(err, StewardError::RateLimited(_)), "{err:?}");
+    assert!(
+        limits.states()[0].used <= 6 * MIB as u64,
+        "denied push charged past its configured ceiling: {:?}",
+        limits.states()[0]
+    );
+    assert!(
+        !remote.has_blob(hash).await.expect("probe refused blob"),
+        "a refused multipart blob must not become visible"
+    );
+}
+
 /// An ungoverned dimension costs nothing at all: no pond read, no control
 /// read, no control write.
 #[tokio::test]
