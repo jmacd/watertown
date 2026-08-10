@@ -19,7 +19,7 @@ use cmd::commands::{
 };
 use cmd::common::ShipContext;
 use provider::factory::rate_limit::LimitUnit;
-use std::sync::Once;
+use std::{collections::HashMap, sync::Once};
 use steward::{PondUserMetadata, REMOTE_MODE_PREFIX, RemoteMode};
 use tempfile::TempDir;
 use tinyfs::EntryType;
@@ -170,6 +170,47 @@ spec:
     ops: /sys/limits/backup-ops
 "#
     )
+}
+
+fn pull_remote_yaml(url: &str, overwrite: bool, migrate_watermark: bool) -> String {
+    format!(
+        r#"version: v1
+kind: remote
+metadata:
+  path: /sys/remotes/upstream
+spec:
+  url: {url}
+  mount: /sources/upstream
+  overwrite: {overwrite}
+  migrate_watermark: {migrate_watermark}
+"#
+    )
+}
+
+async fn publish_equivalent_remotes(tmp: &TempDir, name: &str) -> (ShipContext, String, String) {
+    let producer = tmp.path().join(format!("producer-{name}"));
+    let first = sync_store::testing::in_memory_remote_url(&format!("{name}-first"));
+    let second = sync_store::testing::in_memory_remote_url(&format!("{name}-second"));
+    let ctx = ctx_for(&producer, vec!["pond", "init"]);
+    init_command(&ctx, "producer-host")
+        .await
+        .expect("init producer");
+    apply_yaml(
+        &ctx,
+        tmp.path(),
+        &format!(
+            "version: v1\nkind: backup\nmetadata:\n  path: /sys/remotes/first\nspec:\n  url: {first}\n---\nversion: v1\nkind: backup\nmetadata:\n  path: /sys/remotes/second\nspec:\n  url: {second}\n"
+        ),
+    )
+    .await
+    .expect("attach equivalent producer remotes");
+    write_small_file(&ctx, "/hello.txt", b"same commit on both remotes")
+        .await
+        .expect("write producer content");
+    push_command(&ctx, None)
+        .await
+        .expect("publish identical producer tip");
+    (ctx, first, second)
 }
 
 /// A governed backup authored entirely in YAML behaves like one authored with
@@ -746,6 +787,339 @@ async fn a_governed_pull_within_budget_still_succeeds() {
     assert!(
         tip.is_some_and(|t| !t.is_empty()),
         "a successful governed pull must record the tip it pulled"
+    );
+}
+
+#[tokio::test]
+async fn overwrite_can_migrate_a_verified_pull_watermark_between_equivalent_remotes() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let (_producer, first, second) = publish_equivalent_remotes(&tmp, "migration-ok").await;
+    let pond = tmp.path().join("consumer");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&first, false, false))
+        .await
+        .expect("attach first remote");
+    pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect("pull first remote");
+
+    let old_tip = ctx
+        .open_pond()
+        .await
+        .expect("open")
+        .control_table()
+        .raw_config_get(&format!("last_pulled_tip:{first}"))
+        .await
+        .expect("read old watermark")
+        .expect("old watermark");
+
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&second, true, true))
+        .await
+        .expect("migrate equivalent remote watermark");
+
+    let mut ship = ctx.open_pond().await.expect("open migrated pond");
+    assert_eq!(
+        load_remote_attachment(&mut ship, "upstream")
+            .await
+            .expect("load migrated attachment")
+            .url,
+        second
+    );
+    assert_eq!(
+        ship.control_table()
+            .raw_config_get(&format!("last_pulled_tip:{second}"))
+            .await
+            .expect("read migrated watermark"),
+        Some(old_tip.clone())
+    );
+    assert_eq!(
+        ship.control_table()
+            .raw_config_get(&format!("last_pulled_tip:{first}"))
+            .await
+            .expect("read retained old watermark"),
+        Some(old_tip)
+    );
+    drop(ship);
+
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&second, true, true))
+        .await
+        .expect("reapplying a completed migration must be safe");
+}
+
+#[tokio::test]
+async fn watermark_migration_refuses_an_advanced_destination_without_replacing_the_remote() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let (producer, first, second) = publish_equivalent_remotes(&tmp, "migration-advanced").await;
+    let pond = tmp.path().join("consumer");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&first, false, false))
+        .await
+        .expect("attach first remote");
+    pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect("pull first remote");
+
+    write_small_file(&producer, "/later.txt", b"new producer commit")
+        .await
+        .expect("advance producer");
+    push_command(&producer, None)
+        .await
+        .expect("publish advanced tip");
+
+    let err = apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&second, true, true))
+        .await
+        .expect_err("advanced destination must not inherit an older watermark");
+    assert!(
+        format!("{err:#}").contains("does not exactly match pinned tip"),
+        "unexpected migration error: {err:#}"
+    );
+
+    let mut ship = ctx.open_pond().await.expect("open unchanged pond");
+    assert_eq!(
+        load_remote_attachment(&mut ship, "upstream")
+            .await
+            .expect("load original attachment")
+            .url,
+        first
+    );
+    assert_eq!(
+        ship.control_table()
+            .raw_config_get(&format!("last_pulled_tip:{second}"))
+            .await
+            .expect("read replacement watermark"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn watermark_migration_refuses_a_different_producer_identity() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let (_producer, first, _equivalent) =
+        publish_equivalent_remotes(&tmp, "migration-identity-a").await;
+    let different = publish_upstream(&tmp, "migration-identity-b").await;
+    let pond = tmp.path().join("consumer");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&first, false, false))
+        .await
+        .expect("attach first remote");
+    pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect("pull first producer");
+
+    let err = apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&different, true, true))
+        .await
+        .expect_err("a different producer must not inherit the watermark");
+    assert!(
+        format!("{err:#}").contains("replacement remote has pond_id"),
+        "unexpected identity error: {err:#}"
+    );
+    let mut ship = ctx.open_pond().await.expect("open unchanged pond");
+    assert_eq!(
+        load_remote_attachment(&mut ship, "upstream")
+            .await
+            .expect("load original attachment")
+            .url,
+        first
+    );
+}
+
+#[tokio::test]
+async fn watermark_migration_refuses_when_the_graft_pin_is_missing() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let (_producer, first, second) = publish_equivalent_remotes(&tmp, "migration-no-pin").await;
+    let pond = tmp.path().join("consumer");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&first, false, false))
+        .await
+        .expect("attach first remote");
+    pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect("pull first remote");
+
+    let mut ship = ctx.open_pond().await.expect("open consumer");
+    ship.write_transaction(
+        &PondUserMetadata::new(vec!["test".to_string(), "remove-graft-pin".to_string()]),
+        async |fs| {
+            let root = fs.root().await?;
+            root.open_dir_path(steward::SYS_GRAFTS_DIR)
+                .await?
+                .remove_entry("upstream")
+                .await?;
+            Ok(())
+        },
+    )
+    .await
+    .expect("remove graft pin");
+    drop(ship);
+
+    let err = apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&second, true, true))
+        .await
+        .expect_err("missing graft pin must prevent migration");
+    assert!(
+        format!("{err:#}").contains("graft pin `/sys/grafts/upstream` does not exist"),
+        "unexpected missing-pin error: {err:#}"
+    );
+    let mut ship = ctx.open_pond().await.expect("open unchanged pond");
+    assert_eq!(
+        load_remote_attachment(&mut ship, "upstream")
+            .await
+            .expect("load original attachment")
+            .url,
+        first
+    );
+}
+
+#[tokio::test]
+async fn watermark_migration_refuses_a_watermark_that_disagrees_with_the_graft_pin() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let (_producer, first, second) =
+        publish_equivalent_remotes(&tmp, "migration-bad-watermark").await;
+    let pond = tmp.path().join("consumer");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&first, false, false))
+        .await
+        .expect("attach first remote");
+    pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect("pull first remote");
+
+    let mut ship = ctx.open_pond().await.expect("open consumer");
+    ship.control_table_mut()
+        .raw_config_set(&format!("last_pulled_tip:{first}"), &"0".repeat(64))
+        .await
+        .expect("corrupt old watermark");
+    drop(ship);
+
+    let err = apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&second, true, true))
+        .await
+        .expect_err("watermark and graft pin disagreement must prevent migration");
+    assert!(
+        format!("{err:#}").contains("graft pin tip")
+            && format!("{err:#}").contains("differs from existing URL watermark"),
+        "unexpected mismatched-watermark error: {err:#}"
+    );
+}
+
+#[tokio::test]
+async fn watermark_migration_refuses_a_destination_missing_the_pinned_commit() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let (_producer, first, second) =
+        publish_equivalent_remotes(&tmp, "migration-missing-commit").await;
+    let pond = tmp.path().join("consumer");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&first, false, false))
+        .await
+        .expect("attach first remote");
+    pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect("pull first remote");
+
+    let remote = sync_store::ContentRemote::open_at_url(&second, HashMap::new())
+        .await
+        .expect("open equivalent remote");
+    let pond_id = remote.pond_id();
+    let tip = remote
+        .get_tip("main")
+        .await
+        .expect("read remote tip")
+        .expect("remote tip");
+    let mut store = sync_store::Store::open_at_url(&second, HashMap::new())
+        .await
+        .expect("open backing store");
+    let txn_seq = store.last_txn_seq(pond_id).await.expect("last sequence") + 1;
+    store
+        .apply_batch(
+            pond_id,
+            txn_seq,
+            chrono::Utc::now().timestamp_micros(),
+            vec![sync_store::Op::Delete {
+                partition: "objects".to_string(),
+                key: tip.to_string(),
+            }],
+        )
+        .await
+        .expect("remove pinned commit while retaining the ref");
+
+    let err = apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&second, true, true))
+        .await
+        .expect_err("missing pinned commit must prevent migration");
+    assert!(
+        format!("{err:#}").contains("does not contain pinned commit"),
+        "unexpected missing-commit error: {err:#}"
+    );
+    let mut ship = ctx.open_pond().await.expect("open unchanged pond");
+    assert_eq!(
+        load_remote_attachment(&mut ship, "upstream")
+            .await
+            .expect("load original attachment")
+            .url,
+        first
+    );
+}
+
+#[tokio::test]
+async fn ordinary_overwrite_without_a_prior_pull_does_not_require_migration_state() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let (_producer, first, second) = publish_equivalent_remotes(&tmp, "ordinary-overwrite").await;
+    let pond = tmp.path().join("consumer");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&first, false, false))
+        .await
+        .expect("attach first remote");
+
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&second, true, false))
+        .await
+        .expect("ordinary overwrite remains unchanged");
+    let mut ship = ctx.open_pond().await.expect("open overwritten pond");
+    assert_eq!(
+        load_remote_attachment(&mut ship, "upstream")
+            .await
+            .expect("load replacement attachment")
+            .url,
+        second
+    );
+    assert_eq!(
+        ship.control_table()
+            .raw_config_get(&format!("last_pulled_tip:{second}"))
+            .await
+            .expect("read absent watermark"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn watermark_migration_requires_overwrite() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let pond = tmp.path().join("consumer");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+
+    let err = apply_yaml(
+        &ctx,
+        tmp.path(),
+        &pull_remote_yaml("file:///unused", false, true),
+    )
+    .await
+    .expect_err("migration without overwrite must fail during parsing");
+    assert!(
+        format!("{err:#}").contains("'migrate_watermark: true' requires 'overwrite: true'"),
+        "unexpected apply guard error: {err:#}"
     );
 }
 
