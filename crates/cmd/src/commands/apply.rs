@@ -94,7 +94,7 @@ struct MknodSpec {
 ///
 /// These describe *how to attach*, not *what to attach to*, which is why they
 /// are not part of the replicated attachment document.
-const REMOTE_CONTROL_KEYS: [&str; 3] = ["mount", "bidirectional", "overwrite"];
+const REMOTE_CONTROL_KEYS: [&str; 4] = ["mount", "bidirectional", "overwrite", "migrate_watermark"];
 
 /// Spec for `kind: copy`.
 #[derive(Debug, Deserialize)]
@@ -136,6 +136,7 @@ enum ApplyKind {
         /// Mount path, pull-mode only.
         mount: Option<String>,
         overwrite: bool,
+        migrate_watermark: bool,
     },
 }
 
@@ -412,6 +413,7 @@ fn parse_remote_kind(doc: &ResourceDoc, source_file: &str, index: usize) -> Resu
     };
     let bidirectional = as_bool("bidirectional")?;
     let overwrite = as_bool("overwrite")?;
+    let migrate_watermark = as_bool("migrate_watermark")?;
 
     let mount = match control.get("mount") {
         None => None,
@@ -505,6 +507,20 @@ fn parse_remote_kind(doc: &ResourceDoc, source_file: &str, index: usize) -> Resu
                 mount_path
             ));
         }
+    } else if migrate_watermark {
+        return Err(anyhow!(
+            "{}[{}]: 'migrate_watermark' is valid only for kind 'remote'",
+            source_file,
+            index
+        ));
+    }
+
+    if migrate_watermark && !overwrite {
+        return Err(anyhow!(
+            "{}[{}]: 'migrate_watermark: true' requires 'overwrite: true'",
+            source_file,
+            index
+        ));
     }
 
     Ok(ApplyKind::Remote {
@@ -513,6 +529,7 @@ fn parse_remote_kind(doc: &ResourceDoc, source_file: &str, index: usize) -> Resu
         mode,
         mount,
         overwrite,
+        migrate_watermark,
     })
 }
 
@@ -681,6 +698,7 @@ pub async fn apply_command(ship_context: &ShipContext, files: &[String]) -> Resu
             mode,
             mount,
             overwrite,
+            migrate_watermark,
         } = &spec.kind
         else {
             continue;
@@ -692,6 +710,7 @@ pub async fn apply_command(ship_context: &ShipContext, files: &[String]) -> Resu
             *mode,
             mount.as_deref(),
             *overwrite,
+            *migrate_watermark,
         )
         .await
         .map_err(|e| {

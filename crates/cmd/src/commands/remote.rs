@@ -20,7 +20,9 @@
 use crate::common::ShipContext;
 use anyhow::{Result, anyhow};
 use std::collections::BTreeMap;
-use steward::{REMOTE_MODE_PREFIX, REMOTE_MOUNT_PATH_PREFIX, SYS_DIR, SYS_REMOTES_DIR};
+use steward::{
+    ContentSource, REMOTE_MODE_PREFIX, REMOTE_MOUNT_PATH_PREFIX, SYS_DIR, SYS_REMOTES_DIR,
+};
 use tinyfs::EntryType;
 use tokio::io::AsyncWriteExt;
 
@@ -107,6 +109,7 @@ pub async fn add_remote_command(
         RemoteMode::Pull,
         Some(path),
         overwrite,
+        false,
     )
     .await
 }
@@ -152,6 +155,7 @@ pub async fn add_backup_command(
         mode,
         None,
         overwrite,
+        false,
     )
     .await
 }
@@ -168,6 +172,7 @@ pub async fn add_backup_command(
 ///
 /// Persists the attachment YAML, records mode and -- for pull -- the mount
 /// path, and auto-initializes the remote Delta table.
+#[allow(clippy::too_many_arguments)]
 pub async fn attach_remote(
     ship_context: &ShipContext,
     name: &str,
@@ -175,6 +180,7 @@ pub async fn attach_remote(
     mode: RemoteMode,
     mount_path: Option<&str>,
     overwrite: bool,
+    migrate_watermark: bool,
 ) -> Result<()> {
     validate_name(name)?;
     let url = attachment.url.as_str();
@@ -224,6 +230,12 @@ pub async fn attach_remote(
 
     let mut ship = ship_context.open_pond().await?;
 
+    let watermark_migration = if migrate_watermark {
+        Some(prepare_watermark_migration(&mut ship, name, url, mode, mount_path, overwrite).await?)
+    } else {
+        None
+    };
+
     // D5.7b.5: mount-conflict pre-checks (local only) for pull-mode
     // remotes.  Refuse if another pull-mode attachment already mounts
     // the same `mount_path` (would create overlapping mount entries).
@@ -272,9 +284,16 @@ pub async fn attach_remote(
         // either a content remote (`s3://`, `file://`) or a producer pond clone
         // on local disk (`pond://<path>`, the develop-and-preview workflow).
         let remote_store_id = if let Some(path) = attachment.url.strip_prefix("pond://") {
-            use steward::ContentSource;
             match steward::LocalPondSource::open(path).await {
-                Ok(source) => source.pond_id(),
+                Ok(source) => {
+                    verify_watermark_destination(
+                        &source,
+                        watermark_migration.as_ref(),
+                        &attachment.url,
+                    )
+                    .await?;
+                    source.pond_id()
+                }
                 Err(e) => {
                     return Err(anyhow!(
                         "remote `{}` at {} is not a readable local pond: {}; pull-mode \
@@ -289,7 +308,15 @@ pub async fn attach_remote(
             match sync_store::ContentRemote::open_at_url(&attachment.url, storage_options.clone())
                 .await
             {
-                Ok(remote) => remote.pond_id(),
+                Ok(remote) => {
+                    verify_watermark_destination(
+                        &remote,
+                        watermark_migration.as_ref(),
+                        &attachment.url,
+                    )
+                    .await?;
+                    remote.pond_id()
+                }
                 Err(_) => {
                     return Err(anyhow!(
                         "remote `{}` at {} is not a content remote; pull-mode remotes must \
@@ -445,6 +472,29 @@ pub async fn attach_remote(
     .await
     .map_err(|e| anyhow!("Failed to add remote: {}", e))?;
 
+    if let Some(migration) = watermark_migration {
+        ship.control_table_mut()
+            .raw_config_set(&format!("last_pulled_tip:{url}"), &migration.tip)
+            .await
+            .map_err(|e| anyhow!("record migrated pull watermark for `{name}`: {e}"))?;
+        if migration.old_url == url {
+            log::info!(
+                "[OK] verified existing pull watermark for {} at {} ({})",
+                name,
+                url,
+                migration.tip
+            );
+        } else {
+            log::info!(
+                "[OK] migrated pull watermark for {}: {} -> {} at {}",
+                name,
+                migration.old_url,
+                url,
+                migration.tip
+            );
+        }
+    }
+
     match mount_path {
         Some(p) => log::info!(
             "[OK] added remote {} -> {} (mode={}, mount={})",
@@ -459,6 +509,184 @@ pub async fn attach_remote(
             url,
             mode.as_str()
         ),
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct PullWatermarkMigration {
+    old_url: String,
+    tip: String,
+    foreign_pond_id: String,
+}
+
+impl PullWatermarkMigration {
+    fn verify(&self, remote_pond_id: uuid::Uuid, remote_tip: Option<&str>) -> Result<()> {
+        if remote_pond_id.to_string() != self.foreign_pond_id {
+            return Err(anyhow!(
+                "cannot migrate pull watermark: replacement remote has pond_id {}, \
+                 but graft pin records {}",
+                remote_pond_id,
+                self.foreign_pond_id
+            ));
+        }
+        match remote_tip {
+            Some(tip) if tip == self.tip => Ok(()),
+            Some(tip) => Err(anyhow!(
+                "cannot migrate pull watermark: replacement remote tip {} does not \
+                 exactly match pinned tip {}; refresh the source pond while both remotes \
+                 are synchronized before retrying",
+                tip,
+                self.tip
+            )),
+            None => Err(anyhow!(
+                "cannot migrate pull watermark: replacement remote has no `main` tip"
+            )),
+        }
+    }
+}
+
+async fn prepare_watermark_migration(
+    ship: &mut steward::Steward,
+    name: &str,
+    new_url: &str,
+    mode: RemoteMode,
+    mount_path: Option<&str>,
+    overwrite: bool,
+) -> Result<PullWatermarkMigration> {
+    if !overwrite || mode != RemoteMode::Pull {
+        return Err(anyhow!(
+            "pull watermark migration requires overwrite of a pull remote"
+        ));
+    }
+    let mount_path = mount_path
+        .filter(|path| *path != "/")
+        .ok_or_else(|| anyhow!("pull watermark migration requires a cross-pond mount path"))?;
+    let old_attachment = load_remote_attachment(ship, name).await.map_err(|e| {
+        anyhow!(
+            "cannot migrate pull watermark: existing remote `{}` is unavailable: {}",
+            name,
+            e
+        )
+    })?;
+    if remote_mode_for(ship, name).await? != RemoteMode::Pull {
+        return Err(anyhow!(
+            "cannot migrate pull watermark: existing remote `{}` is not pull-mode",
+            name
+        ));
+    }
+    let old_mount = ship
+        .control_table()
+        .raw_config_get(&format!("{REMOTE_MOUNT_PATH_PREFIX}{name}"))
+        .await
+        .map_err(|e| anyhow!("read existing mount path for `{name}`: {e}"))?
+        .ok_or_else(|| {
+            anyhow!("cannot migrate pull watermark: existing remote has no mount path")
+        })?;
+    if !paths_equivalent(&old_mount, mount_path) {
+        return Err(anyhow!(
+            "cannot migrate pull watermark: existing mount `{}` differs from replacement mount `{}`",
+            old_mount,
+            mount_path
+        ));
+    }
+
+    let tip = ship
+        .control_table()
+        .raw_config_get(&format!("last_pulled_tip:{}", old_attachment.url))
+        .await
+        .map_err(|e| anyhow!("read existing pull watermark for `{name}`: {e}"))?
+        .filter(|tip| !tip.is_empty())
+        .ok_or_else(|| {
+            if old_attachment.url == new_url {
+                anyhow!(
+                    "cannot verify completed pull watermark migration: replacement URL `{}` \
+                     is already attached but has no pull watermark; restore the original \
+                     attachment and retry the migration",
+                    old_attachment.url
+                )
+            } else {
+                anyhow!(
+                    "cannot migrate pull watermark: existing URL `{}` has no pull watermark",
+                    old_attachment.url
+                )
+            }
+        })?;
+
+    let pin_path = steward::GraftPin::pin_path(name);
+    let tx = ship
+        .begin_read(&steward::PondUserMetadata::new(vec![
+            "remote".to_string(),
+            "migrate-watermark".to_string(),
+            name.to_string(),
+        ]))
+        .await
+        .map_err(|e| anyhow!("begin graft pin read for `{name}`: {e}"))?;
+    let pin_bytes = {
+        let root = tx.root().await?;
+        if !root.exists(&pin_path).await {
+            return Err(anyhow!(
+                "cannot migrate pull watermark: graft pin `{}` does not exist",
+                pin_path
+            ));
+        }
+        root.read_file_path_to_vec(&pin_path)
+            .await
+            .map_err(|e| anyhow!("read graft pin `{pin_path}`: {e}"))?
+    };
+    let _ = tx
+        .commit()
+        .await
+        .map_err(|e| anyhow!("commit graft pin read for `{name}`: {e}"))?;
+    let pin = steward::GraftPin::from_yaml_bytes(&pin_bytes)
+        .map_err(|e| anyhow!("parse graft pin `{pin_path}`: {e}"))?;
+    if !paths_equivalent(&pin.mount_path, mount_path) {
+        return Err(anyhow!(
+            "cannot migrate pull watermark: graft pin mount `{}` differs from replacement mount `{}`",
+            pin.mount_path,
+            mount_path
+        ));
+    }
+    if pin.pinned_tip != tip {
+        return Err(anyhow!(
+            "cannot migrate pull watermark: graft pin tip {} differs from existing URL watermark {}",
+            pin.pinned_tip,
+            tip
+        ));
+    }
+
+    Ok(PullWatermarkMigration {
+        old_url: old_attachment.url,
+        tip,
+        foreign_pond_id: pin.foreign_pond_id,
+    })
+}
+
+async fn verify_watermark_destination(
+    source: &impl ContentSource,
+    migration: Option<&PullWatermarkMigration>,
+    url: &str,
+) -> Result<()> {
+    let Some(migration) = migration else {
+        return Ok(());
+    };
+    let tip = source
+        .get_tip("main")
+        .await
+        .map_err(|e| anyhow!("read tip from `{url}`: {e}"))?;
+    let tip_text = tip.as_ref().map(ToString::to_string);
+    migration.verify(source.pond_id(), tip_text.as_deref())?;
+    let tip = tip.expect("verified destination tip is present");
+    if source
+        .get_object(tip)
+        .await
+        .map_err(|e| anyhow!("read pinned commit {} from `{url}`: {e}", migration.tip))?
+        .is_none()
+    {
+        return Err(anyhow!(
+            "cannot migrate pull watermark: replacement remote does not contain pinned commit {}",
+            migration.tip
+        ));
     }
     Ok(())
 }
