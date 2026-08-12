@@ -249,7 +249,9 @@ async fn collect_samples(
     };
     let path = node_path.path.to_string_lossy();
     let filesystem = provider_context.filesystem();
-    let provider = provider::Provider::new(Arc::new(filesystem)).with_root(root.clone());
+    let provider =
+        provider::Provider::with_context(Arc::new(filesystem), Arc::new(provider_context.clone()))
+            .with_root(root.clone());
     let url = format!("series://{path}");
     let table_provider = provider
         .create_table_provider_bounded(
