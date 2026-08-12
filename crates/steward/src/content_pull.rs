@@ -990,7 +990,7 @@ fn plan_one(
     // post-apply fold -- durably, because the commit lands before the fold runs,
     // so every retry re-diffs against the same stale state and fails again.
     // (`content_diff::diff_dir` prunes on both for the same reason.)
-    let meta_changed = existing.is_none_or(|t| t.versions != entry.versions);
+    let meta_changed = existing.is_some_and(|t| t.versions != entry.versions);
     let needs_write = create || content_changed || meta_changed;
 
     match entry.entry_type {
@@ -1032,8 +1032,13 @@ fn plan_one(
             if create {
                 outcome.series += 1;
             }
-            let (versions, collapse_first) =
-                plan_series_versions(entry, graph, target_series, existing.map(|t| t.child_hash))?;
+            let (versions, collapse_first) = plan_series_versions(
+                entry,
+                graph,
+                target_series,
+                existing.map(|t| t.child_hash),
+                meta_changed,
+            )?;
             ops.push(ApplyOp::File {
                 parent: entry.parent_node_id.clone(),
                 name: entry.name.clone(),
@@ -1113,6 +1118,7 @@ fn plan_series_versions(
     graph: &FetchedGraph,
     target_series: &HashMap<String, Vec<ObjectHash>>,
     existing_child_hash: Option<ObjectHash>,
+    meta_changed: bool,
 ) -> Result<(Vec<PlannedVersion>, bool), StewardError> {
     let incoming = series_versions(graph, entry.child_hash)?;
 
@@ -1133,7 +1139,9 @@ fn plan_series_versions(
 
     let held = match existing_child_hash {
         None => &[][..],
-        Some(child_hash) if child_hash == entry.child_hash => return Ok((Vec::new(), false)),
+        Some(child_hash) if child_hash == entry.child_hash && !meta_changed => {
+            return Ok((Vec::new(), false));
+        }
         Some(_) => target_series
             .get(&entry.node_id)
             .map(Vec::as_slice)
@@ -1147,7 +1155,7 @@ fn plan_series_versions(
 
     // Append-only fast path: the incoming list extends what is already held, so
     // write only the missing suffix.
-    if incoming.len() >= held.len() && incoming[..held.len()] == *held {
+    if !meta_changed && incoming.len() >= held.len() && incoming[..held.len()] == *held {
         let suffix = incoming[held.len()..]
             .iter()
             .enumerate()
@@ -1390,6 +1398,44 @@ fn timestamp_column(meta: &VersionMeta) -> String {
             || "Timestamp".to_string(),
             |attrs| attrs.timestamp_column().to_string(),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn series_metadata_divergence_forces_full_rewrite() {
+        let blob_hash = ObjectHash::of_bytes(b"unchanged");
+        let series_hash = ObjectHash::of_bytes(b"series");
+        let entry = ManifestEntry::new(
+            "series-node",
+            "root",
+            "events.series",
+            EntryType::FilePhysicalSeries,
+            series_hash,
+            vec![VersionMeta {
+                timestamp: Some(2),
+                ..VersionMeta::default()
+            }],
+        );
+        let mut graph = FetchedGraph::default();
+        _ = graph
+            .objects
+            .insert(blob_hash, FetchedObject::Blob(b"unchanged".to_vec()));
+        _ = graph
+            .objects
+            .insert(series_hash, FetchedObject::Series(vec![blob_hash]));
+        let target_series = HashMap::from([("series-node".to_string(), vec![blob_hash])]);
+
+        let (versions, collapse_first) =
+            plan_series_versions(&entry, &graph, &target_series, Some(series_hash), true)
+                .expect("metadata repair plan");
+
+        assert_eq!(versions.len(), 1);
+        assert!(collapse_first);
+        assert_eq!(versions[0].meta.timestamp, Some(2));
+    }
 }
 
 /// Look up a parent directory's working directory by `node_id`, erroring if it
