@@ -108,6 +108,7 @@ num-traits = "0.2"
 proptest = "1.4"
 pulldown-cmark = "0.12"
 maud = "0.27.0"
+png = "0.17"
 rss = "2"
 
 [workspace.lints.rust]
