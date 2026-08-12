@@ -119,6 +119,30 @@ async fn write_file_series_version(ship: &mut Ship, path: &str, bytes: &[u8]) {
     .expect("file-series transaction");
 }
 
+async fn write_temporal_file_series_version(
+    ship: &mut Ship,
+    path: &str,
+    bytes: &[u8],
+    min: i64,
+    max: i64,
+) {
+    let path = path.to_string();
+    let bytes = bytes.to_vec();
+    ship.write_transaction(&meta("temporal-file-series"), async move |fs| {
+        use tokio::io::AsyncWriteExt;
+        let root = fs.root().await?;
+        let mut writer = root
+            .async_writer_path_with_type(&path, tinyfs::EntryType::FilePhysicalSeries)
+            .await?;
+        writer.write_all(&bytes).await?;
+        writer.set_temporal_metadata(min, max, "timestamp".to_string());
+        writer.shutdown().await?;
+        Ok(())
+    })
+    .await
+    .expect("temporal file-series transaction");
+}
+
 /// Create a dynamic node (factory + config) at `path` with the given entry
 /// type, exercising the recipe path directly without the provider's factory
 /// registry (rebuild only needs the stored factory string and config bytes).
@@ -222,6 +246,16 @@ async fn root_hash(ship: &Ship) -> ObjectHash {
         .await
         .expect("fold")
         .root_tree_hash
+}
+
+async fn foreign_root_hash(ship: &Ship, pond_id: uuid7::Uuid) -> ObjectHash {
+    steward::compute_content_tree_for_table(
+        ship.data_persistence().table().clone(),
+        &pond_id.to_string(),
+    )
+    .await
+    .expect("foreign fold")
+    .root_tree_hash
 }
 
 /// Fetching a pushed pond returns a verified closure whose tip and root tree
@@ -859,6 +893,113 @@ async fn repull_after_source_side_collapse_converges() {
         .expect("idempotent re-pull");
     assert_eq!(outcome.series, 0);
     assert_eq!(root_hash(&dst).await, root_hash(&src).await);
+}
+
+/// Cross-pond imports also converge after temporal versions stored as external
+/// blobs are compacted, matching the shape of the production septic series.
+#[tokio::test]
+async fn repull_after_temporal_file_series_collapse_converges() {
+    let (_t, mut src) = new_pond("temporal-collapse-src").await;
+    let src_id = src
+        .data_persistence()
+        .pond_id()
+        .parse::<uuid7::Uuid>()
+        .expect("source pond id");
+
+    let chunks: [(Vec<u8>, i64); 4] = [
+        (vec![b'a'; 70 * 1024], 1_000_000),
+        (vec![b'b'; 70 * 1024], 2_000_000),
+        (vec![b'c'; 70 * 1024], 3_000_000),
+        (vec![b'd'; 70 * 1024], 4_000_000),
+    ];
+    for (chunk, timestamp) in chunks {
+        write_temporal_file_series_version(
+            &mut src,
+            "/events.series",
+            &chunk,
+            timestamp,
+            timestamp,
+        )
+        .await;
+    }
+
+    let (_rt, mut remote) = push(&src).await;
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "temporal-collapse-dst")
+        .await
+        .expect("create dst");
+    let graph = fetch_object_graph(&remote, "main").await.expect("fetch");
+    let _ = steward::import_pond(&mut dst, &remote, &graph, src_id)
+        .await
+        .expect("initial import");
+    assert_eq!(foreign_root_hash(&dst, src_id).await, root_hash(&src).await);
+
+    let report = src.collapse_versions(1).await.expect("collapse");
+    assert_eq!(report.files_collapsed, 1);
+
+    repush(&src, &mut remote).await;
+    let graph = fetch_object_graph(&remote, "main").await.expect("fetch");
+    let _ = steward::import_pond(&mut dst, &remote, &graph, src_id)
+        .await
+        .expect("re-import after temporal collapse");
+
+    assert_eq!(foreign_root_hash(&dst, src_id).await, root_hash(&src).await);
+}
+
+/// A collapsing rewrite can retain the exact same series blob list while
+/// changing its mtime. A cross-pond retry must replace that series to repair the
+/// foreign tree rather than short-circuiting on the unchanged series hash.
+#[tokio::test]
+async fn repull_after_metadata_only_series_collapse_converges() {
+    let (_t, mut src) = new_pond("metadata-collapse-src").await;
+    let src_id = src
+        .data_persistence()
+        .pond_id()
+        .parse::<uuid7::Uuid>()
+        .expect("source pond id");
+    write_file_series_version(&mut src, "/events.series", b"one version\n").await;
+
+    let (_rt, mut remote) = push(&src).await;
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "metadata-collapse-dst")
+        .await
+        .expect("create dst");
+    let graph = fetch_object_graph(&remote, "main").await.expect("fetch");
+    let _ = steward::import_pond(&mut dst, &remote, &graph, src_id)
+        .await
+        .expect("initial import");
+    let before = root_hash(&src).await;
+    assert_eq!(foreign_root_hash(&dst, src_id).await, before);
+
+    src.write_transaction(&meta("metadata-only-collapse"), async move |fs| {
+        use tokio::io::AsyncWriteExt;
+        let root = fs.root().await?;
+        let mut writer = root
+            .async_writer_path_collapsing_with_type(
+                "/events.series",
+                tinyfs::EntryType::FilePhysicalSeries,
+            )
+            .await?;
+        writer.write_all(b"one version\n").await?;
+        writer.set_mtime(123);
+        writer.shutdown().await?;
+        Ok(())
+    })
+    .await
+    .expect("metadata-only collapsing rewrite");
+    let after = root_hash(&src).await;
+    assert_ne!(
+        before, after,
+        "single-version collapse must change metadata while retaining its bytes"
+    );
+
+    repush(&src, &mut remote).await;
+    let graph = fetch_object_graph(&remote, "main").await.expect("fetch");
+    let _ = steward::import_pond(&mut dst, &remote, &graph, src_id)
+        .await
+        .expect("metadata-only re-import");
+
+    assert_eq!(foreign_root_hash(&dst, src_id).await, after);
 }
 
 /// A source may append fresh versions after a collapse; a mirror that holds the
