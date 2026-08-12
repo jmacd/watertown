@@ -474,6 +474,7 @@ mod tests {
                 target_points: 1500,
                 timestamp_column: "timestamp".to_string(),
             }],
+            reports: BTreeMap::new(),
             routes: vec![RouteConfig {
                 name: "home".to_string(),
                 route_type: RouteType::Static,
@@ -659,6 +660,7 @@ mod tests {
             },
             content: vec![],
             exports: vec![],
+            reports: BTreeMap::new(),
             routes: vec![RouteConfig {
                 name: "home".to_string(),
                 route_type: RouteType::Static,

@@ -52,6 +52,13 @@ enum SitegenSubcommand {
         #[arg(long)]
         quick: bool,
     },
+    /// Render a named report without sending it
+    Report {
+        /// Name from the config's reports map
+        name: String,
+        /// Directory for report.html, report.txt, and chart PNGs
+        output_dir: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -61,6 +68,7 @@ enum SitegenSubcommand {
 fn validate_config(config: &[u8]) -> tinyfs::Result<Value> {
     // Try parsing as standalone SiteConfig first
     if let Ok(config) = serde_yaml::from_slice::<SiteConfig>(config) {
+        crate::report::validate_reports(&config).map_err(tinyfs::Error::Other)?;
         return serde_json::to_value(&config).map_other_context("Config serialization error");
     }
 
@@ -102,6 +110,7 @@ fn extract_sitegen_from_pond_config(config: &[u8]) -> tinyfs::Result<Value> {
                 serde_json::from_value(inner_config.clone()).map_err(|e| {
                     tinyfs::Error::Other(format!("Invalid sitegen config in pond YAML: {}", e))
                 })?;
+            crate::report::validate_reports(&site_config).map_err(tinyfs::Error::Other)?;
 
             return serde_json::to_value(&site_config)
                 .map_other_context("Config serialization error");
@@ -254,6 +263,20 @@ async fn execute(
                 }
             }
 
+            Ok(())
+        }
+        SitegenSubcommand::Report { name, output_dir } => {
+            let root = context.root().await?;
+            let report = crate::report::render_named_report(
+                &config,
+                &root,
+                &context.context,
+                &name,
+                chrono::Utc::now(),
+            )
+            .await?;
+            crate::report::write_preview(&report, std::path::Path::new(&output_dir))?;
+            info!("Report '{}' written to {}", name, output_dir);
             Ok(())
         }
     }
@@ -2611,6 +2634,7 @@ mod tests {
             },
             content: vec![],
             exports: vec![],
+            reports: BTreeMap::new(),
             routes: vec![],
             partials: BTreeMap::new(),
             static_assets: vec![],
@@ -2740,6 +2764,7 @@ mod tests {
             },
             content: vec![],
             exports: vec![],
+            reports: BTreeMap::new(),
             routes: vec![],
             partials: BTreeMap::new(),
             static_assets: vec![],

@@ -1455,6 +1455,7 @@ sidebar:                              # Ordered sidebar sections (flat pills)
 | `site.base_url` | yes | Base URL path: `"/"` for root, `"/myapp/"` for subdirectory |
 | `content` | no | List of content stages -- glob markdown files for metadata-driven pages |
 | `exports` | no | List of data export stages (see below) |
+| `reports` | no | Named offline reports built from export stages (see below) |
 | `routes` | yes | Hierarchical route tree |
 | `partials` | no | Named Markdown partials (e.g., sidebar) |
 | `static` | no | List of patterns for static files to copy (text files only) |
@@ -1474,6 +1475,38 @@ sidebar:                              # Ordered sidebar sections (flat pills)
 | `name` | yes | Name referenced by `export:` in routes |
 | `pattern` | yes | Glob pattern matching pond files. `*` captures become `$0`, `$1`, ... |
 | `target_points` | no | Target data points per plot (default: 1500). Used to auto-compute temporal partitions per resolution. |
+
+**Named reports:**
+
+```yaml
+reports:
+  weekly:
+    title: "Weekly pond summary"
+    message: "Please check the instruments and glance at the latest data."
+    window: 7d
+    include_pond_size: true
+    sections:
+      - export: params
+        captures: [well-depth, data, res=1h]
+        value: well_depth_value.avg
+        unit: m
+        summary: range
+        chart: true
+        href: data/well-depth.html
+```
+
+Each section selects exactly one file by matching the wildcard captures from
+its named export. A missing `title` reuses the first capture's entry in
+`labels`, falling back to a title-cased capture. `range` renders latest,
+minimum, and maximum values; `sum` renders a total. Generate a local preview
+without credentials or network delivery:
+
+```bash
+pond run /system/etc/90-sitegen report weekly ./report-preview
+```
+
+The output directory contains `report.html`, `report.txt`, and one PNG per
+charted section.
 
 **Route types:**
 

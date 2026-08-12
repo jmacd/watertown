@@ -18,6 +18,7 @@ mod factory;
 mod layouts;
 pub mod markdown;
 pub mod partitions;
+pub mod report;
 mod routes;
 mod shortcodes;
 mod status_summary;

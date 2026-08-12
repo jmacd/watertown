@@ -5,6 +5,7 @@
 //! Site configuration -- parsed from `site.yaml` (pond or host filesystem).
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Top-level site configuration.
 ///
@@ -38,6 +39,9 @@ pub struct SiteConfig {
     pub content: Vec<ContentStage>,
     #[serde(default)]
     pub exports: Vec<ExportStage>,
+    /// Named reports rendered from the same exported datasets as the site.
+    #[serde(default)]
+    pub reports: BTreeMap<String, ReportConfig>,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
     #[serde(default)]
@@ -351,6 +355,60 @@ pub struct ExportStage {
     /// for journald logs).
     #[serde(default = "default_timestamp_column")]
     pub timestamp_column: String,
+}
+
+/// A named, transport-independent report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportConfig {
+    /// Heading shown in rendered report artifacts.
+    pub title: String,
+    /// Optional reminder or explanatory text below the heading.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// Trailing time window, such as `7d` or `168h`.
+    pub window: String,
+    /// Include the pond's allocated storage size.
+    #[serde(default)]
+    pub include_pond_size: bool,
+    /// Ordered data sections.
+    pub sections: Vec<ReportSectionConfig>,
+}
+
+/// A numeric series included in a report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportSectionConfig {
+    /// Optional heading override. Defaults to the first capture's configured
+    /// site label, then to a title-cased capture value.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Name of an entry in `exports`.
+    pub export: String,
+    /// Exact wildcard captures selecting one file from the export pattern.
+    #[serde(default)]
+    pub captures: Vec<String>,
+    /// Numeric column to summarize and chart.
+    pub value: String,
+    /// Display unit appended to numeric values.
+    pub unit: String,
+    /// Summary calculation.
+    #[serde(default)]
+    pub summary: ReportSummary,
+    /// Render a static PNG line chart.
+    #[serde(default)]
+    pub chart: bool,
+    /// Relative or absolute link to the corresponding site page.
+    pub href: String,
+}
+
+/// Numeric aggregation shown for a report section.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReportSummary {
+    #[default]
+    Range,
+    Sum,
 }
 
 fn default_target_points() -> u64 {
