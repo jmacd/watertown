@@ -246,6 +246,20 @@ struct StoredWindow {
     bucket_us: i64,
     #[serde(default)]
     buckets: Buckets,
+    /// Physical traffic observed in the same bounded buckets.
+    ///
+    /// Added after charged windows were already deployed.  Serde's default
+    /// makes every v1 control record a valid empty observed window, so this is
+    /// an in-place compatible extension rather than a state reset.
+    #[serde(default)]
+    observed: Buckets,
+    /// First instant independently observed traffic was recorded.
+    ///
+    /// `None` on pre-instrumentation state.  Keeping that unknown is more
+    /// honest than copying charged buckets into observed and manufacturing a
+    /// match the independent instrument never measured.
+    #[serde(default)]
+    observed_since_us: Option<i64>,
 }
 
 const STORED_WINDOW_VERSION: u32 = 1;
@@ -263,6 +277,10 @@ pub struct Limiter {
     loaded: Buckets,
     /// Charges made this session, not yet persisted.
     pending: Buckets,
+    /// Physical traffic seen this session, independently of charging.
+    observed_loaded: Buckets,
+    observed_pending: Buckets,
+    observed_since_us: Option<i64>,
     dirty: bool,
 }
 
@@ -272,11 +290,24 @@ pub struct LimiterState {
     pub path: String,
     pub unit: LimitUnit,
     pub used: u64,
+    /// Physical traffic seen in the same sliding window.
+    pub observed: u64,
+    /// First independently observed sample, in epoch microseconds.
+    pub observed_since_us: Option<i64>,
+    /// Whether independent observation covers this whole sliding window.
+    pub observed_window_complete: bool,
     pub limit: u64,
+    /// Charged traffic in the shorter burst window.
+    pub burst_used: u64,
+    /// Independently observed traffic in the shorter burst window.
+    pub burst_observed: u64,
     pub burst: u64,
     pub window: Duration,
+    pub burst_window: Duration,
     /// How long until any budget frees up, if currently saturated.
     pub reset_in: Duration,
+    /// How long until burst capacity frees up, if saturated.
+    pub burst_reset_in: Duration,
 }
 
 impl Limiter {
@@ -331,11 +362,11 @@ impl Limiter {
                 reason: e.to_string(),
             })?;
 
-        let loaded = match raw {
+        let (loaded, observed_loaded, observed_since_us) = match raw {
             // No key: fresh pond, or the control table was rebuilt.  Start
             // empty rather than refusing to run (Decision L6).
-            None => Buckets::default(),
-            Some(text) if text.is_empty() => Buckets::default(),
+            None => (Buckets::default(), Buckets::default(), None),
+            Some(text) if text.is_empty() => (Buckets::default(), Buckets::default(), None),
             Some(text) => match serde_json::from_str::<StoredWindow>(&text) {
                 // A stored window measured in a different unit or over a
                 // different period is measuring something else; discard it
@@ -346,15 +377,15 @@ impl Limiter {
                         && w.unit == spec.unit
                         && w.window_us == window_micros(spec.window) =>
                 {
-                    w.buckets
+                    (w.buckets, w.observed, w.observed_since_us)
                 }
-                Ok(_) => Buckets::default(),
+                Ok(_) => (Buckets::default(), Buckets::default(), None),
                 Err(e) => {
                     log::warn!(
                         "limiter `{path}`: discarding unreadable control window ({e}); \
                          starting from an empty window"
                     );
-                    Buckets::default()
+                    (Buckets::default(), Buckets::default(), None)
                 }
             },
         };
@@ -364,6 +395,9 @@ impl Limiter {
             spec,
             loaded,
             pending: Buckets::default(),
+            observed_loaded,
+            observed_pending: Buckets::default(),
+            observed_since_us,
             dirty: false,
         })
     }
@@ -446,6 +480,24 @@ impl Limiter {
         self.dirty = true;
     }
 
+    /// Record physical traffic independently of what enforcement charged.
+    pub fn record_observed_at(&mut self, now_us: i64, amount: u64) {
+        if amount == 0 {
+            return;
+        }
+        self.observed_pending
+            .add(now_us, bucket_micros(self.spec.window), amount);
+        if self.observed_since_us.is_none() {
+            self.observed_since_us = Some(now_us);
+        }
+        self.dirty = true;
+    }
+
+    /// Record independently observed physical traffic at the current time.
+    pub fn record_observed(&mut self, amount: u64) {
+        self.record_observed_at(now_micros(), amount);
+    }
+
     /// Fold this session's charges into the persisted window.
     ///
     /// Exactly one control write, and none at all when nothing was charged
@@ -479,12 +531,16 @@ impl Limiter {
             return Ok(None);
         }
         let spent = self.spent();
+        let observed = self.observed_pending.total();
         let window_us = window_micros(self.spec.window);
         let bucket_us = bucket_micros(self.spec.window);
 
         let mut merged = self.loaded.clone();
         merged.merge(&self.pending);
         merged.prune(now_us, window_us, bucket_us);
+        let mut observed_merged = self.observed_loaded.clone();
+        observed_merged.merge(&self.observed_pending);
+        observed_merged.prune(now_us, window_us, bucket_us);
 
         let stored = StoredWindow {
             v: STORED_WINDOW_VERSION,
@@ -492,6 +548,8 @@ impl Limiter {
             window_us,
             bucket_us,
             buckets: merged.clone(),
+            observed: observed_merged.clone(),
+            observed_since_us: self.observed_since_us,
         };
         let text = serde_json::to_string(&stored).map_err(|e| LimiterError::Control {
             path: self.path.clone(),
@@ -507,9 +565,11 @@ impl Limiter {
 
         self.loaded = merged;
         self.pending = Buckets::default();
+        self.observed_loaded = observed_merged;
+        self.observed_pending = Buckets::default();
         self.dirty = false;
 
-        if spent == 0 {
+        if spent == 0 && observed == 0 {
             return Ok(None);
         }
         // Reported after the merge, so `used` is the window total including
@@ -520,6 +580,7 @@ impl Limiter {
             limiter: state.path,
             unit: state.unit.as_str().to_string(),
             amount: spent,
+            observed,
             used: state.used,
             limit: state.limit,
             window_us,
@@ -552,14 +613,24 @@ impl Limiter {
     #[must_use]
     pub fn state_at(&self, now_us: i64) -> LimiterState {
         let window_us = window_micros(self.spec.window);
+        let burst_us = burst_span_micros(&self.spec, window_us);
         LimiterState {
             path: self.path.clone(),
             unit: self.spec.unit,
             used: self.used_at(now_us, window_us),
+            observed: self.observed_at(now_us, window_us),
+            observed_since_us: self.observed_since_us,
+            observed_window_complete: self
+                .observed_since_us
+                .is_some_and(|since| now_us.saturating_sub(since) >= window_us),
             limit: self.spec.amount,
+            burst_used: self.used_at(now_us, burst_us),
+            burst_observed: self.observed_at(now_us, burst_us),
             burst: self.spec.burst,
             window: self.spec.window,
+            burst_window: Duration::from_micros(u64::try_from(burst_us).unwrap_or(u64::MAX)),
             reset_in: Duration::from_secs(self.retry_after_secs(now_us, window_us)),
+            burst_reset_in: Duration::from_secs(self.retry_after_secs(now_us, burst_us)),
         }
     }
 
@@ -567,6 +638,12 @@ impl Limiter {
         self.loaded
             .sum_since(now_us, span_us)
             .saturating_add(self.pending.sum_since(now_us, span_us))
+    }
+
+    fn observed_at(&self, now_us: i64, span_us: i64) -> u64 {
+        self.observed_loaded
+            .sum_since(now_us, span_us)
+            .saturating_add(self.observed_pending.sum_since(now_us, span_us))
     }
 
     fn exceeded(&self, now_us: i64, used: u64, requested: u64, window_us: i64) -> LimiterError {
@@ -645,6 +722,15 @@ pub struct LimiterSet {
     bound: Vec<Limiter>,
     /// Enforcement suspended for this process by [`IGNORE_LIMITS_ENV`].
     ignored: bool,
+    /// Physical traffic observed during the governed activity: requests.
+    ///
+    /// What was *charged* is what enforcement saw; this is what actually
+    /// happened.  They should agree, and a durable record of both is what
+    /// turns "they disagree" from an invisible accounting error into a
+    /// number an operator can chart (see [`sync_store::Observation`]).
+    observed_ops: u64,
+    /// Physical traffic observed during the governed activity: bytes.
+    observed_bytes: u64,
 }
 
 /// Setting this suspends limit *enforcement* for the process.
@@ -731,7 +817,12 @@ impl LimiterSet {
             );
         }
 
-        Ok(Self { bound, ignored })
+        Ok(Self {
+            bound,
+            ignored,
+            observed_ops: 0,
+            observed_bytes: 0,
+        })
     }
 
     /// Nothing is governed, so no charge can ever be refused.
@@ -800,6 +891,27 @@ impl LimiterSet {
         }
     }
 
+    /// Note the physical traffic of `unit` observed during the activity.
+    ///
+    /// Unlike [`Self::record`] this charges nothing -- it is the measurement
+    /// the charge is supposed to match, carried into the usage sample so the
+    /// two can be compared after the fact.
+    pub fn record_observed(&mut self, unit: LimitUnit, amount: u64) {
+        match unit {
+            LimitUnit::Ops => self.observed_ops = amount,
+            LimitUnit::Bytes => self.observed_bytes = amount,
+        }
+    }
+
+    /// Physical traffic observed for `unit` during the activity.
+    #[must_use]
+    pub fn observed(&self, unit: LimitUnit) -> u64 {
+        match unit {
+            LimitUnit::Ops => self.observed_ops,
+            LimitUnit::Bytes => self.observed_bytes,
+        }
+    }
+
     /// Persist every dirty window: at most one control write per bound
     /// limiter, and none at all for a set that spent nothing.
     ///
@@ -816,20 +928,16 @@ impl LimiterSet {
         control: &mut ControlTable,
         now_us: i64,
     ) -> Result<(), LimiterError> {
-        // An ignored run does not persist its windows.  A seeding import can be
-        // three orders of magnitude larger than a normal day, so folding it into
-        // the sliding window would leave the budget exhausted and refuse routine
-        // traffic for a full period -- the override would create the outage it
-        // was invoked to avoid.  The spend is reported instead of recorded, so
-        // it is accounted for in the log even though it is not charged.
-        if self.ignored {
-            for (path, unit, spent) in self.discard_ignored_spending() {
-                log::warn!(
-                    "[WARN] {IGNORE_LIMITS_ENV} spent {spent} {unit} ungoverned (not charged to `{path}`)"
-                );
-            }
-            return Ok(());
-        }
+        // An ignored run does not persist its CHARGED window.  A seeding import
+        // can be three orders of magnitude larger than a normal day, so folding
+        // it into enforcement would leave the budget exhausted and refuse
+        // routine traffic for a full period -- the override would create the
+        // outage it was invoked to avoid.
+        //
+        // Its observed window IS persisted.  Not charging the import is the
+        // point of the override; not recording it would make the largest
+        // transfer a pond ever performs invisible to status and selfmon.
+        let ignored_spending = self.prepare_windows_at(now_us);
 
         let mut samples = Vec::new();
         for l in &mut self.bound {
@@ -838,11 +946,41 @@ impl LimiterSet {
             }
         }
 
+        if self.ignored {
+            for (path, unit, spent) in ignored_spending {
+                log::warn!(
+                    "[WARN] {IGNORE_LIMITS_ENV} spent {spent} {unit} ungoverned (not charged to `{path}`)"
+                );
+            }
+        }
+
         // Queue for the pond in one write, so spending becomes a durable
         // metric and not just enforcement state that a control rebuild erases
         // (Decision L12).
         crate::limiter_usage::queue(control, &samples).await;
         Ok(())
+    }
+
+    /// Move this activity's independent measurements into each bound
+    /// limiter's bounded window, and remove ignored charged spending before
+    /// anything is persisted.  Split from [`Self::commit_at`] so the subtle
+    /// ignored ordering is directly testable without a control table.
+    fn prepare_windows_at(&mut self, now_us: i64) -> Vec<(String, &'static str, u64)> {
+        let ignored_spending = if self.ignored {
+            self.discard_ignored_spending()
+        } else {
+            Vec::new()
+        };
+        for l in &mut self.bound {
+            let observed = match l.spec().unit {
+                LimitUnit::Ops => self.observed_ops,
+                LimitUnit::Bytes => self.observed_bytes,
+            };
+            l.record_observed_at(now_us, observed);
+        }
+        self.observed_ops = 0;
+        self.observed_bytes = 0;
+        ignored_spending
     }
 
     /// Current position of every bound limiter, for `pond status`.
@@ -919,6 +1057,9 @@ mod tests {
             spec,
             loaded: Buckets::default(),
             pending: Buckets::default(),
+            observed_loaded: Buckets::default(),
+            observed_pending: Buckets::default(),
+            observed_since_us: None,
             dirty: false,
         }
     }
@@ -947,6 +1088,8 @@ mod tests {
     #[test]
     fn an_ignored_set_admits_a_charge_that_would_otherwise_be_refused() {
         let mut set = LimiterSet {
+            observed_ops: 0,
+            observed_bytes: 0,
             bound: vec![limiter("/sys/limits/b", spec("MiB/day", 1.0, None))],
             ignored: false,
         };
@@ -969,6 +1112,8 @@ mod tests {
         // ordinary transfer would be refused -- the override would cause the
         // outage it exists to prevent.  So commit drops it.
         let mut set = LimiterSet {
+            observed_ops: 0,
+            observed_bytes: 0,
             bound: vec![limiter("/sys/limits/b", spec("MiB/day", 1.0, None))],
             ignored: true,
         };
@@ -986,6 +1131,44 @@ mod tests {
         set.ignored = false;
         set.check(LimitUnit::Bytes, 1024)
             .expect("a later ordinary charge must not be blocked by ignored spending");
+    }
+
+    #[test]
+    fn an_ignored_run_still_records_what_it_measured() {
+        // Not charging a seeding import is the point of the override.  Not
+        // *recording* it would mean the largest transfer a pond ever makes is
+        // the one thing its metric cannot show, which is how an 11 GB backfill
+        // becomes invisible.
+        let mut set = LimiterSet {
+            observed_ops: 0,
+            observed_bytes: 0,
+            bound: vec![limiter("/sys/limits/b", spec("MiB/day", 1.0, None))],
+            ignored: true,
+        };
+        let spent = 10 * 1024 * 1024;
+        set.record(LimitUnit::Bytes, spent);
+        set.record_observed(LimitUnit::Bytes, spent);
+
+        let ignored = set.prepare_windows_at(0);
+        assert_eq!(ignored, vec![("/sys/limits/b".to_string(), "bytes", spent)]);
+        let state = set.bound[0].state_at(0);
+        assert_eq!(state.used, 0, "an ignored run charges nothing");
+        assert_eq!(state.observed, spent, "physical traffic remains visible");
+        assert!(
+            state.observed > state.limit,
+            "and the whole point is that it exceeds the ceiling visibly"
+        );
+    }
+
+    #[test]
+    fn an_ignored_run_that_measured_nothing_emits_nothing() {
+        let set = LimiterSet {
+            observed_ops: 0,
+            observed_bytes: 0,
+            bound: vec![limiter("/sys/limits/b", spec("MiB/day", 1.0, None))],
+            ignored: true,
+        };
+        assert_eq!(set.bound[0].state_at(0).observed, 0);
     }
 
     // -------- the unit contract (Decision L10) --------
@@ -1213,12 +1396,49 @@ mod tests {
             window_us: window_micros(s.window),
             bucket_us: bucket_micros(s.window),
             buckets: buckets.clone(),
+            observed: Buckets::default(),
+            observed_since_us: None,
         };
         let text = serde_json::to_string(&stored).unwrap();
         let back: StoredWindow = serde_json::from_str(&text).unwrap();
         assert_eq!(back.buckets, buckets);
         assert_eq!(back.unit, LimitUnit::Bytes);
         assert_eq!(back.window_us, DAY_US);
+    }
+
+    #[test]
+    fn deployed_window_without_observed_buckets_still_loads() {
+        let text = r#"{
+            "v":1,
+            "unit":"bytes",
+            "window_us":86400000000,
+            "bucket_us":864000000,
+            "buckets":[[100,42]]
+        }"#;
+        let back: StoredWindow = serde_json::from_str(text).unwrap();
+        assert_eq!(back.buckets.total(), 42);
+        assert!(
+            back.observed.is_empty(),
+            "observed was added compatibly after v1 windows were deployed"
+        );
+        assert_eq!(back.observed_since_us, None);
+    }
+
+    #[test]
+    fn state_reports_charged_observed_and_burst_windows_separately() {
+        let now = 1_000 * DAY_US;
+        let mut l = limiter("/l", spec("iops/day", 100.0, Some(10.0)));
+        l.record_at(now, 7);
+        l.record_observed_at(now, 9);
+
+        let state = l.state_at(now);
+        assert_eq!(state.used, 7);
+        assert_eq!(state.observed, 9);
+        assert!(!state.observed_window_complete);
+        assert_eq!(state.burst_used, 7);
+        assert_eq!(state.burst_observed, 9);
+        assert_eq!(state.burst, 10);
+        assert_eq!(state.burst_window, Duration::from_secs(8_640));
     }
 
     #[test]

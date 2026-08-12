@@ -240,6 +240,11 @@ enum Commands {
         /// (retention-only; pruned history is then unrecoverable).
         #[arg(long)]
         allow_no_remote: bool,
+        /// Report what maintenance would do -- which series collapse would
+        /// merge and how many bytes that would push -- without changing
+        /// anything.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Show pond contents
     Show {
@@ -292,6 +297,12 @@ enum Commands {
     /// Show an operator-facing status aggregate: identity, local commit
     /// state, recovery health, and per-remote sync watermarks (D6).
     Status,
+    /// Show bounded per-limiter state without scanning usage history.
+    Limits {
+        /// Output format for operators or collectors.
+        #[arg(long, default_value = "table", value_parser = ["table", "json", "jsonl"])]
+        format: String,
+    },
     /// Inspect and verify the pond's transparency log (D5).
     Tlog {
         #[command(subcommand)]
@@ -566,6 +577,7 @@ async fn main() -> Result<()> {
             prune,
             keep_txns,
             allow_no_remote,
+            dry_run,
         } => {
             commands::maintain_command(
                 &ship_context,
@@ -574,6 +586,7 @@ async fn main() -> Result<()> {
                 prune,
                 keep_txns,
                 allow_no_remote,
+                dry_run,
             )
             .await
         }
@@ -613,6 +626,7 @@ async fn main() -> Result<()> {
         }
         Commands::Verify { name } => commands::verify_command(&ship_context, name).await,
         Commands::Status => commands::status_command(&ship_context).await,
+        Commands::Limits { format } => commands::limits_command(&ship_context, &format).await,
         Commands::Tlog { command } => match command {
             TlogCommand::Show => commands::tlog_show_command(&ship_context).await,
             TlogCommand::Verify => commands::tlog_verify_command(&ship_context).await,

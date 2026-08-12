@@ -78,12 +78,15 @@ async fn a_window_survives_rebinding_through_the_control_table() {
         .await
         .expect("open");
     l.record(4 * 1024 * 1024);
+    l.record_observed(5 * 1024 * 1024);
     l.commit(ship.control_table_mut()).await.expect("commit");
 
     let again = Limiter::open(&mut ship, "/quota", LimitUnit::Bytes)
         .await
         .expect("reopen");
     assert_eq!(again.state().used, 4 * 1024 * 1024);
+    assert_eq!(again.state().observed, 5 * 1024 * 1024);
+    assert!(again.state().observed_since_us.is_some());
     assert_eq!(again.state().limit, 10 * 1024 * 1024);
 }
 
@@ -118,10 +121,13 @@ async fn a_generous_limit_does_not_disturb_the_push() {
     write_file(&mut ship, "/a.txt", b"alpha").await;
 
     let pond_id = uuid::Uuid::parse_str(ship.data_persistence().pond_id()).expect("pond id");
-    let remote_dir = tempdir().expect("remote dir");
-    let mut remote = ContentRemote::create_at(remote_dir.path().join("remote"), pond_id)
-        .await
-        .expect("create remote");
+    let mut remote = ContentRemote::create_at_url(
+        &sync_store::testing::in_memory_remote_url("push-ok"),
+        pond_id,
+        [].into(),
+    )
+    .await
+    .expect("create remote");
 
     let mut limits = LimiterSet::open(&mut ship, &[(LimitUnit::Bytes, "/quota".to_string())])
         .await
@@ -150,10 +156,13 @@ async fn an_exhausted_budget_stops_the_push() {
     write_file(&mut ship, "/a.txt", b"alpha").await;
 
     let pond_id = uuid::Uuid::parse_str(ship.data_persistence().pond_id()).expect("pond id");
-    let remote_dir = tempdir().expect("remote dir");
-    let mut remote = ContentRemote::create_at(remote_dir.path().join("remote"), pond_id)
-        .await
-        .expect("create remote");
+    let mut remote = ContentRemote::create_at_url(
+        &sync_store::testing::in_memory_remote_url("push-denied"),
+        pond_id,
+        [].into(),
+    )
+    .await
+    .expect("create remote");
 
     let mut limits = LimiterSet::open(&mut ship, &[(LimitUnit::Bytes, "/quota".to_string())])
         .await
@@ -169,6 +178,46 @@ async fn an_exhausted_budget_stops_the_push() {
     let text = err.to_string();
     assert!(text.contains("/quota"), "{text}");
     assert!(text.contains("retry in"), "{text}");
+}
+
+/// A large blob is admitted one multipart part at a time.  The provider must
+/// never receive the part that would cross either configured byte ceiling.
+#[tokio::test]
+async fn a_multipart_blob_cannot_overrun_its_window_or_burst() {
+    const MIB: usize = 1024 * 1024;
+
+    let (_t, mut ship) = new_pond("limiter-multipart-deny").await;
+    write_limiter(&mut ship, "/quota", "MiB/day", 6.0, Some(6.0)).await;
+    let body = vec![b'x'; 12 * MIB];
+    let hash = sync_store::content::ObjectHash::of_bytes(&body);
+    write_file(&mut ship, "/large.bin", &body).await;
+
+    let pond_id = uuid::Uuid::parse_str(ship.data_persistence().pond_id()).expect("pond id");
+    let mut remote = ContentRemote::create_at_url(
+        &sync_store::testing::in_memory_remote_url("push-multipart-denied"),
+        pond_id,
+        [].into(),
+    )
+    .await
+    .expect("create remote");
+
+    let mut limits = LimiterSet::open(&mut ship, &[(LimitUnit::Bytes, "/quota".to_string())])
+        .await
+        .expect("bind");
+    let err = push_content_to_remote_limited(&ship, &mut remote, "main", &mut limits)
+        .await
+        .expect_err("multipart blob must exceed its budget");
+
+    assert!(matches!(err, StewardError::RateLimited(_)), "{err:?}");
+    assert!(
+        limits.states()[0].used <= 6 * MIB as u64,
+        "denied push charged past its configured ceiling: {:?}",
+        limits.states()[0]
+    );
+    assert!(
+        !remote.has_blob(hash).await.expect("probe refused blob"),
+        "a refused multipart blob must not become visible"
+    );
 }
 
 /// An ungoverned dimension costs nothing at all: no pond read, no control
@@ -299,30 +348,47 @@ async fn each_dimension_reports_separately() {
 /// billed request for each blob in the accumulated history, even when the push
 /// uploads nothing at all -- a bill proportional to how long the pond has
 /// existed rather than to what it just did.  A single listing answers the same
-/// question, so a no-op re-push spends a small constant regardless of how many
-/// blobs are retained.  This is the finding the ops budget surfaced in staging;
-/// the test exists so it cannot come back unnoticed.
+/// question, so a no-op re-push spends the same regardless of how many blobs
+/// are retained.  This is the finding the ops budget surfaced in staging; the
+/// test exists so it cannot come back unnoticed.
+///
+/// The claim is tested as an invariance rather than against a threshold: what
+/// matters is that tripling the retained blobs does not change the bill, and a
+/// fixed number would only ever be a guess about what the constant should be.
 #[tokio::test]
 async fn a_re_push_does_not_pay_per_retained_blob() {
-    const BLOBS: usize = 8;
+    let few = no_op_re_push_cost(4, "push-listing-few").await;
+    let many = no_op_re_push_cost(12, "push-listing-many").await;
+    assert_eq!(
+        few, many,
+        "a no-op re-push cost {few} requests over 4 retained blobs and {many} over 12; \
+         cost that grows with retained blobs is the per-blob probing this listing replaced"
+    );
+}
 
-    let (_t, mut ship) = new_pond("limiter-push-listing").await;
+/// Push `blobs` external blobs to a fresh remote, then push again with nothing
+/// to do, and report what the second push physically cost.
+async fn no_op_re_push_cost(blobs: usize, remote_name: &str) -> u64 {
+    let (_t, mut ship) = new_pond(&format!("limiter-{remote_name}")).await;
     // Generous enough that nothing is refused: the point here is what is
     // *spent*, not what is denied.
     write_limiter(&mut ship, "/ops", "ops/day", 100_000.0, None).await;
 
     // Each file must exceed the 64 KB inline threshold to become an external
     // blob (Decision D7); distinct contents keep their hashes distinct.
-    for i in 0..BLOBS {
+    for i in 0..blobs {
         let body = vec![b'a' + u8::try_from(i).expect("small index"); 100 * 1024];
         write_file(&mut ship, &format!("/big{i}.bin"), &body).await;
     }
 
     let pond_id = uuid::Uuid::parse_str(ship.data_persistence().pond_id()).expect("pond id");
-    let remote_dir = tempdir().expect("remote dir");
-    let mut remote = ContentRemote::create_at(remote_dir.path().join("remote"), pond_id)
-        .await
-        .expect("create remote");
+    let mut remote = ContentRemote::create_at_url(
+        &sync_store::testing::in_memory_remote_url(remote_name),
+        pond_id,
+        [].into(),
+    )
+    .await
+    .expect("create remote");
 
     // First push: uploads are genuine work and are expected to cost per blob.
     let mut limits = LimiterSet::open(&mut ship, &[(LimitUnit::Ops, "/ops".to_string())])
@@ -333,8 +399,8 @@ async fn a_re_push_does_not_pay_per_retained_blob() {
         .expect("first push");
     let after_first = limits.states()[0].used;
     assert!(
-        after_first >= BLOBS as u64,
-        "the first push should have uploaded {BLOBS} blobs, spent {after_first}"
+        after_first >= blobs as u64,
+        "the first push should have uploaded {blobs} blobs, spent {after_first}"
     );
     limits
         .commit(ship.control_table_mut())
@@ -350,11 +416,5 @@ async fn a_re_push_does_not_pay_per_retained_blob() {
     let _ = push_content_to_remote_limited(&ship, &mut remote, "main", &mut limits)
         .await
         .expect("second push");
-    let spent = limits.states()[0].used - before_second;
-
-    assert!(
-        spent < BLOBS as u64,
-        "a no-op re-push spent {spent} ops across {BLOBS} retained blobs, \
-         which is the per-blob probing this listing replaced"
-    );
+    limits.states()[0].used - before_second
 }

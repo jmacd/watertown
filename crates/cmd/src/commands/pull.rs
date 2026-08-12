@@ -132,7 +132,7 @@ async fn pull_one(ship: &mut steward::Steward, name: &str) -> Result<()> {
     let ship_mut = ship
         .as_pond_mut()
         .ok_or_else(|| anyhow!("pull requires a pond steward (not a host steward)"))?;
-    let limits = steward::LimiterSet::open(ship_mut, &limit_spec)
+    let mut limits = steward::LimiterSet::open(ship_mut, &limit_spec)
         .await
         .map_err(|e| anyhow!("bind limiters for remote `{}`: {}", name, e))?;
 
@@ -146,29 +146,57 @@ async fn pull_one(ship: &mut steward::Steward, name: &str) -> Result<()> {
         .map_err(|e| anyhow!("read mount_path for `{}`: {}", name, e))?
         .filter(|s| !s.is_empty() && s != "/");
 
-    // Open once, here, so both modes below share one source -- and one
-    // governed wrapper.  Every remote read either mode performs goes through
-    // it, which is what makes ingress governed by construction rather than by
-    // remembering to charge at each call site.
-    let source = open_content_source(&attachment, storage_options)
-        .await
-        .map_err(|e| anyhow!("open remote `{}` ({}): {}", name, attachment.url, e))?;
-    let governed = steward::GovernedSource::new(source.as_ref(), limits);
+    // Bind the budget to the remote's URL before opening it, so the open is
+    // charged too: opening a Delta table lists the log and reads every commit
+    // since the last checkpoint, which is not a local act.  Charging follows
+    // the URL rather than the call, so the local pond's own traffic is
+    // structurally outside this budget -- it goes somewhere else.
+    let guard = steward::storage_meter::MeterGuard::new(&attachment.url, &mut limits);
+    let opened = open_content_source(&attachment, storage_options).await;
+    let source = match opened {
+        Ok(s) => steward::metered_source::MeteredSource::with_guard(s.into(), guard),
+        Err(e) => {
+            // The open spent whatever it spent before failing; return it
+            // before reporting, so a remote that fails to open on a timer
+            // cannot be retried for free.
+            let refusal = guard.finish(&mut limits);
+            let ship_mut = ship
+                .as_pond_mut()
+                .ok_or_else(|| anyhow!("pull requires a pond steward (not a host steward)"))?;
+            if let Err(e) = limits.commit(ship_mut.control_table_mut()).await {
+                log::warn!(
+                    "[WARN] pull {}: failed to record limiter usage: {}",
+                    name,
+                    e
+                );
+            }
+            return Err(match refusal {
+                Some(r) => anyhow::Error::new(r),
+                None => anyhow!("open remote `{}` ({}): {}", name, attachment.url, e),
+            });
+        }
+    };
 
     // Mirror restart / backup restore (root or no mount): pull the full
     // content graph and rebuild the local pond by node_id.  Cross-pond import
     // (non-root mount): fetch the foreign content graph and rebuild it under
     // the foreign pond_id, then mount it.
-    let result = match mount_path {
-        None => pull_mirror(ship, name, &attachment, &governed).await,
-        Some(mount_path) => pull_import(ship, name, &attachment, &governed, &mount_path).await,
+    let result: Result<()> = match mount_path {
+        None => pull_mirror(ship, name, &attachment, &source).await,
+        Some(mount_path) => pull_import(ship, name, &attachment, &source, &mount_path).await,
+    };
+
+    // A budget's refusal outranks the storage error it surfaced as, so an
+    // exhausted limit reads as a throttle rather than as an outage.
+    let result = match source.finish(&mut limits) {
+        Some(refusal) if result.is_err() => Err(anyhow::Error::new(refusal)),
+        _ => result,
     };
 
     // Persist the windows whether or not the pull succeeded, for the same
     // reason a push does: a pull that failed partway still transferred what it
     // transferred, and a budget that forgets the spending of failed attempts is
     // a budget a retry loop can spend without bound.
-    let mut limits = governed.into_limits();
     let ship_mut = ship
         .as_pond_mut()
         .ok_or_else(|| anyhow!("pull requires a pond steward (not a host steward)"))?;

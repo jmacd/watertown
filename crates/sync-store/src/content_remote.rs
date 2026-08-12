@@ -32,6 +32,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::RwLock;
 
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use uuid::Uuid;
 
 use crate::content::ObjectHash;
@@ -74,9 +76,12 @@ pub struct ContentRemote {
 }
 
 impl ContentRemote {
+    /// Multipart providers require non-final parts of at least 5 MiB.
+    const MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
     /// Maximum in-flight multipart part uploads allowed while streaming a large
     /// blob to the remote (see [`Self::put_blob`]).  Bounds staged upload memory
-    /// to this many `chunk_size` parts when the reader outpaces the network.
+    /// to this many [`Self::MULTIPART_PART_SIZE`] parts when the reader outpaces
+    /// the network.
     const MAX_INFLIGHT_UPLOAD_PARTS: usize = 16;
 
     /// Create a fresh remote at `path`.  Errors if a Delta table already
@@ -152,6 +157,12 @@ impl ContentRemote {
             )
             .await?;
         Ok(())
+    }
+
+    /// The URL this remote lives at, which is the identity its storage budget
+    /// is bound to.
+    pub fn url(&self) -> String {
+        self.store.url()
     }
 
     /// The pond whose objects this remote holds.
@@ -333,11 +344,9 @@ impl ContentRemote {
     /// under a key it does not equal.  Never collects the whole blob in memory.
     ///
     /// Backpressure is applied so a fast local reader cannot outrun a slow
-    /// upload: `WriteMultipart::write` starts a part upload as soon as a chunk
-    /// fills, regardless of how many are already in flight, so without a bound
-    /// the staged parts of a multi-gigabyte blob would accumulate in memory.
-    /// Capping in-flight parts at [`Self::MAX_INFLIGHT_UPLOAD_PARTS`] holds the
-    /// staged bytes to that many `chunk_size` parts.
+    /// upload.  Keeping the multipart handle here, rather than delegating the
+    /// trailing-part flush to `WriteMultipart::finish`, also guarantees every
+    /// failed or refused part can be followed by an explicit abort.
     pub async fn put_blob<R>(&self, hash: ObjectHash, mut reader: R) -> Result<()>
     where
         R: tokio::io::AsyncRead + Unpin,
@@ -350,33 +359,65 @@ impl ContentRemote {
             .put_multipart(&path)
             .await
             .map_err(|e| StoreError::Invariant(format!("blob put_multipart: {e}")))?;
-        let mut writer = object_store::WriteMultipart::new(upload);
+        let mut upload = upload;
+        let mut parts = FuturesUnordered::new();
         let mut hasher = blake3::Hasher::new();
-        let mut buf = vec![0u8; 8 * 1024 * 1024];
+
         loop {
-            let n = reader
-                .read(&mut buf)
-                .await
-                .map_err(|e| StoreError::Invariant(format!("blob read: {e}")))?;
-            if n == 0 {
+            if parts.len() >= Self::MAX_INFLIGHT_UPLOAD_PARTS {
+                match parts.next().await {
+                    Some(Ok(())) => {}
+                    Some(Err(error)) => {
+                        drop(parts);
+                        let abort = upload.abort().await;
+                        return Err(StoreError::Invariant(match abort {
+                            Ok(()) => format!("blob upload part: {error}"),
+                            Err(abort_error) => {
+                                format!("blob upload part: {error}; abort failed: {abort_error}")
+                            }
+                        }));
+                    }
+                    None => {}
+                }
+            }
+
+            let mut part = vec![0u8; Self::MULTIPART_PART_SIZE];
+            let mut filled = 0;
+            while filled < part.len() {
+                let n = match reader.read(&mut part[filled..]).await {
+                    Ok(n) => n,
+                    Err(error) => {
+                        drop(parts);
+                        let abort = upload.abort().await;
+                        return Err(StoreError::Invariant(match abort {
+                            Ok(()) => format!("blob read: {error}"),
+                            Err(abort_error) => {
+                                format!("blob read: {error}; abort failed: {abort_error}")
+                            }
+                        }));
+                    }
+                };
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&part[filled..filled + n]);
+                filled += n;
+            }
+            if filled == 0 {
                 break;
             }
-            hasher.update(&buf[..n]);
-            // Bound the number of in-flight part uploads before staging more, so
-            // a reader faster than the network cannot grow memory without limit.
-            writer
-                .wait_for_capacity(Self::MAX_INFLIGHT_UPLOAD_PARTS)
-                .await
-                .map_err(|e| StoreError::Invariant(format!("blob upload capacity: {e}")))?;
-            writer.write(&buf[..n]);
+            part.truncate(filled);
+            parts.push(upload.put_part(part.into()));
         }
+
         // Verify the streamed content matches its claimed key BEFORE completing
         // the multipart upload.  A multipart object only becomes visible on
         // `finish()`, so aborting here discards the staged parts and a value is
         // never stored under a key it does not equal -- no temporary key needed.
         let computed = ObjectHash::from_bytes(*hasher.finalize().as_bytes());
         if computed != hash {
-            writer
+            drop(parts);
+            upload
                 .abort()
                 .await
                 .map_err(|e| StoreError::Invariant(format!("blob abort: {e}")))?;
@@ -386,10 +427,28 @@ impl ContentRemote {
                 hash.to_hex()
             )));
         }
-        writer
-            .finish()
-            .await
-            .map_err(|e| StoreError::Invariant(format!("blob finish: {e}")))?;
+
+        while let Some(result) = parts.next().await {
+            if let Err(error) = result {
+                drop(parts);
+                let abort = upload.abort().await;
+                return Err(StoreError::Invariant(match abort {
+                    Ok(()) => format!("blob upload part: {error}"),
+                    Err(abort_error) => {
+                        format!("blob upload part: {error}; abort failed: {abort_error}")
+                    }
+                }));
+            }
+        }
+        if let Err(error) = upload.complete().await {
+            let abort = upload.abort().await;
+            return Err(StoreError::Invariant(match abort {
+                Ok(()) => format!("blob complete: {error}"),
+                Err(abort_error) => {
+                    format!("blob complete: {error}; abort failed: {abort_error}")
+                }
+            }));
+        }
         Ok(())
     }
 

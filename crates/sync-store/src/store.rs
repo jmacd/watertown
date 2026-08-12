@@ -16,7 +16,7 @@ use deltalake::DeltaTable;
 use deltalake::kernel::schema::partitions::{PartitionFilter, PartitionValue};
 use deltalake::operations::optimize::OptimizeType;
 use deltalake::protocol::SaveMode;
-use log::debug;
+use log::{debug, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -67,6 +67,15 @@ pub struct Store {
 }
 
 const TABLE_NAME: &str = "source";
+
+/// Write a checkpoint every this many versions, matching the Delta default
+/// and `steward::maintenance`, which does the same for local tables.
+const CHECKPOINT_INTERVAL: u64 = 10;
+
+/// Merge accumulated small files every this many commits.  Compaction rewrites
+/// data, so it is not free; this trades an occasional rewrite against a lookup
+/// cost that would otherwise grow with every write.
+const COMPACT_INTERVAL: u64 = 25;
 
 impl Store {
     /// Create a new store at `path`.  The directory is created if missing.
@@ -163,6 +172,15 @@ impl Store {
         &self.path
     }
 
+    /// The URL this store's table lives at.
+    ///
+    /// This is the identity a storage budget is bound to (see
+    /// [`crate::RemoteKey`]), so a caller that holds a store can find the
+    /// budget governing it without being told separately where it is.
+    pub fn url(&self) -> String {
+        self.table.table_url().to_string()
+    }
+
     /// The backing object store rooted at the Delta table directory.  Used to
     /// read and write sibling content under prefixes outside the Delta log
     /// (e.g. a content-addressed large-blob store), keeping multi-gigabyte
@@ -177,10 +195,39 @@ impl Store {
         self.table.version().unwrap_or(0)
     }
 
+    /// The `txn_seq` recorded for `pond_id` as a Delta app-transaction, or
+    /// `None` for a store last written before commits carried one.
+    ///
+    /// This lives in the commit log and is folded into every checkpoint, so
+    /// reading it opens no data files.
+    pub async fn app_transaction_version(&self, pond_id: Uuid) -> Result<Option<i64>> {
+        Ok(self
+            .table
+            .snapshot()?
+            .transaction_version(self.table.log_store().as_ref(), pond_id.to_string())
+            .await?)
+    }
+
     /// The largest `txn_seq` ever committed to this store for `pond_id`,
     /// or `0` if `pond_id` has never written here.  Use this to allocate
     /// the next `txn_seq` for that pond when calling [`Store::apply_batch`].
+    ///
+    /// Read from the Delta app-transaction the commit records, which lives in
+    /// the log and is folded into each checkpoint, so answering costs a
+    /// bounded number of requests no matter how much the pond has written.
+    ///
+    /// The obvious `SELECT MAX(txn_seq)` instead reads a column from every
+    /// data file the pond owns.  That made the price of a push grow with the
+    /// number of pushes before it: a traced push of water-prod spent 584 of
+    /// its 1198 requests doing exactly this, to learn one number.  It survives
+    /// only as a fallback for remotes written before commits carried the
+    /// app-transaction, and each such store leaves the fallback behind the
+    /// first time it is written to.
     pub async fn last_txn_seq(&self, pond_id: Uuid) -> Result<i64> {
+        if let Some(version) = self.app_transaction_version(pond_id).await? {
+            return Ok(version);
+        }
+
         let sql = format!(
             "SELECT MAX({seq}) AS m FROM {table} WHERE {pid} = '{pid_v}'",
             seq = schema::col::TXN_SEQ,
@@ -301,7 +348,21 @@ impl Store {
             ],
         )?;
 
-        let new_table = self.table.clone().write(vec![batch]).await?;
+        // Record the pond's `txn_seq` as a Delta app-transaction so the next
+        // allocation can read it from the log instead of scanning every data
+        // file the pond owns.  See [`Store::last_txn_seq`].
+        let new_table = self
+            .table
+            .clone()
+            .write(vec![batch])
+            .with_commit_properties(
+                deltalake::kernel::transaction::CommitProperties::default()
+                    .with_application_transaction(deltalake::kernel::Transaction::new(
+                        pond_id.to_string(),
+                        txn_seq,
+                    )),
+            )
+            .await?;
         debug!(
             "store apply_batch: pond {} version {:?} -> {:?}, n_rows={}",
             pond_id,
@@ -313,8 +374,63 @@ impl Store {
 
         // Re-build session context against the new table version.
         self.session_ctx = build_session_ctx(&self.table)?;
+        self.checkpoint_if_due().await;
+        self.compact_if_due(pond_id).await;
 
         Ok(())
+    }
+
+    /// Write a checkpoint when the version reaches an interval boundary.
+    ///
+    /// Without this a remote's `_delta_log/_last_checkpoint` never appears,
+    /// and every reader replays the entire commit history to learn the
+    /// current state.  A traced push of a production pond spent 609 of its
+    /// 1198 requests re-reading `_delta_log` for exactly this reason, and the
+    /// count grows with the table's age rather than with the work being done
+    /// -- a bill for how long the pond has existed.  A checkpoint collapses
+    /// that replay into one read.
+    ///
+    /// Best-effort: a checkpoint is an optimisation, and failing to write one
+    /// must not fail the commit that earned it.
+    async fn checkpoint_if_due(&mut self) {
+        let version = self.table.version().unwrap_or(0);
+        if version <= 0 || !(version as u64).is_multiple_of(CHECKPOINT_INTERVAL) {
+            return;
+        }
+        match deltalake::checkpoints::create_checkpoint(&self.table, None).await {
+            Ok(()) => debug!("store checkpoint written at version {version}"),
+            Err(e) => warn!("store checkpoint failed at version {version}: {e}"),
+        }
+    }
+
+    /// Merge this pond's small parquet files on an interval.
+    ///
+    /// Every commit lands one small file per partition it touches, and a point
+    /// lookup opens every file in the partition, so left alone the price of
+    /// reading one key grows with the number of writes before it.  Delta's
+    /// compaction merges only files below the target size, so a merged file is
+    /// rewritten a bounded number of times as it grows rather than on every
+    /// pass.
+    ///
+    /// Scoped to `pond_id`, which is a partition column, so no other pond's
+    /// files are opened, and required not to change any partition's logical
+    /// content.
+    ///
+    /// Best-effort: merging files is an optimisation, and failing to merge
+    /// them must not fail the commit that earned the attempt.
+    async fn compact_if_due(&mut self, pond_id: Uuid) {
+        let version = self.delta_version();
+        if version <= 0 || !u64::try_from(version).is_ok_and(|v| v.is_multiple_of(COMPACT_INTERVAL))
+        {
+            return;
+        }
+        match self.compact(pond_id, None).await {
+            Ok(m) => debug!(
+                "store compact at version {version}: files +{}/-{}",
+                m.num_files_added, m.num_files_removed
+            ),
+            Err(e) => warn!("store compact failed at version {version}: {e}"),
+        }
     }
 
     /// Convenience: write a single Put using the next available `txn_seq`
@@ -639,6 +755,7 @@ impl Store {
 
         self.table = new_table;
         self.session_ctx = build_session_ctx(&self.table)?;
+        self.checkpoint_if_due().await;
 
         Ok(CompactMetrics {
             num_files_added: metrics.num_files_added,
@@ -726,6 +843,7 @@ impl Store {
             .await?;
         self.table.update_state().await?;
         self.session_ctx = build_session_ctx(&self.table)?;
+        self.checkpoint_if_due().await;
         Ok(self.table.version().unwrap_or(0))
     }
 
@@ -774,6 +892,7 @@ impl Store {
             .await?;
         self.table = new_table;
         self.session_ctx = build_session_ctx(&self.table)?;
+        self.checkpoint_if_due().await;
         Ok(self.table.version().unwrap_or(0))
     }
 }

@@ -23,15 +23,19 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+mod azure_registration;
 pub mod checksum;
 pub mod content;
 pub mod content_remote;
 mod error;
+pub mod metered_store;
 mod s3_registration;
 pub mod schema;
 mod store;
+pub mod testing;
 pub mod tlog;
 
+pub use azure_registration::{AZURE_SCHEMES, register_azure_handlers};
 pub use s3_registration::register_s3_handlers;
 
 pub use content::{
@@ -40,6 +44,9 @@ pub use content::{
 };
 pub use content_remote::ContentRemote;
 pub use error::{Result, StoreError};
+pub use metered_store::{
+    MeterBinding, MeteredStore, Observation, RemoteKey, StorageMeter, bind_meter, observed_under,
+};
 pub use store::{AddPath, CompactMetrics, Op, RemovePath, Store};
 pub use tlog::{
     Checkpoint, CheckpointError, LogHash, TileLog, TransparencyLog, checkpoint_history_path,

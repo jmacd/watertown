@@ -257,13 +257,16 @@ which is a union type wearing a struct's clothes: it can express
 not have been able to represent.
 
 Separate kinds also make dispatch trivial (§0.2): the kind *is* the provider,
-so it selects the handler registration and the option builder directly.
+so it selects the handler registration and the option builder directly.  The
+kind is read from the factory recorded on the node rather than inferred from
+the document (Decision A9), so adding a kind cannot change how an existing one
+is interpreted.
 
 **Only `storage-minio` and `storage-azure` are proposed.** `storage-s3` and
 `storage-r2` are sketched in §3.3 solely as evidence that the shape extends;
 building them before there is a bucket to point them at would be speculation.
 
-### 3.1 `storage-minio` (today)
+### 3.1 `storage-minio`
 
 ```yaml
 version: v1
@@ -297,7 +300,7 @@ Registration reuses `register_s3_handlers` unchanged
 (`sync-store/src/s3_registration.rs:72`), which already covers S3-compatible
 backends.
 
-### 3.2 `storage-azure` (next)
+### 3.2 `storage-azure`
 
 ```yaml
 version: v1
@@ -308,6 +311,7 @@ spec:
   factory: storage-azure
   config:
     account_name: ${env:AZURE_STORAGE_ACCOUNT}
+    timeout: 2m
     account_key: ${env:AZURE_STORAGE_KEY}
 ```
 
@@ -335,16 +339,27 @@ precedence rule in §4.1. This is the concrete reason Azure cannot be optional
 fields on a shared struct: "exactly one of three groups" is not something a
 flat field set can state.
 
-Implementation notes, all of which are new work rather than configuration:
+Implemented in A3:
 
-- `object_store` needs its `azure` feature (`Cargo.toml:78` enables `aws`
-  only).
-- A `sync-store/src/azure_registration.rs` mirroring `s3_registration.rs`,
-  built on `MicrosoftAzureBuilder`/`AzureConfigKey`, registering the `az`,
-  `azure`, `abfs`, and `abfss` schemes.
-- The URL scheme accepted by an attachment must be validated against the
-  profile kind (§4.2), so an `s3://` URL with an Azure profile is refused at
-  attach rather than producing a confusing failure at first push.
+- `object_store`'s `azure` feature, alongside `aws`.
+- `sync-store/src/azure_registration.rs`, mirroring `s3_registration.rs` on
+  `MicrosoftAzureBuilder`/`AzureConfigKey`, registering the `az`, `azure`,
+  `abfs`, and `abfss` schemes.  All four, because a URL copied from the portal
+  and one copied from Hadoop-flavoured documentation name the same store
+  differently.
+- `provider/src/factory/storage_azure.rs`.  `StorageAzureConfig::credential`
+  is the **only** way to read the credential, so the exactly-one rule is
+  enforced wherever a credential is used rather than being a check each call
+  site has to remember.  `to_storage_options` emits only the chosen shape's
+  keys: handing `MicrosoftAzureBuilder` both a key and a token would rebuild,
+  inside the builder, the ambiguity this kind refuses.
+- The URL scheme accepted by an attachment is validated against the profile
+  kind (§4.2), so an `s3://` URL with an Azure profile is refused at attach
+  rather than producing a confusing failure at first push.
+
+`account_name` is deliberately exempt from A1.  It is an identifier that
+appears in every URL, not a secret; requiring it to be indirect would obscure
+which account a profile names while protecting nothing.
 
 ### 3.3 `storage-s3` and `storage-r2` (not proposed)
 
@@ -521,7 +536,7 @@ to replace.
 | A1 | Attach-time validation, `pond status` line | The failure modes, before any deployment depends on them |
 | A2 | Convert `attach-remotes.sh` to `pond apply` documents | §0.1 -- the thing that motivated this |
 | -- | Store `url` raw, expand at use | §0.1a; separate change, see §10.5 |
-| A3 | `storage-azure`: `object_store` azure feature, `azure_registration.rs`, the factory, dispatch | §0.2, and that the abstraction survives a genuinely different provider |
+| A3 | `storage-azure`: `object_store` azure feature, `azure_registration.rs`, the factory, dispatch on the recorded factory name (A9) | §0.2, and that the abstraction survives a genuinely different provider |
 | -- | `storage-s3` / `storage-r2` | Deferred indefinitely; see §3.3 |
 
 A2 is the MinIO payoff and should not be pulled earlier: converting the script
@@ -606,3 +621,4 @@ introduced. That is worth deciding before A3 rather than during it.
 | A6 | `${env:...}` resolution stays at **use time, per replica**; a profile is never inlined into an attachment at attach time. |
 | A7 | Inline connection fields remain supported indefinitely but stay S3-only; Azure is reachable only through a profile. Rollout is binaries-first, config-second. |
 | A8 | Provider dispatch (handler registration and option building) keys off the profile kind, replacing the eight `starts_with("s3://")` comparisons -- including the one that today silently discards credentials for non-S3 URLs. |
+| A9 | A profile's kind comes from the **factory recorded on the node**, not from sniffing the document's shape. Shape dispatch would oblige every kind to stay parse-disjoint from every other one forever -- a constraint `storage-r2` (§3.3) already strains -- and its failure is silent misattribution: the wrong handlers registered, surfacing as an opaque authentication error on first push. The factory name is already stored and returned by `get_dynamic_node_config`; the kind is a known fact, so it should not be guessed. |

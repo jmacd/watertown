@@ -11,6 +11,7 @@ pub mod logfile_ingest;
 pub mod materialize_series;
 pub mod rate_limit;
 pub mod sql_derived;
+pub mod storage_azure;
 pub mod storage_minio;
 pub mod synthetic_timeseries;
 pub mod temporal_reduce;

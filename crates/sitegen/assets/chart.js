@@ -1138,10 +1138,14 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
       // reflects current activity (events/second).  Updowncounters and
       // gauges plot as-is.
       const isCounter = kindFor(chartKey) === "counter";
+      const keyParts = chartKey.split(".");
+      const unit = keyParts[keyParts.length - 1] || "";
       // Rate/flow gauges (e.g. usage.gpm): plotted as-is like any gauge, but
       // zero is a meaningful baseline, so anchor the y-axis at 0 and keep it
-      // rendered even when only one line has data in the window.
-      const yZero = kindFor(chartKey) === "rate";
+      // rendered even when only one line has data in the window. Percentages
+      // have the same zero-baseline requirement: a 2% budget position must not
+      // look large merely because every series sits between 1.9% and 2.1%.
+      const yZero = kindFor(chartKey) === "rate" || unit === "percent";
       const allCols = [];
       for (const s of series) {
         if (s.avg) allCols.push(s.avg);
@@ -1150,7 +1154,6 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
       }
       const plotData = isCounter ? computeCounterRates(data, allCols) : data;
 
-      const keyParts = chartKey.split(".");
       const title = keyParts.length >= 2
         ? `${keyParts[0].charAt(0).toUpperCase() + keyParts[0].slice(1)} (${keyParts[1]})`
         : chartKey;
@@ -1168,7 +1171,6 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
           `<span style="color:${l.color}">&#9679;</span> ${l.label}`
         ).join("&emsp;")}</span>`;
 
-      const unit = keyParts[keyParts.length - 1] || "";
       const isBytes = unit === "bytes";
       const yLabel = isCounter ? `${unit}/s` : unit;
 

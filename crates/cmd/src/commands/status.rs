@@ -310,8 +310,12 @@ mod tests {
     #[test]
     fn the_storage_line_names_the_profile_and_no_credential() {
         let doc = b"endpoint: http://watershop:9000\naccess_key_id: ${env:S3_KEY}\nsecret_access_key: ${env:S3_SECRET}\n";
-        let profile =
-            steward::ResolvedStorage::from_bytes("/sys/storage/minio", doc).expect("parse");
+        let profile = steward::ResolvedStorage::from_bytes(
+            "/sys/storage/minio",
+            provider::factory::storage_minio::FACTORY_NAME,
+            doc,
+        )
+        .expect("parse");
         let line = format_storage_line("/sys/storage/minio", &Ok(profile.describe()));
 
         assert!(line.contains("/sys/storage/minio"), "{line}");
@@ -337,10 +341,17 @@ mod tests {
             path: "/sys/limits/backup".to_string(),
             unit,
             used,
+            observed: used,
+            observed_since_us: Some(0),
+            observed_window_complete: true,
             limit,
+            burst_used: used,
+            burst_observed: used,
             burst: limit,
             window,
+            burst_window: window,
             reset_in: Duration::from_secs(3600),
+            burst_reset_in: Duration::from_secs(3600),
         }
     }
 

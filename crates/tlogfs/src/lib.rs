@@ -75,6 +75,7 @@ pub use provider::TinyFsObjectStore;
 // Re-export key types
 pub use error::TLogFSError;
 pub use file::OpLogFileWriter;
+pub use persistence::CollapsibleSeries;
 pub use persistence::ExternalAddAction;
 pub use persistence::OpLogPersistence;
 pub use schema::{DirectoryEntry, OplogEntry};

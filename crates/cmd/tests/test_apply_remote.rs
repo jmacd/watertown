@@ -19,7 +19,7 @@ use cmd::commands::{
 };
 use cmd::common::ShipContext;
 use provider::factory::rate_limit::LimitUnit;
-use std::sync::Once;
+use std::{collections::HashMap, sync::Once};
 use steward::{PondUserMetadata, REMOTE_MODE_PREFIX, RemoteMode};
 use tempfile::TempDir;
 use tinyfs::EntryType;
@@ -75,11 +75,9 @@ async fn write_small_file(ctx: &ShipContext, path: &str, bytes: &[u8]) -> anyhow
 /// Build a real upstream pond in `tmp` and push it to a `file://` content
 /// store, returning that URL.  A pull-mode remote must point at an existing
 /// pond, so an empty directory cannot stand in for one.
-async fn publish_upstream(tmp: &TempDir) -> String {
-    let producer = tmp.path().join("producer");
-    let store = tmp.path().join("upstream-store");
-    std::fs::create_dir_all(&store).expect("mkdir upstream store");
-    let url = format!("file://{}", store.display());
+async fn publish_upstream(tmp: &TempDir, name: &str) -> String {
+    let producer = tmp.path().join(format!("producer-{name}"));
+    let url = sync_store::testing::in_memory_remote_url(name);
 
     let ctx = ctx_for(&producer, vec!["pond", "init"]);
     init_command(&ctx, "producer-host")
@@ -174,6 +172,47 @@ spec:
     )
 }
 
+fn pull_remote_yaml(url: &str, overwrite: bool, migrate_watermark: bool) -> String {
+    format!(
+        r#"version: v1
+kind: remote
+metadata:
+  path: /sys/remotes/upstream
+spec:
+  url: {url}
+  mount: /sources/upstream
+  overwrite: {overwrite}
+  migrate_watermark: {migrate_watermark}
+"#
+    )
+}
+
+async fn publish_equivalent_remotes(tmp: &TempDir, name: &str) -> (ShipContext, String, String) {
+    let producer = tmp.path().join(format!("producer-{name}"));
+    let first = sync_store::testing::in_memory_remote_url(&format!("{name}-first"));
+    let second = sync_store::testing::in_memory_remote_url(&format!("{name}-second"));
+    let ctx = ctx_for(&producer, vec!["pond", "init"]);
+    init_command(&ctx, "producer-host")
+        .await
+        .expect("init producer");
+    apply_yaml(
+        &ctx,
+        tmp.path(),
+        &format!(
+            "version: v1\nkind: backup\nmetadata:\n  path: /sys/remotes/first\nspec:\n  url: {first}\n---\nversion: v1\nkind: backup\nmetadata:\n  path: /sys/remotes/second\nspec:\n  url: {second}\n"
+        ),
+    )
+    .await
+    .expect("attach equivalent producer remotes");
+    write_small_file(&ctx, "/hello.txt", b"same commit on both remotes")
+        .await
+        .expect("write producer content");
+    push_command(&ctx, None)
+        .await
+        .expect("publish identical producer tip");
+    (ctx, first, second)
+}
+
 /// A governed backup authored entirely in YAML behaves like one authored with
 /// `pond backup add`: it attaches, it records its limiter bindings, and a push
 /// under a generous budget succeeds.
@@ -187,9 +226,7 @@ async fn apply_creates_a_governed_backup_in_one_document() {
     init_log();
     let tmp = TempDir::new().expect("tmp");
     let pond = tmp.path().join("pond");
-    let remote = tmp.path().join("remote");
-    std::fs::create_dir_all(&remote).expect("mkdir remote");
-    let url = format!("file://{}", remote.display());
+    let url = sync_store::testing::in_memory_remote_url("apply-governed-ok");
 
     let ctx = ctx_for(&pond, vec!["pond", "init"]);
     init_command(&ctx, "test-host").await.expect("init");
@@ -228,6 +265,84 @@ async fn apply_creates_a_governed_backup_in_one_document() {
         .expect("push under a generous budget must succeed");
 }
 
+/// The monitoring API reports one bounded row per configured limiter without
+/// opening the remote or scanning `/sys/limits/usage`.
+#[tokio::test]
+async fn limits_status_reports_governed_backup_by_path_and_unit() {
+    init_log();
+    let tmp = TempDir::new().expect("tempdir");
+    let pond = tmp.path().join("pond");
+    let url = sync_store::testing::in_memory_remote_url("limits-status");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "limits-status-pond")
+        .await
+        .expect("init");
+
+    apply_yaml(&ctx, tmp.path(), &governed_backup_yaml(&url, 1024, 100_000))
+        .await
+        .expect("apply governed backup");
+
+    let rows = cmd::commands::limits::collect_limiter_status(&ctx)
+        .await
+        .expect("collect limits");
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r.pond == "limits-status-pond"));
+    assert!(rows.iter().all(|r| r.remotes == "origin"));
+    assert!(rows.iter().all(|r| r.error.is_none()));
+    assert!(
+        rows.iter()
+            .any(|r| { r.limiter == "/sys/limits/backup-bytes" && r.unit == "bytes" })
+    );
+    assert!(
+        rows.iter()
+            .any(|r| { r.limiter == "/sys/limits/backup-ops" && r.unit == "ops" })
+    );
+}
+
+/// Several remotes may deliberately share one pond-wide budget.  Monitoring
+/// reports that limiter once, preserving the remote names as context instead
+/// of multiplying the same state by attachment count.
+#[tokio::test]
+async fn limits_status_deduplicates_a_shared_limiter() {
+    init_log();
+    let tmp = TempDir::new().expect("tempdir");
+    let upstream = publish_upstream(&tmp, "limits-shared-upstream-a").await;
+    let upstream2 = publish_upstream(&tmp, "limits-shared-upstream-b").await;
+    let pond = tmp.path().join("consumer");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "limits-shared-consumer")
+        .await
+        .expect("init");
+
+    let mut yaml = governed_pull_yaml(&upstream, 1024, 100_000);
+    yaml.push_str(&format!(
+        r#"---
+version: v1
+kind: remote
+metadata:
+  path: /sys/remotes/upstream2
+spec:
+  url: {upstream2}
+  mount: /sources/upstream2
+  limits:
+    bytes: /sys/limits/pull-bytes
+    ops: /sys/limits/pull-ops
+"#
+    ));
+    apply_yaml(&ctx, tmp.path(), &yaml)
+        .await
+        .expect("apply shared limits");
+
+    let rows = cmd::commands::limits::collect_limiter_status(&ctx)
+        .await
+        .expect("collect limits");
+    assert_eq!(rows.len(), 2, "shared byte/ops limiters must not repeat");
+    assert!(
+        rows.iter().all(|row| row.remotes == "upstream,upstream2"),
+        "{rows:?}"
+    );
+}
+
 /// The binding is not decorative: a backup attached by `pond apply` naming a
 /// budget of one byte per day cannot push.
 ///
@@ -239,9 +354,7 @@ async fn an_applied_backup_is_actually_governed() {
     init_log();
     let tmp = TempDir::new().expect("tmp");
     let pond = tmp.path().join("pond");
-    let remote = tmp.path().join("remote");
-    std::fs::create_dir_all(&remote).expect("mkdir remote");
-    let url = format!("file://{}", remote.display());
+    let url = sync_store::testing::in_memory_remote_url("apply-governed-denied");
 
     let ctx = ctx_for(&pond, vec!["pond", "init"]);
     init_command(&ctx, "test-host").await.expect("init");
@@ -624,7 +737,7 @@ async fn limits_on_a_pull_only_remote_are_accepted() {
     // claim and must attach, not be refused as an empty one.
     init_log();
     let tmp = TempDir::new().expect("tmp");
-    let url = publish_upstream(&tmp).await;
+    let url = publish_upstream(&tmp, "pull-accepted").await;
 
     let pond = tmp.path().join("consumer");
     let ctx = ctx_for(&pond, vec!["pond", "init"]);
@@ -651,7 +764,7 @@ async fn limits_on_a_pull_only_remote_are_accepted() {
 async fn a_governed_pull_within_budget_still_succeeds() {
     init_log();
     let tmp = TempDir::new().expect("tmp");
-    let url = publish_upstream(&tmp).await;
+    let url = publish_upstream(&tmp, "pull-within-budget").await;
 
     let pond = tmp.path().join("consumer");
     let ctx = ctx_for(&pond, vec!["pond", "init"]);
@@ -677,6 +790,339 @@ async fn a_governed_pull_within_budget_still_succeeds() {
     );
 }
 
+#[tokio::test]
+async fn overwrite_can_migrate_a_verified_pull_watermark_between_equivalent_remotes() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let (_producer, first, second) = publish_equivalent_remotes(&tmp, "migration-ok").await;
+    let pond = tmp.path().join("consumer");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&first, false, false))
+        .await
+        .expect("attach first remote");
+    pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect("pull first remote");
+
+    let old_tip = ctx
+        .open_pond()
+        .await
+        .expect("open")
+        .control_table()
+        .raw_config_get(&format!("last_pulled_tip:{first}"))
+        .await
+        .expect("read old watermark")
+        .expect("old watermark");
+
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&second, true, true))
+        .await
+        .expect("migrate equivalent remote watermark");
+
+    let mut ship = ctx.open_pond().await.expect("open migrated pond");
+    assert_eq!(
+        load_remote_attachment(&mut ship, "upstream")
+            .await
+            .expect("load migrated attachment")
+            .url,
+        second
+    );
+    assert_eq!(
+        ship.control_table()
+            .raw_config_get(&format!("last_pulled_tip:{second}"))
+            .await
+            .expect("read migrated watermark"),
+        Some(old_tip.clone())
+    );
+    assert_eq!(
+        ship.control_table()
+            .raw_config_get(&format!("last_pulled_tip:{first}"))
+            .await
+            .expect("read retained old watermark"),
+        Some(old_tip)
+    );
+    drop(ship);
+
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&second, true, true))
+        .await
+        .expect("reapplying a completed migration must be safe");
+}
+
+#[tokio::test]
+async fn watermark_migration_refuses_an_advanced_destination_without_replacing_the_remote() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let (producer, first, second) = publish_equivalent_remotes(&tmp, "migration-advanced").await;
+    let pond = tmp.path().join("consumer");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&first, false, false))
+        .await
+        .expect("attach first remote");
+    pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect("pull first remote");
+
+    write_small_file(&producer, "/later.txt", b"new producer commit")
+        .await
+        .expect("advance producer");
+    push_command(&producer, None)
+        .await
+        .expect("publish advanced tip");
+
+    let err = apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&second, true, true))
+        .await
+        .expect_err("advanced destination must not inherit an older watermark");
+    assert!(
+        format!("{err:#}").contains("does not exactly match pinned tip"),
+        "unexpected migration error: {err:#}"
+    );
+
+    let mut ship = ctx.open_pond().await.expect("open unchanged pond");
+    assert_eq!(
+        load_remote_attachment(&mut ship, "upstream")
+            .await
+            .expect("load original attachment")
+            .url,
+        first
+    );
+    assert_eq!(
+        ship.control_table()
+            .raw_config_get(&format!("last_pulled_tip:{second}"))
+            .await
+            .expect("read replacement watermark"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn watermark_migration_refuses_a_different_producer_identity() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let (_producer, first, _equivalent) =
+        publish_equivalent_remotes(&tmp, "migration-identity-a").await;
+    let different = publish_upstream(&tmp, "migration-identity-b").await;
+    let pond = tmp.path().join("consumer");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&first, false, false))
+        .await
+        .expect("attach first remote");
+    pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect("pull first producer");
+
+    let err = apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&different, true, true))
+        .await
+        .expect_err("a different producer must not inherit the watermark");
+    assert!(
+        format!("{err:#}").contains("replacement remote has pond_id"),
+        "unexpected identity error: {err:#}"
+    );
+    let mut ship = ctx.open_pond().await.expect("open unchanged pond");
+    assert_eq!(
+        load_remote_attachment(&mut ship, "upstream")
+            .await
+            .expect("load original attachment")
+            .url,
+        first
+    );
+}
+
+#[tokio::test]
+async fn watermark_migration_refuses_when_the_graft_pin_is_missing() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let (_producer, first, second) = publish_equivalent_remotes(&tmp, "migration-no-pin").await;
+    let pond = tmp.path().join("consumer");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&first, false, false))
+        .await
+        .expect("attach first remote");
+    pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect("pull first remote");
+
+    let mut ship = ctx.open_pond().await.expect("open consumer");
+    ship.write_transaction(
+        &PondUserMetadata::new(vec!["test".to_string(), "remove-graft-pin".to_string()]),
+        async |fs| {
+            let root = fs.root().await?;
+            root.open_dir_path(steward::SYS_GRAFTS_DIR)
+                .await?
+                .remove_entry("upstream")
+                .await?;
+            Ok(())
+        },
+    )
+    .await
+    .expect("remove graft pin");
+    drop(ship);
+
+    let err = apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&second, true, true))
+        .await
+        .expect_err("missing graft pin must prevent migration");
+    assert!(
+        format!("{err:#}").contains("graft pin `/sys/grafts/upstream` does not exist"),
+        "unexpected missing-pin error: {err:#}"
+    );
+    let mut ship = ctx.open_pond().await.expect("open unchanged pond");
+    assert_eq!(
+        load_remote_attachment(&mut ship, "upstream")
+            .await
+            .expect("load original attachment")
+            .url,
+        first
+    );
+}
+
+#[tokio::test]
+async fn watermark_migration_refuses_a_watermark_that_disagrees_with_the_graft_pin() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let (_producer, first, second) =
+        publish_equivalent_remotes(&tmp, "migration-bad-watermark").await;
+    let pond = tmp.path().join("consumer");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&first, false, false))
+        .await
+        .expect("attach first remote");
+    pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect("pull first remote");
+
+    let mut ship = ctx.open_pond().await.expect("open consumer");
+    ship.control_table_mut()
+        .raw_config_set(&format!("last_pulled_tip:{first}"), &"0".repeat(64))
+        .await
+        .expect("corrupt old watermark");
+    drop(ship);
+
+    let err = apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&second, true, true))
+        .await
+        .expect_err("watermark and graft pin disagreement must prevent migration");
+    assert!(
+        format!("{err:#}").contains("graft pin tip")
+            && format!("{err:#}").contains("differs from existing URL watermark"),
+        "unexpected mismatched-watermark error: {err:#}"
+    );
+}
+
+#[tokio::test]
+async fn watermark_migration_refuses_a_destination_missing_the_pinned_commit() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let (_producer, first, second) =
+        publish_equivalent_remotes(&tmp, "migration-missing-commit").await;
+    let pond = tmp.path().join("consumer");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&first, false, false))
+        .await
+        .expect("attach first remote");
+    pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect("pull first remote");
+
+    let remote = sync_store::ContentRemote::open_at_url(&second, HashMap::new())
+        .await
+        .expect("open equivalent remote");
+    let pond_id = remote.pond_id();
+    let tip = remote
+        .get_tip("main")
+        .await
+        .expect("read remote tip")
+        .expect("remote tip");
+    let mut store = sync_store::Store::open_at_url(&second, HashMap::new())
+        .await
+        .expect("open backing store");
+    let txn_seq = store.last_txn_seq(pond_id).await.expect("last sequence") + 1;
+    store
+        .apply_batch(
+            pond_id,
+            txn_seq,
+            chrono::Utc::now().timestamp_micros(),
+            vec![sync_store::Op::Delete {
+                partition: "objects".to_string(),
+                key: tip.to_string(),
+            }],
+        )
+        .await
+        .expect("remove pinned commit while retaining the ref");
+
+    let err = apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&second, true, true))
+        .await
+        .expect_err("missing pinned commit must prevent migration");
+    assert!(
+        format!("{err:#}").contains("does not contain pinned commit"),
+        "unexpected missing-commit error: {err:#}"
+    );
+    let mut ship = ctx.open_pond().await.expect("open unchanged pond");
+    assert_eq!(
+        load_remote_attachment(&mut ship, "upstream")
+            .await
+            .expect("load original attachment")
+            .url,
+        first
+    );
+}
+
+#[tokio::test]
+async fn ordinary_overwrite_without_a_prior_pull_does_not_require_migration_state() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let (_producer, first, second) = publish_equivalent_remotes(&tmp, "ordinary-overwrite").await;
+    let pond = tmp.path().join("consumer");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&first, false, false))
+        .await
+        .expect("attach first remote");
+
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&second, true, false))
+        .await
+        .expect("ordinary overwrite remains unchanged");
+    let mut ship = ctx.open_pond().await.expect("open overwritten pond");
+    assert_eq!(
+        load_remote_attachment(&mut ship, "upstream")
+            .await
+            .expect("load replacement attachment")
+            .url,
+        second
+    );
+    assert_eq!(
+        ship.control_table()
+            .raw_config_get(&format!("last_pulled_tip:{second}"))
+            .await
+            .expect("read absent watermark"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn watermark_migration_requires_overwrite() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let pond = tmp.path().join("consumer");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+
+    let err = apply_yaml(
+        &ctx,
+        tmp.path(),
+        &pull_remote_yaml("file:///unused", false, true),
+    )
+    .await
+    .expect_err("migration without overwrite must fail during parsing");
+    assert!(
+        format!("{err:#}").contains("'migrate_watermark: true' requires 'overwrite: true'"),
+        "unexpected apply guard error: {err:#}"
+    );
+}
+
 /// The other half of the claim: an attached pull remote is not merely allowed
 /// to name limiters, it is actually stopped by them.  A budget of one remote
 /// operation per hour cannot cover a graph fetch, so the pull must be refused
@@ -685,7 +1131,7 @@ async fn a_governed_pull_within_budget_still_succeeds() {
 async fn an_applied_pull_remote_is_actually_governed() {
     init_log();
     let tmp = TempDir::new().expect("tmp");
-    let url = publish_upstream(&tmp).await;
+    let url = publish_upstream(&tmp, "pull-refused").await;
 
     let pond = tmp.path().join("consumer");
     let ctx = ctx_for(&pond, vec!["pond", "init"]);
@@ -703,4 +1149,113 @@ async fn an_applied_pull_remote_is_actually_governed() {
         msg.contains("rate limit") || msg.contains("retry in"),
         "expected a rate-limit refusal, got: {msg}"
     );
+}
+
+/// Phase A3, end to end: an Azure profile survives `pond apply` and reads back
+/// as an Azure profile.
+///
+/// The round trip is the point.  Dispatch keys off the factory recorded on the
+/// node (Decision A9), so this is what proves the name is actually stored and
+/// returned -- a unit test can only assert that a name it supplied is honoured.
+#[tokio::test]
+async fn an_azure_profile_applies_and_reads_back_as_azure() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let pond = tmp.path().join("pond");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "test-host").await.expect("init");
+
+    apply_yaml(
+        &ctx,
+        tmp.path(),
+        "version: v1\nkind: mknod\nmetadata:\n  path: /sys/storage/azure\nspec:\n  factory: storage-azure\n  config:\n    account_name: casparwater\n    account_key: ${env:PATH}\n",
+    )
+    .await
+    .expect("apply azure profile");
+
+    let mut ship = ctx.open_pond().await.expect("open");
+    let pond = ship.as_pond_mut().expect("pond steward");
+    let profile = steward::ResolvedStorage::open(pond, "/sys/storage/azure")
+        .await
+        .expect("read profile back");
+
+    assert_eq!(profile.kind(), "storage-azure");
+    assert!(profile.serves_scheme("az://container/prefix"));
+    assert!(
+        !profile.serves_scheme("s3://bucket"),
+        "an azure profile must not claim an s3 URL"
+    );
+
+    // The reference survived as text and resolves here, not at apply time
+    // (Decision A6).
+    let opts = profile.to_storage_options().expect("resolve");
+    let path = std::env::var("PATH").expect("PATH is set");
+    assert_eq!(
+        opts.get("account_key").map(String::as_str),
+        Some(path.as_str())
+    );
+    assert_eq!(
+        opts.get("account_name").map(String::as_str),
+        Some("casparwater")
+    );
+}
+
+/// An Azure profile with two credential shapes is refused at `pond apply`,
+/// not stored and left to fail on first push (Decision A4).
+#[tokio::test]
+async fn an_ambiguous_azure_profile_is_refused_at_apply() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let pond = tmp.path().join("pond");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "test-host").await.expect("init");
+
+    let err = apply_yaml(
+        &ctx,
+        tmp.path(),
+        "version: v1\nkind: mknod\nmetadata:\n  path: /sys/storage/azure\nspec:\n  factory: storage-azure\n  config:\n    account_name: casparwater\n    account_key: ${env:PATH}\n    sas_token: ${env:PATH}\n",
+    )
+    .await
+    .expect_err("two credentials must be refused");
+    assert!(format!("{err:#}").contains("exactly one"), "{err:#}");
+}
+
+/// An Azure profile with no credential is refused at apply too: authenticating
+/// with nothing is an outage deferred to first push.
+#[tokio::test]
+async fn an_azure_profile_without_a_credential_is_refused_at_apply() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let pond = tmp.path().join("pond");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "test-host").await.expect("init");
+
+    let err = apply_yaml(
+        &ctx,
+        tmp.path(),
+        "version: v1\nkind: mknod\nmetadata:\n  path: /sys/storage/azure\nspec:\n  factory: storage-azure\n  config:\n    account_name: casparwater\n",
+    )
+    .await
+    .expect_err("no credential must be refused");
+    assert!(format!("{err:#}").contains("exactly one"), "{err:#}");
+}
+
+/// A literal Azure credential must be refused at apply, exactly as a literal
+/// S3 secret is: the node replicates to every backup.
+#[tokio::test]
+async fn a_literal_azure_credential_is_refused_at_apply() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let pond = tmp.path().join("pond");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "test-host").await.expect("init");
+
+    let err = apply_yaml(
+        &ctx,
+        tmp.path(),
+        "version: v1\nkind: mknod\nmetadata:\n  path: /sys/storage/azure\nspec:\n  factory: storage-azure\n  config:\n    account_name: casparwater\n    account_key: hunter2\n",
+    )
+    .await
+    .expect_err("a literal secret must be refused");
+    assert!(format!("{err:#}").contains("account_key"), "{err:#}");
 }

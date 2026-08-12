@@ -42,7 +42,17 @@ impl ObjectStoreFactory for S3CompatibleStoreFactory {
         let store = builder.build().map_err(|e| DeltaTableError::GenericError {
             source: Box::new(e),
         })?;
-        Ok((Arc::new(store), prefix))
+        // Every request this store makes is charged to the budget bound to
+        // this URL (see `metered_store`).  Wrapping here rather than at the
+        // call sites is the point: a request is counted because it happened,
+        // and attributed by the remote it was made to.
+        Ok((
+            Arc::new(crate::MeteredStore::new(
+                Arc::new(store),
+                crate::RemoteKey::new(url.as_str()),
+            )),
+            prefix,
+        ))
     }
 }
 
