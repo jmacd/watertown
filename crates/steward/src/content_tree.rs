@@ -347,36 +347,6 @@ pub(crate) fn node_manifest_entries(index: &ContentTreeIndex) -> Vec<ManifestEnt
     entries
 }
 
-/// Compute the node-manifest commitments a commit references: the node
-/// manifest object's content hash (`node_manifest_hash`) and the node-keyed
-/// Merkle root over that manifest (`node_manifest_root`).  Both come from a
-/// single fold of the data table, so they are mutually consistent.
-///
-/// # Errors
-///
-/// Returns an error if the data table cannot be read or folded, or if the
-/// manifest cannot be encoded or hashed (a duplicate `node_id`).
-pub(crate) async fn compute_commit_roots_for_table(
-    table: deltalake::DeltaTable,
-    local_pond_id: &str,
-) -> Result<CommitRoots, StewardError> {
-    let index = build_content_tree_for_table(table, local_pond_id).await?;
-    let manifest = node_manifest_entries(&index);
-    let node_manifest_hash = manifest_hash(&manifest).map_err(StewardError::Content)?;
-    let node_manifest_root = node_merkle_rebuild_root(&manifest).map_err(StewardError::Content)?;
-    Ok(CommitRoots {
-        node_manifest_hash,
-        node_manifest_root,
-    })
-}
-
-/// The node-manifest commitments a commit object references, recomputed from a
-/// pond's live state (used by the pull path to verify a rebuilt mirror).
-pub(crate) struct CommitRoots {
-    pub node_manifest_hash: ObjectHash,
-    pub node_manifest_root: ObjectHash,
-}
-
 /// Build the full node-manifest bytes for the current in-transaction live state
 /// (design `docs/incremental-content-tree-design.md` Section 4, Approach A /
 /// Phase 2).

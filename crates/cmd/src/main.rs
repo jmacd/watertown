@@ -616,7 +616,13 @@ async fn main() -> Result<()> {
         Commands::Pull {
             name,
             rebuild_graft,
-        } => commands::pull_command_with_rebuild(&ship_context, name, rebuild_graft).await,
+        } => {
+            if rebuild_graft {
+                commands::pull_command_with_rebuild(&ship_context, name, true).await
+            } else {
+                commands::pull_command(&ship_context, name).await
+            }
+        }
         Commands::Restore { name, url, options } => {
             commands::restore_command(
                 &ship_context,

@@ -613,16 +613,15 @@ impl Ship {
         // Record transaction begin in control table — writes only.
         // Reads no longer leave audit rows; the per-read Delta write
         // was pure overhead now that exclusion is enforced by the lock.
-        if is_write {
-            if let Err(error) = self
+        if is_write
+            && let Err(error) = self
                 .control_table
                 .record_begin(&txn_meta, based_on_seq, transaction_type)
                 .await
-            {
-                return Err(StewardError::ControlTable(format!(
-                    "Failed to record transaction begin: {error}"
-                )));
-            }
+        {
+            return Err(StewardError::ControlTable(format!(
+                "Failed to record transaction begin: {error}"
+            )));
         }
 
         // Begin Data FS transaction guard with metadata
@@ -634,16 +633,13 @@ impl Ship {
         let data_tx = match data_tx_result {
             Ok(data_tx) => data_tx,
             Err(error) => {
-                if is_write {
-                    if let Err(record_error) = self
+                if is_write
+                    && let Err(record_error) = self
                         .control_table
                         .record_failed(&txn_meta, transaction_type, error.to_string(), 0)
                         .await
-                    {
-                        log::error!(
-                            "Failed to record data transaction begin failure: {record_error}"
-                        );
-                    }
+                {
+                    log::error!("Failed to record data transaction begin failure: {record_error}");
                 }
                 return Err(StewardError::DataInit(error));
             }
