@@ -41,7 +41,8 @@ mod write_lock;
 pub use content_diff::{ContentComparison, ContentDiff, DiffKind, compare_content_trees};
 pub use content_objects::{ObjectInventory, ObjectKind, inventory_content_objects};
 pub use content_pull::{
-    FetchedGraph, FetchedObject, RebuildOutcome, fetch_object_graph, import_pond, rebuild_pond,
+    FetchedGraph, FetchedObject, RebuildOutcome, fetch_object_graph, import_graft, import_pond,
+    rebuild_pond, replace_graft,
 };
 pub use content_push::{
     ContentPushOutcome, open_and_push_to_remote_limited, push_content_to_remote,
@@ -53,10 +54,10 @@ pub use content_tree::{
     materialize_content_objects,
 };
 pub use content_verify::{ContentVerifyReport, ContentVerifyState, verify_content_against_remote};
-pub use control_table::{CommitSpine, ControlTable};
+pub use control_table::{CommitSpine, ControlTable, TransactionType};
 pub use dispatch::{Steward, Transaction};
 pub use fsck::{FsckError, FsckOptions, FsckReport, PartitionDigest, fsck};
-pub use graft::{GraftPin, SYS_GRAFTS_DIR};
+pub use graft::{GraftPin, SYS_GRAFTS_DIR, split_mount_path};
 pub use guard::StewardTransactionGuard;
 pub use host::{HostSteward, HostTransaction};
 pub use limiter::{

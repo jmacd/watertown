@@ -13,12 +13,24 @@ use crate::commands::remote::{
 use crate::common::ShipContext;
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
-use steward::{REMOTE_MOUNT_PATH_PREFIX, StewardError};
-use uuid::Uuid;
+use steward::REMOTE_MOUNT_PATH_PREFIX;
 
 /// Pull from `name`, or from every remote in `pull`/`both` mode when `name`
 /// is `None`.  Each remote is processed independently.
 pub async fn pull_command(ship_context: &ShipContext, name: Option<String>) -> Result<()> {
+    pull_command_with_rebuild(ship_context, name, false).await
+}
+
+pub async fn pull_command_with_rebuild(
+    ship_context: &ShipContext,
+    name: Option<String>,
+    rebuild_graft: bool,
+) -> Result<()> {
+    if rebuild_graft && name.is_none() {
+        return Err(anyhow!(
+            "`pond pull --rebuild-graft` requires one remote name"
+        ));
+    }
     let mut ship = ship_context.open_pond().await?;
 
     let targets: Vec<String> = if let Some(n) = name {
@@ -49,7 +61,7 @@ pub async fn pull_command(ship_context: &ShipContext, name: Option<String>) -> R
     // makes a routine throttle look like an outage.
     let mut failures: Vec<String> = Vec::new();
     for name in targets {
-        if let Err(e) = pull_one(&mut ship, &name).await {
+        if let Err(e) = pull_one(&mut ship, &name, rebuild_graft).await {
             log::error!("[ERR] pull {}: {}", name, e);
             failures.push(format!("{}: {}", name, e));
         }
@@ -62,32 +74,114 @@ pub async fn pull_command(ship_context: &ShipContext, name: Option<String>) -> R
     }
 }
 
+async fn pulled_frontier(
+    ship: &mut steward::Ship,
+    url: &str,
+    name: &str,
+    graft: Option<(&str, uuid::Uuid)>,
+) -> Result<Option<String>> {
+    let watermark = ship
+        .control_table()
+        .raw_config_get(&format!("last_pulled_tip:{url}"))
+        .await
+        .map_err(|e| anyhow!("read last_pulled_tip for `{name}`: {e}"))?
+        .filter(|tip| !tip.is_empty());
+    if let Some((mount_path, foreign_pond_id)) = graft {
+        let pin_path = steward::GraftPin::pin_path(name);
+        let tx = ship
+            .begin_read(&steward::PondUserMetadata::new(vec![
+                "pull".to_string(),
+                "read-graft-pin".to_string(),
+                name.to_string(),
+            ]))
+            .await?;
+        let pin_bytes = {
+            let root = tx.root().await?;
+            if root.exists(&pin_path).await {
+                Some(root.read_file_path_to_vec(&pin_path).await?)
+            } else {
+                None
+            }
+        };
+        let _ = tx.commit().await?;
+        let Some(bytes) = pin_bytes else {
+            return Ok(watermark);
+        };
+        let pin = steward::GraftPin::from_yaml_bytes(&bytes)
+            .map_err(|e| anyhow!("parse graft pin `{pin_path}`: {e}"))?;
+        let same_mount = pin.mount_path.trim_end_matches('/') == mount_path.trim_end_matches('/');
+        if pin.foreign_pond_id == foreign_pond_id.to_string() && same_mount {
+            return Ok(Some(pin.pinned_tip));
+        }
+        return Ok(None);
+    }
+    Ok(watermark)
+}
+
 /// Return `true` when the remote's tip commit for ref `main` already equals the
-/// tip we last pulled for `url`, meaning the local mirror/mount is up to date
-/// and the full graph fetch can be skipped.  Records nothing; the caller
-/// refreshes `last_pulled_tip` only after a real rebuild/import lands.
+/// durable graft pin (or mirror watermark), so the graph fetch can be skipped.
 async fn already_at_tip(
-    ship: &steward::Ship,
+    ship: &mut steward::Ship,
     remote: &dyn steward::ContentSource,
     url: &str,
     name: &str,
+    graft: Option<(&str, uuid::Uuid)>,
 ) -> Result<bool> {
     let remote_tip = remote
         .get_tip("main")
         .await
-        .map_err(|e| anyhow!("get tip from `{}`: {}", url, e))?;
-    let last_pulled = ship
-        .control_table()
-        .raw_config_get(&format!("last_pulled_tip:{url}"))
-        .await
-        .map_err(|e| anyhow!("read last_pulled_tip for `{}`: {}", name, e))?;
+        .map_err(|e| anyhow!("get tip from `{url}`: {e}"))?;
+    let last_pulled = pulled_frontier(ship, url, name, graft).await?;
     if let (Some(tip), Some(prev)) = (remote_tip, last_pulled.as_deref())
         && tip.to_hex() == prev
     {
+        if graft.is_some() {
+            let key = format!("last_pulled_tip:{url}");
+            let tip_hex = tip.to_hex();
+            let watermark = ship
+                .control_table()
+                .raw_config_get(&key)
+                .await
+                .map_err(|e| anyhow!("read last_pulled_tip for `{name}`: {e}"))?;
+            if watermark.as_deref() != Some(tip_hex.as_str()) {
+                ship.control_table_mut()
+                    .raw_config_set(&key, &tip_hex)
+                    .await
+                    .map_err(|e| anyhow!("repair last_pulled_tip for `{name}`: {e}"))?;
+            }
+        }
         log::info!("[OK] pull {name} already up to date (tip={prev})");
         return Ok(true);
     }
     Ok(false)
+}
+
+async fn require_fast_forward(
+    ship: &mut steward::Ship,
+    graph: &steward::FetchedGraph,
+    url: &str,
+    name: &str,
+    graft: Option<(&str, uuid::Uuid)>,
+) -> Result<()> {
+    let Some(previous) = pulled_frontier(ship, url, name, graft).await? else {
+        return Ok(());
+    };
+    let previous_hash = sync_store::content::ObjectHash::from_hex(&previous)
+        .map_err(|e| anyhow!("invalid last_pulled_tip for `{name}`: {e}"))?;
+    if graph
+        .commits
+        .iter()
+        .any(|(commit_hash, _)| *commit_hash == previous_hash)
+    {
+        return Ok(());
+    }
+    let remote_tip = graph
+        .tip
+        .map(|tip| tip.to_hex())
+        .unwrap_or_else(|| "<empty>".to_string());
+    Err(anyhow!(
+        "remote `{name}` tip {remote_tip} does not descend from last pulled tip {previous}; refusing non-fast-forward pull"
+    ))
 }
 
 /// Open a [`steward::ContentSource`] for `attachment`: a `pond://<path>` URL
@@ -113,7 +207,7 @@ async fn open_content_source(
     }
 }
 
-async fn pull_one(ship: &mut steward::Steward, name: &str) -> Result<()> {
+async fn pull_one(ship: &mut steward::Steward, name: &str, rebuild_graft: bool) -> Result<()> {
     let attachment = load_remote_attachment(ship, name).await?;
 
     // One dispatch, from the profile when there is one (Decision A8).  A
@@ -182,8 +276,13 @@ async fn pull_one(ship: &mut steward::Steward, name: &str) -> Result<()> {
     // (non-root mount): fetch the foreign content graph and rebuild it under
     // the foreign pond_id, then mount it.
     let result: Result<()> = match mount_path {
+        None if rebuild_graft => Err(anyhow!(
+            "remote `{name}` is a mirror; --rebuild-graft only replaces a non-root graft"
+        )),
         None => pull_mirror(ship, name, &attachment, &source).await,
-        Some(mount_path) => pull_import(ship, name, &attachment, &source, &mount_path).await,
+        Some(mount_path) => {
+            pull_import(ship, name, &attachment, &source, &mount_path, rebuild_graft).await
+        }
     };
 
     // A budget's refusal outranks the storage error it surfaced as, so an
@@ -219,6 +318,7 @@ async fn pull_import(
     attachment: &steward::RemoteAttachment,
     remote: &dyn steward::ContentSource,
     mount_path: &str,
+    rebuild_graft: bool,
 ) -> Result<()> {
     let ship_ref = ship
         .as_pond_mut()
@@ -240,7 +340,10 @@ async fn pull_import(
     // tip we last pulled, the mount is up to date -- skip the full graph fetch
     // and re-import entirely.  This is the bandwidth-bug guard: without it,
     // every pull re-walks and re-downloads the whole reachable object closure.
-    if already_at_tip(ship_ref, remote, &attachment.url, name).await? {
+    let graft_identity = Some((mount_path, remote.pond_id()));
+    if !rebuild_graft
+        && already_at_tip(ship_ref, remote, &attachment.url, name, graft_identity).await?
+    {
         return Ok(());
     }
 
@@ -257,35 +360,26 @@ async fn pull_import(
         );
         return Ok(());
     }
+    require_fast_forward(ship_ref, &graph, &attachment.url, name, graft_identity).await?;
     let foreign_uuid7 = uuid7::Uuid::from(*foreign_pond_id.as_bytes());
-    let outcome = steward::import_pond(ship_ref, remote, &graph, foreign_uuid7)
-        .await
-        .map_err(|e| anyhow!("import from `{}`: {}", attachment.url, e))?;
+    let pinned_tip = graph
+        .tip
+        .ok_or_else(|| anyhow!("imported graph from `{}` has no tip commit", name))?;
+    let outcome = if rebuild_graft {
+        steward::replace_graft(ship_ref, remote, &graph, foreign_uuid7, name, mount_path).await
+    } else {
+        steward::import_graft(ship_ref, remote, &graph, foreign_uuid7, name, mount_path).await
+    }
+    .map_err(|e| anyhow!("import from `{}`: {}", attachment.url, e))?;
     log::info!(
         "[OK] pull {} complete (cross-pond import: {:?})",
         name,
         outcome
     );
 
-    // Materialize the mount and record the graft pin in ONE transaction.  The
-    // mount node is omitted from the content-tree fold (keeping the graft
-    // non-transitive); the pin file is ordinary pond-owned content -- covered
-    // by our commit hash and replicated to consumers as a content-addressed
-    // reference to the foreign tip.
-    let pinned_tip = graph
-        .tip
-        .ok_or_else(|| anyhow!("imported graph from `{}` has no tip commit", name))?;
-    materialize_mount(
-        ship_ref,
-        name,
-        mount_path,
-        foreign_pond_id,
-        &pinned_tip.to_hex(),
-    )
-    .await?;
-
     // Record the per-ref frontier we last pulled: the foreign tip commit hash
-    // now mounted (CA3 replacement for the retired seq watermark).
+    // now atomically imported, mounted, and pinned. If this control-table write
+    // fails, a retry safely repeats the idempotent graft transaction.
     ship_ref
         .control_table_mut()
         .raw_config_set(
@@ -313,7 +407,7 @@ async fn pull_mirror(
 
     // Incremental short-circuit (CA3): skip the full graph fetch and rebuild
     // when the mirror already reflects the remote tip.
-    if already_at_tip(ship_ref, remote, &attachment.url, name).await? {
+    if already_at_tip(ship_ref, remote, &attachment.url, name, None).await? {
         return Ok(());
     }
 
@@ -327,6 +421,7 @@ async fn pull_mirror(
         );
         return Ok(());
     }
+    require_fast_forward(ship_ref, &graph, &attachment.url, name, None).await?;
     let outcome = steward::rebuild_pond(ship_ref, remote, &graph)
         .await
         .map_err(|e| anyhow!("rebuild from `{}`: {}", attachment.url, e))?;
@@ -351,123 +446,11 @@ async fn pull_mirror(
     Ok(())
 }
 
-/// Insert (idempotently) a directory entry at `mount_path` whose `pond_id` is
-/// the foreign pond's id, and record the graft pin at `/sys/grafts/<name>` --
-/// both in a SINGLE transaction so a cross-pond pull adds exactly one local
-/// commit.  Reading through the mount entry yields the foreign pond's tree; the
-/// pin file is ordinary pond-owned content (covered by our commit hash and
-/// replicated to consumers) that pins the foreign tip commit hash without
-/// re-replicating the foreign closure.
-async fn materialize_mount(
-    ship: &mut steward::Ship,
-    name: &str,
-    mount_path: &str,
-    foreign_pond_id: Uuid,
-    pinned_tip_hex: &str,
-) -> Result<()> {
-    let (parent, leaf) = split_mount_path(mount_path)?;
-    let name_owned = name.to_string();
-    let mount_owned = mount_path.to_string();
-    let parent_owned = parent.to_string();
-    let leaf_owned = leaf.to_string();
-
-    let pin = steward::GraftPin {
-        foreign_pond_id: foreign_pond_id.to_string(),
-        mount_path: mount_path.to_string(),
-        pinned_tip: pinned_tip_hex.to_string(),
-    };
-    let pin_yaml = pin
-        .to_yaml()
-        .map_err(|e| anyhow!("serialize graft pin for `{}`: {}", name, e))?;
-    let pin_path = steward::GraftPin::pin_path(name);
-    let pin_name = name_owned.clone();
-
-    ship.write_transaction(
-        &steward::PondUserMetadata::new(vec![
-            "pull".to_string(),
-            "mount".to_string(),
-            name_owned,
-            mount_owned,
-        ]),
-        async move |fs| {
-            use tinyfs::EntryType;
-            use tokio::io::AsyncWriteExt;
-
-            let root = fs.root().await?;
-            let _ = root.create_dir_all(&parent_owned).await?;
-            let parent_wd = root.open_dir_path(&parent_owned).await?;
-
-            let foreign_uuid7 = uuid7::Uuid::from(*foreign_pond_id.as_bytes());
-
-            if let Some(existing) = parent_wd.get(&leaf_owned).await? {
-                let existing_pond = existing.node.id().pond_id();
-                if existing_pond != foreign_uuid7 {
-                    return Err(StewardError::Aborted(format!(
-                        "mount path `{}/{}` already exists with pond_id {}; cannot \
-                         attach foreign pond {}",
-                        parent_owned, leaf_owned, existing_pond, foreign_uuid7
-                    )));
-                }
-                // Idempotent: mount already points at the right pond.
-            } else {
-                let foreign_node = fs.foreign_root_node(foreign_uuid7).await?;
-                let _ = parent_wd.insert_node(&leaf_owned, foreign_node).await?;
-            }
-
-            // Record / refresh the graft pin in the same transaction.
-            let _ = root.create_dir_all(steward::SYS_DIR).await?;
-            let _ = root.create_dir_all(steward::SYS_GRAFTS_DIR).await?;
-            if root.exists(&pin_path).await {
-                let grafts_dir = root.open_dir_path(steward::SYS_GRAFTS_DIR).await?;
-                grafts_dir.remove_entry(&pin_name).await.map_err(|e| {
-                    StewardError::Aborted(format!("remove existing graft pin {}: {}", pin_path, e))
-                })?;
-            }
-            let mut writer = root
-                .async_writer_path_with_type(&pin_path, EntryType::FilePhysicalVersion)
-                .await?;
-            writer
-                .write_all(pin_yaml.as_bytes())
-                .await
-                .map_err(|e| StewardError::Aborted(format!("write graft pin: {}", e)))?;
-            writer
-                .shutdown()
-                .await
-                .map_err(|e| StewardError::Aborted(format!("close graft pin: {}", e)))?;
-            Ok(())
-        },
-    )
-    .await
-    .map_err(|e| anyhow!("materialize mount `{}`: {}", mount_path, e))?;
-    Ok(())
-}
-
 /// Split an absolute mount path into (parent_dir, leaf_name).
 /// Errors if the path is `/` (root mount is mirror mode, handled
 /// elsewhere) or has no leaf segment.
 pub(crate) fn split_mount_path(path: &str) -> Result<(&str, &str)> {
-    if !path.starts_with('/') {
-        return Err(anyhow!("mount path `{}` must be absolute", path));
-    }
-    if path == "/" {
-        return Err(anyhow!(
-            "internal: split_mount_path called on `/` (mirror restart should be filtered earlier)"
-        ));
-    }
-    let trimmed = path.trim_end_matches('/');
-    let last_slash = trimmed
-        .rfind('/')
-        .ok_or_else(|| anyhow!("mount path `{}` has no leaf", path))?;
-    let parent = if last_slash == 0 {
-        "/"
-    } else {
-        &trimmed[..last_slash]
-    };
-    let leaf = &trimmed[last_slash + 1..];
-    if leaf.is_empty() {
-        return Err(anyhow!("mount path `{}` has empty leaf", path));
-    }
-    Ok((parent, leaf))
+    steward::split_mount_path(path).map_err(anyhow::Error::msg)
 }
 
 #[cfg(test)]

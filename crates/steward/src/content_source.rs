@@ -21,7 +21,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use sync_store::ContentRemote;
-use sync_store::content::ObjectHash;
+use sync_store::content::{Commit, ObjectHash};
 use uuid::Uuid;
 
 use crate::content_tree::materialize_content_objects;
@@ -160,42 +160,17 @@ impl LocalPondSource {
             StewardError::Content("pond:// source path is not a pond steward".to_string())
         })?;
 
-        // Resolve the tip exactly as `push_content_to_remote` does: the highest
-        // content-changing spine seq, its commit hash, and the persisted commit
-        // object bytes.
-        let seq = ship
-            .control_table()
-            .latest_spine_seq()
-            .await?
-            .ok_or_else(|| {
-                StewardError::Content("pond:// source has no content-changing commit".to_string())
-            })?;
-        let commit_hash_hex = ship
-            .control_table()
-            .commit_hash_at(seq)
-            .await?
-            .ok_or_else(|| {
-                StewardError::Content(format!("no commit spine recorded at write seq {seq}"))
-            })?;
-        let commit_object_hex = ship
-            .control_table()
-            .commit_object_at(seq)
-            .await?
-            .ok_or_else(|| {
-                StewardError::Content(format!("no commit object recorded at write seq {seq}"))
-            })?;
-        let tip = ObjectHash::from_hex(&commit_hash_hex)
-            .map_err(|e| StewardError::Content(format!("invalid commit hash: {e}")))?;
-        let commit_bytes = hex::decode(&commit_object_hex)
-            .map_err(|e| StewardError::Content(format!("invalid commit object hex: {e}")))?;
-        let recomputed = ObjectHash::of_bytes(&commit_bytes);
-        if recomputed != tip {
-            return Err(StewardError::Content(format!(
-                "commit object hashes to {} but the spine records tip {}",
-                recomputed.to_hex(),
-                tip.to_hex()
-            )));
-        }
+        let pond_id = ship.control_table().pond_id_uuid();
+        let commit_log = crate::content_tree::read_log_leaves(
+            ship.data_persistence().table().clone(),
+            &pond_id.to_string(),
+        )
+        .await?;
+        let tip = Commit::decode(commit_log.last().ok_or_else(|| {
+            StewardError::Content("pond:// source has no content-changing commit".to_string())
+        })?)
+        .map_err(|e| StewardError::Content(format!("decode commit-log tip: {e}")))?
+        .hash();
 
         let materialized = materialize_content_objects(ship).await?;
         let mut objects: BTreeMap<ObjectHash, Vec<u8>> = materialized.inline;
@@ -203,11 +178,16 @@ impl LocalPondSource {
             StewardError::Content("materialized objects carry no node manifest".to_string())
         })?;
         let _ = objects.insert(manifest_hash, manifest_bytes);
-        // The tip commit object is added by the push layer on top of the
-        // materialized closure; add it here so a consumer can fetch it too.
-        let _ = objects.insert(tip, commit_bytes);
+        // Serve the authoritative commit-log chain, not only the tip. A
+        // consumer uses this lineage to reject stale/out-of-order refs while
+        // still accepting an ordinary producer fast-forward.
+        for bytes in commit_log {
+            let commit = Commit::decode(&bytes)
+                .map_err(|e| StewardError::Content(format!("decode commit-log leaf: {e}")))?;
+            let hash = commit.hash();
+            let _ = objects.insert(hash, bytes);
+        }
         let external_blobs = materialized.external_blobs;
-        let pond_id = ship.control_table().pond_id_uuid();
 
         Ok(Self {
             steward,

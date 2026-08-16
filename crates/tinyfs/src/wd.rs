@@ -121,6 +121,11 @@ impl WD {
         self.dref.get(name).await
     }
 
+    /// Get lightweight entry metadata without loading the referenced node.
+    pub async fn entry(&self, name: &str) -> Result<Option<DirectoryEntry>> {
+        self.dref.handle.entry(name).await
+    }
+
     fn id(&self) -> FileID {
         self.np.id()
     }
@@ -615,12 +620,9 @@ impl WD {
     /// The removed node is dropped -- this is a destructive unlink.
     pub async fn remove_entry(&self, name: &str) -> Result<()> {
         self.check_writable()?;
-        let _node = self
-            .dref
-            .handle
-            .remove(name)
-            .await?
-            .ok_or_else(|| Error::not_found(name))?;
+        if !self.dref.handle.unlink(name).await? {
+            return Err(Error::not_found(name));
+        }
 
         debug!("Removed entry '{}' from directory", name);
 

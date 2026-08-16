@@ -14,8 +14,8 @@
 //! All remotes are `file://`, so nothing here touches the network.
 
 use cmd::commands::{
-    apply_command, init_command, pull_command, push_command, remote::list_remote_names,
-    remote::load_remote_attachment, status_command,
+    apply_command, init_command, pull_command, pull_command_with_rebuild, push_command,
+    remote::list_remote_names, remote::load_remote_attachment, status_command,
 };
 use cmd::common::ShipContext;
 use provider::factory::rate_limit::LimitUnit;
@@ -787,6 +787,334 @@ async fn a_governed_pull_within_budget_still_succeeds() {
     assert!(
         tip.is_some_and(|t| !t.is_empty()),
         "a successful governed pull must record the tip it pulled"
+    );
+}
+
+#[tokio::test]
+async fn missing_watermark_retries_graft_without_another_data_commit() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let url = publish_upstream(&tmp, "watermark-retry").await;
+    let pond = tmp.path().join("consumer-watermark-retry");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&url, false, false))
+        .await
+        .expect("attach pull remote");
+    pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect("initial pull");
+
+    let mut ship = ctx.open_pond().await.expect("open consumer");
+    let key = format!("last_pulled_tip:{url}");
+    let pulled_tip = ship
+        .control_table()
+        .raw_config_get(&key)
+        .await
+        .expect("read watermark")
+        .expect("watermark");
+    let version = ship
+        .as_pond()
+        .expect("pond steward")
+        .data_persistence()
+        .table()
+        .version();
+    ship.control_table_mut()
+        .raw_config_set(&key, "")
+        .await
+        .expect("simulate lost trailing watermark");
+    drop(ship);
+
+    // Remove the commit object while retaining the ref. A full graph fetch
+    // would now fail; success proves the graft pin short-circuits the retry.
+    let remote = sync_store::ContentRemote::open_at_url(&url, HashMap::new())
+        .await
+        .expect("open remote");
+    let mut store = sync_store::Store::open_at_url(&url, HashMap::new())
+        .await
+        .expect("open backing store");
+    let txn_seq = store
+        .last_txn_seq(remote.pond_id())
+        .await
+        .expect("last remote sequence")
+        + 1;
+    store
+        .apply_batch(
+            remote.pond_id(),
+            txn_seq,
+            chrono::Utc::now().timestamp_micros(),
+            vec![sync_store::Op::Delete {
+                partition: "objects".to_string(),
+                key: pulled_tip.clone(),
+            }],
+        )
+        .await
+        .expect("remove tip object while retaining ref");
+
+    pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect("retry after watermark loss");
+    let ship = ctx.open_pond().await.expect("reopen consumer");
+    assert_eq!(
+        ship.as_pond()
+            .expect("pond steward")
+            .data_persistence()
+            .table()
+            .version(),
+        version,
+        "idempotent retry must not add a data commit"
+    );
+    assert_eq!(
+        ship.control_table()
+            .raw_config_get(&key)
+            .await
+            .expect("read restored watermark"),
+        Some(pulled_tip)
+    );
+}
+
+#[tokio::test]
+async fn matching_tip_does_not_short_circuit_a_mismatched_graft_pin() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let url = publish_upstream(&tmp, "pin-identity").await;
+    let pond = tmp.path().join("consumer-pin-identity");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&url, false, false))
+        .await
+        .expect("attach pull remote");
+    pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect("initial pull");
+
+    let pin_path = steward::GraftPin::pin_path("upstream");
+    let mut ship = ctx.open_pond().await.expect("open consumer");
+    let pond = ship.as_pond_mut().expect("pond steward");
+    let tx = pond
+        .begin_read(&PondUserMetadata::new(vec![
+            "test".to_string(),
+            "read-pin".to_string(),
+        ]))
+        .await
+        .expect("begin pin read");
+    let pin_bytes = tx
+        .root()
+        .await
+        .expect("root")
+        .read_file_path_to_vec(&pin_path)
+        .await
+        .expect("read pin");
+    let _ = tx.commit().await.expect("close pin read");
+    let mut pin = steward::GraftPin::from_yaml_bytes(&pin_bytes).expect("parse pin");
+    pin.mount_path = "/wrong/path".to_string();
+    let wrong_yaml = pin.to_yaml().expect("serialize wrong pin");
+    pond.write_transaction(
+        &PondUserMetadata::new(vec!["test".to_string(), "wrong-pin".to_string()]),
+        async |fs| {
+            let root = fs.root().await?;
+            root.open_dir_path(steward::SYS_GRAFTS_DIR)
+                .await?
+                .remove_entry("upstream")
+                .await?;
+            let mut writer = root
+                .async_writer_path_with_type(&pin_path, EntryType::FilePhysicalVersion)
+                .await?;
+            writer.write_all(wrong_yaml.as_bytes()).await?;
+            writer.shutdown().await?;
+            Ok(())
+        },
+    )
+    .await
+    .expect("write mismatched pin");
+    let version_before = pond.data_persistence().table().version();
+    drop(ship);
+
+    pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect("repair mismatched pin");
+    let mut ship = ctx.open_pond().await.expect("reopen consumer");
+    let pond = ship.as_pond_mut().expect("pond steward");
+    assert_eq!(
+        pond.data_persistence().table().version(),
+        version_before.map(|version| version + 1),
+        "pin identity mismatch must bypass the matching-tip shortcut"
+    );
+    let tx = pond
+        .begin_read(&PondUserMetadata::new(vec![
+            "test".to_string(),
+            "verify-pin".to_string(),
+        ]))
+        .await
+        .expect("begin pin verification");
+    let pin_bytes = tx
+        .root()
+        .await
+        .expect("root")
+        .read_file_path_to_vec(&pin_path)
+        .await
+        .expect("read repaired pin");
+    let _ = tx.commit().await.expect("close pin verification");
+    let pin = steward::GraftPin::from_yaml_bytes(&pin_bytes).expect("parse repaired pin");
+    assert_eq!(pin.mount_path, "/sources/upstream");
+}
+
+#[tokio::test]
+async fn rebuild_graft_command_runs_end_to_end() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let url = publish_upstream(&tmp, "rebuild-graft-command").await;
+    let pond = tmp.path().join("consumer-rebuild-graft");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&url, false, false))
+        .await
+        .expect("attach pull remote");
+    pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect("initial pull");
+
+    let ship = ctx.open_pond().await.expect("open consumer");
+    let version_before = ship
+        .as_pond()
+        .expect("pond steward")
+        .data_persistence()
+        .table()
+        .version();
+    let watermark_before = ship
+        .control_table()
+        .raw_config_get(&format!("last_pulled_tip:{url}"))
+        .await
+        .expect("read watermark");
+    drop(ship);
+
+    pull_command_with_rebuild(&ctx, Some("upstream".to_string()), true)
+        .await
+        .expect("explicit graft rebuild");
+    let ship = ctx.open_pond().await.expect("reopen consumer");
+    assert_eq!(
+        ship.as_pond()
+            .expect("pond steward")
+            .data_persistence()
+            .table()
+            .version(),
+        version_before.map(|version| version + 1),
+        "scoped replacement must land as one data commit"
+    );
+    assert_eq!(
+        ship.control_table()
+            .raw_config_get(&format!("last_pulled_tip:{url}"))
+            .await
+            .expect("read watermark"),
+        watermark_before
+    );
+
+    let err = pull_command_with_rebuild(&ctx, None, true)
+        .await
+        .expect_err("rebuild requires one named graft");
+    assert!(format!("{err:#}").contains("requires one remote name"));
+
+    let mirror_url = sync_store::testing::in_memory_remote_url("rebuild-graft-mirror");
+    apply_yaml(
+        &ctx,
+        tmp.path(),
+        &format!(
+            "version: v1\nkind: backup\nmetadata:\n  path: /sys/remotes/mirror\nspec:\n  url: {mirror_url}\n"
+        ),
+    )
+    .await
+    .expect("attach local mirror backup");
+    push_command(&ctx, Some("mirror".to_string()))
+        .await
+        .expect("publish local mirror");
+    let err = pull_command_with_rebuild(&ctx, Some("mirror".to_string()), true)
+        .await
+        .expect_err("rebuild-graft must reject a root mirror");
+    assert!(format!("{err:#}").contains("only replaces a non-root graft"));
+}
+
+#[tokio::test]
+async fn out_of_order_remote_tip_cannot_roll_back_a_graft() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let (producer, url, _second) = publish_equivalent_remotes(&tmp, "tip-regression").await;
+    let remote = sync_store::ContentRemote::open_at_url(&url, HashMap::new())
+        .await
+        .expect("open remote");
+    let old_tip = remote
+        .get_tip("main")
+        .await
+        .expect("read old tip")
+        .expect("old tip");
+
+    let pond = tmp.path().join("consumer-tip-regression");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&url, false, false))
+        .await
+        .expect("attach pull remote");
+    pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect("pull old tip");
+
+    write_small_file(&producer, "/later.txt", b"newer")
+        .await
+        .expect("advance producer");
+    push_command(&producer, None)
+        .await
+        .expect("publish newer tip");
+    pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect("pull newer tip");
+
+    let mut ship = ctx.open_pond().await.expect("open advanced consumer");
+    let key = format!("last_pulled_tip:{url}");
+    let new_tip = ship
+        .control_table()
+        .raw_config_get(&key)
+        .await
+        .expect("read newer watermark")
+        .expect("newer watermark");
+    assert_ne!(new_tip, old_tip.to_hex());
+    let version = ship
+        .as_pond()
+        .expect("pond steward")
+        .data_persistence()
+        .table()
+        .version();
+    ship.control_table_mut()
+        .raw_config_set(&key, &old_tip.to_hex())
+        .await
+        .expect("simulate stale trailing watermark");
+    drop(ship);
+
+    let mut remote = sync_store::ContentRemote::open_at_url(&url, HashMap::new())
+        .await
+        .expect("reopen current remote");
+    let _ = remote
+        .push_commit(&[], "main", old_tip)
+        .await
+        .expect("publish stale ref view");
+    let err = pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect_err("older remote tip must be rejected");
+    assert!(format!("{err:#}").contains("refusing non-fast-forward pull"));
+
+    let ship = ctx.open_pond().await.expect("reopen consumer");
+    assert_eq!(
+        ship.as_pond()
+            .expect("pond steward")
+            .data_persistence()
+            .table()
+            .version(),
+        version
+    );
+    assert_eq!(
+        ship.control_table()
+            .raw_config_get(&key)
+            .await
+            .expect("read preserved watermark"),
+        Some(old_tip.to_hex())
     );
 }
 

@@ -436,7 +436,7 @@ impl Ship {
             Err(e) => {
                 let error_msg = format!("{}", e);
                 debug!("Transaction failed: {error_msg}");
-                Err(e)
+                Err(tx.abort_preserving(e).await)
             }
         }
     }
@@ -486,10 +486,9 @@ impl Ship {
                 Ok(value)
             }
             Err(e) => {
-                // Error - steward transaction guard will auto-rollback on drop
                 let error_msg = format!("{}", e);
                 debug!("Transaction replay failed {error_msg}");
-                Err(e)
+                Err(tx.abort_preserving(e).await)
             }
         }
     }
@@ -611,35 +610,47 @@ impl Ship {
             None
         };
 
-        // Lock acquired — now commit the sequence advance.
-        if is_write {
-            self.last_write_seq = txn_seq;
-        }
-
         // Record transaction begin in control table — writes only.
         // Reads no longer leave audit rows; the per-read Delta write
         // was pure overhead now that exclusion is enforced by the lock.
         if is_write {
-            self.control_table
+            if let Err(error) = self
+                .control_table
                 .record_begin(&txn_meta, based_on_seq, transaction_type)
                 .await
-                .map_err(|e| {
-                    StewardError::ControlTable(format!("Failed to record transaction begin: {}", e))
-                })?;
+            {
+                return Err(StewardError::ControlTable(format!(
+                    "Failed to record transaction begin: {error}"
+                )));
+            }
         }
 
         // Begin Data FS transaction guard with metadata
-        let data_tx = if is_write {
-            self.data_persistence
-                .begin_write(&txn_meta)
-                .await
-                .map_err(StewardError::DataInit)?
+        let data_tx_result = if is_write {
+            self.data_persistence.begin_write(&txn_meta).await
         } else {
-            self.data_persistence
-                .begin_read(&txn_meta)
-                .await
-                .map_err(StewardError::DataInit)?
+            self.data_persistence.begin_read(&txn_meta).await
         };
+        let data_tx = match data_tx_result {
+            Ok(data_tx) => data_tx,
+            Err(error) => {
+                if is_write {
+                    if let Err(record_error) = self
+                        .control_table
+                        .record_failed(&txn_meta, transaction_type, error.to_string(), 0)
+                        .await
+                    {
+                        log::error!(
+                            "Failed to record data transaction begin failure: {record_error}"
+                        );
+                    }
+                }
+                return Err(StewardError::DataInit(error));
+            }
+        };
+        if is_write {
+            self.last_write_seq = txn_seq;
+        }
 
         // Limiter usage queued by an earlier push rides out on this write
         // (Decision L12).  Spending happens during the post-commit push, which
@@ -659,6 +670,7 @@ impl Ship {
             &txn_meta,
             transaction_type,
             &mut self.control_table,
+            &mut self.last_write_seq,
             &self.pond_path,
             write_lock,
         );
@@ -716,9 +728,6 @@ impl Ship {
             )));
         }
 
-        // Update last_write_seq to this sequence
-        self.last_write_seq = txn_seq;
-
         debug!("Transaction replay {txn_id:?} using sequence {txn_seq} (type=write, replay=true)",);
 
         // Acquire process-level write lock (same exclusion contract as
@@ -742,11 +751,22 @@ impl Ship {
         // Begin Data FS transaction guard with metadata
 
         // For now, we still need to begin a transaction to get State access
-        let data_tx = self
-            .data_persistence
-            .begin_write(txn_meta)
-            .await
-            .map_err(StewardError::DataInit)?;
+        let data_tx = match self.data_persistence.begin_write(txn_meta).await {
+            Ok(data_tx) => data_tx,
+            Err(error) => {
+                if let Err(record_error) = self
+                    .control_table
+                    .record_failed(txn_meta, TransactionType::Write, error.to_string(), 0)
+                    .await
+                {
+                    log::error!(
+                        "Failed to record replay data transaction begin failure: {record_error}"
+                    );
+                }
+                return Err(StewardError::DataInit(error));
+            }
+        };
+        self.last_write_seq = txn_seq;
 
         // Create steward transaction guard with sequence tracking
         Ok(StewardTransactionGuard::new(
@@ -754,6 +774,7 @@ impl Ship {
             txn_meta,
             TransactionType::Write,
             &mut self.control_table,
+            &mut self.last_write_seq,
             self.pond_path.clone(),
             Some(write_lock),
         ))

@@ -92,6 +92,17 @@ impl Directory for OpLogDirectory {
         Ok(Some(child_node))
     }
 
+    async fn entry(&self, name: &str) -> tinyfs::Result<Option<tinyfs::DirectoryEntry>> {
+        self.state
+            .ensure_directory_loaded(self.id)
+            .await
+            .map_other_context("Failed to load directory")?;
+        self.state
+            .get_directory_entry(self.id, name)
+            .await
+            .map_other_context("Failed to get directory entry")
+    }
+
     async fn insert(&mut self, name: String, node: Node) -> tinyfs::Result<()> {
         debug!("OpLogDirectory::insert('{name}', {:?})", node.id());
 
@@ -161,6 +172,19 @@ impl Directory for OpLogDirectory {
             }
             None => Ok(None),
         }
+    }
+
+    async fn unlink(&mut self, name: &str) -> tinyfs::Result<bool> {
+        self.state
+            .ensure_directory_loaded(self.id)
+            .await
+            .map_other_context("Failed to load directory")?;
+        Ok(self
+            .state
+            .remove_directory_entry(self.id, name)
+            .await
+            .map_other_context("Failed to remove directory entry")?
+            .is_some())
     }
 
     async fn entries(

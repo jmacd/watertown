@@ -274,6 +274,9 @@ enum Commands {
     Pull {
         /// Remote name.  Omit to pull every remote in `pull` or `both` mode.
         name: Option<String>,
+        /// Atomically replace this remote's graft partition, mount, and pin.
+        #[arg(long, requires = "name")]
+        rebuild_graft: bool,
     },
     /// Restore a whole pond from a backup published to a remote.
     ///
@@ -610,7 +613,10 @@ async fn main() -> Result<()> {
             commands::control_command(&ship_context, control_mode).await
         }
         Commands::Push { name } => commands::push_command(&ship_context, name).await,
-        Commands::Pull { name } => commands::pull_command(&ship_context, name).await,
+        Commands::Pull {
+            name,
+            rebuild_graft,
+        } => commands::pull_command_with_rebuild(&ship_context, name, rebuild_graft).await,
         Commands::Restore { name, url, options } => {
             commands::restore_command(
                 &ship_context,
