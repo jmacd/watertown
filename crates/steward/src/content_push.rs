@@ -155,42 +155,17 @@ async fn push_content_inner(
     remote: &mut ContentRemote,
     ref_name: &str,
 ) -> Result<ContentPushOutcome, StewardError> {
-    let seq = ship
-        .control_table()
-        .latest_spine_seq()
-        .await?
-        .ok_or_else(|| {
-            StewardError::Content("no content-changing commit to push (empty pond)".to_string())
-        })?;
-
-    let commit_hash_hex = ship
-        .control_table()
-        .commit_hash_at(seq)
-        .await?
-        .ok_or_else(|| {
-            StewardError::Content(format!("no commit spine recorded at write seq {seq}"))
-        })?;
-    let commit_object_hex = ship
-        .control_table()
-        .commit_object_at(seq)
-        .await?
-        .ok_or_else(|| {
-            StewardError::Content(format!("no commit object recorded at write seq {seq}"))
-        })?;
-
-    let tip = ObjectHash::from_hex(&commit_hash_hex)
-        .map_err(|e| StewardError::Content(format!("invalid commit hash: {e}")))?;
-    let commit_bytes = hex::decode(&commit_object_hex)
-        .map_err(|e| StewardError::Content(format!("invalid commit object hex: {e}")))?;
-
-    let recomputed = ObjectHash::of_bytes(&commit_bytes);
-    if recomputed != tip {
-        return Err(StewardError::Content(format!(
-            "commit object hashes to {} but the spine records tip {}",
-            recomputed.to_hex(),
-            tip.to_hex()
-        )));
-    }
+    let commit_log = crate::content_tree::read_log_leaves(
+        ship.data_persistence().table().clone(),
+        &ship.control_table().pond_id_uuid().to_string(),
+    )
+    .await?;
+    let commit_bytes = commit_log.last().cloned().ok_or_else(|| {
+        StewardError::Content("no content-changing commit to push (empty pond)".to_string())
+    })?;
+    let tip = sync_store::content::Commit::decode(&commit_bytes)
+        .map_err(|e| StewardError::Content(format!("decode commit-log tip: {e}")))?
+        .hash();
 
     let materialized = materialize_content_objects(ship).await?;
 
@@ -256,7 +231,17 @@ async fn push_content_inner(
         )));
     }
     objects.push((manifest_hash, manifest_bytes));
-    objects.push((tip, commit_bytes));
+    for bytes in commit_log {
+        let commit = sync_store::content::Commit::decode(&bytes)
+            .map_err(|e| StewardError::Content(format!("decode commit-log leaf: {e}")))?;
+        let hash = commit.hash();
+        objects.push((hash, bytes));
+    }
+    if !objects.iter().any(|(hash, _)| *hash == tip) {
+        return Err(StewardError::Content(
+            "commit-log does not contain the advertised tip".to_string(),
+        ));
+    }
 
     // The batched commit is one call carrying every inline object; what it
     // costs is whatever the resulting Delta transaction actually performs.

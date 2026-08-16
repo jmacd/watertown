@@ -347,36 +347,6 @@ pub(crate) fn node_manifest_entries(index: &ContentTreeIndex) -> Vec<ManifestEnt
     entries
 }
 
-/// Compute the node-manifest commitments a commit references: the node
-/// manifest object's content hash (`node_manifest_hash`) and the node-keyed
-/// Merkle root over that manifest (`node_manifest_root`).  Both come from a
-/// single fold of the data table, so they are mutually consistent.
-///
-/// # Errors
-///
-/// Returns an error if the data table cannot be read or folded, or if the
-/// manifest cannot be encoded or hashed (a duplicate `node_id`).
-pub(crate) async fn compute_commit_roots_for_table(
-    table: deltalake::DeltaTable,
-    local_pond_id: &str,
-) -> Result<CommitRoots, StewardError> {
-    let index = build_content_tree_for_table(table, local_pond_id).await?;
-    let manifest = node_manifest_entries(&index);
-    let node_manifest_hash = manifest_hash(&manifest).map_err(StewardError::Content)?;
-    let node_manifest_root = node_merkle_rebuild_root(&manifest).map_err(StewardError::Content)?;
-    Ok(CommitRoots {
-        node_manifest_hash,
-        node_manifest_root,
-    })
-}
-
-/// The node-manifest commitments a commit object references, recomputed from a
-/// pond's live state (used by the pull path to verify a rebuilt mirror).
-pub(crate) struct CommitRoots {
-    pub node_manifest_hash: ObjectHash,
-    pub node_manifest_root: ObjectHash,
-}
-
 /// Build the full node-manifest bytes for the current in-transaction live state
 /// (design `docs/incremental-content-tree-design.md` Section 4, Approach A /
 /// Phase 2).
@@ -412,32 +382,60 @@ pub(crate) struct SpineInputs {
     pub node_manifest_root: ObjectHash,
 }
 
-pub(crate) async fn in_txn_spine_inputs(
+/// Canonical full-fold view of one pond partition, including the state needed
+/// to explain a root mismatch at node and series-version granularity.
+pub(crate) struct FoldedContentState {
+    pub manifest: Vec<ManifestEntry>,
+    pub series_versions: HashMap<String, Vec<ObjectHash>>,
+    pub root_tree_hash: ObjectHash,
+    pub node_manifest_hash: ObjectHash,
+    pub node_manifest_root: ObjectHash,
+}
+
+pub(crate) async fn in_txn_content_state(
     committed_table: deltalake::DeltaTable,
     uncommitted: Vec<OplogEntry>,
-    local_pond_id: &str,
-) -> Result<SpineInputs, StewardError> {
+    pond_id: &str,
+) -> Result<FoldedContentState, StewardError> {
     let mut rows = scan_live_rows(committed_table, false).await?;
     rows.extend(uncommitted);
-    // fold_rows takes the latest version per node from ascending-version order;
-    // pending and synthesized rows carry higher (or `i64::MAX`) versions, so
-    // ordering by version per node makes them win over their committed rows.
     rows.sort_by(|a, b| {
         a.pond_id
             .cmp(&b.pond_id)
             .then_with(|| a.node_id.to_string().cmp(&b.node_id.to_string()))
             .then_with(|| a.version.cmp(&b.version))
     });
-    let index = fold_rows(rows, local_pond_id, None)?;
+    let index = fold_rows(rows, pond_id, None)?;
     let manifest = node_manifest_entries(&index);
     let node_manifest_hash = manifest_hash(&manifest).map_err(StewardError::Content)?;
     let node_manifest_root = node_merkle_rebuild_root(&manifest).map_err(StewardError::Content)?;
-    let manifest_bytes = encode_manifest(&manifest).map_err(StewardError::Content)?;
-    Ok(SpineInputs {
-        manifest_bytes,
+    let series_versions = index
+        .series_versions
+        .iter()
+        .filter(|((row_pond_id, _), _)| row_pond_id == pond_id)
+        .map(|((_, node_id), versions)| (node_id.clone(), versions.clone()))
+        .collect();
+    Ok(FoldedContentState {
+        manifest,
+        series_versions,
         root_tree_hash: index.root_tree_hash,
         node_manifest_hash,
         node_manifest_root,
+    })
+}
+
+pub(crate) async fn in_txn_spine_inputs(
+    committed_table: deltalake::DeltaTable,
+    uncommitted: Vec<OplogEntry>,
+    local_pond_id: &str,
+) -> Result<SpineInputs, StewardError> {
+    let state = in_txn_content_state(committed_table, uncommitted, local_pond_id).await?;
+    let manifest_bytes = encode_manifest(&state.manifest).map_err(StewardError::Content)?;
+    Ok(SpineInputs {
+        manifest_bytes,
+        root_tree_hash: state.root_tree_hash,
+        node_manifest_hash: state.node_manifest_hash,
+        node_manifest_root: state.node_manifest_root,
     })
 }
 

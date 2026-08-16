@@ -551,6 +551,9 @@ pond pull
 
 # Pull only the named remote
 pond pull upstream
+
+# Discard and atomically rebuild only this named cross-pond graft
+pond pull upstream --rebuild-graft
 ```
 
 > **Cross-pond pull bootstrap (D5.7b.2):** when a pull-mode remote
@@ -561,6 +564,16 @@ pond pull upstream
 > (`PATH = /`, same `store_id`) require a pond that already carries the
 > source `pond_id`; use **`pond restore`** (below) to bootstrap one from
 > a blank machine.
+
+`--rebuild-graft` is an explicit recovery operation for a non-root graft. It
+replaces only that foreign pond partition, validates the replacement before
+commit, and commits the mount and graft pin in the same transaction. It refuses
+to unlink local content or a different pond's graft at the configured path.
+
+Ordinary pulls are fast-forward only: a differing remote tip must descend from
+the recorded `last_pulled_tip`. A stale or out-of-order remote ref is rejected
+rather than rolling a mirror or graft backward. Use `--rebuild-graft` for an
+intentional cross-pond replacement.
 
 ---
 

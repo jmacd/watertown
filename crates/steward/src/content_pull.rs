@@ -510,43 +510,19 @@ pub async fn rebuild_pond(
     let (ops, outcome) = plan_node_diff(graph, root, &target_nodes, &target_series)?;
 
     let root_node_id = src_root_id(graph)?.to_string();
-    target
-        .write_transaction(
-            &PondUserMetadata::new(vec!["pull".to_string()]),
-            async move |fs| {
-                let root_wd = fs.root().await?;
-                apply_ops(&root_node_id, root_wd, &ops, remote).await?;
-                Ok(())
-            },
-        )
+    let mut tx = target
+        .begin_write(&PondUserMetadata::new(vec!["pull".to_string()]))
         .await?;
-
-    let report = crate::compute_content_tree(target).await?;
-    if report.root_tree_hash != root {
-        return Err(StewardError::Content(format!(
-            "rebuilt pond folds to {} but the tip root tree is {}",
-            report.root_tree_hash.to_hex(),
-            root.to_hex()
-        )));
+    tx.expect_content_roots(root, tip_manifest_hash, tip_manifest_root);
+    let apply_result = async {
+        let root_wd = tx.root().await?;
+        apply_ops(&root_node_id, root_wd, &ops, remote).await
     }
-
-    let pond_id = target.data_persistence().pond_id().to_string();
-    let table = target.data_persistence().table().clone();
-    let roots = crate::content_tree::compute_commit_roots_for_table(table, &pond_id).await?;
-    if roots.node_manifest_hash != tip_manifest_hash {
-        return Err(StewardError::Content(format!(
-            "rebuilt node manifest hashes to {} but the tip commit's manifest is {}",
-            roots.node_manifest_hash.to_hex(),
-            tip_manifest_hash.to_hex()
-        )));
+    .await;
+    if let Err(error) = apply_result {
+        return Err(tx.abort_preserving(error).await);
     }
-    if roots.node_manifest_root != tip_manifest_root {
-        return Err(StewardError::Content(format!(
-            "rebuilt node manifest Merkle root is {} but the tip commit's root is {}",
-            roots.node_manifest_root.to_hex(),
-            tip_manifest_root.to_hex()
-        )));
-    }
+    _ = tx.commit().await?;
 
     Ok(outcome)
 }
@@ -569,6 +545,81 @@ pub async fn import_pond(
     remote: &dyn ContentSource,
     graph: &FetchedGraph,
     foreign_pond_id: uuid7::Uuid,
+) -> Result<RebuildOutcome, StewardError> {
+    import_pond_inner(target, remote, graph, foreign_pond_id, None, false).await
+}
+
+/// Atomically import a foreign pond, materialize its local mount, and pin the
+/// imported tip. A failed import cannot leave either the foreign rows or the
+/// local graft metadata partially committed.
+pub async fn import_graft(
+    target: &mut Ship,
+    remote: &dyn ContentSource,
+    graph: &FetchedGraph,
+    foreign_pond_id: uuid7::Uuid,
+    name: &str,
+    mount_path: &str,
+) -> Result<RebuildOutcome, StewardError> {
+    let graft = prepare_graft(graph, foreign_pond_id, name, mount_path)?;
+    import_pond_inner(target, remote, graph, foreign_pond_id, Some(graft), false).await
+}
+
+/// Atomically discard and recreate one foreign pond partition together with
+/// its mount and pin. Local content and other foreign partitions are untouched.
+pub async fn replace_graft(
+    target: &mut Ship,
+    remote: &dyn ContentSource,
+    graph: &FetchedGraph,
+    foreign_pond_id: uuid7::Uuid,
+    name: &str,
+    mount_path: &str,
+) -> Result<RebuildOutcome, StewardError> {
+    let graft = prepare_graft(graph, foreign_pond_id, name, mount_path)?;
+    import_pond_inner(target, remote, graph, foreign_pond_id, Some(graft), true).await
+}
+
+fn prepare_graft(
+    graph: &FetchedGraph,
+    foreign_pond_id: uuid7::Uuid,
+    name: &str,
+    mount_path: &str,
+) -> Result<PreparedGraft, StewardError> {
+    let pinned_tip = graph
+        .tip
+        .ok_or_else(|| StewardError::Content("cannot graft a graph with no tip".to_string()))?;
+    let pin = crate::GraftPin {
+        foreign_pond_id: foreign_pond_id.to_string(),
+        mount_path: mount_path.to_string(),
+        pinned_tip: pinned_tip.to_hex(),
+    };
+    let pin_yaml = pin
+        .to_yaml()
+        .map_err(|error| StewardError::Content(format!("serialize graft pin: {error}")))?;
+    let (parent, leaf) = crate::split_mount_path(mount_path).map_err(StewardError::Content)?;
+    Ok(PreparedGraft {
+        parent: parent.to_string(),
+        leaf: leaf.to_string(),
+        pin_path: crate::GraftPin::pin_path(name),
+        pin_name: name.to_string(),
+        pin_yaml,
+    })
+}
+
+struct PreparedGraft {
+    parent: String,
+    leaf: String,
+    pin_path: String,
+    pin_name: String,
+    pin_yaml: String,
+}
+
+async fn import_pond_inner(
+    target: &mut Ship,
+    remote: &dyn ContentSource,
+    graph: &FetchedGraph,
+    foreign_pond_id: uuid7::Uuid,
+    graft: Option<PreparedGraft>,
+    replace: bool,
 ) -> Result<RebuildOutcome, StewardError> {
     let root = graph
         .root_tree_hash()
@@ -597,55 +648,114 @@ pub async fn import_pond(
     // before any mutation (see verify_manifest_matches_tree).
     verify_manifest_matches_tree(graph)?;
 
-    let (ops, outcome) = plan_node_diff(graph, root, &target_nodes, &target_series)?;
+    let (ops, outcome) = if replace {
+        plan_full_replacement(graph, root, &target_nodes)?
+    } else {
+        plan_node_diff(graph, root, &target_nodes, &target_series)?
+    };
 
     let root_node_id = src_root_id(graph)?.to_string();
     let first_import = target_nodes.is_empty();
-    target
-        .write_transaction(
-            &PondUserMetadata::new(vec!["pull".to_string(), "import".to_string()]),
-            async move |fs| {
-                if first_import {
-                    fs.initialize_foreign_root(foreign_pond_id).await?;
-                }
-                let foreign_node = fs.foreign_root_node(foreign_pond_id).await?;
-                let foreign_np = tinyfs::NodePath {
-                    node: foreign_node,
-                    path: "/".into(),
-                };
-                let root_wd = fs.wd(&foreign_np, foreign_np.clone()).await?;
-                apply_ops(&root_node_id, root_wd, &ops, remote).await?;
-                Ok(())
-            },
-        )
+    let tx = target
+        .begin_write(&PondUserMetadata::new(vec![
+            "pull".to_string(),
+            "import".to_string(),
+        ]))
         .await?;
+    let apply_result = async {
+        if first_import {
+            tx.initialize_foreign_root(foreign_pond_id).await?;
+        }
+        let foreign_node = tx.foreign_root_node(foreign_pond_id).await?;
+        let foreign_np = tinyfs::NodePath {
+            node: foreign_node,
+            path: "/".into(),
+        };
+        let root_wd = tx.wd(&foreign_np, foreign_np.clone()).await?;
+        if let Some(graft) = &graft {
+            use tinyfs::EntryType;
 
-    let table = target.data_persistence().table().clone();
-    let report =
-        crate::content_tree::compute_content_tree_for_table(table.clone(), &foreign_id).await?;
-    if report.root_tree_hash != root {
-        return Err(StewardError::Content(format!(
-            "imported foreign tree folds to {} but the tip root tree is {}",
-            report.root_tree_hash.to_hex(),
-            root.to_hex()
-        )));
-    }
+            let root = tx.root().await?;
+            let _ = root.create_dir_all(&graft.parent).await?;
+            let parent_wd = root.open_dir_path(&graft.parent).await?;
+            let foreign_node = tx.foreign_root_node(foreign_pond_id).await?;
+            if let Some(existing) = parent_wd.entry(&graft.leaf).await? {
+                let existing_pond = existing.pond_id.as_deref().ok_or_else(|| {
+                    StewardError::Aborted(format!(
+                        "mount path `{}/{}` contains local content; refusing scoped graft replacement",
+                        graft.parent, graft.leaf
+                    ))
+                })?;
+                if existing_pond != foreign_id {
+                    return Err(StewardError::Aborted(format!(
+                        "mount path `{}/{}` belongs to pond {}; refusing to replace graft {}",
+                        graft.parent, graft.leaf, existing_pond, foreign_id
+                    )));
+                }
+                if replace {
+                    parent_wd.remove_entry(&graft.leaf).await?;
+                    let _ = parent_wd.insert_node(&graft.leaf, foreign_node).await?;
+                } else if existing.child_node_id != foreign_node.id().node_id() {
+                    return Err(StewardError::Aborted(format!(
+                        "mount path `{}/{}` points to foreign node {} instead of root {}",
+                        graft.parent,
+                        graft.leaf,
+                        existing.child_node_id,
+                        foreign_node.id().node_id()
+                    )));
+                }
+            } else {
+                let _ = parent_wd.insert_node(&graft.leaf, foreign_node).await?;
+            }
 
-    let roots = crate::content_tree::compute_commit_roots_for_table(table, &foreign_id).await?;
-    if roots.node_manifest_hash != tip_manifest_hash {
-        return Err(StewardError::Content(format!(
-            "imported node manifest hashes to {} but the tip commit's manifest is {}",
-            roots.node_manifest_hash.to_hex(),
-            tip_manifest_hash.to_hex()
-        )));
+            let _ = root.create_dir_all(crate::SYS_DIR).await?;
+            let _ = root.create_dir_all(crate::SYS_GRAFTS_DIR).await?;
+            let pin_is_current = if root.exists(&graft.pin_path).await {
+                root.read_file_path_to_vec(&graft.pin_path).await? == graft.pin_yaml.as_bytes()
+            } else {
+                false
+            };
+            if !pin_is_current && root.exists(&graft.pin_path).await {
+                let grafts_dir = root.open_dir_path(crate::SYS_GRAFTS_DIR).await?;
+                grafts_dir.remove_entry(&graft.pin_name).await?;
+            }
+            if !pin_is_current {
+                let mut writer = root
+                    .async_writer_path_with_type(
+                        &graft.pin_path,
+                        EntryType::FilePhysicalVersion,
+                    )
+                    .await?;
+                writer.write_all(graft.pin_yaml.as_bytes()).await?;
+                writer.shutdown().await?;
+            }
+        }
+        apply_ops(&root_node_id, root_wd, &ops, remote).await?;
+        let uncommitted = tx.state()?.uncommitted_live_rows().await?;
+        let committed_table = tx.data_persistence()?.table().clone();
+        crate::content_tree::in_txn_content_state(committed_table, uncommitted, &foreign_id).await
     }
-    if roots.node_manifest_root != tip_manifest_root {
-        return Err(StewardError::Content(format!(
-            "imported node manifest Merkle root is {} but the tip commit's root is {}",
-            roots.node_manifest_root.to_hex(),
-            tip_manifest_root.to_hex()
-        )));
+    .await;
+    let preview = match apply_result {
+        Ok(preview) => preview,
+        Err(error) => return Err(tx.abort_preserving(error).await),
+    };
+    let validation = preview_validation_error(
+        graph,
+        &preview,
+        root,
+        tip_manifest_hash,
+        tip_manifest_root,
+        "imported foreign tree",
+    );
+    let validation = match validation {
+        Ok(validation) => validation,
+        Err(error) => return Err(tx.abort_preserving(error).await),
+    };
+    if let Some(error) = validation {
+        return Err(tx.abort(error).await);
     }
+    _ = tx.commit().await?;
 
     // Advance only the foreign pond's seq frontier so the local allocator stays
     // contiguous; the highest source seq is the foreign tip's commit seq.
@@ -668,6 +778,210 @@ fn src_root_id(graph: &FetchedGraph) -> Result<&str, StewardError> {
         .find(|e| e.parent_node_id.is_empty() && e.name.is_empty())
         .map(|e| e.node_id.as_str())
         .ok_or_else(|| StewardError::Content("manifest has no root entry".to_string()))
+}
+
+fn first_replica_divergence(
+    graph: &FetchedGraph,
+    actual_nodes: &HashMap<String, ManifestEntry>,
+    actual_series: &HashMap<String, Vec<ObjectHash>>,
+) -> Result<Option<String>, StewardError> {
+    let mut expected_nodes: BTreeMap<&str, &ManifestEntry> = BTreeMap::new();
+    for entry in &graph.manifest {
+        if expected_nodes
+            .insert(entry.node_id.as_str(), entry)
+            .is_some()
+        {
+            return Ok(Some(format!(
+                "source manifest contains duplicate node {}",
+                entry.node_id
+            )));
+        }
+    }
+    let actual_nodes_sorted: BTreeMap<&str, &ManifestEntry> = actual_nodes
+        .values()
+        .map(|entry| (entry.node_id.as_str(), entry))
+        .collect();
+
+    for node_id in expected_nodes
+        .keys()
+        .chain(actual_nodes_sorted.keys())
+        .copied()
+        .collect::<BTreeSet<_>>()
+    {
+        let Some(expected) = expected_nodes.get(node_id) else {
+            let actual = actual_nodes_sorted[node_id];
+            return Ok(Some(format!(
+                "unexpected node {node_id} ({:?} {:?})",
+                actual.entry_type, actual.name
+            )));
+        };
+        let Some(actual) = actual_nodes_sorted.get(node_id) else {
+            return Ok(Some(format!(
+                "missing node {node_id} ({:?} {:?})",
+                expected.entry_type, expected.name
+            )));
+        };
+        if expected.parent_node_id != actual.parent_node_id {
+            return Ok(Some(format!(
+                "node {node_id} parent differs: expected {:?}, actual {:?}",
+                expected.parent_node_id, actual.parent_node_id
+            )));
+        }
+        if expected.name != actual.name {
+            return Ok(Some(format!(
+                "node {node_id} name differs: expected {:?}, actual {:?}",
+                expected.name, actual.name
+            )));
+        }
+        if expected.entry_type != actual.entry_type {
+            return Ok(Some(format!(
+                "node {node_id} type differs: expected {:?}, actual {:?}",
+                expected.entry_type, actual.entry_type
+            )));
+        }
+    }
+
+    for (node_id, expected) in &expected_nodes {
+        let actual = actual_nodes_sorted[node_id];
+        if matches!(
+            expected.entry_type,
+            EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries
+        ) {
+            let expected_versions = series_versions(graph, expected.child_hash)?;
+            let actual_versions = actual_series
+                .get(*node_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let compared = expected_versions.len().min(actual_versions.len());
+            for index in 0..compared {
+                if expected_versions[index] != actual_versions[index] {
+                    return Ok(Some(format!(
+                        "series node {node_id} ({:?}) blob {index} differs: expected {}, actual {}",
+                        expected.name,
+                        expected_versions[index].to_hex(),
+                        actual_versions[index].to_hex()
+                    )));
+                }
+            }
+            if expected_versions.len() != actual_versions.len() {
+                return Ok(Some(format!(
+                    "series node {node_id} ({:?}) blob count differs: expected {}, actual {}",
+                    expected.name,
+                    expected_versions.len(),
+                    actual_versions.len()
+                )));
+            }
+        } else if expected.entry_type != EntryType::DirectoryPhysical
+            && expected.child_hash != actual.child_hash
+        {
+            return Ok(Some(format!(
+                "node {node_id} ({:?}) content hash differs: expected {}, actual {}",
+                expected.name,
+                expected.child_hash.to_hex(),
+                actual.child_hash.to_hex()
+            )));
+        }
+
+        let compared = expected.versions.len().min(actual.versions.len());
+        for index in 0..compared {
+            let expected_meta = &expected.versions[index];
+            let actual_meta = &actual.versions[index];
+            if expected_meta.timestamp != actual_meta.timestamp {
+                return Ok(Some(format!(
+                    "node {node_id} ({:?}) version {index} timestamp differs: expected {:?}, actual {:?}",
+                    expected.name, expected_meta.timestamp, actual_meta.timestamp
+                )));
+            }
+            if expected_meta.min_event_time != actual_meta.min_event_time {
+                return Ok(Some(format!(
+                    "node {node_id} ({:?}) version {index} min_event_time differs: expected {:?}, actual {:?}",
+                    expected.name, expected_meta.min_event_time, actual_meta.min_event_time
+                )));
+            }
+            if expected_meta.max_event_time != actual_meta.max_event_time {
+                return Ok(Some(format!(
+                    "node {node_id} ({:?}) version {index} max_event_time differs: expected {:?}, actual {:?}",
+                    expected.name, expected_meta.max_event_time, actual_meta.max_event_time
+                )));
+            }
+            if expected_meta.extended_attributes != actual_meta.extended_attributes {
+                return Ok(Some(format!(
+                    "node {node_id} ({:?}) version {index} extended_attributes differ: expected {:?}, actual {:?}",
+                    expected.name,
+                    expected_meta.extended_attributes,
+                    actual_meta.extended_attributes
+                )));
+            }
+        }
+        if expected.versions.len() != actual.versions.len() {
+            return Ok(Some(format!(
+                "node {node_id} ({:?}) metadata count differs: expected {}, actual {}",
+                expected.name,
+                expected.versions.len(),
+                actual.versions.len()
+            )));
+        }
+    }
+
+    for (node_id, expected) in expected_nodes {
+        let actual = actual_nodes_sorted[node_id];
+        if expected.child_hash != actual.child_hash {
+            return Ok(Some(format!(
+                "directory node {node_id} ({:?}) derived hash differs: expected {}, actual {}",
+                expected.name,
+                expected.child_hash.to_hex(),
+                actual.child_hash.to_hex()
+            )));
+        }
+    }
+
+    Ok(None)
+}
+
+fn preview_validation_error(
+    graph: &FetchedGraph,
+    preview: &crate::content_tree::FoldedContentState,
+    expected_root: ObjectHash,
+    expected_manifest_hash: ObjectHash,
+    expected_manifest_root: ObjectHash,
+    label: &str,
+) -> Result<Option<String>, StewardError> {
+    let mismatch = if preview.root_tree_hash != expected_root {
+        Some(format!(
+            "{label} would fold to {} but the tip root tree is {}",
+            preview.root_tree_hash.to_hex(),
+            expected_root.to_hex()
+        ))
+    } else if preview.node_manifest_hash != expected_manifest_hash {
+        Some(format!(
+            "{label} node manifest would hash to {} but the tip commit's manifest is {}",
+            preview.node_manifest_hash.to_hex(),
+            expected_manifest_hash.to_hex()
+        ))
+    } else if preview.node_manifest_root != expected_manifest_root {
+        Some(format!(
+            "{label} node manifest Merkle root would be {} but the tip commit's root is {}",
+            preview.node_manifest_root.to_hex(),
+            expected_manifest_root.to_hex()
+        ))
+    } else {
+        None
+    };
+    let Some(mut mismatch) = mismatch else {
+        return Ok(None);
+    };
+
+    let actual_nodes: HashMap<String, ManifestEntry> = preview
+        .manifest
+        .iter()
+        .cloned()
+        .map(|entry| (entry.node_id.clone(), entry))
+        .collect();
+    match first_replica_divergence(graph, &actual_nodes, &preview.series_versions)? {
+        Some(detail) => mismatch.push_str(&format!("; first divergence: {detail}")),
+        None => mismatch.push_str("; manifests match field-by-field"),
+    }
+    Ok(Some(mismatch))
 }
 
 /// Verify the fetched node manifest is structurally consistent with the fetched
@@ -789,7 +1103,12 @@ struct RenameIntent {
 /// rotation) has no such rename; it is broken by first moving one node to a
 /// unique temporary name (freeing its old name so the rest of the cycle can
 /// proceed), then renaming that temporary to its final name once the name frees.
-fn emit_collision_safe_renames(parent: &str, intents: Vec<RenameIntent>, ops: &mut Vec<ApplyOp>) {
+fn emit_collision_safe_renames(
+    parent: &str,
+    intents: Vec<RenameIntent>,
+    mut reserved_names: BTreeSet<String>,
+    ops: &mut Vec<ApplyOp>,
+) {
     // Pending renames keyed by the name each currently occupies. A target `new`
     // is blocked exactly while it is still a key here (some node has not yet
     // vacated it).
@@ -836,7 +1155,14 @@ fn emit_collision_safe_renames(parent: &str, intents: Vec<RenameIntent>, ops: &m
             .cloned()
             .expect("pending is non-empty in the cycle branch");
         let intent = pending.remove(&victim).expect("victim key is present");
-        let temp = format!(".pull-rename-tmp-{}", intent.node_id);
+        let base = format!(".pull-rename-tmp-{}", intent.node_id);
+        let mut temp = base.clone();
+        let mut suffix = 0_u64;
+        while reserved_names.contains(&temp) || pending.contains_key(&temp) {
+            suffix += 1;
+            temp = format!("{base}-{suffix}");
+        }
+        let _ = reserved_names.insert(temp.clone());
         ops.push(ApplyOp::Rename {
             parent: parent.to_string(),
             old: intent.old,
@@ -855,6 +1181,29 @@ fn emit_collision_safe_renames(parent: &str, intents: Vec<RenameIntent>, ops: &m
 
 /// Diff the fetched source manifest against the target's current node state,
 /// keyed by `node_id`, producing the ordered apply plan and the create counts.
+fn plan_full_replacement(
+    graph: &FetchedGraph,
+    root: ObjectHash,
+    target_nodes: &HashMap<String, ManifestEntry>,
+) -> Result<(Vec<ApplyOp>, RebuildOutcome), StewardError> {
+    let root_id = src_root_id(graph)?;
+    let mut existing: Vec<&ManifestEntry> = target_nodes
+        .values()
+        .filter(|entry| entry.node_id != root_id)
+        .collect();
+    existing.sort_by_key(|entry| std::cmp::Reverse(target_depth(&entry.node_id, target_nodes)));
+    let mut deletes = existing
+        .into_iter()
+        .map(|entry| ApplyOp::Delete {
+            parent_path: target_path(&entry.parent_node_id, target_nodes),
+            name: entry.name.clone(),
+        })
+        .collect::<Vec<_>>();
+    let (mut creates, outcome) = plan_node_diff(graph, root, &HashMap::new(), &HashMap::new())?;
+    deletes.append(&mut creates);
+    Ok((deletes, outcome))
+}
+
 fn plan_node_diff(
     graph: &FetchedGraph,
     root: ObjectHash,
@@ -930,7 +1279,17 @@ fn plan_node_diff(
                 });
             }
         }
-        emit_collision_safe_renames(parent_id, renames, &mut ops);
+        let reserved_names = kids
+            .iter()
+            .map(|entry| entry.name.clone())
+            .chain(
+                target_nodes
+                    .values()
+                    .filter(|entry| entry.parent_node_id == parent_id)
+                    .map(|entry| entry.name.clone()),
+            )
+            .collect();
+        emit_collision_safe_renames(parent_id, renames, reserved_names, &mut ops);
 
         for entry in kids {
             plan_one(
@@ -1404,21 +1763,25 @@ fn timestamp_column(meta: &VersionMeta) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn series_metadata_divergence_forces_full_rewrite() {
-        let blob_hash = ObjectHash::of_bytes(b"unchanged");
-        let series_hash = ObjectHash::of_bytes(b"series");
-        let entry = ManifestEntry::new(
+    fn series_entry(child_hash: ObjectHash, timestamp: i64) -> ManifestEntry {
+        ManifestEntry::new(
             "series-node",
             "root",
             "events.series",
             EntryType::FilePhysicalSeries,
-            series_hash,
+            child_hash,
             vec![VersionMeta {
-                timestamp: Some(2),
+                timestamp: Some(timestamp),
                 ..VersionMeta::default()
             }],
-        );
+        )
+    }
+
+    #[test]
+    fn series_metadata_divergence_forces_full_rewrite() {
+        let blob_hash = ObjectHash::of_bytes(b"unchanged");
+        let series_hash = ObjectHash::of_bytes(b"series");
+        let entry = series_entry(series_hash, 2);
         let mut graph = FetchedGraph::default();
         _ = graph
             .objects
@@ -1435,6 +1798,57 @@ mod tests {
         assert_eq!(versions.len(), 1);
         assert!(collapse_first);
         assert_eq!(versions[0].meta.timestamp, Some(2));
+    }
+
+    #[test]
+    fn divergence_diagnostic_identifies_series_metadata_field() {
+        let blob_hash = ObjectHash::of_bytes(b"unchanged");
+        let series_hash = ObjectHash::of_bytes(b"series");
+        let mut graph = FetchedGraph {
+            manifest: vec![series_entry(series_hash, 2)],
+            ..FetchedGraph::default()
+        };
+        _ = graph
+            .objects
+            .insert(series_hash, FetchedObject::Series(vec![blob_hash]));
+        let actual_nodes =
+            HashMap::from([("series-node".to_string(), series_entry(series_hash, 1))]);
+        let actual_series = HashMap::from([("series-node".to_string(), vec![blob_hash])]);
+
+        let detail = first_replica_divergence(&graph, &actual_nodes, &actual_series)
+            .expect("diagnosis")
+            .expect("divergence");
+
+        assert!(detail.contains("version 0 timestamp differs"), "{detail}");
+        assert!(
+            detail.contains("expected Some(2), actual Some(1)"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn divergence_diagnostic_identifies_series_blob() {
+        let expected_blob = ObjectHash::of_bytes(b"expected");
+        let actual_blob = ObjectHash::of_bytes(b"actual");
+        let series_hash = ObjectHash::of_bytes(b"series");
+        let mut graph = FetchedGraph {
+            manifest: vec![series_entry(series_hash, 2)],
+            ..FetchedGraph::default()
+        };
+        _ = graph
+            .objects
+            .insert(series_hash, FetchedObject::Series(vec![expected_blob]));
+        let actual_nodes =
+            HashMap::from([("series-node".to_string(), series_entry(series_hash, 2))]);
+        let actual_series = HashMap::from([("series-node".to_string(), vec![actual_blob])]);
+
+        let detail = first_replica_divergence(&graph, &actual_nodes, &actual_series)
+            .expect("diagnosis")
+            .expect("divergence");
+
+        assert!(detail.contains("blob 0 differs"), "{detail}");
+        assert!(detail.contains(&expected_blob.to_hex()), "{detail}");
+        assert!(detail.contains(&actual_blob.to_hex()), "{detail}");
     }
 }
 

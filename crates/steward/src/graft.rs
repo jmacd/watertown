@@ -28,7 +28,8 @@ pub const SYS_GRAFTS_DIR: &str = "/sys/grafts";
 
 /// The content-addressed reference a pond keeps to a grafted foreign tip.
 ///
-/// Written at `/sys/grafts/<name>` after a successful cross-pond import.  The
+/// Written at `/sys/grafts/<name>` in the same transaction as a cross-pond
+/// import. The
 /// `pinned_tip` is the foreign pond's tip commit hash at import time; the
 /// foreign content it commits to is NOT fetched into this pond (the graft is
 /// non-transitive), so the reference is intentionally dangling for any
@@ -72,6 +73,34 @@ impl GraftPin {
     }
 }
 
+/// Split an absolute, non-root graft mount path into its parent and leaf.
+///
+/// # Errors
+///
+/// Returns an error when the path is relative, root, or has no leaf name.
+pub fn split_mount_path(path: &str) -> Result<(&str, &str), String> {
+    if !path.starts_with('/') {
+        return Err(format!("mount path `{path}` must be absolute"));
+    }
+    if path == "/" {
+        return Err("graft mount path cannot be `/`".to_string());
+    }
+    let trimmed = path.trim_end_matches('/');
+    let last_slash = trimmed
+        .rfind('/')
+        .ok_or_else(|| format!("mount path `{path}` has no leaf"))?;
+    let parent = if last_slash == 0 {
+        "/"
+    } else {
+        &trimmed[..last_slash]
+    };
+    let leaf = &trimmed[last_slash + 1..];
+    if leaf.is_empty() {
+        return Err(format!("mount path `{path}` has empty leaf"));
+    }
+    Ok((parent, leaf))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,5 +126,16 @@ mod tests {
     fn rejects_unknown_fields() {
         let yaml = "foreign_pond_id: x\nmount_path: /imports/A\npinned_tip: y\nbogus: 1\n";
         assert!(GraftPin::from_yaml_bytes(yaml.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn splits_mount_paths() {
+        assert_eq!(split_mount_path("/imports").unwrap(), ("/", "imports"));
+        assert_eq!(
+            split_mount_path("/imports/upstream/").unwrap(),
+            ("/imports", "upstream")
+        );
+        assert!(split_mount_path("/").is_err());
+        assert!(split_mount_path("imports/upstream").is_err());
     }
 }

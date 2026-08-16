@@ -45,7 +45,7 @@ pub use list_factories::list_factories_command;
 pub use maintain::maintain_command;
 pub use mkdir::mkdir_command;
 pub use mknod::mknod_command;
-pub use pull::pull_command;
+pub use pull::{pull_command, pull_command_with_rebuild};
 pub use push::push_command;
 pub use rebuild_control::rebuild_control_command;
 pub use recover::recover_command;

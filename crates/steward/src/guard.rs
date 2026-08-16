@@ -40,6 +40,17 @@ struct PostCommitFactoryConfig {
     factory_mode: String,
 }
 
+struct ExpectedContentRoots {
+    root_tree_hash: String,
+    node_manifest_hash: String,
+    node_manifest_root: String,
+}
+
+struct PreparedCommit {
+    spine: CommitSpine,
+    content_roots: ExpectedContentRoots,
+}
+
 /// Steward transaction guard wraps TLogFS transaction with control table lifecycle tracking
 pub struct StewardTransactionGuard<'a> {
     /// The underlying tlogfs transaction guard
@@ -49,6 +60,9 @@ pub struct StewardTransactionGuard<'a> {
     transaction_type: TransactionType,
     /// Reference to control table for transaction tracking
     control_table: &'a mut ControlTable,
+    /// Ship's in-memory allocator, advanced at begin and restored when a write
+    /// aborts before the underlying TLogFS transaction commits.
+    last_write_seq: &'a mut i64,
     /// Start time for duration tracking
     start_time: std::time::Instant,
     /// Pond path for reloading OpLogPersistence during post-commit
@@ -66,6 +80,7 @@ pub struct StewardTransactionGuard<'a> {
     /// control queue only once this transaction commits, so an aborted write
     /// re-emits rather than losing them.
     emitted_usage: std::sync::atomic::AtomicUsize,
+    expected_content_roots: Option<ExpectedContentRoots>,
 }
 
 impl<'a> StewardTransactionGuard<'a> {
@@ -75,6 +90,7 @@ impl<'a> StewardTransactionGuard<'a> {
         txn_meta: &PondTxnMetadata,
         transaction_type: TransactionType,
         control_table: &'a mut ControlTable,
+        last_write_seq: &'a mut i64,
         path: P,
         write_lock: Option<WriteLockGuard>,
     ) -> Self {
@@ -83,11 +99,13 @@ impl<'a> StewardTransactionGuard<'a> {
             txn_meta: txn_meta.clone(),
             transaction_type,
             control_table,
+            last_write_seq,
             start_time: std::time::Instant::now(),
             pond_path: path.as_ref().to_path_buf(),
             committed: false,
             write_lock,
             emitted_usage: std::sync::atomic::AtomicUsize::new(0),
+            expected_content_roots: None,
         }
     }
 
@@ -256,9 +274,18 @@ impl<'a> StewardTransactionGuard<'a> {
     /// Abort the transaction and record it as failed
     /// Use this when an error occurs that should be recorded in the control table
     pub async fn abort(mut self, error: impl std::fmt::Display) -> StewardError {
-        let duration_ms = self.start_time.elapsed().as_millis() as i64;
         let error_msg = error.to_string();
+        self.rollback(&error_msg).await;
+        StewardError::Aborted(error_msg)
+    }
 
+    pub(crate) async fn abort_preserving(mut self, error: StewardError) -> StewardError {
+        self.rollback(&error.to_string()).await;
+        error
+    }
+
+    async fn rollback(&mut self, error_msg: &str) {
+        let duration_ms = self.start_time.elapsed().as_millis() as i64;
         debug!(
             "Aborting steward transaction {} (seq={}): {}",
             self.txn_meta.user.txn_id, self.txn_meta.txn_seq, error_msg
@@ -272,7 +299,7 @@ impl<'a> StewardTransactionGuard<'a> {
                 .record_failed(
                     &self.txn_meta,
                     self.transaction_type,
-                    error_msg.clone(),
+                    error_msg.to_string(),
                     duration_ms,
                 )
                 .await
@@ -281,11 +308,11 @@ impl<'a> StewardTransactionGuard<'a> {
         }
 
         // Drop the transaction guard without committing (will rollback)
+        if self.transaction_type == TransactionType::Write {
+            *self.last_write_seq = self.txn_meta.txn_seq - 1;
+        }
         self.committed = true; // Mark as handled to avoid Drop warning
         drop(self.data_tx.take());
-
-        // Return the original error wrapped in StewardError
-        StewardError::Aborted(error_msg)
     }
 
     /// Commit the transaction with proper steward sequencing
@@ -298,6 +325,91 @@ impl<'a> StewardTransactionGuard<'a> {
     pub fn note_emitted_usage(&self, count: usize) {
         self.emitted_usage
             .store(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn expect_content_roots(
+        &mut self,
+        root_tree_hash: sync_store::content::ObjectHash,
+        node_manifest_hash: sync_store::content::ObjectHash,
+        node_manifest_root: sync_store::content::ObjectHash,
+    ) {
+        self.expected_content_roots = Some(ExpectedContentRoots {
+            root_tree_hash: root_tree_hash.to_hex(),
+            node_manifest_hash: node_manifest_hash.to_hex(),
+            node_manifest_root: node_manifest_root.to_hex(),
+        });
+    }
+
+    async fn prepare_commit(&self) -> Result<Option<PreparedCommit>, StewardError> {
+        let mut prepared_commit = None;
+        if self.transaction_type == TransactionType::Write {
+            let data_tx = self.data_tx.as_ref().ok_or_else(|| {
+                StewardError::DataInit(tlogfs::TLogFSError::TinyFS(tinyfs::Error::Other(
+                    "Transaction already consumed".to_string(),
+                )))
+            })?;
+            let (pending_records, modified_dirs) = data_tx.state()?.pending_operation_counts();
+            if pending_records > 0 || modified_dirs > 0 {
+                prepared_commit = self
+                    .write_reserved_nodes(
+                        data_tx,
+                        self.txn_meta.txn_seq,
+                        self.txn_meta.user.args.join(" "),
+                    )
+                    .await?;
+            }
+        }
+
+        if let Some(expected) = &self.expected_content_roots {
+            let actual = if let Some(prepared) = &prepared_commit {
+                (
+                    prepared.content_roots.root_tree_hash.clone(),
+                    prepared.content_roots.node_manifest_hash.clone(),
+                    prepared.content_roots.node_manifest_root.clone(),
+                )
+            } else {
+                let data_tx = self.data_tx.as_ref().ok_or_else(|| {
+                    StewardError::DataInit(tlogfs::TLogFSError::TinyFS(tinyfs::Error::Other(
+                        "Transaction already consumed".to_string(),
+                    )))
+                })?;
+                let pond_id = self.control_table.pond_id_uuid().to_string();
+                let current = crate::content_tree::in_txn_content_state(
+                    data_tx.persistence().table().clone(),
+                    Vec::new(),
+                    &pond_id,
+                )
+                .await?;
+                (
+                    current.root_tree_hash.to_hex(),
+                    current.node_manifest_hash.to_hex(),
+                    current.node_manifest_root.to_hex(),
+                )
+            };
+            let mismatch = if actual.0 != expected.root_tree_hash {
+                Some(format!(
+                    "precommit root tree is {} but expected {}",
+                    actual.0, expected.root_tree_hash
+                ))
+            } else if actual.1 != expected.node_manifest_hash {
+                Some(format!(
+                    "precommit node manifest hash is {} but expected {}",
+                    actual.1, expected.node_manifest_hash
+                ))
+            } else if actual.2 != expected.node_manifest_root {
+                Some(format!(
+                    "precommit node manifest Merkle root is {} but expected {}",
+                    actual.2, expected.node_manifest_root
+                ))
+            } else {
+                None
+            };
+            if let Some(error) = mismatch {
+                return Err(StewardError::Content(error));
+            }
+        }
+
+        Ok(prepared_commit)
     }
 
     pub async fn commit(mut self) -> Result<Option<i64>, StewardError> {
@@ -315,32 +427,22 @@ impl<'a> StewardTransactionGuard<'a> {
         // the chunked-parquet remote factory in D4.5; cross-pond import
         // is planned for D5 via row-level `pond_id` partitioning.)
 
-        // Step 2: Extract the underlying transaction guard and commit it
-        let data_tx = self.take_transaction().ok_or_else(|| {
-            StewardError::DataInit(tlogfs::TLogFSError::TinyFS(tinyfs::Error::Other(
-                "Transaction already consumed".to_string(),
-            )))
-        })?;
-
         // Incremental content tree (Phase 2, Approach A): persist the pond's
         // node manifest into the reserved index node as part of this same
         // transaction, before it is finalized.  Only write transactions that
         // actually changed something get an index-node version; a read
         // transaction (or a no-op write) leaves it untouched.
-        let mut in_txn_spine: Option<CommitSpine> = None;
-        if self.transaction_type == TransactionType::Write {
-            let (pending_records, modified_dirs) = data_tx.state()?.pending_operation_counts();
-            if pending_records > 0 || modified_dirs > 0 {
-                in_txn_spine = self
-                    .write_reserved_nodes(
-                        &data_tx,
-                        self.txn_meta.txn_seq,
-                        self.txn_meta.user.args.join(" "),
-                    )
-                    .await?;
-            }
-        }
+        let prepared_commit = match self.prepare_commit().await {
+            Ok(prepared) => prepared,
+            Err(error) => return Err(self.abort_preserving(error).await),
+        };
 
+        // Step 2: Extract the underlying transaction guard and commit it.
+        let data_tx = self.take_transaction().ok_or_else(|| {
+            StewardError::DataInit(tlogfs::TLogFSError::TinyFS(tinyfs::Error::Other(
+                "Transaction already consumed".to_string(),
+            )))
+        })?;
         let commit_result = data_tx.commit().await;
 
         // Step 3: Record transaction lifecycle in control table based on result
@@ -373,7 +475,7 @@ impl<'a> StewardTransactionGuard<'a> {
                 // same Delta transaction as the data, by `write_reserved_nodes`.
                 // The control-table copy recorded below is a disposable,
                 // rebuildable cache -- not the source of truth.
-                let commit_spine = in_txn_spine;
+                let commit_spine = prepared_commit.map(|prepared| prepared.spine);
 
                 // The leaf appended to the transparency log is the commit
                 // object of this commit; a spine is present exactly when the
@@ -468,6 +570,7 @@ impl<'a> StewardTransactionGuard<'a> {
                 // never recorded a Begin so there's nothing to terminate).
                 let error_msg = format!("{}", e);
                 if self.transaction_type == TransactionType::Write {
+                    *self.last_write_seq = self.txn_meta.txn_seq - 1;
                     self.control_table
                         .record_failed(
                             &self.txn_meta,
@@ -532,7 +635,7 @@ impl<'a> StewardTransactionGuard<'a> {
         data_tx: &TransactionGuard<'_>,
         txn_seq: i64,
         commit_args: String,
-    ) -> Result<Option<CommitSpine>, StewardError> {
+    ) -> Result<Option<PreparedCommit>, StewardError> {
         use tokio::io::AsyncWriteExt;
 
         let pond_id = self.control_table.pond_id_uuid();
@@ -634,7 +737,14 @@ impl<'a> StewardTransactionGuard<'a> {
         log_writer.write_all(&commit_object).await?;
         log_writer.shutdown().await?;
 
-        Ok(Some(spine))
+        Ok(Some(PreparedCommit {
+            spine,
+            content_roots: ExpectedContentRoots {
+                root_tree_hash: inputs.root_tree_hash.to_hex(),
+                node_manifest_hash: inputs.node_manifest_hash.to_hex(),
+                node_manifest_root: inputs.node_manifest_root.to_hex(),
+            },
+        }))
     }
 
     /// Run post-commit factories after a successful write transaction
@@ -1092,7 +1202,8 @@ impl<'a> StewardTransactionGuard<'a> {
             } else {
                 None
             }
-        };
+        }
+        .map(|prepared| prepared.spine);
 
         // Commit the post-commit factory execution transaction
         // Metadata was already provided at begin()
@@ -1492,6 +1603,9 @@ impl<'a> Deref for StewardTransactionGuard<'a> {
 impl<'a> Drop for StewardTransactionGuard<'a> {
     fn drop(&mut self) {
         if self.data_tx.is_some() && !self.committed {
+            if self.transaction_type == TransactionType::Write {
+                *self.last_write_seq = self.txn_meta.txn_seq - 1;
+            }
             // Transaction was neither committed nor explicitly failed
             // This happens when an error occurs before commit() is called
             // The transaction will rollback but we can't record failure here (Drop isn't async)

@@ -11,7 +11,7 @@ use sync_store::content::ObjectHash;
 use tempfile::tempdir;
 use tinyfs::arrow::parquet::ParquetExt;
 use tinyfs::async_helpers::convenience::create_file_path;
-use tlogfs::PondUserMetadata;
+use tlogfs::{PondTxnMetadata, PondUserMetadata};
 
 use std::sync::Arc;
 
@@ -31,6 +31,65 @@ async fn write_file(ship: &mut Ship, path: &str, bytes: &[u8]) {
     })
     .await
     .expect("write transaction");
+}
+
+async fn write_foreign_file(ship: &mut Ship, pond_id: uuid7::Uuid, path: &str, bytes: &[u8]) {
+    let tx = ship
+        .begin_write(&meta("write-foreign"))
+        .await
+        .expect("begin write");
+    let foreign_node = tx.foreign_root_node(pond_id).await.expect("foreign root");
+    let foreign_path = tinyfs::NodePath {
+        node: foreign_node,
+        path: "/".into(),
+    };
+    let root = tx
+        .wd(&foreign_path, foreign_path.clone())
+        .await
+        .expect("foreign wd");
+    let _ = create_file_path(&root, path, bytes)
+        .await
+        .expect("write foreign file");
+    let _ = tx.commit().await.expect("commit foreign write");
+}
+
+async fn point_mount_at_foreign_child(
+    ship: &mut Ship,
+    pond_id: uuid7::Uuid,
+    mount_parent: &str,
+    mount_name: &str,
+    child_name: &str,
+) {
+    let tx = ship
+        .begin_write(&meta("mispoint-mount"))
+        .await
+        .expect("begin write");
+    let foreign_root = tx.foreign_root_node(pond_id).await.expect("foreign root");
+    let foreign_path = tinyfs::NodePath {
+        node: foreign_root,
+        path: "/".into(),
+    };
+    let foreign_wd = tx
+        .wd(&foreign_path, foreign_path.clone())
+        .await
+        .expect("foreign wd");
+    let child = foreign_wd
+        .get(child_name)
+        .await
+        .expect("lookup child")
+        .expect("foreign child")
+        .node;
+    let root = tx.root().await.expect("local root");
+    let parent = root
+        .open_dir_path(mount_parent)
+        .await
+        .expect("mount parent");
+    parent.remove_entry(mount_name).await.expect("remove mount");
+    let _ = parent
+        .insert_node(mount_name, child)
+        .await
+        .expect("insert wrong mount");
+    let _ = tx.commit().await.expect("commit wrong mount");
 }
 
 async fn mkdir_and_file(ship: &mut Ship, dir: &str, file: &str, bytes: &[u8]) {
@@ -350,6 +409,103 @@ async fn fetched_closure_matches_pushed_objects() {
     }
 }
 
+#[tokio::test]
+async fn push_includes_ancestry_across_multiple_local_commits() {
+    let (_t, mut src) = new_pond("push-ancestry-src").await;
+    write_file(&mut src, "/v1.txt", b"one").await;
+    let (_rt, mut remote) = push(&src).await;
+    let old_tip = remote
+        .get_tip("main")
+        .await
+        .expect("read old tip")
+        .expect("old tip");
+
+    write_file(&mut src, "/v2.txt", b"two").await;
+    write_file(&mut src, "/v3.txt", b"three").await;
+    repush(&src, &mut remote).await;
+
+    let graph = fetch_object_graph(&remote, "main").await.expect("fetch");
+    assert!(
+        graph
+            .commits
+            .iter()
+            .any(|(commit_hash, _)| *commit_hash == old_tip),
+        "a later push must include enough commit ancestry to prove a fast-forward"
+    );
+    assert!(
+        graph.commits.len() >= 3,
+        "two unpushed local commits must not break the remote commit chain"
+    );
+}
+
+#[tokio::test]
+async fn push_uses_log_tip_when_control_spine_is_stale() {
+    let (_t, mut src) = new_pond("push-log-tip-src").await;
+    write_file(&mut src, "/v1.txt", b"one").await;
+    let old_seq = src.last_write_seq();
+    let old_spine = steward::CommitSpine {
+        root_tree_hash: src
+            .control_table()
+            .root_tree_hash_at(old_seq)
+            .await
+            .expect("read old root")
+            .expect("old root"),
+        parent_commit_hash: src
+            .control_table()
+            .parent_commit_hash_at(old_seq)
+            .await
+            .expect("read old parent"),
+        commit_hash: src
+            .control_table()
+            .commit_hash_at(old_seq)
+            .await
+            .expect("read old hash")
+            .expect("old hash"),
+        commit_object: src
+            .control_table()
+            .commit_object_at(old_seq)
+            .await
+            .expect("read old object")
+            .expect("old object"),
+    };
+
+    write_file(&mut src, "/v2.txt", b"two").await;
+    let current_seq = src.last_write_seq();
+    let authoritative_tip = src
+        .control_table()
+        .commit_hash_at(current_seq)
+        .await
+        .expect("read current hash")
+        .expect("current hash");
+    let fake_meta = PondTxnMetadata::new(current_seq + 100, meta("stale-control-spine"));
+    let data_version = src
+        .data_persistence()
+        .table()
+        .version()
+        .expect("data version");
+    src.control_table_mut()
+        .record_data_committed(
+            &fake_meta,
+            steward::TransactionType::Write,
+            data_version,
+            0,
+            Some(old_spine),
+        )
+        .await
+        .expect("inject stale control spine");
+
+    let (_rt, remote) = push(&src).await;
+    assert_eq!(
+        remote
+            .get_tip("main")
+            .await
+            .expect("read pushed tip")
+            .expect("pushed tip")
+            .to_hex(),
+        authoritative_tip
+    );
+}
+
 /// The full round trip: push a pond, fetch its graph, rebuild into a fresh
 /// empty pond, and confirm the rebuilt pond is content-equal to the source
 /// (its read-side fold equals the source's root tree hash).
@@ -490,6 +646,38 @@ async fn rebuild_streams_large_external_blob() {
         dst_root, src_root,
         "rebuilt pond with a streamed large blob must be content-equal to the source"
     );
+}
+
+#[tokio::test]
+async fn external_blob_validation_failure_leaves_target_unchanged() {
+    let (_t, mut src) = new_pond("large-abort-src").await;
+    let big: Vec<u8> = (0..256 * 1024).map(|i| (i * 31 + 7) as u8).collect();
+    write_file(&mut src, "/big.bin", &big).await;
+
+    let (_rt, remote) = push(&src).await;
+    let valid = fetch_object_graph(&remote, "main").await.expect("fetch");
+    assert_eq!(valid.external_blobs.len(), 1);
+    let mut invalid = valid.clone();
+    invalid.commits[0].1.node_manifest_root =
+        ObjectHash::of_bytes(b"wrong external-blob manifest root");
+
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "large-abort-dst")
+        .await
+        .expect("create dst");
+    let version_before = dst.data_persistence().table().version();
+    let root_before = root_hash(&dst).await;
+
+    let _ = steward::rebuild_pond(&mut dst, &remote, &invalid)
+        .await
+        .expect_err("bad root must abort after streaming the external blob");
+    assert_eq!(dst.data_persistence().table().version(), version_before);
+    assert_eq!(root_hash(&dst).await, root_before);
+
+    let _ = steward::rebuild_pond(&mut dst, &remote, &valid)
+        .await
+        .expect("valid retry");
+    assert_eq!(root_hash(&dst).await, root_hash(&src).await);
 }
 
 /// A pond containing dynamic nodes (factory + config recipes) survives the
@@ -704,6 +892,48 @@ async fn swapped_sibling_names_converge() {
     assert_eq!(outcome.files, 0);
     assert_eq!(read_to_string(&mut dst, "/a.txt").await, "beta");
     assert_eq!(read_to_string(&mut dst, "/b.txt").await, "alpha");
+    assert_eq!(root_hash(&dst).await, root_hash(&src).await);
+}
+
+#[tokio::test]
+async fn rename_cycle_avoids_a_real_temporary_name_collision() {
+    let (_t, mut src) = new_pond("swap-temp-src").await;
+    write_file(&mut src, "/a.txt", b"alpha").await;
+    write_file(&mut src, "/b.txt", b"beta").await;
+    let (_rt, mut remote) = push(&src).await;
+    let graph = fetch_object_graph(&remote, "main").await.expect("fetch");
+    let a_id = graph
+        .manifest
+        .iter()
+        .find(|entry| entry.name == "a.txt")
+        .expect("a.txt manifest entry")
+        .node_id
+        .clone();
+    let collision_path = format!("/.pull-rename-tmp-{a_id}");
+    write_file(&mut src, &collision_path, b"keep").await;
+    repush(&src, &mut remote).await;
+
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "swap-temp-dst")
+        .await
+        .expect("create dst");
+    let graph = fetch_object_graph(&remote, "main").await.expect("fetch");
+    let _ = steward::rebuild_pond(&mut dst, &remote, &graph)
+        .await
+        .expect("initial rebuild");
+
+    rename(&mut src, "/a.txt", "/tmp.txt").await;
+    rename(&mut src, "/b.txt", "/a.txt").await;
+    rename(&mut src, "/tmp.txt", "/b.txt").await;
+    repush(&src, &mut remote).await;
+    let graph = fetch_object_graph(&remote, "main").await.expect("fetch");
+    let _ = steward::rebuild_pond(&mut dst, &remote, &graph)
+        .await
+        .expect("rename cycle with occupied default temp");
+
+    assert_eq!(read_to_string(&mut dst, "/a.txt").await, "beta");
+    assert_eq!(read_to_string(&mut dst, "/b.txt").await, "alpha");
+    assert_eq!(read_to_string(&mut dst, &collision_path).await, "keep");
     assert_eq!(root_hash(&dst).await, root_hash(&src).await);
 }
 
@@ -1104,6 +1334,364 @@ async fn tampered_manifest_is_rejected_before_commit() {
         empty_root,
         "a rejected pull must not mutate the target pond"
     );
+}
+
+/// A mismatch discovered only after applying the import plan is still rejected
+/// before the Delta transaction commits. The failed attempt leaves no foreign
+/// root behind, and the unmodified graph can be imported immediately afterward.
+#[tokio::test]
+async fn precommit_manifest_root_mismatch_leaves_target_unchanged() {
+    let (_t, mut src) = new_pond("precommit-src").await;
+    write_file(&mut src, "/a.txt", b"alpha").await;
+    let src_id = src
+        .data_persistence()
+        .pond_id()
+        .parse::<uuid7::Uuid>()
+        .expect("source pond id");
+
+    let (_rt, remote) = push(&src).await;
+    let valid = fetch_object_graph(&remote, "main").await.expect("fetch");
+    let mut invalid = valid.clone();
+    invalid.commits[0].1.node_manifest_root = ObjectHash::of_bytes(b"wrong manifest root");
+
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "precommit-dst")
+        .await
+        .expect("create dst");
+    let version_before = dst.data_persistence().table().version();
+
+    let err = steward::import_pond(&mut dst, &remote, &invalid, src_id)
+        .await
+        .expect_err("advertised manifest-root mismatch must abort");
+    let message = err.to_string();
+    assert!(
+        message.contains("node manifest Merkle root would be"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("manifests match field-by-field"),
+        "unexpected diagnosis: {message}"
+    );
+    assert_eq!(
+        dst.data_persistence().table().version(),
+        version_before,
+        "failed validation must not advance the data Delta table"
+    );
+    assert!(
+        steward::compute_content_tree_for_table(
+            dst.data_persistence().table().clone(),
+            &src_id.to_string(),
+        )
+        .await
+        .is_err(),
+        "failed first import must leave no foreign root"
+    );
+
+    let _ = steward::import_pond(&mut dst, &remote, &valid, src_id)
+        .await
+        .expect("valid retry");
+    assert_eq!(foreign_root_hash(&dst, src_id).await, root_hash(&src).await);
+}
+
+/// Foreign data, the local mount, and its pin share one Delta transaction.
+/// Validation failure leaves none of them behind; success commits all three.
+#[tokio::test]
+async fn graft_import_is_atomic_with_mount_and_pin() {
+    let (_t, mut src) = new_pond("atomic-graft-src").await;
+    write_file(&mut src, "/a.txt", b"alpha").await;
+    let src_id = src
+        .data_persistence()
+        .pond_id()
+        .parse::<uuid7::Uuid>()
+        .expect("source pond id");
+
+    let (_rt, remote) = push(&src).await;
+    let valid = fetch_object_graph(&remote, "main").await.expect("fetch");
+    let mut invalid = valid.clone();
+    invalid.commits[0].1.node_manifest_root = ObjectHash::of_bytes(b"wrong manifest root");
+
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "atomic-graft-dst")
+        .await
+        .expect("create dst");
+    let version_before = dst.data_persistence().table().version();
+
+    let _ = steward::import_graft(
+        &mut dst,
+        &remote,
+        &invalid,
+        src_id,
+        "upstream",
+        "/imports/upstream",
+    )
+    .await
+    .expect_err("invalid graft must abort");
+    assert_eq!(dst.data_persistence().table().version(), version_before);
+    let tx = dst.begin_read(&meta("inspect-abort")).await.expect("read");
+    assert!(
+        !tx.root()
+            .await
+            .expect("root")
+            .exists(&steward::GraftPin::pin_path("upstream"))
+            .await
+    );
+    let _ = tx.commit().await.expect("close read");
+
+    let _ = steward::import_graft(
+        &mut dst,
+        &remote,
+        &valid,
+        src_id,
+        "upstream",
+        "/imports/upstream",
+    )
+    .await
+    .expect("valid graft");
+    assert_eq!(
+        dst.data_persistence().table().version(),
+        version_before.map(|version| version + 1),
+        "foreign rows, mount, and pin must land in one Delta commit"
+    );
+    assert_eq!(
+        read_to_string(&mut dst, "/imports/upstream/a.txt").await,
+        "alpha"
+    );
+    let pin_yaml = read_to_string(&mut dst, &steward::GraftPin::pin_path("upstream")).await;
+    let pin = steward::GraftPin::from_yaml_bytes(pin_yaml.as_bytes()).expect("parse pin");
+    assert_eq!(pin.foreign_pond_id, src_id.to_string());
+    assert_eq!(pin.pinned_tip, valid.tip.expect("tip").to_hex());
+
+    let committed_version = dst.data_persistence().table().version();
+    let _ = steward::import_graft(
+        &mut dst,
+        &remote,
+        &valid,
+        src_id,
+        "upstream",
+        "/imports/upstream",
+    )
+    .await
+    .expect("idempotent retry");
+    assert_eq!(
+        dst.data_persistence().table().version(),
+        committed_version,
+        "retry after a missing watermark must not create another data commit"
+    );
+}
+
+/// Scoped replacement rebuilds exactly one foreign partition and validates the
+/// replacement before commit, leaving unrelated grafts intact.
+#[tokio::test]
+async fn replace_graft_is_scoped_and_atomic() {
+    let (_t1, mut src1) = new_pond("replace-src-1").await;
+    write_file(&mut src1, "/one.txt", b"one").await;
+    let src1_id = src1
+        .data_persistence()
+        .pond_id()
+        .parse::<uuid7::Uuid>()
+        .expect("source 1 pond id");
+    let (_r1, remote1) = push(&src1).await;
+    let valid1 = fetch_object_graph(&remote1, "main").await.expect("fetch 1");
+
+    let (_t2, mut src2) = new_pond("replace-src-2").await;
+    write_file(&mut src2, "/two.txt", b"two").await;
+    let src2_id = src2
+        .data_persistence()
+        .pond_id()
+        .parse::<uuid7::Uuid>()
+        .expect("source 2 pond id");
+    let (_r2, remote2) = push(&src2).await;
+    let valid2 = fetch_object_graph(&remote2, "main").await.expect("fetch 2");
+
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "replace-dst")
+        .await
+        .expect("create dst");
+    let _ = steward::import_graft(&mut dst, &remote1, &valid1, src1_id, "one", "/imports/one")
+        .await
+        .expect("import first graft");
+    let _ = steward::import_graft(&mut dst, &remote2, &valid2, src2_id, "two", "/imports/two")
+        .await
+        .expect("import second graft");
+    write_foreign_file(&mut dst, src1_id, "/poison.txt", b"poison").await;
+    let poisoned_root = foreign_root_hash(&dst, src1_id).await;
+    let unrelated_root = foreign_root_hash(&dst, src2_id).await;
+    point_mount_at_foreign_child(&mut dst, src1_id, "/imports", "one", "one.txt").await;
+
+    let mut invalid1 = valid1.clone();
+    invalid1.commits[0].1.node_manifest_root = ObjectHash::of_bytes(b"wrong replacement root");
+    let version_before = dst.data_persistence().table().version();
+    let _ = steward::replace_graft(
+        &mut dst,
+        &remote1,
+        &invalid1,
+        src1_id,
+        "one",
+        "/imports/one",
+    )
+    .await
+    .expect_err("invalid replacement must abort");
+    assert_eq!(dst.data_persistence().table().version(), version_before);
+    assert_eq!(foreign_root_hash(&dst, src1_id).await, poisoned_root);
+    assert_eq!(foreign_root_hash(&dst, src2_id).await, unrelated_root);
+
+    let _ = steward::replace_graft(&mut dst, &remote1, &valid1, src1_id, "one", "/imports/one")
+        .await
+        .expect("replace first graft");
+    assert_eq!(
+        foreign_root_hash(&dst, src1_id).await,
+        root_hash(&src1).await
+    );
+    assert_eq!(foreign_root_hash(&dst, src2_id).await, unrelated_root);
+    assert_eq!(
+        read_to_string(&mut dst, "/imports/one/one.txt").await,
+        "one"
+    );
+    assert_eq!(
+        read_to_string(&mut dst, "/imports/two/two.txt").await,
+        "two"
+    );
+
+    dst.write_transaction(&meta("local-mount-collision"), async |fs| {
+        let root = fs.root().await?;
+        root.open_dir_path("/imports")
+            .await?
+            .remove_entry("one")
+            .await?;
+        let _ = create_file_path(&root, "/imports/one", b"local").await?;
+        Ok(())
+    })
+    .await
+    .expect("create local collision");
+    let collision_version = dst.data_persistence().table().version();
+    let _ = steward::replace_graft(&mut dst, &remote1, &valid1, src1_id, "one", "/imports/one")
+        .await
+        .expect_err("local content must not be replaced");
+    assert_eq!(dst.data_persistence().table().version(), collision_version);
+    assert_eq!(read_to_string(&mut dst, "/imports/one").await, "local");
+
+    dst.write_transaction(&meta("foreign-mount-collision"), async |fs| {
+        let root = fs.root().await?;
+        let imports = root.open_dir_path("/imports").await?;
+        imports.remove_entry("one").await?;
+        let other_root = fs.foreign_root_node(src2_id).await?;
+        let _ = imports.insert_node("one", other_root).await?;
+        Ok(())
+    })
+    .await
+    .expect("create unrelated graft collision");
+    let collision_version = dst.data_persistence().table().version();
+    let _ = steward::replace_graft(&mut dst, &remote1, &valid1, src1_id, "one", "/imports/one")
+        .await
+        .expect_err("another graft must not be replaced");
+    assert_eq!(dst.data_persistence().table().version(), collision_version);
+    assert_eq!(
+        read_to_string(&mut dst, "/imports/one/two.txt").await,
+        "two"
+    );
+}
+
+/// Local rebuilds use the same precommit gate as foreign imports: a bad
+/// advertised root aborts without advancing Delta and does not poison retry.
+#[tokio::test]
+async fn rebuild_manifest_root_mismatch_leaves_target_unchanged() {
+    let (_t, mut src) = new_pond("rebuild-precommit-src").await;
+    write_file(&mut src, "/a.txt", b"alpha").await;
+
+    let (_rt, remote) = push(&src).await;
+    let valid = fetch_object_graph(&remote, "main").await.expect("fetch");
+    let mut invalid = valid.clone();
+    invalid.commits[0].1.node_manifest_root = ObjectHash::of_bytes(b"wrong manifest root");
+
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "rebuild-precommit-dst")
+        .await
+        .expect("create dst");
+    let version_before = dst.data_persistence().table().version();
+    let root_before = root_hash(&dst).await;
+
+    let err = steward::rebuild_pond(&mut dst, &remote, &invalid)
+        .await
+        .expect_err("advertised manifest-root mismatch must abort");
+    assert!(
+        err.to_string()
+            .contains("precommit node manifest Merkle root"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        dst.data_persistence().table().version(),
+        version_before,
+        "failed validation must not advance the data Delta table"
+    );
+    assert_eq!(
+        root_hash(&dst).await,
+        root_before,
+        "failed validation must leave local content unchanged"
+    );
+
+    let _ = steward::rebuild_pond(&mut dst, &remote, &valid)
+        .await
+        .expect("valid retry");
+    assert_eq!(root_hash(&dst).await, root_hash(&src).await);
+}
+
+#[tokio::test]
+async fn dropped_and_aborted_writes_reuse_their_sequence() {
+    let (_tmp, mut ship) = new_pond("sequence-reuse").await;
+    let before = ship.last_write_seq();
+
+    let tx = ship
+        .begin_write(&meta("drop"))
+        .await
+        .expect("begin dropped write");
+    assert_eq!(tx.txn_meta().txn_seq, before + 1);
+    drop(tx);
+    assert_eq!(ship.last_write_seq(), before);
+
+    let _ = ship
+        .write_transaction(&meta("abort"), async |_fs| {
+            Err(steward::StewardError::Content(
+                "injected failure".to_string(),
+            ))
+        })
+        .await
+        .expect_err("callback failure must abort");
+    assert_eq!(ship.last_write_seq(), before);
+
+    write_file(&mut ship, "/after.txt", b"after").await;
+    assert_eq!(ship.last_write_seq(), before + 1);
+}
+
+#[tokio::test]
+async fn failed_replay_reuses_its_sequence() {
+    let (_tmp, mut ship) = new_pond("replay-sequence-reuse").await;
+    let before = ship.last_write_seq();
+    let replay_meta = PondTxnMetadata::new(before + 1, meta("replay"));
+
+    let _ = ship
+        .replay_transaction(&replay_meta, |_guard, _fs| {
+            Box::pin(async {
+                Err::<(), _>(steward::StewardError::Content(
+                    "injected replay failure".to_string(),
+                ))
+            })
+        })
+        .await
+        .expect_err("replay callback failure must abort");
+    assert_eq!(ship.last_write_seq(), before);
+
+    let _ = ship
+        .replay_transaction(&replay_meta, |_guard, fs| {
+            Box::pin(async move {
+                let root = fs.root().await?;
+                let _ = create_file_path(&root, "/replayed.txt", b"ok").await?;
+                Ok(())
+            })
+        })
+        .await
+        .expect("retry replay at the same sequence");
+    assert_eq!(ship.last_write_seq(), before + 1);
+    assert_eq!(read_to_string(&mut ship, "/replayed.txt").await, "ok");
 }
 
 /// A source-side change to a node's *metadata alone* replicates.
