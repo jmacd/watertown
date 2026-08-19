@@ -116,6 +116,14 @@ async fn build_recovery_capsule_with_prior(
     prior: Option<&CapsuleManifest>,
 ) -> Result<CapsuleBuild, StewardError> {
     let materialized = crate::content_tree::materialize_content_objects(ship).await?;
+    build_recovery_capsule_from_materialized(ship, &materialized, prior).await
+}
+
+pub(crate) async fn build_recovery_capsule_from_materialized(
+    ship: &Ship,
+    materialized: &crate::content_tree::MaterializedObjects,
+    prior: Option<&CapsuleManifest>,
+) -> Result<CapsuleBuild, StewardError> {
     let (_, manifest_bytes) = materialized.manifest.as_ref().ok_or_else(|| {
         StewardError::Content("materialized pond has no node manifest".to_string())
     })?;
@@ -153,7 +161,7 @@ async fn build_recovery_capsule_with_prior(
                         target.clone()
                     }
                     _ => {
-                        stage_payload(ship, &materialized, native.child_hash, &mut payloads).await?
+                        stage_payload(ship, materialized, native.child_hash, &mut payloads).await?
                     }
                 };
                 CapsuleNode::Symlink { target }
@@ -167,7 +175,7 @@ async fn build_recovery_capsule_with_prior(
                     }
                     _ => {
                         let recipe =
-                            stage_payload(ship, &materialized, native.child_hash, &mut payloads)
+                            stage_payload(ship, materialized, native.child_hash, &mut payloads)
                                 .await?;
                         let bytes = std::fs::read(payloads.path(recipe.hash)).map_err(|error| {
                             StewardError::Content(format!("read staged recipe for {path}: {error}"))
@@ -186,7 +194,7 @@ async fn build_recovery_capsule_with_prior(
             | EntryType::TablePhysicalSeries => {
                 build_physical_node(
                     ship,
-                    &materialized,
+                    materialized,
                     native,
                     &path,
                     prior_node,
@@ -263,6 +271,35 @@ pub async fn open_and_publish_capsule_limited(
                 .map_err(|error| {
                     StewardError::Content(format!("publish recovery capsule: {error}"))
                 })
+        }),
+    )
+    .await
+}
+
+/// List retained capsule generations from a remote under its storage budget.
+pub async fn open_and_list_capsules_limited(
+    url: &str,
+    storage_options: HashMap<String, String>,
+    limits: &mut LimiterSet,
+) -> Result<Vec<(ObjectHash, CapsuleManifest)>, StewardError> {
+    crate::storage_meter::metered_op(
+        url,
+        limits,
+        Box::pin(async move {
+            let remote = sync_store::ContentRemote::open_at_url(url, storage_options)
+                .await
+                .map_err(|error| StewardError::Aborted(format!("open remote {url}: {error}")))?;
+            let roots = remote.capsule_roots().await.map_err(|error| {
+                StewardError::Content(format!("list recovery capsules: {error}"))
+            })?;
+            let mut generations = Vec::with_capacity(roots.len());
+            for root in roots {
+                let manifest = remote.capsule_manifest(root).await.map_err(|error| {
+                    StewardError::Content(format!("read recovery capsule {root}: {error}"))
+                })?;
+                generations.push((root, manifest));
+            }
+            Ok(generations)
         }),
     )
     .await

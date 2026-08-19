@@ -199,11 +199,15 @@ native backup push:
 5. Upload the canonical manifest.
 6. Upload the object list, checksums, runbook, and generated scripts.
 7. Verify the complete generation.
-8. Advance `recovery/refs/latest` last.
+8. Atomically acquire `recovery/locks/publish` and recheck the prior ref.
+9. Advance `recovery/refs/latest` last, merge retained history, and release the
+   lock.
 
 A crash before the final reference update leaves the prior verified capsule
 current. Retrying reuses content-addressed objects and completes the same
-generation.
+generation. A crashed finalizer can leave a stale publication lock; it is never
+stolen automatically. Operators must inspect and explicitly remove a lock older
+than fifteen minutes so two live publishers cannot both believe they own it.
 
 `pond capsule publish <remote>` explicitly publishes or repairs a capsule when
 there has been no new logical pond commit. Normal backup push also attempts

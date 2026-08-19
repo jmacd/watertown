@@ -557,12 +557,19 @@ source-format `pond` binary.
 # Normal successful pushes also do this automatically.
 pond capsule publish azure
 
+# List the current and retained generations at a named remote.
+pond capsule list azure
+
 # Verify and summarize a capsule downloaded into ./recovered/recovery/.
 pond capsule inspect ./recovered
 
 # Verification-only spelling for automation.
 pond capsule verify ./recovered
 ```
+
+Explicit publication reuploads and verifies the full payload closure, repairing
+any stray or corrupt same-name object. Automatic changed-tip publication reuses
+only payloads declared by the prior verified generation.
 
 Each published generation contains `RUNBOOK.txt`, `download-az.sh`, and
 `download-mc.sh`. The scripts embed the immutable capsule root and exact object

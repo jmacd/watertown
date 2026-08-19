@@ -167,10 +167,10 @@ async fn push_content_inner(
         .map_err(|e| StewardError::Content(format!("decode commit-log tip: {e}")))?
         .hash();
 
-    let materialized = materialize_content_objects(ship).await?;
+    let mut materialized = materialize_content_objects(ship).await?;
 
     let mut objects: Vec<(ObjectHash, Vec<u8>)> = Vec::with_capacity(materialized.inline.len() + 2);
-    for (hash, bytes) in materialized.inline {
+    for (hash, bytes) in std::mem::take(&mut materialized.inline) {
         objects.push((hash, bytes));
     }
     // Large blobs (>64KB) live externally under `_large_files/` and are recorded
@@ -218,7 +218,7 @@ async fn push_content_inner(
     // it to adopt the source's node_ids.  Verify it hashes to the commit's
     // recorded manifest hash so the tip can never name a manifest the remote
     // lacks or disagrees with.
-    let (manifest_hash, manifest_bytes) = materialized.manifest.ok_or_else(|| {
+    let (manifest_hash, manifest_bytes) = materialized.manifest.take().ok_or_else(|| {
         StewardError::Content("materialized objects carry no node manifest".to_string())
     })?;
     let commit = sync_store::content::Commit::decode(&commit_bytes)
@@ -249,6 +249,14 @@ async fn push_content_inner(
         .push_commit(&objects, ref_name, tip)
         .await
         .map_err(|e| StewardError::Content(e.to_string()))?;
+    let objects_pushed = objects.len();
+    for (hash, bytes) in objects {
+        if hash == manifest_hash {
+            materialized.manifest = Some((hash, bytes));
+        } else {
+            let _ = materialized.inline.entry(hash).or_insert(bytes);
+        }
+    }
 
     // Publish the portable logical snapshot only after the native ref is
     // durable. A failure leaves the native backup valid and the previous
@@ -266,9 +274,17 @@ async fn push_content_inner(
     } else {
         let capsule = match latest_capsule.as_ref() {
             Some((_, prior)) => {
-                crate::capsule::build_recovery_capsule_incremental(ship, prior).await?
+                crate::capsule::build_recovery_capsule_from_materialized(
+                    ship,
+                    &materialized,
+                    Some(prior),
+                )
+                .await?
             }
-            None => crate::capsule::build_recovery_capsule(ship).await?,
+            None => {
+                crate::capsule::build_recovery_capsule_from_materialized(ship, &materialized, None)
+                    .await?
+            }
         };
         let capsule_outcome = match latest_capsule.as_ref() {
             Some((_, prior)) => {
@@ -301,7 +317,7 @@ async fn push_content_inner(
     Ok(ContentPushOutcome {
         ref_name: ref_name.to_string(),
         tip,
-        objects_pushed: objects.len(),
+        objects_pushed,
         remote_txn_seq,
     })
 }

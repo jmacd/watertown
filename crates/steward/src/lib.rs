@@ -41,7 +41,7 @@ mod write_lock;
 
 pub use capsule::{
     CapsuleBuild, build_recovery_capsule, build_recovery_capsule_incremental,
-    open_and_publish_capsule_limited,
+    open_and_list_capsules_limited, open_and_publish_capsule_limited,
 };
 pub use content_diff::{ContentComparison, ContentDiff, DiffKind, compare_content_trees};
 pub use content_objects::{ObjectInventory, ObjectKind, inventory_content_objects};

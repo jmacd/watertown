@@ -74,3 +74,50 @@ pub async fn capsule_publish_command(ship_context: &ShipContext, name: &str) -> 
     );
     Ok(())
 }
+
+/// List retained recovery-capsule generations at a named remote.
+pub async fn capsule_list_command(ship_context: &ShipContext, name: &str) -> Result<()> {
+    let mut ship = ship_context.open_pond().await?;
+    let attachment = load_remote_attachment(&mut ship, name).await?;
+    let pond = ship
+        .as_pond_mut()
+        .ok_or_else(|| anyhow!("capsule list requires a pond steward"))?;
+    let storage_options = steward::storage_profile::prepare_storage(pond, &attachment).await?;
+    let limit_spec = attachment.resolved_limits()?;
+    let pond = ship
+        .as_pond_mut()
+        .ok_or_else(|| anyhow!("capsule list requires a pond steward"))?;
+    let mut limits = steward::LimiterSet::open(pond, &limit_spec)
+        .await
+        .map_err(|error| anyhow!("bind limiters for remote `{name}`: {error}"))?;
+
+    let generations =
+        steward::open_and_list_capsules_limited(&attachment.url, storage_options, &mut limits)
+            .await;
+
+    let pond = ship
+        .as_pond_mut()
+        .ok_or_else(|| anyhow!("capsule list requires a pond steward"))?;
+    if let Err(error) = limits.commit(pond.control_table_mut()).await {
+        log::warn!("[WARN] capsule list {name}: failed to record limiter usage: {error}");
+    }
+
+    let generations = generations
+        .map_err(|error| anyhow!("capsule list {name} ({}): {error}", attachment.url))?;
+    if generations.is_empty() {
+        log::info!("No recovery capsules are retained at `{name}`.");
+        return Ok(());
+    }
+    for (index, (root, manifest)) in generations.iter().enumerate() {
+        let current = if index == 0 { " current" } else { "" };
+        log::info!(
+            "{}{} source_tip={} exported_at_micros={} entries={}",
+            root,
+            current,
+            manifest.source.source_tip,
+            manifest.source.exported_at_micros,
+            manifest.entries.len()
+        );
+    }
+    Ok(())
+}

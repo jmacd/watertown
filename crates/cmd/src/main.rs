@@ -191,6 +191,11 @@ enum CapsuleCommand {
         /// Backup attachment name.
         name: String,
     },
+    /// List retained generations at a named remote.
+    List {
+        /// Remote attachment name.
+        name: String,
+    },
     /// Verify and summarize a downloaded capsule without opening a pond.
     Inspect {
         /// Directory containing the downloaded `recovery/` tree.
@@ -735,6 +740,9 @@ async fn main() -> Result<()> {
         Commands::Capsule { command } => match command {
             CapsuleCommand::Publish { name } => {
                 commands::capsule_publish_command(&ship_context, &name).await
+            }
+            CapsuleCommand::List { name } => {
+                commands::capsule_list_command(&ship_context, &name).await
             }
             CapsuleCommand::Inspect { path } | CapsuleCommand::Verify { path } => {
                 commands::capsule_inspect_command(&path)
