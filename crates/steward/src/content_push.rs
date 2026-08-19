@@ -250,6 +250,35 @@ async fn push_content_inner(
         .await
         .map_err(|e| StewardError::Content(e.to_string()))?;
 
+    // Publish the portable logical snapshot only after the native ref is
+    // durable. A failure leaves the native backup valid and the previous
+    // capsule current, but fails this push's health result so the next attempt
+    // retries the idempotent trailing publication.
+    let latest_capsule = remote
+        .latest_capsule()
+        .await
+        .map_err(|error| StewardError::Content(format!("inspect recovery capsule: {error}")))?;
+    if latest_capsule
+        .as_ref()
+        .is_some_and(|(_, manifest)| manifest.source.source_tip == tip)
+    {
+        log::info!("[OK] recovery capsule already represents tip {tip}");
+    } else {
+        let capsule = crate::capsule::build_recovery_capsule(ship).await?;
+        let capsule_outcome = remote
+            .publish_capsule(&capsule.manifest, &capsule.payloads)
+            .await
+            .map_err(|error| {
+                StewardError::Content(format!("publish trailing recovery capsule: {error}"))
+            })?;
+        log::info!(
+            "[OK] recovery capsule published (root={}, payloads_uploaded={}, payloads_total={})",
+            capsule_outcome.root,
+            capsule_outcome.payloads_uploaded,
+            capsule_outcome.payloads_total
+        );
+    }
+
     Ok(ContentPushOutcome {
         ref_name: ref_name.to_string(),
         tip,

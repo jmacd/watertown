@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+mod capsule;
 mod content_diff;
 mod content_objects;
 mod content_pull;
@@ -38,6 +39,7 @@ pub mod storage_meter;
 pub mod storage_profile;
 mod write_lock;
 
+pub use capsule::{CapsuleBuild, build_recovery_capsule, open_and_publish_capsule_limited};
 pub use content_diff::{ContentComparison, ContentDiff, DiffKind, compare_content_trees};
 pub use content_objects::{ObjectInventory, ObjectKind, inventory_content_objects};
 pub use content_pull::{

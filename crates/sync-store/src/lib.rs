@@ -39,10 +39,16 @@ pub use azure_registration::{AZURE_SCHEMES, register_azure_handlers};
 pub use s3_registration::register_s3_handlers;
 
 pub use content::{
-    Commit, ManifestEntry, NodeMerkle, ObjectHash, Provenance, TreeEntry, VersionMeta,
-    decode_series, decode_tree, node_merkle_rebuild_root, series_hash, tree_hash,
+    CAPSULE_FORMAT_V1, CapsuleEntry, CapsuleLeaf, CapsuleManifest, CapsuleNode, CapsuleObject,
+    CapsulePayloadKind, CapsuleSource, CapsuleVerifyReport, Commit, IncrementalFileLeafHasher,
+    ManifestEntry, NodeMerkle, ObjectHash, Provenance, TreeEntry, VersionMeta, canonicalize_schema,
+    capsule_leaf_hash, capsule_manifest_bytes, capsule_root, capsule_series_root,
+    decode_capsule_manifest, decode_manifest, decode_recipe, decode_series, decode_tree,
+    encode_canonical_attributes, encode_canonical_schema, encode_capsule_attributes,
+    file_leaf_hash, node_merkle_rebuild_root, schema_fingerprint, series_hash, table_leaf_hash,
+    tree_hash, verify_capsule_directory,
 };
-pub use content_remote::ContentRemote;
+pub use content_remote::{CapsulePublishOutcome, ContentRemote};
 pub use error::{Result, StoreError};
 pub use metered_store::{
     MeterBinding, MeteredStore, Observation, RemoteKey, StorageMeter, bind_meter, observed_under,

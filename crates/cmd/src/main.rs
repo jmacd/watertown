@@ -183,6 +183,26 @@ enum BackupCommand {
     List,
 }
 
+/// Portable recovery-capsule operations.
+#[derive(Debug, Subcommand)]
+enum CapsuleCommand {
+    /// Publish or repair a capsule at a named backup remote.
+    Publish {
+        /// Backup attachment name.
+        name: String,
+    },
+    /// Verify and summarize a downloaded capsule without opening a pond.
+    Inspect {
+        /// Directory containing the downloaded `recovery/` tree.
+        path: PathBuf,
+    },
+    /// Verify a downloaded capsule and all logical leaf identities.
+    Verify {
+        /// Directory containing the downloaded `recovery/` tree.
+        path: PathBuf,
+    },
+}
+
 /// Shared options for `pond remote add` and `pond backup add`.
 #[derive(Debug, Args)]
 struct RemoteAddOptions {
@@ -344,6 +364,11 @@ enum Commands {
     Backup {
         #[command(subcommand)]
         command: BackupCommand,
+    },
+    /// Publish and manage portable recovery capsules.
+    Capsule {
+        #[command(subcommand)]
+        command: CapsuleCommand,
     },
     /// Show or set pond configuration
     Config {
@@ -705,6 +730,14 @@ async fn main() -> Result<()> {
                     Some(commands::RemoteListFilter::BackupsOnly),
                 )
                 .await
+            }
+        },
+        Commands::Capsule { command } => match command {
+            CapsuleCommand::Publish { name } => {
+                commands::capsule_publish_command(&ship_context, &name).await
+            }
+            CapsuleCommand::Inspect { path } | CapsuleCommand::Verify { path } => {
+                commands::capsule_inspect_command(&path)
             }
         },
         Commands::Config { command } => {

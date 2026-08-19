@@ -23,6 +23,7 @@
 | `pond remote remove` | Detach a remote (also works for backups) | `pond remote remove origin` |
 | `pond remote remove --purge` | Detach AND drop the materialized mount entry | `pond remote remove --purge upstream` |
 | `pond push` | Push to push/both-mode remotes | `pond push` |
+| `pond capsule` | Publish or verify a portable recovery snapshot | `pond capsule publish azure` |
 | `pond pull` | Pull from pull/both-mode remotes | `pond pull` |
 | `pond restore` | Bootstrap a whole-pond replica from a backup (disaster recovery) | `pond restore origin file:///mnt/backups/origin` |
 | `pond maintain` | Delta maintenance; `--compact` records a pushable Compact bundle | `pond maintain --compact` |
@@ -537,7 +538,41 @@ pond push origin
 After every write transaction, the steward also auto-pushes all
 `push`/`both`-mode remotes -- so this command is mostly used when an
 earlier auto-push failed (transient network), or right after attaching
-a brand-new remote.
+a brand-new remote. A successful native push is followed by recovery-capsule
+publication. If capsule publication fails, the native backup remains durable
+and the previous verified capsule remains current, but the push reports failure
+so retrying completes the portable backup.
+
+---
+
+### pond capsule
+
+Publish and verify portable logical recovery snapshots. Recovery capsules are
+stored as a canonical manifest plus plain BLAKE3-addressed file and Parquet
+objects, so they can be downloaded with Azure CLI or MinIO Client without a
+source-format `pond` binary.
+
+```bash
+# Explicitly publish or repair the capsule on a named backup.
+# Normal successful pushes also do this automatically.
+pond capsule publish azure
+
+# Verify and summarize a capsule downloaded into ./recovered/recovery/.
+pond capsule inspect ./recovered
+
+# Verification-only spelling for automation.
+pond capsule verify ./recovered
+```
+
+Each published generation contains `RUNBOOK.txt`, `download-az.sh`, and
+`download-mc.sh`. The scripts embed the immutable capsule root and exact object
+list, but no credentials. Download and review a script before running it; use
+managed identity or an already-authenticated client.
+
+Inspection does not open or modify a pond. It validates the latest reference,
+canonical manifest, every physical object hash and size, every Parquet schema,
+every ordered logical file/table leaf hash, and each logical series root.
+See `recovery-capsule-design.md` for the format-upgrade and cleanup design.
 
 ---
 

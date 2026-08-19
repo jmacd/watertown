@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod apply;
+pub mod capsule;
 pub mod cat;
 pub mod control;
 pub mod copy;
@@ -32,6 +33,7 @@ pub mod tlog;
 pub mod verify;
 
 pub use apply::apply_command;
+pub use capsule::{capsule_inspect_command, capsule_publish_command};
 pub use cat::cat_command;
 pub use control::control_command;
 pub use copy::{CopyOptions, copy_command};
