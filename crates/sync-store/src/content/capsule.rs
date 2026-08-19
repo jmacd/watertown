@@ -517,6 +517,189 @@ pub fn verify_capsule_payloads(
     })
 }
 
+/// Deeply verify a candidate manifest against payload files in `objects_dir`.
+///
+/// Each file must be named `blake3=<hash>`. Payloads are loaded and released
+/// one object at a time, so verification does not retain the complete capsule
+/// closure in memory.
+pub fn verify_capsule_payload_directory(
+    manifest: &CapsuleManifest,
+    objects_dir: &Path,
+) -> Result<CapsuleVerifyReport, String> {
+    let root = capsule_root(manifest)?;
+    let objects = manifest.payload_objects()?;
+    let mut physical_bytes = 0u64;
+    for object in &objects {
+        verify_payload_file(objects_dir, object)?;
+        physical_bytes = physical_bytes
+            .checked_add(object.size)
+            .ok_or_else(|| "capsule physical byte count exceeds u64::MAX".to_string())?;
+    }
+
+    let mut logical_count = 0u64;
+    for entry in &manifest.entries {
+        if let CapsuleNode::Physical {
+            payload_kind,
+            schema_fingerprint,
+            logical_root,
+            objects,
+            leaves,
+        } = &entry.node
+        {
+            match payload_kind {
+                CapsulePayloadKind::File => {
+                    verify_file_stream_directory(objects_dir, &entry.path, objects, leaves)?;
+                }
+                CapsulePayloadKind::Table => {
+                    verify_table_stream(
+                        &mut |hash| {
+                            std::fs::read(objects_dir.join(format!("blake3={}", hash.to_hex())))
+                                .map_err(|error| {
+                                    format!("read staged capsule payload {hash}: {error}")
+                                })
+                        },
+                        &entry.path,
+                        schema_fingerprint.ok_or_else(|| {
+                            format!("table {} has no schema fingerprint", entry.path)
+                        })?,
+                        objects,
+                        leaves,
+                    )?;
+                }
+            }
+            let computed = capsule_series_root(*payload_kind, *schema_fingerprint, leaves);
+            if computed != *logical_root {
+                return Err(format!(
+                    "capsule path {:?} series root mismatch",
+                    entry.path
+                ));
+            }
+            for leaf in leaves {
+                logical_count = logical_count
+                    .checked_add(leaf.logical_count)
+                    .ok_or_else(|| "capsule logical count exceeds u64::MAX".to_string())?;
+            }
+        }
+    }
+
+    Ok(CapsuleVerifyReport {
+        root,
+        entries: manifest.entries.len(),
+        payload_objects: objects.len(),
+        physical_bytes,
+        logical_count,
+    })
+}
+
+fn verify_payload_file(objects_dir: &Path, object: &CapsuleObject) -> Result<(), String> {
+    let mut file =
+        std::fs::File::open(objects_dir.join(format!("blake3={}", object.hash.to_hex())))
+            .map_err(|error| format!("open staged capsule payload {}: {error}", object.hash))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut size = 0u64;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let count = std::io::Read::read(&mut file, &mut buffer)
+            .map_err(|error| format!("read staged capsule payload {}: {error}", object.hash))?;
+        if count == 0 {
+            break;
+        }
+        let _ = hasher.update(&buffer[..count]);
+        size = size
+            .checked_add(count as u64)
+            .ok_or_else(|| format!("capsule payload {} exceeds u64::MAX", object.hash))?;
+    }
+    let computed = ObjectHash::from_bytes(*hasher.finalize().as_bytes());
+    if computed != object.hash || size != object.size {
+        return Err(format!(
+            "capsule payload {} has hash {computed} and size {size}, expected size {}",
+            object.hash, object.size
+        ));
+    }
+    Ok(())
+}
+
+fn verify_file_stream_directory(
+    objects_dir: &Path,
+    path: &str,
+    objects: &[CapsuleObject],
+    leaves: &[CapsuleLeaf],
+) -> Result<(), String> {
+    let mut leaf_index = 0usize;
+    let mut hasher = leaves
+        .first()
+        .map(new_file_leaf_hasher)
+        .transpose()
+        .map_err(|error| format!("prepare file {path:?} leaf 0: {error}"))?;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    for object in objects {
+        let mut file =
+            std::fs::File::open(objects_dir.join(format!("blake3={}", object.hash.to_hex())))
+                .map_err(|error| format!("open file {path:?} object {}: {error}", object.hash))?;
+        loop {
+            let count = std::io::Read::read(&mut file, &mut buffer)
+                .map_err(|error| format!("read file {path:?} object {}: {error}", object.hash))?;
+            if count == 0 {
+                break;
+            }
+            let mut offset = 0usize;
+            while offset < count {
+                let current = hasher.as_mut().ok_or_else(|| {
+                    format!("file {path:?} has bytes after its final logical leaf")
+                })?;
+                let take = usize::try_from(current.remaining())
+                    .unwrap_or(usize::MAX)
+                    .min(count - offset);
+                current
+                    .write(&buffer[offset..offset + take])
+                    .map_err(|error| format!("hash file {path:?} leaf {leaf_index}: {error}"))?;
+                offset += take;
+                if current.remaining() == 0 {
+                    let computed = hasher
+                        .take()
+                        .expect("completed file leaf hasher exists")
+                        .finish()
+                        .map_err(|error| {
+                            format!("finish file {path:?} leaf {leaf_index}: {error}")
+                        })?;
+                    if computed != leaves[leaf_index].logical_hash {
+                        return Err(format!(
+                            "file {path:?} leaf {leaf_index} hashes to {computed}, manifest names {}",
+                            leaves[leaf_index].logical_hash
+                        ));
+                    }
+                    leaf_index += 1;
+                    hasher = leaves
+                        .get(leaf_index)
+                        .map(new_file_leaf_hasher)
+                        .transpose()
+                        .map_err(|error| {
+                            format!("prepare file {path:?} leaf {leaf_index}: {error}")
+                        })?;
+                }
+            }
+        }
+    }
+    if leaf_index != leaves.len() {
+        return Err(format!(
+            "file {path:?} ended after {leaf_index} of {} logical leaves",
+            leaves.len()
+        ));
+    }
+    Ok(())
+}
+
+fn new_file_leaf_hasher(
+    leaf: &CapsuleLeaf,
+) -> Result<super::series_leaf::IncrementalFileLeafHasher, String> {
+    super::series_leaf::IncrementalFileLeafHasher::new(
+        leaf.logical_count,
+        leaf.min_event_time,
+        leaf.max_event_time,
+        leaf.logical_attributes.as_deref().map(str::as_bytes),
+    )
+}
+
 fn verify_capsule_with<F>(
     root: ObjectHash,
     manifest: &CapsuleManifest,

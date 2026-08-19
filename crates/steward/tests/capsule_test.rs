@@ -50,6 +50,8 @@ async fn builds_portable_live_inventory_with_ordered_series_leaves() {
         let root = transaction.root().await?;
         let _ = root.create_dir_all("/data").await?;
         let _ = create_file_path(&root, "/data/plain.txt", b"plain").await?;
+        let large = vec![0x5a; 256 * 1024];
+        let _ = create_file_path(&root, "/data/large.bin", &large).await?;
 
         for bytes in [b"first".as_slice(), b"second".as_slice()] {
             let mut writer = root
@@ -87,8 +89,10 @@ async fn builds_portable_live_inventory_with_ordered_series_leaves() {
         capsule.manifest.payload_objects().expect("objects").len(),
         capsule.payloads.len()
     );
-    for (hash, bytes) in &capsule.payloads {
-        assert_eq!(*hash, ObjectHash::of_bytes(bytes));
+    for object in capsule.payloads.objects() {
+        let bytes = std::fs::read(capsule.payloads.path(object.hash)).expect("staged payload");
+        assert_eq!(object.hash, ObjectHash::of_bytes(&bytes));
+        assert_eq!(object.size, bytes.len() as u64);
     }
 
     let paths: Vec<&str> = capsule
@@ -102,6 +106,7 @@ async fn builds_portable_live_inventory_with_ordered_series_leaves() {
         vec![
             "/",
             "/data",
+            "/data/large.bin",
             "/data/log.series",
             "/data/plain.txt",
             "/data/table.series"
@@ -167,6 +172,6 @@ async fn builds_portable_live_inventory_with_ordered_series_leaves() {
         .await
         .expect("push with capsule");
     let verified = verify_capsule_directory(&remote_path).expect("verify downloaded capsule");
-    assert_eq!(verified.entries, 5);
-    assert_eq!(verified.logical_count, 18);
+    assert_eq!(verified.entries, 6);
+    assert_eq!(verified.logical_count, 18 + 256 * 1024);
 }

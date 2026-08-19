@@ -38,7 +38,7 @@ use uuid::Uuid;
 
 use crate::content::{
     CapsuleManifest, ObjectHash, capsule_manifest_bytes, capsule_root, decode_capsule_manifest,
-    verify_capsule_payloads,
+    verify_capsule_payload_directory, verify_capsule_payloads,
 };
 use crate::error::{Result, StoreError};
 use crate::store::{Op, Store};
@@ -367,8 +367,41 @@ impl ContentRemote {
     where
         R: tokio::io::AsyncRead + Unpin,
     {
+        self.put_hashed_object(Self::blob_path(hash), hash, None, &mut reader)
+            .await
+    }
+
+    async fn put_hashed_object<R>(
+        &self,
+        path: object_store::path::Path,
+        hash: ObjectHash,
+        expected_size: Option<u64>,
+        mut reader: R,
+    ) -> Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
         use tokio::io::AsyncReadExt;
-        let path = Self::blob_path(hash);
+        if expected_size == Some(0) {
+            let mut probe = [0u8; 1];
+            let count = reader.read(&mut probe).await.map_err(|error| {
+                StoreError::Invariant(format!("read empty streamed object: {error}"))
+            })?;
+            let empty_hash = ObjectHash::of_bytes(&[]);
+            if count != 0 || hash != empty_hash {
+                return Err(StoreError::Invariant(format!(
+                    "streamed object is not the declared empty payload {hash}"
+                )));
+            }
+            self.store
+                .object_store()
+                .put(&path, Vec::new().into())
+                .await
+                .map_err(|error| {
+                    StoreError::Invariant(format!("publish empty streamed object: {error}"))
+                })?;
+            return Ok(());
+        }
         let upload = self
             .store
             .object_store()
@@ -378,6 +411,7 @@ impl ContentRemote {
         let mut upload = upload;
         let mut parts = FuturesUnordered::new();
         let mut hasher = blake3::Hasher::new();
+        let mut size = 0u64;
 
         loop {
             if parts.len() >= Self::MAX_INFLIGHT_UPLOAD_PARTS {
@@ -417,6 +451,19 @@ impl ContentRemote {
                     break;
                 }
                 hasher.update(&part[filled..filled + n]);
+                size = match size.checked_add(n as u64) {
+                    Some(size) => size,
+                    None => {
+                        drop(parts);
+                        let abort = upload.abort().await;
+                        return Err(StoreError::Invariant(match abort {
+                            Ok(()) => "streamed object exceeds u64::MAX".to_string(),
+                            Err(abort_error) => format!(
+                                "streamed object exceeds u64::MAX; abort failed: {abort_error}"
+                            ),
+                        }));
+                    }
+                };
                 filled += n;
             }
             if filled == 0 {
@@ -431,16 +478,17 @@ impl ContentRemote {
         // `finish()`, so aborting here discards the staged parts and a value is
         // never stored under a key it does not equal -- no temporary key needed.
         let computed = ObjectHash::from_bytes(*hasher.finalize().as_bytes());
-        if computed != hash {
+        if computed != hash || expected_size.is_some_and(|expected| expected != size) {
             drop(parts);
             upload
                 .abort()
                 .await
                 .map_err(|e| StoreError::Invariant(format!("blob abort: {e}")))?;
             return Err(StoreError::Invariant(format!(
-                "blob bytes hash to {} but were offered under {}",
+                "streamed object has hash {} and size {size}, expected hash {} and size {:?}",
                 computed.to_hex(),
-                hash.to_hex()
+                hash.to_hex(),
+                expected_size
             )));
         }
 
@@ -553,6 +601,61 @@ impl ContentRemote {
             uploaded += 1;
         }
 
+        self.finish_capsule_publication(root, manifest_bytes, &declared, uploaded)
+            .await
+    }
+
+    /// Publish a capsule whose payload closure is staged as
+    /// `blake3=<hash>` files in `objects_dir`.
+    ///
+    /// Payload files are verified before publication and loaded one at a time,
+    /// avoiding retention of the complete capsule closure in memory.
+    pub async fn publish_capsule_directory(
+        &self,
+        manifest: &CapsuleManifest,
+        objects_dir: &Path,
+    ) -> Result<CapsulePublishOutcome> {
+        let root = capsule_root(manifest).map_err(StoreError::Invariant)?;
+        let manifest_bytes = capsule_manifest_bytes(manifest).map_err(StoreError::Invariant)?;
+        let declared = manifest.payload_objects().map_err(StoreError::Invariant)?;
+        verify_capsule_payload_directory(manifest, objects_dir).map_err(StoreError::Invariant)?;
+
+        let present = self.list_capsule_payloads().await?;
+        let mut uploaded = 0usize;
+        for object in &declared {
+            if present.contains(&object.hash) {
+                continue;
+            }
+            let source = objects_dir.join(format!("blake3={}", object.hash.to_hex()));
+            let file = tokio::fs::File::open(&source).await.map_err(|error| {
+                StoreError::Invariant(format!(
+                    "open staged capsule payload {}: {error}",
+                    object.hash
+                ))
+            })?;
+            let path = Self::capsule_payload_path(object.hash);
+            self.put_hashed_object(path, object.hash, Some(object.size), file)
+                .await
+                .map_err(|error| {
+                    StoreError::Invariant(format!(
+                        "publish capsule payload {}: {error}",
+                        object.hash
+                    ))
+                })?;
+            uploaded += 1;
+        }
+
+        self.finish_capsule_publication(root, manifest_bytes, &declared, uploaded)
+            .await
+    }
+
+    async fn finish_capsule_publication(
+        &self,
+        root: ObjectHash,
+        manifest_bytes: Vec<u8>,
+        declared: &[crate::content::CapsuleObject],
+        uploaded: usize,
+    ) -> Result<CapsulePublishOutcome> {
         let manifest_path = Self::capsule_manifest_path(root);
         self.store
             .object_store()
@@ -560,8 +663,8 @@ impl ContentRemote {
             .await
             .map_err(|error| StoreError::Invariant(format!("publish capsule manifest: {error}")))?;
 
-        let object_list = capsule_object_list(root, &declared);
-        let checksums = capsule_checksums(&declared);
+        let object_list = capsule_object_list(root, declared);
+        let checksums = capsule_checksums(declared);
         let artifacts = [
             ("objects.list", object_list.into_bytes()),
             ("checksums", checksums.into_bytes()),

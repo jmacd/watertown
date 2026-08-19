@@ -46,7 +46,7 @@ pub use content::{
     decode_capsule_manifest, decode_manifest, decode_recipe, decode_series, decode_tree,
     encode_canonical_attributes, encode_canonical_schema, encode_capsule_attributes,
     file_leaf_hash, node_merkle_rebuild_root, schema_fingerprint, series_hash, table_leaf_hash,
-    tree_hash, verify_capsule_directory,
+    tree_hash, verify_capsule_directory, verify_capsule_payload_directory,
 };
 pub use content_remote::{CapsulePublishOutcome, ContentRemote};
 pub use error::{Result, StoreError};

@@ -3,16 +3,16 @@
 //! Build a format-independent recovery capsule from the current live pond.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
-use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use sync_store::{
     CapsuleEntry, CapsuleLeaf, CapsuleManifest, CapsuleNode, CapsuleObject, CapsulePayloadKind,
-    CapsuleSource, ObjectHash, capsule_series_root, decode_manifest, decode_recipe, decode_series,
-    encode_canonical_attributes, file_leaf_hash, schema_fingerprint, table_leaf_hash,
+    CapsuleSource, IncrementalFileLeafHasher, ObjectHash, capsule_series_root, decode_manifest,
+    decode_recipe, decode_series, encode_canonical_attributes, schema_fingerprint, table_leaf_hash,
 };
 use tinyfs::EntryType;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{LimiterSet, Ship, StewardError};
 
@@ -21,16 +21,64 @@ use crate::{LimiterSet, Ship, StewardError};
 pub struct CapsuleBuild {
     /// Canonical logical snapshot.
     pub manifest: CapsuleManifest,
-    /// Distinct payload bytes keyed by their BLAKE3 content address.
-    pub payloads: BTreeMap<ObjectHash, Vec<u8>>,
+    /// Distinct payloads staged on disk by BLAKE3 content address.
+    pub payloads: CapsulePayloads,
+}
+
+/// Disk-backed capsule payload closure.
+#[derive(Debug)]
+pub struct CapsulePayloads {
+    directory: tempfile::TempDir,
+    objects: BTreeMap<ObjectHash, CapsuleObject>,
+}
+
+impl CapsulePayloads {
+    fn new() -> Result<Self, StewardError> {
+        Ok(Self {
+            directory: tempfile::tempdir().map_err(|error| {
+                StewardError::Content(format!("create capsule staging directory: {error}"))
+            })?,
+            objects: BTreeMap::new(),
+        })
+    }
+
+    /// Directory containing payload files named `blake3=<hash>`.
+    #[must_use]
+    pub fn objects_dir(&self) -> &Path {
+        self.directory.path()
+    }
+
+    /// Number of distinct staged payload objects.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.objects.len()
+    }
+
+    /// Whether no payload objects are staged.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.objects.is_empty()
+    }
+
+    /// Path of a staged payload.
+    #[must_use]
+    pub fn path(&self, hash: ObjectHash) -> PathBuf {
+        self.directory
+            .path()
+            .join(format!("blake3={}", hash.to_hex()))
+    }
+
+    /// Staged payload descriptors in hash order.
+    pub fn objects(&self) -> impl Iterator<Item = &CapsuleObject> {
+        self.objects.values()
+    }
 }
 
 /// Build a recovery capsule from the pond's current immutable content tip.
 ///
-/// This phase-one implementation retains the complete payload closure in
-/// memory. It must be replaced with bounded staging/streaming before publishing
-/// a production-sized first capsule; that change does not affect the wire
-/// contract.
+/// Payloads are staged on disk and released from memory one source object at a
+/// time. A single native table leaf is still decoded as one unit while its
+/// logical hash is computed.
 ///
 /// # Errors
 ///
@@ -56,7 +104,7 @@ pub async fn build_recovery_capsule(ship: &Ship) -> Result<CapsuleBuild, Steward
         .map_err(|error| StewardError::Content(format!("decode content tip: {error}")))?;
     let source_tip = source_commit.hash();
 
-    let mut payloads = BTreeMap::new();
+    let mut payloads = CapsulePayloads::new()?;
     let mut entries = Vec::with_capacity(native_entries.len());
     for native in &native_entries {
         let path = paths
@@ -66,17 +114,20 @@ pub async fn build_recovery_capsule(ship: &Ship) -> Result<CapsuleBuild, Steward
         let node = match native.entry_type {
             EntryType::DirectoryPhysical => CapsuleNode::Directory,
             EntryType::Symlink => {
-                let bytes = object_bytes(ship, &materialized, native.child_hash).await?;
-                let target = insert_payload(&mut payloads, bytes)?;
+                let target =
+                    stage_payload(ship, &materialized, native.child_hash, &mut payloads).await?;
                 CapsuleNode::Symlink { target }
             }
 
             EntryType::DirectoryDynamic | EntryType::FileDynamic | EntryType::TableDynamic => {
-                let bytes = object_bytes(ship, &materialized, native.child_hash).await?;
+                let recipe =
+                    stage_payload(ship, &materialized, native.child_hash, &mut payloads).await?;
+                let bytes = std::fs::read(payloads.path(recipe.hash)).map_err(|error| {
+                    StewardError::Content(format!("read staged recipe for {path}: {error}"))
+                })?;
                 let _ = decode_recipe(&bytes).map_err(|error| {
                     StewardError::Content(format!("decode recipe for {path}: {error}"))
                 })?;
-                let recipe = insert_payload(&mut payloads, bytes)?;
                 CapsuleNode::Dynamic { recipe }
             }
             EntryType::FilePhysicalVersion
@@ -111,7 +162,7 @@ pub async fn build_recovery_capsule(ship: &Ship) -> Result<CapsuleBuild, Steward
         .into_iter()
         .map(|object| object.hash)
         .collect();
-    let actual: HashSet<ObjectHash> = payloads.keys().copied().collect();
+    let actual: HashSet<ObjectHash> = payloads.objects.keys().copied().collect();
     if declared != actual {
         return Err(StewardError::Content(
             "capsule payload closure differs from materialized payloads".to_string(),
@@ -139,7 +190,7 @@ pub async fn open_and_publish_capsule_limited(
                 .await
                 .map_err(|error| StewardError::Aborted(format!("open remote {url}: {error}")))?;
             remote
-                .publish_capsule(&capsule.manifest, &capsule.payloads)
+                .publish_capsule_directory(&capsule.manifest, capsule.payloads.objects_dir())
                 .await
                 .map_err(|error| {
                     StewardError::Content(format!("publish recovery capsule: {error}"))
@@ -154,7 +205,7 @@ async fn build_physical_node(
     materialized: &crate::content_tree::MaterializedObjects,
     native: &sync_store::ManifestEntry,
     path: &str,
-    payloads: &mut BTreeMap<ObjectHash, Vec<u8>>,
+    payloads: &mut CapsulePayloads,
 ) -> Result<CapsuleNode, StewardError> {
     let payload_kind = match native.entry_type {
         EntryType::FilePhysicalVersion | EntryType::FilePhysicalSeries => CapsulePayloadKind::File,
@@ -193,12 +244,8 @@ async fn build_physical_node(
     let mut leaves = Vec::new();
     let mut table_schema: Option<ObjectHash> = None;
     for (hash, metadata) in hashes.into_iter().zip(&native.versions) {
-        let bytes = object_bytes(ship, materialized, hash).await?;
-        if ObjectHash::of_bytes(&bytes) != hash {
-            return Err(StewardError::Content(format!(
-                "payload for {path} does not hash to {hash}"
-            )));
-        }
+        let object = stage_payload(ship, materialized, hash, payloads).await?;
+        let staged_path = payloads.path(hash);
         let attributes = metadata
             .extended_attributes
             .as_deref()
@@ -214,31 +261,46 @@ async fn build_physical_node(
 
         let (logical_hash, logical_count, schema) = match payload_kind {
             CapsulePayloadKind::File => {
-                if bytes.is_empty() {
+                if object.size == 0 {
+                    let _ = payloads.objects.remove(&hash);
                     continue;
                 }
-                let logical_hash = file_leaf_hash(
-                    &bytes,
+                let mut leaf_hasher = IncrementalFileLeafHasher::new(
+                    object.size,
                     metadata.min_event_time,
                     metadata.max_event_time,
-                    attributes.as_deref(),
+                    attributes.as_deref().map(str::as_bytes),
                 )
                 .map_err(|error| {
                     StewardError::Content(format!("hash file leaf for {path}: {error}"))
                 })?;
-                (
-                    logical_hash,
-                    u64::try_from(bytes.len()).map_err(|_| {
-                        StewardError::Content(format!("file leaf for {path} exceeds u64::MAX"))
-                    })?,
-                    None,
-                )
+                let mut file = std::fs::File::open(&staged_path).map_err(|error| {
+                    StewardError::Content(format!("open staged file leaf for {path}: {error}"))
+                })?;
+                let mut buffer = vec![0u8; 1024 * 1024];
+                loop {
+                    let count = std::io::Read::read(&mut file, &mut buffer).map_err(|error| {
+                        StewardError::Content(format!("read staged file leaf for {path}: {error}"))
+                    })?;
+                    if count == 0 {
+                        break;
+                    }
+                    leaf_hasher.write(&buffer[..count]).map_err(|error| {
+                        StewardError::Content(format!("hash file leaf for {path}: {error}"))
+                    })?;
+                }
+                let logical_hash = leaf_hasher.finish().map_err(|error| {
+                    StewardError::Content(format!("finish file leaf for {path}: {error}"))
+                })?;
+                (logical_hash, object.size, None)
             }
             CapsulePayloadKind::Table => {
-                let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes.clone()))
-                    .map_err(|error| {
-                        StewardError::Content(format!("open Parquet leaf for {path}: {error}"))
-                    })?;
+                let file = std::fs::File::open(&staged_path).map_err(|error| {
+                    StewardError::Content(format!("open staged table leaf for {path}: {error}"))
+                })?;
+                let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| {
+                    StewardError::Content(format!("open Parquet leaf for {path}: {error}"))
+                })?;
                 let schema = builder.schema().as_ref().clone();
                 let fingerprint = schema_fingerprint(&schema).map_err(|error| {
                     StewardError::Content(format!("fingerprint table schema for {path}: {error}"))
@@ -268,7 +330,7 @@ async fn build_physical_node(
                     })
                 })?;
                 if logical_count == 0 {
-                    objects.push(insert_payload(payloads, bytes)?);
+                    objects.push(object);
                     continue;
                 }
                 let logical_hash = table_leaf_hash(
@@ -287,7 +349,7 @@ async fn build_physical_node(
         if let Some(schema) = schema {
             table_schema = Some(schema);
         }
-        objects.push(insert_payload(payloads, bytes)?);
+        objects.push(object);
         leaves.push(CapsuleLeaf {
             logical_hash,
             logical_count,
@@ -312,13 +374,17 @@ async fn build_physical_node(
     })
 }
 
-async fn object_bytes(
+async fn stage_payload(
     ship: &Ship,
     materialized: &crate::content_tree::MaterializedObjects,
     hash: ObjectHash,
-) -> Result<Vec<u8>, StewardError> {
+    payloads: &mut CapsulePayloads,
+) -> Result<CapsuleObject, StewardError> {
+    if let Some(existing) = payloads.objects.get(&hash) {
+        return Ok(existing.clone());
+    }
     if let Some(bytes) = materialized.inline.get(&hash) {
-        return Ok(bytes.clone());
+        return insert_payload(payloads, bytes.clone());
     }
     if !materialized.external_blobs.contains(&hash) {
         return Err(StewardError::Content(format!(
@@ -330,29 +396,72 @@ async fn object_bytes(
         .open_large_file_reader_by_hash(&hash.to_hex())
         .await
         .map_err(|error| StewardError::Content(format!("open large file {hash}: {error}")))?;
-    let mut bytes = Vec::new();
-    let _ = reader
-        .read_to_end(&mut bytes)
+    let partial = payloads
+        .objects_dir()
+        .join(format!(".partial-{}", hash.to_hex()));
+    let mut file = tokio::fs::File::create(&partial).await.map_err(|error| {
+        StewardError::Content(format!("create staged capsule payload {hash}: {error}"))
+    })?;
+    let mut hasher = blake3::Hasher::new();
+    let mut size = 0u64;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|error| StewardError::Content(format!("read large file {hash}: {error}")))?;
+        if count == 0 {
+            break;
+        }
+        size = size.checked_add(count as u64).ok_or_else(|| {
+            StewardError::Content(format!("capsule payload {hash} exceeds u64::MAX"))
+        })?;
+        let _ = hasher.update(&buffer[..count]);
+        file.write_all(&buffer[..count])
+            .await
+            .map_err(|error| StewardError::Content(format!("stage large file {hash}: {error}")))?;
+    }
+    file.flush().await.map_err(|error| {
+        StewardError::Content(format!("flush staged capsule payload {hash}: {error}"))
+    })?;
+    drop(file);
+    let computed = ObjectHash::from_bytes(*hasher.finalize().as_bytes());
+    if computed != hash {
+        let _ = tokio::fs::remove_file(&partial).await;
+        return Err(StewardError::Content(format!(
+            "payload bytes hash to {computed}, expected {hash}"
+        )));
+    }
+    tokio::fs::rename(&partial, payloads.path(hash))
         .await
-        .map_err(|error| StewardError::Content(format!("read large file {hash}: {error}")))?;
-    Ok(bytes)
+        .map_err(|error| {
+            StewardError::Content(format!("finish staged capsule payload {hash}: {error}"))
+        })?;
+    let object = CapsuleObject { hash, size };
+    let _ = payloads.objects.insert(hash, object.clone());
+    Ok(object)
 }
 
 fn insert_payload(
-    payloads: &mut BTreeMap<ObjectHash, Vec<u8>>,
+    payloads: &mut CapsulePayloads,
     bytes: Vec<u8>,
 ) -> Result<CapsuleObject, StewardError> {
     let hash = ObjectHash::of_bytes(&bytes);
     let size = u64::try_from(bytes.len())
         .map_err(|_| StewardError::Content("capsule payload exceeds u64::MAX".to_string()))?;
-    if let Some(existing) = payloads.insert(hash, bytes.clone())
-        && existing != bytes
-    {
-        return Err(StewardError::Content(format!(
-            "capsule payload hash collision at {hash}"
-        )));
+    let object = CapsuleObject { hash, size };
+    if let Some(existing) = payloads.objects.get(&hash) {
+        if existing.size != size {
+            return Err(StewardError::Content(format!(
+                "capsule payload hash collision at {hash}"
+            )));
+        }
+        return Ok(existing.clone());
     }
-    Ok(CapsuleObject { hash, size })
+    std::fs::write(payloads.path(hash), &bytes)
+        .map_err(|error| StewardError::Content(format!("stage capsule payload {hash}: {error}")))?;
+    let _ = payloads.objects.insert(hash, object.clone());
+    Ok(object)
 }
 
 fn resolve_paths(

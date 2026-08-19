@@ -55,7 +55,8 @@ pub use capsule::{
     CAPSULE_FORMAT_V1, CapsuleEntry, CapsuleLeaf, CapsuleManifest, CapsuleNode, CapsuleObject,
     CapsulePayloadKind, CapsuleSource, CapsuleVerifyReport, capsule_leaf_hash,
     capsule_manifest_bytes, capsule_root, capsule_series_root, decode_capsule_manifest,
-    encode_capsule_attributes, verify_capsule_directory, verify_capsule_payloads,
+    encode_capsule_attributes, verify_capsule_directory, verify_capsule_payload_directory,
+    verify_capsule_payloads,
 };
 pub use commit::{Commit, Provenance};
 pub use manifest::{ManifestEntry, decode_manifest, encode_manifest, manifest_hash};

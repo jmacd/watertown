@@ -266,7 +266,7 @@ async fn push_content_inner(
     } else {
         let capsule = crate::capsule::build_recovery_capsule(ship).await?;
         let capsule_outcome = remote
-            .publish_capsule(&capsule.manifest, &capsule.payloads)
+            .publish_capsule_directory(&capsule.manifest, capsule.payloads.objects_dir())
             .await
             .map_err(|error| {
                 StewardError::Content(format!("publish trailing recovery capsule: {error}"))
