@@ -450,68 +450,96 @@ pub(crate) fn encode_canonical_rows(
     schema: &Schema,
     batches: &[RecordBatch],
 ) -> Result<Vec<u8>, String> {
-    let resolved_fields: Vec<DataType> = schema
-        .fields()
-        .iter()
-        .map(|f| {
-            canonical_data_type(f.data_type()).map_err(|e| format!("field {:?}: {e}", f.name()))
-        })
-        .collect::<Result<_, _>>()?;
-
-    let mut row_count: u64 = 0;
-    for batch in batches {
-        row_count += batch.num_rows() as u64;
-    }
+    let row_count = batches.iter().try_fold(0u64, |total, batch| {
+        total
+            .checked_add(batch.num_rows() as u64)
+            .ok_or_else(|| "table row count exceeds u64::MAX".to_string())
+    })?;
 
     let mut buf = Vec::new();
     buf.extend_from_slice(ROWS_MAGIC);
     buf.extend_from_slice(&row_count.to_le_bytes());
 
     for (batch_idx, batch) in batches.iter().enumerate() {
-        if batch.num_columns() != resolved_fields.len() {
-            return Err(format!(
-                "batch {batch_idx}: {} column(s) does not match schema's {} field(s)",
-                batch.num_columns(),
-                resolved_fields.len()
-            ));
-        }
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
-        for (col_idx, resolved) in resolved_fields.iter().enumerate() {
-            let array = batch.column(col_idx).as_ref();
-            let actual = canonical_data_type(array.data_type()).map_err(|e| {
-                format!(
-                    "batch {batch_idx} column {col_idx} ({:?}): {e}",
-                    schema.field(col_idx).name()
-                )
-            })?;
-            if &actual != resolved {
-                return Err(format!(
-                    "batch {batch_idx} column {col_idx} ({:?}): array type {:?} does not match \
-                     schema field type {:?}",
-                    schema.field(col_idx).name(),
-                    array.data_type(),
-                    schema.field(col_idx).data_type(),
-                ));
-            }
-            let canonical = if matches!(array.data_type(), DataType::Dictionary(_, _)) {
-                arrow::compute::cast(array, resolved).map_err(|e| {
-                    format!(
-                        "batch {batch_idx} column {col_idx} ({:?}): normalize dictionary: {e}",
-                        schema.field(col_idx).name()
-                    )
-                })?
-            } else {
-                batch.column(col_idx).clone()
-            };
-            columns.push(canonical);
-        }
-        for row in 0..batch.num_rows() {
-            for array in &columns {
-                encode_scalar(array.as_ref(), row, &mut buf)?;
-            }
-        }
+        buf.extend_from_slice(&encode_canonical_batch_rows_at(schema, batch, batch_idx)?);
     }
     Ok(buf)
+}
+
+/// Encode one record batch's canonical scalar rows without the table payload
+/// magic or total-row-count prefix.
+///
+/// Concatenating this output for batches in order after
+/// `dp.series-rows.1\n` and the total `u64` row count produces exactly the
+/// payload encoded by the logical table identity protocol.
+///
+/// # Errors
+///
+/// Returns an error for unsupported or schema-incompatible arrays.
+pub fn encode_canonical_batch_rows(
+    schema: &Schema,
+    batch: &RecordBatch,
+) -> Result<Vec<u8>, String> {
+    encode_canonical_batch_rows_at(schema, batch, 0)
+}
+
+fn encode_canonical_batch_rows_at(
+    schema: &Schema,
+    batch: &RecordBatch,
+    batch_idx: usize,
+) -> Result<Vec<u8>, String> {
+    let resolved_fields: Vec<DataType> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            canonical_data_type(field.data_type())
+                .map_err(|error| format!("field {:?}: {error}", field.name()))
+        })
+        .collect::<Result<_, _>>()?;
+    if batch.num_columns() != resolved_fields.len() {
+        return Err(format!(
+            "batch {batch_idx}: {} column(s) does not match schema's {} field(s)",
+            batch.num_columns(),
+            resolved_fields.len()
+        ));
+    }
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for (col_idx, resolved) in resolved_fields.iter().enumerate() {
+        let array = batch.column(col_idx).as_ref();
+        let actual = canonical_data_type(array.data_type()).map_err(|error| {
+            format!(
+                "batch {batch_idx} column {col_idx} ({:?}): {error}",
+                schema.field(col_idx).name()
+            )
+        })?;
+        if &actual != resolved {
+            return Err(format!(
+                "batch {batch_idx} column {col_idx} ({:?}): array type {:?} does not match \
+                 schema field type {:?}",
+                schema.field(col_idx).name(),
+                array.data_type(),
+                schema.field(col_idx).data_type(),
+            ));
+        }
+        let canonical = if matches!(array.data_type(), DataType::Dictionary(_, _)) {
+            arrow::compute::cast(array, resolved).map_err(|error| {
+                format!(
+                    "batch {batch_idx} column {col_idx} ({:?}): normalize dictionary: {error}",
+                    schema.field(col_idx).name()
+                )
+            })?
+        } else {
+            batch.column(col_idx).clone()
+        };
+        columns.push(canonical);
+    }
+    let mut rows = Vec::new();
+    for row in 0..batch.num_rows() {
+        for array in &columns {
+            encode_scalar(array.as_ref(), row, &mut rows)?;
+        }
+    }
+    Ok(rows)
 }
 
 /// Emit one JSON string with a project-owned, stable escape policy.
@@ -802,6 +830,138 @@ pub fn file_leaf_hash_canonical(
         max_event_time,
         canonical_logical_attributes.unwrap_or(&[]),
     ))
+}
+
+/// Incremental equivalent of [`table_leaf_hash_canonical`].
+///
+/// Callers first scan record batches to total their canonical row-byte length,
+/// then construct this hasher and feed the same batches again. Only one
+/// canonicalized record batch is retained at a time.
+pub struct IncrementalTableLeafHasher {
+    hasher: blake3::Hasher,
+    schema: Schema,
+    logical_count: u64,
+    rows_written: u64,
+    canonical_rows_len: u64,
+    canonical_rows_written: u64,
+    min_event_time: Option<i64>,
+    max_event_time: Option<i64>,
+    canonical_attributes: Vec<u8>,
+}
+
+impl IncrementalTableLeafHasher {
+    /// Start hashing a table leaf with known row and canonical-byte counts.
+    ///
+    /// `canonical_rows_len` excludes the fixed row-payload magic and row-count
+    /// prefix. `canonical_logical_attributes` must already be canonical JSON
+    /// bytes when present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty leaf, unsupported schema, or length
+    /// overflow.
+    pub fn new(
+        schema: &Schema,
+        logical_count: u64,
+        canonical_rows_len: u64,
+        min_event_time: Option<i64>,
+        max_event_time: Option<i64>,
+        canonical_logical_attributes: Option<&[u8]>,
+    ) -> Result<Self, String> {
+        if logical_count == 0 {
+            return Err("a logical table leaf must contain at least one row".to_string());
+        }
+        let fingerprint = schema_fingerprint(schema)?;
+        let payload_len = u64::try_from(ROWS_MAGIC.len() + std::mem::size_of::<u64>())
+            .expect("fixed row payload prefix fits u64")
+            .checked_add(canonical_rows_len)
+            .ok_or_else(|| "canonical table payload length exceeds u64::MAX".to_string())?;
+        let mut hasher = blake3::Hasher::new();
+        let _ = hasher.update(LEAF_MAGIC);
+        let _ = hasher.update(&[LEAF_KIND_TABLE]);
+        let fingerprint_len = u32::try_from(fingerprint.as_bytes().len())
+            .expect("BLAKE3 fingerprint length fits u32");
+        let _ = hasher.update(&fingerprint_len.to_le_bytes());
+        let _ = hasher.update(fingerprint.as_bytes());
+        let _ = hasher.update(&logical_count.to_le_bytes());
+        let _ = hasher.update(&payload_len.to_le_bytes());
+        let _ = hasher.update(ROWS_MAGIC);
+        let _ = hasher.update(&logical_count.to_le_bytes());
+        Ok(Self {
+            hasher,
+            schema: schema.clone(),
+            logical_count,
+            rows_written: 0,
+            canonical_rows_len,
+            canonical_rows_written: 0,
+            min_event_time,
+            max_event_time,
+            canonical_attributes: canonical_logical_attributes.unwrap_or(&[]).to_vec(),
+        })
+    }
+
+    /// Feed the next record batch in logical row order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an incompatible batch or if declared row/byte
+    /// counts would be exceeded.
+    pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<(), String> {
+        let rows = encode_canonical_batch_rows(&self.schema, batch)?;
+        let new_row_count = self
+            .rows_written
+            .checked_add(batch.num_rows() as u64)
+            .ok_or_else(|| "table leaf row count exceeds u64::MAX".to_string())?;
+        let new_byte_count = self
+            .canonical_rows_written
+            .checked_add(rows.len() as u64)
+            .ok_or_else(|| "canonical table row bytes exceed u64::MAX".to_string())?;
+        if new_row_count > self.logical_count || new_byte_count > self.canonical_rows_len {
+            return Err("table leaf received more rows or bytes than declared".to_string());
+        }
+        let _ = self.hasher.update(&rows);
+        self.rows_written = new_row_count;
+        self.canonical_rows_written = new_byte_count;
+        Ok(())
+    }
+
+    /// Finish this leaf and produce its identity hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the supplied batches were truncated.
+    pub fn finish(mut self) -> Result<ObjectHash, String> {
+        if self.rows_written != self.logical_count
+            || self.canonical_rows_written != self.canonical_rows_len
+        {
+            return Err(format!(
+                "table leaf received {} row(s)/{} canonical byte(s), expected {}/{}",
+                self.rows_written,
+                self.canonical_rows_written,
+                self.logical_count,
+                self.canonical_rows_len
+            ));
+        }
+        let mut flags = 0u8;
+        if self.min_event_time.is_some() {
+            flags |= LEAF_HAS_MIN;
+        }
+        if self.max_event_time.is_some() {
+            flags |= LEAF_HAS_MAX;
+        }
+        let _ = self.hasher.update(&[flags]);
+        if let Some(value) = self.min_event_time {
+            let _ = self.hasher.update(&value.to_le_bytes());
+        }
+        if let Some(value) = self.max_event_time {
+            let _ = self.hasher.update(&value.to_le_bytes());
+        }
+        let attributes_len = u32::try_from(self.canonical_attributes.len())
+            .map_err(|_| "table leaf canonical attributes length exceeds u32::MAX".to_string())?;
+        let _ = self.hasher.update(&attributes_len.to_le_bytes());
+        let _ = self.hasher.update(&self.canonical_attributes);
+        Ok(ObjectHash::from_bytes(*self.hasher.finalize().as_bytes()))
+    }
 }
 
 /// Incremental, streaming equivalent of [`file_leaf_hash_canonical`]: computes
@@ -1214,6 +1374,40 @@ mod tests {
         let plain_hash = table_leaf_hash(&plain_schema, &[plain_batch], None, None, None).unwrap();
         let dict_hash = table_leaf_hash(&plain_schema, &[dict_batch], None, None, None).unwrap();
         assert_eq!(plain_hash, dict_hash);
+    }
+
+    #[test]
+    fn incremental_table_leaf_matches_buffered_hash_across_physical_encodings() {
+        let schema = schema_one_utf8("value");
+        let plain_batch = batch_one_utf8(&schema, &[Some("x"), None]);
+        let dictionary: DictionaryArray<arrow_array::types::UInt16Type> =
+            vec![Some("y"), Some("z")].into_iter().collect();
+        let dictionary_batch = RecordBatch::try_new(
+            Arc::new(dictionary_schema("value")),
+            vec![Arc::new(dictionary)],
+        )
+        .unwrap();
+        let batches = vec![plain_batch, dictionary_batch];
+        let canonical_rows_len = batches
+            .iter()
+            .try_fold(0u64, |total, batch| -> Result<u64, String> {
+                let len = u64::try_from(encode_canonical_batch_rows(&schema, batch)?.len())
+                    .map_err(|_| "test batch length exceeds u64::MAX".to_string())?;
+                total
+                    .checked_add(len)
+                    .ok_or_else(|| "test row bytes exceed u64::MAX".to_string())
+            })
+            .unwrap();
+        let mut incremental =
+            IncrementalTableLeafHasher::new(&schema, 4, canonical_rows_len, Some(1), Some(2), None)
+                .unwrap();
+        for batch in &batches {
+            incremental.write_batch(batch).unwrap();
+        }
+        assert_eq!(
+            incremental.finish().unwrap(),
+            table_leaf_hash(&schema, &batches, Some(1), Some(2), None).unwrap()
+        );
     }
 
     #[test]

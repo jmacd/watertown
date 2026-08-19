@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use sync_store::{
     CapsuleEntry, CapsuleLeaf, CapsuleManifest, CapsuleNode, CapsuleObject, CapsulePayloadKind,
-    CapsuleSource, IncrementalFileLeafHasher, ObjectHash, capsule_series_root, decode_manifest,
-    decode_recipe, decode_series, encode_canonical_attributes, schema_fingerprint, table_leaf_hash,
+    CapsuleSource, IncrementalFileLeafHasher, IncrementalTableLeafHasher, ObjectHash,
+    capsule_series_root, decode_manifest, decode_recipe, decode_series,
+    encode_canonical_attributes, encode_canonical_batch_rows, schema_fingerprint,
 };
 use tinyfs::EntryType;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -23,6 +24,15 @@ pub struct CapsuleBuild {
     pub manifest: CapsuleManifest,
     /// Distinct payloads staged on disk by BLAKE3 content address.
     pub payloads: CapsulePayloads,
+    reused_payloads: HashSet<ObjectHash>,
+}
+
+impl CapsuleBuild {
+    /// Number of payload objects inherited from the prior capsule generation.
+    #[must_use]
+    pub fn reused_payload_count(&self) -> usize {
+        self.reused_payloads.len()
+    }
 }
 
 /// Disk-backed capsule payload closure.
@@ -86,6 +96,25 @@ impl CapsulePayloads {
 /// is missing or corrupt, a table uses an unsupported logical schema, or the
 /// resulting capsule violates its format contract.
 pub async fn build_recovery_capsule(ship: &Ship) -> Result<CapsuleBuild, StewardError> {
+    build_recovery_capsule_with_prior(ship, None).await
+}
+
+/// Build a capsule while reusing unchanged logical leaves from `prior`.
+///
+/// Reused payloads are not restaged; publication must use the matching
+/// incremental publisher so their presence in the current remote generation
+/// is checked before advancing the reference.
+pub async fn build_recovery_capsule_incremental(
+    ship: &Ship,
+    prior: &CapsuleManifest,
+) -> Result<CapsuleBuild, StewardError> {
+    build_recovery_capsule_with_prior(ship, Some(prior)).await
+}
+
+async fn build_recovery_capsule_with_prior(
+    ship: &Ship,
+    prior: Option<&CapsuleManifest>,
+) -> Result<CapsuleBuild, StewardError> {
     let materialized = crate::content_tree::materialize_content_objects(ship).await?;
     let (_, manifest_bytes) = materialized.manifest.as_ref().ok_or_else(|| {
         StewardError::Content("materialized pond has no node manifest".to_string())
@@ -105,36 +134,66 @@ pub async fn build_recovery_capsule(ship: &Ship) -> Result<CapsuleBuild, Steward
     let source_tip = source_commit.hash();
 
     let mut payloads = CapsulePayloads::new()?;
+    let mut reused_payloads = HashSet::new();
     let mut entries = Vec::with_capacity(native_entries.len());
     for native in &native_entries {
         let path = paths
             .get(&native.node_id)
             .cloned()
             .ok_or_else(|| StewardError::Content(format!("no path for node {}", native.node_id)))?;
+        let prior_node = prior
+            .and_then(|manifest| manifest.entries.iter().find(|entry| entry.path == path))
+            .map(|entry| &entry.node);
         let node = match native.entry_type {
             EntryType::DirectoryPhysical => CapsuleNode::Directory,
             EntryType::Symlink => {
-                let target =
-                    stage_payload(ship, &materialized, native.child_hash, &mut payloads).await?;
+                let target = match prior_node {
+                    Some(CapsuleNode::Symlink { target }) if target.hash == native.child_hash => {
+                        let _ = reused_payloads.insert(target.hash);
+                        target.clone()
+                    }
+                    _ => {
+                        stage_payload(ship, &materialized, native.child_hash, &mut payloads).await?
+                    }
+                };
                 CapsuleNode::Symlink { target }
             }
 
             EntryType::DirectoryDynamic | EntryType::FileDynamic | EntryType::TableDynamic => {
-                let recipe =
-                    stage_payload(ship, &materialized, native.child_hash, &mut payloads).await?;
-                let bytes = std::fs::read(payloads.path(recipe.hash)).map_err(|error| {
-                    StewardError::Content(format!("read staged recipe for {path}: {error}"))
-                })?;
-                let _ = decode_recipe(&bytes).map_err(|error| {
-                    StewardError::Content(format!("decode recipe for {path}: {error}"))
-                })?;
+                let recipe = match prior_node {
+                    Some(CapsuleNode::Dynamic { recipe }) if recipe.hash == native.child_hash => {
+                        let _ = reused_payloads.insert(recipe.hash);
+                        recipe.clone()
+                    }
+                    _ => {
+                        let recipe =
+                            stage_payload(ship, &materialized, native.child_hash, &mut payloads)
+                                .await?;
+                        let bytes = std::fs::read(payloads.path(recipe.hash)).map_err(|error| {
+                            StewardError::Content(format!("read staged recipe for {path}: {error}"))
+                        })?;
+                        let _ = decode_recipe(&bytes).map_err(|error| {
+                            StewardError::Content(format!("decode recipe for {path}: {error}"))
+                        })?;
+                        recipe
+                    }
+                };
                 CapsuleNode::Dynamic { recipe }
             }
             EntryType::FilePhysicalVersion
             | EntryType::FilePhysicalSeries
             | EntryType::TablePhysicalVersion
             | EntryType::TablePhysicalSeries => {
-                build_physical_node(ship, &materialized, native, &path, &mut payloads).await?
+                build_physical_node(
+                    ship,
+                    &materialized,
+                    native,
+                    &path,
+                    prior_node,
+                    &mut payloads,
+                    &mut reused_payloads,
+                )
+                .await?
             }
         };
         entries.push(CapsuleEntry {
@@ -162,13 +221,22 @@ pub async fn build_recovery_capsule(ship: &Ship) -> Result<CapsuleBuild, Steward
         .into_iter()
         .map(|object| object.hash)
         .collect();
-    let actual: HashSet<ObjectHash> = payloads.objects.keys().copied().collect();
+    let actual: HashSet<ObjectHash> = payloads
+        .objects
+        .keys()
+        .copied()
+        .chain(reused_payloads.iter().copied())
+        .collect();
     if declared != actual {
         return Err(StewardError::Content(
             "capsule payload closure differs from materialized payloads".to_string(),
         ));
     }
-    Ok(CapsuleBuild { manifest, payloads })
+    Ok(CapsuleBuild {
+        manifest,
+        payloads,
+        reused_payloads,
+    })
 }
 
 /// Build and publish a capsule to an attached remote under its storage budget.
@@ -205,7 +273,9 @@ async fn build_physical_node(
     materialized: &crate::content_tree::MaterializedObjects,
     native: &sync_store::ManifestEntry,
     path: &str,
+    prior_node: Option<&CapsuleNode>,
     payloads: &mut CapsulePayloads,
+    reused_payloads: &mut HashSet<ObjectHash>,
 ) -> Result<CapsuleNode, StewardError> {
     let payload_kind = match native.entry_type {
         EntryType::FilePhysicalVersion | EntryType::FilePhysicalSeries => CapsulePayloadKind::File,
@@ -244,8 +314,6 @@ async fn build_physical_node(
     let mut leaves = Vec::new();
     let mut table_schema: Option<ObjectHash> = None;
     for (hash, metadata) in hashes.into_iter().zip(&native.versions) {
-        let object = stage_payload(ship, materialized, hash, payloads).await?;
-        let staged_path = payloads.path(hash);
         let attributes = metadata
             .extended_attributes
             .as_deref()
@@ -258,6 +326,33 @@ async fn build_physical_node(
                 String::from_utf8(bytes)
                     .expect("canonical logical attributes are always valid UTF-8")
             });
+        if let Some((object, leaf, schema)) = reusable_prior_leaf(
+            prior_node,
+            payload_kind,
+            hash,
+            metadata.timestamp.unwrap_or_default(),
+            metadata.min_event_time,
+            metadata.max_event_time,
+            attributes.as_deref(),
+        ) {
+            if let Some(schema) = schema {
+                if let Some(expected) = table_schema
+                    && expected != schema
+                {
+                    return Err(StewardError::Content(format!(
+                        "reused table schema changes within capsule node {path}: {expected} != {schema}"
+                    )));
+                }
+                table_schema = Some(schema);
+            }
+            let _ = reused_payloads.insert(object.hash);
+            objects.push(object);
+            leaves.push(leaf);
+            continue;
+        }
+
+        let object = stage_payload(ship, materialized, hash, payloads).await?;
+        let staged_path = payloads.path(hash);
 
         let (logical_hash, logical_count, schema) = match payload_kind {
             CapsulePayloadKind::File => {
@@ -313,35 +408,73 @@ async fn build_physical_node(
                     )));
                 }
                 table_schema = Some(fingerprint);
-                let batches = builder
-                    .build()
-                    .map_err(|error| {
-                        StewardError::Content(format!("build Parquet reader for {path}: {error}"))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| {
+                let mut logical_count = 0u64;
+                let mut canonical_rows_len = 0u64;
+                for batch in builder.build().map_err(|error| {
+                    StewardError::Content(format!("build Parquet reader for {path}: {error}"))
+                })? {
+                    let batch = batch.map_err(|error| {
                         StewardError::Content(format!("read Parquet rows for {path}: {error}"))
                     })?;
-                let logical_count = batches.iter().try_fold(0u64, |count, batch| {
-                    count.checked_add(batch.num_rows() as u64).ok_or_else(|| {
-                        StewardError::Content(format!(
-                            "table leaf row count for {path} exceeds u64::MAX"
-                        ))
-                    })
-                })?;
+                    logical_count = logical_count
+                        .checked_add(batch.num_rows() as u64)
+                        .ok_or_else(|| {
+                            StewardError::Content(format!(
+                                "table leaf row count for {path} exceeds u64::MAX"
+                            ))
+                        })?;
+                    let row_bytes =
+                        encode_canonical_batch_rows(&schema, &batch).map_err(|error| {
+                            StewardError::Content(format!("encode table rows for {path}: {error}"))
+                        })?;
+                    canonical_rows_len = canonical_rows_len
+                        .checked_add(u64::try_from(row_bytes.len()).map_err(|_| {
+                            StewardError::Content(format!(
+                                "canonical table rows for {path} exceed u64::MAX"
+                            ))
+                        })?)
+                        .ok_or_else(|| {
+                            StewardError::Content(format!(
+                                "canonical table rows for {path} exceed u64::MAX"
+                            ))
+                        })?;
+                }
                 if logical_count == 0 {
                     objects.push(object);
                     continue;
                 }
-                let logical_hash = table_leaf_hash(
+                let mut leaf_hasher = IncrementalTableLeafHasher::new(
                     &schema,
-                    &batches,
+                    logical_count,
+                    canonical_rows_len,
                     metadata.min_event_time,
                     metadata.max_event_time,
-                    attributes.as_deref(),
+                    attributes.as_deref().map(str::as_bytes),
                 )
                 .map_err(|error| {
-                    StewardError::Content(format!("hash table leaf for {path}: {error}"))
+                    StewardError::Content(format!("prepare table leaf for {path}: {error}"))
+                })?;
+                let file = std::fs::File::open(&staged_path).map_err(|error| {
+                    StewardError::Content(format!("reopen staged table leaf for {path}: {error}"))
+                })?;
+                let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+                    .map_err(|error| {
+                        StewardError::Content(format!("reopen Parquet leaf for {path}: {error}"))
+                    })?
+                    .build()
+                    .map_err(|error| {
+                        StewardError::Content(format!("rebuild Parquet reader for {path}: {error}"))
+                    })?;
+                for batch in reader {
+                    let batch = batch.map_err(|error| {
+                        StewardError::Content(format!("reread Parquet rows for {path}: {error}"))
+                    })?;
+                    leaf_hasher.write_batch(&batch).map_err(|error| {
+                        StewardError::Content(format!("hash table rows for {path}: {error}"))
+                    })?;
+                }
+                let logical_hash = leaf_hasher.finish().map_err(|error| {
+                    StewardError::Content(format!("finish table leaf for {path}: {error}"))
                 })?;
                 (logical_hash, logical_count, Some(fingerprint))
             }
@@ -372,6 +505,42 @@ async fn build_physical_node(
         objects,
         leaves,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reusable_prior_leaf(
+    prior_node: Option<&CapsuleNode>,
+    payload_kind: CapsulePayloadKind,
+    source_hash: ObjectHash,
+    source_timestamp: i64,
+    min_event_time: Option<i64>,
+    max_event_time: Option<i64>,
+    logical_attributes: Option<&str>,
+) -> Option<(CapsuleObject, CapsuleLeaf, Option<ObjectHash>)> {
+    let CapsuleNode::Physical {
+        payload_kind: prior_kind,
+        schema_fingerprint,
+        objects,
+        leaves,
+        ..
+    } = prior_node?
+    else {
+        return None;
+    };
+    if *prior_kind != payload_kind || objects.len() != leaves.len() {
+        return None;
+    }
+    objects
+        .iter()
+        .zip(leaves)
+        .find(|(object, leaf)| {
+            object.hash == source_hash
+                && leaf.source_timestamp == source_timestamp
+                && leaf.min_event_time == min_event_time
+                && leaf.max_event_time == max_event_time
+                && leaf.logical_attributes.as_deref() == logical_attributes
+        })
+        .map(|(object, leaf)| (object.clone(), leaf.clone(), *schema_fingerprint))
 }
 
 async fn stage_payload(

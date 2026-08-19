@@ -488,7 +488,7 @@ pub fn verify_capsule_directory(path: &Path) -> Result<CapsuleVerifyReport, Stri
         ));
     }
 
-    verify_capsule_with(root, &manifest, |hash| read_payload(&recovery, hash))
+    verify_capsule_payload_directory_at_root(&manifest, &recovery.join("objects"), root)
 }
 
 /// Deeply verify a candidate manifest against its in-memory payload closure.
@@ -527,6 +527,156 @@ pub fn verify_capsule_payload_directory(
     objects_dir: &Path,
 ) -> Result<CapsuleVerifyReport, String> {
     let root = capsule_root(manifest)?;
+    verify_capsule_payload_directory_at_root(manifest, objects_dir, root)
+}
+
+/// Verify a sparse incremental payload directory against a prior manifest.
+///
+/// Omitted payloads are accepted only when their object and logical leaf
+/// descriptors occur unchanged at the same path in `prior`. Every staged
+/// physical leaf is deeply rehashed.
+pub fn verify_incremental_capsule_payload_directory(
+    manifest: &CapsuleManifest,
+    prior: &CapsuleManifest,
+    objects_dir: &Path,
+) -> Result<(), String> {
+    manifest.validate()?;
+    prior.validate()?;
+    for entry in &manifest.entries {
+        let prior_node = prior
+            .entries
+            .iter()
+            .find(|candidate| candidate.path == entry.path)
+            .map(|candidate| &candidate.node);
+        if prior_node == Some(&entry.node) {
+            continue;
+        }
+        match &entry.node {
+            CapsuleNode::Directory => {}
+            CapsuleNode::Symlink { target } | CapsuleNode::Dynamic { recipe: target } => {
+                if staged_payload_exists(objects_dir, target.hash)? {
+                    verify_payload_file(objects_dir, target)?;
+                } else {
+                    return Err(format!(
+                        "unstaged capsule payload {} changed at path {:?}",
+                        target.hash, entry.path
+                    ));
+                }
+            }
+            CapsuleNode::Physical {
+                payload_kind,
+                schema_fingerprint,
+                objects,
+                leaves,
+                ..
+            } => {
+                if objects.len() != leaves.len() {
+                    let mut missing = false;
+                    for object in objects {
+                        missing |= !staged_payload_exists(objects_dir, object.hash)?;
+                    }
+                    if missing {
+                        return Err(format!(
+                            "sparse changed physical path {:?} has unaligned objects and leaves",
+                            entry.path
+                        ));
+                    }
+                    for object in objects {
+                        verify_payload_file(objects_dir, object)?;
+                    }
+                    verify_staged_physical(
+                        objects_dir,
+                        &entry.path,
+                        *payload_kind,
+                        *schema_fingerprint,
+                        objects,
+                        leaves,
+                    )?;
+                    continue;
+                }
+
+                let prior_pairs = match prior_node {
+                    Some(CapsuleNode::Physical {
+                        payload_kind: prior_kind,
+                        schema_fingerprint: prior_schema,
+                        objects: prior_objects,
+                        leaves: prior_leaves,
+                        ..
+                    }) if prior_kind == payload_kind
+                        && prior_schema == schema_fingerprint
+                        && prior_objects.len() == prior_leaves.len() =>
+                    {
+                        prior_objects.iter().zip(prior_leaves).collect::<Vec<_>>()
+                    }
+                    _ => Vec::new(),
+                };
+                let mut staged_objects = Vec::new();
+                let mut staged_leaves = Vec::new();
+                for (object, leaf) in objects.iter().zip(leaves) {
+                    if staged_payload_exists(objects_dir, object.hash)? {
+                        verify_payload_file(objects_dir, object)?;
+                        staged_objects.push(object.clone());
+                        staged_leaves.push(leaf.clone());
+                    } else if !prior_pairs.iter().any(|(prior_object, prior_leaf)| {
+                        *prior_object == object && *prior_leaf == leaf
+                    }) {
+                        return Err(format!(
+                            "unstaged capsule leaf changed at path {:?} for payload {}",
+                            entry.path, object.hash
+                        ));
+                    }
+                }
+                if !staged_objects.is_empty() {
+                    verify_staged_physical(
+                        objects_dir,
+                        &entry.path,
+                        *payload_kind,
+                        *schema_fingerprint,
+                        &staged_objects,
+                        &staged_leaves,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn staged_payload_exists(objects_dir: &Path, hash: ObjectHash) -> Result<bool, String> {
+    objects_dir
+        .join(format!("blake3={}", hash.to_hex()))
+        .try_exists()
+        .map_err(|error| format!("inspect staged capsule payload {hash}: {error}"))
+}
+
+fn verify_staged_physical(
+    objects_dir: &Path,
+    path: &str,
+    payload_kind: CapsulePayloadKind,
+    schema_fingerprint: Option<ObjectHash>,
+    objects: &[CapsuleObject],
+    leaves: &[CapsuleLeaf],
+) -> Result<(), String> {
+    match payload_kind {
+        CapsulePayloadKind::File => {
+            verify_file_stream_directory(objects_dir, path, objects, leaves)
+        }
+        CapsulePayloadKind::Table => verify_table_stream_directory(
+            objects_dir,
+            path,
+            schema_fingerprint
+                .ok_or_else(|| format!("table {path:?} has no schema fingerprint"))?,
+            objects,
+            leaves,
+        ),
+    }
+}
+
+fn verify_capsule_payload_directory_at_root(
+    manifest: &CapsuleManifest,
+    objects_dir: &Path,
+    root: ObjectHash,
+) -> Result<CapsuleVerifyReport, String> {
     let objects = manifest.payload_objects()?;
     let mut physical_bytes = 0u64;
     for object in &objects {
@@ -551,13 +701,8 @@ pub fn verify_capsule_payload_directory(
                     verify_file_stream_directory(objects_dir, &entry.path, objects, leaves)?;
                 }
                 CapsulePayloadKind::Table => {
-                    verify_table_stream(
-                        &mut |hash| {
-                            std::fs::read(objects_dir.join(format!("blake3={}", hash.to_hex())))
-                                .map_err(|error| {
-                                    format!("read staged capsule payload {hash}: {error}")
-                                })
-                        },
+                    verify_table_stream_directory(
+                        objects_dir,
                         &entry.path,
                         schema_fingerprint.ok_or_else(|| {
                             format!("table {} has no schema fingerprint", entry.path)
@@ -694,6 +839,180 @@ fn new_file_leaf_hasher(
 ) -> Result<super::series_leaf::IncrementalFileLeafHasher, String> {
     super::series_leaf::IncrementalFileLeafHasher::new(
         leaf.logical_count,
+        leaf.min_event_time,
+        leaf.max_event_time,
+        leaf.logical_attributes.as_deref().map(str::as_bytes),
+    )
+}
+
+fn verify_table_stream_directory(
+    objects_dir: &Path,
+    path: &str,
+    expected_schema: ObjectHash,
+    objects: &[CapsuleObject],
+    leaves: &[CapsuleLeaf],
+) -> Result<(), String> {
+    let mut schema: Option<std::sync::Arc<arrow_schema::Schema>> = None;
+    let mut canonical_lengths = vec![0u64; leaves.len()];
+    let mut leaf_index = 0usize;
+    let mut leaf_rows = 0u64;
+
+    for object in objects {
+        let file =
+            std::fs::File::open(objects_dir.join(format!("blake3={}", object.hash.to_hex())))
+                .map_err(|error| format!("open table {path:?} object {}: {error}", object.hash))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|error| format!("open table {path:?} object {}: {error}", object.hash))?;
+        let canonical_schema =
+            super::series_leaf::canonicalize_schema(builder.schema().as_ref())
+                .map_err(|error| format!("canonicalize table {path:?} schema: {error}"))?;
+        let fingerprint = super::series_leaf::schema_fingerprint(&canonical_schema)
+            .map_err(|error| format!("fingerprint table {path:?}: {error}"))?;
+        if fingerprint != expected_schema {
+            return Err(format!(
+                "table {path:?} object {} schema hashes to {fingerprint}, expected {expected_schema}",
+                object.hash
+            ));
+        }
+        if let Some(prior) = &schema {
+            if prior.as_ref() != canonical_schema.as_ref() {
+                return Err(format!(
+                    "table {path:?} has logically inconsistent Arrow schemas"
+                ));
+            }
+        } else {
+            schema = Some(canonical_schema);
+        }
+        for batch in builder
+            .build()
+            .map_err(|error| format!("build table {path:?} reader: {error}"))?
+        {
+            let batch = batch.map_err(|error| format!("read table {path:?} rows: {error}"))?;
+            let mut offset = 0usize;
+            while offset < batch.num_rows() {
+                let leaf = leaves.get(leaf_index).ok_or_else(|| {
+                    format!("table {path:?} has rows after its final logical leaf")
+                })?;
+                let remaining = leaf
+                    .logical_count
+                    .checked_sub(leaf_rows)
+                    .ok_or_else(|| format!("table {path:?} leaf {leaf_index} row underflow"))?;
+                let take = usize::try_from(remaining)
+                    .unwrap_or(usize::MAX)
+                    .min(batch.num_rows() - offset);
+                let slice = batch.slice(offset, take);
+                let bytes = super::series_leaf::encode_canonical_batch_rows(
+                    schema.as_ref().expect("table schema established"),
+                    &slice,
+                )
+                .map_err(|error| {
+                    format!("encode table {path:?} leaf {leaf_index} rows: {error}")
+                })?;
+                canonical_lengths[leaf_index] = canonical_lengths[leaf_index]
+                    .checked_add(u64::try_from(bytes.len()).map_err(|_| {
+                        format!("table {path:?} leaf {leaf_index} bytes exceed u64::MAX")
+                    })?)
+                    .ok_or_else(|| {
+                        format!("table {path:?} leaf {leaf_index} bytes exceed u64::MAX")
+                    })?;
+                leaf_rows += take as u64;
+                offset += take;
+                if leaf_rows == leaf.logical_count {
+                    leaf_index += 1;
+                    leaf_rows = 0;
+                }
+            }
+        }
+    }
+    let schema = schema.ok_or_else(|| format!("table {path:?} has no Parquet schema carrier"))?;
+    if leaf_index != leaves.len() || leaf_rows != 0 {
+        return Err(format!(
+            "table {path:?} ended after {leaf_index} of {} logical leaves",
+            leaves.len()
+        ));
+    }
+    if leaves.is_empty() {
+        return Ok(());
+    }
+
+    let mut leaf_index = 0usize;
+    let mut leaf_rows = 0u64;
+    let mut hasher = Some(new_table_leaf_hasher(
+        &schema,
+        &leaves[0],
+        canonical_lengths[0],
+    )?);
+    for object in objects {
+        let file =
+            std::fs::File::open(objects_dir.join(format!("blake3={}", object.hash.to_hex())))
+                .map_err(|error| {
+                    format!("reopen table {path:?} object {}: {error}", object.hash)
+                })?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|error| format!("reopen table {path:?} object {}: {error}", object.hash))?
+            .build()
+            .map_err(|error| format!("rebuild table {path:?} reader: {error}"))?;
+        for batch in reader {
+            let batch = batch.map_err(|error| format!("reread table {path:?} rows: {error}"))?;
+            let mut offset = 0usize;
+            while offset < batch.num_rows() {
+                let leaf = &leaves[leaf_index];
+                let remaining = leaf.logical_count - leaf_rows;
+                let take = usize::try_from(remaining)
+                    .unwrap_or(usize::MAX)
+                    .min(batch.num_rows() - offset);
+                let slice = batch.slice(offset, take);
+                hasher
+                    .as_mut()
+                    .expect("active table leaf hasher")
+                    .write_batch(&slice)
+                    .map_err(|error| format!("hash table {path:?} leaf {leaf_index}: {error}"))?;
+                leaf_rows += take as u64;
+                offset += take;
+                if leaf_rows == leaf.logical_count {
+                    let computed = hasher
+                        .take()
+                        .expect("completed table leaf hasher")
+                        .finish()
+                        .map_err(|error| {
+                            format!("finish table {path:?} leaf {leaf_index}: {error}")
+                        })?;
+                    if computed != leaf.logical_hash {
+                        return Err(format!(
+                            "table {path:?} leaf {leaf_index} hashes to {computed}, manifest names {}",
+                            leaf.logical_hash
+                        ));
+                    }
+                    leaf_index += 1;
+                    leaf_rows = 0;
+                    hasher = leaves
+                        .get(leaf_index)
+                        .map(|leaf| {
+                            new_table_leaf_hasher(&schema, leaf, canonical_lengths[leaf_index])
+                        })
+                        .transpose()?;
+                }
+            }
+        }
+    }
+    if leaf_index != leaves.len() {
+        return Err(format!(
+            "table {path:?} ended after {leaf_index} of {} logical leaves",
+            leaves.len()
+        ));
+    }
+    Ok(())
+}
+
+fn new_table_leaf_hasher(
+    schema: &arrow_schema::Schema,
+    leaf: &CapsuleLeaf,
+    canonical_rows_len: u64,
+) -> Result<super::series_leaf::IncrementalTableLeafHasher, String> {
+    super::series_leaf::IncrementalTableLeafHasher::new(
+        schema,
+        leaf.logical_count,
+        canonical_rows_len,
         leaf.min_event_time,
         leaf.max_event_time,
         leaf.logical_attributes.as_deref().map(str::as_bytes),
@@ -914,15 +1233,6 @@ fn verify_table_stream(
         ));
     }
     Ok(())
-}
-
-fn read_payload(recovery: &Path, hash: ObjectHash) -> Result<Vec<u8>, String> {
-    std::fs::read(
-        recovery
-            .join("objects")
-            .join(format!("blake3={}", hash.to_hex())),
-    )
-    .map_err(|error| format!("read capsule payload {hash}: {error}"))
 }
 
 fn verify_payload(object: &CapsuleObject, bytes: &[u8]) -> Result<(), String> {
@@ -1355,6 +1665,16 @@ mod tests {
             .collect();
 
         verify_capsule_payloads(&manifest, &payloads).expect("mixed physical encodings verify");
+        let directory = tempfile::tempdir().unwrap();
+        for (hash, bytes) in &payloads {
+            std::fs::write(
+                directory.path().join(format!("blake3={}", hash.to_hex())),
+                bytes,
+            )
+            .unwrap();
+        }
+        verify_capsule_payload_directory(&manifest, directory.path())
+            .expect("streamed mixed physical encodings verify");
     }
 
     #[test]

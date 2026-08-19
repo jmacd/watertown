@@ -39,6 +39,7 @@ use uuid::Uuid;
 use crate::content::{
     CapsuleManifest, ObjectHash, capsule_manifest_bytes, capsule_root, decode_capsule_manifest,
     verify_capsule_payload_directory, verify_capsule_payloads,
+    verify_incremental_capsule_payload_directory,
 };
 use crate::error::{Result, StoreError};
 use crate::store::{Op, Store};
@@ -649,6 +650,99 @@ impl ContentRemote {
             .await
     }
 
+    /// Publish a capsule that inherits unstaged payloads from `prior`.
+    ///
+    /// Every unstaged descriptor must occur identically in the current remote
+    /// generation and its object key must still be present. Newly staged
+    /// payloads are streamed and verified as usual. Publication is refused if
+    /// `prior` is no longer the current generation.
+    pub async fn publish_capsule_incremental(
+        &self,
+        manifest: &CapsuleManifest,
+        objects_dir: &Path,
+        prior: &CapsuleManifest,
+    ) -> Result<CapsulePublishOutcome> {
+        let root = capsule_root(manifest).map_err(StoreError::Invariant)?;
+        let manifest_bytes = capsule_manifest_bytes(manifest).map_err(StoreError::Invariant)?;
+        let declared = manifest.payload_objects().map_err(StoreError::Invariant)?;
+        let prior_root = capsule_root(prior).map_err(StoreError::Invariant)?;
+        verify_incremental_capsule_payload_directory(manifest, prior, objects_dir)
+            .map_err(StoreError::Invariant)?;
+        let prior_objects = prior
+            .payload_objects()
+            .map_err(StoreError::Invariant)?
+            .into_iter()
+            .map(|object| (object.hash, object.size))
+            .collect::<std::collections::HashMap<_, _>>();
+        self.require_current_capsule(prior_root).await?;
+
+        let present = self.list_capsule_payloads().await?;
+        let mut uploaded = 0usize;
+        for object in &declared {
+            let source = objects_dir.join(format!("blake3={}", object.hash.to_hex()));
+            let staged = tokio::fs::try_exists(&source).await.map_err(|error| {
+                StoreError::Invariant(format!(
+                    "inspect staged capsule payload {}: {error}",
+                    object.hash
+                ))
+            })?;
+            if !staged {
+                if prior_objects.get(&object.hash) != Some(&object.size) {
+                    return Err(StoreError::Invariant(format!(
+                        "unstaged capsule payload {} is not inherited from the prior generation",
+                        object.hash
+                    )));
+                }
+                if !present.contains(&object.hash) {
+                    return Err(StoreError::Invariant(format!(
+                        "inherited capsule payload {} is missing remotely",
+                        object.hash
+                    )));
+                }
+                continue;
+            }
+            if present.contains(&object.hash) {
+                continue;
+            }
+            let file = tokio::fs::File::open(&source).await.map_err(|error| {
+                StoreError::Invariant(format!(
+                    "open staged capsule payload {}: {error}",
+                    object.hash
+                ))
+            })?;
+            self.put_hashed_object(
+                Self::capsule_payload_path(object.hash),
+                object.hash,
+                Some(object.size),
+                file,
+            )
+            .await
+            .map_err(|error| {
+                StoreError::Invariant(format!("publish capsule payload {}: {error}", object.hash))
+            })?;
+            uploaded += 1;
+        }
+
+        self.require_current_capsule(prior_root).await?;
+        self.finish_capsule_publication(root, manifest_bytes, &declared, uploaded)
+            .await
+    }
+
+    async fn require_current_capsule(&self, expected: ObjectHash) -> Result<()> {
+        let current = self.latest_capsule().await?.ok_or_else(|| {
+            StoreError::Invariant(
+                "incremental capsule publication requires a current generation".to_string(),
+            )
+        })?;
+        if current.0 != expected {
+            return Err(StoreError::Invariant(format!(
+                "capsule generation changed during incremental publication: expected {expected}, current {}",
+                current.0
+            )));
+        }
+        Ok(())
+    }
+
     async fn finish_capsule_publication(
         &self,
         root: ObjectHash,
@@ -1025,6 +1119,57 @@ mod tests {
         (manifest, BTreeMap::from([(payload_hash, payload.to_vec())]))
     }
 
+    fn append_capsule_file(
+        prior: &CapsuleManifest,
+        path: &str,
+        payload: &[u8],
+    ) -> (CapsuleManifest, CapsuleObject) {
+        let object = CapsuleObject {
+            hash: ObjectHash::of_bytes(payload),
+            size: payload.len() as u64,
+        };
+        let leaf = CapsuleLeaf {
+            logical_hash: capsule_leaf_hash(
+                CapsulePayloadKind::File,
+                None,
+                object.size,
+                payload,
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+            logical_count: object.size,
+            source_timestamp: 1_700_000_000_000_001,
+            min_event_time: None,
+            max_event_time: None,
+            logical_attributes: None,
+        };
+        let mut entries = prior.entries.clone();
+        entries.push(CapsuleEntry {
+            path: path.to_string(),
+            entry_type: EntryType::FilePhysicalVersion,
+            source_node_id: path.to_string(),
+            node: CapsuleNode::Physical {
+                payload_kind: CapsulePayloadKind::File,
+                schema_fingerprint: None,
+                logical_root: capsule_series_root(
+                    CapsulePayloadKind::File,
+                    None,
+                    std::slice::from_ref(&leaf),
+                ),
+                objects: vec![object.clone()],
+                leaves: vec![leaf],
+            },
+        });
+        let mut source = prior.source.clone();
+        source.source_tip = ObjectHash::of_bytes(path.as_bytes());
+        (
+            CapsuleManifest::new(source, entries).expect("extended capsule"),
+            object,
+        )
+    }
+
     #[tokio::test]
     async fn capsule_publication_is_verified_reference_last_and_idempotent() {
         let dir = tempdir().unwrap();
@@ -1134,6 +1279,97 @@ mod tests {
         assert_eq!(
             remote.latest_capsule().await.unwrap().unwrap().0,
             published[3]
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_capsule_requires_every_inherited_remote_payload() {
+        let dir = tempdir().unwrap();
+        let remote_path = dir.path().join("remote");
+        let remote = ContentRemote::create_at(&remote_path, Uuid::new_v4())
+            .await
+            .unwrap();
+        let (first, first_payloads) = test_capsule(b"first");
+        let first_root = remote
+            .publish_capsule(&first, &first_payloads)
+            .await
+            .unwrap()
+            .root;
+
+        let (second, second_object) = append_capsule_file(&first, "/second", b"second");
+        let staging = tempdir().unwrap();
+        std::fs::write(
+            staging
+                .path()
+                .join(format!("blake3={}", second_object.hash.to_hex())),
+            b"second",
+        )
+        .unwrap();
+        let second_root = remote
+            .publish_capsule_incremental(&second, staging.path(), &first)
+            .await
+            .unwrap()
+            .root;
+        assert_ne!(second_root, first_root);
+
+        let (mut malicious, malicious_object) =
+            append_capsule_file(&second, "/malicious", b"malicious");
+        let CapsuleNode::Physical {
+            payload_kind,
+            schema_fingerprint,
+            logical_root,
+            leaves,
+            ..
+        } = &mut malicious.entries[1].node
+        else {
+            panic!("physical inherited entry");
+        };
+        leaves[0].logical_hash = ObjectHash::of_bytes(b"forged logical leaf");
+        *logical_root = capsule_series_root(*payload_kind, *schema_fingerprint, leaves);
+        let malicious_staging = tempdir().unwrap();
+        std::fs::write(
+            malicious_staging
+                .path()
+                .join(format!("blake3={}", malicious_object.hash.to_hex())),
+            b"malicious",
+        )
+        .unwrap();
+        assert!(
+            remote
+                .publish_capsule_incremental(&malicious, malicious_staging.path(), &second)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            remote.latest_capsule().await.unwrap().unwrap().0,
+            second_root
+        );
+
+        let inherited = first.payload_objects().unwrap()[0].hash;
+        std::fs::remove_file(
+            remote_path
+                .join("recovery/objects")
+                .join(format!("blake3={}", inherited.to_hex())),
+        )
+        .unwrap();
+        let (third, third_object) = append_capsule_file(&second, "/third", b"third");
+        let staging = tempdir().unwrap();
+        std::fs::write(
+            staging
+                .path()
+                .join(format!("blake3={}", third_object.hash.to_hex())),
+            b"third",
+        )
+        .unwrap();
+        assert!(
+            remote
+                .publish_capsule_incremental(&third, staging.path(), &second)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            remote.latest_capsule().await.unwrap().unwrap().0,
+            second_root
         );
     }
 }

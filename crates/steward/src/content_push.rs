@@ -264,18 +264,37 @@ async fn push_content_inner(
     {
         log::info!("[OK] recovery capsule already represents tip {tip}");
     } else {
-        let capsule = crate::capsule::build_recovery_capsule(ship).await?;
-        let capsule_outcome = remote
-            .publish_capsule_directory(&capsule.manifest, capsule.payloads.objects_dir())
-            .await
-            .map_err(|error| {
-                StewardError::Content(format!("publish trailing recovery capsule: {error}"))
-            })?;
+        let capsule = match latest_capsule.as_ref() {
+            Some((_, prior)) => {
+                crate::capsule::build_recovery_capsule_incremental(ship, prior).await?
+            }
+            None => crate::capsule::build_recovery_capsule(ship).await?,
+        };
+        let capsule_outcome = match latest_capsule.as_ref() {
+            Some((_, prior)) => {
+                remote
+                    .publish_capsule_incremental(
+                        &capsule.manifest,
+                        capsule.payloads.objects_dir(),
+                        prior,
+                    )
+                    .await
+            }
+            None => {
+                remote
+                    .publish_capsule_directory(&capsule.manifest, capsule.payloads.objects_dir())
+                    .await
+            }
+        }
+        .map_err(|error| {
+            StewardError::Content(format!("publish trailing recovery capsule: {error}"))
+        })?;
         log::info!(
-            "[OK] recovery capsule published (root={}, payloads_uploaded={}, payloads_total={})",
+            "[OK] recovery capsule published (root={}, payloads_uploaded={}, payloads_total={}, payloads_reused={})",
             capsule_outcome.root,
             capsule_outcome.payloads_uploaded,
-            capsule_outcome.payloads_total
+            capsule_outcome.payloads_total,
+            capsule.reused_payload_count()
         );
     }
 

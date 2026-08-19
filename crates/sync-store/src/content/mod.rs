@@ -56,14 +56,15 @@ pub use capsule::{
     CapsulePayloadKind, CapsuleSource, CapsuleVerifyReport, capsule_leaf_hash,
     capsule_manifest_bytes, capsule_root, capsule_series_root, decode_capsule_manifest,
     encode_capsule_attributes, verify_capsule_directory, verify_capsule_payload_directory,
-    verify_capsule_payloads,
+    verify_capsule_payloads, verify_incremental_capsule_payload_directory,
 };
 pub use commit::{Commit, Provenance};
 pub use manifest::{ManifestEntry, decode_manifest, encode_manifest, manifest_hash};
 pub use node_merkle::{NodeMerkle, rebuild_root as node_merkle_rebuild_root};
 pub use series_leaf::{
-    IncrementalFileLeafHasher, canonicalize_schema, encode_canonical_attributes,
-    encode_canonical_schema, file_leaf_hash, schema_fingerprint, table_leaf_hash,
+    IncrementalFileLeafHasher, IncrementalTableLeafHasher, canonicalize_schema,
+    encode_canonical_attributes, encode_canonical_batch_rows, encode_canonical_schema,
+    file_leaf_hash, schema_fingerprint, table_leaf_hash,
 };
 pub use tree::{
     TreeEntry, VersionMeta, decode_recipe, decode_series, decode_tree, encode_recipe,

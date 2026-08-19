@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use arrow_array::{RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use steward::{Ship, build_recovery_capsule};
+use steward::{Ship, build_recovery_capsule, build_recovery_capsule_incremental};
 use sync_store::{
     CapsuleNode, CapsulePayloadKind, ContentRemote, ObjectHash, capsule_root,
     verify_capsule_directory,
@@ -174,4 +174,34 @@ async fn builds_portable_live_inventory_with_ordered_series_leaves() {
     let verified = verify_capsule_directory(&remote_path).expect("verify downloaded capsule");
     assert_eq!(verified.entries, 6);
     assert_eq!(verified.logical_count, 18 + 256 * 1024);
+
+    ship.write_transaction(&meta("incremental"), async move |transaction| {
+        let root = transaction.root().await?;
+        let _ = create_file_path(&root, "/data/new.txt", b"new").await?;
+        Ok(())
+    })
+    .await
+    .expect("append source content");
+    let incremental = build_recovery_capsule_incremental(&ship, &capsule.manifest)
+        .await
+        .expect("incremental capsule");
+    assert!(
+        incremental.reused_payload_count() > 0,
+        "unchanged source versions should inherit prior payloads"
+    );
+    assert!(
+        incremental.payloads.len()
+            < incremental
+                .manifest
+                .payload_objects()
+                .expect("incremental payload closure")
+                .len(),
+        "only changed payloads should be restaged"
+    );
+    let _ = steward::push_content_to_remote(&ship, &mut remote, "main")
+        .await
+        .expect("incremental push with capsule");
+    let verified = verify_capsule_directory(&remote_path).expect("verify incremental capsule");
+    assert_eq!(verified.entries, 7);
+    assert_eq!(verified.logical_count, 21 + 256 * 1024);
 }
