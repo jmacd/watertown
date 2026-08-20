@@ -560,6 +560,11 @@ pond capsule publish azure
 # List the current and retained generations at a named remote.
 pond capsule list azure
 
+# Create, review, verify, and apply exact retained-generation cleanup.
+pond capsule gc plan azure --output capsule-gc.json --grace-hours 24
+pond capsule gc verify azure --plan capsule-gc.json
+pond capsule gc apply azure --plan capsule-gc.json --plan-hash <printed-hash>
+
 # Verify and summarize a capsule downloaded into ./recovered/recovery/.
 pond capsule inspect ./recovered
 

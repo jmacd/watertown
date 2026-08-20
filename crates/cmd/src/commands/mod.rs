@@ -33,7 +33,10 @@ pub mod tlog;
 pub mod verify;
 
 pub use apply::apply_command;
-pub use capsule::{capsule_inspect_command, capsule_list_command, capsule_publish_command};
+pub use capsule::{
+    CapsuleGcAction, capsule_gc_command, capsule_inspect_command, capsule_list_command,
+    capsule_publish_command,
+};
 pub use cat::cat_command;
 pub use control::control_command;
 pub use copy::{CopyOptions, copy_command};

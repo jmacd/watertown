@@ -196,6 +196,11 @@ enum CapsuleCommand {
         /// Remote attachment name.
         name: String,
     },
+    /// Garbage-collect unreachable retained-generation objects.
+    Gc {
+        #[command(subcommand)]
+        command: CapsuleGcCommand,
+    },
     /// Verify and summarize a downloaded capsule without opening a pond.
     Inspect {
         /// Directory containing the downloaded `recovery/` tree.
@@ -205,6 +210,40 @@ enum CapsuleCommand {
     Verify {
         /// Directory containing the downloaded `recovery/` tree.
         path: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CapsuleGcCommand {
+    /// Write an immutable deletion plan without deleting.
+    Plan {
+        /// Remote attachment name.
+        name: String,
+        /// New plan file to create.
+        #[arg(long)]
+        output: PathBuf,
+        /// Reader grace period before apply is allowed.
+        #[arg(long, default_value_t = 24)]
+        grace_hours: u64,
+    },
+    /// Revalidate a plan against the current remote.
+    Verify {
+        /// Remote attachment name.
+        name: String,
+        /// Canonical plan file.
+        #[arg(long)]
+        plan: PathBuf,
+    },
+    /// Apply an exact reviewed plan.
+    Apply {
+        /// Remote attachment name.
+        name: String,
+        /// Canonical plan file.
+        #[arg(long)]
+        plan: PathBuf,
+        /// Exact hash printed by `gc plan`.
+        #[arg(long)]
+        plan_hash: String,
     },
 }
 
@@ -743,6 +782,36 @@ async fn main() -> Result<()> {
             }
             CapsuleCommand::List { name } => {
                 commands::capsule_list_command(&ship_context, &name).await
+            }
+            CapsuleCommand::Gc { command } => {
+                let (name, action) = match command {
+                    CapsuleGcCommand::Plan {
+                        name,
+                        output,
+                        grace_hours,
+                    } => (
+                        name,
+                        commands::CapsuleGcAction::Plan {
+                            output,
+                            grace_hours,
+                        },
+                    ),
+                    CapsuleGcCommand::Verify { name, plan } => {
+                        (name, commands::CapsuleGcAction::Verify { plan })
+                    }
+                    CapsuleGcCommand::Apply {
+                        name,
+                        plan,
+                        plan_hash,
+                    } => (
+                        name,
+                        commands::CapsuleGcAction::Apply {
+                            plan,
+                            reviewed_hash: plan_hash,
+                        },
+                    ),
+                };
+                commands::capsule_gc_command(&ship_context, &name, action).await
             }
             CapsuleCommand::Inspect { path } | CapsuleCommand::Verify { path } => {
                 commands::capsule_inspect_command(&path)

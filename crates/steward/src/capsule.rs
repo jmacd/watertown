@@ -305,6 +305,76 @@ pub async fn open_and_list_capsules_limited(
     .await
 }
 
+/// Create a reviewed retention-GC plan under the remote storage budget.
+pub async fn open_and_plan_capsule_gc_limited(
+    url: &str,
+    storage_options: HashMap<String, String>,
+    grace_micros: i64,
+    limits: &mut LimiterSet,
+) -> Result<sync_store::CapsuleGcPlan, StewardError> {
+    crate::storage_meter::metered_op(
+        url,
+        limits,
+        Box::pin(async move {
+            let remote = sync_store::ContentRemote::open_at_url(url, storage_options)
+                .await
+                .map_err(|error| StewardError::Aborted(format!("open remote {url}: {error}")))?;
+            remote
+                .plan_capsule_gc(url, grace_micros)
+                .await
+                .map_err(|error| StewardError::Content(format!("plan capsule GC: {error}")))
+        }),
+    )
+    .await
+}
+
+/// Verify a retention-GC plan under the remote storage budget.
+pub async fn open_and_verify_capsule_gc_limited(
+    url: &str,
+    storage_options: HashMap<String, String>,
+    plan: sync_store::CapsuleGcPlan,
+    limits: &mut LimiterSet,
+) -> Result<(), StewardError> {
+    crate::storage_meter::metered_op(
+        url,
+        limits,
+        Box::pin(async move {
+            let remote = sync_store::ContentRemote::open_at_url(url, storage_options)
+                .await
+                .map_err(|error| StewardError::Aborted(format!("open remote {url}: {error}")))?;
+            remote
+                .verify_capsule_gc_plan(url, &plan)
+                .await
+                .map_err(|error| StewardError::Content(format!("verify capsule GC: {error}")))
+        }),
+    )
+    .await
+}
+
+/// Apply a reviewed retention-GC plan under the remote storage budget.
+pub async fn open_and_apply_capsule_gc_limited(
+    url: &str,
+    storage_options: HashMap<String, String>,
+    plan: sync_store::CapsuleGcPlan,
+    reviewed_hash: ObjectHash,
+    limits: &mut LimiterSet,
+) -> Result<usize, StewardError> {
+    crate::storage_meter::metered_op(
+        url,
+        limits,
+        Box::pin(async move {
+            let remote = sync_store::ContentRemote::open_at_url(url, storage_options)
+                .await
+                .map_err(|error| StewardError::Aborted(format!("open remote {url}: {error}")))?;
+            remote
+                .apply_capsule_gc_plan(url, &plan, reviewed_hash)
+                .await
+                .map_err(|error| StewardError::Content(format!("apply capsule GC: {error}")))
+        }),
+    )
+    .await
+}
+
 async fn build_physical_node(
     ship: &Ship,
     materialized: &crate::content_tree::MaterializedObjects,

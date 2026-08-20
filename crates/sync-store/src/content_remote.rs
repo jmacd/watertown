@@ -35,6 +35,7 @@ use std::sync::RwLock;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use object_store::{PutMode, PutOptions};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::content::{
@@ -74,6 +75,102 @@ enum CapsuleRefVersion {
 }
 
 const CAPSULE_PUBLISH_LOCK_STALE_MICROS: i64 = 15 * 60 * 1_000_000;
+const CAPSULE_GC_PLAN_FORMAT: &str = "dp.recovery-capsule-gc-plan.1";
+const CAPSULE_GC_PLAN_DOMAIN: &[u8] = b"dp.recovery-capsule-gc-plan-root.1\n";
+
+/// One exact remote object selected by a capsule garbage-collection plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapsuleGcObject {
+    /// Full object-store key beneath the attached remote.
+    pub key: String,
+    /// Size observed when the plan was created.
+    pub size: u64,
+}
+
+/// Immutable reviewed plan for deleting unreachable capsule generations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapsuleGcPlan {
+    /// Plan wire-format identifier.
+    pub format: String,
+    /// Exact attached remote URL.
+    pub remote_url: String,
+    /// Native remote pond identity.
+    pub remote_pond_id: String,
+    /// Current capsule root at snapshot time.
+    pub latest_root: String,
+    /// Retained roots, newest first.
+    pub retained_roots: Vec<String>,
+    /// Plan creation time.
+    pub created_at_micros: i64,
+    /// Earliest permitted apply time.
+    pub not_before_micros: i64,
+    /// Exact objects to delete, sorted by key.
+    pub deletions: Vec<CapsuleGcObject>,
+}
+
+impl CapsuleGcPlan {
+    /// Validate the plan's canonical invariants.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.format != CAPSULE_GC_PLAN_FORMAT {
+            return Err(format!(
+                "unsupported capsule GC plan format {:?}",
+                self.format
+            ));
+        }
+        if self.remote_url.is_empty() || self.remote_pond_id.is_empty() {
+            return Err("capsule GC plan remote identity is empty".to_string());
+        }
+        if self.retained_roots.first() != Some(&self.latest_root) {
+            return Err("capsule GC plan latest root is not first in retention".to_string());
+        }
+        for root in &self.retained_roots {
+            if root.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                return Err("capsule GC plan root is not lowercase hexadecimal".to_string());
+            }
+            let _ = ObjectHash::from_hex(root)?;
+        }
+        if self.not_before_micros < self.created_at_micros {
+            return Err("capsule GC plan not-before precedes creation".to_string());
+        }
+        let mut prior = None;
+        for deletion in &self.deletions {
+            validate_capsule_gc_key(&deletion.key)?;
+            if prior.is_some_and(|key: &str| key >= deletion.key.as_str()) {
+                return Err("capsule GC plan deletions are not uniquely sorted".to_string());
+            }
+            prior = Some(deletion.key.as_str());
+        }
+        Ok(())
+    }
+}
+
+/// Encode a validated capsule GC plan as canonical JSON.
+pub fn capsule_gc_plan_bytes(plan: &CapsuleGcPlan) -> std::result::Result<Vec<u8>, String> {
+    plan.validate()?;
+    serde_json::to_vec(plan).map_err(|error| format!("encode capsule GC plan: {error}"))
+}
+
+/// Decode a canonical capsule GC plan.
+pub fn decode_capsule_gc_plan(bytes: &[u8]) -> std::result::Result<CapsuleGcPlan, String> {
+    let plan: CapsuleGcPlan = serde_json::from_slice(bytes)
+        .map_err(|error| format!("decode capsule GC plan: {error}"))?;
+    let canonical = capsule_gc_plan_bytes(&plan)?;
+    if canonical != bytes {
+        return Err("capsule GC plan is not canonically encoded".to_string());
+    }
+    Ok(plan)
+}
+
+/// Compute the reviewed plan hash.
+pub fn capsule_gc_plan_hash(plan: &CapsuleGcPlan) -> std::result::Result<ObjectHash, String> {
+    let bytes = capsule_gc_plan_bytes(plan)?;
+    let mut hasher = blake3::Hasher::new();
+    let _ = hasher.update(CAPSULE_GC_PLAN_DOMAIN);
+    let _ = hasher.update(&bytes);
+    Ok(ObjectHash::from_bytes(*hasher.finalize().as_bytes()))
+}
 
 /// The delta-managed content-addressed remote for one source pond.
 ///
@@ -1074,6 +1171,224 @@ impl ContentRemote {
         Ok(roots)
     }
 
+    /// Snapshot retained generations and plan deletion of unreachable capsule
+    /// objects after `grace_micros`.
+    pub async fn plan_capsule_gc(
+        &self,
+        remote_url: &str,
+        grace_micros: i64,
+    ) -> Result<CapsuleGcPlan> {
+        if grace_micros < 0 {
+            return Err(StoreError::Invariant(
+                "capsule GC grace period cannot be negative".to_string(),
+            ));
+        }
+        let (latest_root, retained_roots, reachable) = self.capsule_retention_snapshot().await?;
+        let created_at_micros = chrono::Utc::now().timestamp_micros();
+        let not_before_micros = created_at_micros.checked_add(grace_micros).ok_or_else(|| {
+            StoreError::Invariant("capsule GC not-before exceeds i64::MAX".to_string())
+        })?;
+        let plan = CapsuleGcPlan {
+            format: CAPSULE_GC_PLAN_FORMAT.to_string(),
+            remote_url: remote_url.to_string(),
+            remote_pond_id: self.pond_id().to_string(),
+            latest_root: latest_root.to_hex(),
+            retained_roots: retained_roots.iter().map(ObjectHash::to_hex).collect(),
+            created_at_micros,
+            not_before_micros,
+            deletions: self
+                .capsule_gc_candidates(&retained_roots, &reachable)
+                .await?,
+        };
+        plan.validate().map_err(StoreError::Invariant)?;
+        Ok(plan)
+    }
+
+    /// Revalidate a capsule GC plan without deleting anything.
+    pub async fn verify_capsule_gc_plan(
+        &self,
+        remote_url: &str,
+        plan: &CapsuleGcPlan,
+    ) -> Result<()> {
+        let candidates = self
+            .validated_capsule_gc_candidates(remote_url, plan)
+            .await?;
+        for deletion in &plan.deletions {
+            if candidates.get(&deletion.key) != Some(&deletion.size) {
+                return Err(StoreError::Invariant(format!(
+                    "capsule GC target {:?} no longer matches the plan",
+                    deletion.key
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply a reviewed capsule GC plan after its grace period.
+    ///
+    /// Missing targets are treated as already applied, allowing safe retry
+    /// after a partial provider failure.
+    pub async fn apply_capsule_gc_plan(
+        &self,
+        remote_url: &str,
+        plan: &CapsuleGcPlan,
+        reviewed_hash: ObjectHash,
+    ) -> Result<usize> {
+        let actual_hash = capsule_gc_plan_hash(plan).map_err(StoreError::Invariant)?;
+        if actual_hash != reviewed_hash {
+            return Err(StoreError::Invariant(format!(
+                "capsule GC plan hashes to {actual_hash}, reviewed hash is {reviewed_hash}"
+            )));
+        }
+        let now = chrono::Utc::now().timestamp_micros();
+        if now < plan.not_before_micros {
+            return Err(StoreError::Invariant(format!(
+                "capsule GC grace period has not elapsed (now={now}, not_before={})",
+                plan.not_before_micros
+            )));
+        }
+        let lock = self.acquire_capsule_publish_lock().await?;
+        let apply = async {
+            let candidates = self
+                .validated_capsule_gc_candidates(remote_url, plan)
+                .await?;
+            let mut deleted = 0usize;
+            for deletion in &plan.deletions {
+                match candidates.get(&deletion.key) {
+                    Some(size) if *size == deletion.size => {
+                        self.store
+                            .object_store()
+                            .delete(&object_store::path::Path::from(deletion.key.clone()))
+                            .await
+                            .map_err(|error| {
+                                StoreError::Invariant(format!(
+                                    "delete capsule GC target {:?}: {error}",
+                                    deletion.key
+                                ))
+                            })?;
+                        deleted += 1;
+                    }
+                    Some(size) => {
+                        return Err(StoreError::Invariant(format!(
+                            "capsule GC target {:?} has size {size}, expected {}",
+                            deletion.key, deletion.size
+                        )));
+                    }
+                    None => {}
+                }
+            }
+            Ok(deleted)
+        }
+        .await;
+        let release = self.release_capsule_publish_lock(&lock).await;
+        match (apply, release) {
+            (Ok(deleted), Ok(())) => Ok(deleted),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(release_error)) => Err(StoreError::Invariant(format!(
+                "{error}; release capsule GC lock: {release_error}"
+            ))),
+        }
+    }
+
+    async fn validated_capsule_gc_candidates(
+        &self,
+        remote_url: &str,
+        plan: &CapsuleGcPlan,
+    ) -> Result<std::collections::HashMap<String, u64>> {
+        plan.validate().map_err(StoreError::Invariant)?;
+        if plan.remote_url != remote_url || plan.remote_pond_id != self.pond_id().to_string() {
+            return Err(StoreError::Invariant(
+                "capsule GC plan targets a different remote".to_string(),
+            ));
+        }
+        let (latest_root, retained_roots, reachable) = self.capsule_retention_snapshot().await?;
+        let plan_roots = plan
+            .retained_roots
+            .iter()
+            .map(|root| ObjectHash::from_hex(root).map_err(StoreError::Invariant))
+            .collect::<Result<Vec<_>>>()?;
+        if latest_root.to_hex() != plan.latest_root || retained_roots != plan_roots {
+            return Err(StoreError::Invariant(
+                "capsule retention changed after the GC plan was created".to_string(),
+            ));
+        }
+        Ok(self
+            .capsule_gc_candidates(&retained_roots, &reachable)
+            .await?
+            .into_iter()
+            .map(|object| (object.key, object.size))
+            .collect())
+    }
+
+    async fn capsule_retention_snapshot(
+        &self,
+    ) -> Result<(
+        ObjectHash,
+        Vec<ObjectHash>,
+        std::collections::HashSet<ObjectHash>,
+    )> {
+        let latest_root = self
+            .latest_capsule()
+            .await?
+            .ok_or_else(|| {
+                StoreError::Invariant("capsule GC requires a current generation".to_string())
+            })?
+            .0;
+        let retained_roots = self.capsule_roots().await?;
+        if retained_roots.first() != Some(&latest_root) {
+            return Err(StoreError::Invariant(
+                "capsule history does not begin with latest".to_string(),
+            ));
+        }
+        let mut reachable = std::collections::HashSet::new();
+        for root in &retained_roots {
+            let manifest = self.capsule_manifest(*root).await?;
+            for object in manifest.payload_objects().map_err(StoreError::Invariant)? {
+                let _ = reachable.insert(object.hash);
+            }
+        }
+        Ok((latest_root, retained_roots, reachable))
+    }
+
+    async fn capsule_gc_candidates(
+        &self,
+        retained_roots: &[ObjectHash],
+        reachable: &std::collections::HashSet<ObjectHash>,
+    ) -> Result<Vec<CapsuleGcObject>> {
+        let prefix = object_store::path::Path::from(format!("{CAPSULE_PREFIX}/"));
+        let mut listing = self.store.object_store().list(Some(&prefix));
+        let mut deletions = Vec::new();
+        while let Some(result) = listing.next().await {
+            let metadata = result.map_err(|error| {
+                StoreError::Invariant(format!("list capsule GC objects: {error}"))
+            })?;
+            let key = metadata.location.to_string();
+            let delete = if let Some(hash) =
+                parse_capsule_payload_key(&key).map_err(StoreError::Invariant)?
+            {
+                !reachable.contains(&hash)
+            } else if let Some(root) =
+                parse_capsule_manifest_key(&key).map_err(StoreError::Invariant)?
+            {
+                !retained_roots.contains(&root)
+            } else if let Some(root) =
+                parse_capsule_generation_key(&key).map_err(StoreError::Invariant)?
+            {
+                !retained_roots.contains(&root)
+            } else {
+                false
+            };
+            if delete {
+                deletions.push(CapsuleGcObject {
+                    key,
+                    size: metadata.size,
+                });
+            }
+        }
+        deletions.sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(deletions)
+    }
+
     fn capsule_payload_path(hash: ObjectHash) -> object_store::path::Path {
         object_store::path::Path::from(format!("{CAPSULE_PREFIX}/objects/blake3={}", hash.to_hex()))
     }
@@ -1121,6 +1436,61 @@ impl ContentRemote {
     fn capsule_publish_lock_path() -> object_store::path::Path {
         object_store::path::Path::from(format!("{CAPSULE_PREFIX}/locks/publish"))
     }
+}
+
+fn validate_capsule_gc_key(key: &str) -> std::result::Result<(), String> {
+    if key.starts_with('/') || key.split('/').any(|part| part.is_empty() || part == "..") {
+        return Err(format!("unsafe capsule GC key {key:?}"));
+    }
+    if parse_capsule_payload_key(key)?.is_some()
+        || parse_capsule_manifest_key(key)?.is_some()
+        || parse_capsule_generation_key(key)?.is_some()
+    {
+        return Ok(());
+    }
+    Err(format!("capsule GC key is outside managed objects {key:?}"))
+}
+
+fn parse_capsule_payload_key(key: &str) -> std::result::Result<Option<ObjectHash>, String> {
+    let prefix = format!("{CAPSULE_PREFIX}/objects/blake3=");
+    let Some(hex) = key.strip_prefix(&prefix) else {
+        return Ok(None);
+    };
+    if hex.contains('/') {
+        return Err(format!("malformed capsule payload key {key:?}"));
+    }
+    ObjectHash::from_hex(hex).map(Some)
+}
+
+fn parse_capsule_manifest_key(key: &str) -> std::result::Result<Option<ObjectHash>, String> {
+    let prefix = format!("{CAPSULE_PREFIX}/manifests/");
+    let Some(name) = key.strip_prefix(&prefix) else {
+        return Ok(None);
+    };
+    let hex = name
+        .strip_suffix(".json")
+        .ok_or_else(|| format!("malformed capsule manifest key {key:?}"))?;
+    if hex.contains('/') {
+        return Err(format!("malformed capsule manifest key {key:?}"));
+    }
+    ObjectHash::from_hex(hex).map(Some)
+}
+
+fn parse_capsule_generation_key(key: &str) -> std::result::Result<Option<ObjectHash>, String> {
+    let prefix = format!("{CAPSULE_PREFIX}/generations/");
+    let Some(rest) = key.strip_prefix(&prefix) else {
+        return Ok(None);
+    };
+    let (hex, artifact) = rest
+        .split_once('/')
+        .ok_or_else(|| format!("malformed capsule generation key {key:?}"))?;
+    if !matches!(
+        artifact,
+        "objects.list" | "checksums" | "RUNBOOK.txt" | "download-az.sh" | "download-mc.sh"
+    ) {
+        return Err(format!("unexpected capsule generation artifact {key:?}"));
+    }
+    ObjectHash::from_hex(hex).map(Some)
 }
 
 fn capsule_object_list(root: ObjectHash, objects: &[crate::content::CapsuleObject]) -> String {
@@ -1458,6 +1828,50 @@ mod tests {
         assert_eq!(
             remote.latest_capsule().await.unwrap().unwrap().0,
             published[3]
+        );
+
+        let plan = remote.plan_capsule_gc("file:///backup", 0).await.unwrap();
+        assert_eq!(plan.latest_root, published[3].to_hex());
+        assert_eq!(plan.retained_roots.len(), 3);
+        assert_eq!(plan.deletions.len(), 7);
+        assert!(plan.deletions.iter().any(|object| {
+            object.key
+                == format!(
+                    "recovery/objects/blake3={}",
+                    ObjectHash::of_bytes(b"one").to_hex()
+                )
+        }));
+        remote
+            .verify_capsule_gc_plan("file:///backup", &plan)
+            .await
+            .unwrap();
+        let bytes = capsule_gc_plan_bytes(&plan).unwrap();
+        assert_eq!(decode_capsule_gc_plan(&bytes).unwrap(), plan);
+        let plan_hash = capsule_gc_plan_hash(&plan).unwrap();
+        assert_ne!(plan_hash, ObjectHash::of_bytes(b""));
+        assert_eq!(
+            remote
+                .apply_capsule_gc_plan("file:///backup", &plan, plan_hash)
+                .await
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            remote
+                .apply_capsule_gc_plan("file:///backup", &plan, plan_hash)
+                .await
+                .unwrap(),
+            0
+        );
+        verify_capsule_directory(&dir.path().join("remote")).unwrap();
+
+        let (newer, payloads) = test_capsule(b"five");
+        let _ = remote.publish_capsule(&newer, &payloads).await.unwrap();
+        assert!(
+            remote
+                .verify_capsule_gc_plan("file:///backup", &plan)
+                .await
+                .is_err()
         );
     }
 
