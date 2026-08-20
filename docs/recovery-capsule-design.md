@@ -1,6 +1,6 @@
 # Recovery Capsules and Format Upgrades
 
-> **Status:** Proposed.
+> **Status:** Phase one implementation in progress.
 >
 > **Originating work:** `jmacd/incremental1` at
 > `58fd3cf39a6dc5032cd58dc064c51940f5faddf3`.
@@ -11,6 +11,53 @@
 > readable. The human will then return to `jmacd/incremental1`, merge the
 > capsule work from `origin/main` without rebasing, and add the v2 import sink.
 > Record the phase-one commit and PR here before merging it.
+
+## Implementation update: 2026-08-19
+
+Phase-one work on `jmacd/capsule1` currently spans `e8ad3617` through
+`3673d356`. No phase-one PR has been opened yet.
+
+Completed:
+
+- frozen `dp.recovery-capsule.1` manifest, logical leaf, series-root, and
+  inventory-root contracts with golden vectors;
+- old-format live-namespace traversal and deterministic capsule construction;
+- disk-backed bounded staging, streaming external files and uploads, and
+  batch-bounded two-pass table hashing and verification;
+- changed-tip reuse of unchanged prior leaves and payloads without a second
+  native materialization pass;
+- payload-first publication, deep staged-change verification, reference-last
+  finalization, a portable atomic publication lease, and safe stale-lock
+  refusal;
+- explicit full repair of untrusted or corrupt same-name payload objects;
+- generated credential-free Azure CLI and MinIO Client download scripts and
+  runbook;
+- `pond capsule publish`, `list`, `inspect`, and `verify`;
+- three-generation retention; and
+- canonical, reviewed `pond capsule gc plan|verify|apply` with retention
+  snapshots, reader grace, exact-key deletion, drift detection, and idempotent
+  retry.
+
+In progress:
+
+- exact-target erase planning after source attachment removal. Detached
+  verify/apply will reopen the exact planned URL through an explicit storage
+  profile, reject any live attachment resolving there, and use raw object-store
+  access so partial deletion remains resumable.
+
+Still required before the phase-one PR:
+
+- complete exact-target erase plan/verify/apply;
+- implement the generic staged old-format importer with hook suppression,
+  resumable bounded transactions, provenance, remote preflight, exact
+  post-write verification, and atomic promotion;
+- add failure-injection, interrupted-retry, malformed-input, cleanup-race, and
+  full export/download/import round-trip coverage; and
+- update this section with the final phase-one commit and PR.
+
+After phase one merges and builds, publish the current Azure capsule, preserve
+its root out of band, download it independently, verify it offline, and perform
+a throwaway recovery before returning to `jmacd/incremental1`.
 
 ## Problem
 
