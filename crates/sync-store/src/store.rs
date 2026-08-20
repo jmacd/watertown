@@ -24,6 +24,20 @@ use crate::checksum;
 use crate::error::{Result, StoreError};
 use crate::schema;
 
+/// Open the raw object store rooted at `url` without loading its Delta log.
+///
+/// Destructive recovery workflows use this after Delta metadata may already
+/// have been removed, so retries do not depend on the source table remaining
+/// readable.
+pub async fn raw_object_store_at_url(
+    url: &str,
+    storage_options: std::collections::HashMap<String, String>,
+) -> Result<Arc<dyn object_store::ObjectStore>> {
+    let parsed = Url::parse(url).map_err(|_| StoreError::InvalidPath(url.to_string()))?;
+    let table = DeltaTable::try_from_url_with_storage_options(parsed, storage_options).await?;
+    Ok(table.object_store())
+}
+
 /// A single operation applied to the store within an [`Store::apply_batch`] call.
 #[derive(Debug, Clone)]
 pub enum Op {

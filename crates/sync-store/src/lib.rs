@@ -57,7 +57,7 @@ pub use error::{Result, StoreError};
 pub use metered_store::{
     MeterBinding, MeteredStore, Observation, RemoteKey, StorageMeter, bind_meter, observed_under,
 };
-pub use store::{AddPath, CompactMetrics, Op, RemovePath, Store};
+pub use store::{AddPath, CompactMetrics, Op, RemovePath, Store, raw_object_store_at_url};
 pub use tlog::{
     Checkpoint, CheckpointError, LogHash, TileLog, TransparencyLog, checkpoint_history_path,
     commit_leaf_hash, verify_consistency, verify_inclusion,

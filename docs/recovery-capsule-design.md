@@ -370,6 +370,14 @@ Cleanup is a separate plan/verify/apply workflow. A deletion plan records:
 - current proof that no live attachment resolves to the target; and
 - revalidation that the target still matches the plan.
 
+Erase planning resolves the source through its named attachment. Before
+`verify` or `apply`, the operator removes that attachment. Those later phases
+take the exact planned URL plus an explicitly named storage profile, scan all
+current attachments to prove none resolves to the target URL, and open the raw
+object store rather than its Delta table. Raw access keeps a partially completed
+erase resumable after native Delta metadata has already been removed. Inline
+credentials are not copied into plans and are not accepted for detached erase.
+
 Deletion is narrowly scoped to a fully resolved container/prefix. Unresolved
 variables, account roots, broad wildcards, and inferred parent paths are rejected.
 
