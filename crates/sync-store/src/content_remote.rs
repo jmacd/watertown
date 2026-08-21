@@ -87,8 +87,8 @@ enum CapsuleRefVersion {
 }
 
 const CAPSULE_PUBLISH_LOCK_STALE_MICROS: i64 = 15 * 60 * 1_000_000;
-const CAPSULE_GC_PLAN_FORMAT: &str = "dp.recovery-capsule-gc-plan.1";
-const CAPSULE_GC_PLAN_DOMAIN: &[u8] = b"dp.recovery-capsule-gc-plan-root.1\n";
+const CAPSULE_GC_PLAN_FORMAT: &str = "pondcapsule.gc-plan.1";
+const CAPSULE_GC_PLAN_DOMAIN: &[u8] = b"pondcapsule.gc-plan-root.1\n";
 
 /// One exact remote object selected by a capsule garbage-collection plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

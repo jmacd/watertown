@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 
 use crate::ObjectHash;
 
-const RECIPE_DOMAIN: &[u8] = b"dp.recovery-recipe.1\n";
+const RECIPE_DOMAIN: &[u8] = b"pondcapsule.recipe.1\n";
 const README: &str = include_str!("../recovery/dp.commit.3/README.md");
 const FORMAT: &str = include_str!("../recovery/dp.commit.3/FORMAT.md");
 const REQUIREMENTS: &str = include_str!("../recovery/dp.commit.3/requirements.lock");

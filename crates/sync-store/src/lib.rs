@@ -50,11 +50,7 @@ pub use content::{
     series_hash, table_leaf_hash, tree_hash, verify_capsule_directory,
     verify_capsule_payload_directory, verify_incremental_capsule_payload_directory,
 };
-pub use content_remote::{
-    CapsuleGcObject, CapsuleGcPlan, CapsulePublishOutcome, ContentRemote,
-    RecoveryRecipePublishOutcome, capsule_gc_plan_bytes, capsule_gc_plan_hash,
-    decode_capsule_gc_plan,
-};
+pub use content_remote::{ContentRemote, RecoveryRecipePublishOutcome};
 pub use error::{Result, StoreError};
 pub use metered_store::{
     MeterBinding, MeteredStore, Observation, RemoteKey, StorageMeter, bind_meter, observed_under,

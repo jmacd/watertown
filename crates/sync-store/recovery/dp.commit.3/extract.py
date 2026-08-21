@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract a dp.recovery-capsule.1 from a local dp.commit.3 Delta backup."""
+"""Extract a pondcapsule.1 from a local dp.commit.3 Delta backup."""
 
 from __future__ import annotations
 
@@ -415,7 +415,7 @@ def _leaf_hash(kind: int, fingerprint: bytes, count: int, payload_parts: Iterato
 
 
 def _series_root(kind: str, fingerprint: bytes | None, leaves: list[dict[str, Any]], blake3: Any) -> str:
-    digest = blake3.blake3(b"dp.recovery-capsule-series.1\n")
+    digest = blake3.blake3(b"pondcapsule.series.1\n")
     digest.update(b"\0" if kind == "file" else b"\1")
     digest.update(b"\0" if fingerprint is None else b"\1" + fingerprint)
     digest.update(struct.pack("<Q", len(leaves)))
@@ -764,7 +764,7 @@ def _extract_graph(source: Path, destination: Path, ref_name: str | None,
             })
         entries.sort(key=lambda entry: entry["path"].encode())
         manifest = {
-            "format": "dp.recovery-capsule.1",
+            "format": "pondcapsule.1",
             "source": {
                 "pond_id": backup.pond_id,
                 "birthplace": birthplace,
@@ -776,7 +776,7 @@ def _extract_graph(source: Path, destination: Path, ref_name: str | None,
         }
         manifest_bytes = json.dumps(
             manifest, ensure_ascii=False, separators=(",", ":")).encode()
-        capsule_root = blake3.blake3(b"dp.recovery-capsule-root.1\n" + manifest_bytes).hexdigest()
+        capsule_root = blake3.blake3(b"pondcapsule.root.1\n" + manifest_bytes).hexdigest()
         (manifests_dir / f"{capsule_root}.json").write_bytes(manifest_bytes)
         (refs_dir / "latest").write_text(capsule_root + "\n", encoding="ascii")
         return capsule_root

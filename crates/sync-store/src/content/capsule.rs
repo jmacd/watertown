@@ -18,10 +18,10 @@ use tinyfs::EntryType;
 use super::ObjectHash;
 
 /// Recovery-capsule format identifier.
-pub const CAPSULE_FORMAT_V1: &str = "dp.recovery-capsule.1";
+pub const CAPSULE_FORMAT_V1: &str = "pondcapsule.1";
 
-const CAPSULE_ROOT_DOMAIN: &[u8] = b"dp.recovery-capsule-root.1\n";
-const CAPSULE_SERIES_DOMAIN: &[u8] = b"dp.recovery-capsule-series.1\n";
+const CAPSULE_ROOT_DOMAIN: &[u8] = b"pondcapsule.root.1\n";
+const CAPSULE_SERIES_DOMAIN: &[u8] = b"pondcapsule.series.1\n";
 const LOGICAL_LEAF_DOMAIN: &[u8] = b"dp.series-leaf.1\n";
 
 /// Provenance of the live snapshot represented by a capsule.
@@ -1893,7 +1893,7 @@ mod tests {
         let manifest = CapsuleManifest::new(source(), vec![root()]).unwrap();
         assert_eq!(
             capsule_root(&manifest).unwrap().to_hex(),
-            "92d3fd27a48893409bd486d21564f028e5641166a114d4d044a3d19af0804d3a"
+            "9b6891de5b45220d72199fe63df2e7417260ad03e1de2fb66a2ebb1ac41e375f"
         );
     }
 
@@ -1978,7 +1978,7 @@ mod tests {
         let bytes = capsule_manifest_bytes(&manifest).unwrap();
         assert_eq!(
             capsule_root(&manifest).unwrap().to_hex(),
-            "157a4c7f0a995d7c92e3339b4a8637288a6771d73c5484e9ba7f20af6a85088d"
+            "632f82aee90fdb7dfa47d2f95208c8c368328944aaff26febe8850dbf06ad8ce"
         );
         assert_eq!(decode_capsule_manifest(&bytes).unwrap(), manifest);
     }

@@ -23,7 +23,7 @@
 | `pond remote remove` | Detach a remote (also works for backups) | `pond remote remove origin` |
 | `pond remote remove --purge` | Detach AND drop the materialized mount entry | `pond remote remove --purge upstream` |
 | `pond push` | Push to push/both-mode remotes | `pond push` |
-| `pond capsule` | Publish or verify a portable recovery snapshot | `pond capsule publish azure` |
+| `pond capsule` | Install recovery recipes or verify portable capsules | `pond capsule recipe inspect azure` |
 | `pond pull` | Pull from pull/both-mode remotes | `pond pull` |
 | `pond restore` | Bootstrap a whole-pond replica from a backup (disaster recovery) | `pond restore origin file:///mnt/backups/origin` |
 | `pond maintain` | Delta maintenance; `--compact` records a pushable Compact bundle | `pond maintain --compact` |
@@ -538,32 +538,22 @@ pond push origin
 After every write transaction, the steward also auto-pushes all
 `push`/`both`-mode remotes -- so this command is mostly used when an
 earlier auto-push failed (transient network), or right after attaching
-a brand-new remote. A successful native push is followed by recovery-capsule
-publication. If capsule publication fails, the native backup remains durable
-and the previous verified capsule remains current, but the push reports failure
-so retrying completes the portable backup.
+a brand-new remote. Native pushes perform no capsule or recovery-recipe I/O.
 
 ---
 
 ### pond capsule
 
-Publish and verify portable logical recovery snapshots. Recovery capsules are
-stored as a canonical manifest plus plain BLAKE3-addressed file and Parquet
-objects, so they can be downloaded with Azure CLI or MinIO Client without a
-source-format `pond` binary.
+Install static native-format recovery recipes and verify portable logical
+recovery snapshots. The recipe extracts a portable capsule from an existing
+native Delta/Parquet backup only when recovery is needed.
 
 ```bash
-# Prototype command for explicitly materializing the pre-pivot capsule layout.
-# Native pushes do not invoke it.
-pond capsule publish azure
+# Install the reviewed dp.commit.3 recipe once at a backup remote.
+pond capsule recipe publish azure
 
-# List the current and retained generations at a named remote.
-pond capsule list azure
-
-# Create, review, verify, and apply exact retained-generation cleanup.
-pond capsule gc plan azure --output capsule-gc.json --grace-hours 24
-pond capsule gc verify azure --plan capsule-gc.json
-pond capsule gc apply azure --plan capsule-gc.json --plan-hash <printed-hash>
+# Verify its immutable and discoverable bootstrap objects.
+pond capsule recipe inspect azure
 
 # Verify and summarize a capsule downloaded into ./recovered/recovery/.
 pond capsule inspect ./recovered
@@ -572,14 +562,11 @@ pond capsule inspect ./recovered
 pond capsule verify ./recovered
 ```
 
-Explicit publication reuploads and verifies the full payload closure, repairing
-any stray or corrupt same-name object. Automatic changed-tip publication reuses
-only payloads declared by the prior verified generation.
-
-Each published generation contains `RUNBOOK.txt`, `download-az.sh`, and
-`download-mc.sh`. The scripts embed the immutable capsule root and exact object
-list, but no credentials. Download and review a script before running it; use
-managed identity or an already-authenticated client.
+Recipe publication creates
+`recovery/recipes/dp.commit.3/<recipe-hash>/README.sh` before the discoverable
+`recovery/README.sh`. Retries accept only byte-identical objects; neither path
+is overwritten when its content differs. Ordinary native pushes never probe or
+rewrite either object.
 
 Inspection does not open or modify a pond. It validates the latest reference,
 canonical manifest, every physical object hash and size, every Parquet schema,
