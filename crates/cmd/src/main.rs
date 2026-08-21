@@ -186,6 +186,11 @@ enum BackupCommand {
 /// Portable recovery-capsule operations.
 #[derive(Debug, Subcommand)]
 enum CapsuleCommand {
+    /// Publish or inspect the static native-format recovery recipe.
+    Recipe {
+        #[command(subcommand)]
+        command: CapsuleRecipeCommand,
+    },
     /// Publish or repair a capsule at a named backup remote.
     Publish {
         /// Backup attachment name.
@@ -210,6 +215,20 @@ enum CapsuleCommand {
     Verify {
         /// Directory containing the downloaded `recovery/` tree.
         path: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CapsuleRecipeCommand {
+    /// Install the reviewed dp.commit.3 recipe without overwriting differences.
+    Publish {
+        /// Backup attachment name.
+        name: String,
+    },
+    /// Verify both immutable and discoverable recipe objects.
+    Inspect {
+        /// Remote attachment name.
+        name: String,
     },
 }
 
@@ -777,6 +796,17 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Capsule { command } => match command {
+            CapsuleCommand::Recipe { command } => {
+                let (name, action) = match command {
+                    CapsuleRecipeCommand::Publish { name } => {
+                        (name, commands::RecoveryRecipeAction::Publish)
+                    }
+                    CapsuleRecipeCommand::Inspect { name } => {
+                        (name, commands::RecoveryRecipeAction::Inspect)
+                    }
+                };
+                commands::capsule_recipe_command(&ship_context, &name, action).await
+            }
             CapsuleCommand::Publish { name } => {
                 commands::capsule_publish_command(&ship_context, &name).await
             }

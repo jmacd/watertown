@@ -83,9 +83,16 @@ has generated a representative native Delta backup, extracted files, a table,
 a series, a symlink, and a dynamic recipe without invoking `pond`, then passed
 the resulting capsule through the Rust verifier.
 
-Recipe publication remains blocked until the checked-in integration test also
-covers source tree/manifest agreement, external `_blobs`, tombstones and
-historical rows, malformed inputs, and the generated cloud download helpers.
+The checked-in integration harness covers source tree/manifest agreement,
+external `_blobs`, tombstones, historical rows, all physical payload kinds, a
+symlink, and a dynamic recipe, then invokes the Rust capsule verifier only
+after independent extraction. Credential-free Azure AzCopy and MinIO Client
+helpers download into new directories and reject results without `_delta_log`.
+`pond capsule recipe publish` creates the hash-addressed recipe first and the
+discoverable `recovery/README.sh` second; retries accept only byte-identical
+objects and never overwrite a difference. `pond capsule recipe inspect`
+verifies both copies against the reviewed build. Actual production publication
+remains blocked until this branch is reviewed and merged.
 
 ## Implementation update: 2026-08-19
 

@@ -305,6 +305,50 @@ pub async fn open_and_list_capsules_limited(
     .await
 }
 
+/// Install the static `dp.commit.3` recovery recipe under a remote's budget.
+pub async fn open_and_publish_recovery_recipe_limited(
+    url: &str,
+    storage_options: HashMap<String, String>,
+    limits: &mut LimiterSet,
+) -> Result<sync_store::RecoveryRecipePublishOutcome, StewardError> {
+    crate::storage_meter::metered_op(
+        url,
+        limits,
+        Box::pin(async move {
+            let remote = sync_store::ContentRemote::open_at_url(url, storage_options)
+                .await
+                .map_err(|error| StewardError::Aborted(format!("open remote {url}: {error}")))?;
+            remote
+                .publish_recovery_recipe_dp_commit_3()
+                .await
+                .map_err(|error| StewardError::Content(format!("publish recovery recipe: {error}")))
+        }),
+    )
+    .await
+}
+
+/// Verify the static `dp.commit.3` recovery recipe under a remote's budget.
+pub async fn open_and_inspect_recovery_recipe_limited(
+    url: &str,
+    storage_options: HashMap<String, String>,
+    limits: &mut LimiterSet,
+) -> Result<ObjectHash, StewardError> {
+    crate::storage_meter::metered_op(
+        url,
+        limits,
+        Box::pin(async move {
+            let remote = sync_store::ContentRemote::open_at_url(url, storage_options)
+                .await
+                .map_err(|error| StewardError::Aborted(format!("open remote {url}: {error}")))?;
+            remote
+                .inspect_recovery_recipe_dp_commit_3()
+                .await
+                .map_err(|error| StewardError::Content(format!("inspect recovery recipe: {error}")))
+        }),
+    )
+    .await
+}
+
 /// Create a reviewed retention-GC plan under the remote storage budget.
 pub async fn open_and_plan_capsule_gc_limited(
     url: &str,

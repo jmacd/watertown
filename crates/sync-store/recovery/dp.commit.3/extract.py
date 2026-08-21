@@ -24,6 +24,7 @@ ENTRY_TYPES = {
     8: "table:physical:series",
     9: "table:dynamic",
 }
+ENTRY_CODES = {name: code for code, name in ENTRY_TYPES.items()}
 NIL_UUID = "00000000-0000-0000-0000-000000000000"
 
 
@@ -130,6 +131,33 @@ def decode_manifest(data: bytes) -> list[dict[str, Any]]:
             }
         )
     cur.finish()
+    node_ids = [entry["node_id"].encode() for entry in entries]
+    if node_ids != sorted(node_ids) or len(node_ids) != len(set(node_ids)):
+        raise FormatError("native manifest entries are not uniquely sorted by node ID")
+    return entries
+
+
+def decode_tree(data: bytes) -> list[dict[str, Any]]:
+    cur = Cursor(data)
+    cur.tag(b"dp.tree.2\n")
+    entries = []
+    for _ in range(cur.u32()):
+        name = cur.text()
+        kind = cur.u8()
+        if kind not in ENTRY_TYPES:
+            raise FormatError(f"unknown entry type {kind}")
+        child_hash = cur.hash()
+        versions = [decode_metadata(cur) for _ in range(cur.u32())]
+        entries.append({
+            "name": name,
+            "entry_type": ENTRY_TYPES[kind],
+            "child_hash": child_hash,
+            "versions": versions,
+        })
+    cur.finish()
+    names = [entry["name"].encode() for entry in entries]
+    if names != sorted(names) or len(names) != len(set(names)):
+        raise FormatError("native tree entries are not uniquely sorted by name")
     return entries
 
 
@@ -147,6 +175,70 @@ def decode_recipe(data: bytes) -> tuple[str, bytes]:
     factory = cur.text()
     config = cur.take(len(data) - cur.offset)
     return factory, config
+
+
+def _encoded_metadata(metadata: dict[str, Any]) -> bytes:
+    flags = int(metadata["min_event_time"] is not None)
+    flags |= int(metadata["max_event_time"] is not None) << 1
+    flags |= int(metadata["extended_attributes"] is not None) << 2
+    flags |= int(metadata["timestamp"] is not None) << 3
+    result = bytes([flags])
+    if metadata["min_event_time"] is not None:
+        result += struct.pack("<q", metadata["min_event_time"])
+    if metadata["max_event_time"] is not None:
+        result += struct.pack("<q", metadata["max_event_time"])
+    if metadata["extended_attributes"] is not None:
+        value = metadata["extended_attributes"].encode()
+        result += struct.pack("<I", len(value)) + value
+    if metadata["timestamp"] is not None:
+        result += struct.pack("<q", metadata["timestamp"])
+    return result
+
+
+def node_manifest_root(entries: list[dict[str, Any]], blake3: Any) -> bytes:
+    empty = [b""] * 257
+    empty[256] = blake3.blake3(b"\x02").digest()
+    for depth in range(255, -1, -1):
+        empty[depth] = blake3.blake3(
+            b"\x01" + empty[depth + 1] + empty[depth + 1]).digest()
+
+    pairs = []
+    for entry in entries:
+        name = entry["name"].encode()
+        parent = entry["parent_node_id"].encode()
+        value = (
+            bytes([ENTRY_CODES[entry["entry_type"]]])
+            + struct.pack("<I", len(name))
+            + name
+            + struct.pack("<I", len(parent))
+            + parent
+            + entry["child_hash"]
+            + struct.pack("<I", len(entry["versions"]))
+            + b"".join(_encoded_metadata(version) for version in entry["versions"])
+        )
+        key = blake3.blake3(entry["node_id"].encode()).digest()
+        pairs.append((key, blake3.blake3(value).digest()))
+    pairs.sort()
+    if any(left[0] == right[0] for left, right in zip(pairs, pairs[1:])):
+        raise FormatError("duplicate node ID key in node manifest")
+
+    def build(depth: int, subset: list[tuple[bytes, bytes]]) -> bytes:
+        if not subset:
+            return empty[depth]
+        if depth == 256:
+            if len(subset) != 1:
+                raise FormatError("node manifest contains a BLAKE3 key collision")
+            key, value = subset[0]
+            return blake3.blake3(b"\x00" + key + value).digest()
+        byte, shift = depth // 8, 7 - depth % 8
+        split = 0
+        while split < len(subset) and ((subset[split][0][byte] >> shift) & 1) == 0:
+            split += 1
+        left = build(depth + 1, subset[:split])
+        right = build(depth + 1, subset[split:])
+        return blake3.blake3(b"\x01" + left + right).digest()
+
+    return build(0, pairs)
 
 
 def canonical_attributes(text: str) -> str:
@@ -431,6 +523,54 @@ class NativeBackup:
             return external
         raise FormatError(f"native object {digest.hex()} is missing")
 
+    def read_object(self, digest: bytes) -> bytes:
+        data = self.object_path(digest).read_bytes()
+        if self.blake3.blake3(data).digest() != digest:
+            raise FormatError(f"native object {digest.hex()} fails BLAKE3 verification")
+        return data
+
+
+def verify_tree_manifest(backup: NativeBackup, commit: dict[str, Any],
+                         entries: list[dict[str, Any]]) -> None:
+    roots = [entry for entry in entries
+             if not entry["parent_node_id"] and not entry["name"]]
+    if len(roots) != 1:
+        raise FormatError("native manifest must contain exactly one root")
+    root = roots[0]
+    if root["entry_type"] != "dir:physical":
+        raise FormatError("native manifest root is not a physical directory")
+    if root["child_hash"] != commit["root_tree_hash"]:
+        raise FormatError("native manifest root does not match the commit root tree")
+
+    children: dict[str, list[dict[str, Any]]] = {}
+    for entry in entries:
+        if entry is not root:
+            children.setdefault(entry["parent_node_id"], []).append(entry)
+    for directory in entries:
+        if directory["entry_type"] != "dir:physical":
+            if directory["node_id"] in children:
+                raise FormatError(
+                    f"non-physical directory node {directory['node_id']!r} has children")
+            continue
+        tree = decode_tree(backup.read_object(directory["child_hash"]))
+        expected = sorted(children.get(directory["node_id"], []),
+                          key=lambda entry: entry["name"].encode())
+        actual = [{
+            "name": entry["name"],
+            "entry_type": entry["entry_type"],
+            "child_hash": entry["child_hash"],
+            "versions": entry["versions"],
+        } for entry in tree]
+        projected = [{
+            "name": entry["name"],
+            "entry_type": entry["entry_type"],
+            "child_hash": entry["child_hash"],
+            "versions": entry["versions"],
+        } for entry in expected]
+        if actual != projected:
+            raise FormatError(
+                f"tree and manifest disagree at native node {directory['node_id']!r}")
+
 
 def _extract_into(source: Path, destination: Path, ref_name: str | None,
                   commit_hex: str | None, birthplace: str) -> str:
@@ -486,17 +626,17 @@ def _extract_graph(source: Path, destination: Path, ref_name: str | None,
             if ref_name not in backup.refs:
                 raise FormatError(f"native ref {ref_name!r} does not exist")
             tip = backup.refs[ref_name]
-        commit_bytes = backup.object_path(tip).read_bytes()
-        if blake3.blake3(commit_bytes).digest() != tip:
-            raise FormatError("selected commit object fails BLAKE3 verification")
+        commit_bytes = backup.read_object(tip)
         commit = decode_commit(commit_bytes)
         if commit["pond_id"] != backup.pond_id:
             raise FormatError("selected commit belongs to a different pond")
         manifest_hash = commit["node_manifest_hash"]
-        manifest_bytes = backup.object_path(manifest_hash).read_bytes()
-        if blake3.blake3(manifest_bytes).digest() != manifest_hash:
-            raise FormatError("native manifest fails BLAKE3 verification")
+        manifest_bytes = backup.read_object(manifest_hash)
         native_entries = decode_manifest(manifest_bytes)
+        computed_manifest_root = node_manifest_root(native_entries, blake3)
+        if computed_manifest_root != commit["node_manifest_root"]:
+            raise FormatError("native node-manifest Merkle root does not match the commit")
+        verify_tree_manifest(backup, commit, native_entries)
 
         by_id = {entry["node_id"]: entry for entry in native_entries}
         if len(by_id) != len(native_entries):
@@ -546,12 +686,12 @@ def _extract_graph(source: Path, destination: Path, ref_name: str | None,
                     backup.object_path(child_hash), objects_dir, child_hash, blake3)}
             elif entry_type in ("dir:dynamic", "file:dynamic", "table:dynamic"):
                 recipe_path = backup.object_path(child_hash)
-                decode_recipe(recipe_path.read_bytes())
+                decode_recipe(backup.read_object(child_hash))
                 node = {"kind": "dynamic", "recipe": _copy_payload(
                     recipe_path, objects_dir, child_hash, blake3)}
             else:
                 payload_kind = "file" if entry_type.startswith("file:") else "table"
-                hashes = decode_series(backup.object_path(child_hash).read_bytes()) \
+                hashes = decode_series(backup.read_object(child_hash)) \
                     if entry_type.endswith(":series") else [child_hash]
                 if len(hashes) != len(native["versions"]):
                     raise FormatError(f"{paths[native['node_id']]} has mismatched versions and metadata")
@@ -644,16 +784,46 @@ def _extract_graph(source: Path, destination: Path, ref_name: str | None,
 
 def verify_fixtures(path: Path) -> None:
     fixture = json.loads(path.read_text())
-    commit = decode_commit(bytes.fromhex(fixture["commit_hex"]))
+    commit_bytes = bytes.fromhex(fixture["commit_hex"])
+    manifest_bytes = bytes.fromhex(fixture["manifest_hex"])
+    tree_bytes = bytes.fromhex(fixture["tree_hex"])
+    series_bytes = bytes.fromhex(fixture["series_hex"])
+    recipe_bytes = bytes.fromhex(fixture["recipe_hex"])
+    commit = decode_commit(commit_bytes)
     assert commit["pond_id"] == "pond-x" and commit["seq"] == -7
     assert commit["parent_commit_hash"] == bytes(range(32, 64))
-    manifest = decode_manifest(bytes.fromhex(fixture["manifest_hex"]))
+    manifest = decode_manifest(manifest_bytes)
     assert [entry["node_id"] for entry in manifest] == ["node-file", "root"]
     assert manifest[0]["versions"][0]["extended_attributes"] == '{"a":1}'
     assert manifest[0]["versions"][1]["timestamp"] == 124
-    assert decode_series(bytes.fromhex(fixture["series_hex"])) == [
+    tree = decode_tree(tree_bytes)
+    assert len(tree) == 1 and tree[0]["name"] == "data.bin"
+    assert tree[0]["versions"] == manifest[0]["versions"]
+    assert decode_series(series_bytes) == [
         bytes(range(64, 96)), bytes(range(96, 128))]
-    assert decode_recipe(bytes.fromhex(fixture["recipe_hex"])) == ("factory-x", b"\0\xffconfig")
+    assert decode_recipe(recipe_bytes) == ("factory-x", b"\0\xffconfig")
+
+    malformed = [
+        (decode_commit, commit_bytes + b"\0"),
+        (decode_manifest, manifest_bytes[:-1]),
+        (decode_tree, tree_bytes + b"\0"),
+        (decode_series, series_bytes[:-1]),
+        (decode_recipe, b"not-a-recipe"),
+    ]
+    for decoder, value in malformed:
+        try:
+            decoder(value)
+        except FormatError:
+            pass
+        else:
+            raise AssertionError(f"{decoder.__name__} accepted malformed input")
+    for attributes in ('{"fraction":1.5}', '{"too_large":18446744073709551616}'):
+        try:
+            canonical_attributes(attributes)
+        except FormatError:
+            pass
+        else:
+            raise AssertionError("canonical attributes accepted unsupported numbers")
 
 
 def main() -> int:

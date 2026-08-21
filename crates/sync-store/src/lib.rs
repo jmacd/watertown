@@ -51,8 +51,9 @@ pub use content::{
     verify_capsule_payload_directory, verify_incremental_capsule_payload_directory,
 };
 pub use content_remote::{
-    CapsuleGcObject, CapsuleGcPlan, CapsulePublishOutcome, ContentRemote, capsule_gc_plan_bytes,
-    capsule_gc_plan_hash, decode_capsule_gc_plan,
+    CapsuleGcObject, CapsuleGcPlan, CapsulePublishOutcome, ContentRemote,
+    RecoveryRecipePublishOutcome, capsule_gc_plan_bytes, capsule_gc_plan_hash,
+    decode_capsule_gc_plan,
 };
 pub use error::{Result, StoreError};
 pub use metered_store::{

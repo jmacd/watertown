@@ -46,6 +46,6 @@ dp.recipe.1\n   dynamic factory type and raw configuration
 
 Integers are little-endian. Strings and variable byte fields use an unsigned
 32-bit little-endian length followed by exact bytes. Hashes are 32 raw BLAKE3
-bytes. `native-fixtures.json` contains commit, manifest, series, and recipe
+bytes. `native-fixtures.json` contains commit, tree, manifest, series, and recipe
 objects whose exact bytes are checked by both the independent decoder and the
 Rust source codecs.

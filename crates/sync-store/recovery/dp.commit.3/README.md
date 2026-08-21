@@ -19,7 +19,20 @@ access, executes no extracted file, modifies no pond, and deletes no storage.
 ## Recovery stages
 
 1. Download the complete native Delta backup, including `_delta_log/` and
-   `_blobs/`, with reviewed `az`, `azcopy`, or `mc` commands.
+   `_blobs/`, after separately authenticating one of the reviewed helpers:
+
+   ```sh
+   azcopy login
+   sh download-azcopy.sh \
+     https://ACCOUNT.blob.core.windows.net/CONTAINER/PREFIX BACKUP
+
+   mc alias set ALIAS ENDPOINT
+   sh download-mc.sh ALIAS/BUCKET/PREFIX BACKUP
+   ```
+
+   The helpers accept no credential options, refuse an existing destination,
+   and require the result to contain `_delta_log/`. They never delete a
+   partial download; inspect or remove one explicitly before retrying.
 2. Create a disposable Python 3.13 virtual environment and install the exact
    packages in `requirements.lock`.
 3. Select a native ref or exact commit hash.
@@ -61,3 +74,15 @@ python extract.py --verify-fixtures native-fixtures.json
 This checks the independent decoder against byte-for-byte fixtures also
 validated by the Rust source codecs. Production publication remains gated on a
 full native-backup-to-capsule integration test.
+
+Maintainers with the pinned environment and a current binary can run that test
+without network access:
+
+```sh
+python integration_test.py --pond /path/to/pond
+```
+
+The test creates a temporary native Delta backup with historical rows, a
+tombstone, an external `_blobs` payload, Parquet, a series, a symlink, and a
+dynamic recipe. Extraction does not invoke `pond`; the supplied binary is used
+only afterward as the independent portable-capsule verifier.

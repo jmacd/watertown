@@ -10,14 +10,20 @@ const RECIPE_DOMAIN: &[u8] = b"dp.recovery-recipe.1\n";
 const README: &str = include_str!("../recovery/dp.commit.3/README.md");
 const FORMAT: &str = include_str!("../recovery/dp.commit.3/FORMAT.md");
 const REQUIREMENTS: &str = include_str!("../recovery/dp.commit.3/requirements.lock");
+const DOWNLOAD_AZCOPY: &str = include_str!("../recovery/dp.commit.3/download-azcopy.sh");
+const DOWNLOAD_MC: &str = include_str!("../recovery/dp.commit.3/download-mc.sh");
 const EXTRACTOR: &str = include_str!("../recovery/dp.commit.3/extract.py");
+const INTEGRATION_TEST: &str = include_str!("../recovery/dp.commit.3/integration_test.py");
 const NATIVE_FIXTURES: &str = include_str!("../recovery/dp.commit.3/native-fixtures.json");
 
 const FILES: &[(&str, &str)] = &[
     ("README.md", README),
     ("FORMAT.md", FORMAT),
     ("requirements.lock", REQUIREMENTS),
+    ("download-azcopy.sh", DOWNLOAD_AZCOPY),
+    ("download-mc.sh", DOWNLOAD_MC),
     ("extract.py", EXTRACTOR),
+    ("integration_test.py", INTEGRATION_TEST),
     ("native-fixtures.json", NATIVE_FIXTURES),
 ];
 
@@ -100,7 +106,10 @@ mod tests {
                 "FORMAT.md",
                 "README.md",
                 "SHA256SUMS",
+                "download-azcopy.sh",
+                "download-mc.sh",
                 "extract.py",
+                "integration_test.py",
                 "native-fixtures.json",
                 "requirements.lock"
             ]
@@ -114,6 +123,16 @@ mod tests {
                 .unwrap()
                 .success()
         );
+        for helper in ["download-azcopy.sh", "download-mc.sh"] {
+            assert!(
+                Command::new("sh")
+                    .arg("-n")
+                    .arg(destination.join(helper))
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
         assert!(!recovery_recipe_dp_commit_3().is_empty());
         assert_ne!(
             recovery_recipe_dp_commit_3_hash(),
@@ -189,6 +208,20 @@ mod tests {
         assert_eq!(
             crate::content::encode_manifest(&entries).unwrap(),
             hex_value("manifest_hex")
+        );
+        assert_eq!(
+            crate::node_merkle_rebuild_root(&entries).unwrap().to_hex(),
+            fixtures["manifest_root_hex"].as_str().unwrap()
+        );
+        assert_eq!(
+            crate::content::encode_tree(&[crate::TreeEntry::new(
+                "data.bin",
+                EntryType::FilePhysicalSeries,
+                hash(32),
+                entries[0].versions.clone(),
+            )])
+            .unwrap(),
+            hex_value("tree_hex")
         );
         assert_eq!(
             crate::content::encode_series(&[hash(64), hash(96)]),

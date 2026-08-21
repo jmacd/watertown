@@ -56,6 +56,7 @@ const META_PARTITION: &str = "meta";
 const POND_ID_KEY: &str = "pond_id";
 const CAPSULE_PREFIX: &str = "recovery";
 const CAPSULE_HISTORY_LIMIT: usize = 3;
+const RECIPE_NATIVE_FORMAT: &str = "dp.commit.3";
 
 /// Result of publishing one verified recovery-capsule generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +67,17 @@ pub struct CapsulePublishOutcome {
     pub payloads_uploaded: usize,
     /// Total distinct payload objects referenced by the generation.
     pub payloads_total: usize,
+}
+
+/// Result of installing the static recovery recipe for the current native format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryRecipePublishOutcome {
+    /// Domain-separated identity of the exact bootstrap bytes.
+    pub recipe_hash: ObjectHash,
+    /// Whether this call created the immutable versioned recipe object.
+    pub versioned_created: bool,
+    /// Whether this call created the discoverable top-level bootstrap.
+    pub discoverable_created: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -291,6 +303,125 @@ impl ContentRemote {
     /// The pond whose objects this remote holds.
     pub fn pond_id(&self) -> Uuid {
         self.pond_id
+    }
+
+    fn recovery_recipe_versioned_path(hash: ObjectHash) -> object_store::path::Path {
+        object_store::path::Path::from(format!(
+            "{CAPSULE_PREFIX}/recipes/{RECIPE_NATIVE_FORMAT}/{}/README.sh",
+            hash.to_hex()
+        ))
+    }
+
+    fn recovery_recipe_discoverable_path() -> object_store::path::Path {
+        object_store::path::Path::from(format!("{CAPSULE_PREFIX}/README.sh"))
+    }
+
+    async fn create_exact_object(
+        &self,
+        path: &object_store::path::Path,
+        bytes: &[u8],
+        label: &str,
+    ) -> Result<bool> {
+        match self
+            .store
+            .object_store()
+            .put_opts(
+                path,
+                bytes.to_vec().into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..PutOptions::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let existing = self
+                    .store
+                    .object_store()
+                    .get(path)
+                    .await
+                    .map_err(|error| {
+                        StoreError::Invariant(format!("read existing {label}: {error}"))
+                    })?
+                    .bytes()
+                    .await
+                    .map_err(|error| {
+                        StoreError::Invariant(format!("collect existing {label}: {error}"))
+                    })?;
+                if existing.as_ref() != bytes {
+                    return Err(StoreError::Invariant(format!(
+                        "existing {label} differs from the reviewed recovery recipe"
+                    )));
+                }
+                Ok(false)
+            }
+            Err(error) => Err(StoreError::Invariant(format!("create {label}: {error}"))),
+        }
+    }
+
+    /// Install the reviewed `dp.commit.3` recovery recipe exactly once.
+    ///
+    /// The immutable hash-addressed object is created before the discoverable
+    /// top-level bootstrap. Existing byte-identical objects make retries
+    /// idempotent; differing objects are never overwritten.
+    pub async fn publish_recovery_recipe_dp_commit_3(
+        &self,
+    ) -> Result<RecoveryRecipePublishOutcome> {
+        let bytes = crate::recovery_recipe_dp_commit_3();
+        let recipe_hash = crate::recovery_recipe_dp_commit_3_hash();
+        let versioned_created = self
+            .create_exact_object(
+                &Self::recovery_recipe_versioned_path(recipe_hash),
+                &bytes,
+                "versioned recovery recipe",
+            )
+            .await?;
+        let discoverable_created = self
+            .create_exact_object(
+                &Self::recovery_recipe_discoverable_path(),
+                &bytes,
+                "discoverable recovery recipe",
+            )
+            .await?;
+        Ok(RecoveryRecipePublishOutcome {
+            recipe_hash,
+            versioned_created,
+            discoverable_created,
+        })
+    }
+
+    /// Verify the discoverable and immutable `dp.commit.3` recipe objects.
+    pub async fn inspect_recovery_recipe_dp_commit_3(&self) -> Result<ObjectHash> {
+        let expected = crate::recovery_recipe_dp_commit_3();
+        let hash = crate::recovery_recipe_dp_commit_3_hash();
+        for (path, label) in [
+            (
+                Self::recovery_recipe_versioned_path(hash),
+                "versioned recovery recipe",
+            ),
+            (
+                Self::recovery_recipe_discoverable_path(),
+                "discoverable recovery recipe",
+            ),
+        ] {
+            let bytes = self
+                .store
+                .object_store()
+                .get(&path)
+                .await
+                .map_err(|error| StoreError::Invariant(format!("read {label}: {error}")))?
+                .bytes()
+                .await
+                .map_err(|error| StoreError::Invariant(format!("collect {label}: {error}")))?;
+            if bytes.as_ref() != expected {
+                return Err(StoreError::Invariant(format!(
+                    "{label} differs from recipe {hash}"
+                )));
+            }
+        }
+        Ok(hash)
     }
 
     /// Push a commit: write `objects` and advance `ref_name` to `tip` in a
@@ -1595,6 +1726,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(opened.pond_id(), pond);
+    }
+
+    #[tokio::test]
+    async fn static_recovery_recipe_is_immutable_and_idempotent() {
+        let dir = tempdir().unwrap();
+        let remote = ContentRemote::create_at(dir.path().join("remote"), Uuid::new_v4())
+            .await
+            .unwrap();
+        let first = remote.publish_recovery_recipe_dp_commit_3().await.unwrap();
+        assert!(first.versioned_created);
+        assert!(first.discoverable_created);
+        assert_eq!(
+            remote.inspect_recovery_recipe_dp_commit_3().await.unwrap(),
+            first.recipe_hash
+        );
+
+        let retry = remote.publish_recovery_recipe_dp_commit_3().await.unwrap();
+        assert_eq!(retry.recipe_hash, first.recipe_hash);
+        assert!(!retry.versioned_created);
+        assert!(!retry.discoverable_created);
+
+        remote
+            .store
+            .object_store()
+            .put(
+                &ContentRemote::recovery_recipe_discoverable_path(),
+                b"corrupt".to_vec().into(),
+            )
+            .await
+            .unwrap();
+        assert!(remote.inspect_recovery_recipe_dp_commit_3().await.is_err());
+        assert!(remote.publish_recovery_recipe_dp_commit_3().await.is_err());
     }
 
     fn test_capsule(payload: &[u8]) -> (CapsuleManifest, BTreeMap<ObjectHash, Vec<u8>>) {
