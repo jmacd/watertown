@@ -66,6 +66,27 @@ and planned importer remain useful. Its automatic per-commit publisher,
 generation artifacts, retention GC, and payload replication are prototypes to
 remove or repurpose.
 
+## Static recipe implementation update: 2026-08-21
+
+The `dp.commit.3` recovery kit now has a deterministic POSIX `README.sh`
+bootstrap, safety and format documentation, pinned Python 3.13 dependencies,
+an independent Delta/Parquet extractor, and cross-language native wire
+fixtures. The bootstrap only creates a new kit directory, writes its reviewed
+files, and prints instructions; it performs no network access and executes no
+extracted code.
+
+The extractor resolves live Delta rows by greatest transaction sequence,
+rejects ambiguous winners and unsafe paths, verifies native values and content
+addresses, decodes commit/manifest/series/recipe objects, and writes a portable
+capsule through a private sibling staging directory. A local integration check
+has generated a representative native Delta backup, extracted files, a table,
+a series, a symlink, and a dynamic recipe without invoking `pond`, then passed
+the resulting capsule through the Rust verifier.
+
+Recipe publication remains blocked until the checked-in integration test also
+covers source tree/manifest agreement, external `_blobs`, tombstones and
+historical rows, malformed inputs, and the generated cloud download helpers.
+
 ## Implementation update: 2026-08-19
 
 Phase-one work on `jmacd/capsule1` currently spans `e8ad3617` through

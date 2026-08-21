@@ -29,6 +29,7 @@ pub mod content;
 pub mod content_remote;
 mod error;
 pub mod metered_store;
+mod recovery_recipe;
 mod s3_registration;
 pub mod schema;
 mod store;
@@ -57,6 +58,7 @@ pub use error::{Result, StoreError};
 pub use metered_store::{
     MeterBinding, MeteredStore, Observation, RemoteKey, StorageMeter, bind_meter, observed_under,
 };
+pub use recovery_recipe::{recovery_recipe_dp_commit_3, recovery_recipe_dp_commit_3_hash};
 pub use store::{AddPath, CompactMetrics, Op, RemovePath, Store, raw_object_store_at_url};
 pub use tlog::{
     Checkpoint, CheckpointError, LogHash, TileLog, TransparencyLog, checkpoint_history_path,
