@@ -250,69 +250,6 @@ async fn push_content_inner(
         .await
         .map_err(|e| StewardError::Content(e.to_string()))?;
     let objects_pushed = objects.len();
-    for (hash, bytes) in objects {
-        if hash == manifest_hash {
-            materialized.manifest = Some((hash, bytes));
-        } else {
-            let _ = materialized.inline.entry(hash).or_insert(bytes);
-        }
-    }
-
-    // Publish the portable logical snapshot only after the native ref is
-    // durable. A failure leaves the native backup valid and the previous
-    // capsule current, but fails this push's health result so the next attempt
-    // retries the idempotent trailing publication.
-    let latest_capsule = remote
-        .latest_capsule()
-        .await
-        .map_err(|error| StewardError::Content(format!("inspect recovery capsule: {error}")))?;
-    if latest_capsule
-        .as_ref()
-        .is_some_and(|(_, manifest)| manifest.source.source_tip == tip)
-    {
-        log::info!("[OK] recovery capsule already represents tip {tip}");
-    } else {
-        let capsule = match latest_capsule.as_ref() {
-            Some((_, prior)) => {
-                crate::capsule::build_recovery_capsule_from_materialized(
-                    ship,
-                    &materialized,
-                    Some(prior),
-                )
-                .await?
-            }
-            None => {
-                crate::capsule::build_recovery_capsule_from_materialized(ship, &materialized, None)
-                    .await?
-            }
-        };
-        let capsule_outcome = match latest_capsule.as_ref() {
-            Some((_, prior)) => {
-                remote
-                    .publish_capsule_incremental(
-                        &capsule.manifest,
-                        capsule.payloads.objects_dir(),
-                        prior,
-                    )
-                    .await
-            }
-            None => {
-                remote
-                    .publish_capsule_directory(&capsule.manifest, capsule.payloads.objects_dir())
-                    .await
-            }
-        }
-        .map_err(|error| {
-            StewardError::Content(format!("publish trailing recovery capsule: {error}"))
-        })?;
-        log::info!(
-            "[OK] recovery capsule published (root={}, payloads_uploaded={}, payloads_total={}, payloads_reused={})",
-            capsule_outcome.root,
-            capsule_outcome.payloads_uploaded,
-            capsule_outcome.payloads_total,
-            capsule.reused_payload_count()
-        );
-    }
 
     Ok(ContentPushOutcome {
         ref_name: ref_name.to_string(),

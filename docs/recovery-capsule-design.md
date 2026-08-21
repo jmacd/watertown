@@ -12,6 +12,60 @@
 > capsule work from `origin/main` without rebasing, and add the v2 import sink.
 > Record the phase-one commit and PR here before merging it.
 
+## Architecture correction: 2026-08-20
+
+The recovery artifact is split into two distinct things:
+
+- a **recovery recipe**, published once per native storage format; and
+- a **portable capsule**, materialized on demand from a selected native tip.
+
+For `dp.commit.3`, the native ContentRemote backup remains the only cloud copy
+of payload bytes. Small content objects are ordinary `value` bytes in the
+Delta table's `objects` partition. Large objects are raw bytes at
+`_blobs/blob=<blake3>`. Delta and Parquet readers can retrieve both without a
+source-format `pond` binary.
+
+The static recipe contains a reviewed `README.sh` bootstrap, pinned standard
+tool requirements, format documentation, extraction code, Azure CLI and MinIO
+download helpers, golden vectors, and verification code. `README.sh` only
+extracts named files into a new directory and prints instructions. It never
+uses credentials, performs network access, executes extracted code, modifies a
+pond, or deletes storage.
+
+An operator or agent:
+
+1. downloads `recovery/README.sh` and verifies its out-of-band hash;
+2. reviews and runs it to extract the recovery kit;
+3. reviews the extracted files and authenticates ordinary cloud tools;
+4. downloads the native Delta backup and `_blobs/`;
+5. selects a native ref/tip;
+6. decodes `dp.commit.3`, `dp.tree.2`, `dp.manifest.2`, `dp.series.1`, and
+   `dp.recipe.1`;
+7. materializes the portable manifest and `recovery/objects/blake3=<hash>`
+   layout locally;
+8. verifies every source object, logical leaf, series root, and capsule root;
+   and
+9. imports the verified capsule into a fresh current-format pond.
+
+Versioned recipes live under
+`recovery/recipes/dp.commit.3/<recipe-hash>/README.sh`. A discoverable
+top-level `recovery/README.sh` changes only when the native format changes.
+The recipe is published and round-trip tested before the first write in a new
+native format.
+
+This removes all capsule I/O from ordinary native pushes. There are no
+per-commit capsule manifests, duplicated cloud payloads, mutable capsule refs,
+generation history, publication leases, or capsule-generation GC. The native
+backup ref remains the snapshot selector. Recipe integrity is checked
+periodically and during recovery, not by rereading cloud objects after every
+commit.
+
+The implementation described in the following dated section predates this
+correction. Its canonical portable manifest, logical hashing, offline verifier,
+and planned importer remain useful. Its automatic per-commit publisher,
+generation artifacts, retention GC, and payload replication are prototypes to
+remove or repurpose.
+
 ## Implementation update: 2026-08-19
 
 Phase-one work on `jmacd/capsule1` currently spans `e8ad3617` through
@@ -80,7 +134,8 @@ semantic description must be published while the source format is readable.
 
 ## Decision
 
-Publish a versioned **recovery capsule** alongside each native backup.
+Publish a versioned **recovery recipe** alongside each native backup format.
+Use it to materialize a portable recovery capsule on demand.
 
 A capsule is a portable snapshot of the complete live namespace plus ordered
 logical series leaf history. It is not:
@@ -91,32 +146,34 @@ logical series leaf history. It is not:
 - a source of embedded credentials; or
 - an executable script fetched and run without review.
 
-The capsule contains a stable manifest and plain content-addressed payload
-objects. Files remain exact bytes. Tables use standard Parquet. The manifest
-preserves enough logical information to reconstruct every series leaf and
-verify its identity independently of physical Parquet, pack, or object
-boundaries.
+The extracted capsule contains a stable manifest and plain content-addressed
+payload objects. Files remain exact bytes. Tables use standard Parquet. The
+manifest preserves enough logical information to reconstruct every series leaf
+and verify its identity independently of physical Parquet, pack, or object
+boundaries. Those payloads are extracted from the native backup rather than
+duplicated in cloud storage during each push.
 
 Import creates a new pond identity and transaction lineage. Immutable import
 provenance links the new pond to the source pond, source tip, and capsule root.
 
 ## Two-branch delivery sequence
 
-Capsule publication must exist before the old reader is retired.
+The independent recovery recipe must exist before the old reader is retired.
 
 ### Phase one: old-format-compatible branch
 
 Starting from the old-format-compatible `main`:
 
 1. Freeze the capsule v1 wire contract in shared, format-independent code.
-2. Traverse the live `dp.commit.3` graph using the existing supported reader.
-3. Publish portable capsule payloads and manifests.
-4. Add inspection, verification, retention, cloud-tool instructions, safe
-   cleanup planning, and a generic staged importer.
+2. Implement and freeze an independent `dp.commit.3` extractor using standard
+   Delta/Parquet libraries and documented native object decoders.
+3. Publish the static self-extracting recipe once.
+4. Add capsule inspection, verification, cloud-tool instructions, safe cleanup
+   planning, and a generic staged importer.
 5. Prove a complete old-format export/download/import round trip.
 6. Merge and build an image.
-7. Publish and independently preserve a verified capsule of the current Azure
-   pond.
+7. Install the recipe in the current Azure backup, independently materialize a
+   capsule, and preserve its root out of band.
 
 No legacy decoder is added to logical series v2.
 
@@ -130,7 +187,7 @@ After phase one merges:
 4. Implement a v2 import sink using native logical leaf stamping.
 5. Import the preserved capsule into a fresh v2 pond.
 6. Verify logical contents and publish to a new Azure namespace.
-7. Publish and verify a new v2 recovery capsule.
+7. Publish and test the v2 native-format recipe before enabling v2 backups.
 8. Retain the old namespace until a separately reviewed deletion plan is safe
    to apply.
 
@@ -234,59 +291,39 @@ The manifest encoding must be deterministic and validated strictly:
 Future readers may add support for a new capsule version, but must never silently
 reinterpret v1.
 
-## Publication protocol
+## Recipe publication and extraction
 
-Capsule publication is a trailing, idempotent operation after a successful
-native backup push:
+Recipe publication is a one-time prerequisite for writing a native format:
 
-1. Resolve the source's current immutable content tip.
-2. Build or incrementally update the live logical inventory.
-3. Upload missing plain payload objects.
-4. Verify every referenced payload is durable.
-5. Upload the canonical manifest.
-6. Upload the object list, checksums, runbook, and generated scripts.
-7. Verify the complete generation.
-8. Atomically acquire `recovery/locks/publish` and recheck the prior ref.
-9. Advance `recovery/refs/latest` last, merge retained history, and release the
-   lock.
+1. Build and test the self-extracting recovery kit.
+2. Hash the exact `README.sh` bytes.
+3. Create
+   `recovery/recipes/<native-format>/<recipe-hash>/README.sh` immutably.
+4. Install the discoverable top-level `recovery/README.sh`.
+5. Record the recipe hash in release documentation and outside the backup.
+6. Prove extraction from a representative native backup using no `pond`
+   binary.
 
-A crash before the final reference update leaves the prior verified capsule
-current. Retrying reuses content-addressed objects and completes the same
-generation. A crashed finalizer can leave a stale publication lock; it is never
-stolen automatically. Operators must inspect and explicitly remove a lock older
-than fifteen minutes so two live publishers cannot both believe they own it.
+Ordinary native pushes do not read, rewrite, probe, or otherwise maintain the
+recipe. A native-format upgrade publishes and verifies its new recipe before
+the first backup using that format. Old recipes remain immutable.
 
-`pond capsule publish <remote>` explicitly publishes or repairs a capsule when
-there has been no new logical pond commit. Normal backup push also attempts
-capsule publication after its native push succeeds. Capsule failure is reported
-as a backup-health failure but must not corrupt or roll back the already durable
-native backup.
+Recovery selects an existing native ref or content tip. The extractor reads the
+latest Delta snapshot that contains the requested content-addressed objects; it
+does not require historical Delta files to survive indefinitely. It writes the
+portable capsule to local or separately chosen destination storage, never into
+the source backup namespace.
 
-## Incremental cost and retention
+## Cost and retention
 
-The first capsule may require approximately one additional live logical-data
-copy. Native inline objects cannot be exposed to simple copy tools without
-materialization. Compression and existing raw-blob reuse affect the exact
-ratio.
+The recipe adds zero requests, bytes, or CPU to an ordinary native push. Its
+one-time publication cost is the small recovery-kit payload plus its versioned
+and discoverable object writes.
 
-Later capsule generations reuse immutable content-addressed payload objects.
-Normal CPU, requests, and upload bytes must be proportional to changed logical
-payload and metadata, not accumulated history. Each generation adds a small
-manifest and only previously absent payload.
-
-Retention keeps the latest verified capsule plus a configurable history,
-defaulting to three generations. This does not normally mean three full copies:
-storage is the union of payload objects reachable from retained manifests. High
-churn can retain close to three generations of changed data.
-
-Capsule garbage collection:
-
-1. snapshots retained generation references;
-2. computes their complete reachable payload set;
-3. writes an immutable deletion plan;
-4. rechecks references before applying it; and
-5. never deletes an object reachable from any retained generation or active
-   reader grace period.
+The native backup already retains the required data. Recovery extraction pays
+the read and local-materialization cost only when an operator actually requests
+a capsule. Recipe versions are tiny and retained indefinitely; there are no
+capsule generations or capsule payload objects to garbage-collect.
 
 ## Operator command surface
 
@@ -294,13 +331,13 @@ Use a top-level `pond capsule` command family. The existing `pond recover`
 command remains the local crash-transaction repair operation.
 
 ```text
-pond capsule publish <remote>
-pond capsule list <source>
+pond capsule recipe publish <remote>
+pond capsule recipe inspect <source>
+pond capsule extract <source> --tip <ref-or-hash> --target <empty-path>
 pond capsule inspect <source>
 pond capsule verify <source>
 pond capsule scripts <source> --provider az|mc
 pond capsule import <source> --target <empty-path> --birthplace <label>
-pond capsule gc plan|verify|apply ...
 pond capsule erase plan|verify|apply ...
 ```
 

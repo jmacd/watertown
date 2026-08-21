@@ -553,8 +553,8 @@ objects, so they can be downloaded with Azure CLI or MinIO Client without a
 source-format `pond` binary.
 
 ```bash
-# Explicitly publish or repair the capsule on a named backup.
-# Normal successful pushes also do this automatically.
+# Prototype command for explicitly materializing the pre-pivot capsule layout.
+# Native pushes do not invoke it.
 pond capsule publish azure
 
 # List the current and retained generations at a named remote.

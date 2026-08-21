@@ -170,7 +170,11 @@ async fn builds_portable_live_inventory_with_ordered_series_leaves() {
         .expect("create remote");
     let _ = steward::push_content_to_remote(&ship, &mut remote, "main")
         .await
-        .expect("push with capsule");
+        .expect("native push");
+    let _ = remote
+        .publish_capsule_directory(&capsule.manifest, capsule.payloads.objects_dir())
+        .await
+        .expect("explicit prototype capsule publication");
     let verified = verify_capsule_directory(&remote_path).expect("verify downloaded capsule");
     assert_eq!(verified.entries, 6);
     assert_eq!(verified.logical_count, 18 + 256 * 1024);
@@ -200,7 +204,15 @@ async fn builds_portable_live_inventory_with_ordered_series_leaves() {
     );
     let _ = steward::push_content_to_remote(&ship, &mut remote, "main")
         .await
-        .expect("incremental push with capsule");
+        .expect("incremental native push");
+    let _ = remote
+        .publish_capsule_incremental(
+            &incremental.manifest,
+            incremental.payloads.objects_dir(),
+            &capsule.manifest,
+        )
+        .await
+        .expect("explicit incremental prototype publication");
     let verified = verify_capsule_directory(&remote_path).expect("verify incremental capsule");
     assert_eq!(verified.entries, 7);
     assert_eq!(verified.logical_count, 21 + 256 * 1024);

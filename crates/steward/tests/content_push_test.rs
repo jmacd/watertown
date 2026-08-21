@@ -74,16 +74,14 @@ async fn push_lands_objects_and_decodable_tip() {
         .expect("has root tree");
     assert!(root_present, "root tree object must be on the remote");
 
-    let (capsule_root, capsule) = remote
-        .latest_capsule()
-        .await
-        .expect("read latest capsule")
-        .expect("capsule published");
-    assert_eq!(
-        sync_store::capsule_root(&capsule).expect("capsule root"),
-        capsule_root
+    assert!(
+        remote
+            .latest_capsule()
+            .await
+            .expect("read capsule ref")
+            .is_none(),
+        "native pushes do not publish per-commit recovery capsules"
     );
-    assert_eq!(capsule.source.source_tip, outcome.tip);
 }
 
 /// Every object on the remote hashes to its key: pushing preserves the
@@ -149,9 +147,12 @@ async fn re_push_same_tip_is_idempotent() {
     assert_eq!(first.tip, second.tip, "tip is unchanged by a re-push");
     let tip = remote.get_tip("main").await.expect("tip").expect("ref set");
     assert_eq!(tip, first.tip);
-    assert_eq!(
-        remote.capsule_roots().await.expect("capsule roots").len(),
-        1,
-        "an unchanged tip must not rebuild or add a capsule generation"
+    assert!(
+        remote
+            .capsule_roots()
+            .await
+            .expect("capsule roots")
+            .is_empty(),
+        "native pushes do not maintain capsule generations"
     );
 }
