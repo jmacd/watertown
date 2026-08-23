@@ -201,6 +201,23 @@ enum CapsuleCommand {
         /// Directory containing the downloaded `recovery/` tree.
         path: PathBuf,
     },
+    /// Materialize a downloaded capsule into a brand-new pond.
+    ///
+    /// The target must not already exist. A private sibling staging
+    /// directory is created next to it, given a fresh pond identity, and
+    /// populated from the capsule with post-commit factory execution and
+    /// remote auto-push suppressed; only after the staged result is
+    /// re-verified against the capsule's logical contract is it renamed
+    /// atomically onto the target. On any failure the staging directory is
+    /// left in place for inspection rather than silently removed.
+    Import {
+        /// Directory containing the downloaded `recovery/` tree.
+        path: PathBuf,
+        /// Birthplace of the freshly minted target pond identity (see
+        /// `pond init --birthplace`).
+        #[arg(long)]
+        birthplace: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -760,6 +777,10 @@ async fn main() -> Result<()> {
             }
             CapsuleCommand::Inspect { path } | CapsuleCommand::Verify { path } => {
                 commands::capsule_inspect_command(&path)
+            }
+            CapsuleCommand::Import { path, birthplace } => {
+                let target = ship_context.resolve_pond_path()?;
+                commands::capsule_import_command(&path, &target, &birthplace).await
             }
         },
         Commands::Config { command } => {

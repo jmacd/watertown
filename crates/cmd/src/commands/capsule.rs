@@ -31,6 +31,50 @@ pub fn capsule_inspect_command(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Materialize a downloaded recovery capsule into a brand-new pond at
+/// `target`.
+///
+/// See [`steward::import_capsule`] for the full staged-import contract
+/// (fresh identity, suppressed post-commit dispatch during staging,
+/// atomic rename only after the staged result re-verifies against the
+/// capsule's logical contract).
+pub async fn capsule_import_command(
+    path: &std::path::Path,
+    target: &std::path::Path,
+    birthplace: &str,
+) -> Result<()> {
+    let report = steward::import_capsule(path, target, birthplace.to_string())
+        .await
+        .map_err(|error| {
+            anyhow!(
+                "import recovery capsule from {} into {}: {error}",
+                path.display(),
+                target.display()
+            )
+        })?;
+    log::info!(
+        "[OK] capsule imported into {} (pond_id={}, source_pond_id={}, capsule_root={}, \
+         entries={}, directories={}, physical={}, symlinks={}, dynamic={}, logical_count={})",
+        report.target.display(),
+        report.target_pond_id,
+        report.source_pond_id,
+        report.capsule_root,
+        report.entries,
+        report.directories,
+        report.physical,
+        report.symlinks,
+        report.dynamic,
+        report.logical_count
+    );
+    log::warn!(
+        "capsule import persistently disabled automatic post-commit factories and remote pushes \
+         at {}; review and preflight the restored namespace before setting \
+         `post_commit_dispatch` to `enabled` with `pond control set-config`",
+        report.target.display()
+    );
+    Ok(())
+}
+
 /// Publish or inspect the static native-format recovery recipe.
 pub async fn capsule_recipe_command(
     ship_context: &ShipContext,
@@ -63,31 +107,33 @@ pub async fn capsule_recipe_command(
 
     let operation: Result<()> = match action {
         RecoveryRecipeAction::Publish => {
-            let outcome = steward::open_and_publish_recovery_recipe_limited(
+            steward::open_and_publish_recovery_recipe_limited(
                 &attachment.url,
                 storage_options,
                 &mut limits,
             )
             .await
-            .map_err(|error| anyhow!("capsule recipe publish {name}: {error}"))?;
-            log::info!(
-                "[OK] recovery recipe installed (hash={}, versioned_created={}, discoverable_created={})",
-                outcome.recipe_hash,
-                outcome.versioned_created,
-                outcome.discoverable_created
-            );
-            Ok(())
+            .map_err(|error| anyhow!("capsule recipe publish {name}: {error}"))
+            .map(|outcome| {
+                log::info!(
+                    "[OK] recovery recipe installed (hash={}, versioned_created={}, discoverable_created={})",
+                    outcome.recipe_hash,
+                    outcome.versioned_created,
+                    outcome.discoverable_created
+                );
+            })
         }
         RecoveryRecipeAction::Inspect => {
-            let hash = steward::open_and_inspect_recovery_recipe_limited(
+            steward::open_and_inspect_recovery_recipe_limited(
                 &attachment.url,
                 storage_options,
                 &mut limits,
             )
             .await
-            .map_err(|error| anyhow!("capsule recipe inspect {name}: {error}"))?;
-            log::info!("[OK] recovery recipe verified (hash={hash}, format=dp.commit.3)");
-            Ok(())
+            .map_err(|error| anyhow!("capsule recipe inspect {name}: {error}"))
+            .map(|hash| {
+                log::info!("[OK] recovery recipe verified (hash={hash}, format=dp.commit.3)");
+            })
         }
     };
 

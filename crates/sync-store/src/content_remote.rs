@@ -802,42 +802,54 @@ impl ContentRemote {
             )));
         }
 
-        let expected_ref = self.capsule_ref_version().await?;
-        let mut uploaded = 0usize;
-        for object in &declared {
-            let bytes = payloads.get(&object.hash).ok_or_else(|| {
-                StoreError::Invariant(format!("capsule payload {} was not supplied", object.hash))
-            })?;
-            if ObjectHash::of_bytes(bytes) != object.hash {
-                return Err(StoreError::Invariant(format!(
-                    "capsule payload bytes do not hash to {}",
-                    object.hash
-                )));
-            }
-            if u64::try_from(bytes.len()).ok() != Some(object.size) {
-                return Err(StoreError::Invariant(format!(
-                    "capsule payload {} has size {}, expected {}",
-                    object.hash,
-                    bytes.len(),
-                    object.size
-                )));
-            }
-            let path = Self::capsule_payload_path(object.hash);
-            self.store
-                .object_store()
-                .put(&path, bytes.clone().into())
-                .await
-                .map_err(|error| {
+        self.with_capsule_publish_lock(async {
+            let expected_ref = self.capsule_ref_version().await?;
+            let mut uploaded = 0usize;
+            for object in &declared {
+                let bytes = payloads.get(&object.hash).ok_or_else(|| {
                     StoreError::Invariant(format!(
-                        "publish capsule payload {}: {error}",
+                        "capsule payload {} was not supplied",
                         object.hash
                     ))
                 })?;
-            uploaded += 1;
-        }
+                if ObjectHash::of_bytes(bytes) != object.hash {
+                    return Err(StoreError::Invariant(format!(
+                        "capsule payload bytes do not hash to {}",
+                        object.hash
+                    )));
+                }
+                if u64::try_from(bytes.len()).ok() != Some(object.size) {
+                    return Err(StoreError::Invariant(format!(
+                        "capsule payload {} has size {}, expected {}",
+                        object.hash,
+                        bytes.len(),
+                        object.size
+                    )));
+                }
+                let path = Self::capsule_payload_path(object.hash);
+                self.store
+                    .object_store()
+                    .put(&path, bytes.clone().into())
+                    .await
+                    .map_err(|error| {
+                        StoreError::Invariant(format!(
+                            "publish capsule payload {}: {error}",
+                            object.hash
+                        ))
+                    })?;
+                uploaded += 1;
+            }
 
-        self.finish_capsule_publication(root, manifest_bytes, &declared, uploaded, expected_ref)
+            self.finish_capsule_publication_locked(
+                root,
+                manifest_bytes,
+                &declared,
+                uploaded,
+                expected_ref,
+            )
             .await
+        })
+        .await
     }
 
     /// Publish a capsule whose payload closure is staged as
@@ -855,30 +867,39 @@ impl ContentRemote {
         let declared = manifest.payload_objects().map_err(StoreError::Invariant)?;
         verify_capsule_payload_directory(manifest, objects_dir).map_err(StoreError::Invariant)?;
 
-        let expected_ref = self.capsule_ref_version().await?;
-        let mut uploaded = 0usize;
-        for object in &declared {
-            let source = objects_dir.join(format!("blake3={}", object.hash.to_hex()));
-            let file = tokio::fs::File::open(&source).await.map_err(|error| {
-                StoreError::Invariant(format!(
-                    "open staged capsule payload {}: {error}",
-                    object.hash
-                ))
-            })?;
-            let path = Self::capsule_payload_path(object.hash);
-            self.put_hashed_object(path, object.hash, Some(object.size), file)
-                .await
-                .map_err(|error| {
+        self.with_capsule_publish_lock(async {
+            let expected_ref = self.capsule_ref_version().await?;
+            let mut uploaded = 0usize;
+            for object in &declared {
+                let source = objects_dir.join(format!("blake3={}", object.hash.to_hex()));
+                let file = tokio::fs::File::open(&source).await.map_err(|error| {
                     StoreError::Invariant(format!(
-                        "publish capsule payload {}: {error}",
+                        "open staged capsule payload {}: {error}",
                         object.hash
                     ))
                 })?;
-            uploaded += 1;
-        }
+                let path = Self::capsule_payload_path(object.hash);
+                self.put_hashed_object(path, object.hash, Some(object.size), file)
+                    .await
+                    .map_err(|error| {
+                        StoreError::Invariant(format!(
+                            "publish capsule payload {}: {error}",
+                            object.hash
+                        ))
+                    })?;
+                uploaded += 1;
+            }
 
-        self.finish_capsule_publication(root, manifest_bytes, &declared, uploaded, expected_ref)
+            self.finish_capsule_publication_locked(
+                root,
+                manifest_bytes,
+                &declared,
+                uploaded,
+                expected_ref,
+            )
             .await
+        })
+        .await
     }
 
     /// Publish a capsule that inherits unstaged payloads from `prior`.
@@ -905,60 +926,72 @@ impl ContentRemote {
             .into_iter()
             .map(|object| (object.hash, object.size))
             .collect::<std::collections::HashMap<_, _>>();
-        let _ = self.require_current_capsule(prior_root).await?;
+        self.with_capsule_publish_lock(async {
+            let _ = self.require_current_capsule(prior_root).await?;
 
-        let present = self.list_capsule_payloads().await?;
-        let mut uploaded = 0usize;
-        for object in &declared {
-            let source = objects_dir.join(format!("blake3={}", object.hash.to_hex()));
-            let staged = tokio::fs::try_exists(&source).await.map_err(|error| {
-                StoreError::Invariant(format!(
-                    "inspect staged capsule payload {}: {error}",
-                    object.hash
-                ))
-            })?;
-            if !staged {
-                if prior_objects.get(&object.hash) != Some(&object.size) {
-                    return Err(StoreError::Invariant(format!(
-                        "unstaged capsule payload {} is not inherited from the prior generation",
+            let present = self.list_capsule_payloads().await?;
+            let mut uploaded = 0usize;
+            for object in &declared {
+                let source = objects_dir.join(format!("blake3={}", object.hash.to_hex()));
+                let staged = tokio::fs::try_exists(&source).await.map_err(|error| {
+                    StoreError::Invariant(format!(
+                        "inspect staged capsule payload {}: {error}",
                         object.hash
-                    )));
+                    ))
+                })?;
+                if !staged {
+                    if prior_objects.get(&object.hash) != Some(&object.size) {
+                        return Err(StoreError::Invariant(format!(
+                            "unstaged capsule payload {} is not inherited from the prior generation",
+                            object.hash
+                        )));
+                    }
+                    if !present.contains(&object.hash) {
+                        return Err(StoreError::Invariant(format!(
+                            "inherited capsule payload {} is missing remotely",
+                            object.hash
+                        )));
+                    }
+                    continue;
                 }
-                if !present.contains(&object.hash) {
-                    return Err(StoreError::Invariant(format!(
-                        "inherited capsule payload {} is missing remotely",
+                if present.contains(&object.hash)
+                    && prior_objects.get(&object.hash) == Some(&object.size)
+                {
+                    continue;
+                }
+                let file = tokio::fs::File::open(&source).await.map_err(|error| {
+                    StoreError::Invariant(format!(
+                        "open staged capsule payload {}: {error}",
                         object.hash
-                    )));
-                }
-                continue;
+                    ))
+                })?;
+                self.put_hashed_object(
+                    Self::capsule_payload_path(object.hash),
+                    object.hash,
+                    Some(object.size),
+                    file,
+                )
+                .await
+                .map_err(|error| {
+                    StoreError::Invariant(format!(
+                        "publish capsule payload {}: {error}",
+                        object.hash
+                    ))
+                })?;
+                uploaded += 1;
             }
-            if present.contains(&object.hash)
-                && prior_objects.get(&object.hash) == Some(&object.size)
-            {
-                continue;
-            }
-            let file = tokio::fs::File::open(&source).await.map_err(|error| {
-                StoreError::Invariant(format!(
-                    "open staged capsule payload {}: {error}",
-                    object.hash
-                ))
-            })?;
-            self.put_hashed_object(
-                Self::capsule_payload_path(object.hash),
-                object.hash,
-                Some(object.size),
-                file,
+
+            let expected_ref = self.require_current_capsule(prior_root).await?;
+            self.finish_capsule_publication_locked(
+                root,
+                manifest_bytes,
+                &declared,
+                uploaded,
+                expected_ref,
             )
             .await
-            .map_err(|error| {
-                StoreError::Invariant(format!("publish capsule payload {}: {error}", object.hash))
-            })?;
-            uploaded += 1;
-        }
-
-        let expected_ref = self.require_current_capsule(prior_root).await?;
-        self.finish_capsule_publication(root, manifest_bytes, &declared, uploaded, expected_ref)
-            .await
+        })
+        .await
     }
 
     async fn capsule_ref_version(&self) -> Result<CapsuleRefVersion> {
@@ -1002,7 +1035,7 @@ impl ContentRemote {
         Ok(current)
     }
 
-    async fn finish_capsule_publication(
+    async fn finish_capsule_publication_locked(
         &self,
         root: ObjectHash,
         manifest_bytes: Vec<u8>,
@@ -1037,19 +1070,7 @@ impl ContentRemote {
                 })?;
         }
 
-        let lock = self.acquire_capsule_publish_lock().await?;
-        let publish = self.finish_capsule_refs_locked(root, expected_ref).await;
-        let release = self.release_capsule_publish_lock(&lock).await;
-        match (publish, release) {
-            (Err(error), Ok(())) => return Err(error),
-            (Ok(()), Err(error)) => return Err(error),
-            (Err(error), Err(release_error)) => {
-                return Err(StoreError::Invariant(format!(
-                    "{error}; release capsule publication lock: {release_error}"
-                )));
-            }
-            (Ok(()), Ok(())) => {}
-        }
+        self.finish_capsule_refs_locked(root, expected_ref).await?;
 
         Ok(CapsulePublishOutcome {
             root,
@@ -1069,19 +1090,29 @@ impl ContentRemote {
                 "capsule latest ref changed before publication lock was acquired".to_string(),
             ));
         }
+        let prior_history = self.capsule_history_bytes().await?;
         self.merge_capsule_history(root).await?;
         // Ref last: readers cannot discover this root before every generation
         // dependency and recovery artifact is durable.
-        self.store
+        let latest = self
+            .store
             .object_store()
             .put(
                 &Self::capsule_latest_path(),
                 format!("{}\n", root.to_hex()).into_bytes().into(),
             )
-            .await
-            .map_err(|error| {
-                StoreError::Invariant(format!("publish capsule latest ref: {error}"))
-            })?;
+            .await;
+        if let Err(error) = latest {
+            let publish_error =
+                StoreError::Invariant(format!("publish capsule latest ref: {error}"));
+            return match self.restore_capsule_history(prior_history).await {
+                Ok(()) => Err(publish_error),
+                Err(restore_error) => Err(StoreError::Invariant(format!(
+                    "{publish_error}; restore capsule history after failed latest ref: \
+                     {restore_error}"
+                ))),
+            };
+        }
         self.merge_capsule_history(root).await
     }
 
@@ -1140,12 +1171,29 @@ impl ContentRemote {
                         "stale capsule publication lock is {age} microseconds old; inspect and remove it explicitly"
                     )));
                 }
+
                 Err(StoreError::Invariant(
                     "another capsule publication holds the remote lock".to_string(),
                 ))
             }
             Err(error) => Err(StoreError::Invariant(format!(
                 "acquire capsule publication lock: {error}"
+            ))),
+        }
+    }
+
+    async fn with_capsule_publish_lock<T>(
+        &self,
+        operation: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let lock = self.acquire_capsule_publish_lock().await?;
+        let result = operation.await;
+        let release = self.release_capsule_publish_lock(&lock).await;
+        match (result, release) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(release_error)) => Err(StoreError::Invariant(format!(
+                "{error}; release capsule publication lock: {release_error}"
             ))),
         }
     }
@@ -1203,6 +1251,48 @@ impl ContentRemote {
         Ok(())
     }
 
+    async fn capsule_history_bytes(&self) -> Result<Option<Vec<u8>>> {
+        match self
+            .store
+            .object_store()
+            .get(&Self::capsule_history_path())
+            .await
+        {
+            Ok(result) => result
+                .bytes()
+                .await
+                .map(|bytes| Some(bytes.to_vec()))
+                .map_err(|error| StoreError::Invariant(format!("read capsule history: {error}"))),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(error) => Err(StoreError::Invariant(format!(
+                "get capsule history: {error}"
+            ))),
+        }
+    }
+
+    async fn restore_capsule_history(&self, prior: Option<Vec<u8>>) -> Result<()> {
+        let path = Self::capsule_history_path();
+        match prior {
+            Some(bytes) => self
+                .store
+                .object_store()
+                .put(&path, bytes.into())
+                .await
+                .map(|_| ())
+                .map_err(|error| {
+                    StoreError::Invariant(format!("restore capsule history ref: {error}"))
+                }),
+            None => self
+                .store
+                .object_store()
+                .delete(&path)
+                .await
+                .map_err(|error| {
+                    StoreError::Invariant(format!("remove new capsule history ref: {error}"))
+                }),
+        }
+    }
+
     /// Read and validate the latest capsule manifest, if one is published.
     pub async fn latest_capsule(&self) -> Result<Option<(ObjectHash, CapsuleManifest)>> {
         let reference = match self
@@ -1253,22 +1343,9 @@ impl ContentRemote {
 
     /// Retained verified capsule roots, newest first.
     pub async fn capsule_roots(&self) -> Result<Vec<ObjectHash>> {
-        let bytes = match self
-            .store
-            .object_store()
-            .get(&Self::capsule_history_path())
-            .await
-        {
-            Ok(result) => result
-                .bytes()
-                .await
-                .map_err(|error| StoreError::Invariant(format!("read capsule history: {error}")))?,
-            Err(object_store::Error::NotFound { .. }) => return Ok(Vec::new()),
-            Err(error) => {
-                return Err(StoreError::Invariant(format!(
-                    "get capsule history: {error}"
-                )));
-            }
+        let bytes = match self.capsule_history_bytes().await? {
+            Some(bytes) => bytes,
+            None => return Ok(Vec::new()),
         };
         let text = std::str::from_utf8(&bytes).map_err(|error| {
             StoreError::Invariant(format!("capsule history is not UTF-8: {error}"))
@@ -1955,6 +2032,35 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn failed_latest_write_restores_capsule_history() {
+        let dir = tempdir().unwrap();
+        let remote_path = dir.path().join("remote");
+        let remote = ContentRemote::create_at(&remote_path, Uuid::new_v4())
+            .await
+            .unwrap();
+        let (first_manifest, first_payloads) = test_capsule(b"first");
+        let first = remote
+            .publish_capsule(&first_manifest, &first_payloads)
+            .await
+            .unwrap();
+        let prior_history = remote.capsule_roots().await.unwrap();
+
+        let latest_path = remote_path.join("recovery/refs/latest");
+        std::fs::remove_file(&latest_path).unwrap();
+        std::fs::create_dir(&latest_path).unwrap();
+        std::fs::write(latest_path.join("block-replacement"), b"occupied").unwrap();
+
+        let (second_manifest, second_payloads) = test_capsule(b"second");
+        let error = remote
+            .publish_capsule(&second_manifest, &second_payloads)
+            .await
+            .expect_err("latest ref replacement must fail");
+        assert!(error.to_string().contains("publish capsule latest ref"));
+        assert_eq!(prior_history, vec![first.root]);
+        assert_eq!(remote.capsule_roots().await.unwrap(), prior_history);
+    }
+
     #[test]
     fn capsule_download_scripts_reject_unexpected_object_list_paths() {
         let root = ObjectHash::of_bytes(b"capsule");
@@ -2140,13 +2246,13 @@ mod tests {
         let winner_root = capsule_root(&winner).unwrap();
         let winner_declared = winner.payload_objects().unwrap();
         remote
-            .finish_capsule_publication(
+            .with_capsule_publish_lock(remote.finish_capsule_publication_locked(
                 winner_root,
                 capsule_manifest_bytes(&winner).unwrap(),
                 &winner_declared,
                 0,
                 expected.clone(),
-            )
+            ))
             .await
             .unwrap();
 
@@ -2155,13 +2261,13 @@ mod tests {
         let loser_declared = loser.payload_objects().unwrap();
         assert!(
             remote
-                .finish_capsule_publication(
+                .with_capsule_publish_lock(remote.finish_capsule_publication_locked(
                     loser_root,
                     capsule_manifest_bytes(&loser).unwrap(),
                     &loser_declared,
                     0,
                     expected,
-                )
+                ))
                 .await
                 .is_err()
         );
@@ -2173,7 +2279,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_capsule_publication_lock_refuses_another_finalizer() {
+    async fn active_capsule_publication_lock_refuses_upload_before_any_remote_write() {
         let dir = tempdir().unwrap();
         let remote = ContentRemote::create_at(dir.path().join("remote"), Uuid::new_v4())
             .await
@@ -2195,5 +2301,9 @@ mod tests {
         let (manifest, payloads) = test_capsule(b"locked");
         assert!(remote.publish_capsule(&manifest, &payloads).await.is_err());
         assert!(remote.latest_capsule().await.unwrap().is_none());
+        assert!(
+            remote.list_capsule_payloads().await.unwrap().is_empty(),
+            "a publisher must acquire the GC-shared lock before uploading payloads"
+        );
     }
 }

@@ -367,7 +367,23 @@ def canonical_batch_rows(schema: Any, batch: Any, pa: Any) -> bytes:
             elif pa.types.is_binary(data_type) or pa.types.is_large_binary(data_type):
                 result.extend(struct.pack("<Q", len(value)) + value)
             elif pa.types.is_decimal128(data_type):
-                result.extend(int(value.scaleb(data_type.scale)).to_bytes(16, "little", signed=True))
+                decimal = value.as_tuple()
+                coefficient = 0
+                for digit in decimal.digits:
+                    coefficient = coefficient * 10 + digit
+                if decimal.sign:
+                    coefficient = -coefficient
+                adjustment = decimal.exponent + data_type.scale
+                if adjustment >= 0:
+                    unscaled = coefficient * (10 ** adjustment)
+                else:
+                    divisor = 10 ** -adjustment
+                    unscaled, remainder = divmod(coefficient, divisor)
+                    if remainder:
+                        raise FormatError(
+                            f"decimal value {value} is not exactly representable as {data_type}"
+                        )
+                result.extend(unscaled.to_bytes(16, "little", signed=True))
             else:
                 raise FormatError(f"unsupported canonical series value {data_type}")
     return bytes(result)
@@ -693,6 +709,7 @@ def _extract_graph(source: Path, destination: Path, ref_name: str | None,
                 payload_kind = "file" if entry_type.startswith("file:") else "table"
                 hashes = decode_series(backup.read_object(child_hash)) \
                     if entry_type.endswith(":series") else [child_hash]
+                is_series = entry_type.endswith(":series")
                 if len(hashes) != len(native["versions"]):
                     raise FormatError(f"{paths[native['node_id']]} has mismatched versions and metadata")
                 objects, leaves, fingerprint = [], [], None
@@ -704,6 +721,11 @@ def _extract_graph(source: Path, destination: Path, ref_name: str | None,
                         attributes = canonical_attributes(metadata["extended_attributes"])
                     if payload_kind == "file":
                         if descriptor["size"] == 0:
+                            if is_series:
+                                raise FormatError(
+                                    f"series {paths[native['node_id']]} contains an empty file "
+                                    "version that pondcapsule.1 cannot represent"
+                                )
                             (objects_dir / f"blake3={digest.hex()}").unlink()
                             continue
                         def file_parts(path: Path = payload_path) -> Iterator[bytes]:
@@ -727,6 +749,11 @@ def _extract_graph(source: Path, destination: Path, ref_name: str | None,
                             rows_size += len(canonical_batch_rows(schema, batch, pa))
                         objects.append(descriptor)
                         if logical_count == 0:
+                            if is_series:
+                                raise FormatError(
+                                    f"series {paths[native['node_id']]} contains an empty table "
+                                    "version that pondcapsule.1 cannot represent"
+                                )
                             continue
                         def table_parts(parquet: Any = parquet, schema: Any = schema) -> Iterator[bytes]:
                             yield b"dp.series-rows.1\n" + struct.pack("<Q", logical_count)

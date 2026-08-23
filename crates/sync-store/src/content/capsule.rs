@@ -466,6 +466,28 @@ pub fn decode_capsule_manifest(bytes: &[u8]) -> Result<CapsuleManifest, String> 
 /// Returns an error for any missing, malformed, unsupported, or mismatched
 /// component. No pond data is written.
 pub fn verify_capsule_directory(path: &Path) -> Result<CapsuleVerifyReport, String> {
+    let (manifest, root) = read_capsule_manifest(path)?;
+    verify_capsule_payload_directory_at_root(
+        &manifest,
+        &path.join("recovery").join("objects"),
+        root,
+    )
+}
+
+/// Read and validate the canonical manifest named by a downloaded capsule
+/// directory's `recovery/refs/latest`, without touching any payload object.
+///
+/// This is the layout-parsing half of [`verify_capsule_directory`], factored
+/// out so a caller that needs the decoded [`CapsuleManifest`] itself -- for
+/// example a staged importer that must walk every entry -- does not have to
+/// re-derive the `refs/latest` -> `manifests/<hash>.json` lookup or re-check
+/// the root hash.
+///
+/// # Errors
+///
+/// Returns an error if `refs/latest` or the named manifest is missing or
+/// malformed, or if the manifest does not hash to the root it names.
+pub fn read_capsule_manifest(path: &Path) -> Result<(CapsuleManifest, ObjectHash), String> {
     let recovery = path.join("recovery");
     let reference = std::fs::read_to_string(recovery.join("refs/latest"))
         .map_err(|error| format!("read recovery/refs/latest: {error}"))?;
@@ -487,8 +509,7 @@ pub fn verify_capsule_directory(path: &Path) -> Result<CapsuleVerifyReport, Stri
             "capsule manifest hashes to {computed_root}, latest ref names {root}"
         ));
     }
-
-    verify_capsule_payload_directory_at_root(&manifest, &recovery.join("objects"), root)
+    Ok((manifest, root))
 }
 
 /// Deeply verify a candidate manifest against its in-memory payload closure.

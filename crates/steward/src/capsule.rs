@@ -124,7 +124,7 @@ pub(crate) async fn build_recovery_capsule_from_materialized(
     materialized: &crate::content_tree::MaterializedObjects,
     prior: Option<&CapsuleManifest>,
 ) -> Result<CapsuleBuild, StewardError> {
-    let (_, manifest_bytes) = materialized.manifest.as_ref().ok_or_else(|| {
+    let (manifest_hash, manifest_bytes) = materialized.manifest.as_ref().ok_or_else(|| {
         StewardError::Content("materialized pond has no node manifest".to_string())
     })?;
     let native_entries = decode_manifest(manifest_bytes).map_err(StewardError::Content)?;
@@ -139,6 +139,13 @@ pub(crate) async fn build_recovery_capsule_from_materialized(
         .ok_or_else(|| StewardError::Content("pond has no content tip".to_string()))?;
     let source_commit = sync_store::Commit::decode(tip_bytes)
         .map_err(|error| StewardError::Content(format!("decode content tip: {error}")))?;
+    if source_commit.node_manifest_hash != *manifest_hash {
+        return Err(StewardError::Content(format!(
+            "node manifest hashes to {} but the content tip names {}",
+            manifest_hash.to_hex(),
+            source_commit.node_manifest_hash.to_hex()
+        )));
+    }
     let source_tip = source_commit.hash();
 
     let mut payloads = CapsulePayloads::new()?;
@@ -311,6 +318,10 @@ async fn build_physical_node(
             )));
         }
     };
+    let is_series = matches!(
+        native.entry_type,
+        EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries
+    );
     let hashes = match native.entry_type {
         EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries => {
             let bytes = materialized.inline.get(&native.child_hash).ok_or_else(|| {
@@ -380,6 +391,12 @@ async fn build_physical_node(
         let (logical_hash, logical_count, schema) = match payload_kind {
             CapsulePayloadKind::File => {
                 if object.size == 0 {
+                    if is_series {
+                        return Err(StewardError::Content(format!(
+                            "series {path} contains an empty file version that pondcapsule.1 \
+                             cannot represent"
+                        )));
+                    }
                     let _ = payloads.objects.remove(&hash);
                     continue;
                 }
@@ -463,6 +480,12 @@ async fn build_physical_node(
                         })?;
                 }
                 if logical_count == 0 {
+                    if is_series {
+                        return Err(StewardError::Content(format!(
+                            "series {path} contains an empty table version that pondcapsule.1 \
+                             cannot represent"
+                        )));
+                    }
                     objects.push(object);
                     continue;
                 }

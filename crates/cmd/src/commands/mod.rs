@@ -33,7 +33,9 @@ pub mod tlog;
 pub mod verify;
 
 pub use apply::apply_command;
-pub use capsule::{RecoveryRecipeAction, capsule_inspect_command, capsule_recipe_command};
+pub use capsule::{
+    RecoveryRecipeAction, capsule_import_command, capsule_inspect_command, capsule_recipe_command,
+};
 pub use cat::cat_command;
 pub use control::control_command;
 pub use copy::{CopyOptions, copy_command};

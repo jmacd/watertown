@@ -8,6 +8,7 @@ import json
 import struct
 import subprocess
 import tempfile
+from decimal import Decimal
 from pathlib import Path
 
 import blake3
@@ -63,13 +64,14 @@ def manifest_entry(
     )
 
 
-def build_native_backup(root: Path) -> None:
+def build_native_backup(root: Path, *, include_empty_series_version: bool = False) -> None:
     external_file = (b"external recovery payload\n" * 4096) + b"end\n"
     table_path = root.parent / "fixture.parquet"
     schema = pa.schema(
         [
             pa.field("reading", pa.int64(), True),
             pa.field("label", pa.string(), False),
+            pa.field("precise", pa.decimal128(38, 6), True),
         ],
         metadata={b"origin": b"fixture"},
     )
@@ -78,6 +80,14 @@ def build_native_backup(root: Path) -> None:
             [
                 pa.array([1, None, 3], type=pa.int64()),
                 pa.array(["a", "b", "c"]),
+                pa.array(
+                    [
+                        Decimal("12345678901234567890123456789012.345678"),
+                        None,
+                        Decimal("-99999999999999999999999999999999.999999"),
+                    ],
+                    type=pa.decimal128(38, 6),
+                ),
             ],
             schema=schema,
         ),
@@ -85,19 +95,49 @@ def build_native_backup(root: Path) -> None:
     )
     table = table_path.read_bytes()
     table_path.unlink()
+    empty_table = None
+    if include_empty_series_version:
+        empty_path = root.parent / "empty-fixture.parquet"
+        pq.write_table(
+            pa.Table.from_batches(
+                [
+                    pa.RecordBatch.from_arrays(
+                        [
+                            pa.array([], type=pa.int64()),
+                            pa.array([], type=pa.string()),
+                            pa.array([], type=pa.decimal128(38, 6)),
+                        ],
+                        schema=schema,
+                    )
+                ],
+                schema=schema,
+            ),
+            empty_path,
+        )
+        empty_table = empty_path.read_bytes()
+        empty_path.unlink()
     symlink = b"/data/file"
     recipe = (
         b"dp.recipe.1\n"
         + length_prefixed(b"fixture-factory")
         + b'{"source":"integration"}'
     )
-    series = b"dp.series.1\n" + struct.pack("<I", 1) + digest(table)
+    table_hashes = [digest(table)]
+    table_versions = [metadata(102)]
+    if empty_table is not None:
+        table_hashes.append(digest(empty_table))
+        table_versions.append(metadata(103))
+    series = (
+        b"dp.series.1\n"
+        + struct.pack("<I", len(table_hashes))
+        + b"".join(table_hashes)
+    )
 
     children = [
         ("dynamic", 5, digest(recipe), []),
         ("file", 4, digest(external_file), [metadata(101)]),
         ("link", 3, digest(symlink), []),
-        ("table", 8, digest(series), [metadata(102)]),
+        ("table", 8, digest(series), table_versions),
     ]
     tree = (
         b"dp.tree.2\n"
@@ -110,7 +150,7 @@ def build_native_backup(root: Path) -> None:
         ("link", "root", "link", 3, digest(symlink), []),
         ("recipe", "root", "dynamic", 5, digest(recipe), []),
         ("root", "", "", 1, tree_hash, []),
-        ("table", "root", "table", 8, digest(series), [metadata(102)]),
+        ("table", "root", "table", 8, digest(series), table_versions),
     ]
     manifest = (
         b"dp.manifest.2\n"
@@ -140,6 +180,8 @@ def build_native_backup(root: Path) -> None:
         manifest_hash: manifest,
         commit_hash: commit,
     }
+    if empty_table is not None:
+        inline[digest(empty_table)] = empty_table
 
     rows: list[tuple[str, str, str, int, bool, bytes, bytes, int]] = []
 
@@ -229,6 +271,21 @@ def main() -> int:
             check=True,
         )
         print(f"integration capsule verified: {root}")
+
+        empty_source = workspace / "native-empty-series"
+        build_native_backup(empty_source, include_empty_series_version=True)
+        try:
+            extract(
+                empty_source,
+                workspace / "empty-series-capsule",
+                "main",
+                None,
+                "fixture",
+            )
+        except FormatError as error:
+            assert "empty table version" in str(error), error
+        else:
+            raise AssertionError("extractor silently dropped an empty series version")
     return 0
 
 

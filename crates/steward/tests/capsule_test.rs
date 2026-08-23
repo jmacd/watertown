@@ -60,6 +60,7 @@ async fn builds_portable_live_inventory_with_ordered_series_leaves() {
             writer.write_all(bytes).await?;
             writer.shutdown().await?;
         }
+
         for (timestamp, value) in [(100, "a"), (200, "b")] {
             let _ = root
                 .write_series_from_batch(
@@ -216,4 +217,34 @@ async fn builds_portable_live_inventory_with_ordered_series_leaves() {
     let verified = verify_capsule_directory(&remote_path).expect("verify incremental capsule");
     assert_eq!(verified.entries, 7);
     assert_eq!(verified.logical_count, 21 + 256 * 1024);
+}
+
+#[tokio::test]
+async fn rejects_empty_versions_inside_a_series() {
+    let temporary = tempdir().expect("tempdir");
+    let mut ship = Ship::create_pond(temporary.path().join("pond"), "capsule-test")
+        .await
+        .expect("create pond");
+
+    ship.write_transaction(&meta("empty-series"), async move |transaction| {
+        let root = transaction.root().await?;
+        for bytes in [b"first".as_slice(), b"".as_slice(), b"third".as_slice()] {
+            let mut writer = root
+                .async_writer_path_with_type("/series", EntryType::FilePhysicalSeries)
+                .await?;
+            writer.write_all(bytes).await?;
+            writer.shutdown().await?;
+        }
+        Ok(())
+    })
+    .await
+    .expect("write series");
+
+    let error = build_recovery_capsule(&ship)
+        .await
+        .expect_err("capsule builder must not silently drop an empty series version");
+    assert!(
+        error.to_string().contains("empty file version"),
+        "unexpected error: {error}"
+    );
 }

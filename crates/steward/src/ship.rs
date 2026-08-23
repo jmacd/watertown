@@ -565,6 +565,21 @@ impl Ship {
         self.begin_txn(true, meta).await
     }
 
+    /// Begin a write transaction whose commit will not trigger post-commit
+    /// factory execution or remote auto-push (see
+    /// [`StewardTransactionGuard::suppressing_post_commit`]).
+    ///
+    /// Restricted to the crate: used only by the staged capsule importer,
+    /// which recreates `/system/run/*` and `/sys/remotes/*` namespace content
+    /// verbatim from a capsule but must keep it inert until the operator
+    /// explicitly seals and unsuppresses the target pond.
+    pub(crate) async fn begin_write_suppressed(
+        &mut self,
+        meta: &PondUserMetadata,
+    ) -> Result<StewardTransactionGuard<'_>, StewardError> {
+        Ok(self.begin_txn(true, meta).await?.suppressing_post_commit())
+    }
+
     async fn begin_txn(
         &mut self,
         is_write: bool,

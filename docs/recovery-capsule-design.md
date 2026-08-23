@@ -277,7 +277,9 @@ Extra undeclared files do not satisfy a missing declared object.
 
 ## Generic staged import
 
-The importer is the remaining major phase-one implementation.
+The initial importer implements staged reconstruction, exact logical
+verification, and atomic promotion. Bounded transactions, resumable
+checkpoints, and active-remote preflight remain before it is production-ready.
 
 `pond capsule import` will accept only a nonexistent target:
 
@@ -285,7 +287,8 @@ The importer is the remaining major phase-one implementation.
 2. Initialize a fresh pond with a new pond identity.
 3. Persist immutable provenance naming the source pond, source tip, capsule
    root, and importer version.
-4. Suppress post-commit factories, automatic pushes, and pulls while staging.
+4. Persistently suppress post-commit factories and automatic pushes before
+   restoring namespace content.
 5. Recreate parents before children in canonical manifest order.
 6. Stream files and decoded table rows in bounded transactions.
 7. Recreate series leaves in original order with their logical metadata.
@@ -293,7 +296,8 @@ The importer is the remaining major phase-one implementation.
 9. Re-read the staged pond and recompute the complete capsule inventory.
 10. Resolve and preflight every restored active remote.
 11. Seal only on an exact logical match.
-12. Atomically rename staging to the requested target.
+12. Sync the staged tree, atomically rename staging to the requested target,
+    and sync the parent directory so successful promotion is crash-durable.
 
 Node IDs, pond identity, transaction sequence, Parquet encoding, object
 boundaries, and pack layout may change. Paths, entry types, exact file bytes,
@@ -303,10 +307,16 @@ bounds, leaf hashes, and series roots may not.
 A failed transaction commits no partial batch. A retry must validate every
 journal checkpoint rather than trusting staged state.
 
+`pondcapsule.1` cannot encode a zero-length logical leaf. A single empty
+physical node remains representable, but extraction fails closed if any member
+of a multi-version series is empty; silently dropping that member would change
+series order and metadata.
+
 ### Active remote safety
 
-Remote definitions are namespace content and are restored, but dispatch remains
-disabled during staging. Before sealing, the importer refuses:
+Remote definitions are namespace content and are restored. Automatic
+post-commit dispatch remains disabled after promotion until the operator
+explicitly enables it. Before sealing, the completed importer will refuse:
 
 - a destination equal to the source backup namespace;
 - an unresolved destination;
@@ -367,13 +377,15 @@ Completed:
 - credential-free AzCopy and MinIO download helpers;
 - integration coverage for live-row history, tombstones, external blobs,
   files, Parquet tables, series, symlinks, and dynamic recipes;
-- immutable recipe publish and inspect commands; and
+- immutable recipe publish and inspect commands;
+- staged import with a fresh identity, immutable provenance, persistent
+  post-commit suppression, exact logical verification, and atomic target
+  promotion; and
 - removal of the superseded per-generation operator commands.
 
 Remaining:
 
-- generic staged import and exact post-write verification;
-- hook suppression, resumable journaling, and atomic target promotion;
+- bounded import transactions and content-addressed resumable journaling;
 - active-remote preflight;
 - detached exact-target erase plan/verify/apply;
 - failure-injection and interrupted-resume coverage; and

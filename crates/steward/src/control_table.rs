@@ -57,6 +57,13 @@ const KEY_BIRTH_USERNAME: &str = "birth_username";
 const FACTORY_MODE_PREFIX: &str = "factory_mode:";
 const SETTING_PREFIX: &str = "setting:";
 
+/// Per-instance setting that disables automatic post-commit factories and
+/// remote pushes when set to [`POST_COMMIT_DISPATCH_SUPPRESSED`].
+pub const POST_COMMIT_DISPATCH_SETTING: &str = "post_commit_dispatch";
+/// Persisted value used by staged recovery imports until an operator
+/// explicitly activates the recovered pond.
+pub const POST_COMMIT_DISPATCH_SUPPRESSED: &str = "suppressed";
+
 /// Lifecycle classification preserved for source-level compatibility with
 /// pre-D2 callers.  Each variant maps onto the lean schema's
 /// [`RecordKind`] (+ optional [`CommitKind`]) at write time.
@@ -272,6 +279,14 @@ impl ControlTable {
     #[must_use]
     pub fn get_setting(&self, key: &str) -> Option<String> {
         self.settings.get(key).cloned()
+    }
+
+    /// Whether automatic post-commit factories and remote pushes are
+    /// persistently disabled for this pond instance.
+    #[must_use]
+    pub fn post_commit_dispatch_suppressed(&self) -> bool {
+        self.get_setting(POST_COMMIT_DISPATCH_SETTING).as_deref()
+            == Some(POST_COMMIT_DISPATCH_SUPPRESSED)
     }
 
     /// Set per-instance setting and persist under the local pond_id with

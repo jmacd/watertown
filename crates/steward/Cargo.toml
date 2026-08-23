@@ -37,6 +37,7 @@ log = { workspace = true }
 object_store = { workspace = true }
 parquet = { workspace = true }
 provider = { workspace = true }
+rustix = { workspace = true }
 serde = { workspace = true }
 serde_arrow = { workspace = true }
 serde_json = { workspace = true }

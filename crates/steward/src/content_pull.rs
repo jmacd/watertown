@@ -1728,7 +1728,7 @@ async fn stream_external_blob(
 /// bounds as the original. Otherwise a table series can still recover its range
 /// from the parquet footer it just wrote (which also shuts the writer down);
 /// every other kind just closes, leaving the bounds NULL as before.
-async fn finalize_writer(
+pub(crate) async fn finalize_writer(
     mut writer: std::pin::Pin<Box<dyn tinyfs::FileMetadataWriter>>,
     entry_type: EntryType,
     meta: &VersionMeta,
