@@ -806,6 +806,13 @@ def _extract_graph(source: Path, destination: Path, ref_name: str | None,
         capsule_root = blake3.blake3(b"pondcapsule.root.1\n" + manifest_bytes).hexdigest()
         (manifests_dir / f"{capsule_root}.json").write_bytes(manifest_bytes)
         (refs_dir / "latest").write_text(capsule_root + "\n", encoding="ascii")
+        kit = Path(__file__).resolve().parent
+        for source_name, destination_name in (
+            ("CAPSULE-README.md", "CAPSULE-README.md"),
+            ("capsule.py", "capsule.py"),
+            ("capsule-requirements.lock", "capsule-requirements.lock"),
+        ):
+            shutil.copyfile(kit / source_name, destination / destination_name)
         return capsule_root
 
 

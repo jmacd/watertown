@@ -57,6 +57,10 @@ const POND_ID_KEY: &str = "pond_id";
 const CAPSULE_PREFIX: &str = "recovery";
 const CAPSULE_HISTORY_LIMIT: usize = 3;
 const RECIPE_NATIVE_FORMAT: &str = "dp.commit.3";
+const CAPSULE_README: &str = include_str!("../recovery/dp.commit.3/CAPSULE-README.md");
+const CAPSULE_TOOL: &str = include_str!("../recovery/dp.commit.3/capsule.py");
+const CAPSULE_REQUIREMENTS: &str =
+    include_str!("../recovery/dp.commit.3/capsule-requirements.lock");
 
 /// Result of publishing one verified recovery-capsule generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1058,6 +1062,12 @@ impl ContentRemote {
             ("RUNBOOK.txt", capsule_runbook(root).into_bytes()),
             ("download-az.sh", capsule_az_script(root).into_bytes()),
             ("download-mc.sh", capsule_mc_script(root).into_bytes()),
+            ("CAPSULE-README.md", CAPSULE_README.as_bytes().to_vec()),
+            ("capsule.py", CAPSULE_TOOL.as_bytes().to_vec()),
+            (
+                "capsule-requirements.lock",
+                CAPSULE_REQUIREMENTS.as_bytes().to_vec(),
+            ),
         ];
         for (name, bytes) in artifacts {
             let path = Self::capsule_generation_path(root, name);
@@ -1694,7 +1704,14 @@ fn parse_capsule_generation_key(key: &str) -> std::result::Result<Option<ObjectH
         .ok_or_else(|| format!("malformed capsule generation key {key:?}"))?;
     if !matches!(
         artifact,
-        "objects.list" | "checksums" | "RUNBOOK.txt" | "download-az.sh" | "download-mc.sh"
+        "objects.list"
+            | "checksums"
+            | "RUNBOOK.txt"
+            | "download-az.sh"
+            | "download-mc.sh"
+            | "CAPSULE-README.md"
+            | "capsule.py"
+            | "capsule-requirements.lock"
     ) {
         return Err(format!("unexpected capsule generation artifact {key:?}"));
     }
@@ -1702,12 +1719,20 @@ fn parse_capsule_generation_key(key: &str) -> std::result::Result<Option<ObjectH
 }
 
 fn capsule_object_list(root: ObjectHash, objects: &[crate::content::CapsuleObject]) -> String {
-    let mut output = format!("{CAPSULE_PREFIX}/manifests/{}.json\n", root.to_hex());
+    let root = root.to_hex();
+    let mut output = format!("{CAPSULE_PREFIX}/manifests/{root}.json\n");
     for object in objects {
         output.push_str(&format!(
             "{CAPSULE_PREFIX}/objects/blake3={}\n",
             object.hash.to_hex()
         ));
+    }
+    for name in [
+        "CAPSULE-README.md",
+        "capsule.py",
+        "capsule-requirements.lock",
+    ] {
+        output.push_str(&format!("{CAPSULE_PREFIX}/generations/{root}/{name}\n"));
     }
     output
 }
@@ -1730,9 +1755,15 @@ fn capsule_runbook(root: ObjectHash) -> String {
          1. Download and review download-az.sh or download-mc.sh.\n\
          2. Authenticate with managed identity or your normal client environment.\n\
          3. Run the reviewed script; it embeds no credentials.\n\
-         4. Run: pond capsule verify <download-directory>\n\
-         5. Import only into an empty target with pond capsule import.\n\
-         6. Never delete the source namespace as part of import.\n",
+         4. Authenticate the dp.commit.3 recovery kit through its independently \
+            supplied README.sh hash.\n\
+         5. Compare downloaded capsule.py and capsule-requirements.lock byte for byte \
+            with the authenticated kit copies; run the kit copy if they differ.\n\
+         6. Read CAPSULE-README.md in the downloaded capsule.\n\
+         7. Verify without Pond: python capsule.py verify <download-directory>\n\
+         8. Recover human-readable data without Pond: \
+            python capsule.py materialize <download-directory> <new-output-directory>\n\
+         9. Never delete the source namespace as part of recovery.\n",
         root.to_hex()
     )
 }
@@ -1742,17 +1773,22 @@ fn capsule_az_script(root: ObjectHash) -> String {
         "#!/bin/sh\nset -eu\n\
          : \"${{AZURE_CONTAINER:?set AZURE_CONTAINER}}\"\n\
          DEST=${{DEST:-capsule-{root}}}\n\
-         mkdir -p \"$DEST/recovery/generations/{root}\" \"$DEST/recovery/manifests\" \"$DEST/recovery/objects\" \"$DEST/recovery/refs\"\n\
+        case \"$DEST\" in ''|'/'|'.'|'..'|-*) printf '%s\\n' 'unsafe destination' >&2; exit 2;; esac\n\
+        if [ -e \"$DEST\" ]; then printf '%s\\n' \"destination already exists: $DEST\" >&2; exit 2; fi\n\
+        mkdir -p \"$DEST/recovery/generations/{root}\" \"$DEST/recovery/manifests\" \"$DEST/recovery/objects\" \"$DEST/recovery/refs\"\n\
          printf '%s\\n' '{root}' > \"$DEST/recovery/refs/latest\"\n\
          az storage blob download --auth-mode login --container-name \"$AZURE_CONTAINER\" --name \"recovery/generations/{root}/objects.list\" --file \"$DEST/recovery/generations/{root}/objects.list\" --overwrite\n\
          while IFS= read -r key; do\n\
            case \"$key\" in\n\
-             \"recovery/manifests/{root}.json\") ;;\n\
-             recovery/objects/blake3=*) digest=${{key#recovery/objects/blake3=}}; case \"$digest\" in *[!0-9a-f]*|'') exit 1;; esac; [ \"${{#digest}}\" -eq 64 ] || exit 1 ;;\n\
+             \"recovery/manifests/{root}.json\") target=\"$DEST/$key\" ;;\n\
+             recovery/objects/blake3=*) digest=${{key#recovery/objects/blake3=}}; case \"$digest\" in *[!0-9a-f]*|'') exit 1;; esac; [ \"${{#digest}}\" -eq 64 ] || exit 1; target=\"$DEST/$key\" ;;\n\
+             \"recovery/generations/{root}/CAPSULE-README.md\") target=\"$DEST/CAPSULE-README.md\" ;;\n\
+             \"recovery/generations/{root}/capsule.py\") target=\"$DEST/capsule.py\" ;;\n\
+             \"recovery/generations/{root}/capsule-requirements.lock\") target=\"$DEST/capsule-requirements.lock\" ;;\n\
              *) exit 1 ;;\n\
            esac\n\
-           mkdir -p \"$DEST/$(dirname \"$key\")\"\n\
-           az storage blob download --auth-mode login --container-name \"$AZURE_CONTAINER\" --name \"$key\" --file \"$DEST/$key\" --overwrite\n\
+           mkdir -p \"$(dirname \"$target\")\"\n\
+           az storage blob download --auth-mode login --container-name \"$AZURE_CONTAINER\" --name \"$key\" --file \"$target\" --overwrite\n\
          done < \"$DEST/recovery/generations/{root}/objects.list\"\n",
         root = root.to_hex()
     )
@@ -1763,17 +1799,22 @@ fn capsule_mc_script(root: ObjectHash) -> String {
         "#!/bin/sh\nset -eu\n\
          : \"${{MC_SOURCE:?set MC_SOURCE to alias/bucket-or-prefix}}\"\n\
          DEST=${{DEST:-capsule-{root}}}\n\
-         mkdir -p \"$DEST/recovery/generations/{root}\" \"$DEST/recovery/manifests\" \"$DEST/recovery/objects\" \"$DEST/recovery/refs\"\n\
+        case \"$DEST\" in ''|'/'|'.'|'..'|-*) printf '%s\\n' 'unsafe destination' >&2; exit 2;; esac\n\
+        if [ -e \"$DEST\" ]; then printf '%s\\n' \"destination already exists: $DEST\" >&2; exit 2; fi\n\
+        mkdir -p \"$DEST/recovery/generations/{root}\" \"$DEST/recovery/manifests\" \"$DEST/recovery/objects\" \"$DEST/recovery/refs\"\n\
          printf '%s\\n' '{root}' > \"$DEST/recovery/refs/latest\"\n\
          mc cp \"$MC_SOURCE/recovery/generations/{root}/objects.list\" \"$DEST/recovery/generations/{root}/objects.list\"\n\
          while IFS= read -r key; do\n\
            case \"$key\" in\n\
-             \"recovery/manifests/{root}.json\") ;;\n\
-             recovery/objects/blake3=*) digest=${{key#recovery/objects/blake3=}}; case \"$digest\" in *[!0-9a-f]*|'') exit 1;; esac; [ \"${{#digest}}\" -eq 64 ] || exit 1 ;;\n\
+             \"recovery/manifests/{root}.json\") target=\"$DEST/$key\" ;;\n\
+             recovery/objects/blake3=*) digest=${{key#recovery/objects/blake3=}}; case \"$digest\" in *[!0-9a-f]*|'') exit 1;; esac; [ \"${{#digest}}\" -eq 64 ] || exit 1; target=\"$DEST/$key\" ;;\n\
+             \"recovery/generations/{root}/CAPSULE-README.md\") target=\"$DEST/CAPSULE-README.md\" ;;\n\
+             \"recovery/generations/{root}/capsule.py\") target=\"$DEST/capsule.py\" ;;\n\
+             \"recovery/generations/{root}/capsule-requirements.lock\") target=\"$DEST/capsule-requirements.lock\" ;;\n\
              *) exit 1 ;;\n\
            esac\n\
-           mkdir -p \"$DEST/$(dirname \"$key\")\"\n\
-           mc cp \"$MC_SOURCE/$key\" \"$DEST/$key\"\n\
+           mkdir -p \"$(dirname \"$target\")\"\n\
+           mc cp \"$MC_SOURCE/$key\" \"$target\"\n\
          done < \"$DEST/recovery/generations/{root}/objects.list\"\n",
         root = root.to_hex()
     )
@@ -1968,6 +2009,32 @@ mod tests {
         assert_eq!(report.entries, 2);
         assert_eq!(report.payload_objects, 1);
         assert_eq!(report.logical_count, 8);
+        let generation = remote_path
+            .join("recovery/generations")
+            .join(first.root.to_hex());
+        assert_eq!(
+            std::fs::read_to_string(generation.join("CAPSULE-README.md")).unwrap(),
+            CAPSULE_README
+        );
+        assert_eq!(
+            std::fs::read_to_string(generation.join("capsule.py")).unwrap(),
+            CAPSULE_TOOL
+        );
+        assert_eq!(
+            std::fs::read_to_string(generation.join("capsule-requirements.lock")).unwrap(),
+            CAPSULE_REQUIREMENTS
+        );
+        let object_list = std::fs::read_to_string(generation.join("objects.list")).unwrap();
+        for name in [
+            "CAPSULE-README.md",
+            "capsule.py",
+            "capsule-requirements.lock",
+        ] {
+            assert!(object_list.contains(&format!(
+                "recovery/generations/{}/{name}",
+                first.root.to_hex()
+            )));
+        }
 
         let payload_hash = manifest.payload_objects().unwrap()[0].hash;
         std::fs::write(
@@ -2069,6 +2136,11 @@ mod tests {
             assert!(script.contains("recovery/objects/blake3=*"));
             assert!(script.contains("*[!0-9a-f]*|'') exit 1"));
             assert!(script.contains("\"${#digest}\" -eq 64"));
+            assert!(script.contains("CAPSULE-README.md"));
+            assert!(script.contains("capsule.py"));
+            assert!(script.contains("capsule-requirements.lock"));
+            assert!(script.contains("target=\"$DEST/capsule.py\""));
+            assert!(script.contains("destination already exists"));
             assert!(script.contains("*) exit 1"));
         }
     }

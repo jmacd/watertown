@@ -10,6 +10,11 @@ const RECIPE_DOMAIN: &[u8] = b"pondcapsule.recipe.1\n";
 const README: &str = include_str!("../recovery/dp.commit.3/README.md");
 const FORMAT: &str = include_str!("../recovery/dp.commit.3/FORMAT.md");
 const REQUIREMENTS: &str = include_str!("../recovery/dp.commit.3/requirements.lock");
+const CAPSULE_README: &str = include_str!("../recovery/dp.commit.3/CAPSULE-README.md");
+const CAPSULE_REQUIREMENTS: &str =
+    include_str!("../recovery/dp.commit.3/capsule-requirements.lock");
+const CAPSULE_TOOL: &str = include_str!("../recovery/dp.commit.3/capsule.py");
+const CAPSULE_TEST: &str = include_str!("../recovery/dp.commit.3/capsule_test.py");
 const DOWNLOAD_AZCOPY: &str = include_str!("../recovery/dp.commit.3/download-azcopy.sh");
 const DOWNLOAD_MC: &str = include_str!("../recovery/dp.commit.3/download-mc.sh");
 const EXTRACTOR: &str = include_str!("../recovery/dp.commit.3/extract.py");
@@ -20,6 +25,10 @@ const FILES: &[(&str, &str)] = &[
     ("README.md", README),
     ("FORMAT.md", FORMAT),
     ("requirements.lock", REQUIREMENTS),
+    ("CAPSULE-README.md", CAPSULE_README),
+    ("capsule-requirements.lock", CAPSULE_REQUIREMENTS),
+    ("capsule.py", CAPSULE_TOOL),
+    ("capsule_test.py", CAPSULE_TEST),
     ("download-azcopy.sh", DOWNLOAD_AZCOPY),
     ("download-mc.sh", DOWNLOAD_MC),
     ("extract.py", EXTRACTOR),
@@ -103,9 +112,13 @@ mod tests {
         assert_eq!(
             names,
             [
+                "CAPSULE-README.md",
                 "FORMAT.md",
                 "README.md",
                 "SHA256SUMS",
+                "capsule-requirements.lock",
+                "capsule.py",
+                "capsule_test.py",
                 "download-azcopy.sh",
                 "download-mc.sh",
                 "extract.py",

@@ -1,88 +1,127 @@
-# Watertown `dp.commit.3` Recovery Kit
+# Watertown `dp.commit.3` Native-backup Recovery Kit
 
-This kit extracts a portable recovery capsule from a downloaded Watertown
-ContentRemote backup without running a source-format `pond` binary.
+This reviewed kit converts a downloaded native ContentRemote backup into a
+portable `pondcapsule.1` without importing anything and without running Pond.
+It is not itself a capsule. Every produced capsule contains
+`CAPSULE-README.md`, `capsule.py`, and `capsule-requirements.lock` at its root
+for Pond-free verification and materialization.
 
-## Safety
+## Bootstrap identity and safety
 
-1. Verify the `README.sh` hash supplied outside the backup.
-2. Review `README.sh` before running it.
-3. Run it only with an empty destination directory name.
-4. Review every extracted file before following later instructions.
-5. Authenticate Azure CLI or MinIO Client separately. No credential belongs in
-   this kit.
-6. Keep the source backup read-only.
-
-`README.sh` only creates files and prints instructions. It performs no network
-access, executes no extracted file, modifies no pond, and deletes no storage.
-
-## Recovery stages
-
-1. Download the complete native Delta backup, including `_delta_log/` and
-   `_blobs/`, after separately authenticating one of the reviewed helpers:
-
-   ```sh
-   azcopy login
-   sh download-azcopy.sh \
-     https://ACCOUNT.blob.core.windows.net/CONTAINER/PREFIX BACKUP
-
-   mc alias set ALIAS ENDPOINT
-   sh download-mc.sh ALIAS/BUCKET/PREFIX BACKUP
-   ```
-
-   The helpers accept no credential options, refuse an existing destination,
-   and require the result to contain `_delta_log/`. They never delete a
-   partial download; inspect or remove one explicitly before retrying.
-2. Create a disposable Python 3.13 virtual environment and install the exact
-   packages in `requirements.lock`.
-3. Select a native ref or exact commit hash.
-4. Run one of:
-
-   ```sh
-   python extract.py BACKUP CAPSULE --ref REF --birthplace LABEL
-   python extract.py BACKUP CAPSULE --commit HASH --birthplace LABEL
-   ```
-
-   `BACKUP` is a complete local download and `CAPSULE` must not exist.
-5. Run a current `pond capsule verify CAPSULE` before import.
-
-The extractor:
-
-- reads the native Delta table and `_blobs/` only;
-- resolves live rows by greatest transaction sequence;
-- rejects duplicate winners, malformed objects, unsafe paths, and hash
-  mismatches;
-- decodes the selected `dp.commit.3` graph without invoking `pond`; and
-- creates a new portable capsule without changing the backup.
-
-Internally it performs these steps:
-
-1. Select a native ref or exact commit hash.
-2. Read the current Delta snapshot and resolve the live `objects` and `refs`
-   rows by greatest `txn_seq`.
-3. Decode the selected `dp.commit.3` graph and materialize the portable capsule
-   manifest and `recovery/objects/blake3=<hash>` files.
-4. Verify every physical object, logical leaf, series root, and capsule root.
-5. Import only into a new empty target pond.
-
-Before using a newly published kit, run its dependency-free decoder check:
+Obtain both `README.sh` and its expected 64-character recipe hash through
+independent channels. The identity is BLAKE3 over the ASCII domain
+`pondcapsule.recipe.1\n` followed immediately by the exact `README.sh` bytes.
+With a separately trusted `b3sum`:
 
 ```sh
-python extract.py --verify-fixtures native-fixtures.json
+EXPECTED=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+ACTUAL=$({ printf 'pondcapsule.recipe.1\n'; cat README.sh; } | b3sum | awk '{print $1}')
+test "$ACTUAL" = "$EXPECTED"
 ```
 
-This checks the independent decoder against byte-for-byte fixtures also
-validated by the Rust source codecs. Production publication remains gated on a
-full native-backup-to-capsule integration test.
+Substitute the independently obtained expected hash. Do not use a hash stored
+beside an untrusted bootstrap as its only authority. `b3sum` is not bundled;
+install or transfer a reviewed implementation before an offline emergency.
 
-Maintainers with the pinned environment and a current binary can run that test
-without network access:
+Then review `README.sh` and extract it only into a new path:
+
+```sh
+sh README.sh watertown-recovery-dp.commit.3
+cd watertown-recovery-dp.commit.3
+sha256sum -c SHA256SUMS
+# macOS:
+shasum -a 256 -c SHA256SUMS
+```
+
+Review every extracted file. `README.sh` creates files only: it performs no
+network access, executes no extracted file, modifies no pond or backup, and
+deletes nothing. Keep the source backup read-only.
+
+## Exact environment
+
+The extractor requires Python 3.13 and the exact direct dependency versions in
+`requirements.lock`:
+
+```sh
+python3.13 -m venv recovery-venv
+. recovery-venv/bin/activate
+python -m pip install -r requirements.lock
+python extract.py --verify-fixtures native-fixtures.json
+python capsule_test.py
+```
+
+Normal package installation requires network access. For offline recovery,
+pre-stage reviewed, platform-compatible wheels for the pinned packages and any
+installer-reported transitive dependencies. Record their hashes independently,
+transfer them with the kit, and install without an index:
+
+```sh
+python -m pip install --no-index --find-links /trusted/wheelhouse \
+  -r requirements.lock
+python extract.py --verify-fixtures native-fixtures.json
+python capsule_test.py
+```
+
+## Download the complete native backup
+
+Authenticate separately; no credential belongs in this kit:
+
+```sh
+azcopy login
+sh download-azcopy.sh \
+  https://ACCOUNT.blob.core.windows.net/CONTAINER/PREFIX BACKUP
+
+mc alias set ALIAS ENDPOINT
+sh download-mc.sh ALIAS/BUCKET/PREFIX BACKUP
+```
+
+The helpers accept no credential options, refuse an existing destination, and
+require `_delta_log/`. They never delete a partial download.
+
+## Extract, verify, and materialize
+
+Select a native ref or exact commit hash. `BACKUP`, `CAPSULE`, and
+`MATERIALIZED` below are local paths; both output paths must not exist:
+
+```sh
+python extract.py BACKUP CAPSULE --ref REF --birthplace LABEL
+# Or:
+python extract.py BACKUP CAPSULE --commit HASH --birthplace LABEL
+
+python CAPSULE/capsule.py verify CAPSULE
+python CAPSULE/capsule.py materialize CAPSULE MATERIALIZED
+```
+
+The extractor reads the native Delta table and `_blobs/`, resolves live rows,
+verifies the selected native graph, and writes a portable capsule. It does not
+import into a pond. The capsule-local tool then independently verifies the
+latest ref, canonical manifest/root, topology, object closure, Parquet schemas,
+logical leaves, and series roots.
+
+For a capsule downloaded separately from object storage, compare its
+`capsule.py` and `capsule-requirements.lock` byte for byte with this
+hash-authenticated kit before execution. The capsule root authenticates the
+manifest and payload data, not executable helper files.
+
+Materialization creates type-separated roots for directories, files, tables,
+symlink targets, and dynamic recipes. It writes numbered file/Parquet versions
+plus inventories. Symlinks and recipes remain inert data; they are never
+activated or executed.
+
+`pondcapsule.1` cannot encode an empty member of a multi-version series.
+Extraction fails closed when one is encountered rather than silently changing
+series order or metadata. A single empty physical file or table node remains
+representable, although capsule v1 does not retain leaf metadata for that empty
+singleton.
+
+Maintainers can run the full independent integration test without Pond:
+
+```sh
+python integration_test.py
+```
+
+An optional current binary adds compatibility coverage only:
 
 ```sh
 python integration_test.py --pond /path/to/pond
 ```
-
-The test creates a temporary native Delta backup with historical rows, a
-tombstone, an external `_blobs` payload, Parquet, a series, a symlink, and a
-dynamic recipe. Extraction does not invoke `pond`; the supplied binary is used
-only afterward as the independent portable-capsule verifier.

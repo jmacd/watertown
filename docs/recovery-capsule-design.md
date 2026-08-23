@@ -19,7 +19,10 @@ obsolete, using:
 - ordinary Azure Blob or S3-compatible copy tools;
 - standard Delta Lake and Parquet libraries;
 - a reviewed recovery recipe for the source native format; and
-- a current `pond` binary for verification and import.
+- capsule-local, Pond-free verification and inert materialization tooling.
+
+A current `pond` binary is optional compatibility coverage and is needed only
+for a later native import workflow, not to prove or inspect recovered content.
 
 ## Terminology
 
@@ -112,6 +115,8 @@ The extracted `dp.commit.3` kit contains:
 - an independent native-format specification;
 - pinned Python 3.13 dependencies;
 - the independent Delta/Parquet extractor;
+- the standalone capsule verifier/materializer and its capsule-local README;
+- a separate exact direct-dependency file for the capsule tool;
 - cross-language native wire fixtures;
 - a native-backup-to-capsule integration test; and
 - credential-free AzCopy and MinIO Client download helpers.
@@ -130,6 +135,17 @@ pond capsule verify <capsule-directory>
 
 Recipe commands use a named remote attachment and its storage profile.
 Downloaded-capsule inspection and verification do not require a local pond.
+Every produced capsule also carries these operator commands at its root:
+
+```text
+python capsule.py verify CAPSULE
+python capsule.py materialize CAPSULE NEW_DESTINATION
+```
+
+The native recipe kit and produced capsule are deliberately distinct. The kit
+contains `extract.py`, Delta dependencies, native fixtures, and download
+helpers. The capsule contains only its payload and manifest/ref plus the exact root
+files `CAPSULE-README.md`, `capsule.py`, and `capsule-requirements.lock`.
 
 On-demand extraction currently runs from the reviewed kit:
 
@@ -197,6 +213,9 @@ each ordered series root.
 ### Downloaded capsule layout
 
 ```text
+CAPSULE-README.md
+capsule.py
+capsule-requirements.lock
 recovery/
   refs/latest
   manifests/<capsule-root>.json
@@ -204,7 +223,10 @@ recovery/
 ```
 
 `refs/latest` names the canonical manifest root. The manifest declares the
-complete required payload closure.
+complete required payload closure. The capsule-local files explain, verify,
+and safely materialize that closure without Pond. Executable helper files are
+not covered by the capsule root; an operator must compare them with the copy
+from the independently hash-authenticated recovery kit before execution.
 
 ### Canonical encoding
 
@@ -230,8 +252,13 @@ complete required payload closure.
    `_blobs/`.
 7. Run the dependency-free native fixture verification.
 8. Select a native ref or commit and run the extractor.
-9. Run `pond capsule verify` on the resulting capsule.
-10. Import only into a new staged pond.
+9. Run `python CAPSULE/capsule.py verify CAPSULE`.
+10. Run `python CAPSULE/capsule.py materialize CAPSULE NEW_DESTINATION` to
+    inspect exact file bytes, Parquet rows, symlink targets, and recipes as
+    inert data.
+11. Optionally run a current `pond capsule verify CAPSULE` as additional
+    compatibility coverage.
+12. Import only into a new staged pond if an import-capable binary is available.
 
 The capsule root should be recorded outside the source storage. Content hashes
 detect corruption; an out-of-band root also detects replacement of both data
@@ -261,8 +288,8 @@ Any mismatch is fatal. The extractor never repairs or guesses source state.
 
 ## Inspection and verification
 
-`pond capsule inspect` and `pond capsule verify` are currently equivalent
-read-only operations. They:
+The capsule-local `capsule.py verify` command and Pond's optional
+`pond capsule verify` compatibility command:
 
 - decode and validate the canonical manifest;
 - verify the latest manifest root;
@@ -274,6 +301,14 @@ read-only operations. They:
 - report entry, object, byte, and logical counts.
 
 Extra undeclared files do not satisfy a missing declared object.
+
+`capsule.py materialize` first performs the same deep verification and refuses
+an existing destination. It percent-encodes unsafe logical path components and
+uses separate roots for directories, files, tables, symlink targets, and
+dynamic recipes. File and table leaves are exported into numbered versions.
+Symlink targets and native dynamic recipes are copied only as bytes; the tool
+never creates an active symlink, imports a pond, or executes a recipe. A text
+README and JSON inventory preserve mappings and logical metadata.
 
 ## Generic staged import
 
@@ -372,11 +407,14 @@ Completed:
 - canonical capsule manifest, logical hashing, and offline verifier;
 - deterministic `dp.commit.3` bootstrap and recipe identity;
 - independent Delta/Parquet extractor;
+- capsule-local standalone verifier, safe materializer, README, and dependency
+  file requiring no Pond code;
 - commit, node-Merkle, tree, manifest, series, and recipe verification;
 - native wire fixtures checked by Python and Rust;
 - credential-free AzCopy and MinIO download helpers;
 - integration coverage for live-row history, tombstones, external blobs,
-  files, Parquet tables, series, symlinks, and dynamic recipes;
+  Pond-free verification/materialization, exact files and Parquet rows, inert
+  symlink targets and dynamic recipes, series, and destination refusal;
 - immutable recipe publish and inspect commands;
 - staged import with a fresh identity, immutable provenance, persistent
   post-commit suppression, exact logical verification, and atomic target

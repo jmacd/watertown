@@ -7,6 +7,7 @@ import argparse
 import json
 import struct
 import subprocess
+import sys
 import tempfile
 from decimal import Decimal
 from pathlib import Path
@@ -16,11 +17,20 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from deltalake import write_deltalake
 
+from capsule import CapsuleError, load_and_verify, materialize
 from extract import FormatError, decode_manifest, extract, node_manifest_root
 
 NIL_UUID = "00000000-0000-0000-0000-000000000000"
 POND_ID = "11111111-1111-1111-1111-111111111111"
 NOW = 1_700_000_000_000_000
+EXTERNAL_FILE = (b"external recovery payload\n" * 4096) + b"end\n"
+SYMLINK_TARGET = b"/data/file"
+RECIPE_BYTES = (
+    b"dp.recipe.1\n"
+    + struct.pack("<I", len(b"fixture-factory"))
+    + b"fixture-factory"
+    + b'{"source":"integration"}'
+)
 
 
 def digest(value: bytes) -> bytes:
@@ -65,7 +75,6 @@ def manifest_entry(
 
 
 def build_native_backup(root: Path, *, include_empty_series_version: bool = False) -> None:
-    external_file = (b"external recovery payload\n" * 4096) + b"end\n"
     table_path = root.parent / "fixture.parquet"
     schema = pa.schema(
         [
@@ -116,12 +125,6 @@ def build_native_backup(root: Path, *, include_empty_series_version: bool = Fals
         )
         empty_table = empty_path.read_bytes()
         empty_path.unlink()
-    symlink = b"/data/file"
-    recipe = (
-        b"dp.recipe.1\n"
-        + length_prefixed(b"fixture-factory")
-        + b'{"source":"integration"}'
-    )
     table_hashes = [digest(table)]
     table_versions = [metadata(102)]
     if empty_table is not None:
@@ -134,9 +137,9 @@ def build_native_backup(root: Path, *, include_empty_series_version: bool = Fals
     )
 
     children = [
-        ("dynamic", 5, digest(recipe), []),
-        ("file", 4, digest(external_file), [metadata(101)]),
-        ("link", 3, digest(symlink), []),
+        ("dynamic", 5, digest(RECIPE_BYTES), []),
+        ("file", 4, digest(EXTERNAL_FILE), [metadata(101)]),
+        ("link", 3, digest(SYMLINK_TARGET), []),
         ("table", 8, digest(series), table_versions),
     ]
     tree = (
@@ -146,9 +149,9 @@ def build_native_backup(root: Path, *, include_empty_series_version: bool = Fals
     )
     tree_hash = digest(tree)
     entries = [
-        ("file", "root", "file", 4, digest(external_file), [metadata(101)]),
-        ("link", "root", "link", 3, digest(symlink), []),
-        ("recipe", "root", "dynamic", 5, digest(recipe), []),
+        ("file", "root", "file", 4, digest(EXTERNAL_FILE), [metadata(101)]),
+        ("link", "root", "link", 3, digest(SYMLINK_TARGET), []),
+        ("recipe", "root", "dynamic", 5, digest(RECIPE_BYTES), []),
         ("root", "", "", 1, tree_hash, []),
         ("table", "root", "table", 8, digest(series), table_versions),
     ]
@@ -173,8 +176,8 @@ def build_native_backup(root: Path, *, include_empty_series_version: bool = Fals
     commit_hash = digest(commit)
     inline = {
         digest(table): table,
-        digest(symlink): symlink,
-        digest(recipe): recipe,
+        digest(SYMLINK_TARGET): SYMLINK_TARGET,
+        digest(RECIPE_BYTES): RECIPE_BYTES,
         digest(series): series,
         tree_hash: tree,
         manifest_hash: manifest,
@@ -230,7 +233,7 @@ def build_native_backup(root: Path, *, include_empty_series_version: bool = Fals
     write_deltalake(root, arrow, partition_by=["pond_id", "partition_key"])
     blobs = root / "_blobs"
     blobs.mkdir()
-    (blobs / f"blob={digest(external_file).hex()}").write_bytes(external_file)
+    (blobs / f"blob={digest(EXTERNAL_FILE).hex()}").write_bytes(EXTERNAL_FILE)
 
 
 def main() -> int:
@@ -238,12 +241,11 @@ def main() -> int:
     parser.add_argument(
         "--pond",
         type=Path,
-        required=True,
-        help="current pond binary used only for independent capsule verification",
+        help="optional current pond binary for additional compatibility verification",
     )
     args = parser.parse_args()
-    pond = args.pond.resolve()
-    if not pond.is_file():
+    pond = args.pond.resolve() if args.pond is not None else None
+    if pond is not None and not pond.is_file():
         parser.error(f"pond binary does not exist: {pond}")
 
     fixtures = json.loads(
@@ -266,11 +268,54 @@ def main() -> int:
         else:
             raise AssertionError("extractor accepted a destination inside the backup")
         root = extract(source, destination, "main", None, "fixture")
+        for name in (
+            "CAPSULE-README.md",
+            "capsule.py",
+            "capsule-requirements.lock",
+        ):
+            assert (destination / name).is_file(), name
         subprocess.run(
-            [str(pond), "capsule", "verify", str(destination)],
+            [sys.executable, str(destination / "capsule.py"), "verify", str(destination)],
             check=True,
         )
-        print(f"integration capsule verified: {root}")
+        _, report = load_and_verify(destination)
+        assert report["root"] == root
+
+        recovered = workspace / "materialized"
+        materialize(destination, recovered)
+        assert (
+            recovered / "files" / "file" / "version-000001.bin"
+        ).read_bytes() == EXTERNAL_FILE
+        recovered_table = pq.read_table(
+            recovered / "tables" / "table" / "version-000001.parquet"
+        )
+        assert recovered_table.column("reading").to_pylist() == [1, None, 3]
+        assert recovered_table.column("label").to_pylist() == ["a", "b", "c"]
+        assert recovered_table.column("precise").to_pylist() == [
+            Decimal("12345678901234567890123456789012.345678"),
+            None,
+            Decimal("-99999999999999999999999999999999.999999"),
+        ]
+        assert (
+            recovered / "symlinks" / "link" / "target.bin"
+        ).read_bytes() == SYMLINK_TARGET
+        assert not (recovered / "symlinks" / "link" / "target.bin").is_symlink()
+        assert (
+            recovered / "dynamic-recipes" / "dynamic" / "recipe.bin"
+        ).read_bytes() == RECIPE_BYTES
+        try:
+            materialize(destination, recovered)
+        except CapsuleError as error:
+            assert "already exists" in str(error), error
+        else:
+            raise AssertionError("materializer accepted an existing destination")
+
+        if pond is not None:
+            subprocess.run(
+                [str(pond), "capsule", "verify", str(destination)],
+                check=True,
+            )
+        print(f"integration capsule verified and materialized: {root}")
 
         empty_source = workspace / "native-empty-series"
         build_native_backup(empty_source, include_empty_series_version=True)
