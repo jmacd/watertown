@@ -3,8 +3,9 @@
 This reviewed kit converts a downloaded native ContentRemote backup into a
 portable `pondcapsule.1` without importing anything and without running Pond.
 It is not itself a capsule. Every produced capsule contains
-`CAPSULE-README.md`, `capsule.py`, and `capsule-requirements.lock` at its root
-for Pond-free verification and materialization.
+`CAPSULE-README.md`, `CAPSULE-FORMAT.md`, `capsule.py`,
+`capsule-requirements.lock`, and `recover.sh` at its root for Pond-free
+verification and materialization.
 
 ## Bootstrap identity and safety
 
@@ -92,6 +93,15 @@ python CAPSULE/capsule.py verify CAPSULE
 python CAPSULE/capsule.py materialize CAPSULE MATERIALIZED
 ```
 
+Or use the authenticated kit's wrapper, which performs both operations and
+creates its own virtual environment:
+
+```sh
+sh recover.sh CAPSULE MATERIALIZED
+# Strictly offline:
+sh recover.sh CAPSULE MATERIALIZED /trusted/wheelhouse
+```
+
 The extractor reads the native Delta table and `_blobs/`, resolves live rows,
 verifies the selected native graph, and writes a portable capsule. It does not
 import into a pond. The capsule-local tool then independently verifies the
@@ -99,14 +109,17 @@ latest ref, canonical manifest/root, topology, object closure, Parquet schemas,
 logical leaves, and series roots.
 
 For a capsule downloaded separately from object storage, compare its
-`capsule.py` and `capsule-requirements.lock` byte for byte with this
+`CAPSULE-README.md`, `CAPSULE-FORMAT.md`, `capsule.py`,
+`capsule-requirements.lock`, and `recover.sh` byte for byte with this
 hash-authenticated kit before execution. The capsule root authenticates the
-manifest and payload data, not executable helper files.
+manifest and payload data, not executable helper files. Prefer running this
+kit's trusted `recover.sh` rather than the capsule copy.
 
 Materialization creates type-separated roots for directories, files, tables,
 symlink targets, and dynamic recipes. It writes numbered file/Parquet versions
 plus inventories. Symlinks and recipes remain inert data; they are never
-activated or executed.
+activated or executed. Dynamic recipes are also decoded into a factory name
+and exact configuration bytes for inspection.
 
 `pondcapsule.1` cannot encode an empty member of a multi-version series.
 Extraction fails closed when one is encountered rather than silently changing

@@ -11,9 +11,11 @@ const README: &str = include_str!("../recovery/dp.commit.3/README.md");
 const FORMAT: &str = include_str!("../recovery/dp.commit.3/FORMAT.md");
 const REQUIREMENTS: &str = include_str!("../recovery/dp.commit.3/requirements.lock");
 const CAPSULE_README: &str = include_str!("../recovery/dp.commit.3/CAPSULE-README.md");
+const CAPSULE_FORMAT: &str = include_str!("../recovery/dp.commit.3/CAPSULE-FORMAT.md");
 const CAPSULE_REQUIREMENTS: &str =
     include_str!("../recovery/dp.commit.3/capsule-requirements.lock");
 const CAPSULE_TOOL: &str = include_str!("../recovery/dp.commit.3/capsule.py");
+const RECOVER: &str = include_str!("../recovery/dp.commit.3/recover.sh");
 const CAPSULE_TEST: &str = include_str!("../recovery/dp.commit.3/capsule_test.py");
 const DOWNLOAD_AZCOPY: &str = include_str!("../recovery/dp.commit.3/download-azcopy.sh");
 const DOWNLOAD_MC: &str = include_str!("../recovery/dp.commit.3/download-mc.sh");
@@ -26,8 +28,10 @@ const FILES: &[(&str, &str)] = &[
     ("FORMAT.md", FORMAT),
     ("requirements.lock", REQUIREMENTS),
     ("CAPSULE-README.md", CAPSULE_README),
+    ("CAPSULE-FORMAT.md", CAPSULE_FORMAT),
     ("capsule-requirements.lock", CAPSULE_REQUIREMENTS),
     ("capsule.py", CAPSULE_TOOL),
+    ("recover.sh", RECOVER),
     ("capsule_test.py", CAPSULE_TEST),
     ("download-azcopy.sh", DOWNLOAD_AZCOPY),
     ("download-mc.sh", DOWNLOAD_MC),
@@ -75,9 +79,13 @@ pub fn recovery_recipe_dp_commit_3() -> Vec<u8> {
 #[must_use]
 pub fn recovery_recipe_dp_commit_3_hash() -> ObjectHash {
     let script = recovery_recipe_dp_commit_3();
+    recovery_recipe_hash(&script)
+}
+
+pub(crate) fn recovery_recipe_hash(script: &[u8]) -> ObjectHash {
     let mut hasher = blake3::Hasher::new();
     let _ = hasher.update(RECIPE_DOMAIN);
-    let _ = hasher.update(&script);
+    let _ = hasher.update(script);
     ObjectHash::from_bytes(*hasher.finalize().as_bytes())
 }
 
@@ -112,6 +120,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "CAPSULE-FORMAT.md",
                 "CAPSULE-README.md",
                 "FORMAT.md",
                 "README.md",
@@ -124,6 +133,7 @@ mod tests {
                 "extract.py",
                 "integration_test.py",
                 "native-fixtures.json",
+                "recover.sh",
                 "requirements.lock"
             ]
         );

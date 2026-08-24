@@ -1,69 +1,101 @@
-# Watertown Pond-free Recovery Capsule
+# Watertown Pond-free Disaster Recovery
 
-This directory is a produced `pondcapsule.1`, not the native-backup recovery
-recipe kit that created it. Keep the whole directory together and record the
-capsule root from `recovery/refs/latest` through an independent channel.
+**You do not need a Pond binary or the Watertown source tree to recover this
+capsule.** Keep the capsule read-only and work on a copy. Never delete or
+overwrite the source backup during recovery.
 
-`capsule.py` never imports or invokes Pond. It uses Python's standard library
-plus the exact direct dependencies in `capsule-requirements.lock`.
+You need Python 3.13, enough free space for the capsule plus recovered data,
+and the Python packages listed in `capsule-requirements.lock`. Read
+`CAPSULE-FORMAT.md` for the portable layout and output mapping.
 
-## Authenticate the recovery tool
+## 1. Confirm that this is the intended snapshot
 
-The capsule root authenticates the manifest and payload data, not this
-executable helper. Before running a capsule copy downloaded from object
-storage, obtain the `dp.commit.3` recovery kit and its `README.sh` hash through
-the independent process in the kit README. Then compare the reviewed,
-hash-authenticated kit files byte for byte:
+`recovery/refs/latest` contains the capsule root. Compare it with a value kept
+through an independent channel:
 
 ```sh
-cmp /trusted/recovery-kit/capsule.py ./capsule.py
-cmp /trusted/recovery-kit/capsule-requirements.lock \
-  ./capsule-requirements.lock
+cat recovery/refs/latest
 ```
 
-Run the trusted kit copy directly if either comparison fails. A checksum
-downloaded from the same untrusted storage is not an independent authority.
+Hashes prove integrity, not freshness. If no independently recorded capsule
+root or native commit exists, record that limitation in the incident log
+before proceeding.
 
-## Environment and verification
+## 2. Authenticate the recovery aids
 
-Use Python 3.13 on a compatible machine:
+The capsule root authenticates the manifest and payload data, but not the
+scripts beside this README. Obtain the `dp.commit.3` recovery kit and its
+`README.sh` hash through the independent process described in the kit README.
+After authenticating and extracting that kit, compare all capsule aids:
 
 ```sh
-python3.13 -m venv capsule-venv
-. capsule-venv/bin/activate
-python -m pip install -r capsule-requirements.lock
-python capsule.py verify .
+for name in CAPSULE-README.md CAPSULE-FORMAT.md capsule.py \
+  capsule-requirements.lock recover.sh; do
+  cmp "/trusted/recovery-kit/$name" "./$name" || exit 1
+done
 ```
 
-Package installation normally needs network access. For offline recovery,
-obtain reviewed, platform-compatible wheels for `blake3`, `pyarrow`, and any
-installer-reported transitive dependencies in advance, transfer them with
-their independently recorded hashes, then use:
+Use the trusted kit copies directly. A checksum stored only beside an untrusted
+capsule does not establish authenticity.
+
+## 3. Recover
+
+The trusted wrapper creates a virtual environment, installs exact direct
+dependency versions, deeply verifies the capsule, and writes a new
+materialized directory:
 
 ```sh
-python -m pip install --no-index --find-links /trusted/wheelhouse \
-  -r capsule-requirements.lock
-python capsule.py verify .
+sh /trusted/recovery-kit/recover.sh \
+  /path/to/CAPSULE /path/to/NEW-RECOVERED-DIRECTORY
 ```
 
-## Safe materialization
-
-The destination must not exist:
+This online form contacts the configured Python package index. For an offline
+or controlled recovery, prepare platform-compatible wheels for `blake3`,
+`pyarrow`, and their transitive dependencies in advance, authenticate them
+through an independent channel, and pass the wheelhouse as the third argument:
 
 ```sh
-python capsule.py materialize . ../recovered-capsule
+sh /trusted/recovery-kit/recover.sh \
+  /path/to/CAPSULE /path/to/NEW-RECOVERED-DIRECTORY \
+  /trusted/wheelhouse
 ```
 
-The tool verifies the complete capsule before writing. It separates
-directories, files, tables, symlink targets, and dynamic recipes into distinct
-type roots. File and table leaves become numbered versions. Symlink targets
-and recipes are copied as inert bytes: no symlink is created and no recipe is
-executed. Materialization is staged beside the destination and becomes visible
-only after it is complete. `README.txt` and `inventory.json` explain every
-mapping and preserve the metadata present in the capsule.
+Set `PYTHON` if Python 3.13 has a different command name. Set `RECOVERY_VENV`
+to choose where the reusable virtual environment is created.
+
+## 4. Understand the result
+
+Start with `NEW-RECOVERED-DIRECTORY/README.txt`, then consult
+`inventory.json`, which maps every original logical path to its recovered
+files and metadata.
+
+- `files/` contains numbered exact byte-stream versions.
+- `tables/` contains numbered standard Parquet versions.
+- `symlinks/` contains inert target bytes; no symlink is created.
+- `dynamic-recipes/` contains inert `recipe.bin`, readable `factory.json`, and
+  exact `config.bin`; no recipe is executed.
+- `directories/` records directory entries that have no payload.
+
+Each output path directory includes a readable basename hint and a digest of
+the complete logical path. This deliberately avoids collisions and excessive
+path growth on common filesystems; use `inventory.json`, not filename guessing,
+as the authoritative mapping.
+
+The destination must not already exist. Verification completes before any
+result is promoted into place.
+
+## Manual commands
+
+If the wrapper cannot be used, create a Python 3.13 virtual environment,
+install `capsule-requirements.lock`, then run:
+
+```sh
+python /trusted/recovery-kit/capsule.py verify /path/to/CAPSULE
+python /trusted/recovery-kit/capsule.py materialize \
+  /path/to/CAPSULE /path/to/NEW-RECOVERED-DIRECTORY
+```
 
 `pondcapsule.1` cannot encode an empty member of a multi-version series.
-Extraction therefore fails closed instead of dropping such a member. A single
-empty physical file or table node remains representable as an empty stream or
-a Parquet schema carrier. Capsule v1 does not retain leaf metadata for those
-empty singleton nodes.
+Extraction fails rather than silently dropping one. A single empty physical
+file or table remains recoverable as an empty stream or Parquet schema carrier,
+although capsule v1 does not retain leaf metadata for that empty singleton.

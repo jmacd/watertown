@@ -57,9 +57,10 @@ pub struct ContentPushOutcome {
 /// # Errors
 ///
 /// Returns an error if the pond has no content-changing commit to push,
-/// if the persisted commit object does not hash to the recorded commit hash,
-/// if any external large blob is missing or its bytes do not hash to the
-/// recorded key, or if reading the content tree or writing to the remote fails.
+/// if the required recovery recipe cannot be installed or verified, if the
+/// persisted commit object does not hash to the recorded commit hash, if any
+/// external large blob is missing or its bytes do not hash to the recorded
+/// key, or if reading the content tree or writing to the remote fails.
 pub async fn push_content_to_remote(
     ship: &Ship,
     remote: &mut ContentRemote,
@@ -155,6 +156,14 @@ async fn push_content_inner(
     remote: &mut ContentRemote,
     ref_name: &str,
 ) -> Result<ContentPushOutcome, StewardError> {
+    let _ = remote
+        .ensure_recovery_recipe_dp_commit_3()
+        .await
+        .map_err(|error| {
+            StewardError::Content(format!(
+                "install required dp.commit.3 recovery recipe before backup push: {error}"
+            ))
+        })?;
     let commit_log = crate::content_tree::read_log_leaves(
         ship.data_persistence().table().clone(),
         &ship.control_table().pond_id_uuid().to_string(),

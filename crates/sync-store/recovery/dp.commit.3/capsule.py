@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import errno
+import hashlib
 import json
 import math
 import os
@@ -15,7 +16,6 @@ import struct
 import sys
 import tempfile
 import unicodedata
-import urllib.parse
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -846,12 +846,31 @@ def load_and_verify(capsule: Path) -> tuple[dict[str, Any], dict[str, Any]]:
 def _encoded_logical_path(path: str) -> Path:
     if path == "/":
         return Path("_root")
-    return Path(
-        *[
-            urllib.parse.quote(component, safe="-._~")
-            for component in path[1:].split("/")
-        ]
-    )
+    component = path.rsplit("/", 1)[-1]
+    hint = "".join(
+        character.lower()
+        if character.isascii() and character.isalnum()
+        else "-"
+        for character in component
+    ).strip("-")
+    hint = re.sub(r"-+", "-", hint)[:40] or "item"
+    return Path(f"p-{hint}--{hashlib.sha256(path.encode()).hexdigest()}")
+
+
+def _decode_dynamic_recipe(data: bytes) -> tuple[str, bytes]:
+    magic = b"dp.recipe.1\n"
+    if not data.startswith(magic) or len(data) < len(magic) + 4:
+        raise CapsuleError("dynamic recipe does not use dp.recipe.1 framing")
+    name_length = struct.unpack_from("<I", data, len(magic))[0]
+    name_start = len(magic) + 4
+    name_end = name_start + name_length
+    if name_end > len(data):
+        raise CapsuleError("dynamic recipe factory name is truncated")
+    try:
+        factory = data[name_start:name_end].decode()
+    except UnicodeDecodeError as error:
+        raise CapsuleError("dynamic recipe factory name is not UTF-8") from error
+    return factory, data[name_end:]
 
 
 def _write_file_versions(
@@ -994,6 +1013,20 @@ def materialize(capsule: Path, destination: Path) -> dict[str, Any]:
                 target = target_dir / "recipe.bin"
                 shutil.copyfile(_object_path(capsule, node["recipe"]), target)
                 outputs.append(str(target.relative_to(staging)))
+                factory, configuration = _decode_dynamic_recipe(target.read_bytes())
+                factory_target = target_dir / "factory.json"
+                factory_target.write_text(
+                    json.dumps({"factory": factory}, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                config_target = target_dir / "config.bin"
+                config_target.write_bytes(configuration)
+                outputs.extend(
+                    [
+                        str(factory_target.relative_to(staging)),
+                        str(config_target.relative_to(staging)),
+                    ]
+                )
             elif kind == "physical" and node["payload_kind"] == "file":
                 outputs = [
                     str(Path(value).relative_to(staging))
@@ -1032,7 +1065,7 @@ def materialize(capsule: Path, destination: Path) -> dict[str, Any]:
             f"Source pond: {manifest['source']['pond_id']}",
             "",
             "No symlink was activated and no dynamic recipe was executed.",
-            "Logical path components are UTF-8 percent-encoded only when needed.",
+            "Logical path components use readable hints plus SHA-256 digests of exact UTF-8.",
             "See inventory.json for exact mappings, hashes, and leaf metadata.",
             "",
         ]

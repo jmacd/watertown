@@ -538,7 +538,8 @@ pond push origin
 After every write transaction, the steward also auto-pushes all
 `push`/`both`-mode remotes -- so this command is mostly used when an
 earlier auto-push failed (transient network), or right after attaching
-a brand-new remote. Native pushes perform no capsule or recovery-recipe I/O.
+a brand-new remote. Native pushes do not generate capsules; they idempotently
+install or verify the small static recovery recipe before writing backup data.
 
 ---
 
@@ -549,7 +550,7 @@ recovery snapshots. The recipe extracts a portable capsule from an existing
 native Delta/Parquet backup only when recovery is needed.
 
 ```bash
-# Install the reviewed dp.commit.3 recipe once at a backup remote.
+# Repair or explicitly reinstall the reviewed dp.commit.3 recipe.
 pond capsule recipe publish azure
 
 # Verify its immutable and discoverable bootstrap objects.
@@ -562,11 +563,13 @@ pond capsule inspect ./recovered
 pond capsule verify ./recovered
 ```
 
-Recipe publication creates
+Every backup push installs the current hash-addressed recovery recipe and
+verifies any existing discoverable recipe against its immutable copy before
+advancing the native ref. Recipe publication creates
 `recovery/recipes/dp.commit.3/<recipe-hash>/README.sh` before the discoverable
 `recovery/README.sh`. Retries accept only byte-identical objects; neither path
-is overwritten when its content differs. Ordinary native pushes never probe or
-rewrite either object.
+is overwritten when its content differs. Ordinary native pushes verify these
+objects but never replace an existing discoverable recipe.
 
 Inspection does not open or modify a pond. It validates the latest reference,
 canonical manifest, every physical object hash and size, every Parquet schema,

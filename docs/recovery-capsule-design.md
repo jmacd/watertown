@@ -67,7 +67,8 @@ The static recipe:
 7. verifies the portable capsule.
 
 Capsule bytes are created only during recovery. Ordinary native pushes perform
-zero capsule and recipe I/O.
+no capsule generation; before writing backup data, they idempotently ensure
+that the small static recovery recipe is present and byte-identical.
 
 There are no per-commit capsule manifests, duplicated cloud payloads, capsule
 generation refs, publication leases, retention windows, or capsule-generation
@@ -93,8 +94,13 @@ The versioned object is created before the discoverable top-level object.
 Retries accept only byte-identical existing objects; differing content is never
 overwritten.
 
-The recipe is published and tested before the first backup using a new native
-format. Old versioned recipes remain immutable.
+Every native backup push idempotently installs the current hash-addressed
+recipe and verifies the discoverable recipe against its own immutable copy
+before writing backup data or advancing a ref. An existing discoverable recipe
+is never replaced, so an older binary cannot downgrade it and a newer binary
+cannot strand an existing backup. Old versioned recipes remain immutable. The
+explicit publish command remains a strict, idempotent provisioning, repair, and
+inspection aid for the current kit.
 
 ### Bootstrap safety
 
@@ -116,6 +122,7 @@ The extracted `dp.commit.3` kit contains:
 - pinned Python 3.13 dependencies;
 - the independent Delta/Parquet extractor;
 - the standalone capsule verifier/materializer and its capsule-local README;
+- a portable-capsule format reference and one-command recovery wrapper;
 - a separate exact direct-dependency file for the capsule tool;
 - cross-language native wire fixtures;
 - a native-backup-to-capsule integration test; and
@@ -145,7 +152,8 @@ python capsule.py materialize CAPSULE NEW_DESTINATION
 The native recipe kit and produced capsule are deliberately distinct. The kit
 contains `extract.py`, Delta dependencies, native fixtures, and download
 helpers. The capsule contains only its payload and manifest/ref plus the exact root
-files `CAPSULE-README.md`, `capsule.py`, and `capsule-requirements.lock`.
+files `CAPSULE-README.md`, `CAPSULE-FORMAT.md`, `capsule.py`,
+`capsule-requirements.lock`, and `recover.sh`.
 
 On-demand extraction currently runs from the reviewed kit:
 
@@ -214,8 +222,10 @@ each ordered series root.
 
 ```text
 CAPSULE-README.md
+CAPSULE-FORMAT.md
 capsule.py
 capsule-requirements.lock
+recover.sh
 recovery/
   refs/latest
   manifests/<capsule-root>.json
@@ -225,8 +235,10 @@ recovery/
 `refs/latest` names the canonical manifest root. The manifest declares the
 complete required payload closure. The capsule-local files explain, verify,
 and safely materialize that closure without Pond. Executable helper files are
-not covered by the capsule root; an operator must compare them with the copy
-from the independently hash-authenticated recovery kit before execution.
+not covered by the capsule root; an operator must compare all recovery aids
+with copies from the independently hash-authenticated recovery kit before
+execution. The trusted kit's `recover.sh` automates dependency setup,
+verification, and inert materialization without Pond.
 
 ### Canonical encoding
 
@@ -303,12 +315,15 @@ The capsule-local `capsule.py verify` command and Pond's optional
 Extra undeclared files do not satisfy a missing declared object.
 
 `capsule.py materialize` first performs the same deep verification and refuses
-an existing destination. It percent-encodes unsafe logical path components and
-uses separate roots for directories, files, tables, symlink targets, and
-dynamic recipes. File and table leaves are exported into numbered versions.
-Symlink targets and native dynamic recipes are copied only as bytes; the tool
-never creates an active symlink, imports a pond, or executes a recipe. A text
-README and JSON inventory preserve mappings and logical metadata.
+an existing destination. It maps each full logical path to one bounded ASCII
+directory name containing a basename hint and SHA-256 of the exact UTF-8 path,
+avoiding collisions and excessive path growth across common filesystems. Separate
+roots hold directories, files, tables, symlink targets, and dynamic recipes.
+File and table leaves are exported into numbered versions. Symlink targets and
+native dynamic recipes remain inert; recipes are additionally decoded into a
+JSON factory name and exact configuration bytes for inspection. The tool never
+creates an active symlink, imports a pond, or executes a recipe. A text README
+and JSON inventory preserve mappings and logical metadata.
 
 ## Generic staged import
 
@@ -431,8 +446,9 @@ Remaining:
 
 ## Acceptance criteria
 
-- Ordinary native pushes perform zero capsule-specific I/O.
-- A recipe is published once per native format and is immutable.
+- Ordinary native pushes generate no capsules; they ensure the static recovery
+  recipe is present and internally consistent.
+- Each recipe version is immutable and published at most once per backup.
 - Recovery requires no source-format `pond` binary.
 - Every native and portable content address is verified before trust.
 - A capsule preserves complete live logical namespace and series identity.

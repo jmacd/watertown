@@ -809,8 +809,10 @@ def _extract_graph(source: Path, destination: Path, ref_name: str | None,
         kit = Path(__file__).resolve().parent
         for source_name, destination_name in (
             ("CAPSULE-README.md", "CAPSULE-README.md"),
+            ("CAPSULE-FORMAT.md", "CAPSULE-FORMAT.md"),
             ("capsule.py", "capsule.py"),
             ("capsule-requirements.lock", "capsule-requirements.lock"),
+            ("recover.sh", "recover.sh"),
         ):
             shutil.copyfile(kit / source_name, destination / destination_name)
         return capsule_root

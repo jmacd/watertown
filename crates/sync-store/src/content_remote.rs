@@ -58,9 +58,11 @@ const CAPSULE_PREFIX: &str = "recovery";
 const CAPSULE_HISTORY_LIMIT: usize = 3;
 const RECIPE_NATIVE_FORMAT: &str = "dp.commit.3";
 const CAPSULE_README: &str = include_str!("../recovery/dp.commit.3/CAPSULE-README.md");
+const CAPSULE_FORMAT: &str = include_str!("../recovery/dp.commit.3/CAPSULE-FORMAT.md");
 const CAPSULE_TOOL: &str = include_str!("../recovery/dp.commit.3/capsule.py");
 const CAPSULE_REQUIREMENTS: &str =
     include_str!("../recovery/dp.commit.3/capsule-requirements.lock");
+const CAPSULE_RECOVER: &str = include_str!("../recovery/dp.commit.3/recover.sh");
 
 /// Result of publishing one verified recovery-capsule generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -394,6 +396,84 @@ impl ContentRemote {
             versioned_created,
             discoverable_created,
         })
+    }
+
+    /// Ensure recovery remains possible without requiring an existing remote
+    /// to replace its previously published, immutable discoverable recipe.
+    ///
+    /// The current kit is always installed at its hash-addressed path. If an
+    /// older discoverable kit already exists, it is accepted only when its
+    /// bytes match its own hash-addressed immutable copy.
+    pub async fn ensure_recovery_recipe_dp_commit_3(&self) -> Result<ObjectHash> {
+        let current = crate::recovery_recipe_dp_commit_3();
+        let current_hash = crate::recovery_recipe_dp_commit_3_hash();
+        let _ = self
+            .create_exact_object(
+                &Self::recovery_recipe_versioned_path(current_hash),
+                &current,
+                "versioned recovery recipe",
+            )
+            .await?;
+        let discoverable = Self::recovery_recipe_discoverable_path();
+        match self
+            .store
+            .object_store()
+            .put_opts(
+                &discoverable,
+                current.into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..PutOptions::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => Ok(current_hash),
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let existing = self
+                    .store
+                    .object_store()
+                    .get(&discoverable)
+                    .await
+                    .map_err(|error| {
+                        StoreError::Invariant(format!("read discoverable recovery recipe: {error}"))
+                    })?
+                    .bytes()
+                    .await
+                    .map_err(|error| {
+                        StoreError::Invariant(format!(
+                            "collect discoverable recovery recipe: {error}"
+                        ))
+                    })?;
+                let existing_hash = crate::recovery_recipe::recovery_recipe_hash(&existing);
+                let immutable = self
+                    .store
+                    .object_store()
+                    .get(&Self::recovery_recipe_versioned_path(existing_hash))
+                    .await
+                    .map_err(|error| {
+                        StoreError::Invariant(format!(
+                            "read immutable copy of discoverable recovery recipe: {error}"
+                        ))
+                    })?
+                    .bytes()
+                    .await
+                    .map_err(|error| {
+                        StoreError::Invariant(format!(
+                            "collect immutable copy of discoverable recovery recipe: {error}"
+                        ))
+                    })?;
+                if immutable != existing {
+                    return Err(StoreError::Invariant(
+                        "discoverable recovery recipe differs from its immutable copy".to_string(),
+                    ));
+                }
+                Ok(existing_hash)
+            }
+            Err(error) => Err(StoreError::Invariant(format!(
+                "create discoverable recovery recipe: {error}"
+            ))),
+        }
     }
 
     /// Verify the discoverable and immutable `dp.commit.3` recipe objects.
@@ -1063,11 +1143,13 @@ impl ContentRemote {
             ("download-az.sh", capsule_az_script(root).into_bytes()),
             ("download-mc.sh", capsule_mc_script(root).into_bytes()),
             ("CAPSULE-README.md", CAPSULE_README.as_bytes().to_vec()),
+            ("CAPSULE-FORMAT.md", CAPSULE_FORMAT.as_bytes().to_vec()),
             ("capsule.py", CAPSULE_TOOL.as_bytes().to_vec()),
             (
                 "capsule-requirements.lock",
                 CAPSULE_REQUIREMENTS.as_bytes().to_vec(),
             ),
+            ("recover.sh", CAPSULE_RECOVER.as_bytes().to_vec()),
         ];
         for (name, bytes) in artifacts {
             let path = Self::capsule_generation_path(root, name);
@@ -1710,8 +1792,10 @@ fn parse_capsule_generation_key(key: &str) -> std::result::Result<Option<ObjectH
             | "download-az.sh"
             | "download-mc.sh"
             | "CAPSULE-README.md"
+            | "CAPSULE-FORMAT.md"
             | "capsule.py"
             | "capsule-requirements.lock"
+            | "recover.sh"
     ) {
         return Err(format!("unexpected capsule generation artifact {key:?}"));
     }
@@ -1729,8 +1813,10 @@ fn capsule_object_list(root: ObjectHash, objects: &[crate::content::CapsuleObjec
     }
     for name in [
         "CAPSULE-README.md",
+        "CAPSULE-FORMAT.md",
         "capsule.py",
         "capsule-requirements.lock",
+        "recover.sh",
     ] {
         output.push_str(&format!("{CAPSULE_PREFIX}/generations/{root}/{name}\n"));
     }
@@ -1757,12 +1843,12 @@ fn capsule_runbook(root: ObjectHash) -> String {
          3. Run the reviewed script; it embeds no credentials.\n\
          4. Authenticate the dp.commit.3 recovery kit through its independently \
             supplied README.sh hash.\n\
-         5. Compare downloaded capsule.py and capsule-requirements.lock byte for byte \
-            with the authenticated kit copies; run the kit copy if they differ.\n\
+         5. Compare every downloaded recovery aid named in CAPSULE-README.md byte for \
+            byte with the authenticated kit copies.\n\
          6. Read CAPSULE-README.md in the downloaded capsule.\n\
-         7. Verify without Pond: python capsule.py verify <download-directory>\n\
-         8. Recover human-readable data without Pond: \
-            python capsule.py materialize <download-directory> <new-output-directory>\n\
+         7. Recover without Pond: sh /trusted/recovery-kit/recover.sh \
+            <download-directory> <new-output-directory>\n\
+         8. Read <new-output-directory>/README.txt and inventory.json.\n\
          9. Never delete the source namespace as part of recovery.\n",
         root.to_hex()
     )
@@ -1783,8 +1869,10 @@ fn capsule_az_script(root: ObjectHash) -> String {
              \"recovery/manifests/{root}.json\") target=\"$DEST/$key\" ;;\n\
              recovery/objects/blake3=*) digest=${{key#recovery/objects/blake3=}}; case \"$digest\" in *[!0-9a-f]*|'') exit 1;; esac; [ \"${{#digest}}\" -eq 64 ] || exit 1; target=\"$DEST/$key\" ;;\n\
              \"recovery/generations/{root}/CAPSULE-README.md\") target=\"$DEST/CAPSULE-README.md\" ;;\n\
+             \"recovery/generations/{root}/CAPSULE-FORMAT.md\") target=\"$DEST/CAPSULE-FORMAT.md\" ;;\n\
              \"recovery/generations/{root}/capsule.py\") target=\"$DEST/capsule.py\" ;;\n\
              \"recovery/generations/{root}/capsule-requirements.lock\") target=\"$DEST/capsule-requirements.lock\" ;;\n\
+             \"recovery/generations/{root}/recover.sh\") target=\"$DEST/recover.sh\" ;;\n\
              *) exit 1 ;;\n\
            esac\n\
            mkdir -p \"$(dirname \"$target\")\"\n\
@@ -1809,8 +1897,10 @@ fn capsule_mc_script(root: ObjectHash) -> String {
              \"recovery/manifests/{root}.json\") target=\"$DEST/$key\" ;;\n\
              recovery/objects/blake3=*) digest=${{key#recovery/objects/blake3=}}; case \"$digest\" in *[!0-9a-f]*|'') exit 1;; esac; [ \"${{#digest}}\" -eq 64 ] || exit 1; target=\"$DEST/$key\" ;;\n\
              \"recovery/generations/{root}/CAPSULE-README.md\") target=\"$DEST/CAPSULE-README.md\" ;;\n\
+             \"recovery/generations/{root}/CAPSULE-FORMAT.md\") target=\"$DEST/CAPSULE-FORMAT.md\" ;;\n\
              \"recovery/generations/{root}/capsule.py\") target=\"$DEST/capsule.py\" ;;\n\
              \"recovery/generations/{root}/capsule-requirements.lock\") target=\"$DEST/capsule-requirements.lock\" ;;\n\
+             \"recovery/generations/{root}/recover.sh\") target=\"$DEST/recover.sh\" ;;\n\
              *) exit 1 ;;\n\
            esac\n\
            mkdir -p \"$(dirname \"$target\")\"\n\
@@ -1876,6 +1966,61 @@ mod tests {
             .unwrap();
         assert!(remote.inspect_recovery_recipe_dp_commit_3().await.is_err());
         assert!(remote.publish_recovery_recipe_dp_commit_3().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn backup_push_recipe_check_preserves_valid_older_discoverable_kit() {
+        let dir = tempdir().unwrap();
+        let remote = ContentRemote::create_at(dir.path().join("remote"), Uuid::new_v4())
+            .await
+            .unwrap();
+        let older = b"#!/bin/sh\n# previously reviewed recovery kit\n";
+        let older_hash = crate::recovery_recipe::recovery_recipe_hash(older);
+        remote
+            .store
+            .object_store()
+            .put(
+                &ContentRemote::recovery_recipe_versioned_path(older_hash),
+                older.to_vec().into(),
+            )
+            .await
+            .unwrap();
+        remote
+            .store
+            .object_store()
+            .put(
+                &ContentRemote::recovery_recipe_discoverable_path(),
+                older.to_vec().into(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            remote.ensure_recovery_recipe_dp_commit_3().await.unwrap(),
+            older_hash
+        );
+        assert_eq!(
+            remote
+                .store
+                .object_store()
+                .get(&ContentRemote::recovery_recipe_discoverable_path())
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            older
+        );
+        let current_hash = crate::recovery_recipe_dp_commit_3_hash();
+        assert!(
+            remote
+                .store
+                .object_store()
+                .head(&ContentRemote::recovery_recipe_versioned_path(current_hash))
+                .await
+                .is_ok()
+        );
     }
 
     fn test_capsule(payload: &[u8]) -> (CapsuleManifest, BTreeMap<ObjectHash, Vec<u8>>) {
@@ -2017,6 +2162,10 @@ mod tests {
             CAPSULE_README
         );
         assert_eq!(
+            std::fs::read_to_string(generation.join("CAPSULE-FORMAT.md")).unwrap(),
+            CAPSULE_FORMAT
+        );
+        assert_eq!(
             std::fs::read_to_string(generation.join("capsule.py")).unwrap(),
             CAPSULE_TOOL
         );
@@ -2024,11 +2173,17 @@ mod tests {
             std::fs::read_to_string(generation.join("capsule-requirements.lock")).unwrap(),
             CAPSULE_REQUIREMENTS
         );
+        assert_eq!(
+            std::fs::read_to_string(generation.join("recover.sh")).unwrap(),
+            CAPSULE_RECOVER
+        );
         let object_list = std::fs::read_to_string(generation.join("objects.list")).unwrap();
         for name in [
             "CAPSULE-README.md",
+            "CAPSULE-FORMAT.md",
             "capsule.py",
             "capsule-requirements.lock",
+            "recover.sh",
         ] {
             assert!(object_list.contains(&format!(
                 "recovery/generations/{}/{name}",
@@ -2137,8 +2292,10 @@ mod tests {
             assert!(script.contains("*[!0-9a-f]*|'') exit 1"));
             assert!(script.contains("\"${#digest}\" -eq 64"));
             assert!(script.contains("CAPSULE-README.md"));
+            assert!(script.contains("CAPSULE-FORMAT.md"));
             assert!(script.contains("capsule.py"));
             assert!(script.contains("capsule-requirements.lock"));
+            assert!(script.contains("recover.sh"));
             assert!(script.contains("target=\"$DEST/capsule.py\""));
             assert!(script.contains("destination already exists"));
             assert!(script.contains("*) exit 1"));
@@ -2174,14 +2331,34 @@ mod tests {
         let plan = remote.plan_capsule_gc("file:///backup", 0).await.unwrap();
         assert_eq!(plan.latest_root, published[3].to_hex());
         assert_eq!(plan.retained_roots.len(), 3);
-        assert_eq!(plan.deletions.len(), 7);
-        assert!(plan.deletions.iter().any(|object| {
-            object.key
-                == format!(
-                    "recovery/objects/blake3={}",
-                    ObjectHash::of_bytes(b"one").to_hex()
-                )
-        }));
+        let obsolete_root = published[0].to_hex();
+        let mut expected_deletions = [
+            "CAPSULE-FORMAT.md",
+            "CAPSULE-README.md",
+            "RUNBOOK.txt",
+            "capsule-requirements.lock",
+            "capsule.py",
+            "checksums",
+            "download-az.sh",
+            "download-mc.sh",
+            "objects.list",
+            "recover.sh",
+        ]
+        .map(|name| format!("recovery/generations/{obsolete_root}/{name}"))
+        .to_vec();
+        expected_deletions.push(format!("recovery/manifests/{obsolete_root}.json"));
+        expected_deletions.push(format!(
+            "recovery/objects/blake3={}",
+            ObjectHash::of_bytes(b"one").to_hex()
+        ));
+        expected_deletions.sort();
+        assert_eq!(
+            plan.deletions
+                .iter()
+                .map(|object| object.key.clone())
+                .collect::<Vec<_>>(),
+            expected_deletions
+        );
         remote
             .verify_capsule_gc_plan("file:///backup", &plan)
             .await
@@ -2190,12 +2367,13 @@ mod tests {
         assert_eq!(decode_capsule_gc_plan(&bytes).unwrap(), plan);
         let plan_hash = capsule_gc_plan_hash(&plan).unwrap();
         assert_ne!(plan_hash, ObjectHash::of_bytes(b""));
+        let deletion_count = expected_deletions.len();
         assert_eq!(
             remote
                 .apply_capsule_gc_plan("file:///backup", &plan, plan_hash)
                 .await
                 .unwrap(),
-            7
+            deletion_count
         );
         assert_eq!(
             remote

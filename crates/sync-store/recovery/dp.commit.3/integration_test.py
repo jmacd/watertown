@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -17,7 +18,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from deltalake import write_deltalake
 
-from capsule import CapsuleError, load_and_verify, materialize
+from capsule import CapsuleError, _encoded_logical_path, load_and_verify, materialize
 from extract import FormatError, decode_manifest, extract, node_manifest_root
 
 NIL_UUID = "00000000-0000-0000-0000-000000000000"
@@ -270,8 +271,10 @@ def main() -> int:
         root = extract(source, destination, "main", None, "fixture")
         for name in (
             "CAPSULE-README.md",
+            "CAPSULE-FORMAT.md",
             "capsule.py",
             "capsule-requirements.lock",
+            "recover.sh",
         ):
             assert (destination / name).is_file(), name
         subprocess.run(
@@ -283,11 +286,15 @@ def main() -> int:
 
         recovered = workspace / "materialized"
         materialize(destination, recovered)
+        file_path = _encoded_logical_path("/file")
+        table_path = _encoded_logical_path("/table")
+        link_path = _encoded_logical_path("/link")
+        dynamic_path = _encoded_logical_path("/dynamic")
         assert (
-            recovered / "files" / "file" / "version-000001.bin"
+            recovered / "files" / file_path / "version-000001.bin"
         ).read_bytes() == EXTERNAL_FILE
         recovered_table = pq.read_table(
-            recovered / "tables" / "table" / "version-000001.parquet"
+            recovered / "tables" / table_path / "version-000001.parquet"
         )
         assert recovered_table.column("reading").to_pylist() == [1, None, 3]
         assert recovered_table.column("label").to_pylist() == ["a", "b", "c"]
@@ -297,12 +304,50 @@ def main() -> int:
             Decimal("-99999999999999999999999999999999.999999"),
         ]
         assert (
-            recovered / "symlinks" / "link" / "target.bin"
+            recovered / "symlinks" / link_path / "target.bin"
         ).read_bytes() == SYMLINK_TARGET
-        assert not (recovered / "symlinks" / "link" / "target.bin").is_symlink()
+        assert not (
+            recovered / "symlinks" / link_path / "target.bin"
+        ).is_symlink()
         assert (
-            recovered / "dynamic-recipes" / "dynamic" / "recipe.bin"
+            recovered / "dynamic-recipes" / dynamic_path / "recipe.bin"
         ).read_bytes() == RECIPE_BYTES
+        assert json.loads(
+            (
+                recovered / "dynamic-recipes" / dynamic_path / "factory.json"
+            ).read_text()
+        ) == {"factory": "fixture-factory"}
+        assert (
+            recovered / "dynamic-recipes" / dynamic_path / "config.bin"
+        ).read_bytes() == b'{"source":"integration"}'
+        wrapper_recovered = workspace / "wrapper-materialized"
+        wrapper_environment = workspace / "wrapper-environment"
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "venv",
+                "--system-site-packages",
+                str(wrapper_environment),
+            ],
+            check=True,
+        )
+        environment = os.environ.copy()
+        environment["PYTHON"] = sys.executable
+        environment["RECOVERY_VENV"] = str(wrapper_environment)
+        subprocess.run(
+            [
+                "sh",
+                str(destination / "recover.sh"),
+                str(destination),
+                str(wrapper_recovered),
+            ],
+            check=True,
+            env=environment,
+        )
+        assert (
+            wrapper_recovered / "files" / file_path / "version-000001.bin"
+        ).read_bytes() == EXTERNAL_FILE
         try:
             materialize(destination, recovered)
         except CapsuleError as error:

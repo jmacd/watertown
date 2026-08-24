@@ -14,6 +14,7 @@ from capsule import (
     CapsuleError,
     ROOT_DOMAIN,
     _canonical_schema,
+    _encoded_logical_path,
     _rename_no_replace,
     _series_root,
     _table_batches,
@@ -54,6 +55,14 @@ def minimal_manifest() -> dict:
 
 
 class CapsuleTest(unittest.TestCase):
+    def test_materialized_paths_do_not_collide_by_case(self) -> None:
+        upper = _encoded_logical_path("/A")
+        lower = _encoded_logical_path("/a")
+        self.assertNotEqual(upper, lower)
+        self.assertEqual(str(upper), str(upper).lower())
+        self.assertEqual(str(lower), str(lower).lower())
+        self.assertLessEqual(len(upper.name.encode()), 255)
+
     def test_minimal_capsule_and_destination_refusal(self) -> None:
         with tempfile.TemporaryDirectory(prefix="capsule-unit-") as temporary:
             root = Path(temporary) / "capsule"
@@ -95,7 +104,12 @@ class CapsuleTest(unittest.TestCase):
             write_capsule(root, manifest)
             destination = Path(temporary) / "output"
             materialize(root, destination)
-            recovered = destination / "files" / "empty" / "version-000001.bin"
+            recovered = (
+                destination
+                / "files"
+                / _encoded_logical_path("/empty")
+                / "version-000001.bin"
+            )
             self.assertTrue(recovered.is_file())
             self.assertEqual(recovered.read_bytes(), b"")
 
