@@ -826,6 +826,10 @@ def load_and_verify(capsule: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     logical_count = 0
     for entry in manifest["entries"]:
         node = entry["node"]
+        if node["kind"] == "dynamic":
+            descriptor = node["recipe"]
+            _decode_dynamic_recipe(_object_path(capsule, descriptor).read_bytes())
+            continue
         if node["kind"] != "physical":
             continue
         if node["payload_kind"] == "file":
@@ -1057,7 +1061,8 @@ def materialize(capsule: Path, destination: Path) -> dict[str, Any]:
                 }
             )
         (staging / "inventory.json").write_text(
-            json.dumps(inventory, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+            json.dumps(inventory, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
         )
         lines = [
             "Pond-free capsule materialization",
@@ -1074,7 +1079,9 @@ def materialize(capsule: Path, destination: Path) -> dict[str, Any]:
             lines.append(
                 f"{item['logical_path']} [{item['entry_type']}] -> {outputs}"
             )
-        (staging / "README.txt").write_text("\n".join(lines) + "\n")
+        (staging / "README.txt").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8"
+        )
         _rename_no_replace(staging, destination)
     return report
 

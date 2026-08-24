@@ -154,6 +154,28 @@ class CapsuleTest(unittest.TestCase):
             with self.assertRaises(CapsuleError):
                 load_and_verify(root)
 
+    def test_malformed_dynamic_recipe_fails_verification(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="capsule-unit-") as temporary:
+            root = Path(temporary) / "capsule"
+            recipe = b"not-a-dp-recipe"
+            digest = blake3.blake3(recipe).hexdigest()
+            manifest = minimal_manifest()
+            manifest["entries"].append(
+                {
+                    "path": "/dynamic",
+                    "entry_type": "file:dynamic",
+                    "source_node_id": "dynamic",
+                    "node": {
+                        "kind": "dynamic",
+                        "recipe": {"hash": digest, "size": len(recipe)},
+                    },
+                }
+            )
+            write_capsule(root, manifest)
+            (root / "recovery" / "objects" / f"blake3={digest}").write_bytes(recipe)
+            with self.assertRaisesRegex(CapsuleError, "dp.recipe.1 framing"):
+                load_and_verify(root)
+
     def test_reordered_manifest_fields_fail(self) -> None:
         with tempfile.TemporaryDirectory(prefix="capsule-unit-") as temporary:
             root = Path(temporary) / "capsule"

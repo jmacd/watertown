@@ -58,7 +58,7 @@
 //! path.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -644,7 +644,7 @@ async fn write_empty_versions(
         let writer = parent_wd
             .async_writer_path_with_type(name, entry_type)
             .await?;
-        return finalize_writer(writer, entry_type, &VersionMeta::default()).await;
+        return finalize_writer(parent_wd, name, writer, entry_type, &VersionMeta::default()).await;
     }
     for object in objects {
         let bytes = read_object(objects_dir, object)?;
@@ -657,7 +657,7 @@ async fn write_empty_versions(
                 object.hash
             ))
         })?;
-        finalize_writer(writer, entry_type, &VersionMeta::default()).await?;
+        finalize_writer(parent_wd, name, writer, entry_type, &VersionMeta::default()).await?;
     }
     Ok(())
 }
@@ -700,7 +700,14 @@ async fn write_file_entry(
             let mut offset = 0usize;
             while offset < count {
                 if remaining == 0 {
-                    finalize_writer(writer, entry_type, &leaf_meta(&leaves[leaf_index])).await?;
+                    finalize_writer(
+                        parent_wd,
+                        name,
+                        writer,
+                        entry_type,
+                        &leaf_meta(&leaves[leaf_index]),
+                    )
+                    .await?;
                     leaf_index += 1;
                     let leaf = leaves.get(leaf_index).ok_or_else(|| {
                         StewardError::Content(format!(
@@ -735,7 +742,14 @@ async fn write_file_entry(
             leaves.len()
         )));
     }
-    finalize_writer(writer, entry_type, &leaf_meta(&leaves[leaf_index])).await
+    finalize_writer(
+        parent_wd,
+        name,
+        writer,
+        entry_type,
+        &leaf_meta(&leaves[leaf_index]),
+    )
+    .await
 }
 
 /// Stream a `Table`-kind physical node's Parquet payload objects into fresh
@@ -753,7 +767,7 @@ async fn write_table_entry(
 ) -> Result<(), StewardError> {
     let mut leaf_index = 0usize;
     let mut collected = 0u64;
-    let mut pending: Vec<RecordBatch> = Vec::new();
+    let mut pending: Option<ArrowWriter<File>> = None;
     let mut schema: Option<Arc<Schema>> = None;
 
     for object in objects {
@@ -814,7 +828,38 @@ async fn write_table_entry(
                     .unwrap_or(usize::MAX)
                     .min(batch.num_rows() - offset);
                 if take > 0 {
-                    pending.push(batch.slice(offset, take));
+                    if pending.is_none() {
+                        let file = tempfile::tempfile().map_err(|error| {
+                            StewardError::Content(format!(
+                                "create temporary Parquet leaf for {name:?}: {error}"
+                            ))
+                        })?;
+                        let properties = WriterProperties::builder().build();
+                        pending = Some(
+                            ArrowWriter::try_new(
+                                file,
+                                schema
+                                    .as_ref()
+                                    .expect("schema established by first object")
+                                    .clone(),
+                                Some(properties),
+                            )
+                            .map_err(|error| {
+                                StewardError::Content(format!(
+                                    "open Parquet encoder for {name:?} leaf: {error}"
+                                ))
+                            })?,
+                        );
+                    }
+                    pending
+                        .as_mut()
+                        .expect("leaf writer initialized")
+                        .write(&batch.slice(offset, take))
+                        .map_err(|error| {
+                            StewardError::Content(format!(
+                                "encode Parquet rows for {name:?} leaf: {error}"
+                            ))
+                        })?;
                 }
                 collected += take as u64;
                 offset += take;
@@ -823,19 +868,17 @@ async fn write_table_entry(
                         parent_wd,
                         name,
                         entry_type,
-                        schema.as_ref().expect("schema established by first object"),
-                        &pending,
+                        pending.take().expect("non-empty leaf has a writer"),
                         leaf,
                     )
                     .await?;
-                    pending.clear();
                     collected = 0;
                     leaf_index += 1;
                 }
             }
         }
     }
-    if leaf_index != leaves.len() || collected != 0 || !pending.is_empty() {
+    if leaf_index != leaves.len() || collected != 0 || pending.is_some() {
         return Err(StewardError::Content(format!(
             "table {name:?} payload stream ended after {leaf_index} of {} declared logical \
              leaves",
@@ -885,34 +928,27 @@ async fn write_table_leaf(
     parent_wd: &WD,
     name: &str,
     entry_type: EntryType,
-    schema: &Arc<Schema>,
-    batches: &[RecordBatch],
+    arrow_writer: ArrowWriter<File>,
     leaf: &CapsuleLeaf,
 ) -> Result<(), StewardError> {
-    let mut buffer = Vec::new();
-    {
-        let properties = WriterProperties::builder().build();
-        let mut arrow_writer = ArrowWriter::try_new(&mut buffer, schema.clone(), Some(properties))
-            .map_err(|error| {
-                StewardError::Content(format!("open Parquet encoder for {name:?} leaf: {error}"))
-            })?;
-        for batch in batches {
-            arrow_writer.write(batch).map_err(|error| {
-                StewardError::Content(format!("encode Parquet rows for {name:?} leaf: {error}"))
-            })?;
-        }
-        let _: parquet::file::metadata::ParquetMetaData =
-            arrow_writer.close().map_err(|error| {
-                StewardError::Content(format!("finish Parquet encoder for {name:?} leaf: {error}"))
-            })?;
-    }
+    let mut file = arrow_writer.into_inner().map_err(|error| {
+        StewardError::Content(format!("finish Parquet encoder for {name:?} leaf: {error}"))
+    })?;
+    let _ = file.seek(SeekFrom::Start(0)).map_err(|error| {
+        StewardError::Content(format!(
+            "rewind temporary Parquet leaf for {name:?}: {error}"
+        ))
+    })?;
+    let mut file = tokio::fs::File::from_std(file);
     let mut writer = parent_wd
         .async_writer_path_with_type(name, entry_type)
         .await?;
-    writer.write_all(&buffer).await.map_err(|error| {
-        StewardError::Content(format!("write Parquet bytes for {name:?} leaf: {error}"))
-    })?;
-    finalize_writer(writer, entry_type, &leaf_meta(leaf)).await
+    let _ = tokio::io::copy(&mut file, &mut writer)
+        .await
+        .map_err(|error| {
+            StewardError::Content(format!("write Parquet bytes for {name:?} leaf: {error}"))
+        })?;
+    finalize_writer(parent_wd, name, writer, entry_type, &leaf_meta(leaf)).await
 }
 
 /// Compare a capsule manifest rebuilt from the staged pond against the

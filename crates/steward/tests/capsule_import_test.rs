@@ -3,6 +3,7 @@
 //! Coverage for [`steward::import_capsule`], the generic staged importer
 //! (`docs/recovery-capsule-design.md`, "Generic staged import").
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, StringArray, TimestampMicrosecondArray};
@@ -55,13 +56,26 @@ async fn build_source_capsule(
         let _ = root.create_dir_all("/data").await?;
         let _ = root.create_dir_all("/system/run").await?;
         let _ = create_file_path(&root, "/data/plain.txt", b"plain bytes").await?;
+        root.set_extended_attributes(
+            "/data/plain.txt",
+            HashMap::from([("capsule.test".to_string(), "plain".to_string())]),
+        )
+        .await?;
 
-        for bytes in [b"first-".as_slice(), b"second-leaf".as_slice()] {
+        for (index, bytes) in [b"first-".as_slice(), b"second-leaf".as_slice()]
+            .into_iter()
+            .enumerate()
+        {
             let mut writer = root
                 .async_writer_path_with_type("/data/log.series", EntryType::FilePhysicalSeries)
                 .await?;
             writer.write_all(bytes).await?;
             writer.shutdown().await?;
+            root.set_extended_attributes(
+                "/data/log.series",
+                HashMap::from([("capsule.test".to_string(), format!("leaf-{index}"))]),
+            )
+            .await?;
         }
         for (timestamp, value) in [(100, "a"), (200, "b"), (300, "c")] {
             let _ = root

@@ -1205,7 +1205,7 @@ impl ContentRemote {
                 ))),
             };
         }
-        self.merge_capsule_history(root).await
+        Ok(())
     }
 
     async fn acquire_capsule_publish_lock(&self) -> Result<Vec<u8>> {
