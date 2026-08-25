@@ -989,9 +989,10 @@ impl ContentRemote {
     /// Publish a capsule that inherits unstaged payloads from `prior`.
     ///
     /// Every unstaged descriptor must occur identically in the current remote
-    /// generation and its object key must still be present. Newly staged
-    /// payloads are streamed and verified as usual. Publication is refused if
-    /// `prior` is no longer the current generation.
+    /// generation, and every reused remote payload is streamed and verified
+    /// against its declared hash and size. Newly staged payloads are streamed
+    /// and verified as usual. Publication is refused if `prior` is no longer
+    /// the current generation.
     pub async fn publish_capsule_incremental(
         &self,
         manifest: &CapsuleManifest,
@@ -1013,7 +1014,6 @@ impl ContentRemote {
         self.with_capsule_publish_lock(async {
             let _ = self.require_current_capsule(prior_root).await?;
 
-            let present = self.list_capsule_payloads().await?;
             let mut uploaded = 0usize;
             for object in &declared {
                 let source = objects_dir.join(format!("blake3={}", object.hash.to_hex()));
@@ -1023,25 +1023,16 @@ impl ContentRemote {
                         object.hash
                     ))
                 })?;
-                if !staged {
-                    if prior_objects.get(&object.hash) != Some(&object.size) {
-                        return Err(StoreError::Invariant(format!(
-                            "unstaged capsule payload {} is not inherited from the prior generation",
-                            object.hash
-                        )));
-                    }
-                    if !present.contains(&object.hash) {
-                        return Err(StoreError::Invariant(format!(
-                            "inherited capsule payload {} is missing remotely",
-                            object.hash
-                        )));
-                    }
+                if prior_objects.get(&object.hash) == Some(&object.size) {
+                    self.verify_remote_capsule_payload(object.hash, object.size)
+                        .await?;
                     continue;
                 }
-                if present.contains(&object.hash)
-                    && prior_objects.get(&object.hash) == Some(&object.size)
-                {
-                    continue;
+                if !staged {
+                    return Err(StoreError::Invariant(format!(
+                        "unstaged capsule payload {} is not inherited from the prior generation",
+                        object.hash
+                    )));
                 }
                 let file = tokio::fs::File::open(&source).await.map_err(|error| {
                     StoreError::Invariant(format!(
@@ -1691,6 +1682,47 @@ impl ContentRemote {
 
     fn capsule_payload_path(hash: ObjectHash) -> object_store::path::Path {
         object_store::path::Path::from(format!("{CAPSULE_PREFIX}/objects/blake3={}", hash.to_hex()))
+    }
+
+    async fn verify_remote_capsule_payload(
+        &self,
+        expected_hash: ObjectHash,
+        expected_size: u64,
+    ) -> Result<()> {
+        let result = self
+            .store
+            .object_store()
+            .get(&Self::capsule_payload_path(expected_hash))
+            .await
+            .map_err(|error| {
+                StoreError::Invariant(format!(
+                    "read inherited capsule payload {expected_hash}: {error}"
+                ))
+            })?;
+        let mut stream = result.into_stream();
+        let mut hasher = blake3::Hasher::new();
+        let mut size = 0u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| {
+                StoreError::Invariant(format!(
+                    "stream inherited capsule payload {expected_hash}: {error}"
+                ))
+            })?;
+            size = size.checked_add(chunk.len() as u64).ok_or_else(|| {
+                StoreError::Invariant(format!(
+                    "inherited capsule payload {expected_hash} exceeds u64::MAX"
+                ))
+            })?;
+            hasher.update(&chunk);
+        }
+        let computed_hash = ObjectHash::from_bytes(*hasher.finalize().as_bytes());
+        if computed_hash != expected_hash || size != expected_size {
+            return Err(StoreError::Invariant(format!(
+                "inherited capsule payload {expected_hash} has hash {computed_hash} and size \
+                 {size}, expected hash {expected_hash} and size {expected_size}"
+            )));
+        }
+        Ok(())
     }
 
     async fn list_capsule_payloads(&self) -> Result<std::collections::HashSet<ObjectHash>> {
@@ -2458,12 +2490,10 @@ mod tests {
         );
 
         let inherited = first.payload_objects().unwrap()[0].hash;
-        std::fs::remove_file(
-            remote_path
-                .join("recovery/objects")
-                .join(format!("blake3={}", inherited.to_hex())),
-        )
-        .unwrap();
+        let inherited_path = remote_path
+            .join("recovery/objects")
+            .join(format!("blake3={}", inherited.to_hex()));
+        std::fs::write(&inherited_path, b"xxxxx").unwrap();
         let (third, third_object) = append_capsule_file(&second, "/third", b"third");
         let staging = tempdir().unwrap();
         std::fs::write(
@@ -2473,6 +2503,21 @@ mod tests {
             b"third",
         )
         .unwrap();
+        let error = remote
+            .publish_capsule_incremental(&third, staging.path(), &second)
+            .await
+            .expect_err("corrupt inherited payload must prevent publication");
+        assert!(
+            error.to_string().contains("inherited capsule payload"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            remote.latest_capsule().await.unwrap().unwrap().0,
+            second_root
+        );
+
+        std::fs::write(&inherited_path, b"first").unwrap();
+        std::fs::remove_file(inherited_path).unwrap();
         assert!(
             remote
                 .publish_capsule_incremental(&third, staging.path(), &second)
