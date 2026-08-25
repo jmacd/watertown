@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import json
 import math
+import os
 import shutil
 import struct
 import sys
@@ -598,14 +601,59 @@ def _extract_into(source: Path, destination: Path, ref_name: str | None,
         raise
 
 
+def _rename_no_replace(source: Path, destination: Path) -> None:
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    library = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        rename = library.renamex_np
+        rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        result = rename(source_bytes, destination_bytes, 0x00000004)
+    elif sys.platform.startswith("linux"):
+        try:
+            rename = library.renameat2
+        except AttributeError as error:
+            raise FormatError(
+                "this Linux runtime lacks atomic no-replace rename support"
+            ) from error
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        result = rename(-100, source_bytes, -100, destination_bytes, 0x00000001)
+    elif os.name == "nt":
+        try:
+            source.rename(destination)
+            return
+        except FileExistsError as error:
+            raise FormatError(f"destination already exists: {destination}") from error
+    else:
+        raise FormatError(
+            f"atomic no-replace extraction is unsupported on {sys.platform}"
+        )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in (errno.EEXIST, errno.ENOTEMPTY):
+        raise FormatError(f"destination already exists: {destination}")
+    raise OSError(error_number, os.strerror(error_number), destination)
+
+
 def extract(source: Path, destination: Path, ref_name: str | None, commit_hex: str | None,
             birthplace: str) -> str:
-    if destination.exists():
+    try:
+        destination.lstat()
+    except FileNotFoundError:
+        pass
+    else:
         raise FormatError(f"destination already exists: {destination}")
     if not birthplace:
         raise FormatError("birthplace must not be empty")
     source = source.resolve()
-    destination = destination.resolve()
+    destination = destination.parent.resolve() / destination.name
     if destination.is_relative_to(source):
         raise FormatError("destination must not be inside the source backup")
     if not destination.parent.is_dir():
@@ -614,7 +662,7 @@ def extract(source: Path, destination: Path, ref_name: str | None, commit_hex: s
         prefix=f".{destination.name}.partial-", dir=destination.parent))
     staging.rmdir()
     root = _extract_into(source, staging, ref_name, commit_hex, birthplace)
-    staging.rename(destination)
+    _rename_no_replace(staging, destination)
     return root
 
 
@@ -860,6 +908,23 @@ def verify_fixtures(path: Path) -> None:
             pass
         else:
             raise AssertionError("canonical attributes accepted unsupported numbers")
+
+    with tempfile.TemporaryDirectory(prefix="watertown-extract-test-") as temporary:
+        root = Path(temporary)
+        source = root / "source"
+        destination = root / "destination"
+        source.mkdir()
+        destination.mkdir()
+        (source / "source").write_text("source")
+        (destination / "destination").write_text("destination")
+        try:
+            _rename_no_replace(source, destination)
+        except FormatError:
+            pass
+        else:
+            raise AssertionError("no-replace promotion accepted an existing destination")
+        assert (source / "source").read_text() == "source"
+        assert (destination / "destination").read_text() == "destination"
 
 
 def main() -> int:

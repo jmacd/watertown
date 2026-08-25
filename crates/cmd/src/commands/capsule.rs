@@ -42,7 +42,15 @@ pub async fn capsule_import_command(
     path: &std::path::Path,
     target: &std::path::Path,
     birthplace: &str,
+    experimental: bool,
 ) -> Result<()> {
+    if !experimental {
+        return Err(anyhow!(
+            "capsule import is experimental: bounded resume and active-remote preflight are not \
+             yet implemented; pass --experimental only after reviewing the restored namespace \
+             safety requirements"
+        ));
+    }
     let report = steward::import_capsule(path, target, birthplace.to_string())
         .await
         .map_err(|error| {
@@ -73,6 +81,24 @@ pub async fn capsule_import_command(
         report.target.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn capsule_import_requires_experimental_acknowledgement() {
+        let error = capsule_import_command(
+            std::path::Path::new("missing-capsule"),
+            std::path::Path::new("missing-target"),
+            "test",
+            false,
+        )
+        .await
+        .expect_err("incomplete importer must require explicit acknowledgement");
+        assert!(error.to_string().contains("--experimental"));
+    }
 }
 
 /// Publish or inspect the static native-format recovery recipe.

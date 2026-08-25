@@ -331,7 +331,9 @@ The initial importer implements staged reconstruction, exact logical
 verification, and atomic promotion. Bounded transactions, resumable
 checkpoints, and active-remote preflight remain before it is production-ready.
 
-`pond capsule import` will accept only a nonexistent target:
+`pond capsule import` requires an explicit `--experimental` acknowledgement
+until the remaining production-readiness work is complete, and accepts only a
+nonexistent target:
 
 1. Create a private sibling staging directory.
 2. Initialize a fresh pond with a new pond identity.

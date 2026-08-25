@@ -1725,6 +1725,7 @@ impl ContentRemote {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn list_capsule_payloads(&self) -> Result<std::collections::HashSet<ObjectHash>> {
         let prefix = object_store::path::Path::from(format!("{CAPSULE_PREFIX}/objects"));
         let mut stream = self.store.object_store().list(Some(&prefix));

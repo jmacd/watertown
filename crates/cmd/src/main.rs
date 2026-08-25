@@ -217,6 +217,10 @@ enum CapsuleCommand {
         /// `pond init --birthplace`).
         #[arg(long)]
         birthplace: String,
+        /// Acknowledge that bounded resume and active-remote preflight are
+        /// not yet implemented.
+        #[arg(long, required = true)]
+        experimental: bool,
     },
 }
 
@@ -778,9 +782,13 @@ async fn main() -> Result<()> {
             CapsuleCommand::Inspect { path } | CapsuleCommand::Verify { path } => {
                 commands::capsule_inspect_command(&path)
             }
-            CapsuleCommand::Import { path, birthplace } => {
+            CapsuleCommand::Import {
+                path,
+                birthplace,
+                experimental,
+            } => {
                 let target = ship_context.resolve_pond_path()?;
-                commands::capsule_import_command(&path, &target, &birthplace).await
+                commands::capsule_import_command(&path, &target, &birthplace, experimental).await
             }
         },
         Commands::Config { command } => {
