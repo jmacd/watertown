@@ -360,9 +360,10 @@ A failed transaction commits no partial batch. A retry must validate every
 journal checkpoint rather than trusting staged state.
 
 `pondcapsule.1` cannot encode a zero-length logical leaf. A single empty
-physical node remains representable, but extraction fails closed if any member
-of a multi-version series is empty; silently dropping that member would change
-series order and metadata.
+physical node remains representable only when its version metadata is empty.
+Extraction fails closed for a metadata-bearing empty singleton or any empty
+member of a multi-version series; silently dropping either would lose metadata
+or change series order.
 
 ### Active remote safety
 

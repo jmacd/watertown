@@ -38,6 +38,8 @@ hash-authenticated `dp.commit.3` recovery kit.
 Physical objects may not align one-for-one with logical versions. The manifest
 therefore records ordered logical leaves and roots independently of object
 boundaries. `capsule.py verify` checks both physical bytes and logical content.
+Empty physical versions with source metadata are not representable in
+`pondcapsule.1`; extraction fails rather than silently dropping that metadata.
 
 ## Materialized layout
 

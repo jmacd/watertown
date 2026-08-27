@@ -3,13 +3,17 @@
 //! Coverage for [`steward::import_capsule`], the generic staged importer
 //! (`docs/recovery-capsule-design.md`, "Generic staged import").
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use serde::{Deserialize, Serialize};
 use steward::{Ship, build_recovery_capsule, import_capsule};
-use sync_store::{CapsuleNode, ContentRemote};
+use sync_store::{
+    CapsuleManifest, CapsuleNode, ContentRemote, capsule_manifest_bytes, capsule_root,
+    read_capsule_manifest, verify_capsule_directory,
+};
 use tempfile::tempdir;
 use tinyfs::EntryType;
 use tinyfs::arrow::ParquetExt;
@@ -40,13 +44,94 @@ fn table_batch(timestamp: i64, value: &str) -> RecordBatch {
     .expect("record batch")
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct FrozenCapsuleFixture {
+    root: String,
+    manifest_json: String,
+    objects_hex: BTreeMap<String, String>,
+}
+
+fn materialize_frozen_fixture(temporary: &std::path::Path) -> std::path::PathBuf {
+    let fixture: FrozenCapsuleFixture =
+        serde_json::from_str(include_str!("fixtures/pondcapsule1.json"))
+            .expect("decode frozen pondcapsule.1 fixture");
+    let capsule = temporary.join("frozen-capsule");
+    let refs = capsule.join("recovery/refs");
+    let manifests = capsule.join("recovery/manifests");
+    let objects = capsule.join("recovery/objects");
+    std::fs::create_dir_all(&refs).expect("create fixture refs");
+    std::fs::create_dir_all(&manifests).expect("create fixture manifests");
+    std::fs::create_dir_all(&objects).expect("create fixture objects");
+    std::fs::write(refs.join("latest"), format!("{}\n", fixture.root))
+        .expect("write fixture latest ref");
+    std::fs::write(
+        manifests.join(format!("{}.json", fixture.root)),
+        fixture.manifest_json,
+    )
+    .expect("write fixture manifest");
+    for (hash, encoded) in fixture.objects_hex {
+        let bytes = hex::decode(encoded).expect("decode fixture object");
+        std::fs::write(objects.join(format!("blake3={hash}")), bytes)
+            .expect("write fixture object");
+    }
+    capsule
+}
+
+fn assert_logical_projection(expected: &CapsuleManifest, actual: &CapsuleManifest) {
+    assert_eq!(expected.entries.len(), actual.entries.len());
+    for (expected_entry, actual_entry) in expected.entries.iter().zip(&actual.entries) {
+        assert_eq!(expected_entry.path, actual_entry.path);
+        assert_eq!(expected_entry.entry_type, actual_entry.entry_type);
+        match (&expected_entry.node, &actual_entry.node) {
+            (CapsuleNode::Directory, CapsuleNode::Directory) => {}
+            (
+                CapsuleNode::Symlink { target: expected },
+                CapsuleNode::Symlink { target: actual },
+            ) => {
+                assert_eq!(expected, actual);
+            }
+            (
+                CapsuleNode::Dynamic { recipe: expected },
+                CapsuleNode::Dynamic { recipe: actual },
+            ) => {
+                assert_eq!(expected, actual);
+            }
+            (
+                CapsuleNode::Physical {
+                    payload_kind: expected_kind,
+                    schema_fingerprint: expected_schema,
+                    logical_root: expected_root,
+                    leaves: expected_leaves,
+                    ..
+                },
+                CapsuleNode::Physical {
+                    payload_kind: actual_kind,
+                    schema_fingerprint: actual_schema,
+                    logical_root: actual_root,
+                    leaves: actual_leaves,
+                    ..
+                },
+            ) => {
+                assert_eq!(expected_kind, actual_kind);
+                assert_eq!(expected_schema, actual_schema);
+                assert_eq!(expected_root, actual_root);
+                assert_eq!(expected_leaves, actual_leaves);
+            }
+            (expected, actual) => panic!(
+                "capsule node kind changed at {:?}: {expected:?} != {actual:?}",
+                expected_entry.path
+            ),
+        }
+    }
+}
+
 /// Build a small source pond exercising every capsule node kind, publish it
 /// as a downloaded-capsule directory on disk, and return that directory
 /// alongside the source ship (kept alive so its content tip stays put) and
 /// the pre-import manifest for later comparison.
 async fn build_source_capsule(
     temporary: &std::path::Path,
-) -> (std::path::PathBuf, Ship, sync_store::CapsuleManifest) {
+) -> (std::path::PathBuf, Ship, CapsuleManifest) {
     let mut ship = Ship::create_pond(temporary.join("source"), "capsule-import-test")
         .await
         .expect("create source pond");
@@ -121,6 +206,63 @@ async fn build_source_capsule(
         .expect("publish capsule directory");
 
     (remote_path, ship, capsule.manifest)
+}
+
+#[tokio::test]
+async fn imports_frozen_pondcapsule1_fixture() {
+    let temporary = tempdir().expect("tempdir");
+    let capsule_dir = materialize_frozen_fixture(temporary.path());
+    let verified = verify_capsule_directory(&capsule_dir).expect("verify frozen fixture");
+    let (source, source_root) =
+        read_capsule_manifest(&capsule_dir).expect("read frozen fixture manifest");
+    assert_eq!(source_root, verified.root);
+
+    let target = temporary.path().join("restored");
+    let report = import_capsule(&capsule_dir, &target, "pondcapsule1-compatibility-test")
+        .await
+        .expect("import frozen pondcapsule.1 fixture");
+    assert_eq!(report.capsule_root, verified.root);
+
+    let restored = Ship::open_pond(&target).await.expect("open restored pond");
+    let rebuilt = build_recovery_capsule(&restored)
+        .await
+        .expect("rebuild capsule from frozen fixture import");
+    assert_logical_projection(&source, &rebuilt.manifest);
+}
+
+#[tokio::test]
+#[ignore = "explicit fixture update; commits the current pondcapsule.1 wire representation"]
+async fn regenerate_pondcapsule1_fixture() {
+    let temporary = tempdir().expect("tempdir");
+    let (capsule_dir, _source_ship, manifest) = build_source_capsule(temporary.path()).await;
+    let root = capsule_root(&manifest).expect("compute fixture capsule root");
+    let manifest_json = String::from_utf8(
+        capsule_manifest_bytes(&manifest).expect("encode fixture capsule manifest"),
+    )
+    .expect("fixture manifest is UTF-8");
+    let mut objects_hex = BTreeMap::new();
+    for object in manifest
+        .payload_objects()
+        .expect("enumerate fixture payload objects")
+    {
+        let bytes = std::fs::read(
+            capsule_dir
+                .join("recovery/objects")
+                .join(format!("blake3={}", object.hash.to_hex())),
+        )
+        .expect("read fixture payload object");
+        let _ = objects_hex.insert(object.hash.to_hex(), hex::encode(bytes));
+    }
+    let fixture = FrozenCapsuleFixture {
+        root: root.to_hex(),
+        manifest_json,
+        objects_hex,
+    };
+    let fixture_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pondcapsule1.json");
+    let mut encoded = serde_json::to_vec_pretty(&fixture).expect("encode fixture bundle");
+    encoded.push(b'\n');
+    std::fs::write(&fixture_path, encoded).expect("write frozen fixture bundle");
 }
 
 #[tokio::test]

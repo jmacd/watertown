@@ -124,8 +124,8 @@ and exact configuration bytes for inspection.
 `pondcapsule.1` cannot encode an empty member of a multi-version series.
 Extraction fails closed when one is encountered rather than silently changing
 series order or metadata. A single empty physical file or table node remains
-representable, although capsule v1 does not retain leaf metadata for that empty
-singleton.
+representable only when its native version metadata is empty. Extraction fails
+closed for a metadata-bearing empty singleton rather than discarding metadata.
 
 Maintainers can run the full independent integration test without Pond:
 

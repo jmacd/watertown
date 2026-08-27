@@ -774,6 +774,11 @@ def _extract_graph(source: Path, destination: Path, ref_name: str | None,
                                     f"series {paths[native['node_id']]} contains an empty file "
                                     "version that pondcapsule.1 cannot represent"
                                 )
+                            if any(value is not None for value in metadata.values()):
+                                raise FormatError(
+                                    f"empty file version {paths[native['node_id']]} carries "
+                                    "metadata that pondcapsule.1 cannot represent"
+                                )
                             (objects_dir / f"blake3={digest.hex()}").unlink()
                             continue
                         def file_parts(path: Path = payload_path) -> Iterator[bytes]:
@@ -801,6 +806,11 @@ def _extract_graph(source: Path, destination: Path, ref_name: str | None,
                                 raise FormatError(
                                     f"series {paths[native['node_id']]} contains an empty table "
                                     "version that pondcapsule.1 cannot represent"
+                                )
+                            if any(value is not None for value in metadata.values()):
+                                raise FormatError(
+                                    f"empty table version {paths[native['node_id']]} carries "
+                                    "metadata that pondcapsule.1 cannot represent"
                                 )
                             continue
                         def table_parts(parquet: Any = parquet, schema: Any = schema) -> Iterator[bytes]:

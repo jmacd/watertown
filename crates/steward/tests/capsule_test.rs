@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use arrow_array::{RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use parquet::arrow::ArrowWriter;
 use steward::{Ship, build_recovery_capsule, build_recovery_capsule_incremental};
 use sync_store::{
     CapsuleNode, CapsulePayloadKind, ContentRemote, ObjectHash, capsule_root,
@@ -245,6 +246,61 @@ async fn rejects_empty_versions_inside_a_series() {
         .expect_err("capsule builder must not silently drop an empty series version");
     assert!(
         error.to_string().contains("empty file version"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn rejects_metadata_on_empty_singleton_versions() {
+    let temporary = tempdir().expect("tempdir");
+    let mut ship = Ship::create_pond(temporary.path().join("file-pond"), "capsule-test")
+        .await
+        .expect("create file pond");
+
+    ship.write_transaction(&meta("empty-file"), async move |transaction| {
+        let root = transaction.root().await?;
+        let _ = create_file_path(&root, "/empty", b"").await?;
+        Ok(())
+    })
+    .await
+    .expect("write empty file");
+
+    let error = build_recovery_capsule(&ship)
+        .await
+        .expect_err("capsule builder must not silently drop empty file metadata");
+    assert!(
+        error.to_string().contains("empty file version") && error.to_string().contains("metadata"),
+        "unexpected error: {error}"
+    );
+
+    let mut ship = Ship::create_pond(temporary.path().join("table-pond"), "capsule-test")
+        .await
+        .expect("create table pond");
+    ship.write_transaction(&meta("empty-table"), async move |transaction| {
+        let root = transaction.root().await?;
+        let empty_table = RecordBatch::new_empty(table_batch(0, "").schema());
+        let mut empty_parquet = Vec::new();
+        {
+            let mut parquet = ArrowWriter::try_new(&mut empty_parquet, empty_table.schema(), None)
+                .expect("create empty Parquet writer");
+            parquet.write(&empty_table).expect("write empty table");
+            let _ = parquet.close().expect("close empty Parquet writer");
+        }
+        let mut writer = root
+            .async_writer_path_with_type("/empty", EntryType::TablePhysicalVersion)
+            .await?;
+        writer.write_all(&empty_parquet).await?;
+        writer.shutdown().await?;
+        Ok(())
+    })
+    .await
+    .expect("write empty table");
+
+    let error = build_recovery_capsule(&ship)
+        .await
+        .expect_err("capsule builder must not silently drop empty table metadata");
+    assert!(
+        error.to_string().contains("empty table version") && error.to_string().contains("metadata"),
         "unexpected error: {error}"
     );
 }

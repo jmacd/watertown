@@ -75,7 +75,12 @@ def manifest_entry(
     )
 
 
-def build_native_backup(root: Path, *, include_empty_series_version: bool = False) -> None:
+def build_native_backup(
+    root: Path,
+    *,
+    include_empty_singleton: bool = False,
+    include_empty_series_version: bool = False,
+) -> None:
     table_path = root.parent / "fixture.parquet"
     schema = pa.schema(
         [
@@ -143,6 +148,8 @@ def build_native_backup(root: Path, *, include_empty_series_version: bool = Fals
         ("link", 3, digest(SYMLINK_TARGET), []),
         ("table", 8, digest(series), table_versions),
     ]
+    if include_empty_singleton:
+        children.insert(1, ("empty", 4, digest(b""), [metadata(100)]))
     tree = (
         b"dp.tree.2\n"
         + struct.pack("<I", len(children))
@@ -156,6 +163,8 @@ def build_native_backup(root: Path, *, include_empty_series_version: bool = Fals
         ("root", "", "", 1, tree_hash, []),
         ("table", "root", "table", 8, digest(series), table_versions),
     ]
+    if include_empty_singleton:
+        entries.insert(0, ("empty", "root", "empty", 4, digest(b""), [metadata(100)]))
     manifest = (
         b"dp.manifest.2\n"
         + struct.pack("<I", len(entries))
@@ -184,6 +193,8 @@ def build_native_backup(root: Path, *, include_empty_series_version: bool = Fals
         manifest_hash: manifest,
         commit_hash: commit,
     }
+    if include_empty_singleton:
+        inline[digest(b"")] = b""
     if empty_table is not None:
         inline[digest(empty_table)] = empty_table
 
@@ -361,6 +372,21 @@ def main() -> int:
                 check=True,
             )
         print(f"integration capsule verified and materialized: {root}")
+
+        empty_singleton_source = workspace / "native-empty-singleton"
+        build_native_backup(empty_singleton_source, include_empty_singleton=True)
+        try:
+            extract(
+                empty_singleton_source,
+                workspace / "empty-singleton-capsule",
+                "main",
+                None,
+                "fixture",
+            )
+        except FormatError as error:
+            assert "empty file version" in str(error) and "metadata" in str(error), error
+        else:
+            raise AssertionError("extractor silently dropped empty singleton metadata")
 
         empty_source = workspace / "native-empty-series"
         build_native_backup(empty_source, include_empty_series_version=True)

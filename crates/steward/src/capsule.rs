@@ -397,6 +397,12 @@ async fn build_physical_node(
                              cannot represent"
                         )));
                     }
+                    if !metadata.is_empty() {
+                        return Err(StewardError::Content(format!(
+                            "empty file version {path} carries metadata that pondcapsule.1 \
+                              cannot represent"
+                        )));
+                    }
                     let _ = payloads.objects.remove(&hash);
                     continue;
                 }
@@ -484,6 +490,12 @@ async fn build_physical_node(
                         return Err(StewardError::Content(format!(
                             "series {path} contains an empty table version that pondcapsule.1 \
                              cannot represent"
+                        )));
+                    }
+                    if !metadata.is_empty() {
+                        return Err(StewardError::Content(format!(
+                            "empty table version {path} carries metadata that pondcapsule.1 \
+                              cannot represent"
                         )));
                     }
                     objects.push(object);
