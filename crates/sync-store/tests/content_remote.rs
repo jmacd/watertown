@@ -172,7 +172,7 @@ async fn put_blob_rejects_and_does_not_store_hash_mismatch() {
         .await
         .expect_err("mismatched blob must be rejected");
     assert!(
-        format!("{err}").contains("hash to"),
+        format!("{err}").contains("has hash") && format!("{err}").contains("expected hash"),
         "unexpected error: {err}"
     );
 

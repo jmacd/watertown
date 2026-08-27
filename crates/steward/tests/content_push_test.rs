@@ -55,6 +55,10 @@ async fn push_lands_objects_and_decodable_tip() {
         .await
         .expect("push");
 
+    let _ = remote
+        .inspect_recovery_recipe_dp_commit_3()
+        .await
+        .expect("push installs the Pond-free recovery recipe");
     assert!(outcome.objects_pushed >= 1);
     assert_eq!(outcome.ref_name, "main");
 
@@ -73,6 +77,15 @@ async fn push_lands_objects_and_decodable_tip() {
         .await
         .expect("has root tree");
     assert!(root_present, "root tree object must be on the remote");
+
+    assert!(
+        remote
+            .latest_capsule()
+            .await
+            .expect("read capsule ref")
+            .is_none(),
+        "native pushes do not publish per-commit recovery capsules"
+    );
 }
 
 /// Every object on the remote hashes to its key: pushing preserves the
@@ -138,4 +151,12 @@ async fn re_push_same_tip_is_idempotent() {
     assert_eq!(first.tip, second.tip, "tip is unchanged by a re-push");
     let tip = remote.get_tip("main").await.expect("tip").expect("ref set");
     assert_eq!(tip, first.tip);
+    assert!(
+        remote
+            .capsule_roots()
+            .await
+            .expect("capsule roots")
+            .is_empty(),
+        "native pushes do not maintain capsule generations"
+    );
 }

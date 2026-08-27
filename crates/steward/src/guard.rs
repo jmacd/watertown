@@ -81,6 +81,18 @@ pub struct StewardTransactionGuard<'a> {
     /// re-emits rather than losing them.
     emitted_usage: std::sync::atomic::AtomicUsize,
     expected_content_roots: Option<ExpectedContentRoots>,
+    /// When set, [`Self::commit`] skips [`Self::run_post_commit_factories`] and
+    /// [`Self::run_post_commit_remotes`] for this transaction.
+    ///
+    /// A staged capsule import recreates namespace content that includes
+    /// `/system/run/*` factory configs and `/sys/remotes/*` attachments
+    /// verbatim (they are ordinary namespace entries the capsule preserves),
+    /// but the design requires normal dispatch to stay inert until the
+    /// operator explicitly unseals the target (`docs/recovery-capsule-design.md`,
+    /// "Active remote safety"). Without this flag, committing a restored
+    /// push-mode remote or run config mid-staging would push or execute
+    /// against a not-yet-verified, not-yet-sealed pond.
+    suppress_post_commit: bool,
 }
 
 impl<'a> StewardTransactionGuard<'a> {
@@ -106,7 +118,19 @@ impl<'a> StewardTransactionGuard<'a> {
             write_lock,
             emitted_usage: std::sync::atomic::AtomicUsize::new(0),
             expected_content_roots: None,
+            suppress_post_commit: false,
         }
+    }
+
+    /// Suppress post-commit factory execution and remote auto-push for this
+    /// transaction only (see [`Self::suppress_post_commit`] field docs).
+    ///
+    /// Restricted to the crate: this is a narrow safety valve for the staged
+    /// capsule importer, not a general-purpose knob for ordinary writes.
+    #[must_use]
+    pub(crate) fn suppressing_post_commit(mut self) -> Self {
+        self.suppress_post_commit = true;
+        self
     }
 
     /// Get the transaction ID
@@ -527,14 +551,25 @@ impl<'a> StewardTransactionGuard<'a> {
                     crate::limiter_usage::drop_emitted(self.control_table, emitted).await;
                 }
 
-                // Run post-commit factories for write transactions
-                // This happens AFTER commit but uses a NEW transaction
-                self.run_post_commit_factories().await;
+                if self.suppress_post_commit || self.control_table.post_commit_dispatch_suppressed()
+                {
+                    debug!(
+                        "Steward transaction {} suppresses post-commit factories and remote push \
+                         (transaction={}, persistent={})",
+                        self.txn_meta.user.txn_id,
+                        self.suppress_post_commit,
+                        self.control_table.post_commit_dispatch_suppressed()
+                    );
+                } else {
+                    // Run post-commit factories for write transactions
+                    // This happens AFTER commit but uses a NEW transaction
+                    self.run_post_commit_factories().await;
 
-                // D4: Run post-commit auto-push for /sys/remotes/* entries.
-                // Same "after-commit, new transaction" model as factories
-                // above; failures are logged but do not undo the commit.
-                self.run_post_commit_remotes().await;
+                    // D4: Run post-commit auto-push for /sys/remotes/* entries.
+                    // Same "after-commit, new transaction" model as factories
+                    // above; failures are logged but do not undo the commit.
+                    self.run_post_commit_remotes().await;
+                }
 
                 Ok(Some(new_version))
             }

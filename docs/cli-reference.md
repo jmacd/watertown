@@ -23,6 +23,7 @@
 | `pond remote remove` | Detach a remote (also works for backups) | `pond remote remove origin` |
 | `pond remote remove --purge` | Detach AND drop the materialized mount entry | `pond remote remove --purge upstream` |
 | `pond push` | Push to push/both-mode remotes | `pond push` |
+| `pond capsule` | Install recovery recipes or verify portable capsules | `pond capsule recipe inspect azure` |
 | `pond pull` | Pull from pull/both-mode remotes | `pond pull` |
 | `pond restore` | Bootstrap a whole-pond replica from a backup (disaster recovery) | `pond restore origin file:///mnt/backups/origin` |
 | `pond maintain` | Delta maintenance; `--compact` records a pushable Compact bundle | `pond maintain --compact` |
@@ -537,7 +538,43 @@ pond push origin
 After every write transaction, the steward also auto-pushes all
 `push`/`both`-mode remotes -- so this command is mostly used when an
 earlier auto-push failed (transient network), or right after attaching
-a brand-new remote.
+a brand-new remote. Native pushes do not generate capsules; they idempotently
+install or verify the small static recovery recipe before writing backup data.
+
+---
+
+### pond capsule
+
+Install static native-format recovery recipes and verify portable logical
+recovery snapshots. The recipe extracts a portable capsule from an existing
+native Delta/Parquet backup only when recovery is needed.
+
+```bash
+# Repair or explicitly reinstall the reviewed dp.commit.3 recipe.
+pond capsule recipe publish azure
+
+# Verify its immutable and discoverable bootstrap objects.
+pond capsule recipe inspect azure
+
+# Verify and summarize a capsule downloaded into ./recovered/recovery/.
+pond capsule inspect ./recovered
+
+# Verification-only spelling for automation.
+pond capsule verify ./recovered
+```
+
+Every backup push installs the current hash-addressed recovery recipe and
+verifies any existing discoverable recipe against its immutable copy before
+advancing the native ref. Recipe publication creates
+`recovery/recipes/dp.commit.3/<recipe-hash>/README.sh` before the discoverable
+`recovery/README.sh`. Retries accept only byte-identical objects; neither path
+is overwritten when its content differs. Ordinary native pushes verify these
+objects but never replace an existing discoverable recipe.
+
+Inspection does not open or modify a pond. It validates the latest reference,
+canonical manifest, every physical object hash and size, every Parquet schema,
+every ordered logical file/table leaf hash, and each logical series root.
+See `recovery-capsule-design.md` for the format-upgrade and cleanup design.
 
 ---
 

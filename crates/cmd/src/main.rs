@@ -183,6 +183,61 @@ enum BackupCommand {
     List,
 }
 
+/// Portable recovery-capsule operations.
+#[derive(Debug, Subcommand)]
+enum CapsuleCommand {
+    /// Publish or inspect the static native-format recovery recipe.
+    Recipe {
+        #[command(subcommand)]
+        command: CapsuleRecipeCommand,
+    },
+    /// Verify and summarize a downloaded capsule without opening a pond.
+    Inspect {
+        /// Directory containing the downloaded `recovery/` tree.
+        path: PathBuf,
+    },
+    /// Verify a downloaded capsule and all logical leaf identities.
+    Verify {
+        /// Directory containing the downloaded `recovery/` tree.
+        path: PathBuf,
+    },
+    /// Materialize a downloaded capsule into a brand-new pond.
+    ///
+    /// The target must not already exist. A private sibling staging
+    /// directory is created next to it, given a fresh pond identity, and
+    /// populated from the capsule with post-commit factory execution and
+    /// remote auto-push suppressed; only after the staged result is
+    /// re-verified against the capsule's logical contract is it renamed
+    /// atomically onto the target. On any failure the staging directory is
+    /// left in place for inspection rather than silently removed.
+    Import {
+        /// Directory containing the downloaded `recovery/` tree.
+        path: PathBuf,
+        /// Birthplace of the freshly minted target pond identity (see
+        /// `pond init --birthplace`).
+        #[arg(long)]
+        birthplace: String,
+        /// Acknowledge that bounded resume and active-remote preflight are
+        /// not yet implemented.
+        #[arg(long, required = true)]
+        experimental: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CapsuleRecipeCommand {
+    /// Install the reviewed dp.commit.3 recipe without overwriting differences.
+    Publish {
+        /// Backup attachment name.
+        name: String,
+    },
+    /// Verify both immutable and discoverable recipe objects.
+    Inspect {
+        /// Remote attachment name.
+        name: String,
+    },
+}
+
 /// Shared options for `pond remote add` and `pond backup add`.
 #[derive(Debug, Args)]
 struct RemoteAddOptions {
@@ -344,6 +399,11 @@ enum Commands {
     Backup {
         #[command(subcommand)]
         command: BackupCommand,
+    },
+    /// Install recovery recipes or verify portable recovery capsules.
+    Capsule {
+        #[command(subcommand)]
+        command: CapsuleCommand,
     },
     /// Show or set pond configuration
     Config {
@@ -705,6 +765,30 @@ async fn main() -> Result<()> {
                     Some(commands::RemoteListFilter::BackupsOnly),
                 )
                 .await
+            }
+        },
+        Commands::Capsule { command } => match command {
+            CapsuleCommand::Recipe { command } => {
+                let (name, action) = match command {
+                    CapsuleRecipeCommand::Publish { name } => {
+                        (name, commands::RecoveryRecipeAction::Publish)
+                    }
+                    CapsuleRecipeCommand::Inspect { name } => {
+                        (name, commands::RecoveryRecipeAction::Inspect)
+                    }
+                };
+                commands::capsule_recipe_command(&ship_context, &name, action).await
+            }
+            CapsuleCommand::Inspect { path } | CapsuleCommand::Verify { path } => {
+                commands::capsule_inspect_command(&path)
+            }
+            CapsuleCommand::Import {
+                path,
+                birthplace,
+                experimental,
+            } => {
+                let target = ship_context.resolve_pond_path()?;
+                commands::capsule_import_command(&path, &target, &birthplace, experimental).await
             }
         },
         Commands::Config { command } => {

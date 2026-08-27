@@ -262,10 +262,8 @@ impl TileLog {
                 ),
             )));
         }
-        for chunk in bytes.chunks_exact(HASH_LEN).take(count) {
-            let mut arr = [0u8; HASH_LEN];
-            arr.copy_from_slice(chunk);
-            out.push(LogHash::from_bytes(arr));
+        for chunk in bytes.as_chunks::<HASH_LEN>().0.iter().take(count) {
+            out.push(LogHash::from_bytes(*chunk));
         }
         Ok(())
     }
@@ -662,7 +660,9 @@ fn fold_perfect(hashes: &[LogHash]) -> LogHash {
     let mut level = hashes.to_vec();
     while level.len() > 1 {
         level = level
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| hash_children(&pair[0], &pair[1]))
             .collect();
     }
@@ -672,12 +672,11 @@ fn fold_perfect(hashes: &[LogHash]) -> LogHash {
 /// Split a byte run into 32-byte log hashes.
 fn bytes_to_hashes(bytes: &[u8]) -> Vec<LogHash> {
     bytes
-        .chunks_exact(HASH_LEN)
-        .map(|chunk| {
-            let mut arr = [0u8; HASH_LEN];
-            arr.copy_from_slice(chunk);
-            LogHash::from_bytes(arr)
-        })
+        .as_chunks::<HASH_LEN>()
+        .0
+        .iter()
+        .copied()
+        .map(LogHash::from_bytes)
         .collect()
 }
 

@@ -57,9 +57,10 @@ pub struct ContentPushOutcome {
 /// # Errors
 ///
 /// Returns an error if the pond has no content-changing commit to push,
-/// if the persisted commit object does not hash to the recorded commit hash,
-/// if any external large blob is missing or its bytes do not hash to the
-/// recorded key, or if reading the content tree or writing to the remote fails.
+/// if the required recovery recipe cannot be installed or verified, if the
+/// persisted commit object does not hash to the recorded commit hash, if any
+/// external large blob is missing or its bytes do not hash to the recorded
+/// key, or if reading the content tree or writing to the remote fails.
 pub async fn push_content_to_remote(
     ship: &Ship,
     remote: &mut ContentRemote,
@@ -155,6 +156,14 @@ async fn push_content_inner(
     remote: &mut ContentRemote,
     ref_name: &str,
 ) -> Result<ContentPushOutcome, StewardError> {
+    let _ = remote
+        .ensure_recovery_recipe_dp_commit_3()
+        .await
+        .map_err(|error| {
+            StewardError::Content(format!(
+                "install required dp.commit.3 recovery recipe before backup push: {error}"
+            ))
+        })?;
     let commit_log = crate::content_tree::read_log_leaves(
         ship.data_persistence().table().clone(),
         &ship.control_table().pond_id_uuid().to_string(),
@@ -167,10 +176,10 @@ async fn push_content_inner(
         .map_err(|e| StewardError::Content(format!("decode commit-log tip: {e}")))?
         .hash();
 
-    let materialized = materialize_content_objects(ship).await?;
+    let mut materialized = materialize_content_objects(ship).await?;
 
     let mut objects: Vec<(ObjectHash, Vec<u8>)> = Vec::with_capacity(materialized.inline.len() + 2);
-    for (hash, bytes) in materialized.inline {
+    for (hash, bytes) in std::mem::take(&mut materialized.inline) {
         objects.push((hash, bytes));
     }
     // Large blobs (>64KB) live externally under `_large_files/` and are recorded
@@ -218,7 +227,7 @@ async fn push_content_inner(
     // it to adopt the source's node_ids.  Verify it hashes to the commit's
     // recorded manifest hash so the tip can never name a manifest the remote
     // lacks or disagrees with.
-    let (manifest_hash, manifest_bytes) = materialized.manifest.ok_or_else(|| {
+    let (manifest_hash, manifest_bytes) = materialized.manifest.take().ok_or_else(|| {
         StewardError::Content("materialized objects carry no node manifest".to_string())
     })?;
     let commit = sync_store::content::Commit::decode(&commit_bytes)
@@ -249,11 +258,12 @@ async fn push_content_inner(
         .push_commit(&objects, ref_name, tip)
         .await
         .map_err(|e| StewardError::Content(e.to_string()))?;
+    let objects_pushed = objects.len();
 
     Ok(ContentPushOutcome {
         ref_name: ref_name.to_string(),
         tip,
-        objects_pushed: objects.len(),
+        objects_pushed,
         remote_txn_seq,
     })
 }

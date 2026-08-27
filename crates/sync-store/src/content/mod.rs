@@ -44,14 +44,29 @@
 //! two ponds that sync must share the same encoding version, since hashes do
 //! not match across versions.
 
+mod capsule;
 mod commit;
 mod manifest;
 mod node_merkle;
+mod series_leaf;
 mod tree;
 
+pub use capsule::{
+    CAPSULE_FORMAT_V1, CapsuleEntry, CapsuleLeaf, CapsuleManifest, CapsuleNode, CapsuleObject,
+    CapsulePayloadKind, CapsuleSource, CapsuleVerifyReport, capsule_leaf_hash,
+    capsule_manifest_bytes, capsule_root, capsule_series_root, decode_capsule_manifest,
+    encode_capsule_attributes, read_capsule_manifest, verify_capsule_directory,
+    verify_capsule_payload_directory, verify_capsule_payloads,
+    verify_incremental_capsule_payload_directory,
+};
 pub use commit::{Commit, Provenance};
 pub use manifest::{ManifestEntry, decode_manifest, encode_manifest, manifest_hash};
 pub use node_merkle::{NodeMerkle, rebuild_root as node_merkle_rebuild_root};
+pub use series_leaf::{
+    IncrementalFileLeafHasher, IncrementalTableLeafHasher, canonicalize_schema,
+    encode_canonical_attributes, encode_canonical_batch_rows, encode_canonical_schema,
+    file_leaf_hash, schema_fingerprint, table_leaf_hash,
+};
 pub use tree::{
     TreeEntry, VersionMeta, decode_recipe, decode_series, decode_tree, encode_recipe,
     encode_series, encode_tree, recipe_hash, series_hash, tree_hash,
@@ -143,6 +158,13 @@ fn hex_val(c: u8) -> Result<u8, String> {
 /// (names, pond ids, free-form provenance strings) unambiguously.
 pub(crate) fn push_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) {
     let len = u32::try_from(bytes.len()).expect("field length exceeds u32::MAX");
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+/// Append a `u64`-length-prefixed byte field to `buf`.
+pub(crate) fn push_len_prefixed_u64(buf: &mut Vec<u8>, bytes: &[u8]) {
+    let len = u64::try_from(bytes.len()).expect("field length exceeds u64::MAX");
     buf.extend_from_slice(&len.to_le_bytes());
     buf.extend_from_slice(bytes);
 }

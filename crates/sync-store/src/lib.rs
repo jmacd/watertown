@@ -29,6 +29,7 @@ pub mod content;
 pub mod content_remote;
 mod error;
 pub mod metered_store;
+mod recovery_recipe;
 mod s3_registration;
 pub mod schema;
 mod store;
@@ -39,15 +40,23 @@ pub use azure_registration::{AZURE_SCHEMES, register_azure_handlers};
 pub use s3_registration::register_s3_handlers;
 
 pub use content::{
-    Commit, ManifestEntry, NodeMerkle, ObjectHash, Provenance, TreeEntry, VersionMeta,
-    decode_series, decode_tree, node_merkle_rebuild_root, series_hash, tree_hash,
+    CAPSULE_FORMAT_V1, CapsuleEntry, CapsuleLeaf, CapsuleManifest, CapsuleNode, CapsuleObject,
+    CapsulePayloadKind, CapsuleSource, CapsuleVerifyReport, Commit, IncrementalFileLeafHasher,
+    IncrementalTableLeafHasher, ManifestEntry, NodeMerkle, ObjectHash, Provenance, TreeEntry,
+    VersionMeta, canonicalize_schema, capsule_leaf_hash, capsule_manifest_bytes, capsule_root,
+    capsule_series_root, decode_capsule_manifest, decode_manifest, decode_recipe, decode_series,
+    decode_tree, encode_canonical_attributes, encode_canonical_batch_rows, encode_canonical_schema,
+    encode_capsule_attributes, file_leaf_hash, node_merkle_rebuild_root, read_capsule_manifest,
+    schema_fingerprint, series_hash, table_leaf_hash, tree_hash, verify_capsule_directory,
+    verify_capsule_payload_directory, verify_incremental_capsule_payload_directory,
 };
-pub use content_remote::ContentRemote;
+pub use content_remote::{ContentRemote, RecoveryRecipePublishOutcome};
 pub use error::{Result, StoreError};
 pub use metered_store::{
     MeterBinding, MeteredStore, Observation, RemoteKey, StorageMeter, bind_meter, observed_under,
 };
-pub use store::{AddPath, CompactMetrics, Op, RemovePath, Store};
+pub use recovery_recipe::{recovery_recipe_dp_commit_3, recovery_recipe_dp_commit_3_hash};
+pub use store::{AddPath, CompactMetrics, Op, RemovePath, Store, raw_object_store_at_url};
 pub use tlog::{
     Checkpoint, CheckpointError, LogHash, TileLog, TransparencyLog, checkpoint_history_path,
     commit_leaf_hash, verify_consistency, verify_inclusion,

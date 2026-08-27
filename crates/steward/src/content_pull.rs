@@ -1597,7 +1597,7 @@ async fn apply_ops(
                         let writer = pwd
                             .create_file_with_id(name, parse_node_id(node_id)?)
                             .await?;
-                        write_version(writer, first, *entry_type, remote).await?;
+                        write_version(pwd, name, writer, first, *entry_type, remote).await?;
                     }
                 } else if *collapse_first && let Some(first) = remaining.next() {
                     // Replicate a source-side compaction: the first version
@@ -1606,11 +1606,11 @@ async fn apply_ops(
                     let writer = pwd
                         .async_writer_path_collapsing_with_type(name, *entry_type)
                         .await?;
-                    write_version(writer, first, *entry_type, remote).await?;
+                    write_version(pwd, name, writer, first, *entry_type, remote).await?;
                 }
                 for version in remaining {
                     let writer = pwd.async_writer_path_with_type(name, *entry_type).await?;
-                    write_version(writer, version, *entry_type, remote).await?;
+                    write_version(pwd, name, writer, version, *entry_type, remote).await?;
                 }
             }
             ApplyOp::Symlink {
@@ -1660,6 +1660,8 @@ async fn apply_ops(
 /// blob store in bounded chunks, re-hashing to enforce content addressing so a
 /// large blob never lands in a single buffer (D7).
 async fn write_version(
+    parent_wd: &WD,
+    name: &str,
     mut writer: std::pin::Pin<Box<dyn tinyfs::FileMetadataWriter>>,
     version: &PlannedVersion,
     entry_type: EntryType,
@@ -1673,7 +1675,7 @@ async fn write_version(
             stream_external_blob(&mut writer, *hash, remote).await?;
         }
     }
-    finalize_writer(writer, entry_type, &version.meta).await
+    finalize_writer(parent_wd, name, writer, entry_type, &version.meta).await
 }
 
 /// Stream a large external blob from the remote blob store into `writer` in
@@ -1728,7 +1730,9 @@ async fn stream_external_blob(
 /// bounds as the original. Otherwise a table series can still recover its range
 /// from the parquet footer it just wrote (which also shuts the writer down);
 /// every other kind just closes, leaving the bounds NULL as before.
-async fn finalize_writer(
+pub(crate) async fn finalize_writer(
+    parent_wd: &WD,
+    name: &str,
     mut writer: std::pin::Pin<Box<dyn tinyfs::FileMetadataWriter>>,
     entry_type: EntryType,
     meta: &VersionMeta,
@@ -1743,6 +1747,14 @@ async fn finalize_writer(
         let _ = writer.infer_temporal_bounds().await?;
     } else {
         writer.shutdown().await?;
+    }
+    if let Some(json) = &meta.extended_attributes {
+        let attributes = tlogfs::schema::ExtendedAttributes::from_json(json).map_err(|error| {
+            StewardError::Content(format!("decode extended attributes for {name:?}: {error}"))
+        })?;
+        parent_wd
+            .set_extended_attributes(name, attributes.attributes)
+            .await?;
     }
     Ok(())
 }
