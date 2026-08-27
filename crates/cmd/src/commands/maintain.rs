@@ -49,6 +49,19 @@ pub async fn maintain_command(
         .await;
     }
 
+    if let Some(freeze) = ship
+        .as_pond()
+        .ok_or_else(|| anyhow!("maintenance requires a pond steward"))?
+        .write_freeze()?
+    {
+        return Err(anyhow!(
+            "pond writes are frozen at tip {} (frozen_at={}, reason={}); maintenance made no changes",
+            freeze.source_tip.as_deref().unwrap_or("<none>"),
+            freeze.frozen_at.to_rfc3339(),
+            freeze.reason
+        ));
+    }
+
     // Prune BEFORE maintain so the deletion's tombstones are reclaimed by
     // the checkpoint + vacuum below, in the same maintenance pass.
     let pruned = if prune {
@@ -75,7 +88,10 @@ pub async fn maintain_command(
         None
     };
 
-    let report = ship.maintain(true, compact).await;
+    let report = ship
+        .maintain(true, compact)
+        .await
+        .map_err(|error| anyhow!("Maintenance failed: {error}"))?;
 
     // Print results to stdout
     #[allow(clippy::print_stdout)]

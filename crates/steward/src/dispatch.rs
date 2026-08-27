@@ -194,10 +194,14 @@ impl Steward {
     /// When `force` is true, checkpoint is always created.
     /// When `compact` is true, also merges small parquet files into larger ones.
     /// Returns a default (empty) report for Host stewards.
-    pub async fn maintain(&mut self, force: bool, compact: bool) -> MaintenanceReport {
+    pub async fn maintain(
+        &mut self,
+        force: bool,
+        compact: bool,
+    ) -> Result<MaintenanceReport, StewardError> {
         match self {
             Steward::Pond(ship) => ship.maintain(force, compact).await,
-            Steward::Host(_) => MaintenanceReport::default(),
+            Steward::Host(_) => Ok(MaintenanceReport::default()),
         }
     }
 

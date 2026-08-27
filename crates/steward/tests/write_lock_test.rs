@@ -119,3 +119,140 @@ async fn read_transaction_emits_no_control_records() -> Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn persistent_freeze_blocks_old_and_new_writers_but_allows_reads() -> Result<()> {
+    let temp = tempdir()?;
+    let pond_path = temp.path().join("pond");
+    let mut freezer = Ship::create_pond(&pond_path, "test-host")
+        .await
+        .map_err(|e| anyhow::anyhow!("create_pond: {e}"))?;
+    freezer
+        .write_transaction(
+            &PondUserMetadata::new(vec!["test".into(), "seed".into()]),
+            async |fs| {
+                let root = fs.root().await?;
+                let _ = root.create_dir_all("/data").await?;
+                Ok(())
+            },
+        )
+        .await?;
+    let mut already_open = Ship::open_pond(&pond_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("open pre-freeze writer: {e}"))?;
+
+    let tip_seq = freezer
+        .control_table()
+        .latest_spine_seq()
+        .await?
+        .expect("new pond has a content tip");
+    let expected_tip = freezer
+        .control_table()
+        .commit_hash_at(tip_seq)
+        .await?
+        .expect("tip sequence has a commit hash");
+
+    let freeze_meta = PondUserMetadata::new(vec!["freeze".into(), "enable".into()]);
+    let (freeze, created) = freezer
+        .freeze_writes(&freeze_meta, "storage format migration".to_string())
+        .await?;
+    assert!(created);
+    assert_eq!(freeze.source_tip.as_deref(), Some(expected_tip.as_str()));
+    assert_eq!(
+        freezer.write_freeze()?.as_ref(),
+        Some(&freeze),
+        "freezing Ship sees persisted marker"
+    );
+
+    let read_meta = PondUserMetadata::new(vec!["test".into(), "reader".into()]);
+    let reader = already_open.begin_read(&read_meta).await?;
+    let _read_seq = reader.commit().await?;
+
+    let write_meta = PondUserMetadata::new(vec!["test".into(), "writer".into()]);
+    assert!(matches!(
+        already_open.begin_write(&write_meta).await,
+        Err(StewardError::PondWriteFrozen { .. })
+    ));
+
+    let mut newly_opened = Ship::open_pond(&pond_path).await?;
+    assert_eq!(newly_opened.write_freeze()?.as_ref(), Some(&freeze));
+    assert!(matches!(
+        newly_opened.begin_write(&write_meta).await,
+        Err(StewardError::PondWriteFrozen { .. })
+    ));
+    assert!(matches!(
+        newly_opened.maintain(true, true).await,
+        Err(StewardError::PondWriteFrozen { .. })
+    ));
+    assert!(matches!(
+        newly_opened
+            .prune_control_history(1, &PondUserMetadata::new(vec!["prune".into()]))
+            .await,
+        Err(StewardError::PondWriteFrozen { .. })
+    ));
+
+    let removed = freezer
+        .unfreeze_writes(&PondUserMetadata::new(vec![
+            "freeze".into(),
+            "disable".into(),
+        ]))?
+        .expect("remove persisted freeze");
+    assert_eq!(removed, freeze);
+    assert!(freezer.write_freeze()?.is_none());
+
+    let writer = already_open.begin_write(&write_meta).await?;
+    drop(writer);
+    Ok(())
+}
+
+#[tokio::test]
+async fn freeze_refuses_to_race_an_active_writer() -> Result<()> {
+    let temp = tempdir()?;
+    let pond_path = temp.path().join("pond");
+    let mut writer = Ship::create_pond(&pond_path, "test-host").await?;
+    let mut freezer = Ship::open_pond(&pond_path).await?;
+
+    let write_meta = PondUserMetadata::new(vec!["test".into(), "writer".into()]);
+    let transaction = writer.begin_write(&write_meta).await?;
+    let error = freezer
+        .freeze_writes(
+            &PondUserMetadata::new(vec!["freeze".into(), "enable".into()]),
+            "storage format migration".to_string(),
+        )
+        .await
+        .expect_err("freeze must not race an active writer");
+    assert!(matches!(error, StewardError::PondLocked { .. }));
+    drop(transaction);
+    assert!(freezer.write_freeze()?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn unfreeze_does_not_require_a_readable_control_table() -> Result<()> {
+    let temp = tempdir()?;
+    let pond_path = temp.path().join("pond");
+    let mut ship = Ship::create_pond(&pond_path, "test-host").await?;
+    let (_freeze, created) = ship
+        .freeze_writes(
+            &PondUserMetadata::new(vec!["freeze".into(), "enable".into()]),
+            "control recovery test".to_string(),
+        )
+        .await?;
+    assert!(created);
+
+    let control_path = steward::get_control_path(&pond_path);
+    std::fs::rename(
+        control_path.join("_delta_log"),
+        control_path.join("_delta_log.damaged"),
+    )?;
+    assert!(Ship::open_pond(&pond_path).await.is_err());
+
+    let removed = steward::unfreeze_pond_writes(
+        &pond_path,
+        &PondUserMetadata::new(vec!["freeze".into(), "disable".into()]),
+    )?
+    .expect("remove freeze without opening control table");
+    assert_eq!(removed.reason, "control recovery test");
+    assert!(steward::read_pond_write_freeze(&pond_path)?.is_none());
+    Ok(())
+}

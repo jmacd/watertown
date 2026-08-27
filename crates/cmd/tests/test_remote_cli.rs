@@ -365,12 +365,15 @@ async fn pond_verify_ok_after_push() {
         .expect("push");
 
     // Named-target form: must succeed.
-    verify_command(&ctx, Some("origin".to_string()))
+    verify_command(&ctx, Some("origin".to_string()), false)
         .await
         .expect("verify origin");
 
     // All-targets form: must succeed too (single attachment, also OK).
-    verify_command(&ctx, None).await.expect("verify all");
+    verify_command(&ctx, None, false).await.expect("verify all");
+    verify_command(&ctx, Some("origin".to_string()), true)
+        .await
+        .expect("exact verify origin");
 }
 
 /// Content-native verify reports the exact commit-graph relationship: when the
@@ -536,7 +539,9 @@ async fn pond_verify_no_remotes_is_noop() {
     let pond_path = scratch.path().join("pond");
     let ctx = ctx_for(&pond_path, vec!["pond", "init"]);
     init_command(&ctx, "test-host").await.expect("init");
-    verify_command(&ctx, None).await.expect("verify noop");
+    verify_command(&ctx, None, false)
+        .await
+        .expect("verify noop");
 }
 
 /// D6.2: `pond status` renders cleanly on a fresh pond with no remotes.

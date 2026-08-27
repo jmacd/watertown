@@ -1,10 +1,15 @@
 # Recovery Capsules and Format Upgrades
 
-> **Status:** Phase one implementation in progress on `jmacd/capsule1`.
+> **Status:** Phase one is implemented for `dp.commit.3`; production
+> publication and recovery exercises remain.
 >
 > This document is the authoritative design for the current static-recipe
 > mechanism. Superseded per-commit capsule publication is retained only in Git
 > history, not described here.
+>
+> For the executable watershop and Azure migration procedure, including writer
+> quiescence, exact-tip selection, staged import, cutover, and rollback, see
+> [Capsule Recovery and Storage-Format Migration Runbook](capsule-recovery-runbook.md).
 
 ## Purpose
 
@@ -255,6 +260,10 @@ verification, and inert materialization without Pond.
 
 ## Recovery workflow
 
+The following is the artifact-level workflow. The operator gates and commands
+for an authoritative migration are defined in
+[capsule-recovery-runbook.md](capsule-recovery-runbook.md).
+
 1. Obtain `recovery/README.sh` and its hash through independent channels.
 2. Review the bootstrap.
 3. Extract the kit into a new directory.
@@ -275,6 +284,16 @@ verification, and inert materialization without Pond.
 The capsule root should be recorded outside the source storage. Content hashes
 detect corruption; an out-of-band root also detects replacement of both data
 and in-storage checksums.
+
+A selected native commit is immutable and internally consistent, but it may
+not be the final state of a live writer. For an authoritative format
+migration, operators must stop every source writer, run `pond freeze enable`,
+record the protected exact tip, perform and verify a final push of that tip,
+and extract with `--commit HASH`. The durable freeze is enforced after the
+cross-process write lock is acquired by ordinary writes, replay,
+pull/import, compaction, reclamation, and control-history pruning. Forced
+control rebuild refuses to remove an active marker. Locking or withholding a
+remote ref is not a substitute for freezing the writer.
 
 ## Extraction invariants
 

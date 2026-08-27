@@ -160,7 +160,9 @@ impl std::fmt::Display for MaintenanceReport {
 ///   than `now - retention` (checkpoint-aligned, never below the most recent
 ///   checkpoint). Used for the control table, which is never replicated.
 ///
-/// This is best-effort: errors are logged as warnings and do not propagate.
+/// Automatic (`force=false`) maintenance is best-effort and logs failures.
+/// Explicit (`force=true`) maintenance propagates any requested-operation
+/// failure so an operator command cannot report false success.
 /// The table reference is consumed and a new (possibly updated) table is
 /// returned, since vacuum/optimize operations produce a new DeltaTable.
 pub async fn maintain_table(
@@ -169,7 +171,7 @@ pub async fn maintain_table(
     force: bool,
     do_compact: bool,
     log_retention: Option<Duration>,
-) -> (DeltaTable, MaintenanceResult) {
+) -> Result<(DeltaTable, MaintenanceResult), crate::StewardError> {
     let mut result = MaintenanceResult {
         table_name: table_name.to_string(),
         version: table.version().unwrap_or(-1),
@@ -196,6 +198,11 @@ pub async fn maintain_table(
                 result.checkpoint_created = true;
             }
             Err(e) => {
+                if force {
+                    return Err(crate::StewardError::DeltaLake(format!(
+                        "checkpoint {table_name} at version {version}: {e}"
+                    )));
+                }
                 warn!(
                     "[MAINTAIN] Checkpoint failed for {} at version {}: {}",
                     table_name, version, e
@@ -237,6 +244,11 @@ pub async fn maintain_table(
                 result.logs_cleaned = cleaned;
             }
             Err(e) => {
+                if force {
+                    return Err(crate::StewardError::DeltaLake(format!(
+                        "clean expired logs for {table_name}: {e}"
+                    )));
+                }
                 warn!("[MAINTAIN] Log cleanup failed for {}: {}", table_name, e);
             }
         }
@@ -266,6 +278,11 @@ pub async fn maintain_table(
                 table = new_table;
             }
             Err(e) => {
+                if force {
+                    return Err(crate::StewardError::DeltaLake(format!(
+                        "vacuum {table_name}: {e}"
+                    )));
+                }
                 warn!("[MAINTAIN] Vacuum failed for {}: {}", table_name, e);
             }
         }
@@ -298,13 +315,18 @@ pub async fn maintain_table(
                 table = new_table;
             }
             Err(e) => {
+                if force {
+                    return Err(crate::StewardError::DeltaLake(format!(
+                        "compact {table_name}: {e}"
+                    )));
+                }
                 warn!("[MAINTAIN] Compaction failed for {}: {}", table_name, e);
             }
         }
     }
 
     result.version = table.version().unwrap_or(-1);
-    (table, result)
+    Ok((table, result))
 }
 
 /// Check if the most recent commit contained any Remove actions.

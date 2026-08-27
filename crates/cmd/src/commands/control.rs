@@ -939,8 +939,16 @@ pub async fn prune_history_at_horizon(ship: &mut steward::Steward, horizon: i64)
         return Ok(0);
     }
     let deleted = ship
-        .control_table_mut()
-        .prune_below(horizon)
+        .as_pond_mut()
+        .ok_or_else(|| anyhow!("control prune requires a pond steward"))?
+        .prune_control_history(
+            horizon,
+            &steward::PondUserMetadata::new(vec![
+                "pond".to_string(),
+                "control".to_string(),
+                "prune".to_string(),
+            ]),
+        )
         .await
         .map_err(|e| anyhow!("prune failed: {}", e))?;
     Ok(deleted)
@@ -1001,7 +1009,10 @@ async fn prune_control_table(
     println!("  deleted            : {} rows", deleted);
 
     println!("  reclaiming space (checkpoint + vacuum) ...");
-    let _report = ship.maintain(true, false).await;
+    let _report = ship
+        .maintain(true, false)
+        .await
+        .map_err(|error| anyhow!("Failed to reclaim pruned control history: {error}"))?;
     println!("[OK] Control table pruned at horizon {}.", h.horizon);
     Ok(())
 }

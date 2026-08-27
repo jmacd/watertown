@@ -511,6 +511,83 @@ impl Ship {
         &self.pond_path
     }
 
+    /// Return the durable write freeze, if this pond is frozen.
+    pub fn write_freeze(&self) -> Result<Option<crate::WriteFreeze>, StewardError> {
+        crate::write_lock::read_write_freeze(&get_control_path(&self.pond_path))
+    }
+
+    /// Atomically freeze data writes after all earlier writers have completed.
+    ///
+    /// The same process-level lock used by every data-write path serializes
+    /// marker creation. If a writer is active, this fails with
+    /// [`StewardError::PondLocked`] and the operator must retry.
+    pub async fn freeze_writes(
+        &mut self,
+        meta: &PondUserMetadata,
+        reason: String,
+    ) -> Result<(crate::WriteFreeze, bool), StewardError> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err(StewardError::Aborted(
+                "write freeze requires a non-empty reason".to_string(),
+            ));
+        }
+
+        let control_dir = get_control_path(&self.pond_path);
+        let txn_meta = PondTxnMetadata::new(self.last_write_seq + 1, meta.clone());
+        let _write_lock = crate::write_lock::WriteLockGuard::try_acquire(&control_dir, &txn_meta)?;
+        if let Some(existing) = crate::write_lock::read_write_freeze(&control_dir)? {
+            return Ok((existing, false));
+        }
+
+        // Reload after acquiring the lock so a writer that completed between
+        // opening Ship and acquiring exclusion cannot leave stale state here.
+        let fresh_control = ControlTable::open(&control_dir).await?;
+        let pond_id = fresh_control.get_pond_metadata().pond_id.to_string();
+        let data_path = get_data_path(&self.pond_path);
+        let data_url = url::Url::from_directory_path(&data_path)
+            .or_else(|_| url::Url::from_file_path(&data_path))
+            .map_err(|_| {
+                StewardError::Aborted(format!(
+                    "cannot form a URL from pond data path {}",
+                    data_path.display()
+                ))
+            })?;
+        let fresh_data = deltalake::open_table(data_url)
+            .await
+            .map_err(|error| StewardError::DeltaLake(error.to_string()))?;
+        let source_tip = crate::content_tree::log_tip_commit_hash(fresh_data, &pond_id)
+            .await?
+            .map(|tip| tip.to_hex());
+        let freeze = crate::WriteFreeze::new(pond_id, source_tip, reason.to_string());
+        let created = crate::write_lock::create_write_freeze(&control_dir, &freeze)?;
+        Ok((freeze, created))
+    }
+
+    /// Remove the durable write freeze while holding process-level exclusion.
+    pub fn unfreeze_writes(
+        &mut self,
+        meta: &PondUserMetadata,
+    ) -> Result<Option<crate::WriteFreeze>, StewardError> {
+        let control_dir = get_control_path(&self.pond_path);
+        let txn_meta = PondTxnMetadata::new(self.last_write_seq + 1, meta.clone());
+        let _write_lock = crate::write_lock::WriteLockGuard::try_acquire(&control_dir, &txn_meta)?;
+        crate::write_lock::remove_write_freeze(&control_dir)
+    }
+
+    /// Delete old control lifecycle rows under freeze-aware write exclusion.
+    pub async fn prune_control_history(
+        &mut self,
+        horizon: i64,
+        meta: &PondUserMetadata,
+    ) -> Result<usize, StewardError> {
+        let control_dir = get_control_path(&self.pond_path);
+        let txn_meta = PondTxnMetadata::new(self.last_write_seq, meta.clone());
+        let _write_lock =
+            crate::write_lock::WriteLockGuard::try_acquire_for_write(&control_dir, &txn_meta)?;
+        self.control_table.prune_below(horizon).await
+    }
+
     /// Borrow the data persistence layer.  The sync-remote adapter uses
     /// this to read the underlying Delta table for `actions_at_version`
     /// and `read_data_file`.
@@ -617,7 +694,7 @@ impl Ship {
         // safe under Delta's read-time-travel semantics.
         let write_lock = if is_write {
             let control_dir = get_control_path(&self.pond_path);
-            Some(crate::write_lock::WriteLockGuard::try_acquire(
+            Some(crate::write_lock::WriteLockGuard::try_acquire_for_write(
                 &control_dir,
                 &txn_meta,
             )?)
@@ -745,7 +822,8 @@ impl Ship {
         // begin_write).  Replay is a write transaction and must not race
         // with another writer in a sibling process.
         let control_dir = get_control_path(&self.pond_path);
-        let write_lock = crate::write_lock::WriteLockGuard::try_acquire(&control_dir, txn_meta)?;
+        let write_lock =
+            crate::write_lock::WriteLockGuard::try_acquire_for_write(&control_dir, txn_meta)?;
 
         // Record transaction begin in control table
         self.control_table
@@ -808,9 +886,14 @@ impl Ship {
 
         // After a successful write, run automatic maintenance (checkpoint + vacuum)
         if is_write && commit_result.is_some() {
-            let report = self.maintain(false, false).await;
-            if report.data.is_some() || report.control.is_some() {
-                debug!("Post-commit maintenance: {}", report);
+            match self.maintain(false, false).await {
+                Ok(report) if report.data.is_some() || report.control.is_some() => {
+                    debug!("Post-commit maintenance: {}", report);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!("Post-commit maintenance skipped: {error}");
+                }
             }
         }
 
@@ -823,26 +906,32 @@ impl Ship {
     /// When `compact` is true, the data table's own-pond partitions are
     /// compacted as a RECORDED, pushable transaction via [`Self::compact`]
     /// (so the merge replicates to remotes), and the control table is
-    /// optimized best-effort (it is never pushed).  This is best-effort:
-    /// individual failures are logged as warnings and do not prevent
-    /// maintenance of the other table.
-    pub async fn maintain(&mut self, force: bool, compact: bool) -> MaintenanceReport {
+    /// optimized best-effort (it is never pushed).
+    pub async fn maintain(
+        &mut self,
+        force: bool,
+        compact: bool,
+    ) -> Result<MaintenanceReport, StewardError> {
         let mut report = MaintenanceReport::default();
 
         // Data table compaction goes through the recorded transaction path
         // so it is replicated (Begin/DataCommitted(Compact)).  The
         // checkpoint/vacuum that follow are best-effort and unrecorded.
         let compact_outcome = if compact {
-            match self.compact().await {
-                Ok(outcome) => Some(outcome),
-                Err(e) => {
-                    warn!("[MAINTAIN] Data compaction failed: {}", e);
-                    None
-                }
-            }
+            Some(self.compact().await?)
         } else {
             None
         };
+
+        // Checkpoint, log cleanup, vacuum, and control optimization mutate
+        // local storage too. Hold freeze-aware exclusion across all of them.
+        let control_dir = get_control_path(&self.pond_path);
+        let txn_meta = PondTxnMetadata::new(
+            self.last_write_seq,
+            PondUserMetadata::new(vec!["pond".to_string(), "maintain-storage".to_string()]),
+        );
+        let _write_lock =
+            crate::write_lock::WriteLockGuard::try_acquire_for_write(&control_dir, &txn_meta)?;
 
         // Maintain data table (checkpoint + vacuum only; compaction handled
         // above).  Default retention is None (the table's 30-day default),
@@ -857,7 +946,7 @@ impl Ship {
             .map(chrono::Duration::minutes);
         let data_table = self.data_persistence.table().clone();
         let (new_data_table, mut data_result) =
-            maintenance::maintain_table(data_table, "data", force, false, data_retention).await;
+            maintenance::maintain_table(data_table, "data", force, false, data_retention).await?;
         self.data_persistence.set_table(new_data_table);
         if let Some(oc) = compact_outcome {
             data_result.compacted = oc.had_data;
@@ -883,11 +972,11 @@ impl Ship {
             compact,
             Some(chrono::Duration::minutes(control_minutes)),
         )
-        .await;
+        .await?;
         self.control_table.set_table(new_control_table);
         report.control = Some(control_result);
 
-        report
+        Ok(report)
     }
 
     /// Report which series collapse would merge at `threshold`, and what
@@ -1062,7 +1151,8 @@ impl Ship {
         // The sweep deletes every blob no committed row names, which it cannot
         // distinguish from a blob a concurrent writer has staged but not yet
         // committed.  Exclusion is the guarantee that makes it safe.
-        let _write_lock = crate::write_lock::WriteLockGuard::try_acquire(&control_dir, &txn_meta)?;
+        let _write_lock =
+            crate::write_lock::WriteLockGuard::try_acquire_for_write(&control_dir, &txn_meta)?;
 
         let (new_table, stats) = crate::reclaim::reclaim_superseded(
             self.data_persistence.table().clone(),
@@ -1115,7 +1205,8 @@ impl Ship {
         let started = Utc::now().timestamp_micros();
 
         let control_dir = get_control_path(&self.pond_path);
-        let _write_lock = crate::write_lock::WriteLockGuard::try_acquire(&control_dir, &txn_meta)?;
+        let _write_lock =
+            crate::write_lock::WriteLockGuard::try_acquire_for_write(&control_dir, &txn_meta)?;
         self.last_write_seq = txn_seq;
 
         self.control_table
@@ -2578,7 +2669,8 @@ mod tests {
             false,
             Some(chrono::Duration::milliseconds(10)),
         )
-        .await;
+        .await
+        .expect("test control maintenance");
 
         assert!(result.checkpoint_created, "forced maintain must checkpoint");
         assert!(

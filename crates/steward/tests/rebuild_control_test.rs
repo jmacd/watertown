@@ -32,6 +32,29 @@ async fn write_file(ship: &mut Ship, path: &str, bytes: &[u8], args: Vec<&str>) 
     Ok(())
 }
 
+#[tokio::test]
+async fn force_rebuild_refuses_to_remove_write_freeze() -> Result<()> {
+    let temp = tempdir()?;
+    let pond_path = temp.path().join("pond");
+    let mut ship = Ship::create_pond(&pond_path, "rebuild-freeze-test").await?;
+    write_file(&mut ship, "/a.txt", b"alpha", vec!["copy", "a.txt"]).await?;
+    let (_freeze, created) = ship
+        .freeze_writes(
+            &PondUserMetadata::new(vec!["freeze".into(), "enable".into()]),
+            "format migration".to_string(),
+        )
+        .await?;
+    assert!(created);
+
+    let error = rebuild_control_table(&pond_path, true)
+        .await
+        .expect_err("force rebuild must not remove an active freeze");
+    assert!(error.to_string().contains("writes are frozen"));
+    assert!(ship.write_freeze()?.is_some());
+    assert!(get_control_path(&pond_path).join("_delta_log").exists());
+    Ok(())
+}
+
 /// Full disaster-recovery roundtrip: build a pond, capture its identity
 /// and last write seq, delete the control table, rebuild it from data,
 /// then reopen and confirm identity + seq + data survived.
@@ -67,6 +90,10 @@ async fn rebuild_control_recovers_identity_and_history() -> Result<()> {
 
     // 3) Rebuild the control table from the data Delta table.
     let report = rebuild_control_table(&pond_path, false).await?;
+    assert!(
+        get_control_path(&pond_path).join("write.lock").exists(),
+        "missing-control rebuild must establish the stable write lock"
+    );
     assert_eq!(report.pond_id, orig_pond_id, "recovered pond_id must match");
     assert_eq!(
         report.last_txn_seq, orig_last_seq,
@@ -128,7 +155,10 @@ async fn rebuild_control_requires_force_when_control_exists() -> Result<()> {
         err
     );
 
-    // With force: succeeds and moves the old control table aside.
+    // With force: succeeds and moves the old control table aside while
+    // preserving the write-lock inode at its stable path.
+    let lock_path = get_control_path(&pond_path).join("write.lock");
+    let lock_before = std::fs::metadata(&lock_path)?;
     let report = rebuild_control_table(&pond_path, true).await?;
     let backup = report
         .backup_path
@@ -137,6 +167,16 @@ async fn rebuild_control_requires_force_when_control_exists() -> Result<()> {
         backup.exists(),
         "backed-up control dir must exist: {backup:?}"
     );
+    let lock_after = std::fs::metadata(&lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            (lock_before.dev(), lock_before.ino()),
+            (lock_after.dev(), lock_after.ino()),
+            "force rebuild must preserve the locked inode at its stable path"
+        );
+    }
     assert!(
         backup
             .file_name()

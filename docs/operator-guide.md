@@ -464,6 +464,21 @@ A mirror re-fetch rebuilds the local content closure from the remote's
 published tip; a cross-pond pull refreshes only the foreign pond's
 footprint.
 
+### Capsule recovery and storage-format migration
+
+Portable `pondcapsule.1` recovery reconstructs logical pond content into a
+fresh pond created by the current binary. It is the migration path when a
+native backup format should not be copied directly into the target.
+
+Follow [capsule-recovery-runbook.md](capsule-recovery-runbook.md) for the
+complete watershop rehearsal and Azure production procedure. In particular,
+an authoritative migration requires stopping every source writer, running
+`pond freeze enable`, verifying a final push at the exact protected commit,
+keeping the imported pond inert while its remotes are reviewed, and proving
+recovery from the target native format before cutover. Use
+`pond freeze status` to record the source tip and `pond freeze disable` only
+for an explicit pre-cutover rollback.
+
 ### Destructive recovery
 
 `pond emergency` provides destructive recovery operations (e.g. erasing
@@ -671,4 +686,3 @@ what changes is the meaning behind it.
   rebuild local bookkeeping from the data history.
 - Credentials handling, attachment model (backup vs. remote), and the cron /
   systemd patterns in [§7](#7-cron--systemd) are unaffected.
-

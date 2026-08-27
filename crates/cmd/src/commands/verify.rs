@@ -24,7 +24,11 @@ use sync_store::ContentRemote;
 
 /// Verify against `name`, or against every attached remote when `name` is
 /// `None`.
-pub async fn verify_command(ship_context: &ShipContext, name: Option<String>) -> Result<()> {
+pub async fn verify_command(
+    ship_context: &ShipContext,
+    name: Option<String>,
+    exact: bool,
+) -> Result<()> {
     let mut ship = ship_context.open_pond().await?;
 
     let targets: Vec<String> = if let Some(n) = name {
@@ -44,7 +48,7 @@ pub async fn verify_command(ship_context: &ShipContext, name: Option<String>) ->
         match verify_one(&mut ship, &name).await {
             Ok(report) => {
                 print_report(&name, &report);
-                if !report.ok {
+                if !report.ok || (exact && report.state != ContentVerifyState::UpToDate) {
                     had_mismatch = true;
                 }
             }
@@ -58,9 +62,12 @@ pub async fn verify_command(ship_context: &ShipContext, name: Option<String>) ->
     if had_error {
         Err(anyhow!("one or more verifications failed"))
     } else if had_mismatch {
-        Err(anyhow!(
-            "verification completed with mismatches; see report(s) above"
-        ))
+        let requirement = if exact {
+            "verification did not find exact matching local and remote tips"
+        } else {
+            "verification completed with mismatches"
+        };
+        Err(anyhow!("{requirement}; see report(s) above"))
     } else {
         Ok(())
     }
