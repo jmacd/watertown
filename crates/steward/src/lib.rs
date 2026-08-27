@@ -32,6 +32,8 @@ pub mod limiter;
 pub mod limiter_usage;
 pub mod maintenance;
 pub mod metered_source;
+mod pack_maintenance;
+mod pack_store;
 mod rebuild;
 pub mod reclaim;
 mod remote_config;
@@ -48,8 +50,8 @@ pub use capsule_import::{CapsuleImportProvenance, CapsuleImportReport, import_ca
 pub use content_diff::{ContentComparison, ContentDiff, DiffKind, compare_content_trees};
 pub use content_objects::{ObjectInventory, ObjectKind, inventory_content_objects};
 pub use content_pull::{
-    FetchedGraph, FetchedObject, RebuildOutcome, fetch_object_graph, import_graft, import_pond,
-    rebuild_pond, replace_graft,
+    FetchedGraph, FetchedObject, FetchedSeriesV2, RebuildOutcome, fetch_object_graph, import_graft,
+    import_pond, rebuild_pond, replace_graft,
 };
 pub use content_push::{
     ContentPushOutcome, open_and_push_to_remote_limited, push_content_to_remote,
@@ -73,6 +75,7 @@ pub use limiter::{
 pub use limiter_usage::{
     LIMITER_USAGE_PENDING_KEY, LIMITER_USAGE_SERIES, LimiterUsageRow, UsageSample,
 };
+pub use pack_maintenance::{PackCandidateOutcome, PackMaintenanceCandidate};
 pub use rebuild::{RebuildReport, rebuild_control_table};
 pub use remote_config::{RemoteAttachment, RemoteConfigError, RemoteMode};
 pub use ship::{CollapseReport, CompactOutcome, Ship};

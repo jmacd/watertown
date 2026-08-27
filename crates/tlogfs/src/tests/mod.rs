@@ -6,6 +6,7 @@ mod large_file_corruption;
 mod large_file_roundtrip;
 mod partition_cache;
 
+use crate::TLogFSError;
 use crate::persistence::OpLogPersistence;
 use arrow_array::record_batch;
 use log::{debug, info};
@@ -1838,11 +1839,18 @@ async fn test_file_physical_series_version_concatenation() {
     log::debug!("- Read back yielded concatenated content in correct order");
 }
 
-/// Collapse a multi-version FilePhysicalSeries into one merged version, then
-/// verify content, version count, and that an append AFTER collapse resumes
-/// the cumulative bao-tree from the merged baseline correctly.
+/// Row-rewriting collapse of a multi-version `FilePhysicalSeries` must be
+/// rejected outright: a merged row cannot carry the single persisted logical
+/// leaf hash the persisted-leaf invariant requires (see
+/// `docs/logical-series-identity-design.md` and
+/// `TLogFSError::CollapseUnsupported`). This replaces the previous coverage
+/// of a successful collapse-then-append, which committed an unstamped merged
+/// row and is no longer a legal production outcome.  The rejection must not
+/// touch any existing row: content, version count, and cumulative bao must be
+/// exactly as if collapse had never been attempted, and an ordinary append
+/// afterwards must behave exactly like any other append.
 #[tokio::test]
-async fn test_file_physical_series_collapse_and_append() {
+async fn test_file_physical_series_collapse_is_rejected_and_content_preserved() {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let store_path = test_dir();
@@ -1876,27 +1884,29 @@ async fn test_file_physical_series_collapse_and_append() {
         tx.commit_test().await.expect("commit");
     }
 
-    // Cumulative bao is correct across the four pre-collapse versions.
+    // Cumulative bao is correct across the four versions.
     verify_cumulative_blake3(&mut persistence, file_path, &cumulative).await;
 
-    // Collapse the four versions into one merged version.
-    let merged_version = {
+    // Attempting to collapse the four versions must be rejected, not merged.
+    {
         let tx = persistence.begin_test().await.expect("begin collapse tx");
         let wd = tx.root().await.expect("root");
         let id = wd.get_node_path(file_path).await.expect("node").id();
         let state = tx.state().expect("state");
-        let stats = state
+        let err = state
             .collapse_file_series(id, 1)
             .await
-            .expect("collapse_file_series");
-        assert!(stats.collapsed, "expected a collapse to occur");
-        assert_eq!(stats.versions_before, 4);
-        tx.commit_test().await.expect("commit collapse");
-        stats.merged_version
-    };
-    assert_eq!(merged_version, 5, "merged version is next after 4 writes");
+            .expect_err("collapse_file_series must be unsupported for logical-series-v2");
+        assert!(
+            matches!(err, TLogFSError::CollapseUnsupported { .. }),
+            "expected CollapseUnsupported, got {err:?}"
+        );
+        // No write transaction is opened by a rejected collapse, so this
+        // read-only transaction can simply be dropped without committing.
+        drop(tx);
+    }
 
-    // After collapse: content identical and exactly one live version remains.
+    // Content, version count, and cumulative bao are exactly untouched.
     {
         use tinyfs::persistence::PersistenceLayer;
         let tx = persistence.begin_test().await.expect("begin read tx");
@@ -1904,10 +1914,10 @@ async fn test_file_physical_series_collapse_and_append() {
         let content = wd
             .read_file_path_to_vec(file_path)
             .await
-            .expect("read collapsed");
+            .expect("read content");
         assert_eq!(
             content, cumulative,
-            "collapsed content must equal concatenation"
+            "a rejected collapse must not alter content"
         );
 
         let id = wd.get_node_path(file_path).await.expect("node").id();
@@ -1917,14 +1927,17 @@ async fn test_file_physical_series_collapse_and_append() {
             .list_file_versions(id)
             .await
             .expect("list versions");
-        assert_eq!(versions.len(), 1, "collapse leaves one live version");
-        assert_eq!(versions[0].version, 5);
+        assert_eq!(
+            versions.len(),
+            4,
+            "a rejected collapse must not reduce the live version count"
+        );
         tx.commit_test().await.expect("commit read");
     }
     verify_cumulative_blake3(&mut persistence, file_path, &cumulative).await;
 
-    // Append AFTER collapse — this is the bao-continuity stress: the append must
-    // resume from the merged baseline, not double-count the superseded versions.
+    // An ordinary append after the rejected collapse must behave exactly like
+    // any other append: no merged baseline to (incorrectly) resume from.
     {
         let chunk: &[u8] = b"dave,400\n";
         cumulative.extend_from_slice(chunk);
@@ -1940,7 +1953,6 @@ async fn test_file_physical_series_collapse_and_append() {
         tx.commit_test().await.expect("commit append");
     }
 
-    // Read back merged + appended content and confirm two live versions.
     {
         use tinyfs::persistence::PersistenceLayer;
         let tx = persistence.begin_test().await.expect("begin read2 tx");
@@ -1951,7 +1963,7 @@ async fn test_file_physical_series_collapse_and_append() {
             .expect("read appended");
         assert_eq!(
             content, cumulative,
-            "post-collapse append must read merged + appended content"
+            "post-attempt append must read the full concatenation"
         );
 
         let id = wd.get_node_path(file_path).await.expect("node").id();
@@ -1961,16 +1973,10 @@ async fn test_file_physical_series_collapse_and_append() {
             .list_file_versions(id)
             .await
             .expect("list versions");
-        assert_eq!(
-            versions.len(),
-            2,
-            "merged version plus one appended version"
-        );
+        assert_eq!(versions.len(), 5, "four original versions plus one append");
         tx.commit_test().await.expect("commit read2");
     }
 
-    // The decisive check: cumulative bao over the full logical content still
-    // matches a fresh computation, proving the append resumed correctly.
     verify_cumulative_blake3(&mut persistence, file_path, &cumulative).await;
 }
 
@@ -2014,11 +2020,13 @@ async fn live_version_count(persistence: &mut OpLogPersistence, file_path: &str)
     n
 }
 
-/// Collapse of versions whose content exceeds `LARGE_FILE_THRESHOLD` must keep
-/// the externally stored bytes intact and preserve cumulative bao continuity
-/// across a post-collapse append.
+/// Attempting to collapse versions whose content exceeds
+/// `LARGE_FILE_THRESHOLD` must be rejected the same as any other collapse
+/// attempt: the externally stored bytes and cumulative bao must remain
+/// exactly as the un-merged versions left them, and an append afterwards
+/// behaves as an ordinary append.
 #[tokio::test]
-async fn test_collapse_large_file_series() {
+async fn test_collapse_large_file_series_is_rejected() {
     let _ = env_logger::builder().is_test(true).try_init();
     use crate::large_files::LARGE_FILE_THRESHOLD;
 
@@ -2041,52 +2049,56 @@ async fn test_collapse_large_file_series() {
     assert_eq!(live_version_count(&mut persistence, file_path).await, 3);
     verify_cumulative_blake3(&mut persistence, file_path, &cumulative).await;
 
-    // Collapse the three large versions into one merged version.
+    // Attempting to collapse the three large versions must be rejected.
     {
         let tx = persistence.begin_test().await.expect("begin collapse tx");
         let wd = tx.root().await.expect("root");
         let id = wd.get_node_path(file_path).await.expect("node").id();
-        let stats = tx
+        let err = tx
             .state()
             .expect("state")
             .collapse_file_series(id, 1)
             .await
-            .expect("collapse_file_series");
-        assert!(stats.collapsed, "expected a collapse");
-        assert_eq!(stats.versions_before, 3);
-        assert_eq!(stats.bytes, cumulative.len() as u64);
-        tx.commit_test().await.expect("commit collapse");
+            .expect_err("collapse_file_series must be unsupported for logical-series-v2");
+        assert!(
+            matches!(err, TLogFSError::CollapseUnsupported { .. }),
+            "expected CollapseUnsupported, got {err:?}"
+        );
+        drop(tx);
     }
     assert_eq!(
         live_version_count(&mut persistence, file_path).await,
-        1,
-        "collapse leaves a single live version"
+        3,
+        "a rejected collapse must not reduce the live version count"
     );
 
-    // Content and cumulative bao are identical after collapse.
+    // Content and cumulative bao are exactly untouched.
     {
         let tx = persistence.begin_test().await.expect("begin read tx");
         let wd = tx.root().await.expect("root");
         let content = wd
             .read_file_path_to_vec(file_path)
             .await
-            .expect("read collapsed");
-        assert_eq!(content, cumulative, "collapsed large content matches");
+            .expect("read content");
+        assert_eq!(
+            content, cumulative,
+            "rejected collapse leaves content untouched"
+        );
         tx.commit_test().await.expect("commit read");
     }
     verify_cumulative_blake3(&mut persistence, file_path, &cumulative).await;
 
-    // Append after collapse and confirm the bao state resumed from the merged
-    // baseline rather than double-counting the superseded large versions.
+    // An append after the rejected collapse behaves as an ordinary append.
     let tail = vec![44u8; chunk_len];
     cumulative.extend_from_slice(&tail);
     append_series_version(&mut persistence, file_path, &tail, None).await;
+    assert_eq!(live_version_count(&mut persistence, file_path).await, 4);
     verify_cumulative_blake3(&mut persistence, file_path, &cumulative).await;
 }
 
-/// Collapsing a file that was already collapsed once must use the highest
-/// `collapsed_through` sentinel, so only the versions written after the first
-/// collapse are merged and the content stays correct.
+/// Repeated collapse attempts on a `FilePhysicalSeries` must consistently be
+/// rejected -- collapse never becomes available after a first failed attempt,
+/// and appends between attempts are unaffected.
 #[tokio::test]
 async fn test_collapse_double_collapse() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -2105,27 +2117,20 @@ async fn test_collapse_double_collapse() {
         append_series_version(&mut persistence, file_path, chunk, create).await;
     }
 
-    // First collapse: 3 versions -> merged version 4 (collapsed_through = 3).
-    let merged_one = collapse_now(&mut persistence, file_path).await;
-    assert_eq!(merged_one, 4);
-    assert_eq!(live_version_count(&mut persistence, file_path).await, 1);
+    // First attempt: rejected, three versions remain live.
+    attempt_collapse_file_series(&mut persistence, file_path).await;
+    assert_eq!(live_version_count(&mut persistence, file_path).await, 3);
 
-    // Append two more versions after the first collapse.
+    // Append two more versions after the first rejected attempt.
     for chunk in [b"d,4\n".as_slice(), b"e,5\n".as_slice()] {
         cumulative.extend_from_slice(chunk);
         append_series_version(&mut persistence, file_path, chunk, None).await;
     }
-    assert_eq!(
-        live_version_count(&mut persistence, file_path).await,
-        3,
-        "merged version plus two appends"
-    );
+    assert_eq!(live_version_count(&mut persistence, file_path).await, 5);
 
-    // Second collapse: merged version 4 plus versions 5,6 -> merged version 7
-    // (collapsed_through = 6).
-    let merged_two = collapse_now(&mut persistence, file_path).await;
-    assert_eq!(merged_two, 7);
-    assert_eq!(live_version_count(&mut persistence, file_path).await, 1);
+    // Second attempt: still rejected, all five versions remain live.
+    attempt_collapse_file_series(&mut persistence, file_path).await;
+    assert_eq!(live_version_count(&mut persistence, file_path).await, 5);
 
     {
         let tx = persistence.begin_test().await.expect("begin read tx");
@@ -2133,30 +2138,33 @@ async fn test_collapse_double_collapse() {
         let content = wd
             .read_file_path_to_vec(file_path)
             .await
-            .expect("read double-collapsed");
+            .expect("read content");
         assert_eq!(
             content, cumulative,
-            "double-collapse preserves full content"
+            "repeated rejected collapse attempts preserve full content"
         );
         tx.commit_test().await.expect("commit read");
     }
     verify_cumulative_blake3(&mut persistence, file_path, &cumulative).await;
 }
 
-/// Collapse the series file at `file_path` and return the merged version.
-async fn collapse_now(persistence: &mut OpLogPersistence, file_path: &str) -> i64 {
+/// Attempt to collapse the series file at `file_path` and assert it is
+/// rejected with `TLogFSError::CollapseUnsupported`.
+async fn attempt_collapse_file_series(persistence: &mut OpLogPersistence, file_path: &str) {
     let tx = persistence.begin_test().await.expect("begin collapse tx");
     let wd = tx.root().await.expect("root");
     let id = wd.get_node_path(file_path).await.expect("node").id();
-    let stats = tx
+    let err = tx
         .state()
         .expect("state")
         .collapse_file_series(id, 1)
         .await
-        .expect("collapse_file_series");
-    assert!(stats.collapsed, "expected a collapse at {file_path}");
-    tx.commit_test().await.expect("commit collapse");
-    stats.merged_version
+        .expect_err("collapse_file_series must be unsupported for logical-series-v2");
+    assert!(
+        matches!(err, TLogFSError::CollapseUnsupported { .. }),
+        "expected CollapseUnsupported at {file_path}, got {err:?}"
+    );
+    drop(tx);
 }
 
 /// Read the full series content at `file_path`.
@@ -2171,22 +2179,13 @@ async fn read_series_content(persistence: &mut OpLogPersistence, file_path: &str
     content
 }
 
-/// Size-tiered collapse merges a bounded *window* of same-size-class versions
-/// instead of the whole series, so several merged runs coexist. This is what
-/// makes total write volume `O(N log N)` rather than `O(N^2)`: absorbing new
-/// versions must not rewrite the accumulated history.
-///
-/// The critical invariant is ordering. A merged run is allocated a fresh
-/// (highest) version number, so a run covering versions 1..=10 outranks the
-/// loose versions 21..=25 that follow it in the byte stream. Readers must
-/// therefore order by range start, not by version. Concatenating by version
-/// would silently emit the runs *after* the loose tail, which only a
-/// multi-run fixture like this one can detect.
+/// Repeated collapse attempts against a series with many live versions must
+/// each be rejected -- no partial or size-tiered merge is performed, no
+/// versions are renumbered, and every version stays live and independently
+/// readable in order.
 #[tokio::test]
-async fn test_collapse_tiered_windows_preserve_order_and_content() {
+async fn test_collapse_many_versions_is_rejected_and_order_preserved() {
     let _ = env_logger::builder().is_test(true).try_init();
-
-    use crate::persistence::COLLAPSE_FANOUT;
 
     let store_path = test_dir();
     let mut persistence = OpLogPersistence::create_test(&store_path)
@@ -2194,8 +2193,7 @@ async fn test_collapse_tiered_windows_preserve_order_and_content() {
         .expect("Failed to create persistence");
     let file_path = "data/tiered.csv";
 
-    // 25 versions of 9 bytes each: small enough to share one size class, so the
-    // tiering policy sees a single mergeable group.
+    // 25 versions of 9 bytes each.
     let mut cumulative: Vec<u8> = Vec::new();
     for i in 0..25u32 {
         let chunk = format!("line-{i:03}\n").into_bytes();
@@ -2206,66 +2204,45 @@ async fn test_collapse_tiered_windows_preserve_order_and_content() {
     }
     assert_eq!(live_version_count(&mut persistence, file_path).await, 25);
 
-    // `max_live` is high enough that the read-cost backstop never fires, so
-    // every merge below is a genuine same-class tiered merge.
-    async fn collapse_window(persistence: &mut OpLogPersistence, file_path: &str) -> (bool, i64) {
+    // Repeated attempts, at a range of `max_live` thresholds, must all be
+    // rejected without changing the live version count or content.
+    for max_live in [1usize, 1000] {
         let tx = persistence.begin_test().await.expect("begin collapse tx");
         let wd = tx.root().await.expect("root");
         let id = wd.get_node_path(file_path).await.expect("node").id();
-        let stats = tx
+        let err = tx
             .state()
             .expect("state")
-            .collapse_file_series(id, 1000)
+            .collapse_file_series(id, max_live)
             .await
-            .expect("collapse_file_series");
-        tx.commit_test().await.expect("commit collapse");
-        (stats.collapsed, stats.merged_version)
+            .expect_err("collapse_file_series must be unsupported for logical-series-v2");
+        assert!(
+            matches!(err, TLogFSError::CollapseUnsupported { .. }),
+            "expected CollapseUnsupported at max_live={max_live}, got {err:?}"
+        );
+        drop(tx);
+        assert_eq!(
+            live_version_count(&mut persistence, file_path).await,
+            25,
+            "a rejected collapse attempt must not change the live version count"
+        );
+        assert_eq!(
+            read_series_content(&mut persistence, file_path).await,
+            cumulative,
+            "a rejected collapse attempt must not change content"
+        );
     }
 
-    // First window: COLLAPSE_FANOUT versions merge into one run, leaving the
-    // rest loose. A whole-series collapse would have left exactly one version.
-    let (first_collapsed, first_version) = collapse_window(&mut persistence, file_path).await;
-    assert!(first_collapsed, "expected a tiered collapse");
-    assert_eq!(
-        live_version_count(&mut persistence, file_path).await,
-        25 - COLLAPSE_FANOUT + 1,
-        "only one window merges; the remaining versions stay loose"
-    );
-    assert_eq!(
-        read_series_content(&mut persistence, file_path).await,
-        cumulative,
-        "content unchanged after the first tiered merge"
-    );
-
-    // Second window: a second run now coexists with the first. Its version
-    // number is higher than the loose tail's, so this is the case that fails if
-    // readers order by version rather than by range start.
-    let (second_collapsed, second_version) = collapse_window(&mut persistence, file_path).await;
-    assert!(second_collapsed, "expected a second tiered collapse");
-    assert!(
-        second_version > first_version,
-        "runs are appended, never renumbered"
-    );
-    assert_eq!(
-        live_version_count(&mut persistence, file_path).await,
-        25 - 2 * COLLAPSE_FANOUT + 2,
-        "two runs plus the still-loose tail"
-    );
-    assert_eq!(
-        read_series_content(&mut persistence, file_path).await,
-        cumulative,
-        "two coexisting runs still concatenate in series byte order"
-    );
-
-    // Appending after collapse must continue from the tail, and cumulative bao
-    // must still describe the whole stream.
+    // Appending afterwards must continue from the tail, exactly like any
+    // other append.
     let tail = b"line-final\n";
     cumulative.extend_from_slice(tail);
     append_series_version(&mut persistence, file_path, tail, None).await;
+    assert_eq!(live_version_count(&mut persistence, file_path).await, 26);
     assert_eq!(
         read_series_content(&mut persistence, file_path).await,
         cumulative,
-        "append after tiered collapse lands at the end"
+        "append after rejected collapse attempts lands at the end"
     );
     verify_cumulative_blake3(&mut persistence, file_path, &cumulative).await;
 }
@@ -2523,12 +2500,16 @@ async fn bounded_and_unbounded_providers_do_not_share_a_cache_entry() {
 }
 
 /// A `TablePhysicalSeries` accumulates one parquet file per version, so reads
-/// cost O(versions) no matter how few rows each version carries. Collapsing
-/// must merge them into a single version by re-encoding (parquet files cannot
-/// be byte-concatenated the way a `FilePhysicalSeries` can), preserving every
-/// row, and must be a no-op once already collapsed.
+/// cost O(versions) no matter how few rows each version carries. `collapse_table_series`
+/// is discoverable via `list_collapsible_series` (both physical series kinds are
+/// valid collapse *candidates* for reporting/discovery purposes), but actually
+/// invoking it must be rejected: a re-encoded merged row cannot carry the
+/// single persisted logical leaf hash the persisted-leaf invariant requires
+/// (see `docs/logical-series-identity-design.md` and
+/// `TLogFSError::CollapseUnsupported`). Every row and its row count must
+/// survive the rejected attempt untouched.
 #[tokio::test]
-async fn test_collapse_table_series_reencodes_versions() {
+async fn test_collapse_table_series_is_rejected_and_rows_preserved() {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let store_path = test_dir();
@@ -2545,10 +2526,13 @@ async fn test_collapse_table_series_reencodes_versions() {
     assert_eq!(
         live_version_count(&mut persistence, file_path).await,
         3,
-        "three appended versions are all live before collapse"
+        "three appended versions are all live before any collapse attempt"
     );
     let rows_before = table_series_rows(&mut persistence, file_path).await;
-    assert_eq!(rows_before, 6, "all six rows are visible before collapse");
+    assert_eq!(
+        rows_before, 6,
+        "all six rows are visible before any collapse attempt"
+    );
 
     let id = node_id_of(&mut persistence, file_path).await;
     assert_eq!(
@@ -2557,9 +2541,9 @@ async fn test_collapse_table_series_reencodes_versions() {
         "create_series_from_batch writes a TablePhysicalSeries"
     );
 
-    // A table series must be discoverable as a collapse candidate; before this
-    // was supported the discovery query matched FilePhysicalSeries only and
-    // these nodes could never be collapsed at any threshold.
+    // A table series must still be discoverable as a collapse candidate by
+    // `list_collapsible_series` -- discovery/reporting is unaffected by
+    // collapse execution being unsupported.
     {
         let tx = persistence.begin_test().await.expect("begin read tx");
         let candidates = tx
@@ -2570,179 +2554,44 @@ async fn test_collapse_table_series_reencodes_versions() {
             .expect("list_collapsible_series");
         assert!(
             candidates.contains(&id),
-            "a multi-version table series must be a collapse candidate"
+            "a multi-version table series must remain a reportable collapse candidate"
         );
         tx.commit_test().await.expect("commit read");
     }
 
-    // Collapse.
+    // Attempting to actually collapse it must be rejected.
     {
         let tx = persistence.begin_test().await.expect("begin collapse tx");
-        let stats = tx
+        let err = tx
             .state()
             .expect("state")
             .collapse_table_series(id, 1)
             .await
-            .expect("collapse_table_series");
-        assert!(stats.collapsed, "expected a collapse");
-        assert_eq!(stats.versions_before, 3, "three versions were merged");
-        tx.commit_test().await.expect("commit collapse");
+            .expect_err("collapse_table_series must be unsupported for logical-series-v2");
+        assert!(
+            matches!(err, TLogFSError::CollapseUnsupported { .. }),
+            "expected CollapseUnsupported, got {err:?}"
+        );
+        drop(tx);
     }
 
     assert_eq!(
         live_version_count(&mut persistence, file_path).await,
-        1,
-        "collapse leaves exactly one live version"
+        3,
+        "a rejected collapse attempt must not reduce the live version count"
     );
     assert_eq!(
         table_series_rows(&mut persistence, file_path).await,
         rows_before,
-        "re-encoding must preserve every row and must not double-count \
-         superseded versions"
+        "a rejected collapse attempt must not change the visible row count"
     );
 
-    // Already collapsed: no further candidacy and no further work.
-    {
-        let tx = persistence.begin_test().await.expect("begin read tx");
-        let candidates = tx
-            .state()
-            .expect("state")
-            .list_collapsible_series(1)
-            .await
-            .expect("list_collapsible_series");
-        assert!(
-            !candidates.contains(&id),
-            "a collapsed table series is no longer a candidate"
-        );
-        tx.commit_test().await.expect("commit read");
-    }
-    {
-        let tx = persistence.begin_test().await.expect("begin collapse tx");
-        let stats = tx
-            .state()
-            .expect("state")
-            .collapse_table_series(id, 1)
-            .await
-            .expect("second collapse_table_series");
-        assert!(
-            !stats.collapsed,
-            "collapsing an already-merged series is a no-op"
-        );
-        tx.commit_test().await.expect("commit");
-    }
-
-    // Appending after a collapse must extend the merged baseline, not resurrect
-    // the superseded versions.
+    // Appending after the rejected attempt must behave as an ordinary append.
     append_table_series_version(&mut persistence, file_path, vec![700, 800], vec![7.0, 8.0]).await;
     assert_eq!(
         table_series_rows(&mut persistence, file_path).await,
         rows_before + 2,
-        "a post-collapse append adds exactly its own rows"
-    );
-}
-
-/// Tiering the table path: with a realistic `max_live`, collapse must merge a
-/// bounded *window* of same-size-class versions instead of re-encoding the
-/// entire series on every trigger. That is what turns collapse from an O(N^2)
-/// write amplifier into an O(N log N) one.
-///
-/// This drives two collapses so a merged run and loose versions coexist, which
-/// is the configuration that hid the ordering bugs on the file path. For tables
-/// the risk is different: the window is re-encoded through a table provider fed
-/// explicit per-version URLs, so a run must be readable as an ordinary version
-/// and must not be double-counted alongside the versions it replaced.
-#[tokio::test]
-async fn test_collapse_table_series_tiered_windows() {
-    let _ = env_logger::builder().is_test(true).try_init();
-
-    let store_path = test_dir();
-    let mut persistence = OpLogPersistence::create_test(&store_path)
-        .await
-        .expect("Failed to create persistence");
-    let file_path = "table.series";
-
-    // 25 tiny disjoint appends, the shape of an hourly collector.
-    const VERSIONS: usize = 25;
-    for i in 0..VERSIONS {
-        let base = (i as i64 + 1) * 1000;
-        append_table_series_version(
-            &mut persistence,
-            file_path,
-            vec![base, base + 1],
-            vec![i as f64, i as f64 + 0.5],
-        )
-        .await;
-    }
-
-    let rows_before = table_series_rows(&mut persistence, file_path).await;
-    assert_eq!(rows_before, VERSIONS * 2, "every appended row is visible");
-    assert_eq!(
-        live_version_count(&mut persistence, file_path).await,
-        VERSIONS,
-        "no collapse has run yet"
-    );
-
-    let id = node_id_of(&mut persistence, file_path).await;
-
-    // First collapse: merges exactly one fanout-sized window, not the history.
-    async fn collapse(
-        persistence: &mut OpLogPersistence,
-        id: tinyfs::FileID,
-        max_live: usize,
-    ) -> crate::persistence::CollapseStats {
-        let tx = persistence.begin_test().await.expect("begin collapse tx");
-        let stats = tx
-            .state()
-            .expect("state")
-            .collapse_table_series(id, max_live)
-            .await
-            .expect("collapse_table_series");
-        tx.commit_test().await.expect("commit collapse");
-        stats
-    }
-
-    let stats = collapse(&mut persistence, id, VERSIONS).await;
-    assert!(
-        stats.collapsed,
-        "a full same-size-class window is available"
-    );
-    let after_first = live_version_count(&mut persistence, file_path).await;
-    assert_eq!(
-        after_first,
-        VERSIONS - 9,
-        "a window of {} versions collapses to one merged run",
-        crate::persistence::COLLAPSE_FANOUT
-    );
-    assert_eq!(
-        table_series_rows(&mut persistence, file_path).await,
-        rows_before,
-        "merging a window must neither lose rows nor double-count the \
-         versions it superseded"
-    );
-
-    // Second collapse: a merged run now coexists with loose versions, so the
-    // window picker must skip the run (different size class) and merge the next
-    // group of loose versions.
-    let stats = collapse(&mut persistence, id, VERSIONS).await;
-    assert!(stats.collapsed, "a second loose window is still available");
-    assert_eq!(
-        live_version_count(&mut persistence, file_path).await,
-        after_first - 9,
-        "the second window collapses independently of the first run"
-    );
-    assert_eq!(
-        table_series_rows(&mut persistence, file_path).await,
-        rows_before,
-        "two coexisting merged runs must not overlap or drop rows"
-    );
-
-    // Appending afterwards must extend the series, not resurrect superseded
-    // versions absorbed by either run.
-    append_table_series_version(&mut persistence, file_path, vec![99_000], vec![9.9]).await;
-    assert_eq!(
-        table_series_rows(&mut persistence, file_path).await,
-        rows_before + 1,
-        "a post-collapse append adds exactly its own rows"
+        "a post-attempt append adds exactly its own rows"
     );
 }
 
@@ -2835,8 +2684,11 @@ async fn test_list_collapsible_series_threshold() {
         tx.commit_test().await.expect("commit read");
     }
 
-    // After collapsing noisy, it is excluded because its live count drops to 1.
-    _ = collapse_now(&mut persistence, noisy).await;
+    // Collapse is unsupported for logical-series-v2, so attempting it must be
+    // rejected and must not remove `noisy` from the candidate list: discovery
+    // reports collapse-worthy series independent of whether collapse can
+    // actually run.
+    attempt_collapse_file_series(&mut persistence, noisy).await;
     {
         let tx = persistence.begin_test().await.expect("begin read tx");
         let candidates = tx
@@ -2845,9 +2697,10 @@ async fn test_list_collapsible_series_threshold() {
             .list_collapsible_series(1)
             .await
             .expect("list_collapsible_series");
-        assert!(
-            candidates.is_empty(),
-            "a collapsed file is no longer a candidate"
+        assert_eq!(
+            candidates,
+            vec![noisy_id],
+            "a rejected collapse attempt must not change candidacy"
         );
         tx.commit_test().await.expect("commit read");
     }
@@ -3731,12 +3584,19 @@ fn test_supersession_uses_ranges_not_max_watermark() {
     );
 }
 
-/// Build a `FilePhysicalSeries` of `n` nine-byte versions and collapse it twice,
-/// leaving two merged runs coexisting with a loose tail. Returns the cumulative
-/// stream bytes.
+/// Build a `FilePhysicalSeries` of `n` nine-byte versions and synthesize two
+/// merged runs (via the test-only `collapse_file_series_for_test` fixture
+/// builder), leaving two merged runs coexisting with a loose tail. Returns
+/// the cumulative stream bytes.
 ///
 /// This is the only shape that exposes the tiered-collapse reader bugs: with a
-/// single run, or with no loose tail, version order and byte order still agree.
+/// single run, or with no loose tail, version order and byte order still
+/// agree. Row-rewriting collapse is no longer a production capability for
+/// logical-series-v2 (`State::collapse_file_series` unconditionally returns
+/// `TLogFSError::CollapseUnsupported`), but the merged-row shape it used to
+/// produce remains reachable in production via content-pull replication of a
+/// source-side collapse (`collapse_prior` in `crate::file`), so the read
+/// path's range-ordering logic below still needs this fixture.
 async fn build_two_run_series(persistence: &mut OpLogPersistence, file_path: &str) -> Vec<u8> {
     let mut cumulative: Vec<u8> = Vec::new();
     for i in 0..25u32 {
@@ -3752,9 +3612,9 @@ async fn build_two_run_series(persistence: &mut OpLogPersistence, file_path: &st
         let stats = tx
             .state()
             .expect("state")
-            .collapse_file_series(id, 1000)
+            .collapse_file_series_for_test(id, 1000)
             .await
-            .expect("collapse_file_series");
+            .expect("collapse_file_series_for_test");
         assert!(stats.collapsed, "expected a tiered collapse");
         tx.commit_test().await.expect("commit collapse");
     }

@@ -39,9 +39,10 @@ use std::sync::Arc;
 use datafusion::execution::context::SessionContext;
 
 use sync_store::content::{
-    Commit, ManifestEntry, ObjectHash, Provenance, TreeEntry, VersionMeta, decode_manifest,
-    encode_manifest, encode_recipe, encode_series, encode_tree, manifest_hash,
-    node_merkle_rebuild_root, recipe_hash, series_hash,
+    Commit, ContentModelVersion, ManifestEntry, ObjectHash, PayloadKind, Provenance,
+    SeriesManifest, TreeEntry, VersionMeta, decode_manifest, encode_canonical_attributes,
+    encode_manifest, encode_recipe, encode_tree, manifest_hash, merkle_root,
+    node_merkle_rebuild_root, recipe_hash,
 };
 use tinyfs::{EntryType, ROOT_UUID};
 use tlogfs::schema::{CollapseRange, OplogEntry, decode_directory_entries, live_series_versions};
@@ -147,6 +148,39 @@ pub struct MaterializedObjects {
     /// ponds with identical content still have different manifests.  `None`
     /// only on a default-constructed value; a real fold always produces one.
     pub manifest: Option<(ObjectHash, Vec<u8>)>,
+    /// Everything [`publish_initial_series_packs`] needs to mint one
+    /// whole-range "initial" identity pack per `dp.series.2` series folded
+    /// in this materialization, without re-walking the pond. Not itself a
+    /// pushed object (a `PackIndex` is derived storage metadata excluded
+    /// from the content tree), so it is not counted by [`Self::len`]/
+    /// [`Self::is_empty`].
+    pub(crate) series_material: Vec<SeriesPackMaterial>,
+}
+
+/// One v2 series node's manifest plus its ordered live versions, captured
+/// during materialization so a later, separate step can mint an "initial"
+/// pack (`docs/logical-series-identity-design.md`) from the exact same
+/// content the fold already read, without a second pass over the pond.
+///
+/// See [`publish_initial_series_packs`] for how this is consumed and why:
+/// the dual reader (`crate::content_pull::fetch_series_v2`) requires an
+/// exact pack cover before it will trust any `dp.series.2` content, so a
+/// freshly-folded v2 series is otherwise unfetchable the moment it is
+/// pushed.
+#[derive(Debug, Clone)]
+pub(crate) struct SeriesPackMaterial {
+    /// The series' own content address -- the `dp.series.2` manifest hash,
+    /// and the key packs are published under.
+    pub(crate) series_hash: ObjectHash,
+    /// `FilePhysicalSeries` or `TablePhysicalSeries`; nothing else is ever
+    /// recorded here.
+    pub(crate) entry_type: EntryType,
+    /// The already-built, already-verified manifest this series folded to.
+    pub(crate) manifest: SeriesManifest,
+    /// This series' live versions, oldest first -- exactly the slice
+    /// [`build_series_manifest`] itself folded, including metadata-only
+    /// (no-leaf) versions, which a pack builder must skip identically.
+    pub(crate) versions: Vec<SeriesVersionData>,
 }
 
 impl MaterializedObjects {
@@ -212,6 +246,19 @@ pub(crate) struct ContentTreeIndex {
     /// Lets an incremental rebuild compute the suffix it must append to a
     /// series it already holds (design Section 8.5.3).
     pub series_versions: HashMap<NodeKey, Vec<ObjectHash>>,
+    /// Per series node, its ordered *logical leaf* hashes (ascending
+    /// version, skipping leafless metadata-only rows) --
+    /// `docs/logical-series-identity-design.md` v2 identity, distinct from
+    /// `series_versions`' physical blob identity above. A v2 materializer
+    /// (`steward::content_pull`'s `rebuild_pond`/`import_pond`) diffs a
+    /// fetched, verified [`sync_store::content::SeriesManifest`]'s ordered
+    /// leaf hashes against this per-node list to find the suffix of leaves
+    /// it must still write, exactly as `series_versions` lets a v1
+    /// incremental rebuild find its own suffix -- but at logical-leaf
+    /// granularity, which is stable across a re-encode (physical blob
+    /// identity is not: re-encoding a table leaf's Parquet bytes changes
+    /// `blob_hash` even when the decoded rows are unchanged).
+    pub series_leaf_hashes: HashMap<NodeKey, Vec<ObjectHash>>,
     /// Number of distinct nodes folded into the root.
     pub nodes_hashed: usize,
 }
@@ -239,13 +286,60 @@ struct NodeFacts {
     meta: VersionMeta,
 }
 
-/// One version of a series: its blob hash plus the inline bytes when the
-/// version is small enough to be stored in-row.  `content` is `None` for an
-/// externalized (large) version, whose bytes transfer via the external path.
-struct VersionBlob {
-    hash: ObjectHash,
-    content: Option<Vec<u8>>,
-    meta: VersionMeta,
+/// One version of a series, carrying both its physical blob identity
+/// (materialization/replica-divergence bookkeeping, keyed on raw bytes) and,
+/// when present, its persisted v2 logical-leaf identity
+/// (`docs/logical-series-identity-design.md`). Shared by the full fold
+/// ([`fold_rows`]/[`hash_child`]) and the incremental fold
+/// ([`incremental_spine_inputs`]/[`read_series_committed`]) so both compute
+/// the [`SeriesManifest`] identically -- see [`build_series_manifest`].
+#[derive(Debug, Clone)]
+pub(crate) struct SeriesVersionData {
+    /// This row's Delta table `version` number. Needed (only by
+    /// pack-maintenance's bounded repack) to fetch this one version's
+    /// inline content lazily and individually via
+    /// [`read_series_version_inline_content`], rather than the whole
+    /// series' content column being read into memory in one batch (see
+    /// that function's doc comment).
+    pub(crate) version: i64,
+    /// The physical blob hash of this version's raw bytes. Unrelated to the
+    /// v2 logical identity, but still needed to materialize/publish this
+    /// version's blob (initial pack publication/fetch keeps physical blobs
+    /// available even once the series' own identity is the manifest hash)
+    /// and for the physical-byte replica-divergence bookkeeping in
+    /// [`ContentTreeIndex::series_versions`], which is unaffected by this
+    /// module's v1-to-v2 change.
+    pub(crate) blob_hash: ObjectHash,
+    /// Inline bytes when small; `None` when externalized (large file) --
+    /// only read by the full fold's materialization sink.
+    pub(crate) content: Option<Vec<u8>>,
+    /// This version's own node metadata, canonicalized exactly as every
+    /// other node kind is (used for the tree-entry-level `VersionMeta`, a
+    /// concern distinct from the v2 manifest's own canonical-attributes
+    /// requirement below).
+    pub(crate) meta: VersionMeta,
+    /// This version's raw (un-canonicalized) `extended_attributes` JSON as
+    /// persisted on the row. Needed to compute `dp.series.2`'s
+    /// `logical_attributes` via
+    /// [`sync_store::content::encode_canonical_attributes`], whose
+    /// canonical-JSON convention is distinct from this module's own
+    /// [`canonical_attributes`].
+    pub(crate) raw_extended_attributes: Option<String>,
+    /// The persisted v2 logical leaf hash (`None` for an empty,
+    /// metadata-only append -- the nonempty-leaf invariant means there is no
+    /// leaf to identify, not an error).
+    pub(crate) logical_leaf_hash: Option<ObjectHash>,
+    /// The persisted logical count (rows for a table leaf, bytes for a file
+    /// leaf); `Some` iff `logical_leaf_hash` is `Some`.
+    pub(crate) logical_count: Option<i64>,
+    /// The persisted table schema fingerprint (`TablePhysicalSeries` only;
+    /// always `None` for a file series).
+    pub(crate) schema_fingerprint: Option<ObjectHash>,
+    /// This version's persisted physical byte size (the row's `size`
+    /// column). Needed, without reading any payload bytes, to compute an
+    /// initial pack's `physical_byte_count` directly from persisted rows
+    /// (see [`build_initial_pack_index`]).
+    pub(crate) blob_size: u64,
 }
 
 /// Compute the local pond's `root_tree_hash` from its live filesystem state.
@@ -552,7 +646,7 @@ pub(crate) async fn incremental_spine_inputs(
     // the latest leaf row, and the accumulated series version blobs per node.
     let mut dir_rows: HashMap<String, (i64, Vec<u8>)> = HashMap::new();
     let mut leaf_latest: HashMap<String, OplogEntry> = HashMap::new();
-    let mut series_new: HashMap<String, BTreeMap<i64, (ObjectHash, VersionMeta)>> = HashMap::new();
+    let mut series_new: HashMap<String, BTreeMap<i64, SeriesVersionData>> = HashMap::new();
     let mut series_ranges: HashMap<String, Vec<(i64, CollapseRange)>> = HashMap::new();
     let mut changed: BTreeSet<String> = BTreeSet::new();
     for row in uncommitted {
@@ -567,19 +661,24 @@ pub(crate) async fn incremental_spine_inputs(
         let _ = etype_of.insert(node.clone(), row.file_type);
         match row.file_type {
             EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries => {
-                let hash = row_blob_hash(&row.blake3, row.content.as_deref());
-                let _ = series_new.entry(node.clone()).or_default().insert(
+                let data = series_version_data(
                     row.version,
-                    (
-                        hash,
-                        version_meta(
-                            row.timestamp,
-                            row.min_event_time,
-                            row.max_event_time,
-                            row.extended_attributes.as_ref(),
-                        ),
-                    ),
-                );
+                    row.timestamp,
+                    &row.blake3,
+                    row.content.clone(),
+                    row.min_event_time,
+                    row.max_event_time,
+                    row.extended_attributes.as_ref(),
+                    &row.logical_leaf_hash,
+                    row.logical_count,
+                    &row.series_schema_fingerprint,
+                    row.size,
+                    &node,
+                )?;
+                let _ = series_new
+                    .entry(node.clone())
+                    .or_default()
+                    .insert(row.version, data);
                 series_ranges
                     .entry(node)
                     .or_default()
@@ -642,25 +741,30 @@ pub(crate) async fn incremental_spine_inputs(
     // New content hash of every touched series: its committed version blobs
     // followed by this transaction's appended versions, pruned by range
     // containment and ordered oldest content first, exactly as [`fold_rows`]
-    // does, then hashed as one series object.
+    // does, then folded into one dp.series.2 manifest.
     for (node, appended) in &series_new {
         let (mut versions, mut ranges) =
             read_series_committed(committed_table.clone(), local_pond_id, node).await?;
-        for (version, version_obj) in appended {
-            let _ = versions.insert(*version, version_obj.clone());
+        for (version, data) in appended {
+            let _ = versions.insert(*version, data.clone());
         }
         // This transaction's rows shadow the committed rows of the same version.
         if let Some(new_ranges) = series_ranges.get(node) {
             ranges.retain(|(v, _)| !new_ranges.iter().any(|(nv, _)| nv == v));
             ranges.extend(new_ranges.iter().copied());
         }
-        let ordered: Vec<(ObjectHash, VersionMeta)> = live_series_versions(&ranges)
+        let ordered: Vec<SeriesVersionData> = live_series_versions(&ranges)
             .into_iter()
             .filter_map(|version| versions.get(&version).cloned())
             .collect();
-        let hashes: Vec<ObjectHash> = ordered.iter().map(|(h, _)| *h).collect();
-        let _ = child_hash.insert(node.clone(), series_hash(&hashes));
-        let _ = child_versions.insert(node.clone(), ordered.into_iter().map(|(_, m)| m).collect());
+        let entry_type = *etype_of.get(node).ok_or_else(|| {
+            StewardError::DeltaLake(format!(
+                "incremental fold: series node {node} has no known entry type"
+            ))
+        })?;
+        let (manifest, meta) = build_series_manifest(entry_type, &ordered)?;
+        let _ = child_hash.insert(node.clone(), manifest.hash());
+        let _ = child_versions.insert(node.clone(), vec![meta]);
     }
 
     // Replace the listing of every modified directory, skipping the entries the
@@ -829,20 +933,15 @@ async fn read_series_committed(
     table: deltalake::DeltaTable,
     pond_id: &str,
     node_id: &str,
-) -> Result<
-    (
-        BTreeMap<i64, (ObjectHash, VersionMeta)>,
-        Vec<(i64, CollapseRange)>,
-    ),
-    StewardError,
-> {
+) -> Result<(BTreeMap<i64, SeriesVersionData>, Vec<(i64, CollapseRange)>), StewardError> {
     let ctx = SessionContext::new();
     let _previous = ctx
         .register_table("series_live", Arc::new(table))
         .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
     let sql = format!(
         "SELECT version, timestamp, blake3, content, collapsed_from, collapsed_through, \
-         min_event_time, max_event_time, extended_attributes FROM series_live \
+         min_event_time, max_event_time, extended_attributes, logical_leaf_hash, \
+         logical_count, series_schema_fingerprint, size FROM series_live \
          WHERE pond_id = '{pond_id}' AND node_id = '{node_id}' ORDER BY version",
     );
     let batches = ctx
@@ -867,27 +966,205 @@ async fn read_series_committed(
             )
         })
         .collect();
-    let mut versions: BTreeMap<i64, (ObjectHash, VersionMeta)> = BTreeMap::new();
+    let node_desc = format!("{pond_id}/{node_id}");
+    let mut versions: BTreeMap<i64, SeriesVersionData> = BTreeMap::new();
     for row in rows {
-        let _ = versions.insert(
-            row.version,
-            (
-                row_blob_hash(&row.blake3, row.content.as_deref()),
-                version_meta(
-                    row.timestamp,
-                    row.min_event_time,
-                    row.max_event_time,
-                    row.extended_attributes.as_ref(),
-                ),
-            ),
-        );
+        let version = row.version;
+        let data = series_version_data(
+            version,
+            row.timestamp,
+            &row.blake3,
+            row.content,
+            row.min_event_time,
+            row.max_event_time,
+            row.extended_attributes.as_ref(),
+            &row.logical_leaf_hash,
+            row.logical_count,
+            &row.series_schema_fingerprint,
+            row.size,
+            &node_desc,
+        )?;
+        let _ = versions.insert(version, data);
     }
     Ok((versions, ranges))
 }
 
+/// Fetch **one** already-known-live series version's inline content, by
+/// `(pond_id, node_id, version)`, straight from that one Oplog row --
+/// never the whole series' `content` column read into memory in one batch
+/// the way [`read_series_committed`] does.
+///
+/// Returns `None` when that version's row carries no inline `content` --
+/// it was externalized to `_large_files`, so its bytes must instead be
+/// streamed from there by [`SeriesVersionData::blob_hash`] -- never as a
+/// signal that the version itself is missing (callers already know it
+/// exists from a prior metadata-only ordered read, e.g.
+/// [`read_series_live_metadata_ordered`], and use `None` exactly to decide
+/// "stream externally" vs "use these inline bytes").
+///
+/// This is `crate::pack_maintenance`'s bounded per-leaf content source: a
+/// real repack fetches metadata for every live version up front (bounded,
+/// tiny), then calls this once per leaf, immediately before that leaf's
+/// bytes are streamed into the pack, so at most one leaf's inline content
+/// is ever held in memory at a time -- never a whole series' worth
+/// (finding 2, `docs/logical-series-identity-design.md`'s pack-maintenance
+/// memory-boundedness requirement).
+///
+/// # Errors
+///
+/// Returns an error if the query fails, if the row cannot be deserialized,
+/// or if more than one row shares this `(pond_id, node_id, version)` key
+/// (a corrupt/duplicated commit -- never silently resolved by picking one).
+pub(crate) async fn read_series_version_inline_content(
+    table: deltalake::DeltaTable,
+    pond_id: &str,
+    node_id: &str,
+    version: i64,
+) -> Result<Option<Vec<u8>>, StewardError> {
+    let ctx = SessionContext::new();
+    let _previous = ctx
+        .register_table("series_live", Arc::new(table))
+        .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
+    let sql = format!(
+        "SELECT content FROM series_live WHERE pond_id = '{pond_id}' AND node_id = '{node_id}' \
+         AND version = {version}",
+    );
+    let batches = ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| StewardError::DeltaLake(e.to_string()))?
+        .collect()
+        .await
+        .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
+    #[derive(serde::Deserialize)]
+    struct InlineContentRow {
+        content: Option<Vec<u8>>,
+    }
+    let mut rows: Vec<InlineContentRow> = Vec::new();
+    for batch in &batches {
+        let parsed: Vec<InlineContentRow> = serde_arrow::from_record_batch(batch)
+            .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
+        rows.extend(parsed);
+    }
+    if rows.len() > 1 {
+        return Err(StewardError::DeltaLake(format!(
+            "node {pond_id}/{node_id} version {version}: {} rows share one (pond_id, node_id, \
+             version) key (expected at most one)",
+            rows.len()
+        )));
+    }
+    Ok(rows.into_iter().next().and_then(|r| r.content))
+}
+
+/// Read one series node's current *live* versions' identity/bookkeeping
+/// metadata only, oldest first -- everything [`build_series_manifest`] and
+/// pack-maintenance candidacy need (`logical_leaf_hash`, `logical_count`,
+/// `series_schema_fingerprint`, event-time bounds, extended attributes,
+/// persisted `size`) *without* selecting or deserializing the row's
+/// (potentially large) inline `content` column at all.
+///
+/// This is the metadata-only counterpart to [`read_series_committed`]:
+/// `crate::pack_maintenance`'s discovery (shared by dry-run and a real run)
+/// uses this so surveying every over-threshold series in a pond never reads,
+/// decodes, or buffers a single byte of any series' actual payload -- a real
+/// repack instead fetches one leaf's inline content at a time, only for the
+/// one leaf it is about to stream, via
+/// [`read_series_version_inline_content`].
+///
+/// Every [`SeriesVersionData::content`] returned here is `None` regardless of
+/// whether the row's content was actually inline or externalized: nothing
+/// this feeds ([`build_series_manifest`], [`current_pack_fanout`]) reads
+/// `content` at all, so leaving it unset is correct, not merely convenient.
+///
+/// # Errors
+///
+/// Returns an error if the series rows cannot be read or deserialized.
+pub(crate) async fn read_series_live_metadata_ordered(
+    table: deltalake::DeltaTable,
+    pond_id: &str,
+    node_id: &str,
+) -> Result<Vec<SeriesVersionData>, StewardError> {
+    let ctx = SessionContext::new();
+    let _previous = ctx
+        .register_table("series_live", Arc::new(table))
+        .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
+    let sql = format!(
+        "SELECT version, timestamp, blake3, collapsed_from, collapsed_through, \
+         min_event_time, max_event_time, extended_attributes, logical_leaf_hash, \
+         logical_count, series_schema_fingerprint, size FROM series_live \
+         WHERE pond_id = '{pond_id}' AND node_id = '{node_id}' ORDER BY version",
+    );
+    let batches = ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| StewardError::DeltaLake(e.to_string()))?
+        .collect()
+        .await
+        .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
+    let mut rows: Vec<SeriesVersionMetaRow> = Vec::new();
+    for batch in &batches {
+        let parsed: Vec<SeriesVersionMetaRow> = serde_arrow::from_record_batch(batch)
+            .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
+        rows.extend(parsed);
+    }
+    let ranges: Vec<(i64, CollapseRange)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.version,
+                CollapseRange::new(r.version, r.collapsed_from, r.collapsed_through),
+            )
+        })
+        .collect();
+    let node_desc = format!("{pond_id}/{node_id}");
+    let mut versions: BTreeMap<i64, SeriesVersionData> = BTreeMap::new();
+    for row in rows {
+        let version = row.version;
+        let data = series_version_data(
+            version,
+            row.timestamp,
+            &row.blake3,
+            None,
+            row.min_event_time,
+            row.max_event_time,
+            row.extended_attributes.as_ref(),
+            &row.logical_leaf_hash,
+            row.logical_count,
+            &row.series_schema_fingerprint,
+            row.size,
+            &node_desc,
+        )?;
+        let _ = versions.insert(version, data);
+    }
+    Ok(live_series_versions(&ranges)
+        .into_iter()
+        .filter_map(|version| versions.get(&version).cloned())
+        .collect())
+}
+
+/// One committed series version row's identity/bookkeeping metadata, exactly
+/// [`SeriesVersionRow`] minus the inline `content` column -- see
+/// [`read_series_live_metadata_ordered`].
+#[derive(serde::Deserialize)]
+struct SeriesVersionMetaRow {
+    version: i64,
+    timestamp: i64,
+    blake3: Option<String>,
+    collapsed_from: Option<i64>,
+    collapsed_through: Option<i64>,
+    min_event_time: Option<i64>,
+    max_event_time: Option<i64>,
+    extended_attributes: Option<String>,
+    logical_leaf_hash: Option<String>,
+    logical_count: Option<i64>,
+    series_schema_fingerprint: Option<String>,
+    size: Option<i64>,
+}
+
 /// One committed series version row: its version and the fields
-/// [`row_blob_hash`] needs, plus the collapse range columns and the node
-/// metadata a replica cannot recompute.
+/// [`row_blob_hash`] needs, plus the collapse range columns, the node
+/// metadata a replica cannot recompute, and the v2 logical-series identity
+/// columns [`series_version_data`] parses.
 #[derive(serde::Deserialize)]
 struct SeriesVersionRow {
     version: i64,
@@ -899,6 +1176,10 @@ struct SeriesVersionRow {
     min_event_time: Option<i64>,
     max_event_time: Option<i64>,
     extended_attributes: Option<String>,
+    logical_leaf_hash: Option<String>,
+    logical_count: Option<i64>,
+    series_schema_fingerprint: Option<String>,
+    size: Option<i64>,
 }
 
 /// Read the reserved commit-log node's leaves from `table` in commit order:
@@ -1024,6 +1305,7 @@ pub(crate) fn build_commit_spine(
         request,
     };
     let commit = Commit::new(
+        ContentModelVersion::LogicalSeriesV2,
         root_tree_hash,
         parent_commit_hash,
         node_manifest_hash,
@@ -1039,8 +1321,12 @@ pub(crate) fn build_commit_spine(
 }
 
 /// Build a target pond's current node state for an incremental rebuild: a map
-/// from `node_id` to its [`ManifestEntry`], and a map from each series
-/// `node_id` to its ordered version blob hashes.
+/// from `node_id` to its [`ManifestEntry`]; a map from each series `node_id`
+/// to its ordered version blob hashes (v1 physical-blob identity); and a map
+/// from each series `node_id` to its ordered v2 logical leaf hashes (`docs/
+/// logical-series-identity-design.md`), used by native v2 materialization to
+/// find the suffix of leaves a source's fetched manifest still needs to
+/// write.
 ///
 /// The maps are keyed by `node_id` alone (not the full `NodeKey`) because an
 /// incremental pull operates within a single mirror pond; the diff against the
@@ -1054,6 +1340,7 @@ pub(crate) async fn build_target_state(
 ) -> Result<
     (
         HashMap<String, ManifestEntry>,
+        HashMap<String, Vec<ObjectHash>>,
         HashMap<String, Vec<ObjectHash>>,
     ),
     StewardError,
@@ -1079,6 +1366,7 @@ pub(crate) async fn build_target_state_for_pond(
     (
         HashMap<String, ManifestEntry>,
         HashMap<String, Vec<ObjectHash>>,
+        HashMap<String, Vec<ObjectHash>>,
     ),
     StewardError,
 > {
@@ -1087,7 +1375,7 @@ pub(crate) async fn build_target_state_for_pond(
         Ok(index) => index,
         // A foreign pond with no root row yet: first import, empty target.
         Err(StewardError::DeltaLake(msg)) if msg.contains("no root directory row") => {
-            return Ok((HashMap::new(), HashMap::new()));
+            return Ok((HashMap::new(), HashMap::new(), HashMap::new()));
         }
         Err(e) => return Err(e),
     };
@@ -1109,7 +1397,13 @@ pub(crate) async fn build_target_state_for_pond(
         .filter(|((pond, _node_id), _versions)| pond == pond_id)
         .map(|((_pond, node_id), versions)| (node_id, versions))
         .collect();
-    Ok((by_id, series))
+    let series_leaves = index
+        .series_leaf_hashes
+        .into_iter()
+        .filter(|((pond, _node_id), _leaves)| pond == pond_id)
+        .map(|((_pond, node_id), leaves)| (node_id, leaves))
+        .collect();
+    Ok((by_id, series, series_leaves))
 }
 
 /// Materialize the content objects reachable from a pond's root tree.
@@ -1141,6 +1435,214 @@ pub async fn materialize_content_objects(ship: &Ship) -> Result<MaterializedObje
     let manifest_bytes = encode_manifest(&manifest).map_err(StewardError::Content)?;
     materialized.manifest = Some((ObjectHash::of_bytes(&manifest_bytes), manifest_bytes));
     Ok(materialized)
+}
+
+/// Build the "initial" whole-range identity pack index for one folded v2
+/// series, directly from its already-persisted rows -- no payload bytes are
+/// read, decoded, concatenated, or re-encoded, and no new physical object is
+/// minted.
+///
+/// This replaces the earlier production path that rebuilt/reuploaded an
+/// entire series as one in-memory object under a `u64::MAX` layout cap
+/// (quadratic remote storage for a series that grows by repeated small
+/// appends, since every push re-encoded and republished everything again).
+/// The native `Oplog` already stores, per append, the physical blob hash
+/// ([`SeriesVersionData::blob_hash`]) the ordinary content push already
+/// publishes (inline or external, [`super::content_tree::hash_child`]'s
+/// `record_blob` call) alongside the persisted logical leaf hash/count/
+/// schema/bounds/attrs
+/// (`docs/logical-series-identity-design.md`'s persisted-leaf invariant).
+/// The pack index is therefore built by pairing each leaf-bearing version's
+/// already-published physical object with its own persisted per-leaf
+/// metadata -- the exact "one-object-per-append" physical stream, never
+/// merged or re-split.
+///
+/// A series with `leaf_count() == 0` needs no cover
+/// ([`sync_store::content::select_exact_cover`] already special-cases an
+/// empty series) and returns `Ok(None)`.
+///
+/// Deterministic and idempotent: called with the same persisted
+/// [`SeriesPackMaterial`], this always produces byte-identical
+/// [`PackIndex`] encodings, so it is safe to call repeatedly (on every push,
+/// or on-demand when a local `pond://` source is asked for a series it has
+/// not yet advertised) without ever diverging. Shared by the remote
+/// publication path ([`publish_initial_series_packs`]) and
+/// [`crate::content_source::LocalPondSource`]'s on-demand materialization
+/// of `data/_packs/series=<hex>` for an unpushed local pond.
+///
+/// # Errors
+///
+/// Returns an error if a leaf-bearing version's canonical logical
+/// attributes cannot be re-encoded, if constructing the full-range Merkle
+/// proof or the [`PackIndex`] itself is rejected (which would mean this
+/// pond's own persisted rows disagree with the manifest it just folded from
+/// those same rows -- an internal bug, not user error), or if the freshly
+/// built pack fails its own self-check against `material.manifest`.
+pub(crate) fn build_initial_pack_index(
+    material: &SeriesPackMaterial,
+) -> Result<Option<sync_store::content::PackIndex>, StewardError> {
+    if !matches!(
+        material.entry_type,
+        EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries
+    ) {
+        return Err(StewardError::DeltaLake(format!(
+            "series pack material carries an unexpected entry type {:?}",
+            material.entry_type
+        )));
+    }
+    if material.manifest.leaf_count() == 0 {
+        return Ok(None);
+    }
+    let leaf_versions: Vec<&SeriesVersionData> = material
+        .versions
+        .iter()
+        .filter(|v| v.logical_leaf_hash.is_some())
+        .collect();
+
+    let mut whole_series_leaf_hashes = Vec::with_capacity(leaf_versions.len());
+    let mut physical_object_hashes = Vec::with_capacity(leaf_versions.len());
+    let mut leaf_descriptors = Vec::with_capacity(leaf_versions.len());
+    let mut physical_byte_count: u64 = 0;
+    for v in &leaf_versions {
+        let leaf_hash = v.logical_leaf_hash.ok_or_else(|| {
+            StewardError::Content(
+                "internal: a version filtered for Some(logical_leaf_hash) above lost it -- \
+                 corrupt SeriesPackMaterial"
+                    .to_string(),
+            )
+        })?;
+        let logical_count = v.logical_count.ok_or_else(|| {
+            StewardError::Content(
+                "leaf-bearing series version has a logical_leaf_hash but no logical_count"
+                    .to_string(),
+            )
+        })?;
+        let logical_count = u64::try_from(logical_count).map_err(|_| {
+            StewardError::Content("series version logical_count is negative".to_string())
+        })?;
+        let attrs = canonical_leaf_attributes(v)?;
+        let descriptor = sync_store::content::PackLeafDescriptor::new(
+            logical_count,
+            v.meta.min_event_time,
+            v.meta.max_event_time,
+            attrs,
+        )
+        .map_err(StewardError::Content)?;
+        whole_series_leaf_hashes.push(leaf_hash);
+        physical_object_hashes.push(v.blob_hash);
+        leaf_descriptors.push(descriptor);
+        physical_byte_count = physical_byte_count
+            .checked_add(v.blob_size)
+            .ok_or_else(|| {
+                StewardError::Content("series physical_byte_count aggregate overflow".to_string())
+            })?;
+    }
+
+    let total_leaf_count = whole_series_leaf_hashes.len() as u64;
+    let range_proof = sync_store::content::generate_range_proof(
+        &whole_series_leaf_hashes,
+        0,
+        leaf_versions.len(),
+    )
+    .map_err(StewardError::Content)?;
+    let range_root = material.manifest.leaf_merkle_root();
+
+    let pack = sync_store::content::PackIndex::new(
+        material.series_hash,
+        0,
+        total_leaf_count,
+        total_leaf_count,
+        range_root,
+        range_proof,
+        physical_object_hashes,
+        material.manifest.logical_count(),
+        physical_byte_count,
+        leaf_descriptors,
+    )
+    .map_err(StewardError::Content)?;
+
+    // Self-check before ever handing this pack to a publisher: a pack built
+    // from this pond's own just-folded rows must verify against the
+    // manifest those same rows just folded to, or the persisted state and
+    // the fold disagree -- an internal bug that must not be published.
+    sync_store::content::verify_pack_against_manifest(
+        material.series_hash,
+        &material.manifest,
+        &pack,
+        &whole_series_leaf_hashes,
+    )
+    .map_err(StewardError::Content)?;
+
+    Ok(Some(pack))
+}
+
+/// Build and publish one whole-range "initial" identity pack for every v2
+/// series captured in `materialized.series_material`
+/// (`docs/logical-series-identity-design.md`).
+///
+/// A freshly-folded `dp.series.2` manifest is otherwise unfetchable the
+/// moment it is pushed: the dual reader
+/// (`crate::content_pull::fetch_series_v2`) requires an exact pack cover
+/// before it will trust any series content, and nothing else in this
+/// codebase publishes one. Each pack is minted directly from persisted rows
+/// by [`build_initial_pack_index`] -- no payload bytes are read, decoded, or
+/// re-encoded, and no new physical object is written; the pack instead
+/// advertises the exact per-version physical objects the ordinary content
+/// push already published (inline or external). Call this only after that
+/// ordinary push has durably landed those objects on `remote` (blobs-first,
+/// index-last applies across the whole push, not only within one pack).
+///
+/// `known_present` names the physical object hashes this same push already
+/// durably wrote (the just-committed inline objects and streamed external
+/// blobs) -- passed through to
+/// [`sync_store::ContentRemote::publish_pack_with_known_present`] so
+/// publishing these packs never re-probes an object this push just proved
+/// present with its own write, only objects it did not itself just write
+/// (item 3, `docs/logical-series-identity-design.md`).
+///
+/// # Errors
+///
+/// Returns an error if [`build_initial_pack_index`] fails for any series, or
+/// if publishing the pack to `remote` fails (including when a physical
+/// object the pack names is not actually present on `remote` yet -- which
+/// would mean this was called before the ordinary push completed).
+pub(crate) async fn publish_initial_series_packs(
+    remote: &sync_store::ContentRemote,
+    series_material: &[SeriesPackMaterial],
+    known_present: &HashSet<ObjectHash>,
+) -> Result<usize, StewardError> {
+    let mut published = 0usize;
+    for material in series_material {
+        let Some(pack) = build_initial_pack_index(material)? else {
+            continue;
+        };
+        let _ = remote
+            .publish_pack_with_known_present(material.series_hash, &pack, &[], known_present)
+            .await
+            .map_err(|e| StewardError::Content(format!("publish initial series pack: {e}")))?;
+        published += 1;
+    }
+    Ok(published)
+}
+
+/// This version's `logical_attributes`, re-encoded canonically (see
+/// [`encode_canonical_attributes`]), or `None` when the version carries no
+/// extended attributes -- matching [`sync_store::content::FileLeafInput`]/
+/// [`TableLeafInput`]'s absent-vs-empty convention.
+///
+/// Also reused by `crate::pack_maintenance`'s repack paths (`pub(crate)`)
+/// so a repack's own [`PackLeafDescriptor`](sync_store::content::PackLeafDescriptor)s
+/// use the identical canonicalization the initial pack publication path
+/// does.
+pub(crate) fn canonical_leaf_attributes(
+    version: &SeriesVersionData,
+) -> Result<Option<Vec<u8>>, StewardError> {
+    match &version.raw_extended_attributes {
+        Some(json) => Ok(Some(encode_canonical_attributes(json).map_err(|e| {
+            StewardError::Content(format!("logical attributes: {e}"))
+        })?)),
+        None => Ok(None),
+    }
 }
 
 /// Scan a pond's live rows once for the content fold (and, in the per-commit
@@ -1180,7 +1682,8 @@ async fn scan_live_rows(
 const NARROW_META_SQL: &str = "SELECT part_id, node_id, file_type, timestamp, version, \
      arrow_cast(NULL, 'Binary') AS content, blake3, size, min_event_time, max_event_time, \
      extended_attributes, factory, format, txn_seq, pond_id, \
-     arrow_cast(NULL, 'Binary') AS bao_outboard, collapsed_through, collapsed_from \
+     arrow_cast(NULL, 'Binary') AS bao_outboard, collapsed_through, collapsed_from, \
+     logical_leaf_hash, logical_count, series_schema_fingerprint \
      FROM content_live ORDER BY pond_id, part_id, node_id, version";
 
 /// Content of exactly the structural rows the fold decodes -- those without a
@@ -1271,7 +1774,7 @@ fn fold_rows(
 ) -> Result<ContentTreeIndex, StewardError> {
     // Latest-version facts per node, and per-version blobs for series.
     let mut latest: HashMap<NodeKey, NodeFacts> = HashMap::new();
-    let mut series_versions: HashMap<NodeKey, BTreeMap<i64, VersionBlob>> = HashMap::new();
+    let mut series_versions: HashMap<NodeKey, BTreeMap<i64, SeriesVersionData>> = HashMap::new();
     // Collapse range of every series row.  A compaction leaves the superseded
     // per-version rows in the table beside a merged row covering them; the
     // superseded versions are pruned after the scan.
@@ -1284,20 +1787,25 @@ fn fold_rows(
             row.file_type,
             EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries
         ) {
-            let hash = row_blob_hash(&row.blake3, row.content.as_deref());
-            let _ = series_versions.entry(key.clone()).or_default().insert(
+            let node_desc = format!("{}/{}", key.0, key.1);
+            let data = series_version_data(
                 row.version,
-                VersionBlob {
-                    hash,
-                    content: row.content.clone(),
-                    meta: version_meta(
-                        row.timestamp,
-                        row.min_event_time,
-                        row.max_event_time,
-                        row.extended_attributes.as_ref(),
-                    ),
-                },
-            );
+                row.timestamp,
+                &row.blake3,
+                row.content.clone(),
+                row.min_event_time,
+                row.max_event_time,
+                row.extended_attributes.as_ref(),
+                &row.logical_leaf_hash,
+                row.logical_count,
+                &row.series_schema_fingerprint,
+                row.size,
+                &node_desc,
+            )?;
+            let _ = series_versions
+                .entry(key.clone())
+                .or_default()
+                .insert(row.version, data);
             series_ranges
                 .entry(key.clone())
                 .or_default()
@@ -1336,17 +1844,17 @@ fn fold_rows(
     // reconstructs a pulled series by writing these blobs in order, and
     // plan_series_versions compares them as a prefix to find the suffix it must
     // append.
-    let mut series_live: HashMap<NodeKey, Vec<VersionBlob>> = HashMap::new();
+    let mut series_live: HashMap<NodeKey, Vec<SeriesVersionData>> = HashMap::new();
     for (key, versions) in &mut series_versions {
         let ordered = match series_ranges.get(key) {
             Some(ranges) => live_series_versions(ranges),
             None => versions.keys().copied().collect(),
         };
-        let blobs: Vec<VersionBlob> = ordered
+        let items: Vec<SeriesVersionData> = ordered
             .into_iter()
             .filter_map(|version| versions.remove(&version))
             .collect();
-        let _ = series_live.insert(key.clone(), blobs);
+        let _ = series_live.insert(key.clone(), items);
     }
     let series_versions = series_live;
 
@@ -1370,9 +1878,21 @@ fn fold_rows(
         sink,
     )?;
 
+    let series_leaf_hashes = series_versions
+        .iter()
+        .map(|(key, versions)| {
+            (
+                key.clone(),
+                versions
+                    .iter()
+                    .filter_map(|v| v.logical_leaf_hash)
+                    .collect(),
+            )
+        })
+        .collect();
     let series_version_hashes = series_versions
         .into_iter()
-        .map(|(key, versions)| (key, versions.iter().map(|v| v.hash).collect()))
+        .map(|(key, versions)| (key, versions.iter().map(|v| v.blob_hash).collect()))
         .collect();
 
     Ok(ContentTreeIndex {
@@ -1380,6 +1900,7 @@ fn fold_rows(
         root_key,
         dirs,
         series_versions: series_version_hashes,
+        series_leaf_hashes,
         nodes_hashed: memo.len(),
     })
 }
@@ -1432,6 +1953,229 @@ fn version_meta(
     }
 }
 
+/// Parse a persisted hex `ObjectHash` column, erroring loudly on malformed
+/// hex rather than silently treating it as absent.
+///
+/// `logical_leaf_hash` and `series_schema_fingerprint` are written by exactly
+/// one code path (`tlogfs::series_identity::stamp_logical_leaf`) that always
+/// produces valid hex, so a decode failure here means the persisted row is
+/// corrupt -- a `None` fallback would silently drop a leaf from the series
+/// identity, which is exactly the class of bug
+/// `docs/logical-series-identity-design.md` requires being loud about.
+fn parse_optional_object_hash(
+    hex: Option<&str>,
+    field: &str,
+    node_desc: &str,
+) -> Result<Option<ObjectHash>, StewardError> {
+    hex.map(|s| {
+        ObjectHash::from_hex(s).map_err(|e| {
+            StewardError::DeltaLake(format!("node {node_desc}: invalid {field} hex {s:?}: {e}"))
+        })
+    })
+    .transpose()
+}
+
+/// Build one series version's [`SeriesVersionData`] from its row's scalar
+/// fields. Shared by the full fold ([`fold_rows`]) and the incremental fold
+/// ([`incremental_spine_inputs`], [`read_series_committed`]) so a row's v2
+/// fields are parsed identically everywhere.
+#[allow(clippy::too_many_arguments)]
+fn series_version_data(
+    version: i64,
+    timestamp: i64,
+    blake3: &Option<String>,
+    content: Option<Vec<u8>>,
+    min_event_time: Option<i64>,
+    max_event_time: Option<i64>,
+    extended_attributes: Option<&String>,
+    logical_leaf_hash: &Option<String>,
+    logical_count: Option<i64>,
+    series_schema_fingerprint: &Option<String>,
+    size: Option<i64>,
+    node_desc: &str,
+) -> Result<SeriesVersionData, StewardError> {
+    let blob_hash = row_blob_hash(blake3, content.as_deref());
+    let logical_leaf_hash =
+        parse_optional_object_hash(logical_leaf_hash.as_deref(), "logical_leaf_hash", node_desc)?;
+    let schema_fingerprint = parse_optional_object_hash(
+        series_schema_fingerprint.as_deref(),
+        "series_schema_fingerprint",
+        node_desc,
+    )?;
+    // The row's own persisted `size` is authoritative for physical byte
+    // count (needed by initial pack construction without reading payload
+    // bytes); fall back to the inline content length only when `size` was
+    // never recorded (older rows), never silently to zero for content that
+    // is actually present.
+    let blob_size = match size {
+        Some(s) if s >= 0 => s as u64,
+        Some(negative) => {
+            return Err(StewardError::DeltaLake(format!(
+                "node {node_desc}: negative persisted size {negative}"
+            )));
+        }
+        None => content.as_deref().map(<[u8]>::len).unwrap_or(0) as u64,
+    };
+    Ok(SeriesVersionData {
+        version,
+        blob_hash,
+        meta: version_meta(
+            timestamp,
+            min_event_time,
+            max_event_time,
+            extended_attributes,
+        ),
+        raw_extended_attributes: extended_attributes.cloned(),
+        logical_leaf_hash,
+        logical_count,
+        schema_fingerprint,
+        blob_size,
+        content,
+    })
+}
+
+/// Build a series node's `dp.series.2` [`SeriesManifest`] and its single
+/// aggregate [`VersionMeta`] from its live versions in fold order (oldest
+/// first).
+///
+/// A version with no persisted `logical_leaf_hash` contributes no leaf
+/// (skipped when building the ordered leaf sequence and the
+/// `logical_count`/event-bounds aggregates) ONLY when it is truly empty
+/// (`blob_size == 0`) -- a genuine metadata-only touch. A NONEMPTY leafless
+/// live version is corruption (BLOCKER 3, `docs/logical-series-identity-design.md`:
+/// every public write path stamps `stamp_logical_leaf` before a nonempty
+/// series row can commit) and is rejected with an error rather than
+/// silently dropped, since silently skipping it would erase a real logical
+/// leaf from the series' identity without a trace. Either way, a leafless
+/// version's `series_schema_fingerprint` (a table-level property, not tied
+/// to any one leaf) still participates in the schema-fingerprint
+/// consistency check, since a metadata-only touch can still carry the
+/// series' schema.
+///
+/// The returned `VersionMeta` -- the *one* series-level metadata record a v2
+/// series tree entry carries (`docs/logical-series-identity-design.md`,
+/// rather than one per physical version as v1 did) -- takes its timestamp
+/// and attributes from the latest version that contributed a leaf (the
+/// latest *logical* append), alongside the aggregate event bounds.
+///
+/// # Errors
+///
+/// Returns an error if `entry_type` is not a series type, if a nonempty
+/// version has no `logical_leaf_hash` (corrupt row), if a leaf-bearing
+/// version is missing its `logical_count`, if the aggregate `logical_count`
+/// overflows `u64`, if a table series' versions disagree about their schema
+/// fingerprint, or if the assembled manifest fails
+/// [`SeriesManifest::new`]'s invariants (for example a table series with no
+/// schema fingerprint available from any version).
+pub(crate) fn build_series_manifest(
+    entry_type: EntryType,
+    versions: &[SeriesVersionData],
+) -> Result<(SeriesManifest, VersionMeta), StewardError> {
+    let payload_kind = match entry_type {
+        EntryType::FilePhysicalSeries => PayloadKind::File,
+        EntryType::TablePhysicalSeries => PayloadKind::Table,
+        other => {
+            return Err(StewardError::DeltaLake(format!(
+                "build_series_manifest called for non-series entry type {other:?}"
+            )));
+        }
+    };
+
+    let mut leaf_hashes: Vec<ObjectHash> = Vec::new();
+    let mut logical_count: u64 = 0;
+    let mut min_event_time: Option<i64> = None;
+    let mut max_event_time: Option<i64> = None;
+    let mut schema_fingerprint: Option<ObjectHash> = None;
+    let mut latest_meta: Option<VersionMeta> = None;
+    let mut latest_raw_attrs: Option<String> = None;
+
+    for v in versions {
+        if let Some(fp) = v.schema_fingerprint {
+            match schema_fingerprint {
+                None => schema_fingerprint = Some(fp),
+                Some(existing) if existing != fp => {
+                    return Err(StewardError::DeltaLake(
+                        "table series has inconsistent schema fingerprints across its versions"
+                            .to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        let Some(leaf_hash) = v.logical_leaf_hash else {
+            // A leafless live version is only legitimate when it is truly
+            // empty (zero physical bytes): a metadata-only touch that
+            // carries no content of its own. A nonempty leafless row means
+            // `stamp_logical_leaf` was bypassed or failed silently upstream
+            // -- BLOCKER 3 requires this be treated as corruption here, not
+            // silently skipped, since silently skipping it would drop a
+            // real logical leaf from the series' identity without a trace.
+            if v.blob_size > 0 {
+                return Err(StewardError::DeltaLake(format!(
+                    "series version at timestamp {:?} is nonempty ({} bytes) but has no \
+                     logical_leaf_hash -- corrupt row (persisted-leaf invariant violated)",
+                    v.meta.timestamp, v.blob_size
+                )));
+            }
+            continue;
+        };
+        leaf_hashes.push(leaf_hash);
+        let count = v.logical_count.ok_or_else(|| {
+            StewardError::DeltaLake(
+                "series version has a logical_leaf_hash but no logical_count".to_string(),
+            )
+        })?;
+        let count = u64::try_from(count).map_err(|_| {
+            StewardError::DeltaLake("series version has a negative logical_count".to_string())
+        })?;
+        logical_count = logical_count.checked_add(count).ok_or_else(|| {
+            StewardError::DeltaLake("series logical_count aggregate overflow".to_string())
+        })?;
+        if let Some(min) = v.meta.min_event_time {
+            min_event_time = Some(min_event_time.map_or(min, |cur: i64| cur.min(min)));
+        }
+        if let Some(max) = v.meta.max_event_time {
+            max_event_time = Some(max_event_time.map_or(max, |cur: i64| cur.max(max)));
+        }
+        latest_meta = Some(v.meta.clone());
+        latest_raw_attrs = v.raw_extended_attributes.clone();
+    }
+
+    let leaf_merkle_root = merkle_root(&leaf_hashes);
+    let logical_attributes = match &latest_raw_attrs {
+        Some(json) => Some(
+            encode_canonical_attributes(json)
+                .map_err(|e| StewardError::DeltaLake(format!("logical attributes: {e}")))?,
+        ),
+        None => None,
+    };
+
+    let manifest = SeriesManifest::new(
+        payload_kind,
+        schema_fingerprint,
+        logical_count,
+        leaf_hashes.len() as u64,
+        min_event_time,
+        max_event_time,
+        logical_attributes,
+        leaf_merkle_root,
+    )
+    .map_err(StewardError::DeltaLake)?;
+
+    let meta = VersionMeta {
+        timestamp: latest_meta
+            .as_ref()
+            .and_then(|m| m.timestamp)
+            .or_else(|| versions.last().and_then(|v| v.meta.timestamp)),
+        min_event_time,
+        max_event_time,
+        extended_attributes: latest_meta.and_then(|m| m.extended_attributes),
+    };
+
+    Ok((manifest, meta))
+}
+
 /// Fold one directory (by key) into its recursive [`tree_hash`], recording its
 /// child list into `dirs` for later comparison.  When `sink` is `Some`, the
 /// encoded tree object bytes (and, via `hash_child`, descendant object bytes)
@@ -1440,7 +2184,7 @@ fn version_meta(
 fn hash_directory(
     key: &NodeKey,
     latest: &HashMap<NodeKey, NodeFacts>,
-    series_versions: &HashMap<NodeKey, Vec<VersionBlob>>,
+    series_versions: &HashMap<NodeKey, Vec<SeriesVersionData>>,
     memo: &mut HashMap<NodeKey, ObjectHash>,
     in_progress: &mut Vec<NodeKey>,
     dirs: &mut HashMap<NodeKey, Vec<ChildRef>>,
@@ -1547,7 +2291,7 @@ fn hash_child(
     key: &NodeKey,
     entry_type: EntryType,
     latest: &HashMap<NodeKey, NodeFacts>,
-    series_versions: &HashMap<NodeKey, Vec<VersionBlob>>,
+    series_versions: &HashMap<NodeKey, Vec<SeriesVersionData>>,
     memo: &mut HashMap<NodeKey, ObjectHash>,
     in_progress: &mut Vec<NodeKey>,
     dirs: &mut HashMap<NodeKey, Vec<ChildRef>>,
@@ -1564,18 +2308,42 @@ fn hash_child(
             let versions = series_versions.get(key).ok_or_else(|| {
                 StewardError::DeltaLake(format!("missing series node {}/{}", key.0, key.1))
             })?;
-            let ordered: Vec<ObjectHash> = versions.iter().map(|v| v.hash).collect();
-            let metas: Vec<VersionMeta> = versions.iter().map(|v| v.meta.clone()).collect();
-            let series = series_hash(&ordered);
+            let (manifest, meta) = build_series_manifest(entry_type, versions)?;
+            let hash = manifest.hash();
             if let Some(sink) = sink {
-                // The series manifest object, plus each version blob: small
-                // versions inline, large (externalized) versions by hash (D7).
-                sink.put_inline(series, encode_series(&ordered));
+                // The v2 dp.series.2 manifest object, plus each version's
+                // physical blob: small versions inline, large (externalized)
+                // versions by hash (D7). Physical blobs stay available for
+                // initial pack publication/fetch even though the series'
+                // identity is now the manifest hash, not a hash over these
+                // blobs (`docs/logical-series-identity-design.md`).
+                sink.put_inline(hash, manifest.encode());
                 for v in versions.iter() {
-                    record_blob(sink, v.hash, v.content.as_deref());
+                    record_blob(sink, v.blob_hash, v.content.as_deref());
                 }
+                // Capture what `publish_initial_series_packs` needs to mint
+                // this series' whole-range identity pack, so the dual
+                // reader can fetch it the moment it is pushed.
+                // `build_initial_pack_index` (the sole reader of
+                // `SeriesPackMaterial::versions`) never reads a version's
+                // inline `content` -- it was already recorded above via
+                // `record_blob` for materialization -- so drop it here
+                // rather than cloning every inline series payload a second
+                // time into this side table (release blocker item 3): an
+                // in-memory `push`/`pond://` fold would otherwise briefly
+                // hold two copies of all inline series content at once.
+                sink.series_material.push(SeriesPackMaterial {
+                    series_hash: hash,
+                    entry_type,
+                    manifest: manifest.clone(),
+                    versions: versions
+                        .iter()
+                        .cloned()
+                        .map(|v| SeriesVersionData { content: None, ..v })
+                        .collect(),
+                });
             }
-            Ok((series, metas))
+            Ok((hash, vec![meta]))
         }
         // Symlinks hash their target bytes; dynamic nodes hash their recipe
         // (factory type plus config), so the content commits to the factory and
@@ -1701,15 +2469,21 @@ mod tests {
         // A later window, versions 21..=31, merged as version 36 -- so the
         // highest sentinel (31) sits *above* run A's version number (26).
         let series_row = |version: i64, from: Option<i64>, through: Option<i64>| {
-            let mut row = OplogEntry::new_small_file(
-                series_id,
-                version,
-                version,
-                format!("blob-for-version-{version}").into_bytes(),
-                1,
-            );
+            let content = format!("blob-for-version-{version}").into_bytes();
+            let mut row =
+                OplogEntry::new_small_file(series_id, version, version, content.clone(), 1);
             row.collapsed_from = from;
             row.collapsed_through = through;
+            // BLOCKER 3: every nonempty live row must carry a valid logical
+            // leaf hash/count -- these synthetic rows emulate the (now
+            // production-unreachable, see `schema::tests` for why) tiered
+            // collapse row shape purely to test `fold_rows`'s range-pruning
+            // logic, so they must still satisfy the invariant
+            // `build_series_manifest` now enforces.
+            let hash = sync_store::content::file_leaf_hash(&content, None, None, None)
+                .expect("file leaf hash");
+            row.logical_leaf_hash = Some(hash.to_hex());
+            row.logical_count = Some(content.len() as i64);
             row
         };
         let run_a = series_row(26, Some(1), Some(10));
@@ -1809,5 +2583,318 @@ mod tests {
             .find(|r| r.blake3.is_some())
             .expect("file row present");
         assert_eq!(full_file.content.as_deref(), Some(file_content.as_slice()));
+    }
+
+    #[tokio::test]
+    async fn native_fold_emits_decodable_series_manifest_and_append_changes_root() {
+        use tinyfs::{DirectoryEntry, EntryType, FileID};
+        use tlogfs::schema::{ExtendedAttributes, encode_directory_entries};
+
+        let pond = tinyfs::local_pond_uuid();
+        let dir_id = FileID::root_for(pond);
+        let series_id =
+            FileID::new_in_partition(dir_id.part_id(), EntryType::FilePhysicalSeries, pond);
+
+        let dir_content = encode_directory_entries(&[DirectoryEntry::new(
+            "series".to_string(),
+            series_id.node_id(),
+            EntryType::FilePhysicalSeries,
+            1,
+        )])
+        .expect("encode directory");
+        let dir_row = OplogEntry::new_inline(dir_id, 1, 1, dir_content, 1);
+
+        let mut attrs_v1 = ExtendedAttributes::default();
+        _ = attrs_v1.set_timestamp_column("ts");
+        let mut v1 =
+            OplogEntry::new_file_series(series_id, 100, 1, b"aaaa".to_vec(), 10, 20, attrs_v1, 1);
+        tlogfs::series_identity::stamp_logical_leaf(std::path::Path::new("/unused"), &mut v1)
+            .await
+            .expect("stamp v1");
+
+        // Fold with only the first version: proves the manifest is
+        // decodable and correct with a single leaf.
+        let index_one = fold_rows(vec![dir_row.clone(), v1.clone()], &pond.to_string(), None)
+            .expect("fold one version");
+        let mut sink_one = MaterializedObjects::default();
+        let index_one_sunk = fold_rows(
+            vec![dir_row.clone(), v1.clone()],
+            &pond.to_string(),
+            Some(&mut sink_one),
+        )
+        .expect("fold one version with sink");
+        assert_eq!(index_one.root_tree_hash, index_one_sunk.root_tree_hash);
+
+        let root_key = (pond.to_string(), ROOT_UUID.to_string());
+        let one_series_child = index_one_sunk
+            .dirs
+            .get(&root_key)
+            .expect("root children")
+            .iter()
+            .find(|c| c.name == "series")
+            .expect("series child ref");
+        let manifest_bytes_one = sink_one
+            .inline
+            .get(&one_series_child.child_hash)
+            .expect("manifest object materialized under its own hash");
+        let manifest_one =
+            SeriesManifest::decode(manifest_bytes_one).expect("decode dp.series.2 manifest");
+        assert_eq!(manifest_one.payload_kind(), PayloadKind::File);
+        assert_eq!(manifest_one.logical_count(), 4, "4 bytes in v1");
+        assert_eq!(manifest_one.leaf_count(), 1);
+        assert_eq!(manifest_one.min_event_time(), Some(10));
+        assert_eq!(manifest_one.max_event_time(), Some(20));
+        assert_eq!(one_series_child.versions.len(), 1);
+        assert_eq!(one_series_child.versions[0].timestamp, Some(100));
+
+        // Now append a second version and fold again.
+        let mut attrs_v2 = ExtendedAttributes::default();
+        _ = attrs_v2.set_timestamp_column("ts");
+        let mut v2 =
+            OplogEntry::new_file_series(series_id, 200, 2, b"bbbbbb".to_vec(), 30, 40, attrs_v2, 2);
+        tlogfs::series_identity::stamp_logical_leaf(std::path::Path::new("/unused"), &mut v2)
+            .await
+            .expect("stamp v2");
+
+        let mut sink_two = MaterializedObjects::default();
+        let index_two = fold_rows(
+            vec![dir_row, v1, v2],
+            &pond.to_string(),
+            Some(&mut sink_two),
+        )
+        .expect("fold two versions with sink");
+
+        assert_ne!(
+            index_one_sunk.root_tree_hash, index_two.root_tree_hash,
+            "appending a second logical leaf must change the root tree hash"
+        );
+
+        let two_series_child = index_two
+            .dirs
+            .get(&root_key)
+            .expect("root children")
+            .iter()
+            .find(|c| c.name == "series")
+            .expect("series child ref");
+        assert_ne!(
+            one_series_child.child_hash, two_series_child.child_hash,
+            "the series manifest hash itself must change with the append"
+        );
+        let manifest_bytes_two = sink_two
+            .inline
+            .get(&two_series_child.child_hash)
+            .expect("manifest object materialized under its own hash");
+        let manifest_two =
+            SeriesManifest::decode(manifest_bytes_two).expect("decode dp.series.2 manifest");
+        assert_eq!(manifest_two.logical_count(), 10, "4 + 6 bytes across both");
+        assert_eq!(manifest_two.leaf_count(), 2);
+        assert_eq!(
+            manifest_two.min_event_time(),
+            Some(10),
+            "aggregate min must come from the earliest version"
+        );
+        assert_eq!(
+            manifest_two.max_event_time(),
+            Some(40),
+            "aggregate max must come from the latest version"
+        );
+
+        // Design doc: one series-level VersionMeta per tree entry, not one
+        // per physical row -- and it reflects the latest logical append.
+        assert_eq!(two_series_child.versions.len(), 1);
+        assert_eq!(
+            two_series_child.versions[0].timestamp,
+            Some(200),
+            "aggregate VersionMeta.timestamp must be the latest append's timestamp"
+        );
+        assert_eq!(two_series_child.versions[0].min_event_time, Some(10));
+        assert_eq!(two_series_child.versions[0].max_event_time, Some(40));
+    }
+
+    /// `build_series_manifest`'s aggregation must be a pure, repeatable
+    /// function of its input rows: same versions in, byte-identical manifest
+    /// and metadata out, every time. And per the design doc, an empty
+    /// (metadata-only, no logical leaf) version in the middle of a series
+    /// must be transparent to aggregation -- it contributes no leaf, no
+    /// count, and must not become the "latest" version merely by appearing
+    /// last in a slice; only leaf-bearing versions can be "the latest
+    /// logical append".
+    #[test]
+    fn build_series_manifest_aggregation_is_deterministic_and_uses_latest_leaf_bearing_version() {
+        let leaf_a = ObjectHash::of_bytes(b"leaf-a");
+        let leaf_b = ObjectHash::of_bytes(b"leaf-b");
+
+        let v_a = SeriesVersionData {
+            version: 1,
+            blob_hash: ObjectHash::of_bytes(b"blob-a"),
+            content: None,
+            meta: VersionMeta {
+                timestamp: Some(100),
+                min_event_time: Some(10),
+                max_event_time: Some(20),
+                extended_attributes: Some("{\"a\":\"1\"}".to_string()),
+            },
+            raw_extended_attributes: Some("{\"a\":\"1\"}".to_string()),
+            logical_leaf_hash: Some(leaf_a),
+            logical_count: Some(4),
+            schema_fingerprint: None,
+            blob_size: 4,
+        };
+        // A metadata-only version between the two real leaves: no leaf hash,
+        // so it must not perturb the aggregate bounds or become "latest".
+        let v_metadata_only = SeriesVersionData {
+            version: 2,
+            blob_hash: ObjectHash::of_bytes(b"blob-meta"),
+            content: None,
+            meta: VersionMeta {
+                timestamp: Some(150),
+                min_event_time: Some(9_999),
+                max_event_time: Some(9_999),
+                extended_attributes: Some("{\"a\":\"should-not-win\"}".to_string()),
+            },
+            raw_extended_attributes: Some("{\"a\":\"should-not-win\"}".to_string()),
+            logical_leaf_hash: None,
+            logical_count: None,
+            schema_fingerprint: None,
+            blob_size: 0,
+        };
+        let v_b = SeriesVersionData {
+            version: 3,
+            blob_hash: ObjectHash::of_bytes(b"blob-b"),
+            content: None,
+            meta: VersionMeta {
+                timestamp: Some(200),
+                min_event_time: Some(30),
+                max_event_time: Some(40),
+                extended_attributes: Some("{\"a\":\"2\"}".to_string()),
+            },
+            raw_extended_attributes: Some("{\"a\":\"2\"}".to_string()),
+            logical_leaf_hash: Some(leaf_b),
+            logical_count: Some(6),
+            schema_fingerprint: None,
+            blob_size: 6,
+        };
+        let versions = vec![v_a, v_metadata_only, v_b];
+
+        let (manifest_1, meta_1) =
+            build_series_manifest(EntryType::FilePhysicalSeries, &versions).expect("fold 1");
+        let (manifest_2, meta_2) =
+            build_series_manifest(EntryType::FilePhysicalSeries, &versions).expect("fold 2");
+
+        assert_eq!(
+            manifest_1.hash(),
+            manifest_2.hash(),
+            "aggregation must be deterministic across repeated calls"
+        );
+        assert_eq!(manifest_1.logical_count(), 10);
+        assert_eq!(manifest_1.leaf_count(), 2);
+        assert_eq!(manifest_1.min_event_time(), Some(10));
+        assert_eq!(manifest_1.max_event_time(), Some(40));
+        assert_eq!(
+            meta_1.timestamp,
+            Some(200),
+            "latest LEAF-BEARING version's timestamp wins, not the metadata-only row's"
+        );
+        assert_eq!(meta_1.min_event_time, Some(10));
+        assert_eq!(meta_1.max_event_time, Some(40));
+        assert_eq!(meta_1.timestamp, meta_2.timestamp);
+        assert_eq!(meta_1.extended_attributes, meta_2.extended_attributes);
+    }
+
+    /// DIAGNOSTIC PROBE (not a permanent assertion of desired behavior):
+    /// a `TablePhysicalSeries` whose only version is genuinely empty
+    /// (`blob_size == 0`, no schema fingerprint -- the state
+    /// `tlogfs::persistence::stamp_and_validate_series_entry` currently
+    /// still accepts as version 1) can never carry a schema fingerprint,
+    /// but [`SeriesManifest::new`] unconditionally requires one for
+    /// [`PayloadKind::Table`] regardless of `leaf_count`. This probe
+    /// confirms the resulting fold failure surfaces as a clear, typed
+    /// error (not a panic or a corrupted manifest), which is what makes it
+    /// safe to reject the same state earlier, at the tlogfs write choke
+    /// point, with an equally clear message (release blocker item 1,
+    /// `docs/logical-series-identity-design.md`).
+    #[test]
+    fn build_series_manifest_cannot_represent_a_genuinely_empty_table_series() {
+        let v_empty = SeriesVersionData {
+            version: 4,
+            blob_hash: ObjectHash::of_bytes(b""),
+            content: Some(Vec::new()),
+            meta: VersionMeta {
+                timestamp: Some(100),
+                min_event_time: None,
+                max_event_time: None,
+                extended_attributes: None,
+            },
+            raw_extended_attributes: None,
+            logical_leaf_hash: None,
+            logical_count: None,
+            schema_fingerprint: None,
+            blob_size: 0,
+        };
+        let versions = vec![v_empty];
+
+        let err = build_series_manifest(EntryType::TablePhysicalSeries, &versions).expect_err(
+            "a table series with no schema fingerprint from any version cannot be represented \
+             by SeriesManifest::new, which always requires one for PayloadKind::Table",
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("schema fingerprint"),
+            "expected a clear schema-fingerprint error, got: {message}"
+        );
+    }
+
+    /// BLOCKER 3: a nonempty leafless live row (`blob_size > 0` but no
+    /// `logical_leaf_hash`) must be treated as corruption and rejected, not
+    /// silently skipped -- silently skipping it would erase a real logical
+    /// leaf from the series' identity without a trace. Only a truly empty
+    /// row (`blob_size == 0`, covered above) may remain leafless.
+    #[test]
+    fn build_series_manifest_rejects_nonempty_leafless_live_row_as_corruption() {
+        let leaf_a = ObjectHash::of_bytes(b"leaf-a");
+        let v_a = SeriesVersionData {
+            version: 5,
+            blob_hash: ObjectHash::of_bytes(b"blob-a"),
+            content: None,
+            meta: VersionMeta {
+                timestamp: Some(100),
+                min_event_time: Some(10),
+                max_event_time: Some(20),
+                extended_attributes: None,
+            },
+            raw_extended_attributes: None,
+            logical_leaf_hash: Some(leaf_a),
+            logical_count: Some(4),
+            schema_fingerprint: None,
+            blob_size: 4,
+        };
+        // Corrupt: physically nonempty (blob_size > 0) but never stamped --
+        // this must never happen via any public write path after BLOCKER 3,
+        // but the fold must still refuse to silently accept it if it does.
+        let v_corrupt = SeriesVersionData {
+            version: 6,
+            blob_hash: ObjectHash::of_bytes(b"blob-corrupt"),
+            content: None,
+            meta: VersionMeta {
+                timestamp: Some(150),
+                min_event_time: None,
+                max_event_time: None,
+                extended_attributes: None,
+            },
+            raw_extended_attributes: None,
+            logical_leaf_hash: None,
+            logical_count: None,
+            schema_fingerprint: None,
+            blob_size: 128,
+        };
+        let versions = vec![v_a, v_corrupt];
+
+        let err = build_series_manifest(EntryType::FilePhysicalSeries, &versions)
+            .expect_err("nonempty leafless row must be rejected, not silently skipped");
+        let message = err.to_string();
+        assert!(
+            message.contains("logical_leaf_hash") || message.contains("corrupt"),
+            "error should describe the missing-leaf corruption, got: {message}"
+        );
     }
 }

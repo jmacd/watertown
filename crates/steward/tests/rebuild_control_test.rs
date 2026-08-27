@@ -300,24 +300,42 @@ async fn rebuild_control_preserves_content_roots() -> Result<()> {
 
 /// Reclamation's delete commits must not be replayed as transactions.
 ///
-/// `reclaim` runs as the tail of a collapse and deliberately consumes no
-/// sequence of its own.  Its deletes are chunked, so stamping them with the
-/// collapse's `txn_seq` under the `pond_txn` key would make
+/// `reclaim` runs as the tail of pack-only maintenance and deliberately
+/// consumes no sequence of its own.  Its deletes are chunked, so stamping
+/// them with maintenance's own `txn_seq` under the `pond_txn` key would make
 /// `reconstruct_txn_history` -- which yields one transaction per `pond_txn`
 /// commit -- emit several entries for that single sequence, and rebuild would
 /// replay a duplicate lifecycle record for each.  Maintenance commits are
 /// stamped under `pond_maintenance` instead, so they stay attributable on disk
 /// while being invisible to transaction reconstruction.
+///
+/// Native writes are now always logical-series-v2 (delivery gate 7):
+/// `Ship::collapse_versions` runs pack-only physical maintenance (repacking
+/// over-threshold series into bounded physical packs under `_packs/`,
+/// `docs/logical-series-identity-design.md`) rather than the old
+/// row-rewriting merge, so it succeeds instead of gating, and it still never
+/// produces `collapsed_from`/`collapsed_through` rows on the user's own
+/// `/events.series` -- pack-only maintenance never touches an Oplog row.
+/// Reclaim nonetheless finds *real* work every run: the reserved node-manifest
+/// index node ([`tinyfs::INDEX_NODE_UUID`]) is a self-collapsing single-current-
+/// version node that stamps `collapsed_through = Some(version - 1)` on every
+/// write transaction, entirely independent of `--collapse-versions` (see
+/// `Ship`'s own `test_index_node_phase2`). Twelve write transactions therefore
+/// leave eleven superseded index-node rows for reclaim to delete even though
+/// the user's series was never row-rewritten -- this is what proves the test's
+/// real point: those deletes (both the index node's steady-state churn and any
+/// future series collapse) must never surface as an extra `pond_txn` entry in
+/// reconstructed history.
 #[tokio::test]
 async fn rebuild_after_collapse_reclaim_replays_one_txn_per_seq() -> Result<()> {
     let temp = tempdir()?;
     let pond_path = temp.path().join("pond");
 
-    let (orig_last_seq, reclaimed_rows) = {
+    let orig_last_seq = {
         let mut ship = Ship::create_pond(&pond_path, "reclaim-rebuild").await?;
 
-        // Enough versions of a collapsible series that a collapse has real
-        // work, and reclaim has real rows to delete.
+        // Enough versions of a collapsible series that a collapse would have
+        // real work if it were not gated.
         for i in 0..12u64 {
             let meta = PondUserMetadata::new(vec!["test".into(), format!("append{i}")]);
             let bytes = vec![b'a'.wrapping_add((i % 26) as u8); 4096];
@@ -337,13 +355,31 @@ async fn rebuild_after_collapse_reclaim_replays_one_txn_per_seq() -> Result<()> 
             .await?;
         }
 
-        let report = ship.collapse_versions(1).await?;
-        assert!(report.files_collapsed > 0, "series should have collapsed");
-        assert!(
-            report.reclaimed.rows_deleted > 0,
-            "collapse must have superseded rows to reclaim"
+        let report = ship
+            .collapse_versions(1)
+            .await
+            .expect("pack-only maintenance must succeed, never gate");
+        assert_eq!(report.candidates, 1);
+        assert_eq!(
+            report.series_repacked, 1,
+            "the twelve-version series exceeds threshold 1 and is repacked"
         );
-        (ship.last_write_seq(), report.reclaimed.rows_deleted)
+        // Reclaim still finds the reserved index node's own steady-state
+        // churn (eleven of its twelve versions are superseded, one per write
+        // transaction) even though `/events.series` itself carries no
+        // `collapsed_from`/`collapsed_through` row: pack-only maintenance
+        // never rewrites an Oplog row. No externalized blob is involved
+        // (every chunk here is small enough to inline), so nothing is freed
+        // on that side.
+        assert_eq!(
+            report.reclaimed.rows_deleted, 11,
+            "only the reserved index node's steady-state churn is superseded, not the user series"
+        );
+        assert_eq!(
+            report.reclaimed.blobs_removed, 0,
+            "every write here is small enough to inline; there is no external blob to free"
+        );
+        ship.last_write_seq()
     };
 
     std::fs::remove_dir_all(get_control_path(&pond_path))?;
@@ -351,12 +387,14 @@ async fn rebuild_after_collapse_reclaim_replays_one_txn_per_seq() -> Result<()> 
 
     assert_eq!(
         report.last_txn_seq, orig_last_seq,
-        "reclaim consumes no sequence, so the recovered frontier is the collapse's"
+        "the recovered frontier is exactly the twelve appends' seq"
     );
     assert_eq!(
         report.txns_reconstructed as i64, orig_last_seq,
-        "exactly one reconstructed txn per committed seq: reclaim deleted {reclaimed_rows} \
-         row(s) across its own Delta commits, and none of them may appear as a transaction"
+        "exactly one reconstructed txn per committed seq: reclaim's own delete commit(s) for \
+         the index node's superseded rows are stamped `pond_maintenance`, not `pond_txn`, so \
+         `reconstruct_txn_history` -- which yields one transaction per `pond_txn` commit -- \
+         correctly skips them rather than replaying an extra lifecycle record"
     );
 
     // The rebuilt control table must agree, and the pond must still open.

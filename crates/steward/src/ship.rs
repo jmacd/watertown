@@ -42,17 +42,43 @@ pub struct CompactOutcome {
     pub data_delta_version: i64,
 }
 
-/// Outcome of a multi-version collapse sweep ([`Ship::collapse_versions`]).
+/// Outcome of a pack-only physical maintenance sweep
+/// ([`Ship::collapse_versions`]).
+///
+/// Every field describes *physical* pack state only: no Oplog append row,
+/// `dp.series.2` manifest, tree/commit root, Delta version, or txn sequence
+/// is ever touched by this operation (`docs/logical-series-identity-design.md`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CollapseReport {
-    /// Number of `FilePhysicalSeries` nodes that exceeded the version
-    /// threshold and were selected for collapse.
+    /// Number of native v2 series (`FilePhysicalSeries`/`TablePhysicalSeries`)
+    /// discovered as coarse candidates (more live versions than the
+    /// requested threshold), before per-series bounded-layout candidacy is
+    /// evaluated.
     pub candidates: usize,
-    /// Number of nodes actually collapsed into a single merged version.
-    pub files_collapsed: usize,
-    /// Total live versions superseded across all collapsed nodes.
-    pub versions_collapsed: usize,
-    /// What the reclamation pass that follows the collapse actually freed.
+    /// Number of series actually repacked into a new, more-bounded
+    /// physical pack this run.
+    pub series_repacked: usize,
+    /// Number of series already at their achievable bounded floor (or
+    /// never exceeding the threshold once evaluated) -- an idempotent
+    /// no-op, proof that repeated maintenance settles.
+    pub already_bounded: usize,
+    /// Number of series that carry no persisted v2 leaf identity at all
+    /// (pre-v2/legacy): pack-only maintenance does not cover these; not an
+    /// error, just out of scope.
+    pub unsupported_legacy: usize,
+    /// New physical pack objects durably written this run (content-addressed;
+    /// an object already present from a previous run does not count again).
+    pub pack_objects_written: usize,
+    /// Bytes of new physical pack objects durably written this run.
+    pub pack_bytes_written: u64,
+    /// Orphaned physical pack objects removed by this run's GC sweep (no
+    /// longer referenced by any retained local pack advertisement).
+    pub pack_objects_removed: usize,
+    /// Bytes reclaimed by this run's pack-object GC sweep.
+    pub pack_bytes_freed: u64,
+    /// What the reclamation pass that follows pack maintenance actually
+    /// freed (the pre-existing row/blob reclamation mechanism, unrelated
+    /// to pack-object GC above).
     pub reclaimed: crate::reclaim::ReclaimStats,
 }
 
@@ -60,8 +86,17 @@ impl std::fmt::Display for CollapseReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "collapse: {} file(s) collapsed, {} version(s) superseded ({} candidate(s))",
-            self.files_collapsed, self.versions_collapsed, self.candidates
+            "pack maintenance: {} candidate(s), {} repacked, {} already bounded, \
+             {} unsupported legacy series",
+            self.candidates, self.series_repacked, self.already_bounded, self.unsupported_legacy
+        )?;
+        write!(
+            f,
+            "\n  packs: {} object(s) written ({} byte(s)), {} object(s) removed ({} byte(s) freed)",
+            self.pack_objects_written,
+            self.pack_bytes_written,
+            self.pack_objects_removed,
+            self.pack_bytes_freed
         )?;
         if !self.reclaimed.is_empty() {
             write!(f, "\n  {}", self.reclaimed)?;
@@ -1032,20 +1067,59 @@ impl Ship {
         result
     }
 
-    /// Collapse every `FilePhysicalSeries` node with more than `threshold` live
-    /// versions into a single merged version, so subsequent reads are O(1)
-    /// instead of O(versions).
+    /// Report which native v2 series pack maintenance would repack at
+    /// `threshold`, and the bounded physical layout it would publish,
+    /// without writing anything.
     ///
-    /// Discovery runs first in a read transaction; only when at least one
-    /// candidate exists is a write transaction opened. The merged rows are
-    /// written as a NORMAL `Write` transaction so they replicate like any other
-    /// write. When nothing qualifies, no write transaction is opened and no
-    /// sequence number is consumed.
+    /// Shares its discovery (through `pack_maintenance`, a private module)
+    /// with [`Ship::collapse_versions`], so a preview can never disagree
+    /// with what a real run would do. Mutates nothing: only reads a coarse
+    /// candidate list under a read transaction (no control-table records,
+    /// no sequence number consumed) and this pond's own local `_packs`
+    /// state.
     ///
     /// # Errors
-    /// Returns an error if discovery fails, if any collapse fails, or if the
-    /// commit fails. A failed collapse aborts the whole transaction so no
-    /// partial merge is committed.
+    /// Returns an error if the discovery read transaction, a series'
+    /// manifest fold, or this pond's local pack-index enumeration fails.
+    pub async fn survey_pack_maintenance(
+        &mut self,
+        threshold: usize,
+    ) -> Result<Vec<crate::PackMaintenanceCandidate>, StewardError> {
+        crate::pack_maintenance::survey_pack_maintenance(self, threshold).await
+    }
+
+    /// Run pack-only physical maintenance: repack every native v2 series
+    /// whose current physical representation exceeds `threshold` physical
+    /// objects into a smaller, bounded set of content-addressed physical
+    /// pack objects, published to this pond's own `data/_packs` namespace
+    /// (`docs/logical-series-identity-design.md`).
+    ///
+    /// **This never rewrites or deletes an Oplog append row, never changes
+    /// a `dp.series.2` manifest/tree/commit root, Delta version, or txn
+    /// sequence, and never changes logical metadata.** Every physical
+    /// object this publishes is durably written and content-addressed
+    /// *before* the [`sync_store::content::PackIndex`] naming it is
+    /// published, so a crash mid-repack can never expose an advertisement
+    /// naming a missing object, and re-running is deterministic: a series
+    /// already repacked to its achievable bounded floor is reported as
+    /// already-bounded rather than repacked again (see
+    /// [`CollapseReport::already_bounded`]).
+    ///
+    /// Reclamation (the pre-existing row/blob sweep, [`Ship::reclaim`])
+    /// still runs unconditionally afterward, exactly as before: a pond can
+    /// carry debt from before reclamation existed, from a crash between
+    /// maintenance and reclaim, or from a blob staged by a transaction
+    /// that never committed, and reclamation is otherwise only reachable
+    /// through this method.
+    ///
+    /// # Errors
+    /// Returns an error if discovery fails, if a series' recomputed leaf
+    /// hash disagrees with its persisted value (corrupt row), if the
+    /// assembled pack fails its own self-verification against the series'
+    /// untouched manifest, if this pond's local pack-index state is
+    /// malformed or names a cross-series pack (pack maintenance refuses to
+    /// proceed rather than risk deleting data GC could not safely reason
+    /// about), or if reclamation fails.
     pub async fn collapse_versions(
         &mut self,
         threshold: usize,
@@ -1056,66 +1130,36 @@ impl Ship {
             "--collapse-versions".to_string(),
         ]);
 
-        // Phase 1: discover candidates under a read transaction. Reads take no
-        // control-table records and consume no sequence number, so a sweep that
-        // finds nothing leaves no trace.
-        let candidates = {
-            let tx = self.begin_read(&meta).await?;
-            let candidates = {
-                let state = tx.state()?;
-                state.list_collapsible_series(threshold).await?
-            };
-            _ = tx.commit().await?;
-            candidates
-        };
+        // Coarse candidate count for reporting -- the exact same discovery
+        // `pack_maintenance::run_pack_maintenance` reruns under its own
+        // write lock below; a plain read here, taking no control-table
+        // records and consuming no sequence number.
+        let candidates = self.survey_collapsible_series(threshold).await?;
+
+        let maintenance =
+            crate::pack_maintenance::run_pack_maintenance(self, threshold, &meta).await?;
 
         let mut report = CollapseReport {
             candidates: candidates.len(),
-            ..CollapseReport::default()
+            series_repacked: maintenance.series_repacked,
+            already_bounded: maintenance.already_bounded,
+            unsupported_legacy: maintenance.unsupported_legacy,
+            pack_objects_written: maintenance.pack_objects_written,
+            pack_bytes_written: maintenance.pack_bytes_written,
+            pack_objects_removed: maintenance.pack_objects_removed,
+            pack_bytes_freed: maintenance.pack_bytes_freed,
+            reclaimed: crate::reclaim::ReclaimStats::default(),
         };
-        if candidates.is_empty() {
-            // Still reclaim: a pond can carry debt from before reclamation
-            // existed, from a crash between collapse and reclaim, or from a
-            // blob staged by a transaction that never committed.
-            report.reclaimed = self.reclaim(&meta).await?;
-            return Ok(report);
-        }
 
-        // Phase 2: collapse the candidates inside a single write transaction.
-        let tx = self.begin_write(&meta).await?;
-        let state = match tx.state() {
-            Ok(state) => state,
-            Err(e) => return Err(tx.abort(e).await),
-        };
-        for id in candidates {
-            // Both physical series kinds are collapsible, but by different
-            // means: a FilePhysicalSeries is byte-concatenated, while a
-            // TablePhysicalSeries must be re-encoded as a single parquet file.
-            let collapsed = match id.entry_type() {
-                tinyfs::EntryType::TablePhysicalSeries => {
-                    state.collapse_table_series(id, threshold).await
-                }
-                _ => state.collapse_file_series(id, threshold).await,
-            };
-            match collapsed {
-                Ok(stats) if stats.collapsed => {
-                    report.files_collapsed += 1;
-                    report.versions_collapsed += stats.versions_before;
-                }
-                Ok(_) => {}
-                Err(e) => return Err(tx.abort(e).await),
-            }
-        }
-        _ = tx.commit().await?;
-
-        // Phase 3: reclaim, now that the merged runs are durable.  This is the
-        // second half of collapse, not a separate feature: until the superseded
-        // rows are deleted they still reference their `_large_files` blobs, so
-        // collapse alone bounds the GROWTH RATE of a pond without ever
-        // returning a byte.  Doing it after the commit is what makes it
-        // crash-safe -- an interruption leaves the superseded rows in place,
-        // which is exactly the pre-reclaim state, whereas deleting first could
-        // lose content if the merged run never landed.
+        // Reclaim unconditionally, whether or not any series needed
+        // repacking: a pond can carry debt from before reclamation
+        // existed, from a crash between maintenance and reclaim, or from a
+        // blob staged by a transaction that never committed. Reclamation
+        // is otherwise only reachable through this method, so gating it
+        // behind pack maintenance finding work would make it permanently
+        // unreachable for an already fully-bounded pond -- exactly the
+        // ponds least in need of further pack work but still eligible for
+        // reclamation.
         report.reclaimed = self.reclaim(&meta).await?;
 
         Ok(report)
@@ -2450,19 +2494,28 @@ mod tests {
             "manifest root hash matches the content-tree root_tree_hash"
         );
 
-        // The index node stays at a single live version: a collapse sweep that
+        // The index node stays at a single live version: pack maintenance that
         // targets anything with more than one live version finds no candidate
         // (the directories are single-version, and the index node collapses on
-        // every write), so it is never a user-visible compaction candidate.
+        // every write), so it is never a pack maintenance candidate.
         let report = ship.collapse_versions(1).await.expect("collapse sweep");
         assert_eq!(
-            report.files_collapsed, 0,
-            "index node self-collapses and is not a collapse candidate"
+            report.candidates, 0,
+            "index node self-collapses and is not a pack maintenance candidate"
         );
+        assert_eq!(report.series_repacked, 0);
     }
 
+    /// `Ship::collapse_versions` now performs real, pack-only physical
+    /// maintenance instead of gating (`docs/logical-series-identity-design.md`):
+    /// once a series exceeds the requested threshold's physical object
+    /// count, it is repacked into a bounded physical pack published under
+    /// this pond's own `data/_packs`, while every Oplog row, the series'
+    /// `dp.series.2` manifest, and the Delta write sequence are left
+    /// completely untouched. A threshold nobody exceeds still no-ops
+    /// cleanly, and repeated maintenance settles (idempotent).
     #[tokio::test]
-    async fn test_collapse_versions_end_to_end() {
+    async fn test_collapse_versions_repacks_once_a_real_candidate_exists() {
         use tinyfs::ResultExt;
         use tokio::io::AsyncWriteExt;
 
@@ -2504,36 +2557,275 @@ mod tests {
             .await
             .expect("collapse with high threshold");
         assert_eq!(
-            none.files_collapsed, 0,
+            none.candidates, 0,
             "threshold above version count is a no-op"
         );
+        assert_eq!(none.series_repacked, 0);
         assert_eq!(
             ship.last_write_seq, seq_before,
-            "a no-op collapse must not consume a sequence number"
+            "a no-op pack maintenance sweep must not consume a sequence number"
         );
 
-        // Collapse anything with more than one live version.
-        let report = ship.collapse_versions(1).await.expect("collapse versions");
+        // Root/Delta state before repacking, so we can prove it is untouched.
+        let root_before = crate::content_tree::compute_content_tree(&ship)
+            .await
+            .expect("content tree before repack")
+            .root_tree_hash;
+        let delta_version_before = ship.data_persistence().table().version();
+
+        // Pack-only maintenance: the series has 4 live versions/physical
+        // objects, exceeding threshold 1, and is repacked into one bounded
+        // physical pack (the whole tiny payload fits under the file pack's
+        // byte cap).
+        let seq_before_repack = ship.last_write_seq;
+        let report = ship
+            .collapse_versions(1)
+            .await
+            .expect("pack maintenance must succeed (exit 0), never gate");
+        assert_eq!(report.candidates, 1);
         assert_eq!(
-            report.files_collapsed, 1,
-            "the one series file is collapsed"
+            report.series_repacked, 1,
+            "the one over-threshold series must be repacked"
+        );
+        assert_eq!(report.unsupported_legacy, 0);
+        assert!(
+            report.pack_objects_written > 0,
+            "repacking must publish at least one new physical pack object"
         );
         assert_eq!(
-            report.versions_collapsed, 4,
-            "all four live versions merged"
+            ship.last_write_seq, seq_before_repack,
+            "pack maintenance touches only local `_packs/` disk state, never a Delta \
+             transaction, so it must not consume a sequence number"
         );
 
-        // Content is byte-identical after the collapse.
+        // Delta/root state is provably untouched: no logical row, manifest,
+        // tree, or commit root changed.
+        let root_after = crate::content_tree::compute_content_tree(&ship)
+            .await
+            .expect("content tree after repack")
+            .root_tree_hash;
+        assert_eq!(
+            root_after, root_before,
+            "pack-only maintenance must never change the root tree hash"
+        );
+        assert_eq!(
+            ship.data_persistence().table().version(),
+            delta_version_before,
+            "pack-only maintenance must never advance the Delta version"
+        );
+
+        // Content is byte-identical: reads still come from the untouched
+        // Oplog rows, not from any pack.
         let meta = PondUserMetadata::new(vec!["read".to_string()]);
         let tx = ship.begin_read(&meta).await.expect("begin read");
         let root = tx.root().await.expect("root");
         let content = root
             .read_file_path_to_vec(file_path)
             .await
-            .expect("read collapsed content");
+            .expect("read content");
         assert_eq!(
             content, cumulative,
-            "collapsed content equals concatenation"
+            "content is unchanged by pack-only maintenance"
+        );
+        _ = tx.commit().await.expect("commit read");
+
+        // Idempotent: a second run at the same threshold settles -- the
+        // series is now already at its achievable bounded floor and is not
+        // repacked again, and no further physical objects are written.
+        let again = ship
+            .collapse_versions(1)
+            .await
+            .expect("repeat pack maintenance");
+        assert_eq!(
+            again.candidates, 1,
+            "still a coarse candidate by version count"
+        );
+        assert_eq!(
+            again.series_repacked, 0,
+            "an already-bounded series must not be repacked again"
+        );
+        assert_eq!(
+            again.already_bounded, 1,
+            "the just-repacked series settles as already bounded"
+        );
+        assert_eq!(
+            again.pack_objects_written, 0,
+            "a settled repeat run writes no further physical objects"
+        );
+    }
+
+    /// The lower-level `collapse_file_series` helper
+    /// (`tlogfs::persistence::State::collapse_file_series`) is unsupported
+    /// for logical-series-v2 (a merged row cannot carry a single persisted
+    /// logical leaf hash for the versions it would absorb -- BLOCKER 3):
+    /// called directly it must reject rather than merge, content and version
+    /// count must stay untouched, and the series must remain fully usable
+    /// afterward (further ordinary appends still work).
+    ///
+    /// The real, supported way to collapse history for a logical-series-v2
+    /// node is `WD::async_writer_path_collapsing_with_type`, used by
+    /// content-pull replication to mirror a source pond's collapse: it is
+    /// exercised here too, proving a genuine merged-history write still
+    /// round-trips byte-identical content through the normal read path.
+    #[tokio::test]
+    async fn test_collapse_file_series_low_level_is_rejected_and_pull_mirror_collapse_works() {
+        use tinyfs::ResultExt;
+        use tokio::io::AsyncWriteExt;
+
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let pond_path = temp_dir.path().join("test_pond_collapse_low_level");
+        let mut ship = Ship::create_pond(&pond_path, "test-host")
+            .await
+            .expect("Failed to create pond");
+
+        let file_path = "/data/events.csv";
+        let chunks: [&[u8]; 4] = [b"name,value\n", b"alice,1\n", b"bob,2\n", b"carol,3\n"];
+        let mut cumulative: Vec<u8> = Vec::new();
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            cumulative.extend_from_slice(chunk);
+            let meta = PondUserMetadata::new(vec![format!("write{i}")]);
+            let chunk = chunk.to_vec();
+            let first = i == 0;
+            ship.write_transaction(&meta, async move |fs| {
+                let root = fs.root().await?;
+                if first {
+                    _ = root.create_dir_path("data").await?;
+                }
+                let mut writer = root
+                    .async_writer_path_with_type(file_path, tinyfs::EntryType::FilePhysicalSeries)
+                    .await?;
+                writer.write_all(&chunk).await.map_other()?;
+                writer.shutdown().await.map_other()?;
+                Ok(())
+            })
+            .await
+            .expect("series write transaction");
+        }
+
+        let file_id = {
+            let meta = PondUserMetadata::new(vec!["read-id".to_string()]);
+            let tx = ship.begin_read(&meta).await.expect("begin read");
+            let candidates = {
+                let state = tx.state().expect("state");
+                state
+                    .list_collapsible_series(1)
+                    .await
+                    .expect("list collapsible series")
+            };
+            _ = tx.commit().await.expect("commit read");
+            assert_eq!(candidates.len(), 1, "exactly one series should qualify");
+            candidates[0]
+        };
+
+        let meta = PondUserMetadata::new(vec!["low-level-collapse".to_string()]);
+        let tx = ship.begin_write(&meta).await.expect("begin write");
+        let err = {
+            let state = tx.state().expect("state");
+            state
+                .collapse_file_series(file_id, 1)
+                .await
+                .expect_err("collapse_file_series must be unsupported for logical-series-v2")
+        };
+        assert!(
+            matches!(err, tlogfs::TLogFSError::CollapseUnsupported { .. }),
+            "expected CollapseUnsupported, got {err:?}"
+        );
+        // Abort: the rejected call must not have queued any row rewrite.
+        drop(tx);
+
+        // Content and version count are exactly as the four appends left them.
+        let meta = PondUserMetadata::new(vec!["read".to_string()]);
+        let tx = ship.begin_read(&meta).await.expect("begin read");
+        let root = tx.root().await.expect("root");
+        let content = root
+            .read_file_path_to_vec(file_path)
+            .await
+            .expect("read content");
+        assert_eq!(
+            content, cumulative,
+            "a rejected low-level collapse must not change content"
+        );
+        _ = tx.commit().await.expect("commit read");
+
+        // The supported replacement: a pull-mirror collapsing write
+        // (`async_writer_path_collapsing_with_type`) supersedes every earlier
+        // version with one fresh baseline. Verify it round-trips correctly
+        // and that the series stays discoverable/appendable afterward.
+        let meta = PondUserMetadata::new(vec!["pull-mirror-collapse".to_string()]);
+        let cumulative_for_write = cumulative.clone();
+        ship.write_transaction(&meta, async move |fs| {
+            let root = fs.root().await?;
+            let mut writer = root
+                .async_writer_path_collapsing_with_type(
+                    file_path,
+                    tinyfs::EntryType::FilePhysicalSeries,
+                )
+                .await?;
+            writer.write_all(&cumulative_for_write).await.map_other()?;
+            writer.shutdown().await.map_other()?;
+            Ok(())
+        })
+        .await
+        .expect("pull-mirror collapsing write");
+
+        let meta = PondUserMetadata::new(vec!["read-after-mirror".to_string()]);
+        let tx = ship.begin_read(&meta).await.expect("begin read");
+        let root = tx.root().await.expect("root");
+        let content = root
+            .read_file_path_to_vec(file_path)
+            .await
+            .expect("read pull-mirrored content");
+        assert_eq!(
+            content, cumulative,
+            "pull-mirror collapsing write preserves byte-identical content"
+        );
+        _ = tx.commit().await.expect("commit read");
+
+        // The merged version now supersedes every prior version, so only one
+        // live version remains and the series is no longer a collapse
+        // candidate at threshold 1.
+        let meta = PondUserMetadata::new(vec!["read-candidates".to_string()]);
+        let tx = ship.begin_read(&meta).await.expect("begin read");
+        let candidates = {
+            let state = tx.state().expect("state");
+            state
+                .list_collapsible_series(1)
+                .await
+                .expect("list collapsible series")
+        };
+        _ = tx.commit().await.expect("commit read");
+        assert!(
+            candidates.is_empty(),
+            "a single merged live version must not itself be a collapse candidate"
+        );
+
+        // The series remains normally appendable after a pull-mirror collapse.
+        let meta = PondUserMetadata::new(vec!["append-after-mirror".to_string()]);
+        ship.write_transaction(&meta, async move |fs| {
+            let root = fs.root().await?;
+            let mut writer = root
+                .async_writer_path_with_type(file_path, tinyfs::EntryType::FilePhysicalSeries)
+                .await?;
+            writer.write_all(b"dave,4\n").await.map_other()?;
+            writer.shutdown().await.map_other()?;
+            Ok(())
+        })
+        .await
+        .expect("append after pull-mirror collapse");
+
+        let meta = PondUserMetadata::new(vec!["read-final".to_string()]);
+        let tx = ship.begin_read(&meta).await.expect("begin read");
+        let root = tx.root().await.expect("root");
+        let content = root
+            .read_file_path_to_vec(file_path)
+            .await
+            .expect("read final content");
+        let mut expected = cumulative.clone();
+        expected.extend_from_slice(b"dave,4\n");
+        assert_eq!(
+            content, expected,
+            "an ordinary append after a pull-mirror collapse is fully live"
         );
         _ = tx.commit().await.expect("commit read");
     }
@@ -2584,28 +2876,41 @@ mod tests {
         }
         write_version(&mut ship, quiet, b"q,1\n", false).await;
 
-        // Collapse anything with more than one live version: only noisy qualifies.
-        let report = ship.collapse_versions(1).await.expect("collapse versions");
-        assert_eq!(report.candidates, 1, "only the noisy file is a candidate");
-        assert_eq!(report.files_collapsed, 1);
-        assert_eq!(report.versions_collapsed, 3);
+        // Pack maintenance repacks only the over-threshold series (noisy);
+        // quiet has a single version and is never even a coarse candidate.
+        let report = ship
+            .collapse_versions(1)
+            .await
+            .expect("pack maintenance must succeed");
+        assert_eq!(report.candidates, 1);
+        assert_eq!(report.series_repacked, 1);
 
-        // noisy now reads as the merged concatenation; quiet is untouched.
+        // Both files' content is untouched: pack maintenance never rewrites
+        // Oplog rows.
         let meta = PondUserMetadata::new(vec!["read".to_string()]);
         let tx = ship.begin_read(&meta).await.expect("begin read");
         let root = tx.root().await.expect("root");
         let noisy_content = root.read_file_path_to_vec(noisy).await.expect("read noisy");
         assert_eq!(
             noisy_content, noisy_full,
-            "noisy collapsed to concatenation"
+            "noisy is unchanged by pack-only maintenance"
         );
         let quiet_content = root.read_file_path_to_vec(quiet).await.expect("read quiet");
         assert_eq!(quiet_content, b"q,1\n", "quiet file is unchanged");
         _ = tx.commit().await.expect("commit read");
 
-        // A second sweep is a clean no-op now that nothing qualifies.
-        let again = ship.collapse_versions(1).await.expect("second sweep");
-        assert_eq!(again.files_collapsed, 0, "nothing left to collapse");
+        // A repeated run settles: noisy is now already bounded and is not
+        // repacked again.
+        let again = ship
+            .collapse_versions(1)
+            .await
+            .expect("repeated pack maintenance must settle");
+        assert_eq!(again.candidates, 1);
+        assert_eq!(
+            again.series_repacked, 0,
+            "a repeated run must not repack an already-bounded series"
+        );
+        assert_eq!(again.already_bounded, 1);
     }
 
     fn count_log_files(log_dir: &Path, ext: &str) -> usize {

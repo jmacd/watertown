@@ -109,6 +109,23 @@ impl ContentSource for MeteredSource {
         self.charged(outcome)
     }
 
+    async fn list_pack_hashes(
+        &self,
+        series_hash: ObjectHash,
+    ) -> Result<HashSet<ObjectHash>, StewardError> {
+        let outcome = self.inner.list_pack_hashes(series_hash).await;
+        self.charged(outcome)
+    }
+
+    async fn get_pack_index(
+        &self,
+        series_hash: ObjectHash,
+        pack_hash: ObjectHash,
+    ) -> Result<Option<Vec<u8>>, StewardError> {
+        let outcome = self.inner.get_pack_index(series_hash, pack_hash).await;
+        self.charged(outcome)
+    }
+
     async fn preload_objects(&self) -> Result<(), StewardError> {
         let outcome = self.inner.preload_objects().await;
         self.charged(outcome)

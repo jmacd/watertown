@@ -10,8 +10,19 @@ use log::info;
 ///
 /// Performs checkpoint creation, log cleanup, and vacuum.
 /// When `compact` is true, also merges small parquet files.
-/// When `collapse_versions` is non-zero, also collapses multi-version
-/// `data:series` files whose live version count exceeds that threshold.
+/// When `collapse_versions` is non-zero, also runs production, pack-only
+/// physical maintenance (`docs/logical-series-identity-design.md`) on
+/// `data:series` files whose current physical representation (live
+/// version/physical-object count) exceeds that threshold:
+/// `Ship::collapse_versions` repacks each over-threshold native
+/// logical-series-v2 series into a smaller, bounded set of
+/// content-addressed physical pack objects published under this pond's own
+/// local `data/_packs` namespace. This never rewrites or deletes an Oplog
+/// append row and never changes a series' `dp.series.2` manifest, content
+/// tree/commit root, Delta version, or txn sequence -- only local disk
+/// state under `_packs/` is mutated, so it always returns `Ok`. A pre-v2
+/// (legacy) series carries no persisted v2 leaf identity and is reported as
+/// unsupported by this operation, not as an error.
 /// When `prune` is true, first deletes replicated control-table lifecycle
 /// history at or below a safe horizon so the subsequent checkpoint +
 /// vacuum reclaims it in the SAME pass (no extra ship open / read txn).
@@ -75,14 +86,19 @@ pub async fn maintain_command(
         None
     };
 
-    // Collapse BEFORE maintain, for the same reason as prune above: collapse's
-    // reclamation phase deletes superseded rows, and those tombstones are only
-    // turned back into free space by the checkpoint + vacuum that follows.
+    // Collapse (pack-only physical maintenance) BEFORE maintain, for the
+    // same reason as prune above: its reclamation phase deletes superseded
+    // rows, and those tombstones are only turned back into free space by
+    // the checkpoint + vacuum that follows. `Ship::collapse_versions` never
+    // touches a Delta root/version/txn sequence, so a real failure here is a
+    // genuine error, not a gated no-op -- unlike the old logical-series-v2
+    // gate this used to report, pack-only maintenance always runs
+    // reclamation as part of the same call.
     let collapse_report = if collapse_versions > 0 {
         Some(
             ship.collapse_versions(collapse_versions)
                 .await
-                .map_err(|e| anyhow!("Version collapse failed: {}", e))?,
+                .map_err(|e| anyhow!("Pack-only maintenance failed: {}", e))?,
         )
     } else {
         None
@@ -124,6 +140,7 @@ pub async fn maintain_command(
     }
 
     info!("[OK] Maintenance completed");
+
     Ok(())
 }
 
@@ -153,9 +170,12 @@ async fn report_dry_run(
     };
 
     // Resolve node identities to paths so the report names files rather than
-    // UUIDs.  Done only when there is something to name.
+    // UUIDs.  Done only when there is something to name.  Shares
+    // `Ship::survey_pack_maintenance`'s discovery with `Ship::collapse_versions`
+    // (through the private `pack_maintenance` module), so this preview can
+    // never disagree with what a real run would do.
     let candidates = if collapse_versions > 0 {
-        ship.survey_collapsible_series(collapse_versions).await?
+        ship.survey_pack_maintenance(collapse_versions).await?
     } else {
         Vec::new()
     };
@@ -185,50 +205,45 @@ async fn report_dry_run(
         } else if candidates.is_empty() {
             println!("  collapse: no series exceeds {collapse_versions} live versions");
         } else {
-            let total: u64 = candidates.iter().map(|c| c.total_bytes).sum();
+            let needs_repack = candidates
+                .iter()
+                .filter(|c| c.outcome == steward::PackCandidateOutcome::NeedsRepack)
+                .count();
+            let unsupported_legacy = candidates
+                .iter()
+                .filter(|c| c.outcome == steward::PackCandidateOutcome::UnsupportedLegacy)
+                .count();
             println!(
-                "  collapse: {} series exceed {} live versions",
+                "  collapse: {} series exceed {} live versions ({} would be repacked, \
+                 {} already at their achievable bounded layout, {} pre-v2/unsupported)",
                 candidates.len(),
-                collapse_versions
+                collapse_versions,
+                needs_repack,
+                candidates.len() - needs_repack - unsupported_legacy,
+                unsupported_legacy,
             );
             let mut rows: Vec<_> = candidates.iter().collect();
-            rows.sort_by_key(|c| std::cmp::Reverse(c.total_bytes));
+            rows.sort_by_key(|c| std::cmp::Reverse(c.logical_count));
             for c in rows {
                 let name = paths
                     .get(&c.file_id)
                     .map_or_else(|| c.file_id.node_id().to_string(), |p| p.clone());
+                println!("    {name}: {c}");
+            }
+            if needs_repack > 0 {
                 println!(
-                    "    {name}: {} versions -> 1, {}",
-                    c.live_versions,
-                    human_bytes(c.total_bytes)
+                    "  a repack publishes new physical pack objects and a pack index to this \
+                     pond's own local `data/_packs` storage (or `pond://` sidecar storage for a \
+                     replica) only; today's `pond push` never uploads them -- it only publishes \
+                     fresh 1:1 packs built from the Oplog rows a push itself just carried, so a \
+                     maintained/repacked pack stays local (or `pond://`-visible) unless and \
+                     until an explicit pack uploader is added. This never rewrites an Oplog row \
+                     or changes a series' dp.series.2 manifest, content root, Delta version, or \
+                     txn sequence."
                 );
             }
-            println!(
-                "  collapse would rewrite {} as new content, which the next push \n  \
-                 must carry and the remote keeps permanently",
-                human_bytes(total)
-            );
         }
     }
 
     Ok(())
-}
-
-/// Render a byte count the way the limiter reports its budgets, so a dry-run
-/// figure can be compared against `pond status` without arithmetic.
-fn human_bytes(n: u64) -> String {
-    #[allow(clippy::cast_precision_loss)]
-    let bytes = n as f64;
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = KIB * 1024.0;
-    const GIB: f64 = MIB * 1024.0;
-    if bytes >= GIB {
-        format!("{:.1} GiB", bytes / GIB)
-    } else if bytes >= MIB {
-        format!("{:.1} MiB", bytes / MIB)
-    } else if bytes >= KIB {
-        format!("{:.1} KiB", bytes / KIB)
-    } else {
-        format!("{n} B")
-    }
 }

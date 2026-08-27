@@ -29,6 +29,7 @@ pub mod content;
 pub mod content_remote;
 mod error;
 pub mod metered_store;
+pub mod pack_keys;
 mod recovery_recipe;
 mod s3_registration;
 pub mod schema;

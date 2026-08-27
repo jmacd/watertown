@@ -224,6 +224,15 @@ pub use provider::size_tier::MERGE_FANOUT as COLLAPSE_FANOUT;
 /// and so makes it a merge candidate rather than an obstacle.
 ///
 /// `live` must be ordered oldest content first; the returned range indexes it.
+///
+/// No longer called by `State::collapse_file_series`/`collapse_table_series`,
+/// which now unconditionally refuse to write a merged row for a
+/// logical-series-v2 pond (see those methods' docs and
+/// `TLogFSError::CollapseUnsupported`): a merged row cannot carry the single
+/// persisted logical leaf hash the persisted-leaf invariant requires. Retained
+/// -- and still covered by its own unit tests below -- as the pure
+/// window-selection policy a future pack-level streaming repacker would reuse.
+#[allow(dead_code)]
 fn choose_collapse_window(live: &[&OplogEntry], max_live: usize) -> Option<Range<usize>> {
     let sizes: Vec<u64> = live
         .iter()
@@ -992,28 +1001,7 @@ impl OpLogPersistence {
     /// Returns the reconstructed bytes from `_large_files/`. Errors if no
     /// externalized blob with the given hash exists or if it cannot be read.
     pub async fn read_large_file_bytes(&self, blake3: &str) -> Result<Vec<u8>, TLogFSError> {
-        use tokio::io::AsyncReadExt;
-        let path = crate::large_files::find_large_file_path(&self.path, blake3)
-            .await
-            .map_err(|e| TLogFSError::ArrowMessage(format!("locate large file {blake3}: {e}")))?
-            .ok_or_else(|| TLogFSError::LargeFileNotFound {
-                blake3: blake3.to_string(),
-                path: format!("_large_files/blake3={blake3}"),
-                source: std::io::Error::new(std::io::ErrorKind::NotFound, "large file not found"),
-            })?;
-        let mut reader = crate::large_files::ParquetFileReader::new(path.clone())
-            .await
-            .map_err(|e| TLogFSError::LargeFileNotFound {
-                blake3: blake3.to_string(),
-                path: path.display().to_string(),
-                source: e,
-            })?;
-        let mut buf = Vec::new();
-        let _ = reader
-            .read_to_end(&mut buf)
-            .await
-            .map_err(|e| TLogFSError::ArrowMessage(format!("read large file {blake3}: {e}")))?;
-        Ok(buf)
+        crate::large_files::read_external_bytes(&self.path, blake3).await
     }
 
     /// Open a streaming reader for an externalized large file by BLAKE3 hash.
@@ -1229,6 +1217,52 @@ impl State {
     pub async fn collapse_file_series(
         &self,
         id: FileID,
+        _max_live: usize,
+    ) -> Result<CollapseStats, TLogFSError> {
+        if id.entry_type() != EntryType::FilePhysicalSeries {
+            return Err(TLogFSError::Transaction {
+                message: format!(
+                    "collapse_file_series requires a FilePhysicalSeries node, got {:?} for {id}",
+                    id.entry_type()
+                ),
+            });
+        }
+
+        // Row-rewriting collapse cannot represent the persisted-leaf
+        // invariant (`docs/logical-series-identity-design.md`): every
+        // nonempty `FilePhysicalSeries` row is exactly one immutable
+        // logical leaf with its own persisted `logical_leaf_hash`/
+        // `logical_count`, and merging several rows into one physical row
+        // has no single leaf identity to stamp it with. Refuse before any
+        // read, decode, or write of a merged row -- never silently produce
+        // an unstamped row that would violate the invariant every other
+        // write path enforces (`crate::series_identity::stamp_logical_leaf`,
+        // centralized in `State::store_file_content_ref`/
+        // `store_file_series_from_parquet`/`store_file_from_hybrid_writer`).
+        Err(TLogFSError::CollapseUnsupported {
+            reason: format!(
+                "collapse_file_series is unsupported for {id}: a merged row cannot carry a \
+                 single persisted logical leaf hash for the versions it would absorb"
+            ),
+        })
+    }
+
+    /// Test-only fixture builder: synthesize a merged `FilePhysicalSeries` row
+    /// exactly as the retired row-rewriting `collapse_file_series` production
+    /// path used to (byte-concatenate a size-tiered window, write it through a
+    /// fresh `HybridWriter` baseline, stamp `collapsed_from`/`collapsed_through`).
+    ///
+    /// This does NOT reinstate collapse as a production capability: it exists
+    /// solely so the read path's `collapsed_from`/`collapsed_through`
+    /// range-ordering logic keeps test coverage, because that shape is still a
+    /// real, reachable state in production -- a content pull that replicates a
+    /// source-side collapse stamps exactly this sentinel via
+    /// `tinyfs::wd::WD::async_writer_collapsing` (see `collapse_prior` in
+    /// `crate::file`). Never call this outside a test.
+    #[cfg(test)]
+    pub(crate) async fn collapse_file_series_for_test(
+        &self,
+        id: FileID,
         max_live: usize,
     ) -> Result<CollapseStats, TLogFSError> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1236,7 +1270,8 @@ impl State {
         if id.entry_type() != EntryType::FilePhysicalSeries {
             return Err(TLogFSError::Transaction {
                 message: format!(
-                    "collapse_file_series requires a FilePhysicalSeries node, got {:?} for {id}",
+                    "collapse_file_series_for_test requires a FilePhysicalSeries node, got \
+                     {:?} for {id}",
                     id.entry_type()
                 ),
             });
@@ -1273,11 +1308,6 @@ impl State {
                 _ => None,
             };
 
-            // The merged run inherits the cumulative bao state of the newest
-            // version it absorbs. Collapse regroups an unchanged byte stream, so
-            // the series prefix through that version is byte-identical before and
-            // after; recomputing it would be both wasteful and, for a run that
-            // does not start at version 1, wrong.
             let inherited_bao = newest.bao_outboard.clone();
             let newest_version = newest.version;
 
@@ -1295,9 +1325,6 @@ impl State {
         let lo = crate::schema::CollapseRange::of(&window[0]).lo;
         let hi = crate::schema::CollapseRange::of(window.last().expect("non-empty")).hi;
 
-        // Read just this window's bytes. Reading the whole series here is what
-        // made collapse O(N^2); the window is the only content the merged run
-        // stands in for.
         let merged = {
             let inner = self.inner.lock().await;
             let mut buf = Vec::new();
@@ -1316,7 +1343,6 @@ impl State {
             buf
         };
 
-        // Re-write the window's bytes as a single standalone body.
         let mut writer = crate::large_files::HybridWriter::with_options(&store_path, options);
         writer
             .write_all(&merged)
@@ -1333,30 +1359,13 @@ impl State {
 
         let content_len = result.size;
 
-        // The merged run inherits the cumulative bao state of the newest version
-        // it absorbs, with `version_size` restated as the run's own length.
-        // Collapse only regroups bytes, so the series prefix through `hi` is
-        // unchanged; recomputing it as a fresh first version would be correct
-        // only for a run starting at the very beginning of the series, and is
-        // wrong for every later run.
-        // "No outboard" and "unparseable outboard" are NOT the same case, and
-        // must not share a fallback: the fallback below is the FIRST-version
-        // baseline, which -- as the comment above states -- is correct only for
-        // a run starting at the beginning of the series.  Silently applying it
-        // to a run that merely failed to parse its predecessor's state would
-        // stamp a wrong baseline onto the merged run, which no later
-        // verification could attribute back to here.  A corrupt outboard is a
-        // hard error that aborts the collapse instead.
         let bao_outboard = match inherited_bao.as_deref() {
             Some(bytes) => {
                 let mut inherited = utilities::bao_outboard::SeriesOutboard::from_bytes(bytes)
                     .map_err(|e| {
                         TLogFSError::Internal(format!(
                             "collapse: node {} version {} has an unreadable bao outboard \
-                             ({} bytes): {e}. The merged run must inherit that cumulative \
-                             state -- recomputing it as a first version would stamp a wrong \
-                             baseline -- so the collapse is aborted, leaving the series \
-                             uncollapsed and intact.",
+                             ({} bytes): {e}",
                             id,
                             newest_version,
                             bytes.len(),
@@ -1380,7 +1389,6 @@ impl State {
             crate::file_writer::ContentRef::Small(result.content)
         };
 
-        // Enqueue the merged version with the collapse sentinel.
         let merged_version = {
             let mut inner = self.inner.lock().await;
             let version = inner.get_next_version_for_node(id).await?;
@@ -1422,9 +1430,6 @@ impl State {
             version
         };
 
-        // Invariant: the merged run must read back byte-identically. Verifying
-        // the run rather than the whole series keeps collapse's I/O proportional
-        // to the window it actually rewrote.
         let after = {
             let inner = self.inner.lock().await;
             let record = inner
@@ -1450,7 +1455,8 @@ impl State {
         if after != merged {
             return Err(TLogFSError::Transaction {
                 message: format!(
-                    "collapse invariant violated for {id}: merged {} bytes but post-collapse read {} bytes",
+                    "collapse invariant violated for {id}: merged {} bytes but post-collapse \
+                     read {} bytes",
                     merged.len(),
                     after.len()
                 ),
@@ -1498,10 +1504,8 @@ impl State {
     pub async fn collapse_table_series(
         &self,
         id: FileID,
-        max_live: usize,
+        _max_live: usize,
     ) -> Result<CollapseStats, TLogFSError> {
-        use tokio::io::AsyncWriteExt;
-
         if id.entry_type() != EntryType::TablePhysicalSeries {
             return Err(TLogFSError::Transaction {
                 message: format!(
@@ -1511,265 +1515,25 @@ impl State {
             });
         }
 
-        // Assess current versions and pick the window to merge. The lock is
-        // released before any table-provider work below, which re-enters the
-        // persistence layer to resolve versions.
-        let (
-            versions_before,
-            window_versions,
-            lo,
-            hi,
-            min_event,
-            max_event,
-            timestamp_column,
-            store_path,
-            options,
-        ) = {
-            let mut inner = self.inner.lock().await;
-            let records = inner.query_records(id).await?;
-            let live: Vec<&OplogEntry> = crate::schema::live_series_entries(&records)
-                .into_iter()
-                .filter(|r| r.size.unwrap_or(0) > 0)
-                .collect();
-
-            let Some(range) = choose_collapse_window(&live, max_live) else {
-                return Ok(CollapseStats {
-                    collapsed: false,
-                    versions_before: live.len(),
-                    merged_version: 0,
-                    bytes: 0,
-                });
-            };
-            let window = &live[range];
-
-            let newest = *window.last().expect("window is non-empty");
-            let timestamp_column = newest
-                .get_extended_attributes()
-                .map(|a| a.timestamp_column().to_string())
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| TLogFSError::Transaction {
-                    message: format!(
-                        "collapse_table_series: {id} has no timestamp column; a \
-                         TablePhysicalSeries cannot be rewritten without one"
-                    ),
-                })?;
-            let min_event = window.iter().filter_map(|r| r.min_event_time).min();
-            let max_event = window.iter().filter_map(|r| r.max_event_time).max();
-
-            let lo = window
-                .iter()
-                .map(|r| crate::schema::CollapseRange::of(r).lo)
-                .min()
-                .expect("window is non-empty");
-            let hi = window
-                .iter()
-                .map(|r| crate::schema::CollapseRange::of(r).hi)
-                .max()
-                .expect("window is non-empty");
-            let window_versions: Vec<i64> = window.iter().map(|r| r.version).collect();
-
-            (
-                live.len(),
-                window_versions,
-                lo,
-                hi,
-                min_event,
-                max_event,
-                timestamp_column,
-                inner.path.clone(),
-                inner.large_file_options.clone(),
-            )
-        };
-
-        // Re-encode just this window into a single parquet buffer. The table
-        // provider unions the listed per-version parquet files and merges their
-        // schemas, so this is the authoritative content for the merged run.
-        let (merged, rows_before) = self
-            .reencode_table_versions(id, &window_versions, &timestamp_column)
-            .await?;
-
-        // Store the merged parquet as a fresh first-version body so the bao-tree
-        // cumulative state covers exactly this content.
-        let mut writer = crate::large_files::HybridWriter::with_options(&store_path, options);
-        writer
-            .write_all(&merged)
-            .await
-            .map_err(|e| TLogFSError::Internal(format!("collapse: write merged parquet: {e}")))?;
-        writer
-            .flush()
-            .await
-            .map_err(|e| TLogFSError::Internal(format!("collapse: flush merged parquet: {e}")))?;
-        let result = writer.finalize().await.map_err(|e| {
-            TLogFSError::Internal(format!("collapse: finalize merged parquet: {e}"))
-        })?;
-
-        let content_len = result.size;
-        let series_outboard = utilities::bao_outboard::SeriesOutboard::from_first_version_state(
-            &result.bao_state,
-            content_len as u64,
-        );
-        let bao_outboard = series_outboard.to_bytes();
-
-        let content_ref = if result.content.is_empty()
-            && content_len >= crate::large_files::LARGE_FILE_THRESHOLD
-        {
-            crate::file_writer::ContentRef::Large(result.blake3, content_len as u64)
-        } else {
-            crate::file_writer::ContentRef::Small(result.content)
-        };
-
-        // A TablePhysicalSeries is invalid without temporal metadata, so the
-        // merged row always carries the union of the inputs' event-time bounds.
-        let (min_event, max_event) = match (min_event, max_event) {
-            (Some(min), Some(max)) => (min, max),
-            _ => {
-                return Err(TLogFSError::Transaction {
-                    message: format!(
-                        "collapse_table_series: {id} has live versions without event-time bounds"
-                    ),
-                });
-            }
-        };
-
-        // Enqueue the merged version with the collapse sentinel.
-        let merged_version = {
-            let mut inner = self.inner.lock().await;
-            let version = inner.get_next_version_for_node(id).await?;
-            let now = Utc::now().timestamp_micros();
-            let txn_seq = inner.txn_seq;
-
-            let mut ea = crate::schema::ExtendedAttributes::default();
-            _ = ea.set_timestamp_column(&timestamp_column);
-
-            let mut entry = match content_ref {
-                crate::file_writer::ContentRef::Small(content) => OplogEntry::new_file_series(
-                    id, now, version, content, min_event, max_event, ea, txn_seq,
-                ),
-                crate::file_writer::ContentRef::Large(b3, size) => {
-                    OplogEntry::new_large_file_series(
-                        id,
-                        now,
-                        version,
-                        b3,
-                        size as i64,
-                        min_event,
-                        max_event,
-                        ea,
-                        txn_seq,
-                    )
-                }
-            };
-            entry.set_bao_outboard(bao_outboard);
-            entry.collapsed_from = Some(lo);
-            entry.collapsed_through = Some(hi);
-            inner.records.push(entry);
-            version
-        };
-
-        // Invariant: re-encoding must preserve logical content. Byte-identity
-        // does not hold across a parquet rewrite, so compare the row count of
-        // the stored merged run against the window it replaced. Scanning only
-        // the merged version keeps verification proportional to the window.
-        let (after, rows_after) = self
-            .reencode_table_versions(id, &[merged_version], &timestamp_column)
-            .await?;
-        if rows_after != rows_before {
-            return Err(TLogFSError::Transaction {
-                message: format!(
-                    "collapse invariant violated for {id}: merged {rows_before} rows but \
-                     post-collapse read {rows_after} rows"
-                ),
-            });
-        }
-        drop(after);
-
-        Ok(CollapseStats {
-            collapsed: true,
-            versions_before,
-            merged_version,
-            bytes: content_len as u64,
-        })
-    }
-
-    /// Read the given versions of a table series back through a table provider
-    /// and re-encode their union as a single parquet buffer.
-    ///
-    /// The versions are passed as explicit per-version URLs rather than the
-    /// series' "all versions" pattern, so a collapse can re-encode just the
-    /// window it intends to merge. DataFusion still infers and merges the schema
-    /// across the listed files, which is why this goes through the provider
-    /// instead of decoding each version's parquet directly.
-    ///
-    /// Returns the parquet bytes and the total row count.
-    async fn reencode_table_versions(
-        &self,
-        id: FileID,
-        versions: &[i64],
-        timestamp_column: &str,
-    ) -> Result<(Vec<u8>, usize), TLogFSError> {
-        use futures::StreamExt;
-        use parquet::arrow::ArrowWriter;
-
-        let context = self.as_provider_context();
-        let additional_urls: Vec<String> = versions
-            .iter()
-            .map(|v| provider::TinyFsPathBuilder::url_specific_version(&id, *v as u64))
-            .collect();
-        let table_provider = provider::create_table_provider(
-            id,
-            &context,
-            provider::TableProviderOptions {
-                version_selection: provider::VersionSelection::AllVersions,
-                additional_urls,
-                bounds: tinyfs::SeriesReadBounds::NONE,
-            },
-        )
-        .await
-        .map_err(|e| TLogFSError::Internal(format!("collapse: build table provider: {e}")))?;
-
-        let session = &context.datafusion_session;
-        let df_state = session.state();
-        let plan = table_provider
-            .scan(&df_state, None, &[], None)
-            .await
-            .map_err(|e| TLogFSError::Internal(format!("collapse: scan series: {e}")))?;
-        let mut stream = plan
-            .execute(0, session.task_ctx())
-            .map_err(|e| TLogFSError::Internal(format!("collapse: execute scan: {e}")))?;
-
-        let mut rows = 0usize;
-        let mut writer: Option<ArrowWriter<Vec<u8>>> = None;
-        while let Some(batch) = stream.next().await {
-            let batch =
-                batch.map_err(|e| TLogFSError::Internal(format!("collapse: read batch: {e}")))?;
-            rows += batch.num_rows();
-            let writer = match writer {
-                Some(ref mut w) => w,
-                None => {
-                    let w =
-                        ArrowWriter::try_new(Vec::new(), batch.schema(), None).map_err(|e| {
-                            TLogFSError::Internal(format!("collapse: create parquet writer: {e}"))
-                        })?;
-                    writer.insert(w)
-                }
-            };
-            writer
-                .write(&batch)
-                .map_err(|e| TLogFSError::Internal(format!("collapse: write batch: {e}")))?;
-        }
-
-        let writer = writer.ok_or_else(|| TLogFSError::Transaction {
-            message: format!(
-                "collapse_table_series: {id} produced no batches; refusing to \
-                 replace live versions with an empty file (timestamp column \
-                 '{timestamp_column}')"
+        // Row-rewriting collapse cannot represent the persisted-leaf
+        // invariant (`docs/logical-series-identity-design.md`): every
+        // nonempty `TablePhysicalSeries` row is exactly one immutable
+        // logical leaf with its own persisted `logical_leaf_hash`/
+        // `logical_count`/schema fingerprint, and merging several rows into
+        // one re-encoded parquet body has no single leaf identity to stamp
+        // it with. Refuse before any read, decode, or write of a merged row
+        // -- never silently produce an unstamped row that would violate the
+        // invariant every other write path enforces
+        // (`crate::series_identity::stamp_logical_leaf`, centralized in
+        // `State::store_file_content_ref`/`store_file_series_from_parquet`/
+        // `store_file_from_hybrid_writer`).
+        Err(TLogFSError::CollapseUnsupported {
+            reason: format!(
+                "collapse_table_series is unsupported for {id}: a re-encoded merged row \
+                 cannot carry a single persisted logical leaf hash for the versions it \
+                 would absorb"
             ),
-        })?;
-        let merged = writer
-            .into_inner()
-            .map_err(|e| TLogFSError::Internal(format!("collapse: finalize parquet: {e}")))?;
-
-        Ok((merged, rows))
+        })
     }
 
     /// Discover series nodes with more than `threshold` live versions, the
@@ -2003,8 +1767,15 @@ impl State {
 
     /// Add an arbitrary OplogEntry record to pending transaction state
     /// This is used for metadata-only operations like temporal bounds setting
+    ///
+    /// Routed through [`InnerState::push_stamped_entry`] rather than pushing
+    /// to `records` directly: this is a public entry point, so it must go
+    /// through the same stamp/validate choke point every internal write path
+    /// uses, or a caller could silently commit a `FilePhysicalSeries`/
+    /// `TablePhysicalSeries` row with no logical leaf identity (item 5,
+    /// `docs/logical-series-identity-design.md`).
     pub async fn add_oplog_entry(&self, entry: OplogEntry) -> Result<(), TLogFSError> {
-        self.inner.lock().await.records.push(entry);
+        self.inner.lock().await.push_stamped_entry(entry).await?;
         Ok(())
     }
 
@@ -2301,6 +2072,7 @@ impl State {
         bao_outboard: Option<Vec<u8>>,
         collapsed_through: Option<i64>,
         mtime: Option<i64>,
+        exact_logical_attributes: Option<Vec<u8>>,
     ) -> Result<(), TLogFSError> {
         self.inner
             .lock()
@@ -2313,7 +2085,24 @@ impl State {
                 bao_outboard,
                 collapsed_through,
                 mtime,
+                exact_logical_attributes,
             )
+            .await
+    }
+
+    /// Store a FileSeries directly from Parquet bytes, extracting temporal
+    /// metadata (and, per BLOCKER 3, stamping v2 logical-series identity)
+    /// before queuing the row.
+    pub async fn store_file_series_from_parquet(
+        &self,
+        id: FileID,
+        content: &[u8],
+        timestamp_column: Option<&str>,
+    ) -> Result<(i64, i64), TLogFSError> {
+        self.inner
+            .lock()
+            .await
+            .store_file_series_from_parquet(id, content, timestamp_column)
             .await
     }
 
@@ -2766,7 +2555,10 @@ impl InnerState {
                 }
             }
         };
-        self.records.push(entry);
+        // v2 logical-series identity (BLOCKER 3): stamp/validate before
+        // queuing so this path can never commit an unstamped
+        // FilePhysicalSeries/TablePhysicalSeries row (no-op for other kinds).
+        self.push_stamped_entry(entry).await?;
         Ok(())
     }
 
@@ -2804,7 +2596,7 @@ impl InnerState {
         let now = Utc::now().timestamp_micros();
         let entry = OplogEntry::new_small_file(id, now, version, content.to_vec(), self.txn_seq);
 
-        self.records.push(entry);
+        self.push_stamped_entry(entry).await?;
         Ok(())
     }
 
@@ -2952,8 +2744,10 @@ impl InnerState {
                 self.txn_seq,
             );
 
-            // Store metadata in pending records (content is external)
-            self.records.push(entry);
+            // Store metadata in pending records (content is external). Stamp
+            // the v2 logical-series identity before queuing (BLOCKER 3) so
+            // this path can never commit an unstamped TablePhysicalSeries row.
+            self.push_stamped_entry(entry).await?;
         } else {
             // Store as small FileSeries
             let now = Utc::now().timestamp_micros();
@@ -2979,7 +2773,9 @@ impl InnerState {
                 "store_file_series_from_parquet - created OplogEntry with content size: {entry_content_size}"
             );
 
-            self.records.push(entry);
+            // Stamp the v2 logical-series identity before queuing (BLOCKER 3)
+            // so this path can never commit an unstamped TablePhysicalSeries row.
+            self.push_stamped_entry(entry).await?;
         }
 
         Ok((global_min, global_max))
@@ -3379,6 +3175,181 @@ impl InnerState {
         Ok(map)
     }
 
+    /// Stamp the v2 logical-series identity onto a freshly-constructed
+    /// `OplogEntry` and enforce the persisted-leaf invariant before it is
+    /// queued for commit (BLOCKER 3,
+    /// `docs/logical-series-identity-design.md`). This is the single choke
+    /// point every write path that can construct a `FilePhysicalSeries` /
+    /// `TablePhysicalSeries` row must go through -- `self.records.push`
+    /// must never be called directly with such an entry, or a future write
+    /// path could silently commit a series row with no logical leaf, which
+    /// `dp.series.2` (steward's content fold) cannot detect after the fact.
+    ///
+    /// Also enforces item 5: a `TablePhysicalSeries` append's schema
+    /// fingerprint must match every existing committed-or-pending logical
+    /// leaf of the same series node, checked here (before commit) rather
+    /// than left for steward's fold to discover after the incompatible row
+    /// is already durable.
+    ///
+    /// No-op (stamps nothing, validates nothing) for every other
+    /// `EntryType`, matching [`crate::series_identity::stamp_logical_leaf`].
+    ///
+    /// # Errors
+    /// Returns [`TLogFSError::Internal`] if, after stamping, a row that is
+    /// physically nonempty (or already row-decoded as nonempty) is still
+    /// missing its logical leaf hash/count (or, for `TablePhysicalSeries`,
+    /// its schema fingerprint) -- a corrupt row must never reach `push`
+    /// silently. A genuinely empty (zero-byte) `FilePhysicalSeries` append
+    /// is exempt when it is the node's very first version: it is allowed to
+    /// remain leafless. Returns
+    /// [`TLogFSError::SeriesLeaflessAppendAfterFirstVersion`] if a
+    /// genuinely empty `FilePhysicalSeries` append targets a LATER version
+    /// (`version > 1`) of an already-existing series -- unlike the
+    /// first-version case, that state cannot be reproduced by the v2
+    /// replication fold (release blocker item 2,
+    /// `docs/logical-series-identity-design.md`). Returns
+    /// [`TLogFSError::SeriesTableRequiresSchemaBearingFirstVersion`] if a
+    /// `TablePhysicalSeries` append is genuinely empty at ANY version
+    /// (including the first): unlike a file series, a table series can
+    /// never obtain the schema fingerprint `SeriesManifest::new`
+    /// unconditionally requires for `PayloadKind::Table`, so this state
+    /// would durably commit a node steward's own fold could never later
+    /// represent. Returns [`TLogFSError::SeriesZeroRowAppend`] if a
+    /// `TablePhysicalSeries` append carries nonempty Parquet bytes that
+    /// decode to zero rows. Returns [`TLogFSError::SeriesSchemaMismatch`]
+    /// (a recoverable write error, not a corrupt-row bug) if this append's
+    /// schema fingerprint disagrees with an existing leaf of the same
+    /// series.
+    async fn stamp_and_validate_series_entry(
+        &mut self,
+        entry: &mut OplogEntry,
+    ) -> Result<(), TLogFSError> {
+        crate::series_identity::stamp_logical_leaf(&self.path, entry).await?;
+
+        match entry.file_type {
+            EntryType::FilePhysicalSeries => {
+                let physically_nonempty = entry.size.unwrap_or(0) > 0;
+                if !physically_nonempty && entry.version > 1 {
+                    return Err(TLogFSError::SeriesLeaflessAppendAfterFirstVersion {
+                        node_id: entry.node_id.to_string(),
+                        version: entry.version,
+                    });
+                }
+                if physically_nonempty
+                    && (entry.logical_leaf_hash.is_none()
+                        || entry.logical_count.is_none_or(|c| c <= 0))
+                {
+                    return Err(TLogFSError::Internal(format!(
+                        "logical-leaf invariant violated: nonempty FilePhysicalSeries append \
+                         for node {} version {} (size={:?}) has no valid logical leaf hash/count \
+                         after stamping -- refusing to commit a corrupt row",
+                        entry.node_id, entry.version, entry.size
+                    )));
+                }
+            }
+            EntryType::TablePhysicalSeries => {
+                let physically_nonempty = entry.size.unwrap_or(0) > 0;
+                // Unlike `FilePhysicalSeries`, a table series has no
+                // legitimate leafless state at ANY version: `SeriesManifest::
+                // new` unconditionally requires a schema fingerprint for
+                // `PayloadKind::Table`, and the only way to obtain one is a
+                // real, nonempty Parquet append (`SeriesZeroRowAppend`
+                // rejects a nonempty-but-zero-row one) -- a genuinely empty
+                // first version would durably commit a node steward's own
+                // source-side fold can never later represent as a valid
+                // `dp.series.2` manifest. Reject here, before the row is
+                // ever durable, rather than let that surface as an opaque
+                // fold failure at the next commit.
+                if !physically_nonempty {
+                    return Err(TLogFSError::SeriesTableRequiresSchemaBearingFirstVersion {
+                        node_id: entry.node_id.to_string(),
+                        version: entry.version,
+                    });
+                }
+                // A nonempty leaf always requires a schema fingerprint too;
+                // `decode_parquet_batches` yields a schema whenever the
+                // Parquet bytes are nonempty, even at zero rows, so a
+                // physically nonempty row missing its fingerprint means
+                // stamping was skipped or failed silently upstream.
+                if physically_nonempty && entry.series_schema_fingerprint.is_none() {
+                    return Err(TLogFSError::Internal(format!(
+                        "schema-fingerprint invariant violated: nonempty TablePhysicalSeries \
+                         append for node {} version {} (size={:?}) has no schema fingerprint \
+                         after stamping -- refusing to commit a corrupt row",
+                        entry.node_id, entry.version, entry.size
+                    )));
+                }
+                // Item 5: a physically nonempty (real Parquet bytes present)
+                // append that decodes to zero rows is rejected here, at the
+                // write choke point, rather than allowed through leafless
+                // and left for steward's fold to fail on later. A row with
+                // no leaf hash despite carrying real Parquet bytes is
+                // exactly this case (`stamp_logical_leaf` only leaves a
+                // physically nonempty row leafless when its decoded row
+                // count is zero); a truly empty append never reaches this
+                // branch because `physically_nonempty` is false for it.
+                if physically_nonempty && entry.logical_leaf_hash.is_none() {
+                    return Err(TLogFSError::SeriesZeroRowAppend {
+                        node_id: entry.node_id.to_string(),
+                        version: entry.version,
+                        byte_count: entry.size.unwrap_or(0),
+                    });
+                }
+                if entry.logical_leaf_hash.is_some() != entry.logical_count.is_some_and(|c| c > 0) {
+                    return Err(TLogFSError::Internal(format!(
+                        "logical-leaf invariant violated: TablePhysicalSeries append for node {} \
+                         version {} has an inconsistent logical_leaf_hash/logical_count pair \
+                         after stamping ({:?}, {:?}) -- refusing to commit a corrupt row",
+                        entry.node_id, entry.version, entry.logical_leaf_hash, entry.logical_count
+                    )));
+                }
+
+                // Item 5: table schema stability must be enforced BEFORE
+                // commit, not first discovered by steward's fold after the
+                // incompatible row is already durable. Check this append's
+                // fingerprint against every existing committed-or-pending
+                // logical leaf of the SAME series node.
+                if let Some(new_fingerprint) = entry.series_schema_fingerprint.clone() {
+                    let id = FileID::new_from_ids(
+                        entry.part_id,
+                        entry.node_id,
+                        entry.pond_id.parse().map_err(|e| {
+                            TLogFSError::Internal(format!(
+                                "series schema stability check: node {} has an unparseable \
+                                 pond_id {:?}: {e}",
+                                entry.node_id, entry.pond_id
+                            ))
+                        })?,
+                    );
+                    for prior in self.query_records(id).await? {
+                        let Some(existing_fingerprint) = prior.series_schema_fingerprint else {
+                            continue;
+                        };
+                        if existing_fingerprint != new_fingerprint {
+                            return Err(TLogFSError::SeriesSchemaMismatch {
+                                node_id: entry.node_id.to_string(),
+                                new_fingerprint,
+                                existing_fingerprint,
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Stamp, validate, then queue `entry` for commit. The single call site
+    /// every write path that can construct a `FilePhysicalSeries` /
+    /// `TablePhysicalSeries` row must use in place of `self.records.push`
+    /// directly (see [`Self::stamp_and_validate_series_entry`]).
+    async fn push_stamped_entry(&mut self, mut entry: OplogEntry) -> Result<(), TLogFSError> {
+        self.stamp_and_validate_series_entry(&mut entry).await?;
+        self.records.push(entry);
+        Ok(())
+    }
+
     /// Store file content reference with transaction context (used by transaction guard NewFileWriter)
     /// If pre_allocated_version is Some, uses that version instead of calculating a new one
     pub async fn store_file_content_ref(
@@ -3390,6 +3361,7 @@ impl InnerState {
         bao_outboard: Option<Vec<u8>>,
         collapsed_through: Option<i64>,
         mtime: Option<i64>,
+        exact_logical_attributes: Option<Vec<u8>>,
     ) -> Result<(), TLogFSError> {
         debug!("store_file_content_ref_transactional called for node_id={id}");
 
@@ -3598,7 +3570,22 @@ impl InnerState {
             entry.collapsed_through = Some(sentinel);
         }
 
-        self.records.push(entry);
+        // Release blocker item 2 (`docs/logical-series-identity-design.md`):
+        // adopt exact canonical logical-attributes bytes, when the caller
+        // supplied them, in place of whatever `metadata`'s
+        // `timestamp_column`-only reconstruction above produced -- done
+        // before `push_stamped_entry` below so identity stamping computes
+        // the hash from the exact bytes the caller committed to.
+        apply_exact_logical_attributes(&mut entry, exact_logical_attributes)?;
+
+        // v2 logical-series identity (`docs/logical-series-identity-design.md`,
+        // BLOCKER 3): every write path that can construct a
+        // FilePhysicalSeries/TablePhysicalSeries row must go through the
+        // shared stamp-then-validate choke point rather than pushing
+        // directly, so a corrupt (nonempty-but-leafless) row can never reach
+        // commit silently. No-op for every other EntryType and for a
+        // genuinely empty append of either series kind.
+        self.push_stamped_entry(entry).await?;
 
         debug!("Stored file content reference for node {id}");
         Ok(())
@@ -4643,10 +4630,127 @@ impl InnerState {
             let attributes_json = serde_json::to_string(&attributes)
                 .map_other_context("Failed to serialize extended attributes")?;
             self.records[index].extended_attributes = Some(attributes_json);
+
+            // BLOCKER item 2 (`docs/logical-series-identity-design.md`): a
+            // nonempty `FilePhysicalSeries`/`TablePhysicalSeries` row's
+            // `logical_leaf_hash` commits to its `extended_attributes`
+            // (`crate::series_identity::hash_file_series_content`/
+            // `stamp_logical_leaf`'s table branch). Mutating the attributes
+            // in place above without recomputing that hash would leave the
+            // still-pending row internally inconsistent -- its persisted
+            // `logical_leaf_hash` would no longer match what a reader (or
+            // this pond's own later fold) independently recomputes from the
+            // row's own persisted fields. Re-stamp here, before this
+            // transaction can commit, so the invariant holds; a no-op for
+            // every non-series `EntryType` and for a leafless row (content
+            // is unchanged, so re-stamping the same leafless row that was
+            // already empty stays leafless).
+            let pond_path = self.path.clone();
+            crate::series_identity::stamp_logical_leaf(&pond_path, &mut self.records[index])
+                .await
+                .map_other_context(
+                    "Failed to re-stamp logical leaf identity after extended attribute change",
+                )?;
         }
 
         Ok(())
     }
+}
+
+/// Adopt `exact_attributes` (already-canonical logical-attributes bytes, as
+/// [`sync_store::content::encode_canonical_attributes`] would produce them)
+/// onto `entry`'s `extended_attributes` field verbatim, in place of whatever
+/// [`FileMetadata::Series`]'s `timestamp_column`-only reconstruction already
+/// wrote there -- release blocker item 2
+/// (`docs/logical-series-identity-design.md`): a writer that only calls
+/// [`tinyfs::FileMetadataWriter::set_temporal_metadata`] can round-trip
+/// exactly one attribute key (the timestamp column); any other key a source
+/// leaf carried via a raw attribute setter would otherwise be silently
+/// dropped when reconstructing a replicated version's attributes.
+///
+/// A no-op when `exact_attributes` is `None` (the ordinary write path, which
+/// never sets it).
+///
+/// [`FileMetadata::Series`]: crate::file_writer::FileMetadata::Series
+///
+/// # Errors
+///
+/// Returns an error if `exact_attributes` is `Some` but `entry.file_type` is
+/// not `FilePhysicalSeries`/`TablePhysicalSeries` (only these carry v2
+/// logical-series identity, so this parameter is caller-internal misuse for
+/// any other kind), if the bytes are not valid UTF-8 or not exactly
+/// canonical logical-attributes JSON (byte-identical to what
+/// `encode_canonical_attributes` would produce for the same content), or if
+/// they name a `watertown.timestamp_column` that disagrees with whatever
+/// `metadata` already established for this write -- an ambiguous conflict
+/// between two sources of truth for the same column, rejected rather than
+/// silently preferring one.
+fn apply_exact_logical_attributes(
+    entry: &mut OplogEntry,
+    exact_attributes: Option<Vec<u8>>,
+) -> Result<(), TLogFSError> {
+    let Some(bytes) = exact_attributes else {
+        return Ok(());
+    };
+    if !matches!(
+        entry.file_type,
+        EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries
+    ) {
+        return Err(TLogFSError::Internal(format!(
+            "exact logical attributes were supplied for node {} but its entry type is {:?}, not \
+             a v2 logical series -- caller error",
+            entry.node_id, entry.file_type
+        )));
+    }
+    let json = String::from_utf8(bytes).map_err(|e| {
+        TLogFSError::ArrowMessage(format!("exact logical attributes are not valid utf-8: {e}"))
+    })?;
+    let canonical = sync_store::content::encode_canonical_attributes(&json).map_err(|e| {
+        TLogFSError::ArrowMessage(format!("exact logical attributes are not valid JSON: {e}"))
+    })?;
+    if canonical.as_slice() != json.as_bytes() {
+        return Err(TLogFSError::ArrowMessage(
+            "exact logical attributes bytes are not already canonical (sorted keys, no \
+             insignificant whitespace)"
+                .to_string(),
+        ));
+    }
+    // A conflict check against whatever `timestamp_column` the ordinary
+    // metadata path already wrote: both name the same well-known key, and
+    // disagreeing would mean the writer told two different code paths two
+    // different truths about which column is authoritative. Read the raw
+    // key rather than `ExtendedAttributes::timestamp_column()`'s
+    // default-fallback accessor, so an existing attributes blob that simply
+    // never mentioned the column (e.g. a synthesized empty-content stamp)
+    // is not mistaken for an explicit, conflicting claim.
+    if let Some(existing_json) = &entry.extended_attributes {
+        let existing_column: Option<String> =
+            crate::schema::ExtendedAttributes::from_json(existing_json)
+                .ok()
+                .and_then(|attrs| {
+                    attrs
+                        .attributes
+                        .get(crate::schema::watertown::TIMESTAMP_COLUMN)
+                        .cloned()
+                });
+        let new_column: Option<String> = serde_json::from_str::<serde_json::Value>(&json)
+            .ok()
+            .and_then(|v| {
+                v.get(crate::schema::watertown::TIMESTAMP_COLUMN)
+                    .and_then(|c| c.as_str())
+                    .map(str::to_string)
+            });
+        if let (Some(existing_column), Some(new_column)) = (&existing_column, &new_column)
+            && existing_column != new_column
+        {
+            return Err(TLogFSError::ArrowMessage(format!(
+                "exact logical attributes name timestamp column {new_column:?} but this write \
+                 already established column {existing_column:?}; ambiguous conflict"
+            )));
+        }
+    }
+    entry.extended_attributes = Some(json);
+    Ok(())
 }
 
 /// Serialization utilities for Arrow IPC format
@@ -5132,5 +5236,461 @@ mod collapse_window_tests {
     fn backstop_handles_a_series_shorter_than_the_fanout() {
         let sizes = vec![1, 1_000, 1_000_000];
         assert_eq!(window(&sizes, 1), Some(0..3));
+    }
+}
+
+/// BLOCKER 3 (`docs/logical-series-identity-design.md`): every write path
+/// that can construct a `FilePhysicalSeries`/`TablePhysicalSeries` row must
+/// go through [`InnerState::push_stamped_entry`], not `self.records.push`
+/// directly, so a corrupt (nonempty-but-leafless) row can never reach
+/// commit silently. These tests exercise the two write paths that were
+/// found to bypass stamping entirely --
+/// [`InnerState::store_file_series_from_parquet`] and
+/// [`InnerState::store_small_file_with_type`]/[`InnerState::store_file_from_hybrid_writer`]
+/// (via `store_file_content_with_type`) -- end to end through a real
+/// `OpLogPersistence`, confirming the persisted row now carries a valid
+/// logical leaf (and, for tables, a schema fingerprint) after commit.
+#[cfg(test)]
+mod stamping_choke_point_tests {
+    use super::{EntryType, FileID, OpLogPersistence};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow_array::{Int64Array, RecordBatch};
+    use tempfile::TempDir;
+
+    fn parquet_bytes(values: &[i64]) -> Vec<u8> {
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                std::sync::Arc::new(Int64Array::from(values.to_vec())),
+                std::sync::Arc::new(Int64Array::from(values.to_vec())),
+            ],
+        )
+        .expect("record batch");
+        let mut buf = Vec::new();
+        {
+            let mut writer =
+                parquet::arrow::ArrowWriter::try_new(&mut buf, schema, None).expect("writer");
+            writer.write(&batch).expect("write batch");
+            _ = writer.close().expect("close writer");
+        }
+        buf
+    }
+
+    /// A valid, schema-bearing but zero-row Parquet file: nonempty bytes
+    /// (footer/magic are still written even with no row groups) that decode
+    /// to `total_rows == 0`. Used to exercise the Item 5 write-choke-point
+    /// rejection of a physically nonempty append that carries no logical
+    /// rows.
+    fn parquet_bytes_zero_rows() -> Vec<u8> {
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let mut buf = Vec::new();
+        {
+            let writer =
+                parquet::arrow::ArrowWriter::try_new(&mut buf, schema, None).expect("writer");
+            // No `.write()` call: close a writer that never received a
+            // batch, producing a structurally valid Parquet file (schema in
+            // the footer) with zero row groups.
+            _ = writer.close().expect("close writer");
+        }
+        buf
+    }
+
+    /// Same shape as [`parquet_bytes`] but with an extra `extra` column, so
+    /// its schema fingerprint necessarily differs.
+    fn parquet_bytes_with_extra_column(values: &[i64]) -> Vec<u8> {
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+            Field::new("extra", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                std::sync::Arc::new(Int64Array::from(values.to_vec())),
+                std::sync::Arc::new(Int64Array::from(values.to_vec())),
+                std::sync::Arc::new(Int64Array::from(values.to_vec())),
+            ],
+        )
+        .expect("record batch");
+        let mut buf = Vec::new();
+        {
+            let mut writer =
+                parquet::arrow::ArrowWriter::try_new(&mut buf, schema, None).expect("writer");
+            writer.write(&batch).expect("write batch");
+            _ = writer.close().expect("close writer");
+        }
+        buf
+    }
+
+    async fn new_test_persistence() -> (TempDir, OpLogPersistence) {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("pond").to_string_lossy().to_string();
+        let persistence = OpLogPersistence::create_test(&path)
+            .await
+            .expect("create persistence");
+        (dir, persistence)
+    }
+
+    fn series_id(persistence: &OpLogPersistence, entry_type: EntryType) -> FileID {
+        let pond_uuid: uuid7::Uuid = persistence.pond_id().parse().expect("valid pond uuid");
+        FileID::new_in_partition(FileID::root_for(pond_uuid).part_id(), entry_type, pond_uuid)
+    }
+
+    /// `store_file_series_from_parquet` previously pushed the raw
+    /// `OplogEntry` straight to `self.records`, entirely skipping
+    /// `stamp_logical_leaf` -- a nonempty `TablePhysicalSeries` row could
+    /// commit with no `logical_leaf_hash`/`logical_count`/
+    /// `series_schema_fingerprint`. It must now stamp correctly.
+    #[tokio::test]
+    async fn store_file_series_from_parquet_stamps_logical_leaf() {
+        let (_dir, mut persistence) = new_test_persistence().await;
+        let id = series_id(&persistence, EntryType::TablePhysicalSeries);
+        let bytes = parquet_bytes(&[1, 2, 3]);
+
+        let tx = persistence.begin_test().await.expect("begin");
+        let state = tx.state().expect("state");
+        let _ = state
+            .store_file_series_from_parquet(id, &bytes, Some("timestamp"))
+            .await
+            .expect("store series from parquet");
+        let pending = state.query_records(id).await.expect("query pending");
+        tx.commit_test().await.expect("commit");
+
+        assert_eq!(pending.len(), 1);
+        let row = &pending[0];
+        assert_eq!(row.file_type, EntryType::TablePhysicalSeries);
+        assert!(
+            row.logical_leaf_hash.is_some(),
+            "nonempty TablePhysicalSeries row must carry a logical leaf hash"
+        );
+        assert!(
+            row.logical_count.is_some_and(|c| c > 0),
+            "nonempty TablePhysicalSeries row must carry a positive logical count"
+        );
+        assert!(
+            row.series_schema_fingerprint.is_some(),
+            "nonempty TablePhysicalSeries row must carry a schema fingerprint"
+        );
+    }
+
+    /// Item 5: a physically nonempty append (real, schema-bearing Parquet
+    /// bytes) that decodes to zero rows must be rejected right here, at the
+    /// write choke point (`stamp_and_validate_series_entry`), instead of
+    /// being allowed through leafless (as a "no leaf to identify" append is,
+    /// per `stamp_logical_leaf`'s doc comment) only to later fail steward's
+    /// fold when it finds a nonempty-but-leafless row it cannot reconcile.
+    /// Constructs the `OplogEntry` directly (bypassing
+    /// `store_file_series_from_parquet`'s own temporal-metadata extraction,
+    /// which requires at least one row to detect a timestamp column) so the
+    /// choke point itself -- not an earlier, unrelated precondition -- is
+    /// what is being exercised.
+    #[tokio::test]
+    async fn table_series_nonempty_parquet_zero_rows_append_is_rejected_at_write_choke_point() {
+        use crate::TLogFSError;
+        use crate::schema::{ExtendedAttributes, OplogEntry};
+
+        let (_dir, mut persistence) = new_test_persistence().await;
+        let id = series_id(&persistence, EntryType::TablePhysicalSeries);
+        let bytes = parquet_bytes_zero_rows();
+        assert!(
+            !bytes.is_empty(),
+            "a structurally valid empty Parquet file still carries footer/magic bytes"
+        );
+
+        let tx = persistence.begin_test().await.expect("begin");
+        let state = tx.state().expect("state");
+        let mut inner = state.inner.lock().await;
+        let next_version = inner
+            .get_next_version_for_node(id)
+            .await
+            .expect("next version");
+        let entry = OplogEntry::new_file_series(
+            id,
+            chrono::Utc::now().timestamp_micros(),
+            next_version,
+            bytes,
+            0,
+            0,
+            ExtendedAttributes::default(),
+            inner.txn_seq,
+        );
+        let err = inner
+            .push_stamped_entry(entry)
+            .await
+            .expect_err("nonempty-but-zero-row TablePhysicalSeries append must be rejected");
+        assert!(
+            matches!(err, TLogFSError::SeriesZeroRowAppend { .. }),
+            "expected SeriesZeroRowAppend, got: {err}"
+        );
+        drop(inner);
+        tx.commit_test().await.expect("commit (nothing pending)");
+    }
+
+    /// `store_small_file_with_type` (reached via
+    /// `store_file_content_with_type`) previously skipped stamping too. A
+    /// small `FilePhysicalSeries` write must now stamp a logical leaf hash
+    /// and count.
+    #[tokio::test]
+    async fn store_small_file_with_type_stamps_logical_leaf() {
+        let (_dir, mut persistence) = new_test_persistence().await;
+        let id = series_id(&persistence, EntryType::FilePhysicalSeries);
+        let content = b"hello logical leaf".to_vec();
+
+        let tx = persistence.begin_test().await.expect("begin");
+        let state = tx.state().expect("state");
+        state
+            .inner
+            .lock()
+            .await
+            .store_small_file_with_type(id, &content)
+            .await
+            .expect("store small file");
+        let pending = state.query_records(id).await.expect("query pending");
+        tx.commit_test().await.expect("commit");
+
+        assert_eq!(pending.len(), 1);
+        let row = &pending[0];
+        assert_eq!(row.file_type, EntryType::FilePhysicalSeries);
+        assert!(
+            row.logical_leaf_hash.is_some(),
+            "nonempty FilePhysicalSeries row must carry a logical leaf hash"
+        );
+        assert!(
+            row.logical_count.is_some_and(|c| c > 0),
+            "nonempty FilePhysicalSeries row must carry a positive logical count"
+        );
+    }
+
+    /// A genuinely empty append must remain leafless -- the invariant is
+    /// "nonempty implies stamped", not "always stamped". Exercised via
+    /// `store_small_file_with_type` (a `FilePhysicalSeries` write path):
+    /// `store_file_series_from_parquet` always requires valid, nonempty
+    /// Parquet bytes with a detectable timestamp column to extract temporal
+    /// bounds, so an empty call is not a supported input for that path.
+    #[tokio::test]
+    async fn empty_series_append_stays_leafless_without_erroring() {
+        let (_dir, mut persistence) = new_test_persistence().await;
+        let id = series_id(&persistence, EntryType::FilePhysicalSeries);
+
+        let tx = persistence.begin_test().await.expect("begin");
+        let state = tx.state().expect("state");
+        state
+            .inner
+            .lock()
+            .await
+            .store_small_file_with_type(id, &[])
+            .await
+            .expect("store empty small file");
+        let pending = state.query_records(id).await.expect("query pending");
+        tx.commit_test().await.expect("commit");
+
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].logical_leaf_hash.is_none());
+        assert!(pending[0].logical_count.is_none());
+    }
+
+    /// Release blocker item 2 (`docs/logical-series-identity-design.md`): a
+    /// genuinely empty (leafless) append to a `FilePhysicalSeries` node is
+    /// only supported as the node's very first version (release blocker
+    /// item 1's empty-series-creation state); a LATER leafless append would
+    /// change series-level attributes/mtime independently of the last real
+    /// logical leaf, which `build_series_manifest`'s aggregation (steward's
+    /// source-side fold) intentionally ignores for every leafless version,
+    /// so it could never be reproduced by the v2 replication fold. Rejected
+    /// here, at the write choke point, before it could ever commit.
+    #[tokio::test]
+    async fn leafless_append_after_first_version_is_rejected() {
+        use crate::TLogFSError;
+
+        let (_dir, mut persistence) = new_test_persistence().await;
+        let id = series_id(&persistence, EntryType::FilePhysicalSeries);
+
+        // Version 1: a real, nonempty leaf.
+        let tx = persistence.begin_test().await.expect("begin v1");
+        let state = tx.state().expect("state");
+        state
+            .inner
+            .lock()
+            .await
+            .store_small_file_with_type(id, b"first real leaf")
+            .await
+            .expect("store first version");
+        tx.commit_test().await.expect("commit v1");
+
+        // Version 2: a genuinely empty (leafless) append -- must be
+        // rejected before it can ever reach commit.
+        let tx = persistence.begin_test().await.expect("begin v2");
+        let state = tx.state().expect("state");
+        let err = state
+            .inner
+            .lock()
+            .await
+            .store_small_file_with_type(id, &[])
+            .await
+            .expect_err("a leafless append after the first version must be rejected");
+        assert!(
+            matches!(
+                err,
+                TLogFSError::SeriesLeaflessAppendAfterFirstVersion { version: 2, .. }
+            ),
+            "expected SeriesLeaflessAppendAfterFirstVersion{{version: 2}}, got: {err}"
+        );
+        tx.commit_test().await.expect("commit (nothing pending)");
+    }
+
+    /// A `TablePhysicalSeries` has no legitimate leafless state at any
+    /// version -- unlike `FilePhysicalSeries`, this is rejected even at
+    /// version 1 (see [`TLogFSError::SeriesTableRequiresSchemaBearingFirstVersion`]'s
+    /// doc comment: a table series can never obtain a schema fingerprint
+    /// without a real, nonempty Parquet append, and `SeriesManifest::new`
+    /// always requires one for `PayloadKind::Table`). Exercised via
+    /// `store_file_series_from_parquet` for a real first leaf (confirming
+    /// the *nonempty* path is unaffected) and a direct zero-byte
+    /// `store_small_file_with_type` call (bypassing the Parquet-only path,
+    /// which requires nonempty content) for the rejected, leafless second
+    /// append.
+    #[tokio::test]
+    async fn table_series_leafless_append_is_always_rejected() {
+        use crate::TLogFSError;
+
+        let (_dir, mut persistence) = new_test_persistence().await;
+        let id = series_id(&persistence, EntryType::TablePhysicalSeries);
+
+        let tx = persistence.begin_test().await.expect("begin v1");
+        let state = tx.state().expect("state");
+        let _ = state
+            .store_file_series_from_parquet(id, &parquet_bytes(&[1, 2, 3]), Some("timestamp"))
+            .await
+            .expect("store first version");
+        tx.commit_test().await.expect("commit v1");
+
+        let tx = persistence.begin_test().await.expect("begin v2");
+        let state = tx.state().expect("state");
+        let err = state
+            .inner
+            .lock()
+            .await
+            .store_small_file_with_type(id, &[])
+            .await
+            .expect_err("a leafless TablePhysicalSeries append must always be rejected");
+        assert!(
+            matches!(
+                err,
+                TLogFSError::SeriesTableRequiresSchemaBearingFirstVersion { version: 2, .. }
+            ),
+            "expected SeriesTableRequiresSchemaBearingFirstVersion{{version: 2}}, got: {err}"
+        );
+        tx.commit_test().await.expect("commit (nothing pending)");
+    }
+
+    /// The genuinely-empty-first-version case too: a brand-new
+    /// `TablePhysicalSeries` node's very first append must be rejected if
+    /// it carries zero bytes, since (unlike a file series) it could never
+    /// be folded into a valid `dp.series.2` manifest afterward.
+    #[tokio::test]
+    async fn table_series_leafless_first_version_is_rejected() {
+        use crate::TLogFSError;
+
+        let (_dir, mut persistence) = new_test_persistence().await;
+        let id = series_id(&persistence, EntryType::TablePhysicalSeries);
+
+        let tx = persistence.begin_test().await.expect("begin v1");
+        let state = tx.state().expect("state");
+        let err = state
+            .inner
+            .lock()
+            .await
+            .store_small_file_with_type(id, &[])
+            .await
+            .expect_err("a leafless TablePhysicalSeries first version must be rejected");
+        assert!(
+            matches!(
+                err,
+                TLogFSError::SeriesTableRequiresSchemaBearingFirstVersion { version: 1, .. }
+            ),
+            "expected SeriesTableRequiresSchemaBearingFirstVersion{{version: 1}}, got: {err}"
+        );
+        tx.commit_test().await.expect("commit (nothing pending)");
+    }
+
+    /// Item 5: a second append to the same `TablePhysicalSeries` node whose
+    /// schema fingerprint disagrees with an already-*pending* (uncommitted)
+    /// leaf of that series must be rejected before commit, not merely
+    /// discovered later by steward's fold.
+    #[tokio::test]
+    async fn table_series_schema_mismatch_against_pending_leaf_is_rejected_before_commit() {
+        let (_dir, mut persistence) = new_test_persistence().await;
+        let id = series_id(&persistence, EntryType::TablePhysicalSeries);
+
+        let tx = persistence.begin_test().await.expect("begin");
+        let state = tx.state().expect("state");
+        let _ = state
+            .store_file_series_from_parquet(id, &parquet_bytes(&[1, 2, 3]), Some("timestamp"))
+            .await
+            .expect("first append (2-column schema)");
+
+        let err = state
+            .store_file_series_from_parquet(
+                id,
+                &parquet_bytes_with_extra_column(&[4, 5, 6]),
+                Some("timestamp"),
+            )
+            .await
+            .expect_err("second append with a different schema must be rejected before commit");
+        let message = err.to_string();
+        assert!(
+            message.contains("schema fingerprint") || message.contains("SeriesSchemaMismatch"),
+            "expected a schema-mismatch error, got: {message}"
+        );
+
+        // Only the first (valid) append made it into the pending set --
+        // the mismatched second append must not have been queued either.
+        let pending = state.query_records(id).await.expect("query pending");
+        assert_eq!(pending.len(), 1);
+        tx.commit_test().await.expect("commit");
+    }
+
+    /// Same as above, but the conflicting fingerprint belongs to an
+    /// already-*committed* leaf in a prior transaction -- the check must
+    /// also see across-transaction history, not just the in-flight batch.
+    #[tokio::test]
+    async fn table_series_schema_mismatch_against_committed_leaf_is_rejected_before_commit() {
+        let (_dir, mut persistence) = new_test_persistence().await;
+        let id = series_id(&persistence, EntryType::TablePhysicalSeries);
+
+        let tx1 = persistence.begin_test().await.expect("begin 1");
+        {
+            let state = tx1.state().expect("state 1");
+            let _ = state
+                .store_file_series_from_parquet(id, &parquet_bytes(&[1, 2, 3]), Some("timestamp"))
+                .await
+                .expect("first append (2-column schema)");
+        }
+        tx1.commit_test().await.expect("commit 1");
+
+        let tx2 = persistence.begin_test().await.expect("begin 2");
+        let state2 = tx2.state().expect("state 2");
+        let err = state2
+            .store_file_series_from_parquet(
+                id,
+                &parquet_bytes_with_extra_column(&[4, 5, 6]),
+                Some("timestamp"),
+            )
+            .await
+            .expect_err(
+                "append with a schema differing from a committed leaf must be rejected before commit",
+            );
+        let message = err.to_string();
+        assert!(
+            message.contains("schema fingerprint") || message.contains("SeriesSchemaMismatch"),
+            "expected a schema-mismatch error, got: {message}"
+        );
     }
 }

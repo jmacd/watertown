@@ -57,10 +57,11 @@ pub fn commit_leaf_hash(commit: &Commit) -> LogHash {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::content::{ObjectHash, Provenance};
+    use crate::content::{ContentModelVersion, ObjectHash, Provenance};
 
     fn commit(seq: i64, root_byte: u8) -> Commit {
         Commit::new(
+            ContentModelVersion::LogicalSeriesV2,
             ObjectHash::of_bytes(&[root_byte]),
             None,
             ObjectHash::of_bytes(b"manifest"),

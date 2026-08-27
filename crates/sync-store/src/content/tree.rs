@@ -38,7 +38,12 @@ use super::{Cursor, ObjectHash, push_len_prefixed};
 const TREE_MAGIC: &[u8] = b"dp.tree.2\n";
 
 /// Magic header for the cumulative series hash (D2).
-const SERIES_MAGIC: &[u8] = b"dp.series.1\n";
+///
+/// `pub(crate)`: [`super::series_dispatch`] dispatches a fetched series
+/// object between this (v1) and [`super::series_manifest::MANIFEST_MAGIC`]
+/// (v2) by inspecting the same magic bytes, so it must reference this exact
+/// constant rather than risk a second, potentially-divergent literal.
+pub(crate) const SERIES_MAGIC: &[u8] = b"dp.series.1\n";
 
 /// Magic header for a dynamic-node recipe object (D2/D4).
 const RECIPE_MAGIC: &[u8] = b"dp.recipe.1\n";

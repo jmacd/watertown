@@ -6,11 +6,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use sync_store::content::{FetchedSeriesObject, decode_fetched_series_object};
 use sync_store::{
     CapsuleEntry, CapsuleLeaf, CapsuleManifest, CapsuleNode, CapsuleObject, CapsulePayloadKind,
     CapsuleSource, IncrementalFileLeafHasher, IncrementalTableLeafHasher, ObjectHash,
-    capsule_series_root, decode_manifest, decode_recipe, decode_series,
-    encode_canonical_attributes, encode_canonical_batch_rows, schema_fingerprint,
+    capsule_series_root, decode_manifest, decode_recipe, encode_canonical_attributes,
+    encode_canonical_batch_rows, schema_fingerprint,
 };
 use tinyfs::EntryType;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -322,32 +323,85 @@ async fn build_physical_node(
         native.entry_type,
         EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries
     );
-    let hashes = match native.entry_type {
+    let (payload_versions, manifest_table_schema) = match native.entry_type {
         EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries => {
             let bytes = materialized.inline.get(&native.child_hash).ok_or_else(|| {
                 StewardError::Content(format!("series object {} is missing", native.child_hash))
             })?;
-            decode_series(bytes).map_err(|error| {
+            match decode_fetched_series_object(bytes).map_err(|error| {
                 StewardError::Content(format!("decode series object for {path}: {error}"))
-            })?
+            })? {
+                FetchedSeriesObject::V1(hashes) => {
+                    if hashes.len() != native.versions.len() {
+                        return Err(StewardError::Content(format!(
+                            "{path} has {} payload versions but {} metadata versions",
+                            hashes.len(),
+                            native.versions.len()
+                        )));
+                    }
+                    (
+                        hashes
+                            .into_iter()
+                            .zip(native.versions.iter().cloned())
+                            .collect(),
+                        None,
+                    )
+                }
+                FetchedSeriesObject::V2(manifest) => {
+                    let series = materialized
+                        .series_material
+                        .iter()
+                        .find(|series| series.series_hash == native.child_hash)
+                        .ok_or_else(|| {
+                            StewardError::Content(format!(
+                                "physical material for v2 series {path} is missing"
+                            ))
+                        })?;
+                    if series.entry_type != native.entry_type {
+                        return Err(StewardError::Content(format!(
+                            "v2 series {path} material has type {:?}, expected {:?}",
+                            series.entry_type, native.entry_type
+                        )));
+                    }
+                    if series.manifest != manifest {
+                        return Err(StewardError::Content(format!(
+                            "v2 series {path} material does not match its manifest"
+                        )));
+                    }
+                    let versions: Vec<_> = series
+                        .versions
+                        .iter()
+                        .filter(|version| version.logical_leaf_hash.is_some())
+                        .map(|version| (version.blob_hash, version.meta.clone()))
+                        .collect();
+                    if versions.len() as u64 != manifest.leaf_count() {
+                        return Err(StewardError::Content(format!(
+                            "v2 series {path} has {} physical leaf versions but its manifest \
+                             declares {}",
+                            versions.len(),
+                            manifest.leaf_count()
+                        )));
+                    }
+                    (versions, manifest.schema_fingerprint())
+                }
+            }
         }
         EntryType::FilePhysicalVersion | EntryType::TablePhysicalVersion => {
-            vec![native.child_hash]
+            if native.versions.len() != 1 {
+                return Err(StewardError::Content(format!(
+                    "{path} has one payload version but {} metadata versions",
+                    native.versions.len()
+                )));
+            }
+            (vec![(native.child_hash, native.versions[0].clone())], None)
         }
         _ => unreachable!("entry type checked above"),
     };
-    if hashes.len() != native.versions.len() {
-        return Err(StewardError::Content(format!(
-            "{path} has {} payload versions but {} metadata versions",
-            hashes.len(),
-            native.versions.len()
-        )));
-    }
 
     let mut objects = Vec::new();
     let mut leaves = Vec::new();
-    let mut table_schema: Option<ObjectHash> = None;
-    for (hash, metadata) in hashes.into_iter().zip(&native.versions) {
+    let mut table_schema = manifest_table_schema;
+    for (hash, metadata) in payload_versions {
         let attributes = metadata
             .extended_attributes
             .as_deref()

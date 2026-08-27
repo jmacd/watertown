@@ -296,7 +296,11 @@ enum Commands {
         compact: bool,
         /// Also collapse multi-version `data:series` files whose live version
         /// count exceeds this threshold into a single merged version. Pass 0 to
-        /// disable (the default).
+        /// disable (the default). On a logical-series-v2 pond this is a
+        /// reported, exit-0 no-op instead: row-rewriting collapse would
+        /// destroy logical leaf identity, so it is skipped with a warning
+        /// (see docs/logical-series-identity-design.md) rather than run or
+        /// fail the command; checkpoint/vacuum/prune still proceed normally.
         #[arg(long, default_value = "0")]
         collapse_versions: usize,
         /// Also prune replicated control-table lifecycle history at or below a

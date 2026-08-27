@@ -1723,3 +1723,127 @@ async fn test_maintain_prune_shrinks_in_one_pass() {
     let last_after = setup.get_last_txn_seq().await.expect("last seq after");
     assert_eq!(last_after, last_committed, "newest committed seq preserved");
 }
+
+/// `pond maintain --collapse-versions` must not prevent unrelated
+/// checkpoint/vacuum/prune maintenance from running, AND must not fail the
+/// command itself (item 4): a logical-series-v2 pond's row-rewriting
+/// collapse is gated (`StewardError::SeriesCollapseUnavailable`) whenever a
+/// real candidate exists, but that gate is an explicit, reported no-op --
+/// not a failure -- so `pond maintain --collapse-versions N` under `set -e`
+/// (config/deploy scripts run on a schedule alongside unrelated,
+/// always-wanted checkpoint/vacuum/reclaim maintenance) never aborts merely
+/// because a v2 pond crossed the collapse threshold. The REST of the
+/// requested maintenance pass -- prune's tombstone deletion in particular --
+/// must still complete normally, and the whole command must still exit 0
+/// (`Ok(())`).
+#[tokio::test]
+async fn test_maintain_collapse_gate_is_a_reported_noop_not_a_failure() {
+    use cmd::commands::maintain_command;
+    use tokio::io::AsyncWriteExt;
+
+    let setup = TestSetup::new().await.expect("setup");
+
+    // Build a genuine collapse candidate: a FilePhysicalSeries with several
+    // live (non-superseded) versions, via the ordinary append write path.
+    {
+        let mut ship = setup.ship_context.open_pond().await.expect("open");
+        for i in 0..4u8 {
+            let bytes = vec![i; 32];
+            ship.write_transaction(
+                &steward::PondUserMetadata::new(vec!["test".to_string(), "series".to_string()]),
+                async move |fs| {
+                    let root = fs.root().await?;
+                    let mut writer = root
+                        .async_writer_path_with_type(
+                            "/collapse_gate.series",
+                            tinyfs::EntryType::FilePhysicalSeries,
+                        )
+                        .await?;
+                    writer.write_all(&bytes).await?;
+                    writer.shutdown().await?;
+                    Ok(())
+                },
+            )
+            .await
+            .expect("series append transaction");
+        }
+    }
+
+    // A few more plain writes so prune has replicated history below the
+    // horizon to actually delete, independent of the series above.
+    for i in 0..4 {
+        setup
+            .execute_write_transaction(&format!("mcollapse_{}", i))
+            .await
+            .expect("write txn");
+    }
+
+    let last_committed = setup.get_last_txn_seq().await.expect("last seq");
+    let keep_txns = 2i64;
+    let horizon = last_committed - keep_txns;
+    assert!(horizon >= 1);
+
+    let below_before = count_control_rows(
+        &setup.ship_context,
+        &format!("record_kind != 'setting' AND txn_seq <= {}", horizon),
+    )
+    .await
+    .expect("count below before");
+    assert!(below_before > 0);
+
+    // Independently confirm the collapse gate condition is genuinely real
+    // (not a false negative that would make this test vacuous) before
+    // asserting the command reports it as a no-op rather than acting on it.
+    {
+        let mut ship = setup.ship_context.open_pond().await.expect("open");
+        let candidates = ship
+            .survey_collapsible_series(1)
+            .await
+            .expect("survey collapsible series");
+        assert!(
+            !candidates.is_empty(),
+            "the 4-version series above must be a genuine collapse candidate"
+        );
+    }
+
+    // collapse_versions=1: any series with >1 live version is a candidate,
+    // so the 4-version series above always gates. compact=false, prune=true,
+    // allow_no_remote=true, dry_run=false.
+    let result =
+        maintain_command(&setup.ship_context, false, 1, true, keep_txns, true, false).await;
+
+    assert!(
+        result.is_ok(),
+        "collapse gate firing must be a reported no-op (exit 0), not a command failure: {:?}",
+        result.err()
+    );
+
+    // The gate firing must NOT have prevented prune's tombstone deletion --
+    // reclamation is never permanently unreachable, and requested,
+    // unrelated maintenance is not blocked by the gate.
+    let below_after = count_control_rows(
+        &setup.ship_context,
+        &format!("record_kind != 'setting' AND txn_seq <= {}", horizon),
+    )
+    .await
+    .expect("count below after");
+    assert_eq!(
+        below_after, 0,
+        "prune must still run to completion despite the collapse gate"
+    );
+
+    // The gated series itself must remain completely untouched: still
+    // exactly the candidate discovery already found, since no write
+    // transaction is ever opened for a gated collapse.
+    {
+        let mut ship = setup.ship_context.open_pond().await.expect("open");
+        let candidates_after = ship
+            .survey_collapsible_series(1)
+            .await
+            .expect("survey collapsible series after");
+        assert!(
+            !candidates_after.is_empty(),
+            "a gated collapse must leave the candidate series exactly as it found it"
+        );
+    }
+}

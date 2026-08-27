@@ -222,6 +222,25 @@ impl Steward {
         }
     }
 
+    /// Report which native v2 series pack maintenance would repack at
+    /// `threshold`, and the bounded physical layout it would publish,
+    /// without writing anything.
+    ///
+    /// Returns an empty survey for Host stewards, which hold no series.
+    ///
+    /// # Errors
+    /// Returns an error if the discovery read transaction, a series'
+    /// manifest fold, or this pond's local pack-index enumeration fails.
+    pub async fn survey_pack_maintenance(
+        &mut self,
+        threshold: usize,
+    ) -> Result<Vec<crate::PackMaintenanceCandidate>, StewardError> {
+        match self {
+            Steward::Pond(ship) => ship.survey_pack_maintenance(threshold).await,
+            Steward::Host(_) => Ok(Vec::new()),
+        }
+    }
+
     /// Map every node in the pond to its path, from stored directory rows.
     ///
     /// Host stewards hold no pond tree, so they map nothing.

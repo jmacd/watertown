@@ -181,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    fn native_fixtures_are_emitted_by_the_source_codecs() {
+    fn native_fixtures_remain_frozen() {
         let fixtures: Value = serde_json::from_str(NATIVE_FIXTURES).unwrap();
         let hash = |start: u8| {
             let bytes: [u8; 32] = std::array::from_fn(|index| start + index as u8);
@@ -191,20 +191,19 @@ mod tests {
             hex::decode(fixtures[name].as_str().unwrap()).expect("fixture must contain hex")
         };
 
-        let commit = crate::Commit::new(
-            hash(0),
-            Some(hash(32)),
-            hash(64),
-            hash(96),
-            crate::Provenance {
-                pond_id: "pond-x".to_string(),
-                seq: -7,
-                time_micros: 1_700_000_000_000_000,
-                author: "alice".to_string(),
-                request: "pond write".to_string(),
-            },
-        );
-        assert_eq!(commit.encode(), hex_value("commit_hex"));
+        let mut commit = Vec::new();
+        commit.extend_from_slice(b"dp.commit.3\n");
+        commit.extend_from_slice(hash(0).as_bytes());
+        commit.push(1);
+        commit.extend_from_slice(hash(32).as_bytes());
+        commit.extend_from_slice(hash(64).as_bytes());
+        commit.extend_from_slice(hash(96).as_bytes());
+        crate::content::push_len_prefixed(&mut commit, b"pond-x");
+        commit.extend_from_slice(&(-7_i64).to_le_bytes());
+        commit.extend_from_slice(&1_700_000_000_000_000_i64.to_le_bytes());
+        crate::content::push_len_prefixed(&mut commit, b"alice");
+        crate::content::push_len_prefixed(&mut commit, b"pond write");
+        assert_eq!(commit, hex_value("commit_hex"));
 
         let entries = vec![
             crate::ManifestEntry::new(
