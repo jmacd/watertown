@@ -4,7 +4,7 @@ SPDX-PackageSupplier = "Caspar Water Company"
 SPDX-PackageDownloadLocation = "https://github.com/jmacd/watertown"
 
 [[annotations]]
-path = ["crates/**/**.rs", "crates/**/**.js", "crates/**/**.css", "original/**/**.rs"]
+path = ["crates/**/**.rs", "crates/**/**.js", "crates/**/**.css", "crates/**/**.py", "crates/**/**.json", "original/**/**.rs"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "Caspar Water Company"
 SPDX-License-Identifier = "Apache-2.0"
