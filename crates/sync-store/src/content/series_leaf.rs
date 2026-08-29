@@ -316,7 +316,9 @@ pub(crate) fn schema_fingerprint_with_magic(
     schema: &Schema,
     magic: &[u8],
 ) -> Result<ObjectHash, String> {
-    Ok(ObjectHash::of_bytes(&encode_canonical_schema_with_magic(schema, magic)?))
+    Ok(ObjectHash::of_bytes(&encode_canonical_schema_with_magic(
+        schema, magic,
+    )?))
 }
 
 /// Resolve `schema` to its canonical logical schema: every field's

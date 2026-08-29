@@ -118,7 +118,10 @@ fn assert_logical_projection(expected: &CapsuleManifest, actual: &CapsuleManifes
                     assert_eq!(expected_leaf.source_timestamp, actual_leaf.source_timestamp);
                     assert_eq!(expected_leaf.min_event_time, actual_leaf.min_event_time);
                     assert_eq!(expected_leaf.max_event_time, actual_leaf.max_event_time);
-                    assert_eq!(expected_leaf.logical_attributes, actual_leaf.logical_attributes);
+                    assert_eq!(
+                        expected_leaf.logical_attributes,
+                        actual_leaf.logical_attributes
+                    );
                 }
             }
             (expected, actual) => panic!(

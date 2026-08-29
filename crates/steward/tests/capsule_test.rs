@@ -246,7 +246,9 @@ async fn rejects_empty_versions_inside_a_series() {
             Ok(())
         })
         .await
-        .expect_err("a leafless append after a series' first version must be rejected at write time");
+        .expect_err(
+            "a leafless append after a series' first version must be rejected at write time",
+        );
     assert!(
         error.to_string().contains("leafless (zero-byte) append"),
         "unexpected error: {error}"
