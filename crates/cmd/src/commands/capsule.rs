@@ -101,10 +101,11 @@ mod tests {
     }
 }
 
-/// Publish or inspect the static native-format recovery recipe.
+/// Publish or inspect one explicit native-format recovery recipe.
 pub async fn capsule_recipe_command(
     ship_context: &ShipContext,
     name: &str,
+    flavor: steward::RecoveryRecipeFlavor,
     action: RecoveryRecipeAction,
 ) -> Result<()> {
     let mut ship = ship_context.open_pond().await?;
@@ -136,13 +137,22 @@ pub async fn capsule_recipe_command(
             steward::open_and_publish_recovery_recipe_limited(
                 &attachment.url,
                 storage_options,
+                flavor,
                 &mut limits,
             )
             .await
-            .map_err(|error| anyhow!("capsule recipe publish {name}: {error}"))
+            .map_err(|error| {
+                anyhow!(
+                    "capsule recipe {} publish {name}: {error}",
+                    flavor.name()
+                )
+            })
             .map(|outcome| {
                 log::info!(
-                    "[OK] recovery recipe installed (hash={}, versioned_created={}, discoverable_created={})",
+                    "[OK] recovery recipe installed (flavor={}, native_format={}, capsule_format={}, hash={}, versioned_created={}, discoverable_created={})",
+                    flavor.name(),
+                    flavor.native_format(),
+                    flavor.capsule_format(),
                     outcome.recipe_hash,
                     outcome.versioned_created,
                     outcome.discoverable_created
@@ -153,12 +163,23 @@ pub async fn capsule_recipe_command(
             steward::open_and_inspect_recovery_recipe_limited(
                 &attachment.url,
                 storage_options,
+                flavor,
                 &mut limits,
             )
             .await
-            .map_err(|error| anyhow!("capsule recipe inspect {name}: {error}"))
+            .map_err(|error| {
+                anyhow!(
+                    "capsule recipe {} inspect {name}: {error}",
+                    flavor.name()
+                )
+            })
             .map(|hash| {
-                log::info!("[OK] recovery recipe verified (hash={hash}, format=dp.commit.3)");
+                log::info!(
+                    "[OK] recovery recipe verified (flavor={}, native_format={}, capsule_format={}, hash={hash})",
+                    flavor.name(),
+                    flavor.native_format(),
+                    flavor.capsule_format()
+                );
             })
         }
     };
@@ -167,7 +188,10 @@ pub async fn capsule_recipe_command(
         .as_pond_mut()
         .ok_or_else(|| anyhow!("capsule recipe requires a pond steward"))?;
     if let Err(error) = limits.commit(pond.control_table_mut()).await {
-        log::warn!("[WARN] capsule recipe {name}: failed to record limiter usage: {error}");
+        log::warn!(
+            "[WARN] capsule recipe {} {name}: failed to record limiter usage: {error}",
+            flavor.name()
+        );
     }
     operation
 }

@@ -547,15 +547,18 @@ install or verify the small static recovery recipe before writing backup data.
 ### pond capsule
 
 Install static native-format recovery recipes and verify portable logical
-recovery snapshots. The recipe extracts a portable capsule from an existing
-native Delta/Parquet backup only when recovery is needed.
+recovery snapshots. The default recipe is the current target-format
+`watertown.commit.v1` to `pondcapsule.2` path. Legacy migration is a separate,
+deliberate `dp.commit.3` to `pondcapsule.legacy.1` operation.
 
 ```bash
-# Repair or explicitly reinstall the reviewed dp.commit.3 recipe.
+# Install or verify the current target-format recipe.
 pond capsule recipe publish azure
-
-# Verify its immutable and discoverable bootstrap objects.
 pond capsule recipe inspect azure
+
+# Install or verify the explicit opaque legacy-migration recipe.
+pond capsule recipe legacy-migration publish azure
+pond capsule recipe legacy-migration inspect azure
 
 # Verify and summarize a capsule downloaded into ./recovered/recovery/.
 pond capsule inspect ./recovered
@@ -570,13 +573,17 @@ POND=/srv/watertown/recovered pond capsule import ./recovered \
   --experimental
 ```
 
-Every backup push installs the current hash-addressed recovery recipe and
-verifies any existing discoverable recipe against its immutable copy before
-advancing the native ref. Recipe publication creates
-`recovery/recipes/dp.commit.3/<recipe-hash>/README.sh` before the discoverable
-`recovery/README.sh`. Retries accept only byte-identical objects; neither path
-is overwritten when its content differs. Ordinary native pushes verify these
-objects but never replace an existing discoverable recipe.
+Every backup push installs the current target-format hash-addressed recipe and
+verifies any existing generic discoverable recipe against its immutable copy
+before advancing the native ref. Explicit target-format publication creates
+`recovery/recipes/watertown.commit.v1/<recipe-hash>/README.sh` before
+`recovery/README.sh`.
+
+The legacy operation instead creates exactly
+`recovery/legacy-migration/recipes/<recipe-hash>/README.sh` before
+`recovery/legacy-migration/README.sh`. It is never selected automatically by
+backup push. Both flavors use create-only writes: retries accept only
+byte-identical objects, and differing bytes are never overwritten.
 
 Inspection does not open or modify a pond. It validates the latest reference,
 canonical manifest, every physical object hash and size, every Parquet schema,

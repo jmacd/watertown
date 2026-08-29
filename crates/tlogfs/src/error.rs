@@ -89,24 +89,6 @@ pub enum TLogFSError {
     )]
     CollapseUnsupported { reason: String },
 
-    /// A `TablePhysicalSeries` append's schema fingerprint disagrees with an
-    /// existing committed or pending logical leaf of the same series. This
-    /// is a recoverable write error caught BEFORE commit, per
-    /// `docs/logical-series-identity-design.md`: table schema stability is
-    /// a precondition of the append, not a fact the fold discovers after
-    /// the incompatible row is already durable.
-    #[error(
-        "table series schema fingerprint mismatch for node {node_id}: this append's schema \
-         fingerprint {new_fingerprint} disagrees with an existing logical leaf's fingerprint \
-         {existing_fingerprint} -- a table series' schema must stay stable across all its \
-         versions"
-    )]
-    SeriesSchemaMismatch {
-        node_id: String,
-        new_fingerprint: String,
-        existing_fingerprint: String,
-    },
-
     /// A `TablePhysicalSeries` append carried nonempty Parquet bytes (a
     /// real, decodable schema/footer) that decoded to zero rows. This is
     /// rejected at the write choke point rather than allowed through and

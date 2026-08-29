@@ -3216,10 +3216,7 @@ impl InnerState {
     /// would durably commit a node steward's own fold could never later
     /// represent. Returns [`TLogFSError::SeriesZeroRowAppend`] if a
     /// `TablePhysicalSeries` append carries nonempty Parquet bytes that
-    /// decode to zero rows. Returns [`TLogFSError::SeriesSchemaMismatch`]
-    /// (a recoverable write error, not a corrupt-row bug) if this append's
-    /// schema fingerprint disagrees with an existing leaf of the same
-    /// series.
+    /// decode to zero rows.
     async fn stamp_and_validate_series_entry(
         &mut self,
         entry: &mut OplogEntry,
@@ -3302,37 +3299,6 @@ impl InnerState {
                          after stamping ({:?}, {:?}) -- refusing to commit a corrupt row",
                         entry.node_id, entry.version, entry.logical_leaf_hash, entry.logical_count
                     )));
-                }
-
-                // Item 5: table schema stability must be enforced BEFORE
-                // commit, not first discovered by steward's fold after the
-                // incompatible row is already durable. Check this append's
-                // fingerprint against every existing committed-or-pending
-                // logical leaf of the SAME series node.
-                if let Some(new_fingerprint) = entry.series_schema_fingerprint.clone() {
-                    let id = FileID::new_from_ids(
-                        entry.part_id,
-                        entry.node_id,
-                        entry.pond_id.parse().map_err(|e| {
-                            TLogFSError::Internal(format!(
-                                "series schema stability check: node {} has an unparseable \
-                                 pond_id {:?}: {e}",
-                                entry.node_id, entry.pond_id
-                            ))
-                        })?,
-                    );
-                    for prior in self.query_records(id).await? {
-                        let Some(existing_fingerprint) = prior.series_schema_fingerprint else {
-                            continue;
-                        };
-                        if existing_fingerprint != new_fingerprint {
-                            return Err(TLogFSError::SeriesSchemaMismatch {
-                                node_id: entry.node_id.to_string(),
-                                new_fingerprint,
-                                existing_fingerprint,
-                            });
-                        }
-                    }
                 }
             }
             _ => {}
@@ -5620,12 +5586,11 @@ mod stamping_choke_point_tests {
         tx.commit_test().await.expect("commit (nothing pending)");
     }
 
-    /// Item 5: a second append to the same `TablePhysicalSeries` node whose
-    /// schema fingerprint disagrees with an already-*pending* (uncommitted)
-    /// leaf of that series must be rejected before commit, not merely
-    /// discovered later by steward's fold.
+    /// Every nonempty table-series version retains its own logical schema
+    /// fingerprint. Additive schema evolution is valid: the query layer
+    /// derives a merged read schema without changing historical leaf identity.
     #[tokio::test]
-    async fn table_series_schema_mismatch_against_pending_leaf_is_rejected_before_commit() {
+    async fn table_series_schema_evolution_against_pending_leaf_preserves_both_fingerprints() {
         let (_dir, mut persistence) = new_test_persistence().await;
         let id = series_id(&persistence, EntryType::TablePhysicalSeries);
 
@@ -5636,32 +5601,28 @@ mod stamping_choke_point_tests {
             .await
             .expect("first append (2-column schema)");
 
-        let err = state
+        let _ = state
             .store_file_series_from_parquet(
                 id,
                 &parquet_bytes_with_extra_column(&[4, 5, 6]),
                 Some("timestamp"),
             )
             .await
-            .expect_err("second append with a different schema must be rejected before commit");
-        let message = err.to_string();
-        assert!(
-            message.contains("schema fingerprint") || message.contains("SeriesSchemaMismatch"),
-            "expected a schema-mismatch error, got: {message}"
-        );
+            .expect("additive schema evolution must be accepted before commit");
 
-        // Only the first (valid) append made it into the pending set --
-        // the mismatched second append must not have been queued either.
         let pending = state.query_records(id).await.expect("query pending");
-        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.len(), 2);
+        assert_ne!(
+            pending[0].series_schema_fingerprint, pending[1].series_schema_fingerprint,
+            "each historical table leaf retains its own schema fingerprint"
+        );
         tx.commit_test().await.expect("commit");
     }
 
-    /// Same as above, but the conflicting fingerprint belongs to an
-    /// already-*committed* leaf in a prior transaction -- the check must
-    /// also see across-transaction history, not just the in-flight batch.
+    /// Schema evolution remains valid when the earlier table leaf has already
+    /// committed in a prior transaction.
     #[tokio::test]
-    async fn table_series_schema_mismatch_against_committed_leaf_is_rejected_before_commit() {
+    async fn table_series_schema_evolution_against_committed_leaf_preserves_both_fingerprints() {
         let (_dir, mut persistence) = new_test_persistence().await;
         let id = series_id(&persistence, EntryType::TablePhysicalSeries);
 
@@ -5677,20 +5638,22 @@ mod stamping_choke_point_tests {
 
         let tx2 = persistence.begin_test().await.expect("begin 2");
         let state2 = tx2.state().expect("state 2");
-        let err = state2
+        let _ = state2
             .store_file_series_from_parquet(
                 id,
                 &parquet_bytes_with_extra_column(&[4, 5, 6]),
                 Some("timestamp"),
             )
             .await
-            .expect_err(
-                "append with a schema differing from a committed leaf must be rejected before commit",
-            );
-        let message = err.to_string();
-        assert!(
-            message.contains("schema fingerprint") || message.contains("SeriesSchemaMismatch"),
-            "expected a schema-mismatch error, got: {message}"
+            .expect("additive schema evolution must be accepted after commit");
+        let committed = state2
+            .query_records(id)
+            .await
+            .expect("query committed and pending");
+        assert_eq!(committed.len(), 2);
+        assert_ne!(
+            committed[0].series_schema_fingerprint, committed[1].series_schema_fingerprint,
+            "the committed and new leaves retain distinct schema fingerprints"
         );
     }
 }

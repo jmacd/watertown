@@ -62,6 +62,33 @@ fn table_batch(ts_micros: i64, label: &str) -> arrow_array::RecordBatch {
     .expect("build table batch")
 }
 
+fn evolved_table_batch(ts_micros: i64, label: &str) -> arrow_array::RecordBatch {
+    use arrow_array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use std::sync::Arc;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+        Field::new("value", DataType::Int64, false),
+        Field::new("label", DataType::Utf8, false),
+        Field::new("quality", DataType::Int64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(TimestampMicrosecondArray::from(vec![ts_micros])),
+            Arc::new(Int64Array::from(vec![ts_micros])),
+            Arc::new(StringArray::from(vec![label])),
+            Arc::new(Int64Array::from(vec![100])),
+        ],
+    )
+    .expect("build evolved table batch")
+}
+
 /// Same logical shape as [`table_batch`] (one `timestamp`/`value`/`label`
 /// row), but `label` is physically `Dictionary<Int32, Utf8>` rather than
 /// plain `Utf8` -- the exact same logical column encoded a different way,
@@ -517,6 +544,100 @@ async fn collapse_versions_repacks_a_table_series_mixing_dictionary_and_plain_la
         "every row survives repacking a series that mixes dictionary- and plain-encoded \
          leaves for the same logical label column"
     );
+}
+
+#[tokio::test]
+async fn collapse_versions_splits_table_pack_at_schema_transitions() {
+    let temp_dir = tempdir().expect("tempdir");
+    let pond_path = temp_dir.path().join("evolved_table_repack_pond");
+    let mut ship = Ship::create_pond(&pond_path, "test-host")
+        .await
+        .expect("create pond");
+
+    let first = table_batch(1_000_000, "a");
+    let second = table_batch(2_000_000, "b");
+    let third = evolved_table_batch(3_000_000, "c");
+    let fourth = evolved_table_batch(4_000_000, "d");
+    let fingerprint_a =
+        sync_store::content::schema_fingerprint(&first.schema()).expect("fingerprint a");
+    let fingerprint_b =
+        sync_store::content::schema_fingerprint(&third.schema()).expect("fingerprint b");
+    assert_ne!(fingerprint_a, fingerprint_b);
+
+    ship.write_transaction(&meta("evolved-table-series"), async move |fs| {
+        let root = fs.root().await?;
+        let _ = root.create_dir_path("data").await?;
+        for batch in [&first, &second, &third, &fourth] {
+            let _ = root
+                .write_series_from_batch("/data/events.table", batch, Some("timestamp"))
+                .await?;
+        }
+        Ok(())
+    })
+    .await
+    .expect("write schema-evolving table series");
+
+    let root_before = compute_content_tree(&ship)
+        .await
+        .expect("root before repack")
+        .root_tree_hash;
+    let report = ship
+        .collapse_versions(1)
+        .await
+        .expect("repack heterogeneous table series");
+    assert_eq!(report.series_repacked, 1);
+    let root_after = compute_content_tree(&ship)
+        .await
+        .expect("root after repack")
+        .root_tree_hash;
+    assert_eq!(root_after, root_before);
+
+    drop(ship);
+    let source = LocalPondSource::open(&pond_path)
+        .await
+        .expect("open local source");
+    let (_series_hash, pack) = maintained_pack_for_series(
+        &source,
+        &pond_path,
+        "events.table",
+        EntryType::TablePhysicalSeries,
+    )
+    .await;
+    let descriptor_fingerprints: Vec<_> = pack
+        .leaf_descriptors()
+        .iter()
+        .map(|descriptor| descriptor.schema_fingerprint())
+        .collect();
+    assert_eq!(
+        descriptor_fingerprints,
+        vec![
+            Some(fingerprint_a),
+            Some(fingerprint_a),
+            Some(fingerprint_b),
+            Some(fingerprint_b),
+        ]
+    );
+    assert_eq!(
+        pack.physical_object_hashes().len(),
+        2,
+        "the large row cap would produce one object without the mandatory schema boundary"
+    );
+    let mut object_fingerprints = Vec::new();
+    for &hash in pack.physical_object_hashes() {
+        let mut reader = source
+            .get_blob_reader(hash)
+            .await
+            .expect("get object")
+            .expect("object exists");
+        let mut bytes = Vec::new();
+        let _ = reader.read_to_end(&mut bytes).await.expect("read object");
+        let batch = decode_parquet_rows(&bytes);
+        object_fingerprints.push(
+            sync_store::content::schema_fingerprint(&batch.schema())
+                .expect("object schema fingerprint"),
+        );
+    }
+    assert_eq!(object_fingerprints, vec![fingerprint_a, fingerprint_b]);
 }
 
 /// A physical object boundary is independent of a logical leaf boundary: a

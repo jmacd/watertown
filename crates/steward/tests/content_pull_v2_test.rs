@@ -205,9 +205,8 @@ fn build_file_pack(bytes: &[u8], leaf_lens: &[usize], object_lens: &[usize]) -> 
         offset += len;
     }
     let root = merkle_root(&leaf_hashes);
-    let manifest = SeriesManifest::new(
+    let manifest = SeriesManifest::new_v2(
         PayloadKind::File,
-        None,
         bytes.len() as u64,
         leaf_lens.len() as u64,
         None,
@@ -228,7 +227,7 @@ fn build_file_pack(bytes: &[u8], leaf_lens: &[usize], object_lens: &[usize]) -> 
     }
     let proof =
         generate_range_proof(&leaf_hashes, 0, leaf_hashes.len()).expect("whole-range proof");
-    let pack = PackIndex::new(
+    let pack = PackIndex::new_v2(
         series_hash,
         0,
         leaf_lens.len() as u64,
@@ -345,14 +344,15 @@ fn build_table_pack(
         let labels: Vec<&str> = slice.iter().map(|(_, l)| *l).collect();
         let b = batch(schema, &ids, &labels);
         leaf_hashes.push(table_leaf_hash(schema, &[b], None, None, None).expect("real leaf hash"));
-        descriptors
-            .push(PackLeafDescriptor::new(count as u64, None, None, None).expect("descriptor"));
+        descriptors.push(
+            PackLeafDescriptor::new_with_schema(count as u64, Some(fingerprint), None, None, None)
+                .expect("descriptor"),
+        );
         offset += count;
     }
     let root = merkle_root(&leaf_hashes);
-    let manifest = SeriesManifest::new(
+    let manifest = SeriesManifest::new_v2(
         PayloadKind::Table,
-        Some(fingerprint),
         rows.len() as u64,
         leaf_row_counts.len() as u64,
         None,
@@ -379,7 +379,7 @@ fn build_table_pack(
     }
     let proof =
         generate_range_proof(&leaf_hashes, 0, leaf_hashes.len()).expect("whole-range proof");
-    let pack = PackIndex::new(
+    let pack = PackIndex::new_v2(
         series_hash,
         0,
         leaf_row_counts.len() as u64,
@@ -447,8 +447,9 @@ fn build_table_pack_timed(
                 .expect("real leaf hash"),
         );
         descriptors.push(
-            PackLeafDescriptor::new(
+            PackLeafDescriptor::new_with_schema(
                 count as u64,
+                Some(fingerprint),
                 Some(min),
                 Some(max),
                 Some(canonical_attrs.clone()),
@@ -462,9 +463,8 @@ fn build_table_pack_timed(
     // canonical attributes verbatim (`content_tree.rs::build_series_manifest`),
     // which is this same value since every leaf here names the same column.
     let logical_attributes = Some(canonical_attrs);
-    let manifest = SeriesManifest::new(
+    let manifest = SeriesManifest::new_v2(
         PayloadKind::Table,
-        Some(fingerprint),
         rows.len() as u64,
         leaf_row_counts.len() as u64,
         Some(min),
@@ -491,7 +491,7 @@ fn build_table_pack_timed(
     }
     let proof =
         generate_range_proof(&leaf_hashes, 0, leaf_hashes.len()).expect("whole-range proof");
-    let pack = PackIndex::new(
+    let pack = PackIndex::new_v2(
         series_hash,
         0,
         leaf_row_counts.len() as u64,
@@ -618,7 +618,7 @@ async fn file_pack_fetch_rejects_truncated_physical_content() {
     let fixture = build_file_pack(&bytes, &[4, 4], &[8]);
     let truncated_bytes = bytes[..6].to_vec();
     let truncated_hash = ObjectHash::of_bytes(&truncated_bytes);
-    let truncated_pack = PackIndex::new(
+    let truncated_pack = PackIndex::new_v2(
         fixture.series_hash,
         0,
         2,
@@ -672,7 +672,7 @@ async fn file_pack_fetch_rejects_trailing_physical_bytes() {
     let fixture = build_file_pack(&bytes, &[4, 4], &[8]);
     let padded_bytes = b"abcdefghXX".to_vec();
     let padded_hash = ObjectHash::of_bytes(&padded_bytes);
-    let padded_pack = PackIndex::new(
+    let padded_pack = PackIndex::new_v2(
         fixture.series_hash,
         0,
         2,
@@ -733,7 +733,7 @@ async fn file_pack_fetch_rejects_wrong_descriptor_metadata() {
         fixture.pack.leaf_descriptors().to_vec();
     tampered_descriptors[0] =
         PackLeafDescriptor::new(4, Some(999), Some(999), None).expect("tampered descriptor");
-    let tampered_pack = PackIndex::new(
+    let tampered_pack = PackIndex::new_v2(
         fixture.series_hash,
         0,
         2,
@@ -797,7 +797,7 @@ async fn file_pack_fetch_rejects_wrong_proof() {
     let leaves_b = leaves_of(&bytes_b);
     let root_a = merkle_root(&leaves_a);
     let manifest_a =
-        SeriesManifest::new(PayloadKind::File, None, 16, 4, None, None, None, root_a).unwrap();
+        SeriesManifest::new_v2(PayloadKind::File, 16, 4, None, None, None, root_a).unwrap();
     let series_hash_a = manifest_a.hash();
 
     // A genuine partial-range proof for A's own middle range would be
@@ -806,7 +806,7 @@ async fn file_pack_fetch_rejects_wrong_proof() {
     let wrong_proof = generate_range_proof(&leaves_b, 1, 3).unwrap();
     let object_bytes = bytes_a[4..12].to_vec();
     let object_hash = ObjectHash::of_bytes(&object_bytes);
-    let spliced_pack = PackIndex::new(
+    let spliced_pack = PackIndex::new_v2(
         series_hash_a,
         1,
         3,
@@ -834,7 +834,7 @@ async fn file_pack_fetch_rejects_wrong_proof() {
     // any cover at all.
     let left_bytes = bytes_a[..4].to_vec();
     let left_hash = ObjectHash::of_bytes(&left_bytes);
-    let left_pack = PackIndex::new(
+    let left_pack = PackIndex::new_v2(
         series_hash_a,
         0,
         1,
@@ -849,7 +849,7 @@ async fn file_pack_fetch_rejects_wrong_proof() {
     .unwrap();
     let right_bytes = bytes_a[12..].to_vec();
     let right_hash = ObjectHash::of_bytes(&right_bytes);
-    let right_pack = PackIndex::new(
+    let right_pack = PackIndex::new_v2(
         series_hash_a,
         3,
         4,
@@ -993,12 +993,12 @@ async fn file_pack_fetch_rejects_a_gap_between_two_partial_layouts() {
         file_leaf_hash(&bytes[4..], None, None, None).unwrap(),
     ];
     let root = merkle_root(&leaf_hashes);
-    let manifest = SeriesManifest::new(PayloadKind::File, None, 8, 2, None, None, None, root)
-        .expect("manifest");
+    let manifest =
+        SeriesManifest::new_v2(PayloadKind::File, 8, 2, None, None, None, root).expect("manifest");
     let series_hash = manifest.hash();
     let object_hash = ObjectHash::of_bytes(&bytes[..4]);
     let proof = generate_range_proof(&leaf_hashes, 0, 1).unwrap();
-    let pack = PackIndex::new(
+    let pack = PackIndex::new_v2(
         series_hash,
         0,
         1,
@@ -1050,7 +1050,7 @@ async fn file_pack_fetch_verifies_with_either_of_two_valid_layouts() {
     let object_a_hash = ObjectHash::of_bytes(&bytes[..4]);
     let object_b_hash = ObjectHash::of_bytes(&bytes[4..]);
     let proof_a = generate_range_proof(&leaf_hashes, 0, 1).unwrap();
-    let pack_a = PackIndex::new(
+    let pack_a = PackIndex::new_v2(
         whole.series_hash,
         0,
         1,
@@ -1064,7 +1064,7 @@ async fn file_pack_fetch_verifies_with_either_of_two_valid_layouts() {
     )
     .unwrap();
     let proof_b = generate_range_proof(&leaf_hashes, 1, 3).unwrap();
-    let pack_b = PackIndex::new(
+    let pack_b = PackIndex::new_v2(
         whole.series_hash,
         1,
         3,
@@ -1194,7 +1194,7 @@ async fn table_pack_fetch_rejects_schema_mismatch() {
     .unwrap();
     let wrong_bytes = write_parquet(&wrong_schema, &wrong_batch);
     let wrong_hash = ObjectHash::of_bytes(&wrong_bytes);
-    let mismatched_pack = PackIndex::new(
+    let mismatched_pack = PackIndex::new_v2(
         fixture.series_hash,
         0,
         1,
@@ -1235,6 +1235,132 @@ async fn table_pack_fetch_rejects_schema_mismatch() {
 }
 
 #[tokio::test]
+async fn table_pack_fetch_rejects_tampered_descriptor_schema() {
+    let dir = tempdir().expect("tempdir");
+    let mut remote = ContentRemote::create_at(dir.path(), pid())
+        .await
+        .expect("create remote");
+    let schema = i64_string_schema();
+    let rows: Vec<(i64, &str)> = vec![(1, "a"), (2, "b")];
+    let fixture = build_table_pack(&schema, &rows, &[2], &[2]);
+    let wrong_schema = Arc::new(Schema::new(vec![Field::new(
+        "other",
+        DataType::Int64,
+        false,
+    )]));
+    let descriptor = PackLeafDescriptor::new_with_schema(
+        2,
+        Some(schema_fingerprint(&wrong_schema).expect("wrong fingerprint")),
+        None,
+        None,
+        None,
+    )
+    .expect("tampered descriptor");
+    let tampered = PackIndex::new_v2(
+        fixture.series_hash,
+        0,
+        1,
+        1,
+        fixture.pack.range_root(),
+        fixture.pack.range_proof().clone(),
+        fixture.pack.physical_object_hashes().to_vec(),
+        fixture.pack.logical_count(),
+        fixture.pack.physical_byte_count(),
+        vec![descriptor],
+    )
+    .expect("valid pack shape");
+    let _ = remote
+        .publish_pack(fixture.series_hash, &tampered, &fixture.physical_objects)
+        .await
+        .expect("publish tampered pack");
+    seed_series_manifest(&mut remote, &fixture.manifest).await;
+    let _ = push_root(
+        &mut remote,
+        &[(
+            "series.tbl",
+            EntryType::TablePhysicalSeries,
+            fixture.series_hash,
+        )],
+        Vec::new(),
+    )
+    .await;
+
+    let err = fetch_object_graph(&remote, "main")
+        .await
+        .expect_err("descriptor schema tampering must be rejected");
+    assert!(format!("{err}").contains("schema fingerprint"), "{err}");
+}
+
+#[tokio::test]
+async fn table_pack_fetch_inherits_legacy_v1_manifest_schema() {
+    let dir = tempdir().expect("tempdir");
+    let mut remote = ContentRemote::create_at(dir.path(), pid())
+        .await
+        .expect("create remote");
+    let schema = i64_string_schema();
+    let batch = batch(&schema, &[1, 2], &["a", "b"]);
+    let fingerprint = schema_fingerprint(&schema).expect("fingerprint");
+    let leaf_hash =
+        table_leaf_hash(&schema, std::slice::from_ref(&batch), None, None, None).expect("leaf");
+    let manifest = SeriesManifest::new(
+        PayloadKind::Table,
+        Some(fingerprint),
+        2,
+        1,
+        None,
+        None,
+        None,
+        merkle_root(&[leaf_hash]),
+    )
+    .expect("legacy manifest");
+    let bytes = write_parquet(&schema, &batch);
+    let object_hash = ObjectHash::of_bytes(&bytes);
+    let pack = PackIndex::new(
+        manifest.hash(),
+        0,
+        1,
+        1,
+        manifest.leaf_merkle_root(),
+        generate_range_proof(&[leaf_hash], 0, 1).expect("proof"),
+        vec![object_hash],
+        2,
+        bytes.len() as u64,
+        vec![PackLeafDescriptor::new(2, None, None, None).expect("legacy descriptor")],
+    )
+    .expect("legacy pack");
+    let fixture = TablePackFixture {
+        series_hash: manifest.hash(),
+        manifest,
+        pack,
+        physical_objects: vec![(object_hash, bytes)],
+        leaf_hashes: vec![leaf_hash],
+    };
+    publish_table(&mut remote, &fixture).await;
+    let _ = push_root(
+        &mut remote,
+        &[(
+            "legacy.tbl",
+            EntryType::TablePhysicalSeries,
+            fixture.series_hash,
+        )],
+        Vec::new(),
+    )
+    .await;
+
+    let graph = fetch_object_graph(&remote, "main")
+        .await
+        .expect("legacy homogeneous table pack must verify");
+    let Some(FetchedObject::SeriesV2(series)) = graph.objects.get(&fixture.series_hash) else {
+        panic!("expected fetched native series");
+    };
+    assert_eq!(
+        series.packs[0].1.leaf_descriptors()[0].schema_fingerprint(),
+        None,
+        "a decoded v1 descriptor does not intrinsically carry the inherited schema"
+    );
+}
+
+#[tokio::test]
 async fn table_pack_fetch_rejects_row_truncation() {
     let dir = tempdir().expect("tempdir");
     let mut remote = ContentRemote::create_at(dir.path(), pid())
@@ -1248,7 +1374,7 @@ async fn table_pack_fetch_rejects_row_truncation() {
     let short_batch = batch(&schema, &[1, 2, 3], &["a", "b", "c"]);
     let short_bytes = write_parquet(&schema, &short_batch);
     let short_hash = ObjectHash::of_bytes(&short_bytes);
-    let truncated_pack = PackIndex::new(
+    let truncated_pack = PackIndex::new_v2(
         fixture.series_hash,
         0,
         2,
@@ -1300,7 +1426,7 @@ async fn table_pack_fetch_rejects_corrupt_parquet_bytes() {
 
     let garbage = b"not a parquet file at all, just junk bytes".to_vec();
     let garbage_hash = ObjectHash::of_bytes(&garbage);
-    let corrupt_pack = PackIndex::new(
+    let corrupt_pack = PackIndex::new_v2(
         fixture.series_hash,
         0,
         1,
@@ -1605,6 +1731,131 @@ async fn rebuild_materializes_a_v2_table_series_crossing_objects_and_batches() {
     assert_eq!(read_batch, expected_first_leaf);
 }
 
+#[tokio::test]
+async fn rebuild_materializes_heterogeneous_table_leaf_schemas() {
+    let dir = tempdir().expect("tempdir");
+    let mut remote = ContentRemote::create_at(dir.path(), pid())
+        .await
+        .expect("create remote");
+
+    let schema_a = i64_string_schema();
+    let schema_b = Arc::new(Schema::new(vec![
+        Field::new("measurement", DataType::Int64, false),
+        Field::new("description", DataType::Utf8, true),
+    ]));
+    let batch_a = batch(&schema_a, &[1], &["a"]);
+    let batch_b = batch(&schema_b, &[2], &["b"]);
+    let fingerprint_a = schema_fingerprint(&schema_a).expect("fingerprint a");
+    let fingerprint_b = schema_fingerprint(&schema_b).expect("fingerprint b");
+    let attrs_json = r#"{"watertown.timestamp_column":"Timestamp"}"#;
+    let attrs = encode_canonical_attributes(attrs_json).expect("canonical attributes");
+    let leaf_hashes = vec![
+        table_leaf_hash(
+            &schema_a,
+            std::slice::from_ref(&batch_a),
+            Some(1_000),
+            Some(2_000),
+            Some(attrs_json),
+        )
+        .expect("leaf a hash"),
+        table_leaf_hash(
+            &schema_b,
+            std::slice::from_ref(&batch_b),
+            Some(1_000),
+            Some(2_000),
+            Some(attrs_json),
+        )
+        .expect("leaf b hash"),
+    ];
+    let root = merkle_root(&leaf_hashes);
+    let manifest = SeriesManifest::new_v2(
+        PayloadKind::Table,
+        2,
+        2,
+        Some(1_000),
+        Some(2_000),
+        Some(attrs.clone()),
+        root,
+    )
+    .expect("manifest");
+    let bytes_a = write_parquet(&schema_a, &batch_a);
+    let bytes_b = write_parquet(&schema_b, &batch_b);
+    let physical_objects = vec![
+        (ObjectHash::of_bytes(&bytes_a), bytes_a),
+        (ObjectHash::of_bytes(&bytes_b), bytes_b),
+    ];
+    let descriptors = vec![
+        PackLeafDescriptor::new_with_schema(
+            1,
+            Some(fingerprint_a),
+            Some(1_000),
+            Some(2_000),
+            Some(attrs.clone()),
+        )
+        .expect("descriptor a"),
+        PackLeafDescriptor::new_with_schema(
+            1,
+            Some(fingerprint_b),
+            Some(1_000),
+            Some(2_000),
+            Some(attrs),
+        )
+        .expect("descriptor b"),
+    ];
+    let pack = PackIndex::new_v2(
+        manifest.hash(),
+        0,
+        2,
+        2,
+        root,
+        generate_range_proof(&leaf_hashes, 0, 2).expect("proof"),
+        physical_objects.iter().map(|(hash, _)| *hash).collect(),
+        2,
+        physical_objects
+            .iter()
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum(),
+        descriptors,
+    )
+    .expect("pack");
+    let fixture = TablePackFixture {
+        series_hash: manifest.hash(),
+        manifest,
+        pack,
+        physical_objects,
+        leaf_hashes,
+    };
+    publish_table(&mut remote, &fixture).await;
+    let _ = push_root_versioned(
+        &mut remote,
+        &[(
+            "series.table",
+            EntryType::TablePhysicalSeries,
+            fixture.series_hash,
+            vec![VersionMeta {
+                timestamp: Some(FIXTURE_MTIME),
+                min_event_time: Some(1_000),
+                max_event_time: Some(2_000),
+                extended_attributes: Some(attrs_json.to_string()),
+            }],
+        )],
+        Vec::new(),
+    )
+    .await;
+
+    let graph = fetch_object_graph(&remote, "main")
+        .await
+        .expect("fetch heterogeneous series");
+    let target_dir = tempdir().expect("tempdir");
+    let mut target = Ship::create_pond(target_dir.path().join("pond"), "target")
+        .await
+        .expect("create target pond");
+    let outcome = rebuild_pond(&mut target, &remote, &graph)
+        .await
+        .expect("materialize heterogeneous series");
+    assert_eq!(outcome.series, 1);
+}
+
 /// A leaf descriptor carrying only one of `min_event_time`/`max_event_time`
 /// is a state gate-4 fetch verification does not reject (it only checks
 /// hashes/proofs, not writer-side invariants about paired bounds), but a
@@ -1627,9 +1878,8 @@ async fn rebuild_aborts_cleanly_on_an_asymmetric_temporal_descriptor() {
         PackLeafDescriptor::new(bytes.len() as u64, Some(1_000), None, None).expect("descriptor");
     let leaf_hashes = vec![leaf_hash];
     let root = merkle_root(&leaf_hashes);
-    let manifest = SeriesManifest::new(
+    let manifest = SeriesManifest::new_v2(
         PayloadKind::File,
-        None,
         bytes.len() as u64,
         1,
         Some(1_000),
@@ -1642,7 +1892,7 @@ async fn rebuild_aborts_cleanly_on_an_asymmetric_temporal_descriptor() {
     let object_hash = ObjectHash::of_bytes(&bytes);
     let physical_objects = vec![(object_hash, bytes.clone())];
     let proof = generate_range_proof(&leaf_hashes, 0, 1).expect("whole-range proof");
-    let pack = PackIndex::new(
+    let pack = PackIndex::new_v2(
         series_hash,
         0,
         1,
@@ -1714,7 +1964,7 @@ async fn rebuild_materializes_an_empty_v2_file_series() {
         .expect("create remote");
 
     let empty_root = merkle_root(&[]);
-    let manifest = SeriesManifest::new(PayloadKind::File, None, 0, 0, None, None, None, empty_root)
+    let manifest = SeriesManifest::new_v2(PayloadKind::File, 0, 0, None, None, None, empty_root)
         .expect("valid empty-series manifest");
     let series_hash = manifest.hash();
     seed_series_manifest(&mut remote, &manifest).await;
@@ -1786,18 +2036,8 @@ async fn rebuild_rejects_an_empty_v2_table_series() {
         .expect("create remote");
 
     let empty_root = merkle_root(&[]);
-    let schema_fingerprint = schema_fingerprint(&i64_string_schema()).expect("schema fingerprint");
-    let manifest = SeriesManifest::new(
-        PayloadKind::Table,
-        Some(schema_fingerprint),
-        0,
-        0,
-        None,
-        None,
-        None,
-        empty_root,
-    )
-    .expect("valid empty-table-series manifest");
+    let manifest = SeriesManifest::new_v2(PayloadKind::Table, 0, 0, None, None, None, empty_root)
+        .expect("valid empty-table-series manifest");
     let series_hash = manifest.hash();
     seed_series_manifest(&mut remote, &manifest).await;
 
@@ -1883,8 +2123,9 @@ async fn rebuild_round_trips_an_arbitrary_extra_logical_attribute_key() {
         Some(attrs_json),
     )
     .expect("real leaf hash");
-    let descriptor = PackLeafDescriptor::new(
+    let descriptor = PackLeafDescriptor::new_with_schema(
         rows.len() as u64,
+        Some(fingerprint),
         Some(1_000),
         Some(3_000),
         Some(canonical_attrs.clone()),
@@ -1893,9 +2134,8 @@ async fn rebuild_round_trips_an_arbitrary_extra_logical_attribute_key() {
     let leaf_hashes = vec![leaf_hash];
     let root = merkle_root(&leaf_hashes);
     let logical_attributes = Some(canonical_attrs);
-    let manifest = SeriesManifest::new(
+    let manifest = SeriesManifest::new_v2(
         PayloadKind::Table,
-        Some(fingerprint),
         rows.len() as u64,
         1,
         Some(1_000),
@@ -1910,7 +2150,7 @@ async fn rebuild_round_trips_an_arbitrary_extra_logical_attribute_key() {
     let object_hash = ObjectHash::of_bytes(&bytes);
     let physical_objects = vec![(object_hash, bytes.clone())];
     let proof = generate_range_proof(&leaf_hashes, 0, 1).expect("whole-range proof");
-    let pack = PackIndex::new(
+    let pack = PackIndex::new_v2(
         series_hash,
         0,
         1,

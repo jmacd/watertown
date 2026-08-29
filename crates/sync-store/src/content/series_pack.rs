@@ -51,14 +51,15 @@
 use std::collections::BTreeMap;
 
 use super::series_leaf::{LEAF_HAS_MAX, LEAF_HAS_MIN, validate_canonical_attributes};
-use super::series_manifest::SeriesManifest;
+use super::series_manifest::{PayloadKind, SeriesManifest, SeriesManifestRevision};
 use super::series_merkle::{
     RangeProof, decode_range_proof, encode_range_proof, verify_range_proof,
 };
 use super::{Cursor, ObjectHash, push_len_prefixed};
 
-/// Magic header for a `watertown.series-pack.v1` pack index object.
-const PACK_MAGIC: &[u8] = b"watertown.series-pack.v1\n";
+/// Magic headers for pack-index wire revisions.
+const PACK_MAGIC_V1: &[u8] = b"watertown.series-pack.v1\n";
+const PACK_MAGIC_V2: &[u8] = b"watertown.series-pack.v2\n";
 
 /// Known `bounds_flags` bits for a [`PackLeafDescriptor`]; any other bit set
 /// is a decode error, matching [`super::series_leaf`]'s and
@@ -69,7 +70,17 @@ const KNOWN_DESCRIPTOR_BOUNDS_FLAGS: u8 = LEAF_HAS_MIN | LEAF_HAS_MAX;
 /// on the wire: a `u64` logical count, a `u8` bounds-flags byte, and a `u32`
 /// (zero) logical-attributes length, with no bounds or attribute bytes
 /// present. Used to bound a hostile descriptor count's pre-allocation.
-const MIN_DESCRIPTOR_WIRE_BYTES: usize = 8 + 1 + 4;
+const MIN_DESCRIPTOR_V1_WIRE_BYTES: usize = 8 + 1 + 4;
+const MIN_DESCRIPTOR_V2_WIRE_BYTES: usize = 8 + 4 + 1 + 4;
+
+/// The pack-index wire revision retained by a decoded index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackIndexRevision {
+    /// Legacy descriptors without an intrinsic schema fingerprint.
+    V1,
+    /// Descriptors carry an optional per-leaf schema fingerprint.
+    V2,
+}
 
 /// One logical leaf's per-leaf metadata within a `watertown.series-pack.v1` pack
 /// index: exactly one descriptor for each logical leaf in
@@ -90,6 +101,7 @@ const MIN_DESCRIPTOR_WIRE_BYTES: usize = 8 + 1 + 4;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackLeafDescriptor {
     logical_count: u64,
+    schema_fingerprint: Option<ObjectHash>,
     min_event_time: Option<i64>,
     max_event_time: Option<i64>,
     logical_attributes: Option<Vec<u8>>,
@@ -121,16 +133,56 @@ impl PackLeafDescriptor {
         validate_descriptor(logical_count, &logical_attributes)?;
         Ok(Self {
             logical_count,
+            schema_fingerprint: None,
             min_event_time,
             max_event_time,
             logical_attributes,
         })
     }
 
+    /// Construct a descriptor for the v2 pack codec, optionally carrying
+    /// this leaf's schema fingerprint.
+    ///
+    /// Table descriptors must pass `Some`; file descriptors must pass
+    /// `None`. That payload-kind rule is checked when the pack is verified
+    /// against its independently fetched manifest.
+    pub fn new_with_schema(
+        logical_count: u64,
+        schema_fingerprint: Option<ObjectHash>,
+        min_event_time: Option<i64>,
+        max_event_time: Option<i64>,
+        logical_attributes: Option<Vec<u8>>,
+    ) -> Result<Self, String> {
+        validate_descriptor(logical_count, &logical_attributes)?;
+        Ok(Self {
+            logical_count,
+            schema_fingerprint,
+            min_event_time,
+            max_event_time,
+            logical_attributes,
+        })
+    }
+
+    /// Return a clone carrying `schema_fingerprint`.
+    pub fn with_schema_fingerprint(&self, schema_fingerprint: ObjectHash) -> Self {
+        let mut descriptor = self.clone();
+        descriptor.schema_fingerprint = Some(schema_fingerprint);
+        descriptor
+    }
+
     /// This leaf's logical row (table) or byte (file) count.
     #[must_use]
     pub fn logical_count(&self) -> u64 {
         self.logical_count
+    }
+
+    /// The schema fingerprint intrinsically carried by a v2 descriptor.
+    ///
+    /// A decoded v1 descriptor always returns `None`; its effective table
+    /// schema is inherited only while paired with a v1 homogeneous manifest.
+    #[must_use]
+    pub fn schema_fingerprint(&self) -> Option<ObjectHash> {
+        self.schema_fingerprint
     }
 
     /// This leaf's minimum event time, if it carried one.
@@ -160,8 +212,38 @@ impl PackLeafDescriptor {
     /// [i64 LE max_event_time]
     /// u32 LE  logical_attributes length (0 = absent) + bytes
     /// ```
-    fn encode_into(&self, buf: &mut Vec<u8>) {
+    fn encode_v1_into(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.logical_count.to_le_bytes());
+        let mut flags = 0u8;
+        if self.min_event_time.is_some() {
+            flags |= LEAF_HAS_MIN;
+        }
+        if self.max_event_time.is_some() {
+            flags |= LEAF_HAS_MAX;
+        }
+        buf.push(flags);
+        if let Some(v) = self.min_event_time {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        if let Some(v) = self.max_event_time {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        match &self.logical_attributes {
+            Some(attrs) => push_len_prefixed(buf, attrs),
+            None => push_len_prefixed(buf, &[]),
+        }
+    }
+
+    fn encode_v2_into(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.logical_count.to_le_bytes());
+        match self.schema_fingerprint {
+            Some(fingerprint) => push_len_prefixed(buf, fingerprint.as_bytes()),
+            None => push_len_prefixed(buf, &[]),
+        }
+        self.encode_bounds_and_attributes(buf);
+    }
+
+    fn encode_bounds_and_attributes(&self, buf: &mut Vec<u8>) {
         let mut flags = 0u8;
         if self.min_event_time.is_some() {
             flags |= LEAF_HAS_MIN;
@@ -185,8 +267,47 @@ impl PackLeafDescriptor {
     /// Decode one descriptor from `cur` (the inverse of
     /// [`PackLeafDescriptor::encode_into`]), applying the same invariants as
     /// [`PackLeafDescriptor::new`].
-    fn decode_from(cur: &mut Cursor<'_>) -> Result<Self, String> {
+    fn decode_v1_from(cur: &mut Cursor<'_>) -> Result<Self, String> {
         let logical_count = cur.take_u64()?;
+        let (min_event_time, max_event_time, logical_attributes) =
+            Self::decode_bounds_and_attributes(cur)?;
+        Self::new(
+            logical_count,
+            min_event_time,
+            max_event_time,
+            logical_attributes,
+        )
+    }
+
+    fn decode_v2_from(cur: &mut Cursor<'_>) -> Result<Self, String> {
+        let logical_count = cur.take_u64()?;
+        let schema_bytes = cur.take_len_prefixed()?;
+        let schema_fingerprint = if schema_bytes.is_empty() {
+            None
+        } else if schema_bytes.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(schema_bytes);
+            Some(ObjectHash::from_bytes(arr))
+        } else {
+            return Err(format!(
+                "pack leaf schema fingerprint must be 0 or 32 bytes, got {}",
+                schema_bytes.len()
+            ));
+        };
+        let (min_event_time, max_event_time, logical_attributes) =
+            Self::decode_bounds_and_attributes(cur)?;
+        Self::new_with_schema(
+            logical_count,
+            schema_fingerprint,
+            min_event_time,
+            max_event_time,
+            logical_attributes,
+        )
+    }
+
+    fn decode_bounds_and_attributes(
+        cur: &mut Cursor<'_>,
+    ) -> Result<(Option<i64>, Option<i64>, Option<Vec<u8>>), String> {
         let flags = cur.take_u8()?;
         if flags & !KNOWN_DESCRIPTOR_BOUNDS_FLAGS != 0 {
             return Err(format!(
@@ -209,12 +330,7 @@ impl PackLeafDescriptor {
         } else {
             Some(attrs_bytes.to_vec())
         };
-        Self::new(
-            logical_count,
-            min_event_time,
-            max_event_time,
-            logical_attributes,
-        )
+        Ok((min_event_time, max_event_time, logical_attributes))
     }
 }
 
@@ -254,6 +370,7 @@ fn validate_descriptor(
 /// ([`PackIndex::new`]) or strict decode ([`PackIndex::decode`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackIndex {
+    revision: PackIndexRevision,
     series_hash: ObjectHash,
     leaf_start: u64,
     leaf_end: u64,
@@ -308,7 +425,67 @@ impl PackIndex {
         physical_byte_count: u64,
         leaf_descriptors: Vec<PackLeafDescriptor>,
     ) -> Result<Self, String> {
+        Self::new_with_revision(
+            PackIndexRevision::V1,
+            series_hash,
+            leaf_start,
+            leaf_end,
+            total_leaf_count,
+            range_root,
+            range_proof,
+            physical_object_hashes,
+            logical_count,
+            physical_byte_count,
+            leaf_descriptors,
+        )
+    }
+
+    /// Construct a v2 pack index whose descriptors carry optional per-leaf
+    /// schema fingerprints.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_v2(
+        series_hash: ObjectHash,
+        leaf_start: u64,
+        leaf_end: u64,
+        total_leaf_count: u64,
+        range_root: ObjectHash,
+        range_proof: RangeProof,
+        physical_object_hashes: Vec<ObjectHash>,
+        logical_count: u64,
+        physical_byte_count: u64,
+        leaf_descriptors: Vec<PackLeafDescriptor>,
+    ) -> Result<Self, String> {
+        Self::new_with_revision(
+            PackIndexRevision::V2,
+            series_hash,
+            leaf_start,
+            leaf_end,
+            total_leaf_count,
+            range_root,
+            range_proof,
+            physical_object_hashes,
+            logical_count,
+            physical_byte_count,
+            leaf_descriptors,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_revision(
+        revision: PackIndexRevision,
+        series_hash: ObjectHash,
+        leaf_start: u64,
+        leaf_end: u64,
+        total_leaf_count: u64,
+        range_root: ObjectHash,
+        range_proof: RangeProof,
+        physical_object_hashes: Vec<ObjectHash>,
+        logical_count: u64,
+        physical_byte_count: u64,
+        leaf_descriptors: Vec<PackLeafDescriptor>,
+    ) -> Result<Self, String> {
         validate(
+            revision,
             leaf_start,
             leaf_end,
             total_leaf_count,
@@ -318,6 +495,7 @@ impl PackIndex {
             logical_count,
         )?;
         Ok(Self {
+            revision,
             series_hash,
             leaf_start,
             leaf_end,
@@ -329,6 +507,12 @@ impl PackIndex {
             physical_byte_count,
             leaf_descriptors,
         })
+    }
+
+    /// The pack-index wire revision this value encodes as.
+    #[must_use]
+    pub fn revision(&self) -> PackIndexRevision {
+        self.revision
     }
 
     /// The `watertown.series.v1` object hash this pack claims to belong to.
@@ -404,7 +588,7 @@ impl PackIndex {
     /// Serialize this pack index into its `watertown.series-pack.v1` wire bytes:
     ///
     /// ```text
-    /// PACK_MAGIC
+    /// PACK_MAGIC_V1 or PACK_MAGIC_V2
     /// 32      series_hash
     /// u64 LE  leaf_start
     /// u64 LE  leaf_end
@@ -424,8 +608,12 @@ impl PackIndex {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let proof_bytes = encode_range_proof(&self.range_proof);
+        let magic = match self.revision {
+            PackIndexRevision::V1 => PACK_MAGIC_V1,
+            PackIndexRevision::V2 => PACK_MAGIC_V2,
+        };
         let mut buf = Vec::with_capacity(
-            PACK_MAGIC.len()
+            magic.len()
                 + 32
                 + 8
                 + 8
@@ -438,7 +626,7 @@ impl PackIndex {
                 + 8
                 + 8,
         );
-        buf.extend_from_slice(PACK_MAGIC);
+        buf.extend_from_slice(magic);
         buf.extend_from_slice(self.series_hash.as_bytes());
         buf.extend_from_slice(&self.leaf_start.to_le_bytes());
         buf.extend_from_slice(&self.leaf_end.to_le_bytes());
@@ -457,7 +645,10 @@ impl PackIndex {
             .expect("pack leaf descriptor count exceeds u32::MAX");
         buf.extend_from_slice(&descriptor_count.to_le_bytes());
         for descriptor in &self.leaf_descriptors {
-            descriptor.encode_into(&mut buf);
+            match self.revision {
+                PackIndexRevision::V1 => descriptor.encode_v1_into(&mut buf),
+                PackIndexRevision::V2 => descriptor.encode_v2_into(&mut buf),
+            }
         }
         buf
     }
@@ -485,8 +676,24 @@ impl PackIndex {
     /// object list, exactly one descriptor per leaf, descriptor counts
     /// summing to `logical_count`).
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        let revision = if bytes.starts_with(PACK_MAGIC_V1) {
+            PackIndexRevision::V1
+        } else if bytes.starts_with(PACK_MAGIC_V2) {
+            PackIndexRevision::V2
+        } else {
+            let preview_len = bytes
+                .len()
+                .min(PACK_MAGIC_V1.len().max(PACK_MAGIC_V2.len()));
+            return Err(format!(
+                "bad pack index magic: expected {PACK_MAGIC_V1:?} or {PACK_MAGIC_V2:?}, found {:?}",
+                &bytes[..preview_len]
+            ));
+        };
         let mut cur = Cursor::new(bytes);
-        cur.expect_tag(PACK_MAGIC)?;
+        cur.expect_tag(match revision {
+            PackIndexRevision::V1 => PACK_MAGIC_V1,
+            PackIndexRevision::V2 => PACK_MAGIC_V2,
+        })?;
         let series_hash = cur.take_hash()?;
         let leaf_start = cur.take_u64()?;
         let leaf_end = cur.take_u64()?;
@@ -513,10 +720,17 @@ impl PackIndex {
         let logical_count = cur.take_u64()?;
         let physical_byte_count = cur.take_u64()?;
         let descriptor_count = cur.take_u32()? as usize;
+        let min_descriptor_bytes = match revision {
+            PackIndexRevision::V1 => MIN_DESCRIPTOR_V1_WIRE_BYTES,
+            PackIndexRevision::V2 => MIN_DESCRIPTOR_V2_WIRE_BYTES,
+        };
         let mut leaf_descriptors =
-            Vec::with_capacity(cur.bounded_capacity(descriptor_count, MIN_DESCRIPTOR_WIRE_BYTES));
+            Vec::with_capacity(cur.bounded_capacity(descriptor_count, min_descriptor_bytes));
         for _ in 0..descriptor_count {
-            leaf_descriptors.push(PackLeafDescriptor::decode_from(&mut cur)?);
+            leaf_descriptors.push(match revision {
+                PackIndexRevision::V1 => PackLeafDescriptor::decode_v1_from(&mut cur)?,
+                PackIndexRevision::V2 => PackLeafDescriptor::decode_v2_from(&mut cur)?,
+            });
         }
         if !cur.is_empty() {
             return Err(format!(
@@ -524,7 +738,8 @@ impl PackIndex {
                 cur.remaining()
             ));
         }
-        Self::new(
+        Self::new_with_revision(
+            revision,
             series_hash,
             leaf_start,
             leaf_end,
@@ -542,6 +757,7 @@ impl PackIndex {
 /// Shared invariant checks for [`PackIndex::new`] and [`PackIndex::decode`].
 #[allow(clippy::too_many_arguments)]
 fn validate(
+    revision: PackIndexRevision,
     leaf_start: u64,
     leaf_end: u64,
     total_leaf_count: u64,
@@ -579,6 +795,12 @@ fn validate(
     }
     let mut descriptor_logical_sum: u64 = 0;
     for descriptor in leaf_descriptors {
+        if revision == PackIndexRevision::V1 && descriptor.schema_fingerprint().is_some() {
+            return Err(
+                "a v1 pack leaf descriptor cannot intrinsically carry a schema fingerprint"
+                    .to_string(),
+            );
+        }
         descriptor_logical_sum = descriptor_logical_sum
             .checked_add(descriptor.logical_count())
             .ok_or_else(|| "pack leaf descriptor logical_count sum overflows u64".to_string())?;
@@ -597,6 +819,55 @@ fn validate(
         leaf_start_u64,
         leaf_end_u64,
     )
+}
+
+/// Resolve one descriptor's effective schema fingerprint against its
+/// manifest and pack revisions.
+///
+/// V2 table descriptors carry their own fingerprint. A v1 table descriptor
+/// intrinsically carries none and may inherit the v1 manifest's homogeneous
+/// fingerprint only when both objects are legacy. File descriptors must
+/// never carry a schema fingerprint.
+pub fn effective_leaf_schema_fingerprint(
+    manifest: &SeriesManifest,
+    pack: &PackIndex,
+    descriptor: &PackLeafDescriptor,
+) -> Result<Option<ObjectHash>, String> {
+    match manifest.payload_kind() {
+        PayloadKind::File => {
+            if descriptor.schema_fingerprint().is_some() {
+                return Err(
+                    "a file pack leaf descriptor must not carry a schema fingerprint".to_string(),
+                );
+            }
+            Ok(None)
+        }
+        PayloadKind::Table => match descriptor.schema_fingerprint() {
+            Some(fingerprint) => {
+                if let Some(legacy) = manifest.schema_fingerprint()
+                    && fingerprint != legacy
+                {
+                    return Err(format!(
+                        "table pack leaf schema fingerprint {fingerprint} does not match the v1 \
+                         manifest's homogeneous schema fingerprint {legacy}"
+                    ));
+                }
+                Ok(Some(fingerprint))
+            }
+            None if pack.revision() == PackIndexRevision::V1
+                && manifest.revision() == SeriesManifestRevision::V1 =>
+            {
+                manifest.schema_fingerprint().map(Some).ok_or_else(|| {
+                    "a v1 table manifest has no homogeneous schema fingerprint".to_string()
+                })
+            }
+            None => Err(
+                "a table pack leaf descriptor requires a schema fingerprint; legacy inheritance \
+                 is allowed only when both the manifest and pack are v1"
+                    .to_string(),
+            ),
+        },
+    }
 }
 
 /// Verify a decoded [`PackIndex`] against an independently-fetched
@@ -652,6 +923,11 @@ pub fn verify_pack_against_manifest(
             pack.total_leaf_count(),
             manifest.leaf_count()
         ));
+    }
+    for (index, descriptor) in pack.leaf_descriptors().iter().enumerate() {
+        effective_leaf_schema_fingerprint(manifest, pack, descriptor).map_err(|e| {
+            format!("pack leaf descriptor {index} is incompatible with the manifest: {e}")
+        })?;
     }
     let expected_len = usize::try_from(pack.leaf_end() - pack.leaf_start())
         .map_err(|_| "pack leaf range does not fit in usize on this platform".to_string())?;
@@ -919,6 +1195,167 @@ mod tests {
     }
 
     #[test]
+    fn v2_pack_round_trips_per_leaf_schema_fingerprints() {
+        let leaves = vec![h("leaf-a"), h("leaf-b")];
+        let manifest = SeriesManifest::new_v2(
+            PayloadKind::Table,
+            20,
+            2,
+            None,
+            None,
+            None,
+            merkle_root(&leaves),
+        )
+        .unwrap();
+        let descriptors = vec![
+            PackLeafDescriptor::new_with_schema(10, Some(h("schema-a")), None, None, None).unwrap(),
+            PackLeafDescriptor::new_with_schema(10, Some(h("schema-b")), None, None, None).unwrap(),
+        ];
+        let pack = PackIndex::new_v2(
+            manifest.hash(),
+            0,
+            2,
+            2,
+            manifest.leaf_merkle_root(),
+            generate_range_proof(&leaves, 0, 2).unwrap(),
+            vec![h("object-a"), h("object-b")],
+            20,
+            100,
+            descriptors,
+        )
+        .unwrap();
+        let bytes = pack.encode();
+        assert!(bytes.starts_with(PACK_MAGIC_V2));
+        let decoded = PackIndex::decode(&bytes).unwrap();
+        assert_eq!(decoded, pack);
+        assert_eq!(decoded.encode(), bytes);
+        assert_eq!(
+            decoded.leaf_descriptors()[0].schema_fingerprint(),
+            Some(h("schema-a"))
+        );
+        assert_eq!(
+            decoded.leaf_descriptors()[1].schema_fingerprint(),
+            Some(h("schema-b"))
+        );
+        verify_pack_against_manifest(manifest.hash(), &manifest, &decoded, &leaves).unwrap();
+    }
+
+    #[test]
+    fn v1_table_descriptor_inherits_schema_without_claiming_to_carry_it() {
+        let leaves = vec![h("leaf")];
+        let schema = h("schema");
+        let manifest = SeriesManifest::new(
+            PayloadKind::Table,
+            Some(schema),
+            10,
+            1,
+            None,
+            None,
+            None,
+            merkle_root(&leaves),
+        )
+        .unwrap();
+        let pack = PackIndex::new(
+            manifest.hash(),
+            0,
+            1,
+            1,
+            manifest.leaf_merkle_root(),
+            generate_range_proof(&leaves, 0, 1).unwrap(),
+            vec![h("object")],
+            10,
+            100,
+            vec![PackLeafDescriptor::new(10, None, None, None).unwrap()],
+        )
+        .unwrap();
+        let decoded = PackIndex::decode(&pack.encode()).unwrap();
+        let descriptor = &decoded.leaf_descriptors()[0];
+        assert_eq!(descriptor.schema_fingerprint(), None);
+        assert_eq!(
+            effective_leaf_schema_fingerprint(&manifest, &decoded, descriptor).unwrap(),
+            Some(schema)
+        );
+        verify_pack_against_manifest(manifest.hash(), &manifest, &decoded, &leaves).unwrap();
+    }
+
+    #[test]
+    fn descriptor_schema_presence_tampering_is_rejected_by_verification() {
+        let leaves = vec![h("leaf")];
+        let table_manifest = SeriesManifest::new_v2(
+            PayloadKind::Table,
+            10,
+            1,
+            None,
+            None,
+            None,
+            merkle_root(&leaves),
+        )
+        .unwrap();
+        let missing_schema = PackIndex::new_v2(
+            table_manifest.hash(),
+            0,
+            1,
+            1,
+            table_manifest.leaf_merkle_root(),
+            generate_range_proof(&leaves, 0, 1).unwrap(),
+            vec![h("object")],
+            10,
+            100,
+            vec![PackLeafDescriptor::new(10, None, None, None).unwrap()],
+        )
+        .unwrap();
+        let err = verify_pack_against_manifest(
+            table_manifest.hash(),
+            &table_manifest,
+            &missing_schema,
+            &leaves,
+        )
+        .unwrap_err();
+        assert!(err.contains("requires a schema fingerprint"));
+
+        let file_manifest = SeriesManifest::new_v2(
+            PayloadKind::File,
+            10,
+            1,
+            None,
+            None,
+            None,
+            merkle_root(&leaves),
+        )
+        .unwrap();
+        let injected_schema = PackIndex::new_v2(
+            file_manifest.hash(),
+            0,
+            1,
+            1,
+            file_manifest.leaf_merkle_root(),
+            generate_range_proof(&leaves, 0, 1).unwrap(),
+            vec![h("object")],
+            10,
+            100,
+            vec![
+                PackLeafDescriptor::new_with_schema(
+                    10,
+                    Some(h("injected-schema")),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let err = verify_pack_against_manifest(
+            file_manifest.hash(),
+            &file_manifest,
+            &injected_schema,
+            &leaves,
+        )
+        .unwrap_err();
+        assert!(err.contains("file pack leaf descriptor"));
+    }
+
+    #[test]
     fn golden_pack_index_and_proof() {
         let (leaves, _manifest, series_hash) = build_series(&["a", "b", "c", "d", "e"]);
         let pack = build_pack(&leaves, series_hash, 1, 4);
@@ -991,7 +1428,7 @@ mod tests {
         // Corrupt the claimed series_hash by rebuilding through decode with a
         // tampered first hash byte.
         let mut bytes = pack.encode();
-        let series_hash_pos = PACK_MAGIC.len();
+        let series_hash_pos = PACK_MAGIC_V1.len();
         bytes[series_hash_pos] ^= 0xff;
         // Decoding still succeeds (decode does not know the "true" series
         // hash), but verification against the real manifest must fail.
@@ -1018,7 +1455,7 @@ mod tests {
         // embedded range proof's shape (it was computed for the original
         // total), so decode itself must reject the tampered bytes.
         let mut bytes = pack.encode();
-        let total_pos = PACK_MAGIC.len() + 32 + 8 + 8;
+        let total_pos = PACK_MAGIC_V1.len() + 32 + 8 + 8;
         let mut total_bytes = [0u8; 8];
         total_bytes.copy_from_slice(&bytes[total_pos..total_pos + 8]);
         let mutated_total = u64::from_le_bytes(total_bytes) + 1;
@@ -1031,7 +1468,7 @@ mod tests {
         let (leaves, _manifest, series_hash) = build_series(&["a", "b", "c", "d", "e"]);
         let pack = build_pack(&leaves, series_hash, 1, 4);
         let mut bytes = pack.encode();
-        let total_pos = PACK_MAGIC.len() + 32 + 8 + 8;
+        let total_pos = PACK_MAGIC_V1.len() + 32 + 8 + 8;
         bytes[total_pos..total_pos + 8].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(PackIndex::decode(&bytes).is_err());
     }
@@ -1264,7 +1701,7 @@ mod tests {
         // u32 descriptor count, so its exact offset is computed rather than
         // hardcoded, keeping this test resilient to unrelated header changes.
         let descriptor_section_start =
-            bytes.len() - (pack.leaf_descriptors.len() * MIN_DESCRIPTOR_WIRE_BYTES);
+            bytes.len() - (pack.leaf_descriptors.len() * MIN_DESCRIPTOR_V1_WIRE_BYTES);
         bytes[descriptor_section_start..descriptor_section_start + 8]
             .copy_from_slice(&0u64.to_le_bytes());
         let err = PackIndex::decode(&bytes).unwrap_err();
@@ -1277,11 +1714,11 @@ mod tests {
         let pack = build_pack(&leaves, series_hash, 1, 4);
         let mut bytes = pack.encode();
         let descriptor_section_start =
-            bytes.len() - (pack.leaf_descriptors.len() * MIN_DESCRIPTOR_WIRE_BYTES);
+            bytes.len() - (pack.leaf_descriptors.len() * MIN_DESCRIPTOR_V1_WIRE_BYTES);
         // Set every descriptor's logical_count to u64::MAX so their sum
         // overflows u64 rather than merely mismatching.
         for i in 0..pack.leaf_descriptors.len() {
-            let start = descriptor_section_start + i * MIN_DESCRIPTOR_WIRE_BYTES;
+            let start = descriptor_section_start + i * MIN_DESCRIPTOR_V1_WIRE_BYTES;
             bytes[start..start + 8].copy_from_slice(&u64::MAX.to_le_bytes());
         }
         let err = PackIndex::decode(&bytes).unwrap_err();
@@ -1294,7 +1731,7 @@ mod tests {
         let pack = build_pack(&leaves, series_hash, 1, 4);
         let mut bytes = pack.encode();
         let descriptor_section_start =
-            bytes.len() - (pack.leaf_descriptors.len() * MIN_DESCRIPTOR_WIRE_BYTES);
+            bytes.len() - (pack.leaf_descriptors.len() * MIN_DESCRIPTOR_V1_WIRE_BYTES);
         // The bounds_flags byte is right after the u64 logical_count.
         let flags_pos = descriptor_section_start + 8;
         bytes[flags_pos] = 0b1111_1100;
@@ -1432,7 +1869,7 @@ mod tests {
         // legitimate proof bytes, discarding the real (small) count and
         // object list, and check that decode fails on truncation rather
         // than attempting a huge allocation.
-        let proof_len_pos = PACK_MAGIC.len() + 32 + 8 + 8 + 8 + 32;
+        let proof_len_pos = PACK_MAGIC_V1.len() + 32 + 8 + 8 + 8 + 32;
         let mut proof_len_bytes = [0u8; 4];
         proof_len_bytes.copy_from_slice(&bytes[proof_len_pos..proof_len_pos + 4]);
         let proof_len = u32::from_le_bytes(proof_len_bytes) as usize;
