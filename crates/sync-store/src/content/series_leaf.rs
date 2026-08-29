@@ -477,6 +477,7 @@ fn encode_scalar(array: &dyn Array, row: usize, buf: &mut Vec<u8>) -> Result<(),
 /// or if a batch column's resolved type does not match its schema field's
 /// resolved type (a dictionary column is compatible with its plain value
 /// type; anything else is a caller bug this must not hash over silently).
+#[allow(dead_code)] // exercised by this module's canonical-row-encoding unit tests
 pub(crate) fn encode_canonical_rows(
     schema: &Schema,
     batches: &[RecordBatch],
@@ -704,27 +705,6 @@ pub(crate) fn validate_canonical_attributes(bytes: &[u8]) -> Result<(), String> 
 /// Build the `logical_leaf` preimage exactly as specified in
 /// `docs/logical-series-identity-design.md`, and return its `blake3` hash.
 #[allow(clippy::too_many_arguments)]
-fn leaf_hash(
-    payload_kind: u8,
-    schema_fingerprint: &[u8],
-    logical_count: u64,
-    canonical_payload: &[u8],
-    min_event_time: Option<i64>,
-    max_event_time: Option<i64>,
-    canonical_attributes: &[u8],
-) -> ObjectHash {
-    leaf_hash_with_magic(
-        LEAF_MAGIC,
-        payload_kind,
-        schema_fingerprint,
-        logical_count,
-        canonical_payload,
-        min_event_time,
-        max_event_time,
-        canonical_attributes,
-    )
-}
-
 fn leaf_hash_with_magic(
     magic: &[u8],
     payload_kind: u8,
@@ -829,6 +809,7 @@ pub fn table_leaf_hash_canonical(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn table_leaf_hash_canonical_with_magic(
     schema: &Schema,
     batches: &[RecordBatch],
@@ -1002,6 +983,7 @@ impl IncrementalTableLeafHasher {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_magic_and_rows_domain(
         magic: &[u8],
         schema: &Schema,
