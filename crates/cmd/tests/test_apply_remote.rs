@@ -146,7 +146,7 @@ spec:
   config:
     unit: MiB/day
     limit: {mib_per_day}
-    burst: 1
+    burst: 2
 ---
 version: v1
 kind: mknod

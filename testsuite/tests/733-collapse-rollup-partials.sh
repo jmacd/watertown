@@ -1,46 +1,20 @@
 #!/bin/bash
-# EXPERIMENT: version collapse must not double-count temporal-reduce rollup
-#   partials.
+# EXPERIMENT: pack-only version maintenance preserves temporal-reduce rollups.
 #
 # DESCRIPTION:
-#   This is the same defect as 731, one layer over. 731 fixed the FORMAT cache,
-#   which globbed a node's cache directory and so returned both a merged
-#   version and the superseded versions it stands for. The ROLLUP cache has the
-#   identical structure and was not fixed:
+#   temporal-reduce's rollup cache stores one partial per immutable source
+#   logical leaf. Native logical-series-v2 maintenance is pack-only: it creates
+#   a bounded physical pack but does not add, merge, supersede, or delete those
+#   source leaves. The cached whole-series sum and count must remain unchanged,
+#   and a repeated maintenance pass must recognize the source as already
+#   physically bounded.
 #
-#     - rollup_cache::find_uncached_members() writes one partial per LIVE source
-#       version, named {node}_v{version}_{blake3}.parquet. It only ever ADDS;
-#       nothing removes the partial of a version that later becomes superseded.
-#     - temporal_reduce.rs registers the whole directory via
-#       rollup_cache::listing_table_from_dir(&glob_dir, ctx) -- a plain glob.
-#     - the read-side merge is SUM(__p_sum_i), SUM(__p_count_i) GROUP BY bucket.
-#
-#   So after `maintain --collapse-versions` merges source versions [lo,hi] into
-#   one run, the run is a new version with a new blake3, gets its own partial,
-#   and the hi-lo+1 superseded partials are still on disk and still summed.
-#   Every row in the collapsed window is counted twice, and again on each later
-#   collapse.
-#
-#   Why this survived: the rollup cache is only engaged when the input scheme
-#   has a FormatProvider (temporal_reduce.rs try_rollup_table_provider), i.e.
-#   oteljson/jsonlogs/csv -- NOT the builtin series:/// scheme. The existing
-#   collapse-vs-rollup test (050) uses oteljson and so does reach it, but it
-#   asserts only on `avg` and on bucket COUNT, and both are invariant under
-#   doubling: avg = SUM(sum)/SUM(count) is unchanged when sum and count both
-#   double, and GROUP BY collapses duplicate buckets back to the same row count.
-#   `sum` and `count` are the aggregations that expose it, and nothing used them
-#   over a collapsed source.
-#
-#   Live in production: config/water.yaml and config/septic.yaml reduce over
-#   "oteljson:///ingest/*.json" -- logfile-ingest FilePhysicalSeries that are
-#   exactly what list_collapsible_series targets -- while config/scripts/run.sh
-#   runs `maintain --compact --collapse-versions 100` hourly.
-#
-# EXPECTED (currently FAILS -- this pins the bug before the fix):
-#   - Before collapse, the reduced series totals 96 samples summing to 96.0.
-#   - `maintain --collapse-versions` merges the source versions.
-#   - After collapse those totals are UNCHANGED. Today they double to 192 / 192.0
-#     because the superseded versions' partials are still in the glob dir.
+# EXPECTED:
+#   - Before maintenance, the reduced series totals 96 samples summing to 96.0.
+#   - `maintain --collapse-versions` reports a real repack and creates pack
+#     objects without changing the source's Oplog version.
+#   - After maintenance those totals are unchanged.
+#   - A second pass reports 0 repacked / already bounded and writes no new pack.
 #
 # History:
 #   Added on jmacd/analysis8 while reviewing the size-tiered collapse work. The
@@ -54,6 +28,11 @@ echo "=== Experiment: collapse must not double-count rollup partials ==="
 
 export POND=/pond
 pond init --birthplace test-host >/dev/null
+
+PACKS=/pond/data/_packs
+count_pack_objects() {
+    find "${PACKS}/objects" -type f 2>/dev/null | wc -l | tr -d ' '
+}
 
 # ---- Source: 96 hourly OTelJSON samples, every value exactly 1.0 ------------
 # A constant 1.0 makes the arithmetic unambiguous: over the whole series
@@ -79,8 +58,8 @@ pond mkdir -p /ingest >/dev/null
 pond mknod logfile-ingest /system/run/10-well --config-path /tmp/733-ingest.yaml >/dev/null
 
 # ---- Accumulate several source versions (24 samples per ingest run) ---------
-# One append version per run, so `maintain --collapse-versions` has a real run
-# of adjacent versions to merge -- the hourly-ingest shape of water/septic.
+# One append version per run, so `maintain --collapse-versions` has a genuine
+# over-threshold series to pack -- the hourly-ingest shape of water/septic.
 : > /var/log/well/well.json
 split -l 24 /tmp/733-all.jsonl /tmp/733-chunk.
 for c in /tmp/733-chunk.*; do
@@ -93,20 +72,18 @@ SRC_ROWS=$(pond cat oteljson:///ingest/well.json --format=table \
   | grep -E '^\| *[0-9]' | head -1 | grep -oE '[0-9]+' | head -1)
 check '[ "'"${SRC_ROWS}"'" = "96" ]' "source ingested 96 points across versions (${SRC_ROWS})"
 
-# `pond describe` reports a FilePhysicalSeries' highest version, and each ingest
-# run appends exactly one, so >1 means there is a real run of adjacent versions
-# for collapse to merge. (Note this differs from 730's per-version listing,
-# which is the TablePhysicalSeries shape.)
+# `pond describe` reports a FilePhysicalSeries' highest Oplog version, and each
+# ingest run appends exactly one, so >1 confirms a genuine maintenance
+# candidate. (This differs from 730's per-version table listing.)
 SRC_VERSIONS=$(pond describe /ingest/well.json 2>/dev/null \
   | grep -E '^ *Version:' | grep -oE '[0-9]+' | head -1)
 echo "source series is at version ${SRC_VERSIONS}"
 check '[ "'"${SRC_VERSIONS}"'" -ge 2 ]' \
-    "the source really has multiple versions to collapse (v${SRC_VERSIONS})"
+    "the source really has multiple logical versions to repack (v${SRC_VERSIONS})"
 
 # ---- A rollup that uses sum and count, the aggregations that expose it ------
-# allowed_lateness=14d keeps the collapsed tail inside the unsealed hot window,
-# so this test isolates double-counting rather than re-testing the sealed-bucket
-# rejection already covered by 050.
+# allowed_lateness=14d mirrors production while sum and count make any accidental
+# duplication visible.
 cat > /tmp/733-reduce.yaml << 'YAML'
 in_pattern: "oteljson:///ingest/well.json"
 out_pattern: "data"
@@ -129,7 +106,7 @@ totals() {
 
 # ---- First read: builds the rollup partials, one per live source version ----
 echo ""
-echo "--- Before collapse ---"
+echo "--- Before maintenance ---"
 BEFORE_OUT=$(totals)
 echo "$BEFORE_OUT"
 BEFORE_SUM=$(echo "$BEFORE_OUT" | grep -E '^\| *[0-9]' | head -1 | awk -F'|' '{gsub(/ /,"",$2); print $2}')
@@ -138,33 +115,50 @@ BEFORE_N=$(echo "$BEFORE_OUT"   | grep -E '^\| *[0-9]' | head -1 | awk -F'|' '{g
 check '[ "'"${BEFORE_SUM}"'" = "96" ]'  "before collapse the rollup sums 96 samples of 1.0 (${BEFORE_SUM})"
 check '[ "'"${BEFORE_N}"'" = "96" ]'    "before collapse the rollup counts 96 samples (${BEFORE_N})"
 
-# ---- Collapse the source versions (the hourly production trigger) -----------
+# ---- Repack the source versions (the hourly production trigger) -------------
 echo ""
 echo "--- maintain --collapse-versions 1 ---"
+BEFORE_PACKS=$(count_pack_objects)
 pond maintain --collapse-versions 1 > /tmp/733-collapse.log 2>&1
-grep -iE "collapse|reclaim" /tmp/733-collapse.log || true
-check 'grep -qE "collapse: [1-9][0-9]* file\(s\) collapsed" /tmp/733-collapse.log' \
-    "maintain actually collapsed the source series"
+grep -iE "pack maintenance|packs:|reclaim" /tmp/733-collapse.log || true
+check 'grep -qE "pack maintenance: [1-9][0-9]* candidate\(s\), [1-9][0-9]* repacked" /tmp/733-collapse.log' \
+    "maintain physically repacked the source series"
+check 'grep -qE "packs: [1-9][0-9]* object\(s\) written" /tmp/733-collapse.log' \
+    "maintain reports bounded pack objects written"
+AFTER_PACKS=$(count_pack_objects)
+check '[ "'"${AFTER_PACKS}"'" -gt "'"${BEFORE_PACKS}"'" ]' \
+    "maintenance created local pack objects (${BEFORE_PACKS} -> ${AFTER_PACKS})"
+SRC_VERSIONS_AFTER=$(pond describe /ingest/well.json 2>/dev/null \
+  | grep -E '^ *Version:' | grep -oE '[0-9]+' | head -1)
+check '[ "'"${SRC_VERSIONS_AFTER}"'" = "'"${SRC_VERSIONS}"'" ]' \
+    "pack-only maintenance leaves the source Oplog version unchanged (v${SRC_VERSIONS_AFTER})"
 
-# ---- Second read: the merged run adds a partial; the old ones remain --------
+# ---- Second read: physical maintenance is invisible to rollup content -------
 echo ""
-echo "--- After collapse ---"
+echo "--- After maintenance ---"
 AFTER_OUT=$(totals)
 echo "$AFTER_OUT"
 AFTER_SUM=$(echo "$AFTER_OUT" | grep -E '^\| *[0-9]' | head -1 | awk -F'|' '{gsub(/ /,"",$2); print $2}')
 AFTER_N=$(echo "$AFTER_OUT"   | grep -E '^\| *[0-9]' | head -1 | awk -F'|' '{gsub(/ /,"",$3); print $3}')
 
 check '[ "'"${AFTER_SUM}"'" = "96" ]' \
-    "collapse must not change the rollup sum (want 96, got ${AFTER_SUM})"
+    "pack maintenance must not change the rollup sum (want 96, got ${AFTER_SUM})"
 check '[ "'"${AFTER_N}"'" = "96" ]' \
-    "collapse must not change the rollup count (want 96, got ${AFTER_N})"
+    "pack maintenance must not change the rollup count (want 96, got ${AFTER_N})"
 
-# ---- A second collapse must not compound the error either -------------------
-pond maintain --collapse-versions 1 >/dev/null 2>&1 || true
+# ---- A second pass must settle without changing pack or query state ----------
+pond maintain --collapse-versions 1 > /tmp/733-collapse2.log 2>&1
+cat /tmp/733-collapse2.log
+check 'grep -qE "pack maintenance: [1-9][0-9]* candidate\(s\), 0 repacked, [1-9][0-9]* already bounded" /tmp/733-collapse2.log' \
+    "the repeated maintenance pass finds the source already bounded"
+check 'grep -qE "packs: 0 object\(s\) written" /tmp/733-collapse2.log' \
+    "the repeated maintenance pass writes no new pack objects"
+check '[ "$(count_pack_objects)" = "'"${AFTER_PACKS}"'" ]' \
+    "pack object count is stable across repeated maintenance"
 AGAIN_OUT=$(totals)
 AGAIN_N=$(echo "$AGAIN_OUT" | grep -E '^\| *[0-9]' | head -1 | awk -F'|' '{gsub(/ /,"",$3); print $3}')
 check '[ "'"${AGAIN_N}"'" = "96" ]' \
-    "a second collapse pass keeps the count at 96 (${AGAIN_N})"
+    "a second maintenance pass keeps the count at 96 (${AGAIN_N})"
 
 # ---- Control: avg is why this went unnoticed --------------------------------
 # Every sample is 1.0, so the mean is 1.0 before and after -- doubling sum and

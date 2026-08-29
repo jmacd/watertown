@@ -1,42 +1,28 @@
 #!/bin/bash
-# EXPERIMENT: Multi-version table:series collapse via `pond maintain`
+# EXPERIMENT: Multi-version table:series pack maintenance via `pond maintain`
 #
 # DESCRIPTION:
-#   716 covers collapse for a FilePhysicalSeries (data:series), which merges
-#   versions by BYTE-CONCATENATING them and verifies byte-identity.  A
-#   TablePhysicalSeries cannot work that way: each version is a self-contained
-#   parquet file with its own footer, and parquet files cannot be
-#   concatenated.  Collapsing a table:series therefore has to RE-ENCODE --
-#   scan the whole series through its table provider and stream every batch
-#   into one new parquet file -- so only LOGICAL equality (row count, per-
-#   version rows, temporal coverage) can be asserted, never a byte hash.
-#
-#   This distinction is why table:series was excluded from collapse entirely:
-#   `list_collapsible_series` matched only 'file:physical:series' and
-#   `collapse_file_series` hard-errored on anything else.  Both gates were
-#   silent -- `pond maintain --collapse-versions N` simply reported
-#   "0 file(s) collapsed" for ANY N, so no threshold could ever help.
-#
-#   That mattered because a table:series is read as a DataFusion ListingTable
-#   with ONE PARQUET FILE PER LIVE VERSION, costing ~58ms per version
-#   regardless of size (per-file listing + footer schema inference).  On
-#   caspar.water an hourly collector accrued ~1 version/hour with 4 rows each,
-#   so subsite export time grew without bound while the data did not.
+#   A TablePhysicalSeries appends one immutable logical leaf/Oplog row per
+#   ingest. Native logical-series-v2 maintenance does not re-encode those rows
+#   into one replacement version. Instead it publishes a bounded set of
+#   content-addressed Parquet pack objects under data/_packs while preserving
+#   the series manifest, Oplog rows, logical content, and query results.
 #
 # EXPECTED:
 #   - Three `host+series://` copies onto one path build a 3-version
 #     table:series (21 rows, three distinct days).
-#   - `pond maintain --collapse-versions 1` reports >=1 file collapsed.
-#     (Before table:series support this reported 0 -- the regression guard.)
-#   - After collapse the series still reads all 21 rows with every day intact:
-#     re-encoding neither drops superseded versions' rows nor double-counts
-#     them.
-#   - A second maintain reports 0 collapsed (already merged).
-#   - Appending a 4th version after the collapse extends the merged baseline.
+#   - `pond maintain --collapse-versions 1` reports a real repack and creates
+#     physical pack storage.
+#   - After maintenance the series still reads all 21 rows with every day
+#     intact, preserving its logical content.
+#   - Oplog version rows remain intact, and a second maintain reports
+#     0 repacked / already bounded without writing another pack.
+#   - Appending a 4th version extends the logical series and makes it a repack
+#     candidate again.
 #
 # History:
-#   Added alongside State::collapse_table_series / the table:physical:series
-#   arm of list_collapsible_series, which 716 did not reach.
+#   Added alongside table:series collapse support, then updated for the v2
+#   pack-only maintenance contract.
 set -e
 source check.sh
 
@@ -44,6 +30,11 @@ echo "=== Experiment: table:series version collapse ==="
 
 export POND=/pond
 pond init --birthplace test-host >/dev/null
+
+PACKS=/pond/data/_packs
+count_pack_objects() {
+    find "${PACKS}/objects" -type f 2>/dev/null | wc -l | tr -d ' '
+}
 
 # ---- Setup: four parquet files, one per distinct day ------------------------
 # Distinct days keep the versions non-overlapping so row counts add cleanly,
@@ -72,10 +63,9 @@ YAML
     cp "/tmp/728-exp/gen/day${d}" "/tmp/728-v${d}.parquet"
 done
 
-# Helper: number of LIVE versions, i.e. the per-version parquet files the
-# read path must list and open.  This is the quantity collapse exists to
-# shrink -- reads cost ~58ms per live version regardless of size.
-live_versions() {
+# Helper: number of immutable Oplog versions. Pack-only maintenance deliberately
+# leaves these logical rows intact and bounds their physical read layout instead.
+oplog_versions() {
     pond describe /data/well.series 2>/dev/null | grep -cE '^ *Version [0-9]+:'
 }
 series_rows() {
@@ -111,97 +101,111 @@ cat /tmp/728-describe-before.txt
 check 'grep -q "Type: TablePhysicalSeries" /tmp/728-describe-before.txt' \
     "node is a TablePhysicalSeries (the type collapse used to skip)"
 
-BEFORE_VERSIONS=$(live_versions)
+BEFORE_VERSIONS=$(oplog_versions)
 check '[ "'"${BEFORE_VERSIONS}"'" = "3" ]' \
-    "three live versions => three parquet files to list on every read, got ${BEFORE_VERSIONS}"
+    "three immutable Oplog versions were appended, got ${BEFORE_VERSIONS}"
+BEFORE_PACKS=$(count_pack_objects)
+check '[ "'"${BEFORE_PACKS}"'" = "0" ]' \
+    "no pack objects exist before maintenance"
 
-# ---- Step 2: collapse -------------------------------------------------------
-echo "--- Step 2: collapse the version chain ---"
+# ---- Step 2: pack maintenance -----------------------------------------------
+echo "--- Step 2: publish a bounded physical pack layout ---"
+pond maintain --dry-run --collapse-versions 1 > /tmp/728-dry-run.log 2>&1
+cat /tmp/728-dry-run.log
+check 'grep -q "Dry run: nothing was modified." /tmp/728-dry-run.log' \
+    "dry run identifies itself"
+check 'grep -qE "^ +/data/well\.series: node .* \(TablePhysicalSeries\): 3 leaf/leaves, 21 logical row\(s\), 3 physical object\(s\) -> 1 proposed \(needs repack\)$" /tmp/728-dry-run.log' \
+    "dry run identifies the table:series path, leaf fanout, and required repack"
+check '[ "$(count_pack_objects)" = "'"${BEFORE_PACKS}"'" ]' \
+    "dry run publishes no pack objects"
+
 pond maintain --collapse-versions 1 > /tmp/728-collapse.log 2>&1
 cat /tmp/728-collapse.log
 
-# THE REGRESSION GUARD: this line read "0 file(s) collapsed" for every
-# threshold before table:series became a collapse candidate.
-check 'grep -qE "collapse: [1-9][0-9]* file\(s\) collapsed" /tmp/728-collapse.log' \
-    "maintain collapsed the table:series (was always 0 before support)"
+check 'grep -qE "pack maintenance: [1-9][0-9]* candidate\(s\), [1-9][0-9]* repacked" /tmp/728-collapse.log' \
+    "maintain repacked the table:series"
+check 'grep -qE "packs: [1-9][0-9]* object\(s\) written" /tmp/728-collapse.log' \
+    "maintain reports bounded pack objects written"
+AFTER_PACKS=$(count_pack_objects)
+check '[ "'"${AFTER_PACKS}"'" -gt "'"${BEFORE_PACKS}"'" ]' \
+    "pack maintenance durably created physical pack objects (${BEFORE_PACKS} -> ${AFTER_PACKS})"
 
-# ---- Step 3: re-encoding preserved every row -------------------------------
-echo "--- Step 3: content survives the re-encode ---"
+# ---- Step 3: logical rows and Oplog history are unchanged -------------------
+echo "--- Step 3: content survives pack-only maintenance ---"
 
-# THE POINT OF THE FIX: the read path now lists ONE parquet file instead of
-# three, so per-read cost stops scaling with ingest history.
 pond describe /data/well.series > /tmp/728-describe-after.txt 2>&1
 cat /tmp/728-describe-after.txt
-AFTER_VERSIONS=$(live_versions)
-check '[ "'"${AFTER_VERSIONS}"'" = "1" ]' \
-    "three live versions collapsed into one parquet file, got ${AFTER_VERSIONS}"
-check 'grep -qE "^ *Version [0-9]+: 21 rows" /tmp/728-describe-after.txt' \
-    "the single surviving version carries all 21 rows"
-check 'grep -qE "^ *Version [0-9]+: 21 rows, time range: 2024-01-01 .* to 2024-01-03 " /tmp/728-describe-after.txt' \
-    "merged version's temporal bounds span the union of all three versions"
+AFTER_VERSIONS=$(oplog_versions)
+check '[ "'"${AFTER_VERSIONS}"'" = "'"${BEFORE_VERSIONS}"'" ]' \
+    "pack-only maintenance leaves all ${BEFORE_VERSIONS} Oplog versions intact"
 
 AFTER_ROWS=$(series_rows)
 check '[ "'"${AFTER_ROWS}"'" = "'"${BEFORE_ROWS}"'" ]' \
-    "row count unchanged after collapse (${BEFORE_ROWS} -> ${AFTER_ROWS})"
+    "row count unchanged after maintenance (${BEFORE_ROWS} -> ${AFTER_ROWS})"
 
 AFTER_D1=$(series_rows "temperature = 10.0")
 AFTER_D3=$(series_rows "temperature = 30.0")
 check '[ "'"${AFTER_D1}"'" = "7" ]' \
-    "oldest version's rows survive the merge, got ${AFTER_D1}"
+    "oldest version's logical rows remain present, got ${AFTER_D1}"
 check '[ "'"${AFTER_D3}"'" = "7" ]' \
-    "newest version's rows survive the merge, got ${AFTER_D3}"
+    "newest version's logical rows remain present, got ${AFTER_D3}"
 
-# Superseded versions must be skipped on read, not replayed alongside the
-# merged file -- that would silently double every row.
-check '[ "'"${AFTER_ROWS}"'" != "42" ]' \
-    "superseded versions are not double-counted after collapse"
-
-# Temporal coverage must span all three original days, not just the last one.
+# Temporal coverage must still span all three original days.
 SPAN=$(pond cat --sql "SELECT count(DISTINCT date_trunc('day', timestamp)) AS n FROM source" \
     --format table /data/well.series 2>/dev/null \
     | grep -E '^\| *[0-9]+ *\|' | grep -oE '[0-9]+' | head -1)
 check '[ "'"${SPAN}"'" = "3" ]' \
-    "merged version still spans all three days, got ${SPAN}"
+    "maintained series still spans all three days, got ${SPAN}"
 
 # ---- Step 4: idempotence ----------------------------------------------------
-echo "--- Step 4: second collapse is a no-op ---"
+echo "--- Step 4: second maintenance pass is already bounded ---"
 pond maintain --collapse-versions 1 > /tmp/728-collapse2.log 2>&1
 cat /tmp/728-collapse2.log
-check 'grep -qE "collapse: 0 file\(s\) collapsed" /tmp/728-collapse2.log' \
-    "an already-collapsed table:series is no longer a candidate"
+check 'grep -qE "pack maintenance: [1-9][0-9]* candidate\(s\), 0 repacked, [1-9][0-9]* already bounded" /tmp/728-collapse2.log' \
+    "the repeated attempt finds the table:series already bounded"
+check 'grep -qE "packs: 0 object\(s\) written" /tmp/728-collapse2.log' \
+    "the repeated attempt writes no new pack objects"
+check '[ "$(count_pack_objects)" = "'"${AFTER_PACKS}"'" ]' \
+    "pack object count is stable across repeated maintenance"
+check '[ "$(oplog_versions)" = "'"${BEFORE_VERSIONS}"'" ]' \
+    "repeated maintenance still leaves Oplog history intact"
 
-# ---- Step 5: appends still work on top of the merged version ----------------
-# The merged file carries `collapsed_through`; a later append must extend it
-# rather than resurrect the superseded versions.
-echo "--- Step 5: append after collapse ---"
+# ---- Step 5: appends still extend the logical series -------------------------
+echo "--- Step 5: append after pack maintenance ---"
 pond copy "host+series:///tmp/728-v4.parquet" /data/well.series >/dev/null 2>&1
 
 APPEND_ROWS=$(series_rows)
 check '[ "'"${APPEND_ROWS}"'" = "28" ]' \
-    "post-collapse append adds exactly its own 7 rows, got ${APPEND_ROWS}"
+    "post-maintenance append adds exactly its own 7 rows, got ${APPEND_ROWS}"
 
-APPEND_VERSIONS=$(live_versions)
-check '[ "'"${APPEND_VERSIONS}"'" = "2" ]' \
-    "append extends the merged baseline (1 merged + 1 new), got ${APPEND_VERSIONS}"
+APPEND_VERSIONS=$(oplog_versions)
+EXPECTED_APPEND_VERSIONS=$((BEFORE_VERSIONS + 1))
+check '[ "'"${APPEND_VERSIONS}"'" = "'"${EXPECTED_APPEND_VERSIONS}"'" ]' \
+    "append adds one immutable Oplog version (${BEFORE_VERSIONS} -> ${APPEND_VERSIONS})"
 
 APPEND_D4=$(series_rows "temperature = 40.0")
 APPEND_D1=$(series_rows "temperature = 10.0")
 check '[ "'"${APPEND_D4}"'" = "7" ]' \
     "appended version is readable, got ${APPEND_D4}"
 check '[ "'"${APPEND_D1}"'" = "7" ]' \
-    "pre-collapse rows still readable after the append, got ${APPEND_D1}"
+    "pre-maintenance rows still readable after the append, got ${APPEND_D1}"
 
-# ---- Step 6: the new tail is collapsible again ------------------------------
-echo "--- Step 6: the merged+appended chain collapses again ---"
+# ---- Step 6: the new leaf makes the physical layout repackable again --------
+echo "--- Step 6: the extended series repacks again ---"
 pond maintain --collapse-versions 1 > /tmp/728-collapse3.log 2>&1
 cat /tmp/728-collapse3.log
-check 'grep -qE "collapse: [1-9][0-9]* file\(s\) collapsed" /tmp/728-collapse3.log' \
-    "collapse re-arms once a new version lands"
+check 'grep -qE "pack maintenance: [1-9][0-9]* candidate\(s\), [1-9][0-9]* repacked" /tmp/728-collapse3.log' \
+    "pack maintenance re-arms once a new logical leaf lands"
+check 'grep -qE "packs: [1-9][0-9]* object\(s\) written" /tmp/728-collapse3.log' \
+    "the extended logical series publishes a new bounded pack"
 FINAL_ROWS=$(series_rows)
 check '[ "'"${FINAL_ROWS}"'" = "28" ]' \
-    "repeated collapse is lossless, got ${FINAL_ROWS}"
-FINAL_VERSIONS=$(live_versions)
-check '[ "'"${FINAL_VERSIONS}"'" = "1" ]' \
-    "the chain is back to a single live version, got ${FINAL_VERSIONS}"
+    "repeated pack maintenance is lossless, got ${FINAL_ROWS}"
+FINAL_VERSIONS=$(oplog_versions)
+check '[ "'"${FINAL_VERSIONS}"'" = "'"${APPEND_VERSIONS}"'" ]' \
+    "repacking leaves all ${FINAL_VERSIONS} Oplog versions intact"
+FINAL_PACKS=$(count_pack_objects)
+check '[ "'"${FINAL_PACKS}"'" -ge "'"${AFTER_PACKS}"'" ]' \
+    "a renewed repack preserves a bounded physical pack set (${AFTER_PACKS} -> ${FINAL_PACKS})"
 
 check_finish

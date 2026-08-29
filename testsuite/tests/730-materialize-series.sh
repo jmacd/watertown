@@ -18,7 +18,7 @@
 #
 #   The incrementality is the point. A snapshot-and-replace materializer would
 #   rewrite the whole history every tick, which is precisely the O(N^2) write
-#   amplification that size-tiered collapse exists to remove.
+#   amplification that bounded pack maintenance exists to remove.
 #
 # EXPECTED:
 #   - The target is a TablePhysicalSeries, created on the first run.
@@ -26,7 +26,8 @@
 #     the new rows.
 #   - A tick with no new source rows appends NOTHING (no empty versions).
 #   - The materialized content equals what the derived node computes.
-#   - The result is a genuine collapse candidate.
+#   - The result is a genuine pack-maintenance candidate; maintenance creates a
+#     bounded physical pack without rewriting its Oplog versions or content.
 #   - It works when the source lives inside a `dynamic-dir`, which is the
 #     topology selfmon actually uses (config/watershop-selfmon.yaml:/derived).
 #
@@ -40,6 +41,11 @@ echo "=== Experiment: materialize a derived series into table:series ==="
 
 export POND=/pond
 pond init --birthplace test-host >/dev/null
+
+PACKS=/pond/data/_packs
+count_pack_objects() {
+    find "${PACKS}/objects" -type f 2>/dev/null | wc -l | tr -d ' '
+}
 
 version_count() {
     pond describe /metrics/cpu.series 2>/dev/null | grep -cE '^ *Version [0-9]+:' || true
@@ -136,23 +142,50 @@ check '[ "'"${MAT_ROWS}"'" = "'"${DER_ROWS}"'" ]' \
     "materialized row count matches the derived node (${MAT_ROWS} = ${DER_ROWS})"
 check 'grep -q "1200" /tmp/730-materialized.txt' "latest value is present after append"
 
-echo "--- Step 5: the result is a real collapse candidate ---"
+echo "--- Step 5: the result is a real pack-maintenance candidate ---"
 for i in 3 4 5 6 7 8; do
     emit "2024-01-01T00:0${i}:00Z" "$((1200 + i * 100))" "0.${i}"
     pond run /system/etc/ingest >/dev/null 2>&1
     pond run /system/etc/materialize >/dev/null 2>&1
 done
 BEFORE_VERSIONS=$(version_count)
-check '[ "'"${BEFORE_VERSIONS}"'" -ge 6 ]' "accumulated ${BEFORE_VERSIONS} versions to collapse"
+check '[ "'"${BEFORE_VERSIONS}"'" -ge 6 ]' "accumulated ${BEFORE_VERSIONS} immutable versions to repack"
+BEFORE_PACKS=$(count_pack_objects)
+
+pond maintain --dry-run --collapse-versions 1 > /tmp/730-dry-run.log 2>&1
+cat /tmp/730-dry-run.log
+check 'grep -q "Dry run: nothing was modified." /tmp/730-dry-run.log' \
+    "dry run identifies itself"
+check 'grep -qE "^ +/metrics/cpu\.series: node .* \(TablePhysicalSeries\): 8 leaf/leaves, 9 logical row\(s\), 8 physical object\(s\) -> 1 proposed \(needs repack\)$" /tmp/730-dry-run.log' \
+    "dry run identifies the materialized target as needing repack"
+check '[ "$(count_pack_objects)" = "'"${BEFORE_PACKS}"'" ]' \
+    "dry run publishes no pack objects"
 
 pond maintain --collapse-versions 1 > /tmp/730-collapse.log 2>&1
 cat /tmp/730-collapse.log
-check 'grep -qE "collapse: [1-9][0-9]* file\(s\) collapsed" /tmp/730-collapse.log' \
-    "the materialized series is collapsible like any other table:series"
+check 'grep -qE "pack maintenance: [1-9][0-9]* candidate\(s\), [1-9][0-9]* repacked" /tmp/730-collapse.log' \
+    "the materialized series participates in pack maintenance"
+check 'grep -qE "packs: [1-9][0-9]* object\(s\) written" /tmp/730-collapse.log' \
+    "maintenance reports bounded pack objects written"
+AFTER_PACKS=$(count_pack_objects)
+check '[ "'"${AFTER_PACKS}"'" -gt "'"${BEFORE_PACKS}"'" ]' \
+    "maintenance durably creates physical pack objects (${BEFORE_PACKS} -> ${AFTER_PACKS})"
+AFTER_VERSIONS=$(version_count)
+check '[ "'"${AFTER_VERSIONS}"'" = "'"${BEFORE_VERSIONS}"'" ]' \
+    "pack-only maintenance leaves all ${BEFORE_VERSIONS} Oplog versions intact"
 
 AFTER_ROWS=$(pond cat --format table /metrics/cpu.series 2>/dev/null | grep -c "2024-01-01" || true)
 check '[ "'"${AFTER_ROWS}"'" = "9" ]' \
-    "collapse preserved every materialized row (${AFTER_ROWS})"
+    "pack maintenance preserved every materialized row (${AFTER_ROWS})"
+
+pond maintain --collapse-versions 1 > /tmp/730-collapse2.log 2>&1
+cat /tmp/730-collapse2.log
+check 'grep -qE "pack maintenance: [1-9][0-9]* candidate\(s\), 0 repacked, [1-9][0-9]* already bounded" /tmp/730-collapse2.log' \
+    "a repeated maintenance pass finds the candidate set already bounded"
+check 'grep -qE "packs: 0 object\(s\) written" /tmp/730-collapse2.log' \
+    "a repeated maintenance pass writes no new pack objects"
+check '[ "$(count_pack_objects)" = "'"${AFTER_PACKS}"'" ]' \
+    "pack object count is stable across repeated maintenance"
 
 echo "--- Step 6: source inside a dynamic-dir (selfmon's real topology) ---"
 # selfmon does not put its derived nodes at the pond root: they are entries of

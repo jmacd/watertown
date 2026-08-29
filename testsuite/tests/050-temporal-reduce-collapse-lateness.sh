@@ -1,41 +1,18 @@
 #!/bin/bash
-# EXPERIMENT: temporal-reduce rollup vs. `maintain --collapse-versions` --
-#   a collapsed source tail must never abort a read, at any allowed_lateness.
+# EXPERIMENT: temporal-reduce rollup vs. pack-only version maintenance
 #
 # DESCRIPTION:
-#   Reproduces the caspar.water site-staging outage where the whole sitegen
-#   build aborted for days. The water pond runs an hourly
-#   `maintain --compact --collapse-versions 100`, which rewrites roughly the
-#   last ~100 versions (~4 days) of each reduced series' source into a single
-#   merged version. A downstream temporal-reduce rollup that had already sealed
-#   buckets then saw that merged tail as data landing behind its sealed
-#   watermark and hard-failed:
-#
-#     temporal-reduce rollup: source data backfills an already-sealed bucket
-#     (earliest new output bucket ... precedes the sealed watermark ...;
-#     allowed_lateness = 86400s). ... Re-run the export with --rebuild ...
-#
-#   The original mitigation was to raise allowed_lateness so the collapse
-#   window stays inside the unsealed hot window (config/water.yaml sets 14d on
-#   every reduced instrument). That mitigation hid a deeper defect: the merged
-#   version's rows were ADDED to the rollup while the superseded versions' rows
-#   stayed, so at 14d the read did not fail -- it silently summed the collapsed
-#   window twice (see test 733).
-#
-#   The real fix is to stop keying the cache on version identity at all. The
-#   manifest now records the CONTENT of each live source version (its blake3 and
-#   its event-time range), so a collapse -- which rewrites N versions into one
-#   with identical content -- changes the version numbers but not the recorded
-#   ranges' union. What did change is dirty, and only that range is recomputed;
-#   the segments covering it are unsealed rather than rejected. A collapse that
-#   preserves content is therefore neither an error nor a double-count.
-#
-#   Both reduced nodes below read the SAME collapsed source; only their
-#   allowed_lateness differs, isolating the knob under test.
+#   Native logical-series-v2 maintenance is physical and pack-only:
+#   `pond maintain --collapse-versions` publishes bounded content-addressed
+#   packs but does not rewrite source Oplog rows, change the logical content
+#   tip, or present a synthetic backfill to temporal-reduce. Both reduced nodes
+#   below read the same maintained source; only their allowed_lateness differs.
+#   Their already-built rollups must remain readable and unchanged.
 #
 # EXPECTED:
-#   - Neither lateness setting errors after the collapse: allowed_lateness
-#     governs genuinely late data, not version collapse.
+#   - Maintenance reports a real repack and creates local pack storage.
+#   - Neither lateness setting errors after maintenance: allowed_lateness
+#     governs genuinely late data, not physical packing.
 #   - Both read every bucket exactly once -- 96 buckets, and a total sample
 #     count equal to the 96 points ingested, not 192.
 set -e
@@ -45,6 +22,11 @@ echo "=== Experiment: temporal-reduce collapse vs allowed_lateness ==="
 
 export POND=/pond
 pond init --birthplace test-host >/dev/null
+
+PACKS=/pond/data/_packs
+count_pack_objects() {
+    find "${PACKS}/objects" -type f 2>/dev/null | wc -l | tr -d ' '
+}
 
 # ---- Source: 96 hourly OTelJSON well_depth samples spanning 4 days ----------
 # 2026-07-15T00:00Z (epoch 1784073600) .. 2026-07-18T23:00Z, one point/hour.
@@ -71,8 +53,8 @@ pond mkdir -p /ingest >/dev/null
 pond mknod logfile-ingest /system/run/10-well --config-path /tmp/050-ingest.yaml >/dev/null
 
 # ---- Accumulate multiple source versions (24 samples per ingest run) --------
-# Multiple append versions give `maintain --collapse-versions` something to
-# merge, mirroring the many hourly ingest versions on water-staging.
+# Multiple append versions give pack maintenance a genuine over-threshold
+# native series, mirroring the many hourly ingest versions on water-staging.
 : > /var/log/well/well.json
 split -l 24 /tmp/050-all.jsonl /tmp/050-chunk.
 for c in /tmp/050-chunk.*; do
@@ -113,7 +95,7 @@ YAML
 pond mknod temporal-reduce /reduced-default --config-path /tmp/050-reduce-default.yaml >/dev/null
 pond mknod temporal-reduce /reduced-late --config-path /tmp/050-reduce-late.yaml >/dev/null
 
-# ---- Seal both rollups by reading them BEFORE the collapse ------------------
+# ---- Seal both rollups by reading them BEFORE maintenance ------------------
 # The first read builds the rollup cache and seals buckets older than
 # newest - allowed_lateness.
 echo ""
@@ -125,10 +107,13 @@ SEAL_LATE=$(pond cat /reduced-late/data/res=1h.series --format=table \
   --sql "SELECT COUNT(*) AS c FROM source" 2>&1 \
   | grep -E '^\| *[0-9]' | head -1 | grep -oE '[0-9]+' | head -1)
 
-# ---- Collapse the source versions (the production trigger) ------------------
+# ---- Repack the source versions without changing logical history ------------
 echo ""
-echo "--- maintain --collapse-versions 1 (rewrites the source tail) ---"
-pond maintain --collapse-versions 1 2>&1 | tee /tmp/050-collapse.log | grep -i collapse
+echo "--- maintain --collapse-versions 1 (pack-only physical maintenance) ---"
+BEFORE_PACKS=$(count_pack_objects)
+pond maintain --collapse-versions 1 > /tmp/050-collapse.log 2>&1
+grep -iE "pack maintenance|packs:" /tmp/050-collapse.log || true
+AFTER_PACKS=$(count_pack_objects)
 
 # ---- Second read: neither lateness may error, neither may double-count ------
 echo ""
@@ -154,24 +139,30 @@ echo "--- Verification ---"
 check '[ "${ROWS}" = "96" ]' \
   "source ingested 96 hourly points across versions, got ${ROWS}"
 
-check 'grep -qE "collapse: [1-9][0-9]* file\(s\) collapsed" /tmp/050-collapse.log' \
-  "maintain collapsed the source version tail"
+check 'grep -qE "pack maintenance: [1-9][0-9]* candidate\(s\), [1-9][0-9]* repacked" /tmp/050-collapse.log' \
+  "maintain repacked the source into a bounded physical layout"
+
+check 'grep -qE "packs: [1-9][0-9]* object\(s\) written" /tmp/050-collapse.log' \
+  "maintain reports new physical pack objects"
+
+check '[ "'"${AFTER_PACKS}"'" -gt "'"${BEFORE_PACKS}"'" ]' \
+  "pack maintenance created local pack objects (${BEFORE_PACKS} -> ${AFTER_PACKS})"
 
 check '[ "${SEAL_DEFAULT}" = "96" ] && [ "${SEAL_LATE}" = "96" ]' \
   "both rollups read all 96 buckets on the sealing pass"
 
 check '! echo "$DEFAULT_OUT" | grep -qiE "backfills|--rebuild"' \
-  "default 1d lateness no longer rejects the collapsed tail (the outage is gone)"
+  "default 1d lateness remains readable after physical maintenance"
 
 check '! echo "$LATE_OUT" | grep -qiE "backfills|--rebuild"' \
-  "allowed_lateness=14d tolerates the collapsed tail"
+  "allowed_lateness=14d remains readable after physical maintenance"
 
 check '[ "${DEFAULT_ROWS}" = "96" ] && [ "${LATE_ROWS}" = "96" ]' \
-  "both reduced series still read all 96 buckets after collapse, got ${DEFAULT_ROWS} / ${LATE_ROWS}"
+  "both reduced series still read all 96 buckets after maintenance, got ${DEFAULT_ROWS} / ${LATE_ROWS}"
 
-# The mitigation-era blind spot: avg and bucket count are both invariant under
-# doubling, so only a total count catches a superseded partial being re-summed.
+# Avg and bucket count alone can hide duplication, so retain a total-count
+# invariant across physical maintenance as the stronger cache-integrity check.
 check '[ "${DEFAULT_N}" = "96" ] && [ "${LATE_N}" = "96" ]' \
-  "each source point is counted exactly once after collapse, got ${DEFAULT_N} / ${LATE_N} (192 = double-counted)"
+  "each source point is counted exactly once after maintenance, got ${DEFAULT_N} / ${LATE_N}"
 
 check_finish
