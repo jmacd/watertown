@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Magic-dispatch over a fetched series object: `dp.series.1` (v1, a plain
-//! ordered list of version blob hashes) versus `dp.series.2` (v2, a decoded
+//! ordered list of version blob hashes) versus `watertown.series.v1` (v2, a decoded
 //! [`super::series_manifest::SeriesManifest`]).
 //!
 //! `docs/logical-series-identity-design.md` delivery gate 4 ("Add a dual
@@ -32,7 +32,7 @@ pub enum FetchedSeriesObject {
     /// A `dp.series.1` object: the ordered per-version blob hashes
     /// [`super::decode_series`] already returns.
     V1(Vec<ObjectHash>),
-    /// A `dp.series.2` object: a decoded [`SeriesManifest`].
+    /// A `watertown.series.v1` object: a decoded [`SeriesManifest`].
     V2(SeriesManifest),
 }
 
@@ -40,7 +40,7 @@ pub enum FetchedSeriesObject {
 /// inspecting its magic header.
 ///
 /// Bytes are checked against both known magics (`dp.series.1\n` and
-/// `dp.series.2\n`) before any decode is attempted, so a caller gets one
+/// `watertown.series.v1\n`) before any decode is attempted, so a caller gets one
 /// precise error naming the exact expectation for whichever it is, rather
 /// than a decoder's own truncation/tag error for the other encoding.
 ///
@@ -50,7 +50,7 @@ pub enum FetchedSeriesObject {
 ///   [`super::decode_series`]'s error (truncation, oversized count, trailing
 ///   bytes) with a `"dp.series.1"`-prefixed context.
 /// - If `bytes` starts with the v2 magic, propagates
-///   [`SeriesManifest::decode`]'s error similarly, prefixed `"dp.series.2"`.
+///   [`SeriesManifest::decode`]'s error similarly, prefixed `"watertown.series.v1"`.
 /// - If `bytes` starts with neither known magic (including a magic-length
 ///   prefix that is merely truncated), returns one combined error precisely
 ///   naming both expected magics and the actual leading bytes found, so a
@@ -65,14 +65,14 @@ pub fn decode_fetched_series_object(bytes: &[u8]) -> Result<FetchedSeriesObject,
     if bytes.starts_with(MANIFEST_MAGIC) {
         return SeriesManifest::decode(bytes)
             .map(FetchedSeriesObject::V2)
-            .map_err(|e| format!("dp.series.2 series object: {e}"));
+            .map_err(|e| format!("watertown.series.v1 series object: {e}"));
     }
     let preview_len = bytes
         .len()
         .min(SERIES_MAGIC.len().max(MANIFEST_MAGIC.len()));
     Err(format!(
         "fetched series object matches neither known magic \
-         ({SERIES_MAGIC:?} for dp.series.1 or {MANIFEST_MAGIC:?} for dp.series.2); \
+         ({SERIES_MAGIC:?} for dp.series.1 or {MANIFEST_MAGIC:?} for watertown.series.v1); \
          got {} byte(s) starting with {:?}",
         bytes.len(),
         &bytes[..preview_len]
@@ -116,14 +116,17 @@ mod tests {
         let bytes = b"dp.something-else.1\nrest of the bytes".to_vec();
         let err = decode_fetched_series_object(&bytes).expect_err("unknown magic must fail");
         assert!(err.contains("dp.series.1"), "error should name v1: {err}");
-        assert!(err.contains("dp.series.2"), "error should name v2: {err}");
+        assert!(
+            err.contains("watertown.series.v1"),
+            "error should name v2: {err}"
+        );
     }
 
     #[test]
     fn rejects_empty_bytes() {
         let err = decode_fetched_series_object(&[]).expect_err("empty bytes must fail");
         assert!(err.contains("dp.series.1"));
-        assert!(err.contains("dp.series.2"));
+        assert!(err.contains("watertown.series.v1"));
     }
 
     #[test]
@@ -150,7 +153,7 @@ mod tests {
         let truncated = &bytes[..bytes.len() - 4];
         let err = decode_fetched_series_object(truncated).expect_err("truncated v2 must fail");
         assert!(
-            err.starts_with("dp.series.2"),
+            err.starts_with("watertown.series.v1"),
             "expected v2-tagged error, got: {err}"
         );
     }

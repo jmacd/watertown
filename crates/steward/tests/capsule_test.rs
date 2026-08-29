@@ -227,25 +227,28 @@ async fn rejects_empty_versions_inside_a_series() {
         .await
         .expect("create pond");
 
-    ship.write_transaction(&meta("empty-series"), async move |transaction| {
-        let root = transaction.root().await?;
-        for bytes in [b"first".as_slice(), b"".as_slice(), b"third".as_slice()] {
-            let mut writer = root
-                .async_writer_path_with_type("/series", EntryType::FilePhysicalSeries)
-                .await?;
-            writer.write_all(bytes).await?;
-            writer.shutdown().await?;
-        }
-        Ok(())
-    })
-    .await
-    .expect("write series");
-
-    let error = build_recovery_capsule(&ship)
+    // A leafless (zero-byte) append after a series' first version is now
+    // rejected at write time by tlogfs itself (see
+    // `TLogFSError::SeriesLeaflessAppendAfterFirstVersion`), before the
+    // capsule builder ever runs: a later leafless append would change
+    // series-level attributes/mtime independently of the last logical leaf,
+    // which the v2 replication fold cannot reproduce.
+    let error = ship
+        .write_transaction(&meta("empty-series"), async move |transaction| {
+            let root = transaction.root().await?;
+            for bytes in [b"first".as_slice(), b"".as_slice(), b"third".as_slice()] {
+                let mut writer = root
+                    .async_writer_path_with_type("/series", EntryType::FilePhysicalSeries)
+                    .await?;
+                writer.write_all(bytes).await?;
+                writer.shutdown().await?;
+            }
+            Ok(())
+        })
         .await
-        .expect_err("capsule builder must not silently drop an empty series version");
+        .expect_err("a leafless append after a series' first version must be rejected at write time");
     assert!(
-        error.to_string().contains("empty file version"),
+        error.to_string().contains("leafless (zero-byte) append"),
         "unexpected error: {error}"
     );
 }

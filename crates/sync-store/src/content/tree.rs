@@ -35,7 +35,7 @@ use super::{Cursor, ObjectHash, push_len_prefixed};
 /// Version 2 adds per-version [`VersionMeta`] to each entry: a directory now
 /// records what it knows about its children, mirroring a real filesystem where
 /// the node's metadata lives beside the name that refers to it.
-const TREE_MAGIC: &[u8] = b"dp.tree.2\n";
+const TREE_MAGIC: &[u8] = b"watertown.tree.v1\n";
 
 /// Magic header for the cumulative series hash (D2).
 ///
@@ -46,7 +46,8 @@ const TREE_MAGIC: &[u8] = b"dp.tree.2\n";
 pub(crate) const SERIES_MAGIC: &[u8] = b"dp.series.1\n";
 
 /// Magic header for a dynamic-node recipe object (D2/D4).
-const RECIPE_MAGIC: &[u8] = b"dp.recipe.1\n";
+const RECIPE_MAGIC: &[u8] = b"watertown.recipe.v1\n";
+const LEGACY_RECIPE_MAGIC: &[u8] = b"dp.recipe.1\n";
 
 /// Minimum on-wire size of a single tree entry: a length-prefixed name (4-byte
 /// length + 0 bytes for an empty name), a 1-byte entry-type discriminant, a
@@ -469,7 +470,16 @@ pub fn recipe_hash(factory_type: &str, config: &[u8]) -> ObjectHash {
 /// the factory type is not valid UTF-8.
 pub fn decode_recipe(bytes: &[u8]) -> Result<(String, Vec<u8>), String> {
     let mut cur = Cursor::new(bytes);
-    cur.expect_tag(RECIPE_MAGIC)?;
+    if bytes.starts_with(RECIPE_MAGIC) {
+        cur.expect_tag(RECIPE_MAGIC)?;
+    } else if bytes.starts_with(LEGACY_RECIPE_MAGIC) {
+        cur.expect_tag(LEGACY_RECIPE_MAGIC)?;
+    } else {
+        return Err(format!(
+            "bad recipe magic header: expected {:?} or {:?}",
+            RECIPE_MAGIC, LEGACY_RECIPE_MAGIC
+        ));
+    }
     let factory_type = cur.take_len_prefixed_string()?;
     let config = cur.take_rest().to_vec();
     Ok((factory_type, config))

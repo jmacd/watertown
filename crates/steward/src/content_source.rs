@@ -65,7 +65,7 @@ pub trait ContentSource: Send + Sync {
     /// if the source does not hold it.
     async fn get_blob_reader(&self, hash: ObjectHash) -> Result<Option<BlobReader>, StewardError>;
 
-    /// Every pack hash advertised for the `dp.series.2` series named
+    /// Every pack hash advertised for the `watertown.series.v1` series named
     /// `series_hash`, as one listing
     /// (`docs/logical-series-identity-design.md` delivery gate 3).
     ///
@@ -81,7 +81,7 @@ pub trait ContentSource: Send + Sync {
         series_hash: ObjectHash,
     ) -> Result<std::collections::HashSet<ObjectHash>, StewardError>;
 
-    /// Fetch one pack advertisement's raw `dp.series-pack.1` bytes by the
+    /// Fetch one pack advertisement's raw `watertown.series-pack.v1` bytes by the
     /// series it claims and its own content address, or `None` if absent.
     ///
     /// Implementations validate the returned bytes before handing them back:
@@ -216,7 +216,7 @@ pub struct LocalPondSource {
     objects: BTreeMap<ObjectHash, Vec<u8>>,
     /// Hashes of the large blobs that transfer via the external path.
     external_blobs: BTreeSet<ObjectHash>,
-    /// Every `dp.series.2` series' manifest and ordered live versions
+    /// Every `watertown.series.v1` series' manifest and ordered live versions
     /// captured at [`Self::open`] time, exactly as a push would.  Backs
     /// [`Self::list_pack_hashes`]/[`Self::get_pack_index`]'s on-demand pack
     /// materialization: a native v2 series in this unpushed local pond has

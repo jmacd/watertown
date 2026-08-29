@@ -6,7 +6,7 @@
 //! --collapse-versions N` (`docs/logical-series-identity-design.md`).
 //!
 //! This module never rewrites or deletes an Oplog append row, never
-//! changes a `dp.series.2` manifest/tree/commit root, Delta version, or txn
+//! changes a `watertown.series.v1` manifest/tree/commit root, Delta version, or txn
 //! sequence, and never changes logical metadata. What it *does* do is
 //! discover native v2 series whose current physical representation is
 //! fragmented past a requested threshold and publish a smaller, bounded set
@@ -24,7 +24,7 @@
 //! series' already-committed logical content, never a replacement for the
 //! Oplog rows themselves. [`crate::content_tree::build_series_manifest`]
 //! (the exact same fold every push/verify path uses) is called on the
-//! series' live rows to get the untouched, canonical `dp.series.2`
+//! series' live rows to get the untouched, canonical `watertown.series.v1`
 //! manifest; every leaf hash a fresh pack claims is recomputed from the
 //! real, live-fetched content and checked against that persisted leaf hash
 //! before it is trusted (requirement 3's "recompute/verify"); and the
@@ -150,7 +150,7 @@ pub enum PackCandidateOutcome {
 pub struct PackMaintenanceCandidate {
     /// The series node's identity.
     pub file_id: FileID,
-    /// The series' `dp.series.2` manifest hash, or `None` for
+    /// The series' `watertown.series.v1` manifest hash, or `None` for
     /// [`PackCandidateOutcome::UnsupportedLegacy`] (a pre-v2 series has no
     /// v2 manifest to hash).
     pub series_hash: Option<ObjectHash>,

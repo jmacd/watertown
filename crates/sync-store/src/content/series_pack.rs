@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `dp.series-pack.1` pack index: a physical pack's proof of membership in a
+//! `watertown.series-pack.v1` pack index: a physical pack's proof of membership in a
 //! logical series, and the verification helper that checks a pack against a
 //! decoded series manifest.
 //!
@@ -57,8 +57,8 @@ use super::series_merkle::{
 };
 use super::{Cursor, ObjectHash, push_len_prefixed};
 
-/// Magic header for a `dp.series-pack.1` pack index object.
-const PACK_MAGIC: &[u8] = b"dp.series-pack.1\n";
+/// Magic header for a `watertown.series-pack.v1` pack index object.
+const PACK_MAGIC: &[u8] = b"watertown.series-pack.v1\n";
 
 /// Known `bounds_flags` bits for a [`PackLeafDescriptor`]; any other bit set
 /// is a decode error, matching [`super::series_leaf`]'s and
@@ -71,7 +71,7 @@ const KNOWN_DESCRIPTOR_BOUNDS_FLAGS: u8 = LEAF_HAS_MIN | LEAF_HAS_MAX;
 /// present. Used to bound a hostile descriptor count's pre-allocation.
 const MIN_DESCRIPTOR_WIRE_BYTES: usize = 8 + 1 + 4;
 
-/// One logical leaf's per-leaf metadata within a `dp.series-pack.1` pack
+/// One logical leaf's per-leaf metadata within a `watertown.series-pack.v1` pack
 /// index: exactly one descriptor for each logical leaf in
 /// `[leaf_start, leaf_end)`, in leaf order.
 ///
@@ -242,7 +242,7 @@ fn validate_descriptor(
     Ok(())
 }
 
-/// A `dp.series-pack.1` pack index: one contiguous logical-leaf range,
+/// A `watertown.series-pack.v1` pack index: one contiguous logical-leaf range,
 /// covered by one or more physical objects, together with its membership
 /// proof against a named series.
 ///
@@ -331,7 +331,7 @@ impl PackIndex {
         })
     }
 
-    /// The `dp.series.2` object hash this pack claims to belong to.
+    /// The `watertown.series.v1` object hash this pack claims to belong to.
     #[must_use]
     pub fn series_hash(&self) -> ObjectHash {
         self.series_hash
@@ -401,7 +401,7 @@ impl PackIndex {
         &self.leaf_descriptors
     }
 
-    /// Serialize this pack index into its `dp.series-pack.1` wire bytes:
+    /// Serialize this pack index into its `watertown.series-pack.v1` wire bytes:
     ///
     /// ```text
     /// PACK_MAGIC
@@ -469,7 +469,7 @@ impl PackIndex {
         ObjectHash::of_bytes(&self.encode())
     }
 
-    /// Decode a `dp.series-pack.1` pack index (the inverse of
+    /// Decode a `watertown.series-pack.v1` pack index (the inverse of
     /// [`PackIndex::encode`]), applying the same invariants as
     /// [`PackIndex::new`].
     ///
@@ -924,15 +924,15 @@ mod tests {
         let pack = build_pack(&leaves, series_hash, 1, 4);
         assert_eq!(
             hex::encode(encode_range_proof(pack.range_proof())),
-            "64702e7365726965732d72616e67652d70726f6f662e310a0200000000000000000000000100000000000000a2539e838bd25deb4f6a7d2e8002377ed3ec86a1f157a1f5a34dce114a73471f040000000000000001000000000000003aa425e8a280103c5a69b0c1f63ba71c2436797d2d223ab1e566eb1cac2ef7e3"
+            "7761746572746f776e2e7365726965732d72616e67652d70726f6f662e76310a02000000000000000000000001000000000000001aea83da8ebb2fdc51fa40699b0f41d25e042a507891584889349db9a6cdaa3f04000000000000000100000000000000b1ed2124b50cdcdbae50d0eae40d70a60327480b1a823e48a8ab0f347fcab9c1"
         );
         assert_eq!(
             hex::encode(pack.encode()),
-            "64702e7365726965732d7061636b2e310a480e6f96823b7a89f8564d58c7838d5df3fe24370240e8f2b50fa8863f133e47010000000000000004000000000000000500000000000000111f170d646e41f5de22753af524d1bef6a1df486eb8e80d6a589986e1bd693f7c00000064702e7365726965732d72616e67652d70726f6f662e310a0200000000000000000000000100000000000000a2539e838bd25deb4f6a7d2e8002377ed3ec86a1f157a1f5a34dce114a73471f040000000000000001000000000000003aa425e8a280103c5a69b0c1f63ba71c2436797d2d223ab1e566eb1cac2ef7e301000000d7fcc2bd302c6b704349120c3e4b551acdba7c20b91435f31e1c7e554df3a6911e000000000000000010000000000000030000000a0000000000000000000000000a0000000000000000000000000a000000000000000000000000"
+            "7761746572746f776e2e7365726965732d7061636b2e76310af485f39723437f886bdffdcac6c23e08f7aa1ad9b4dd5af63e89e8337807179c01000000000000000400000000000000050000000000000028112314f429fca118cb035dee9e07715e25aa75f275e9d7563c3e7951236774840000007761746572746f776e2e7365726965732d72616e67652d70726f6f662e76310a02000000000000000000000001000000000000001aea83da8ebb2fdc51fa40699b0f41d25e042a507891584889349db9a6cdaa3f04000000000000000100000000000000b1ed2124b50cdcdbae50d0eae40d70a60327480b1a823e48a8ab0f347fcab9c101000000d7fcc2bd302c6b704349120c3e4b551acdba7c20b91435f31e1c7e554df3a6911e000000000000000010000000000000030000000a0000000000000000000000000a0000000000000000000000000a000000000000000000000000"
         );
         assert_eq!(
             pack.hash().to_hex(),
-            "76bdbfe917071ea6f8cc7e8b5c4f500b400fede8a42eaf49f0ff836a4ce1fa29"
+            "3bbdfdd226b21715e107adebd4d4872ab5b846b59ab650aab7d28666d56f1ec6"
         );
     }
 
@@ -1177,11 +1177,11 @@ mod tests {
         assert_eq!(decoded.encode(), bytes);
         assert_eq!(
             hex::encode(&bytes),
-            "64702e7365726965732d7061636b2e310a7b2ed12ca76572917dfd7f91112a76abcfa141652fa9528c6892b614d100f309000000000000000001000000000000000100000000000000a2539e838bd25deb4f6a7d2e8002377ed3ec86a1f157a1f5a34dce114a73471f1c00000064702e7365726965732d72616e67652d70726f6f662e310a0000000001000000d7fcc2bd302c6b704349120c3e4b551acdba7c20b91435f31e1c7e554df3a6912a000000000000008000000000000000010000002a0000000000000003fbffffffffffffff6300000000000000090000007b226b223a2276227d"
+            "7761746572746f776e2e7365726965732d7061636b2e76310a22f78a7d24a28024bab448d1002be520a30e48083c977ce0c73303072925230d0000000000000000010000000000000001000000000000001aea83da8ebb2fdc51fa40699b0f41d25e042a507891584889349db9a6cdaa3f240000007761746572746f776e2e7365726965732d72616e67652d70726f6f662e76310a0000000001000000d7fcc2bd302c6b704349120c3e4b551acdba7c20b91435f31e1c7e554df3a6912a000000000000008000000000000000010000002a0000000000000003fbffffffffffffff6300000000000000090000007b226b223a2276227d"
         );
         assert_eq!(
             pack.hash().to_hex(),
-            "f448c832c14d07b714be4a231fb389ead19a803dc2b45cc3dbb579dcb4214d5f"
+            "a861f816ff5e92704074d02f3445d502f6bc5c91ca873628fc0936f8e1e0621f"
         );
     }
 

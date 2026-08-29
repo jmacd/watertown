@@ -55,7 +55,7 @@ pub enum FetchedObject {
     /// the remote straight into the local writer at rebuild time, keyed by this
     /// object's hash; only its presence is recorded here.
     External,
-    /// A verified `dp.series.2` logical series
+    /// A verified `watertown.series.v1` logical series
     /// (`docs/logical-series-identity-design.md` delivery gate 4).
     ///
     /// By the time this variant exists in [`FetchedGraph::objects`], the
@@ -71,7 +71,7 @@ pub enum FetchedObject {
     SeriesV2(Box<FetchedSeriesV2>),
 }
 
-/// The immutable, verified state of one fetched `dp.series.2` logical series:
+/// The immutable, verified state of one fetched `watertown.series.v1` logical series:
 /// enough information for a future v2 materializer to rebuild it, without
 /// this delivery gate implementing that rebuild itself.
 ///
@@ -84,7 +84,7 @@ pub enum FetchedObject {
 /// this is built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchedSeriesV2 {
-    /// The `dp.series.2` object's own content address -- the hash the owning
+    /// The `watertown.series.v1` object's own content address -- the hash the owning
     /// tree entry's `child_hash` named.
     pub manifest_hash: ObjectHash,
     /// The decoded series manifest.
@@ -296,14 +296,14 @@ async fn fetch_tree(
     Ok(())
 }
 
-/// Fetch a series object -- v1 (`dp.series.1`) or v2 (`dp.series.2`),
+/// Fetch a series object -- v1 (`dp.series.1`) or v2 (`watertown.series.v1`),
 /// dispatched by magic header -- and everything it names.
 ///
 /// `entry_type` is the owning tree entry's declared kind
 /// (`FilePhysicalSeries` or `TablePhysicalSeries`); for a v2 series it must
 /// agree with the manifest's own [`PayloadKind`] (`docs/logical-series-
 /// identity-design.md` delivery gate 4), since nothing else ties a
-/// `dp.series.2` object's payload kind to the directory position naming it.
+/// `watertown.series.v1` object's payload kind to the directory position naming it.
 async fn fetch_series(
     remote: &dyn ContentSource,
     series_hash: ObjectHash,
@@ -361,7 +361,7 @@ async fn fetch_series(
 }
 
 /// Map a series-carrying tree entry type to the [`PayloadKind`] its
-/// `dp.series.2` manifest must declare.
+/// `watertown.series.v1` manifest must declare.
 ///
 /// Only ever called with a series entry type (the two callers -- [`fetch_tree`]'s
 /// match arm and [`fetch_series`] -- both guarantee that), so any other value
@@ -374,7 +374,7 @@ fn expected_payload_kind(entry_type: EntryType) -> PayloadKind {
     }
 }
 
-/// Fetch, discover, and fully verify a `dp.series.2` logical series
+/// Fetch, discover, and fully verify a `watertown.series.v1` logical series
 /// (`docs/logical-series-identity-design.md` delivery gate 4).
 ///
 /// This is the heart of the dual reader's v2 side. It:
@@ -1239,7 +1239,7 @@ enum ApplyOp {
     },
     /// Unlink a target node that is absent from the source.
     Delete { parent_path: String, name: String },
-    /// Create (adopting `node_id`) or append to a native `dp.series.2` v2
+    /// Create (adopting `node_id`) or append to a native `watertown.series.v1` v2
     /// logical series (`docs/logical-series-identity-design.md`, release
     /// blocker item 1). Unlike [`ApplyOp::File`], a v2 series carries no
     /// buffered version list here: its physical content already lives in the
@@ -1253,7 +1253,7 @@ enum ApplyOp {
         node_id: String,
         create: bool,
         entry_type: EntryType,
-        /// The `dp.series.2` manifest object's hash -- this node's
+        /// The `watertown.series.v1` manifest object's hash -- this node's
         /// `child_hash` -- naming the verified [`FetchedSeriesV2`] in
         /// `graph.objects` to materialize from.
         manifest_hash: ObjectHash,
@@ -1266,7 +1266,7 @@ enum ApplyOp {
         /// ([`replicated_mtime`]), adopted verbatim on the *last* leaf this
         /// operation writes so the destination's own subsequent fold
         /// recomputes the identical aggregate `VersionMeta` (mtime is not
-        /// part of the `dp.series.2` manifest hash, but is part of the
+        /// part of the `watertown.series.v1` manifest hash, but is part of the
         /// destination's own `build_series_manifest` aggregation, which
         /// takes it from the latest leaf-bearing version).
         replicated_mtime: Option<i64>,
@@ -2403,7 +2403,7 @@ fn plan_series_versions(
     Ok((full, true))
 }
 
-/// Resolve a `dp.series.2` object to its verified [`FetchedSeriesV2`] state.
+/// Resolve a `watertown.series.v1` object to its verified [`FetchedSeriesV2`] state.
 ///
 /// # Errors
 ///
@@ -2417,7 +2417,7 @@ fn series_v2(
     match graph.objects.get(&series_hash) {
         Some(FetchedObject::SeriesV2(series)) => Ok(series),
         Some(_) => Err(StewardError::Content(format!(
-            "expected a v2 (dp.series.2) series at {} but found a different object shape",
+            "expected a v2 (watertown.series.v1) series at {} but found a different object shape",
             series_hash.to_hex()
         ))),
         None => Err(StewardError::Content(format!(
@@ -2430,7 +2430,7 @@ fn series_v2(
 /// Decide the suffix of a v2 logical series' leaves the target still needs
 /// (release blocker item 1, `docs/logical-series-identity-design.md`).
 ///
-/// A `dp.series.2` series' `child_hash` is its manifest hash, which is a pure
+/// A `watertown.series.v1` series' `child_hash` is its manifest hash, which is a pure
 /// function of its whole logical content (leaf hashes, aggregate bounds,
 /// schema, attributes -- everything except mtime); an unchanged `child_hash`
 /// therefore means an unchanged logical state, full stop.
@@ -2749,7 +2749,7 @@ fn timestamp_column(meta: &VersionMeta) -> String {
         )
 }
 
-/// Materialize a verified `dp.series.2` logical series into the destination
+/// Materialize a verified `watertown.series.v1` logical series into the destination
 /// as native tlogfs rows (release blocker item 1,
 /// `docs/logical-series-identity-design.md`).
 ///
@@ -2904,7 +2904,7 @@ fn descriptor_timestamp_column(descriptor: &PackLeafDescriptor) -> Result<String
     }
 }
 
-/// Materialize a `dp.series.2` `FilePhysicalSeries` whose manifest declares
+/// Materialize a `watertown.series.v1` `FilePhysicalSeries` whose manifest declares
 /// `leaf_count() == 0` (release blocker item 1,
 /// `docs/logical-series-identity-design.md`): a legitimately empty,
 /// metadata-only series that has never carried a logical leaf (for example a
@@ -3232,7 +3232,7 @@ async fn materialize_table_series_v2(
         // Unlike a `FilePhysicalSeries`, a genuinely empty
         // `TablePhysicalSeries` cannot be materialized at all: any table
         // series node this writes would itself need a schema fingerprint
-        // to be foldable into a valid `dp.series.2` manifest by this same
+        // to be foldable into a valid `watertown.series.v1` manifest by this same
         // destination's own future commits ([`SeriesManifest::new`]
         // unconditionally requires one for [`PayloadKind::Table`]), and a
         // zero-content write can never carry one (a real schema is only
@@ -3245,7 +3245,7 @@ async fn materialize_table_series_v2(
         return Err(StewardError::Content(format!(
             "v2 table series {name:?} (node {node_id}) declares leaf_count() == 0 -- a table \
              series with no logical leaves can never carry the schema fingerprint every \
-             dp.series.2 table manifest requires, so it cannot be materialized as a \
+             watertown.series.v1 table manifest requires, so it cannot be materialized as a \
              TablePhysicalSeries; refusing to create a node this destination could never fold \
              back into a valid manifest itself"
         )));
@@ -3594,7 +3594,7 @@ fn series_versions(
     match graph.objects.get(&series_hash) {
         Some(FetchedObject::Series(versions)) => Ok(versions),
         Some(FetchedObject::SeriesV2(_)) => Err(StewardError::Content(format!(
-            "series {} is a v2 (dp.series.2) logical series and must be planned/applied via \
+            "series {} is a v2 (watertown.series.v1) logical series and must be planned/applied via \
              plan_series_v2_leaves/materialize_series_v2, not as a v1 series (internal \
              dispatch error)",
             series_hash.to_hex()

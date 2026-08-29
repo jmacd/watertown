@@ -18,7 +18,7 @@ use log::info;
 /// logical-series-v2 series into a smaller, bounded set of
 /// content-addressed physical pack objects published under this pond's own
 /// local `data/_packs` namespace. This never rewrites or deletes an Oplog
-/// append row and never changes a series' `dp.series.2` manifest, content
+/// append row and never changes a series' `watertown.series.v1` manifest, content
 /// tree/commit root, Delta version, or txn sequence -- only local disk
 /// state under `_packs/` is mutated, so it always returns `Ok`. A pre-v2
 /// (legacy) series carries no persisted v2 leaf identity and is reported as
@@ -238,7 +238,7 @@ async fn report_dry_run(
                      fresh 1:1 packs built from the Oplog rows a push itself just carried, so a \
                      maintained/repacked pack stays local (or `pond://`-visible) unless and \
                      until an explicit pack uploader is added. This never rewrites an Oplog row \
-                     or changes a series' dp.series.2 manifest, content root, Delta version, or \
+                     or changes a series' watertown.series.v1 manifest, content root, Delta version, or \
                      txn sequence."
                 );
             }

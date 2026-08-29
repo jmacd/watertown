@@ -767,7 +767,7 @@ pub(crate) struct RetentionStats {
 /// alongside [`sweep_unreferenced_pack_objects`] -- but only once each has
 /// survived one full maintenance generation as no-longer-live.
 ///
-/// A `dp.series.2` series hash is the fold of *all* of a series' current
+/// A `watertown.series.v1` series hash is the fold of *all* of a series' current
 /// live leaf hashes, so any append at all mints a brand new series hash;
 /// without this, every append-then-repack cycle would leave the previous
 /// cycle's now-superseded `series=<oldhash>` directory (and its

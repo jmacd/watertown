@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Generic staged import: materialize a downloaded `pondcapsule.1` capsule
+//! Generic staged import: materialize a downloaded `pondcapsule.1` or
+//! `pondcapsule.2` capsule
 //! into a brand-new pond (`docs/recovery-capsule-design.md`, "Generic staged
 //! import").
 //!
@@ -988,7 +989,7 @@ fn assert_logical_match(source: &CapsuleManifest, rebuilt: &CapsuleManifest) -> 
                 }
             }
             (CapsuleNode::Dynamic { recipe: want }, CapsuleNode::Dynamic { recipe: got }) => {
-                if want != got {
+                if source.format == rebuilt.format && want != got {
                     return Err(format!("{:?} dynamic recipe changed", expected.path));
                 }
             }
@@ -1008,11 +1009,23 @@ fn assert_logical_match(source: &CapsuleManifest, rebuilt: &CapsuleManifest) -> 
                     ..
                 },
             ) => {
-                if want_kind != got_kind
-                    || want_schema != got_schema
-                    || want_root != got_root
-                    || want_leaves != got_leaves
-                {
+                let compatible_logical_match = if source.format == rebuilt.format {
+                    want_kind == got_kind
+                        && want_schema == got_schema
+                        && want_root == got_root
+                        && want_leaves == got_leaves
+                } else {
+                    want_kind == got_kind
+                        && want_leaves.len() == got_leaves.len()
+                        && want_leaves.iter().zip(got_leaves).all(|(want, got)| {
+                            want.logical_count == got.logical_count
+                                && want.source_timestamp == got.source_timestamp
+                                && want.min_event_time == got.min_event_time
+                                && want.max_event_time == got.max_event_time
+                                && want.logical_attributes == got.logical_attributes
+                        })
+                };
+                if !compatible_logical_match {
                     return Err(format!(
                         "{:?} logical content changed (payload kind, schema, series root, or \
                          leaves differ)",

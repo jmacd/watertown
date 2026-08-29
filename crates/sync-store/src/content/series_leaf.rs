@@ -7,7 +7,7 @@
 //! and [`super::manifest`]: it turns project-owned logical content -- a
 //! schema, an ordered run of [`RecordBatch`] rows, or an appended file byte
 //! range -- into stable bytes and a `blake3` leaf hash. It knows nothing about
-//! Delta Lake, Parquet, Bao outboards, packs, or the `dp.series.2` root object
+//! Delta Lake, Parquet, Bao outboards, packs, or the `watertown.series.v1` root object
 //! that will later chain these leaves together; those are later delivery
 //! gates. Physical encoding never contributes: chunking a `RecordBatch`
 //! differently, or storing a string column dictionary-encoded instead of
@@ -53,7 +53,7 @@
 //!   min/max-event-time presence flags, and length-prefixed canonical logical
 //!   attributes.
 //!
-//! Decoding (and therefore the `dp.series.2` root object, packs, readers, and
+//! Decoding (and therefore the `watertown.series.v1` root object, packs, readers, and
 //! migration) is out of scope for this gate; only the pure, one-directional
 //! encode-and-hash path is implemented and tested here.
 
@@ -71,14 +71,29 @@ use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use super::{ObjectHash, push_len_prefixed, push_len_prefixed_u64};
 
 /// Magic header for canonical schema bytes (the input to [`schema_fingerprint`]).
-const SCHEMA_MAGIC: &[u8] = b"dp.series-schema.1\n";
+const SCHEMA_MAGIC: &[u8] = b"watertown.series-schema.v1\n";
+const LEGACY_SCHEMA_MAGIC: &[u8] = b"dp.series-schema.1\n";
 
 /// Magic header for the canonical table-row payload.
-const ROWS_MAGIC: &[u8] = b"dp.series-rows.1\n";
+const ROWS_MAGIC: &[u8] = b"watertown.series-rows.v1\n";
+const LEGACY_ROWS_MAGIC: &[u8] = b"dp.series-rows.1\n";
 
 /// Domain-separation tag for a leaf preimage, exactly as specified in
 /// `docs/logical-series-identity-design.md`.
-const LEAF_MAGIC: &[u8] = b"dp.series-leaf.1\n";
+const LEAF_MAGIC: &[u8] = b"watertown.series-leaf.v1\n";
+const LEGACY_LEAF_MAGIC: &[u8] = b"dp.series-leaf.1\n";
+
+pub(crate) const fn legacy_leaf_magic() -> &'static [u8] {
+    LEGACY_LEAF_MAGIC
+}
+
+pub(crate) const fn legacy_schema_magic() -> &'static [u8] {
+    LEGACY_SCHEMA_MAGIC
+}
+
+pub(crate) const fn legacy_rows_magic() -> &'static [u8] {
+    LEGACY_ROWS_MAGIC
+}
 
 /// `payload_kind` byte for a table leaf.
 ///
@@ -86,7 +101,7 @@ const LEAF_MAGIC: &[u8] = b"dp.series-leaf.1\n";
 /// value is part of a hashed wire format and must never move just because an
 /// unrelated enum gains or reorders variants, so it is minted fresh here.
 ///
-/// `pub(crate)`: [`super::series_manifest`]'s `dp.series.2` root object
+/// `pub(crate)`: [`super::series_manifest`]'s `watertown.series.v1` root object
 /// records the same payload kind at the series level, and must use this exact
 /// wire value rather than mint a second, potentially-divergent encoding of
 /// "table or file".
@@ -259,8 +274,15 @@ fn encode_metadata(metadata: &std::collections::HashMap<String, String>, buf: &m
 /// Returns an error if any field's type is not accepted by
 /// [`canonical_data_type`].
 pub fn encode_canonical_schema(schema: &Schema) -> Result<Vec<u8>, String> {
+    encode_canonical_schema_with_magic(schema, SCHEMA_MAGIC)
+}
+
+pub(crate) fn encode_canonical_schema_with_magic(
+    schema: &Schema,
+    magic: &[u8],
+) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
-    buf.extend_from_slice(SCHEMA_MAGIC);
+    buf.extend_from_slice(magic);
     let field_count =
         u32::try_from(schema.fields().len()).expect("schema field count exceeds u32::MAX");
     buf.extend_from_slice(&field_count.to_le_bytes());
@@ -287,7 +309,14 @@ pub fn encode_canonical_schema(schema: &Schema) -> Result<Vec<u8>, String> {
 /// Propagates [`encode_canonical_schema`]'s error for an unsupported field
 /// type.
 pub fn schema_fingerprint(schema: &Schema) -> Result<ObjectHash, String> {
-    Ok(ObjectHash::of_bytes(&encode_canonical_schema(schema)?))
+    schema_fingerprint_with_magic(schema, SCHEMA_MAGIC)
+}
+
+pub(crate) fn schema_fingerprint_with_magic(
+    schema: &Schema,
+    magic: &[u8],
+) -> Result<ObjectHash, String> {
+    Ok(ObjectHash::of_bytes(&encode_canonical_schema_with_magic(schema, magic)?))
 }
 
 /// Resolve `schema` to its canonical logical schema: every field's
@@ -450,6 +479,14 @@ pub(crate) fn encode_canonical_rows(
     schema: &Schema,
     batches: &[RecordBatch],
 ) -> Result<Vec<u8>, String> {
+    encode_canonical_rows_with_magic(schema, batches, ROWS_MAGIC)
+}
+
+pub(crate) fn encode_canonical_rows_with_magic(
+    schema: &Schema,
+    batches: &[RecordBatch],
+    magic: &[u8],
+) -> Result<Vec<u8>, String> {
     let row_count = batches.iter().try_fold(0u64, |total, batch| {
         total
             .checked_add(batch.num_rows() as u64)
@@ -457,7 +494,7 @@ pub(crate) fn encode_canonical_rows(
     })?;
 
     let mut buf = Vec::new();
-    buf.extend_from_slice(ROWS_MAGIC);
+    buf.extend_from_slice(magic);
     buf.extend_from_slice(&row_count.to_le_bytes());
 
     for (batch_idx, batch) in batches.iter().enumerate() {
@@ -470,7 +507,7 @@ pub(crate) fn encode_canonical_rows(
 /// magic or total-row-count prefix.
 ///
 /// Concatenating this output for batches in order after
-/// `dp.series-rows.1\n` and the total `u64` row count produces exactly the
+/// `watertown.series-rows.v1\n` and the total `u64` row count produces exactly the
 /// payload encoded by the logical table identity protocol.
 ///
 /// # Errors
@@ -674,8 +711,30 @@ fn leaf_hash(
     max_event_time: Option<i64>,
     canonical_attributes: &[u8],
 ) -> ObjectHash {
+    leaf_hash_with_magic(
+        LEAF_MAGIC,
+        payload_kind,
+        schema_fingerprint,
+        logical_count,
+        canonical_payload,
+        min_event_time,
+        max_event_time,
+        canonical_attributes,
+    )
+}
+
+fn leaf_hash_with_magic(
+    magic: &[u8],
+    payload_kind: u8,
+    schema_fingerprint: &[u8],
+    logical_count: u64,
+    canonical_payload: &[u8],
+    min_event_time: Option<i64>,
+    max_event_time: Option<i64>,
+    canonical_attributes: &[u8],
+) -> ObjectHash {
     let mut buf = Vec::new();
-    buf.extend_from_slice(LEAF_MAGIC);
+    buf.extend_from_slice(magic);
     buf.push(payload_kind);
     push_len_prefixed(&mut buf, schema_fingerprint);
     buf.extend_from_slice(&logical_count.to_le_bytes());
@@ -756,8 +815,30 @@ pub fn table_leaf_hash_canonical(
     max_event_time: Option<i64>,
     canonical_logical_attributes: Option<&[u8]>,
 ) -> Result<ObjectHash, String> {
-    let fingerprint = schema_fingerprint(schema)?;
-    let payload = encode_canonical_rows(schema, batches)?;
+    table_leaf_hash_canonical_with_magic(
+        schema,
+        batches,
+        min_event_time,
+        max_event_time,
+        canonical_logical_attributes,
+        LEAF_MAGIC,
+        SCHEMA_MAGIC,
+        ROWS_MAGIC,
+    )
+}
+
+pub(crate) fn table_leaf_hash_canonical_with_magic(
+    schema: &Schema,
+    batches: &[RecordBatch],
+    min_event_time: Option<i64>,
+    max_event_time: Option<i64>,
+    canonical_logical_attributes: Option<&[u8]>,
+    leaf_magic: &[u8],
+    schema_magic: &[u8],
+    rows_magic: &[u8],
+) -> Result<ObjectHash, String> {
+    let fingerprint = schema_fingerprint_with_magic(schema, schema_magic)?;
+    let payload = encode_canonical_rows_with_magic(schema, batches, rows_magic)?;
     let logical_count = batches.iter().try_fold(0u64, |total, batch| {
         total
             .checked_add(batch.num_rows() as u64)
@@ -766,7 +847,8 @@ pub fn table_leaf_hash_canonical(
     if logical_count == 0 {
         return Err("a logical table leaf must contain at least one row".to_string());
     }
-    Ok(leaf_hash(
+    Ok(leaf_hash_with_magic(
+        leaf_magic,
         LEAF_KIND_TABLE,
         fingerprint.as_bytes(),
         logical_count,
@@ -817,11 +899,28 @@ pub fn file_leaf_hash_canonical(
     max_event_time: Option<i64>,
     canonical_logical_attributes: Option<&[u8]>,
 ) -> Result<ObjectHash, String> {
+    file_leaf_hash_canonical_with_magic(
+        bytes,
+        min_event_time,
+        max_event_time,
+        canonical_logical_attributes,
+        LEAF_MAGIC,
+    )
+}
+
+pub(crate) fn file_leaf_hash_canonical_with_magic(
+    bytes: &[u8],
+    min_event_time: Option<i64>,
+    max_event_time: Option<i64>,
+    canonical_logical_attributes: Option<&[u8]>,
+    magic: &[u8],
+) -> Result<ObjectHash, String> {
     if bytes.is_empty() {
         return Err("a logical file leaf must contain at least one byte".to_string());
     }
     let logical_count = bytes.len() as u64;
-    Ok(leaf_hash(
+    Ok(leaf_hash_with_magic(
+        magic,
         LEAF_KIND_FILE,
         &[],
         logical_count,
@@ -868,16 +967,60 @@ impl IncrementalTableLeafHasher {
         max_event_time: Option<i64>,
         canonical_logical_attributes: Option<&[u8]>,
     ) -> Result<Self, String> {
+        Self::new_with_magic(
+            LEAF_MAGIC,
+            schema,
+            logical_count,
+            canonical_rows_len,
+            min_event_time,
+            max_event_time,
+            canonical_logical_attributes,
+        )
+    }
+
+    pub(crate) fn new_with_magic(
+        magic: &[u8],
+        schema: &Schema,
+        logical_count: u64,
+        canonical_rows_len: u64,
+        min_event_time: Option<i64>,
+        max_event_time: Option<i64>,
+        canonical_logical_attributes: Option<&[u8]>,
+    ) -> Result<Self, String> {
+        Self::new_with_magic_and_rows_domain(
+            magic,
+            schema,
+            logical_count,
+            canonical_rows_len,
+            min_event_time,
+            max_event_time,
+            canonical_logical_attributes,
+            ROWS_MAGIC,
+            SCHEMA_MAGIC,
+        )
+    }
+
+    pub(crate) fn new_with_magic_and_rows_domain(
+        magic: &[u8],
+        schema: &Schema,
+        logical_count: u64,
+        canonical_rows_len: u64,
+        min_event_time: Option<i64>,
+        max_event_time: Option<i64>,
+        canonical_logical_attributes: Option<&[u8]>,
+        rows_magic: &[u8],
+        schema_magic: &[u8],
+    ) -> Result<Self, String> {
         if logical_count == 0 {
             return Err("a logical table leaf must contain at least one row".to_string());
         }
-        let fingerprint = schema_fingerprint(schema)?;
-        let payload_len = u64::try_from(ROWS_MAGIC.len() + std::mem::size_of::<u64>())
+        let fingerprint = schema_fingerprint_with_magic(schema, schema_magic)?;
+        let payload_len = u64::try_from(rows_magic.len() + std::mem::size_of::<u64>())
             .expect("fixed row payload prefix fits u64")
             .checked_add(canonical_rows_len)
             .ok_or_else(|| "canonical table payload length exceeds u64::MAX".to_string())?;
         let mut hasher = blake3::Hasher::new();
-        let _ = hasher.update(LEAF_MAGIC);
+        let _ = hasher.update(magic);
         let _ = hasher.update(&[LEAF_KIND_TABLE]);
         let fingerprint_len = u32::try_from(fingerprint.as_bytes().len())
             .expect("BLAKE3 fingerprint length fits u32");
@@ -885,7 +1028,7 @@ impl IncrementalTableLeafHasher {
         let _ = hasher.update(fingerprint.as_bytes());
         let _ = hasher.update(&logical_count.to_le_bytes());
         let _ = hasher.update(&payload_len.to_le_bytes());
-        let _ = hasher.update(ROWS_MAGIC);
+        let _ = hasher.update(rows_magic);
         let _ = hasher.update(&logical_count.to_le_bytes());
         Ok(Self {
             hasher,
@@ -1016,11 +1159,27 @@ impl IncrementalFileLeafHasher {
         max_event_time: Option<i64>,
         canonical_logical_attributes: Option<&[u8]>,
     ) -> Result<Self, String> {
+        Self::new_with_magic(
+            LEAF_MAGIC,
+            logical_count,
+            min_event_time,
+            max_event_time,
+            canonical_logical_attributes,
+        )
+    }
+
+    pub(crate) fn new_with_magic(
+        magic: &[u8],
+        logical_count: u64,
+        min_event_time: Option<i64>,
+        max_event_time: Option<i64>,
+        canonical_logical_attributes: Option<&[u8]>,
+    ) -> Result<Self, String> {
         if logical_count == 0 {
             return Err("a logical file leaf must contain at least one byte".to_string());
         }
         let mut hasher = blake3::Hasher::new();
-        hasher.update(LEAF_MAGIC);
+        hasher.update(magic);
         hasher.update(&[LEAF_KIND_FILE]);
         // File leaves never carry a schema fingerprint.
         hasher.update(&0u32.to_le_bytes());
@@ -1443,7 +1602,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             hex::encode(encode_canonical_rows(&f32_schema, &[f32_batch]).unwrap()),
-            "64702e7365726965732d726f77732e310a0100000000000000010000c07f"
+            "7761746572746f776e2e7365726965732d726f77732e76310a0100000000000000010000c07f"
         );
 
         let f64_schema = Schema::new(vec![Field::new("v", DataType::Float64, false)]);
@@ -1454,7 +1613,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             hex::encode(encode_canonical_rows(&f64_schema, &[f64_batch]).unwrap()),
-            "64702e7365726965732d726f77732e310a010000000000000001000000000000f87f"
+            "7761746572746f776e2e7365726965732d726f77732e76310a010000000000000001000000000000f87f"
         );
     }
 
@@ -1694,7 +1853,7 @@ mod tests {
         let schema_bytes = encode_canonical_schema(&schema).unwrap();
         assert_eq!(
             hex::encode(&schema_bytes),
-            "64702e7365726965732d736368656d612e310a04000000020000006964000300000000040000006e\
+            "7761746572746f776e2e7365726965732d736368656d612e76310a04000000020000006964000300000000040000006e\
 616d65010b000000000200000074730010020103000000555443000000000700000072656164696e67010a0000\
 000000000000"
         );
@@ -1702,7 +1861,7 @@ mod tests {
         let row_bytes = encode_canonical_rows(&schema, std::slice::from_ref(&batch)).unwrap();
         assert_eq!(
             hex::encode(&row_bytes),
-            "64702e7365726965732d726f77732e310a02000000000000000101000000010500000000000000\
+            "7761746572746f776e2e7365726965732d726f77732e76310a02000000000000000101000000010500000000000000\
 616c7068610100401e18240a060001000000000000f83f0102000000000140822d18240a06000100000000\
 00000080"
         );
@@ -1717,7 +1876,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             hash.to_hex(),
-            "171e811e48964bc30a94317f65ebab7a5f622c11a4f71cba307e7f54b690610a"
+            "325a3ad2b15552adf5335d49bd283425d35d9380fe8833e8e333221f4bfbdc41"
         );
     }
 
@@ -1732,7 +1891,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             hash.to_hex(),
-            "d73c1b7ebacffa9699e532234fc2452a50eb9083024e98b2aef744c2ebbfddbf"
+            "316b52fa1dc942471704cb2498faf9e73903d46ec7a4d03b778ac02125648ad6"
         );
     }
 

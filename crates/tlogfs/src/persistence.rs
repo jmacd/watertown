@@ -3183,7 +3183,7 @@ impl InnerState {
     /// `TablePhysicalSeries` row must go through -- `self.records.push`
     /// must never be called directly with such an entry, or a future write
     /// path could silently commit a series row with no logical leaf, which
-    /// `dp.series.2` (steward's content fold) cannot detect after the fact.
+    /// `watertown.series.v1` (steward's content fold) cannot detect after the fact.
     ///
     /// Also enforces item 5: a `TablePhysicalSeries` append's schema
     /// fingerprint must match every existing committed-or-pending logical
@@ -3257,7 +3257,7 @@ impl InnerState {
                 // rejects a nonempty-but-zero-row one) -- a genuinely empty
                 // first version would durably commit a node steward's own
                 // source-side fold can never later represent as a valid
-                // `dp.series.2` manifest. Reject here, before the row is
+                // `watertown.series.v1` manifest. Reject here, before the row is
                 // ever durable, rather than let that surface as an opaque
                 // fold failure at the next commit.
                 if !physically_nonempty {
@@ -5593,7 +5593,7 @@ mod stamping_choke_point_tests {
     /// The genuinely-empty-first-version case too: a brand-new
     /// `TablePhysicalSeries` node's very first append must be rejected if
     /// it carries zero bytes, since (unlike a file series) it could never
-    /// be folded into a valid `dp.series.2` manifest afterward.
+    /// be folded into a valid `watertown.series.v1` manifest afterward.
     #[tokio::test]
     async fn table_series_leafless_first_version_is_rejected() {
         use crate::TLogFSError;

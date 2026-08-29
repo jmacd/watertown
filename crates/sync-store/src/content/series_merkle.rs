@@ -4,7 +4,7 @@
 //! hashes, and contiguous range membership proofs over it.
 //!
 //! `docs/logical-series-identity-design.md` delivery gate 2. This module
-//! knows nothing about `dp.series.2` root objects, `dp.series-pack.1` pack
+//! knows nothing about `watertown.series.v1` root objects, `watertown.series-pack.v1` pack
 //! indexes, Parquet, or Bao; it is pure, order-sensitive Merkle math over an
 //! already-computed ordered list of leaf hashes (each produced by
 //! [`super::series_leaf::table_leaf_hash`] or
@@ -80,7 +80,7 @@ use super::{Cursor, ObjectHash};
 /// [`super::series_leaf`]'s and [`super::node_merkle`]'s own tags so no two
 /// modules' preimages can ever collide even if, by coincidence, they were fed
 /// identical bytes.
-const MERKLE_DOMAIN: &[u8] = b"dp.series-merkle.1\n";
+const MERKLE_DOMAIN: &[u8] = b"watertown.series-merkle.v1\n";
 
 /// Domain tag for the empty tree (`n = 0`).
 const TAG_EMPTY: u8 = 0x00;
@@ -90,7 +90,7 @@ const TAG_LEAF: u8 = 0x01;
 const TAG_NODE: u8 = 0x02;
 
 /// Magic header for an encoded [`RangeProof`].
-const PROOF_MAGIC: &[u8] = b"dp.series-range-proof.1\n";
+const PROOF_MAGIC: &[u8] = b"watertown.series-range-proof.v1\n";
 
 /// Minimum on-wire size of one proof node: two `u64` fields and a 32-byte
 /// hash. Used to bound decode pre-allocation against a hostile node count.
@@ -513,11 +513,11 @@ mod tests {
     // accidental change to domain tags, split-point math, or hash order is
     // caught by a plain `cargo test`, not only by comparative assertions.
     const GOLDEN_EMPTY_ROOT_HEX: &str =
-        "a34c85fb16828f5a618cc5a9a1f76a52a2ed823fd3acba02c624f5e24be3f336";
-    const GOLDEN_N1_HEX: &str = "a2539e838bd25deb4f6a7d2e8002377ed3ec86a1f157a1f5a34dce114a73471f";
-    const GOLDEN_N2_HEX: &str = "a5f0077d77e108392d2abad94b9c0207ce77f5a019cf306029415da20773a1c0";
-    const GOLDEN_N3_HEX: &str = "39e8b5303c662eb953616da74c275afce70dbcebe26faae1e446ddc373229e43";
-    const GOLDEN_N4_HEX: &str = "e7b1b1da57f1fa956bd0f8e1dc53bad966558012338d88ae4c2d25b8c1213286";
+        "27470c01030ce200198e6c61a5e26b39d940227a21dd79589491973df76eb2e9";
+    const GOLDEN_N1_HEX: &str = "1aea83da8ebb2fdc51fa40699b0f41d25e042a507891584889349db9a6cdaa3f";
+    const GOLDEN_N2_HEX: &str = "2433d4c461ad75f4a095f814bc697ae7e2e0cd2b89ae54e5049e8014f43ca814";
+    const GOLDEN_N3_HEX: &str = "24c34c9d29eec5fe3a0b8345ed692b6f5190e585a2a57143a247970fa304bfa4";
+    const GOLDEN_N4_HEX: &str = "311d64c75eeb33cb86b52d5809f813baae4a52ab31aec00d8074c1089d4924e6";
 
     fn h(s: &str) -> ObjectHash {
         ObjectHash::of_bytes(s.as_bytes())

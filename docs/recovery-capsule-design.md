@@ -1,6 +1,9 @@
 # Recovery Capsules and Format Upgrades
 
-> **Status:** Phase one is implemented for `dp.commit.3`; production
+> **Status:** `pondcapsule.1` remains the frozen migration input format.
+> `pondcapsule.2` is implemented as the new explicit output format for
+> `watertown.*.v1` ponds; native v2 pack-aware extraction is still in progress.
+> Phase one is implemented for `dp.commit.3`; production
 > publication and recovery exercises remain.
 >
 > This document is the authoritative design for the current static-recipe
@@ -35,9 +38,13 @@ for a later native import workflow, not to prove or inspect recovered content.
 portable capsule uses its own explicit `pondcapsule` namespace:
 
 - `dp.commit.3` is native commit format 3;
-- `dp.tree.2`, `dp.manifest.2`, `dp.series.1`, and `dp.recipe.1` are native
+- `watertown.tree.v1`, `watertown.manifest.v1`, `dp.series.1`, and `watertown.recipe.v1` are native
   object formats; and
-- `pondcapsule.1` is portable recovery-capsule format 1.
+- `pondcapsule.1` is the frozen portable recovery-capsule format 1.
+- `pondcapsule.2` is portable recovery-capsule format 2 for newly-created
+  Watertown ponds. It has a distinct manifest format identifier and root hash
+  domain, while retaining the same verified logical payload model during the
+  migration transition.
 
 The mechanism has two distinct artifacts:
 
@@ -68,7 +75,7 @@ The static recipe:
 4. verifies the commit, node-Merkle root, tree/manifest agreement, and every
    content address;
 5. decodes the selected native graph;
-6. writes a `pondcapsule.1` manifest and plain payload objects; and
+6. writes a `pondcapsule.2` manifest and plain payload objects; and
 7. verifies the portable capsule.
 
 Capsule bytes are created only during recovery. Ordinary native pushes perform

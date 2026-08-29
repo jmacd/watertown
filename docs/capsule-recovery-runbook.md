@@ -97,6 +97,10 @@ The target native format must have its own reviewed standalone recovery recipe
 before production relies exclusively on backups written in that format.
 Implementing capsule import alone is not sufficient: import proves old-to-new
 migration, while the new recipe proves future disaster recovery.
+The initial `watertown.commit.v1` kit is intentionally a fail-closed format probe; it
+must not be treated as the completed v2 pack-aware recovery implementation.
+TODO after migration and rollback retention: remove the legacy `dp.commit.3`
+recovery kit once no retained backup requires it.
 
 Use fresh destinations throughout. Example shell variables:
 

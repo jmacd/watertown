@@ -548,7 +548,7 @@ async fn rebuild_reproduces_source_content() {
     );
 }
 
-/// A multi-version (multi-leaf) native `dp.series.2` table series survives
+/// A multi-version (multi-leaf) native `watertown.series.v1` table series survives
 /// the full round trip: the rebuilt pond is content-equal to the source,
 /// materializing every logical leaf in order so the read-side fold's root
 /// tree hash matches (design Section 8.5.3, release blocker item 1 --

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `dp.series.2` root object: the fetchable identity of one logical series.
+//! `watertown.series.v1` root object: the fetchable identity of one logical series.
 //!
 //! `docs/logical-series-identity-design.md` delivery gate 2. A
-//! [`SeriesManifest`] aggregates everything a `dp.series.2` object commits to
+//! [`SeriesManifest`] aggregates everything a `watertown.series.v1` object commits to
 //! over the whole ordered run of logical leaves (see
 //! [`super::series_leaf`]): the payload kind, the schema fingerprint (table
 //! only), the aggregate logical row/byte count, the leaf count, aggregate
@@ -27,13 +27,13 @@ use super::series_leaf::{LEAF_HAS_MAX, LEAF_HAS_MIN, LEAF_KIND_FILE, LEAF_KIND_T
 use super::series_merkle::merkle_root;
 use super::{Cursor, ObjectHash, push_len_prefixed};
 
-/// Magic header for a `dp.series.2` root object.
+/// Magic header for a `watertown.series.v1` root object.
 ///
 /// `pub(crate)`: [`super::series_dispatch`] dispatches a fetched series
 /// object between this (v2) and [`super::tree::SERIES_MAGIC`] (v1) by
 /// inspecting the same magic bytes, so it must reference this exact constant
 /// rather than risk a second, potentially-divergent literal.
-pub(crate) const MANIFEST_MAGIC: &[u8] = b"dp.series.2\n";
+pub(crate) const MANIFEST_MAGIC: &[u8] = b"watertown.series.v1\n";
 
 /// Known `bounds_flags` bits; any other bit set is a decode error, matching
 /// [`super::series_leaf`]'s and [`super::tree`]'s "unknown flag" convention.
@@ -72,7 +72,7 @@ impl PayloadKind {
     }
 }
 
-/// The `dp.series.2` root object: one logical series' fetchable identity.
+/// The `watertown.series.v1` root object: one logical series' fetchable identity.
 ///
 /// See the module docs for exactly what this commits to and why packs are
 /// excluded. Construct with [`SeriesManifest::new`] (or decode existing
@@ -90,7 +90,7 @@ pub struct SeriesManifest {
 }
 
 impl SeriesManifest {
-    /// Construct a validated `dp.series.2` root object.
+    /// Construct a validated `watertown.series.v1` root object.
     ///
     /// `logical_attributes`, when given, must already be canonical logical-
     /// attribute bytes exactly as
@@ -192,7 +192,7 @@ impl SeriesManifest {
         self.leaf_merkle_root
     }
 
-    /// Serialize this object into its `dp.series.2` wire bytes:
+    /// Serialize this object into its `watertown.series.v1` wire bytes:
     ///
     /// ```text
     /// MANIFEST_MAGIC
@@ -248,7 +248,7 @@ impl SeriesManifest {
         ObjectHash::of_bytes(&self.encode())
     }
 
-    /// Decode a `dp.series.2` root object (the inverse of
+    /// Decode a `watertown.series.v1` root object (the inverse of
     /// [`SeriesManifest::encode`]), applying the same invariants as
     /// [`SeriesManifest::new`].
     ///
@@ -423,11 +423,11 @@ mod tests {
         let manifest = valid_table();
         assert_eq!(
             hex::encode(manifest.encode()),
-            "64702e7365726965732e320a002000000020fdd34e632861ac10bc22672eb7d669a6b2e85f3ae40f33b6ff2459bddfd87464000000000000000300000000000000030a00000000000000140000000000000000000000362d886386058bf417eb9f212ba565e4087aa6fb4f8e419dd98b85915ec47ce9"
+            "7761746572746f776e2e7365726965732e76310a002000000020fdd34e632861ac10bc22672eb7d669a6b2e85f3ae40f33b6ff2459bddfd87464000000000000000300000000000000030a00000000000000140000000000000000000000377dc0ab9f3b6f23909372652bbc205a8290aa7db1b46bca7a9227edf4d9820c"
         );
         assert_eq!(
             manifest.hash().to_hex(),
-            "e9b8fe2fa11f439c87d6368d5bda37f979ae5ca3b1476e776a32d37039dfb9b9"
+            "12b8b877162d594a5c9cb9d1dc1f76d0754ea34ffd204ecb76f471261055552b"
         );
     }
 

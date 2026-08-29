@@ -11,7 +11,7 @@
 //! nothing to ask. `Ship::collapse_versions` performs pack-only physical
 //! maintenance (design doc, delivery gate 7 and the pack-maintenance
 //! follow-up): it never rewrites/deletes Oplog rows, never changes
-//! `dp.series.2` manifests/root/version, and instead publishes bounded
+//! `watertown.series.v1` manifests/root/version, and instead publishes bounded
 //! content-addressed physical packs. The coarse survey
 //! (`survey_collapsible_series`) remains a pure, side-effect-free discovery
 //! query regardless; the finer-grained `survey_pack_maintenance` is the one

@@ -2,22 +2,22 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Integration tests for the v2 (`dp.series.2`) dual reader
+//! Integration tests for the v2 (`watertown.series.v1`) dual reader
 //! (`docs/logical-series-identity-design.md` delivery gate 4):
 //! `steward::fetch_object_graph`'s pack discovery, physical-object
 //! fetch/verification, and its explicit refusal to materialize a verified
 //! v2 series.
 //!
 //! The native v2 writer landed in delivery gate 7 (see
-//! `crates/tlogfs/src/series_identity.rs` and the `dp.series.2` fold in
+//! `crates/tlogfs/src/series_identity.rs` and the `watertown.series.v1` fold in
 //! `crates/steward/src/content_tree.rs`), but every fixture here is still
 //! constructed by hand at the wire-object level -- directly encoding tree,
 //! commit, manifest, series-manifest, and pack-index bytes and pushing them
 //! into a [`ContentRemote`] -- rather than produced by any real Watertown
 //! write path, so that the dual reader's dispatch and verification logic can
 //! be exercised in isolation from the writer. Fixtures now build a
-//! `dp.commit.4` commit (the compatibility fence gate 7 introduced) whose
-//! tree carries a `dp.series.2` child hash, matching what a real v2 writer
+//! `watertown.commit.v1` commit (the compatibility fence gate 7 introduced) whose
+//! tree carries a `watertown.series.v1` child hash, matching what a real v2 writer
 //! publishes; old `dp.commit.3` readers reject these roots outright by
 //! construction (unrecognized magic), which is the fence's intended effect.
 
@@ -266,7 +266,7 @@ async fn publish(remote: &mut ContentRemote, fixture: &FilePackFixture) {
     seed_series_manifest(remote, &fixture.manifest).await;
 }
 
-/// Seed a `dp.series.2` manifest object into the inline `objects` partition
+/// Seed a `watertown.series.v1` manifest object into the inline `objects` partition
 /// so it is reachable via ordinary [`ContentRemote::get_object`], exactly as
 /// a real tree-referenced series manifest would be. Packs are deliberately
 /// *not* reachable this way (design doc: "Physical pack index"), but the
@@ -1343,9 +1343,9 @@ async fn table_pack_fetch_rejects_corrupt_parquet_bytes() {
 // -- Mixed v1/v2 fetch --------------------------------------------------------
 
 /// A synthetic tree containing *both* a real v1 (`dp.series.1`) series and a
-/// v2 (`dp.series.2`) series side by side, under one `dp.commit.4` commit.
+/// v2 (`watertown.series.v1`) series side by side, under one `watertown.commit.v1` commit.
 /// This is a **test-only fixture**: after the reset, a real writer only
-/// ever emits `dp.series.2` entries (delivery gate 7 removed the v1 writer
+/// ever emits `watertown.series.v1` entries (delivery gate 7 removed the v1 writer
 /// path entirely, and old `dp.commit.3` history is not expected to remain
 /// openable), but mixing both kinds under one commit is still the most
 /// direct way to prove the dual reader dispatches each entry to the correct
@@ -1701,7 +1701,7 @@ async fn rebuild_aborts_cleanly_on_an_asymmetric_temporal_descriptor() {
 // -- Release blocker item 1: zero-leaf series materialization ---------------
 
 /// A legitimately empty (never-appended-to) `FilePhysicalSeries` -- a
-/// `dp.series.2` manifest with `leaf_count() == 0` -- has no packs to fetch
+/// `watertown.series.v1` manifest with `leaf_count() == 0` -- has no packs to fetch
 /// ([`sync_store::content::select_exact_cover`] special-cases this) and no
 /// leaf-bearing version to reproduce, but the node itself must still be
 /// created: an empty file at the destination, matching exactly what a real

@@ -24,7 +24,7 @@ use super::tree::{push_version_metas, take_version_metas};
 use super::{Cursor, ObjectHash, VersionMeta, push_len_prefixed};
 
 /// Magic header distinguishing a serialized node manifest from a raw blob (D2).
-const MANIFEST_MAGIC: &[u8] = b"dp.manifest.2\n";
+const MANIFEST_MAGIC: &[u8] = b"watertown.manifest.v1\n";
 
 /// Minimum on-wire size of a single manifest entry: three length-prefixed
 /// strings (4-byte length each, all empty), a 1-byte entry-type discriminant,

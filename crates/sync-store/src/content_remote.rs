@@ -56,13 +56,13 @@ const META_PARTITION: &str = "meta";
 const POND_ID_KEY: &str = "pond_id";
 const CAPSULE_PREFIX: &str = "recovery";
 const CAPSULE_HISTORY_LIMIT: usize = 3;
-const RECIPE_NATIVE_FORMAT: &str = "dp.commit.3";
-const CAPSULE_README: &str = include_str!("../recovery/dp.commit.3/CAPSULE-README.md");
-const CAPSULE_FORMAT: &str = include_str!("../recovery/dp.commit.3/CAPSULE-FORMAT.md");
-const CAPSULE_TOOL: &str = include_str!("../recovery/dp.commit.3/capsule.py");
+const RECIPE_NATIVE_FORMAT: &str = "watertown.commit.v1";
+const CAPSULE_README: &str = include_str!("../recovery/watertown.commit.v1/CAPSULE-README.md");
+const CAPSULE_FORMAT: &str = include_str!("../recovery/watertown.commit.v1/CAPSULE-FORMAT.md");
+const CAPSULE_TOOL: &str = include_str!("../recovery/watertown.commit.v1/capsule.py");
 const CAPSULE_REQUIREMENTS: &str =
-    include_str!("../recovery/dp.commit.3/capsule-requirements.lock");
-const CAPSULE_RECOVER: &str = include_str!("../recovery/dp.commit.3/recover.sh");
+    include_str!("../recovery/watertown.commit.v1/capsule-requirements.lock");
+const CAPSULE_RECOVER: &str = include_str!("../recovery/watertown.commit.v1/recover.sh");
 
 /// Result of publishing one verified recovery-capsule generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,11 +372,11 @@ impl ContentRemote {
     /// The immutable hash-addressed object is created before the discoverable
     /// top-level bootstrap. Existing byte-identical objects make retries
     /// idempotent; differing objects are never overwritten.
-    pub async fn publish_recovery_recipe_dp_commit_3(
+    pub async fn publish_recovery_recipe_watertown_commit_v1(
         &self,
     ) -> Result<RecoveryRecipePublishOutcome> {
-        let bytes = crate::recovery_recipe_dp_commit_3();
-        let recipe_hash = crate::recovery_recipe_dp_commit_3_hash();
+        let bytes = crate::recovery_recipe_watertown_commit_v1();
+        let recipe_hash = crate::recovery_recipe_watertown_commit_v1_hash();
         let versioned_created = self
             .create_exact_object(
                 &Self::recovery_recipe_versioned_path(recipe_hash),
@@ -404,9 +404,9 @@ impl ContentRemote {
     /// The current kit is always installed at its hash-addressed path. If an
     /// older discoverable kit already exists, it is accepted only when its
     /// bytes match its own hash-addressed immutable copy.
-    pub async fn ensure_recovery_recipe_dp_commit_3(&self) -> Result<ObjectHash> {
-        let current = crate::recovery_recipe_dp_commit_3();
-        let current_hash = crate::recovery_recipe_dp_commit_3_hash();
+    pub async fn ensure_recovery_recipe_watertown_commit_v1(&self) -> Result<ObjectHash> {
+        let current = crate::recovery_recipe_watertown_commit_v1();
+        let current_hash = crate::recovery_recipe_watertown_commit_v1_hash();
         let _ = self
             .create_exact_object(
                 &Self::recovery_recipe_versioned_path(current_hash),
@@ -477,9 +477,9 @@ impl ContentRemote {
     }
 
     /// Verify the discoverable and immutable `dp.commit.3` recipe objects.
-    pub async fn inspect_recovery_recipe_dp_commit_3(&self) -> Result<ObjectHash> {
-        let expected = crate::recovery_recipe_dp_commit_3();
-        let hash = crate::recovery_recipe_dp_commit_3_hash();
+    pub async fn inspect_recovery_recipe_watertown_commit_v1(&self) -> Result<ObjectHash> {
+        let expected = crate::recovery_recipe_watertown_commit_v1();
+        let hash = crate::recovery_recipe_watertown_commit_v1_hash();
         for (path, label) in [
             (
                 Self::recovery_recipe_versioned_path(hash),
@@ -802,7 +802,7 @@ impl ContentRemote {
         Ok(out)
     }
 
-    /// Fetch one pack advertisement's raw `dp.series-pack.1` bytes by the
+    /// Fetch one pack advertisement's raw `watertown.series-pack.v1` bytes by the
     /// series it claims and its own content address, or `None` if absent.
     ///
     /// This fetches at the exact series-scoped key
@@ -821,7 +821,7 @@ impl ContentRemote {
     /// # Errors
     ///
     /// Returns an error if the stored bytes do not hash to `pack_hash`, do
-    /// not decode as a `dp.series-pack.1` object, or decode to a pack index
+    /// not decode as a `watertown.series-pack.v1` object, or decode to a pack index
     /// naming a different series than `series_hash`.
     pub async fn get_pack_index_bytes(
         &self,
@@ -2319,15 +2319,24 @@ mod tests {
         let remote = ContentRemote::create_at(dir.path().join("remote"), Uuid::new_v4())
             .await
             .unwrap();
-        let first = remote.publish_recovery_recipe_dp_commit_3().await.unwrap();
+        let first = remote
+            .publish_recovery_recipe_watertown_commit_v1()
+            .await
+            .unwrap();
         assert!(first.versioned_created);
         assert!(first.discoverable_created);
         assert_eq!(
-            remote.inspect_recovery_recipe_dp_commit_3().await.unwrap(),
+            remote
+                .inspect_recovery_recipe_watertown_commit_v1()
+                .await
+                .unwrap(),
             first.recipe_hash
         );
 
-        let retry = remote.publish_recovery_recipe_dp_commit_3().await.unwrap();
+        let retry = remote
+            .publish_recovery_recipe_watertown_commit_v1()
+            .await
+            .unwrap();
         assert_eq!(retry.recipe_hash, first.recipe_hash);
         assert!(!retry.versioned_created);
         assert!(!retry.discoverable_created);
@@ -2341,8 +2350,18 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(remote.inspect_recovery_recipe_dp_commit_3().await.is_err());
-        assert!(remote.publish_recovery_recipe_dp_commit_3().await.is_err());
+        assert!(
+            remote
+                .inspect_recovery_recipe_watertown_commit_v1()
+                .await
+                .is_err()
+        );
+        assert!(
+            remote
+                .publish_recovery_recipe_watertown_commit_v1()
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -2373,7 +2392,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            remote.ensure_recovery_recipe_dp_commit_3().await.unwrap(),
+            remote
+                .ensure_recovery_recipe_watertown_commit_v1()
+                .await
+                .unwrap(),
             older_hash
         );
         assert_eq!(
@@ -2389,7 +2411,7 @@ mod tests {
                 .as_ref(),
             older
         );
-        let current_hash = crate::recovery_recipe_dp_commit_3_hash();
+        let current_hash = crate::recovery_recipe_watertown_commit_v1_hash();
         assert!(
             remote
                 .store
@@ -2419,7 +2441,7 @@ mod tests {
             max_event_time: None,
             logical_attributes: None,
         };
-        let manifest = CapsuleManifest::new(
+        let manifest = CapsuleManifest::new_v2(
             CapsuleSource {
                 pond_id: Uuid::nil().to_string(),
                 birthplace: "test".to_string(),
@@ -2505,7 +2527,7 @@ mod tests {
         let mut source = prior.source.clone();
         source.source_tip = ObjectHash::of_bytes(path.as_bytes());
         (
-            CapsuleManifest::new(source, entries).expect("extended capsule"),
+            CapsuleManifest::new_v2(source, entries).expect("extended capsule"),
             object,
         )
     }

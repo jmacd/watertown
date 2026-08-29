@@ -230,7 +230,7 @@ pub(crate) async fn build_recovery_capsule_from_materialized(
         exported_at_micros: source_commit.provenance.time_micros,
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    let manifest = CapsuleManifest::new(source, entries).map_err(StewardError::Content)?;
+    let manifest = CapsuleManifest::new_v2(source, entries).map_err(StewardError::Content)?;
     let declared: HashSet<ObjectHash> = manifest
         .payload_objects()
         .map_err(StewardError::Content)?
@@ -269,7 +269,7 @@ pub async fn open_and_publish_recovery_recipe_limited(
                 .await
                 .map_err(|error| StewardError::Aborted(format!("open remote {url}: {error}")))?;
             remote
-                .publish_recovery_recipe_dp_commit_3()
+                .publish_recovery_recipe_watertown_commit_v1()
                 .await
                 .map_err(|error| StewardError::Content(format!("publish recovery recipe: {error}")))
         }),
@@ -291,7 +291,7 @@ pub async fn open_and_inspect_recovery_recipe_limited(
                 .await
                 .map_err(|error| StewardError::Aborted(format!("open remote {url}: {error}")))?;
             remote
-                .inspect_recovery_recipe_dp_commit_3()
+                .inspect_recovery_recipe_watertown_commit_v1()
                 .await
                 .map_err(|error| StewardError::Content(format!("inspect recovery recipe: {error}")))
         }),

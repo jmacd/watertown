@@ -252,6 +252,22 @@ pub async fn maintain_table(
                 warn!("[MAINTAIN] Log cleanup failed for {}: {}", table_name, e);
             }
         }
+
+        // Checkpointing and log cleanup both mutate storage without updating
+        // `table`'s in-memory state. A later vacuum internally replays the
+        // log from that stale state and would otherwise try to read a JSON
+        // commit file that cleanup just deleted from disk.
+        if let Err(e) = table.load().await {
+            if force {
+                return Err(crate::StewardError::DeltaLake(format!(
+                    "reload {table_name} after log cleanup: {e}"
+                )));
+            }
+            warn!(
+                "[MAINTAIN] Reload after log cleanup failed for {}: {}",
+                table_name, e
+            );
+        }
     }
 
     // 3. Vacuum stale data files (gated: only when needed)

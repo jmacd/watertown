@@ -297,7 +297,7 @@ pub struct OplogEntry {
 
     /// The immutable logical-series identity of this append
     /// (`docs/logical-series-identity-design.md`): `blake3` (hex) of the
-    /// `dp.series-leaf.1` preimage over this version's canonical logical
+    /// `watertown.series-leaf.v1` preimage over this version's canonical logical
     /// bytes (`sync_store::content::file_leaf_hash` /
     /// `table_leaf_hash`), computed once at write time and never recomputed
     /// from physical (Parquet/Bao) encoding.

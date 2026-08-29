@@ -149,7 +149,7 @@ pub struct MaterializedObjects {
     /// only on a default-constructed value; a real fold always produces one.
     pub manifest: Option<(ObjectHash, Vec<u8>)>,
     /// Everything [`publish_initial_series_packs`] needs to mint one
-    /// whole-range "initial" identity pack per `dp.series.2` series folded
+    /// whole-range "initial" identity pack per `watertown.series.v1` series folded
     /// in this materialization, without re-walking the pond. Not itself a
     /// pushed object (a `PackIndex` is derived storage metadata excluded
     /// from the content tree), so it is not counted by [`Self::len`]/
@@ -164,12 +164,12 @@ pub struct MaterializedObjects {
 ///
 /// See [`publish_initial_series_packs`] for how this is consumed and why:
 /// the dual reader (`crate::content_pull::fetch_series_v2`) requires an
-/// exact pack cover before it will trust any `dp.series.2` content, so a
+/// exact pack cover before it will trust any `watertown.series.v1` content, so a
 /// freshly-folded v2 series is otherwise unfetchable the moment it is
 /// pushed.
 #[derive(Debug, Clone)]
 pub(crate) struct SeriesPackMaterial {
-    /// The series' own content address -- the `dp.series.2` manifest hash,
+    /// The series' own content address -- the `watertown.series.v1` manifest hash,
     /// and the key packs are published under.
     pub(crate) series_hash: ObjectHash,
     /// `FilePhysicalSeries` or `TablePhysicalSeries`; nothing else is ever
@@ -319,7 +319,7 @@ pub(crate) struct SeriesVersionData {
     /// requirement below).
     pub(crate) meta: VersionMeta,
     /// This version's raw (un-canonicalized) `extended_attributes` JSON as
-    /// persisted on the row. Needed to compute `dp.series.2`'s
+    /// persisted on the row. Needed to compute `watertown.series.v1`'s
     /// `logical_attributes` via
     /// [`sync_store::content::encode_canonical_attributes`], whose
     /// canonical-JSON convention is distinct from this module's own
@@ -741,7 +741,7 @@ pub(crate) async fn incremental_spine_inputs(
     // New content hash of every touched series: its committed version blobs
     // followed by this transaction's appended versions, pruned by range
     // containment and ordered oldest content first, exactly as [`fold_rows`]
-    // does, then folded into one dp.series.2 manifest.
+    // does, then folded into one watertown.series.v1 manifest.
     for (node, appended) in &series_new {
         let (mut versions, mut ranges) =
             read_series_committed(committed_table.clone(), local_pond_id, node).await?;
@@ -1580,7 +1580,7 @@ pub(crate) fn build_initial_pack_index(
 /// series captured in `materialized.series_material`
 /// (`docs/logical-series-identity-design.md`).
 ///
-/// A freshly-folded `dp.series.2` manifest is otherwise unfetchable the
+/// A freshly-folded `watertown.series.v1` manifest is otherwise unfetchable the
 /// moment it is pushed: the dual reader
 /// (`crate::content_pull::fetch_series_v2`) requires an exact pack cover
 /// before it will trust any series content, and nothing else in this
@@ -2034,7 +2034,7 @@ fn series_version_data(
     })
 }
 
-/// Build a series node's `dp.series.2` [`SeriesManifest`] and its single
+/// Build a series node's `watertown.series.v1` [`SeriesManifest`] and its single
 /// aggregate [`VersionMeta`] from its live versions in fold order (oldest
 /// first).
 ///
@@ -2311,7 +2311,7 @@ fn hash_child(
             let (manifest, meta) = build_series_manifest(entry_type, versions)?;
             let hash = manifest.hash();
             if let Some(sink) = sink {
-                // The v2 dp.series.2 manifest object, plus each version's
+                // The v2 watertown.series.v1 manifest object, plus each version's
                 // physical blob: small versions inline, large (externalized)
                 // versions by hash (D7). Physical blobs stay available for
                 // initial pack publication/fetch even though the series'
@@ -2637,8 +2637,8 @@ mod tests {
             .inline
             .get(&one_series_child.child_hash)
             .expect("manifest object materialized under its own hash");
-        let manifest_one =
-            SeriesManifest::decode(manifest_bytes_one).expect("decode dp.series.2 manifest");
+        let manifest_one = SeriesManifest::decode(manifest_bytes_one)
+            .expect("decode watertown.series.v1 manifest");
         assert_eq!(manifest_one.payload_kind(), PayloadKind::File);
         assert_eq!(manifest_one.logical_count(), 4, "4 bytes in v1");
         assert_eq!(manifest_one.leaf_count(), 1);
@@ -2684,8 +2684,8 @@ mod tests {
             .inline
             .get(&two_series_child.child_hash)
             .expect("manifest object materialized under its own hash");
-        let manifest_two =
-            SeriesManifest::decode(manifest_bytes_two).expect("decode dp.series.2 manifest");
+        let manifest_two = SeriesManifest::decode(manifest_bytes_two)
+            .expect("decode watertown.series.v1 manifest");
         assert_eq!(manifest_two.logical_count(), 10, "4 + 6 bytes across both");
         assert_eq!(manifest_two.leaf_count(), 2);
         assert_eq!(

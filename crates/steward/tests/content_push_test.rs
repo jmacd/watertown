@@ -56,7 +56,7 @@ async fn push_lands_objects_and_decodable_tip() {
         .expect("push");
 
     let _ = remote
-        .inspect_recovery_recipe_dp_commit_3()
+        .inspect_recovery_recipe_watertown_commit_v1()
         .await
         .expect("push installs the Pond-free recovery recipe");
     assert!(outcome.objects_pushed >= 1);

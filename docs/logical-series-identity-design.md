@@ -67,7 +67,7 @@ Each leaf preimage is unambiguously framed:
 
 ```text
 logical_leaf = blake3(
-  "dp.series-leaf.1\n" ||
+  "watertown.series-leaf.v1\n" ||
   u8 payload_kind ||
   u32 schema_fingerprint_length || schema_fingerprint ||
   u64 logical_count ||
@@ -90,7 +90,7 @@ payload is the exact bytes.
 
 Ordered leaf hashes form an RFC-6962-shaped BLAKE3 Merkle tree: leaf and
 interior preimages have distinct domain tags, and an unpaired rightmost node
-is promoted rather than duplicated. A `dp.series.2` root object records the
+is promoted rather than duplicated. A `watertown.series.v1` root object records the
 payload kind, schema fingerprint, logical row/byte count, leaf count, aggregate
 event-time bounds and logical attributes, and the leaf Merkle root. The
 BLAKE3 hash of that encoded root object is both the series identity and the
@@ -126,23 +126,23 @@ framing before accepting them.
 
 The permanent wire constants are:
 
-- schema magic `dp.series-schema.1\n`;
-- row magic `dp.series-rows.1\n`;
-- leaf magic `dp.series-leaf.1\n`;
+- schema magic `watertown.series-schema.v1\n`;
+- row magic `watertown.series-rows.v1\n`;
+- leaf magic `watertown.series-leaf.v1\n`;
 - payload kinds table `0`, file `1`;
 - scalar markers absent `0`, present `1`;
 - bounds bits minimum `0x01`, maximum `0x02`;
 - type tags Boolean `0`, Int8 through Int64 `1..4`, UInt8 through UInt64
   `5..8`, Float32 `9`, Float64 `10`, Utf8 `11`, LargeUtf8 `12`, Binary `13`,
   LargeBinary `14`, Date32 `15`, Timestamp `16`, Decimal128 `17`.
-- ordered-Merkle domain `dp.series-merkle.1\n`, with empty `0`, leaf `1`,
+- ordered-Merkle domain `watertown.series-merkle.v1\n`, with empty `0`, leaf `1`,
   and interior `2` tags;
-- range-proof magic `dp.series-range-proof.1\n`;
-- manifest magic `dp.series.2\n`;
-- pack-index magic `dp.series-pack.1\n`.
+- range-proof magic `watertown.series-range-proof.v1\n`;
+- manifest magic `watertown.series.v1\n`;
+- pack-index magic `watertown.series-pack.v1\n`.
 
 Cross-process golden vectors freeze schema bytes, scalar bytes, leaf hashes,
-Merkle roots, and `dp.series.2` object hashes. Arrow library upgrades must
+Merkle roots, and `watertown.series.v1` object hashes. Arrow library upgrades must
 pass those vectors.
 
 ### Physical pack index
@@ -246,7 +246,7 @@ content tree, like Delta file layout. A pack is accepted only when:
 1. its physical object bytes pass their normal BLAKE3/Bao verification;
 2. decoding and canonicalizing it reproduces the declared ordered leaf hashes
    and logical range root;
-3. its range proof binds that root to the leaf Merkle root in `dp.series.2`;
+3. its range proof binds that root to the leaf Merkle root in `watertown.series.v1`;
 4. counts, schema, bounds, and logical attributes agree with the decoded data;
 5. `leaf_descriptors.len()` equals `leaf_end - leaf_start` exactly, and the
    descriptors' `logical_count`s sum (checked, rejecting overflow) to exactly
@@ -258,7 +258,7 @@ substituted merely because it is internally self-consistent.
 
 Because packs are excluded from logical identity, they cannot be discovered
 through the commit/tree object closure. Remotes therefore expose a separate
-pack-advertisement namespace keyed by the `dp.series.2` object hash. Updating
+pack-advertisement namespace keyed by the `watertown.series.v1` object hash. Updating
 that namespace does not create a logical commit. Advertisements are
 append-only until referenced packs pass their retention window; a clean
 replica lists candidates, chooses a verified exact cover, and fetches their
@@ -337,7 +337,7 @@ above) and `LocalPondSource` (a `pond://` producer clone, reading a persistent
 A v1 pond, or a v2 series with nothing published yet, returns an empty list
 from either backend -- not an error -- since absence of advertisements is the
 ordinary case until a writer exists. This gate did not itself wire pack
-discovery into `dp.series.2` writers or collapse -- the selection algorithm
+discovery into `watertown.series.v1` writers or collapse -- the selection algorithm
 and the discovery contract existed and were tested in isolation, ready for
 the reader gate (4) and the writer gate (7) to consume; gate 7 (this phase)
 is what wires production push to publish an initial pack per nonempty
@@ -348,7 +348,7 @@ series so that gate 4's reader has a cover to discover.
 `steward`'s content-graph fetch (`fetch_object_graph`) now dispatches every
 series object it encounters by magic header
 (`sync_store::content::decode_fetched_series_object`): a `dp.series.1` object
-follows the unchanged v1 path (`FetchedObject::Series`); a `dp.series.2`
+follows the unchanged v1 path (`FetchedObject::Series`); a `watertown.series.v1`
 object is fully discovered, fetched, and cryptographically verified into a
 new `FetchedObject::SeriesV2(FetchedSeriesV2)` graph entry. Verification
 checks, before that entry is ever inserted:
@@ -441,7 +441,7 @@ scenarios now assert successful round-trip convergence instead.
 Three correctness gaps in the otherwise-complete gate-4/7 materialization
 above were closed after the fact:
 
-- **Zero-leaf series materialization.** A `dp.series.2` manifest with
+- **Zero-leaf series materialization.** A `watertown.series.v1` manifest with
   `leaf_count() == 0` -- a legitimately empty, never-appended-to series --
   has no packs to cover it (`select_exact_cover` special-cases this to an
   empty cover), so `materialize_file_series_v2` /
@@ -581,7 +581,7 @@ the assembled `PackIndex` against that manifest before ever publishing it;
 index (`sweep_unreferenced_pack_objects`); and (4) unconditionally runs the
 ordinary `reclaim` pass (superseded-row/blob cleanup), independent of
 whether any series needed repacking. None of this ever rewrites or deletes
-an Oplog append row, changes a `dp.series.2` manifest/tree/commit root,
+an Oplog append row, changes a `watertown.series.v1` manifest/tree/commit root,
 Delta version, or txn sequence, or changes logical metadata -- a pack
 advertisement is purely an additional, bounded way to *read* already-
 committed content, so a crash at any point leaves only harmless orphaned
@@ -678,7 +678,7 @@ metadata; repacking does not.
 
 ## Wire compatibility
 
-`dp.series.2` is the logical manifest object; `dp.series-pack.1` is a
+`watertown.series.v1` is the logical manifest object; `watertown.series-pack.v1` is a
 separately tagged pack-index object. A tree entry remains structurally
 unchanged: its `child_hash` names a series object, detected by object magic
 after fetch. Native ponds no longer ever produce `dp.series.1`; the dual
@@ -687,12 +687,12 @@ reader and pack verification (gate 4)" above), because a remote can still
 hold pre-reset history from a pond that has not yet been reset, but no
 production writer emits it.
 
-Commit encoding has advanced from `dp.commit.3` to `dp.commit.4` and carries
+Commit encoding has advanced from `dp.commit.3` to `watertown.commit.v1` and carries
 an explicit content-model version (`ContentModelVersion`, a typed enum, not a
 bare integer -- see `sync-store/src/content/commit.rs`). Per the reset
 decision below, this is a hard cutover, not a dual-format bridge: production
-encoding only ever writes `dp.commit.4` with the logical-series-v2 model, and
-decoding only accepts `dp.commit.4`. There is no reader support for
+encoding only ever writes `watertown.commit.v1` with the logical-series-v2 model, and
+decoding only accepts `watertown.commit.v1`. There is no reader support for
 `dp.commit.3` and none is planned -- a pond that still has `dp.commit.3` tips
 must go through the destructive reset described below before it can be read
 by v2-era code.
@@ -704,7 +704,7 @@ design): there is no migration path, no rollback window, and no mixed v1/v2
 writer support.** Adopting logical-series-v2 is a **destructive pond reset**:
 a pond upgrades by being recreated from scratch as v2-only. Pre-reset
 history is not translated forward and cannot be opened by v2-era code -- it
-is out of scope by design, not an oversight. `dp.commit.4` is published as
+is out of scope by design, not an oversight. `watertown.commit.v1` is published as
 the compatibility fence: any binary that only understands `dp.commit.3` is
 structurally unable to read a post-reset pond's tip, and any post-reset pond
 structurally cannot have a `dp.commit.3` tip, so the two populations never
@@ -751,12 +751,12 @@ intentional root change that all later physical repacks must preserve.
    canonical logical leaf hash, logical count, and (for tables) a schema
    fingerprint directly on the Oplog row at write time
    (`tlogfs/src/series_identity.rs`); the steward fold
-   (`steward/src/content_tree.rs`) derives the ordered `dp.series.2`
+   (`steward/src/content_tree.rs`) derives the ordered `watertown.series.v1`
    manifest, RFC-6962 Merkle root, and one series-level logical-metadata
    record (latest logical append mtime/attributes, aggregate
    min/max event-time bounds, checked-arithmetic logical count) from those
    persisted rows during both the full and incremental fold, never from
-   `row_blob_hash`. Production commits are `dp.commit.4` only. The write
+   `row_blob_hash`. Production commits are `watertown.commit.v1` only. The write
    choke point (`tlogfs`'s `stamp_and_validate_series_entry`, reached by
    every public append path including `State::add_oplog_entry`, with no
    bypass) additionally rejects a nonempty-Parquet-but-zero-row

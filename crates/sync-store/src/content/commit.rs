@@ -21,7 +21,7 @@ use super::{Cursor, ObjectHash, push_len_prefixed};
 /// be decoded by this version, which is intentional under the clean-reset
 /// encoding policy (D2) and the reset decision above: old pre-reset pond
 /// history is not expected to remain openable.
-const COMMIT_MAGIC: &[u8] = b"dp.commit.4\n";
+const COMMIT_MAGIC: &[u8] = b"watertown.commit.v1\n";
 
 /// The one prior commit magic this reset retired (D2, `docs/logical-series-identity-design.md`):
 /// `dp.commit.3` was one field shorter (no `content_model_version` byte).
@@ -41,13 +41,13 @@ const PRE_RESET_COMMIT_MAGIC: &[u8] = b"dp.commit.3\n";
 /// There is currently exactly one variant because the reset decision
 /// (`docs/logical-series-identity-design.md`) means there is no v1-writing
 /// path to keep distinguishing: every production commit encodes the v2
-/// logical-series model. The type still exists (rather than a bare `dp.commit.4`
+/// logical-series model. The type still exists (rather than a bare `watertown.commit.v1`
 /// bump) so a future content-model change has an explicit, checked tag to
 /// bump instead of silently repurposing the magic string again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentModelVersion {
     /// The v2 logical-series identity model: series nodes commit to a
-    /// `dp.series.2` manifest over persisted logical leaf hashes (BLAKE3 over
+    /// `watertown.series.v1` manifest over persisted logical leaf hashes (BLAKE3 over
     /// canonical logical bytes), not to a physical-blob Merkle tree.
     LogicalSeriesV2,
 }
@@ -421,7 +421,7 @@ mod tests {
     #[test]
     fn decode_rejects_old_dp_commit_3_magic() {
         // dp.commit.3 (pre-reset, one field shorter: no content_model_version
-        // byte) must not decode under dp.commit.4, per the reset decision
+        // byte) must not decode under watertown.commit.v1, per the reset decision
         // (docs/logical-series-identity-design.md): old pre-reset pond
         // history is not expected to remain openable. Item 8: the error must
         // clearly diagnose that a destructive reset is required, not merely

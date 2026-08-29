@@ -19,10 +19,13 @@ use super::ObjectHash;
 
 /// Recovery-capsule format identifier.
 pub const CAPSULE_FORMAT_V1: &str = "pondcapsule.1";
+/// The second portable capsule format used by newly-created Watertown ponds.
+pub const CAPSULE_FORMAT_V2: &str = "pondcapsule.2";
 
 const CAPSULE_ROOT_DOMAIN: &[u8] = b"pondcapsule.root.1\n";
+const CAPSULE_ROOT_DOMAIN_V2: &[u8] = b"pondcapsule.root.2\n";
 const CAPSULE_SERIES_DOMAIN: &[u8] = b"pondcapsule.series.1\n";
-const LOGICAL_LEAF_DOMAIN: &[u8] = b"dp.series-leaf.1\n";
+const LOGICAL_LEAF_DOMAIN: &[u8] = b"watertown.series-leaf.v1\n";
 
 /// Provenance of the live snapshot represented by a capsule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,10 +170,23 @@ impl CapsuleManifest {
     ///
     /// Returns an error for an invalid source, path topology, entry/content
     /// mismatch, logical descriptor, or noncanonical attribute object.
-    pub fn new(source: CapsuleSource, mut entries: Vec<CapsuleEntry>) -> Result<Self, String> {
+    pub fn new(source: CapsuleSource, entries: Vec<CapsuleEntry>) -> Result<Self, String> {
+        Self::new_with_format(CAPSULE_FORMAT_V1, source, entries)
+    }
+
+    /// Construct and validate a v2 manifest for the new Watertown native format.
+    pub fn new_v2(source: CapsuleSource, entries: Vec<CapsuleEntry>) -> Result<Self, String> {
+        Self::new_with_format(CAPSULE_FORMAT_V2, source, entries)
+    }
+
+    fn new_with_format(
+        format: &str,
+        source: CapsuleSource,
+        mut entries: Vec<CapsuleEntry>,
+    ) -> Result<Self, String> {
         entries.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
         let manifest = Self {
-            format: CAPSULE_FORMAT_V1.to_string(),
+            format: format.to_string(),
             source,
             entries,
         };
@@ -184,7 +200,7 @@ impl CapsuleManifest {
     ///
     /// Returns a specific diagnostic for the first violated capsule invariant.
     pub fn validate(&self) -> Result<(), String> {
-        if self.format != CAPSULE_FORMAT_V1 {
+        if self.format != CAPSULE_FORMAT_V1 && self.format != CAPSULE_FORMAT_V2 {
             return Err(format!(
                 "unsupported capsule format {:?}; expected {CAPSULE_FORMAT_V1:?}",
                 self.format
@@ -294,7 +310,11 @@ pub fn capsule_manifest_bytes(manifest: &CapsuleManifest) -> Result<Vec<u8>, Str
 pub fn capsule_root(manifest: &CapsuleManifest) -> Result<ObjectHash, String> {
     let bytes = capsule_manifest_bytes(manifest)?;
     let mut hasher = blake3::Hasher::new();
-    hasher.update(CAPSULE_ROOT_DOMAIN);
+    hasher.update(if manifest.format == CAPSULE_FORMAT_V2 {
+        CAPSULE_ROOT_DOMAIN_V2
+    } else {
+        CAPSULE_ROOT_DOMAIN
+    });
     hasher.update(&bytes);
     Ok(ObjectHash::from_bytes(*hasher.finalize().as_bytes()))
 }
@@ -612,6 +632,7 @@ pub fn verify_incremental_capsule_payload_directory(
                         *schema_fingerprint,
                         objects,
                         leaves,
+                        manifest.format == CAPSULE_FORMAT_V1,
                     )?;
                     continue;
                 }
@@ -655,6 +676,7 @@ pub fn verify_incremental_capsule_payload_directory(
                         *schema_fingerprint,
                         &staged_objects,
                         &staged_leaves,
+                        manifest.format == CAPSULE_FORMAT_V1,
                     )?;
                 }
             }
@@ -677,10 +699,11 @@ fn verify_staged_physical(
     schema_fingerprint: Option<ObjectHash>,
     objects: &[CapsuleObject],
     leaves: &[CapsuleLeaf],
+    legacy: bool,
 ) -> Result<(), String> {
     match payload_kind {
         CapsulePayloadKind::File => {
-            verify_file_stream_directory(objects_dir, path, objects, leaves)
+            verify_file_stream_directory(objects_dir, path, objects, leaves, legacy)
         }
         CapsulePayloadKind::Table => verify_table_stream_directory(
             objects_dir,
@@ -689,6 +712,7 @@ fn verify_staged_physical(
                 .ok_or_else(|| format!("table {path:?} has no schema fingerprint"))?,
             objects,
             leaves,
+            legacy,
         ),
     }
 }
@@ -719,7 +743,13 @@ fn verify_capsule_payload_directory_at_root(
         {
             match payload_kind {
                 CapsulePayloadKind::File => {
-                    verify_file_stream_directory(objects_dir, &entry.path, objects, leaves)?;
+                    verify_file_stream_directory(
+                        objects_dir,
+                        &entry.path,
+                        objects,
+                        leaves,
+                        manifest.format == CAPSULE_FORMAT_V1,
+                    )?;
                 }
                 CapsulePayloadKind::Table => {
                     verify_table_stream_directory(
@@ -730,6 +760,7 @@ fn verify_capsule_payload_directory_at_root(
                         })?,
                         objects,
                         leaves,
+                        manifest.format == CAPSULE_FORMAT_V1,
                     )?;
                 }
             }
@@ -790,11 +821,12 @@ fn verify_file_stream_directory(
     path: &str,
     objects: &[CapsuleObject],
     leaves: &[CapsuleLeaf],
+    legacy: bool,
 ) -> Result<(), String> {
     let mut leaf_index = 0usize;
     let mut hasher = leaves
         .first()
-        .map(new_file_leaf_hasher)
+        .map(|leaf| new_file_leaf_hasher(leaf, legacy))
         .transpose()
         .map_err(|error| format!("prepare file {path:?} leaf 0: {error}"))?;
     let mut buffer = vec![0u8; 1024 * 1024];
@@ -837,7 +869,7 @@ fn verify_file_stream_directory(
                     leaf_index += 1;
                     hasher = leaves
                         .get(leaf_index)
-                        .map(new_file_leaf_hasher)
+                        .map(|leaf| new_file_leaf_hasher(leaf, legacy))
                         .transpose()
                         .map_err(|error| {
                             format!("prepare file {path:?} leaf {leaf_index}: {error}")
@@ -857,8 +889,14 @@ fn verify_file_stream_directory(
 
 fn new_file_leaf_hasher(
     leaf: &CapsuleLeaf,
+    legacy: bool,
 ) -> Result<super::series_leaf::IncrementalFileLeafHasher, String> {
-    super::series_leaf::IncrementalFileLeafHasher::new(
+    super::series_leaf::IncrementalFileLeafHasher::new_with_magic(
+        if legacy {
+            super::series_leaf::legacy_leaf_magic()
+        } else {
+            b"watertown.series-leaf.v1\n"
+        },
         leaf.logical_count,
         leaf.min_event_time,
         leaf.max_event_time,
@@ -872,6 +910,7 @@ fn verify_table_stream_directory(
     expected_schema: ObjectHash,
     objects: &[CapsuleObject],
     leaves: &[CapsuleLeaf],
+    legacy: bool,
 ) -> Result<(), String> {
     let mut schema: Option<std::sync::Arc<arrow_schema::Schema>> = None;
     let mut canonical_lengths = vec![0u64; leaves.len()];
@@ -887,8 +926,15 @@ fn verify_table_stream_directory(
         let canonical_schema =
             super::series_leaf::canonicalize_schema(builder.schema().as_ref())
                 .map_err(|error| format!("canonicalize table {path:?} schema: {error}"))?;
-        let fingerprint = super::series_leaf::schema_fingerprint(&canonical_schema)
-            .map_err(|error| format!("fingerprint table {path:?}: {error}"))?;
+        let fingerprint = if legacy {
+            super::series_leaf::schema_fingerprint_with_magic(
+                &canonical_schema,
+                super::series_leaf::legacy_schema_magic(),
+            )
+        } else {
+            super::series_leaf::schema_fingerprint(&canonical_schema)
+        }
+        .map_err(|error| format!("fingerprint table {path:?}: {error}"))?;
         if fingerprint != expected_schema {
             return Err(format!(
                 "table {path:?} object {} schema hashes to {fingerprint}, expected {expected_schema}",
@@ -962,6 +1008,7 @@ fn verify_table_stream_directory(
         &schema,
         &leaves[0],
         canonical_lengths[0],
+        legacy,
     )?);
     for object in objects {
         let file =
@@ -1009,7 +1056,12 @@ fn verify_table_stream_directory(
                     hasher = leaves
                         .get(leaf_index)
                         .map(|leaf| {
-                            new_table_leaf_hasher(&schema, leaf, canonical_lengths[leaf_index])
+                            new_table_leaf_hasher(
+                                &schema,
+                                leaf,
+                                canonical_lengths[leaf_index],
+                                legacy,
+                            )
                         })
                         .transpose()?;
                 }
@@ -1029,15 +1081,30 @@ fn new_table_leaf_hasher(
     schema: &arrow_schema::Schema,
     leaf: &CapsuleLeaf,
     canonical_rows_len: u64,
+    legacy: bool,
 ) -> Result<super::series_leaf::IncrementalTableLeafHasher, String> {
-    super::series_leaf::IncrementalTableLeafHasher::new(
-        schema,
-        leaf.logical_count,
-        canonical_rows_len,
-        leaf.min_event_time,
-        leaf.max_event_time,
-        leaf.logical_attributes.as_deref().map(str::as_bytes),
-    )
+    if legacy {
+        super::series_leaf::IncrementalTableLeafHasher::new_with_magic_and_rows_domain(
+            super::series_leaf::legacy_leaf_magic(),
+            schema,
+            leaf.logical_count,
+            canonical_rows_len,
+            leaf.min_event_time,
+            leaf.max_event_time,
+            leaf.logical_attributes.as_deref().map(str::as_bytes),
+            super::series_leaf::legacy_rows_magic(),
+            super::series_leaf::legacy_schema_magic(),
+        )
+    } else {
+        super::series_leaf::IncrementalTableLeafHasher::new(
+            schema,
+            leaf.logical_count,
+            canonical_rows_len,
+            leaf.min_event_time,
+            leaf.max_event_time,
+            leaf.logical_attributes.as_deref().map(str::as_bytes),
+        )
+    }
 }
 
 fn verify_capsule_with<F>(
@@ -1657,7 +1724,7 @@ mod tests {
             max_event_time: None,
             logical_attributes: None,
         };
-        let manifest = CapsuleManifest::new(
+        let manifest = CapsuleManifest::new_v2(
             source(),
             vec![
                 root(),
@@ -1919,6 +1986,22 @@ mod tests {
     }
 
     #[test]
+    fn v2_manifest_uses_distinct_format_and_root_domain() {
+        let source = source();
+        let entries = vec![root()];
+        let v1 = CapsuleManifest::new(source.clone(), entries.clone()).unwrap();
+        let v2 = CapsuleManifest::new_v2(source, entries).unwrap();
+        assert_eq!(v2.format, CAPSULE_FORMAT_V2);
+        assert_ne!(capsule_root(&v1).unwrap(), capsule_root(&v2).unwrap());
+        assert_eq!(
+            decode_capsule_manifest(&capsule_manifest_bytes(&v2).unwrap())
+                .unwrap()
+                .format,
+            CAPSULE_FORMAT_V2
+        );
+    }
+
+    #[test]
     fn logical_file_leaf_matches_v2_golden_vector() {
         let payload = b"pressure,depth\n1.0,2.0\n";
         let logical_hash = capsule_leaf_hash(
@@ -1933,7 +2016,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             logical_hash.to_hex(),
-            "d73c1b7ebacffa9699e532234fc2452a50eb9083024e98b2aef744c2ebbfddbf"
+            "316b52fa1dc942471704cb2498faf9e73903d46ec7a4d03b778ac02125648ad6"
         );
     }
 
@@ -1999,7 +2082,7 @@ mod tests {
         let bytes = capsule_manifest_bytes(&manifest).unwrap();
         assert_eq!(
             capsule_root(&manifest).unwrap().to_hex(),
-            "632f82aee90fdb7dfa47d2f95208c8c368328944aaff26febe8850dbf06ad8ce"
+            "0cebe535670d309ec8bde50d530e997a8bbb186d26ce2d94bb94764929241f62"
         );
         assert_eq!(decode_capsule_manifest(&bytes).unwrap(), manifest);
     }
