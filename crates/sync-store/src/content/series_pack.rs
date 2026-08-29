@@ -107,6 +107,12 @@ pub struct PackLeafDescriptor {
     logical_attributes: Option<Vec<u8>>,
 }
 
+struct DecodedDescriptorMetadata {
+    min_event_time: Option<i64>,
+    max_event_time: Option<i64>,
+    logical_attributes: Option<Vec<u8>>,
+}
+
 impl PackLeafDescriptor {
     /// Construct a validated per-leaf pack descriptor.
     ///
@@ -269,13 +275,12 @@ impl PackLeafDescriptor {
     /// [`PackLeafDescriptor::new`].
     fn decode_v1_from(cur: &mut Cursor<'_>) -> Result<Self, String> {
         let logical_count = cur.take_u64()?;
-        let (min_event_time, max_event_time, logical_attributes) =
-            Self::decode_bounds_and_attributes(cur)?;
+        let metadata = Self::decode_bounds_and_attributes(cur)?;
         Self::new(
             logical_count,
-            min_event_time,
-            max_event_time,
-            logical_attributes,
+            metadata.min_event_time,
+            metadata.max_event_time,
+            metadata.logical_attributes,
         )
     }
 
@@ -294,20 +299,19 @@ impl PackLeafDescriptor {
                 schema_bytes.len()
             ));
         };
-        let (min_event_time, max_event_time, logical_attributes) =
-            Self::decode_bounds_and_attributes(cur)?;
+        let metadata = Self::decode_bounds_and_attributes(cur)?;
         Self::new_with_schema(
             logical_count,
             schema_fingerprint,
-            min_event_time,
-            max_event_time,
-            logical_attributes,
+            metadata.min_event_time,
+            metadata.max_event_time,
+            metadata.logical_attributes,
         )
     }
 
     fn decode_bounds_and_attributes(
         cur: &mut Cursor<'_>,
-    ) -> Result<(Option<i64>, Option<i64>, Option<Vec<u8>>), String> {
+    ) -> Result<DecodedDescriptorMetadata, String> {
         let flags = cur.take_u8()?;
         if flags & !KNOWN_DESCRIPTOR_BOUNDS_FLAGS != 0 {
             return Err(format!(
@@ -330,7 +334,11 @@ impl PackLeafDescriptor {
         } else {
             Some(attrs_bytes.to_vec())
         };
-        Ok((min_event_time, max_event_time, logical_attributes))
+        Ok(DecodedDescriptorMetadata {
+            min_event_time,
+            max_event_time,
+            logical_attributes,
+        })
     }
 }
 
