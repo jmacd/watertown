@@ -10,6 +10,7 @@ pub mod copy;
 pub mod describe;
 pub mod emergency;
 pub mod export;
+pub mod freeze;
 pub mod fsck;
 // pub mod hydrovu;  // Removed: replaced by factory-based `pond run` command
 pub mod init;
@@ -41,6 +42,7 @@ pub use control::control_command;
 pub use copy::{CopyOptions, copy_command};
 pub use describe::describe_command;
 pub use export::export_command;
+pub use freeze::{freeze_status_command, freeze_writes_command, unfreeze_writes_command};
 pub use fsck::fsck_command;
 pub use init::init_command;
 pub use limits::limits_command;

@@ -122,6 +122,37 @@ pub trait FileMetadataWriter: AsyncWrite + Send + Unpin {
     /// The default is a no-op, for backends that do not persist an mtime.
     fn set_mtime(&mut self, _timestamp: i64) {}
 
+    /// Adopt an already-canonical logical-attributes JSON object (as produced
+    /// by `sync_store::content::encode_canonical_attributes`) to persist
+    /// verbatim, instead of deriving it solely from
+    /// [`Self::set_temporal_metadata`]'s `timestamp_column`.
+    ///
+    /// `set_temporal_metadata`'s `timestamp_column` only ever round-trips
+    /// through a single key (`watertown.timestamp_column`); any other key a
+    /// writer set via a raw attribute setter is otherwise silently dropped
+    /// when only that method is used to reconstruct a version's attributes
+    /// (for example, native v2 series materialization replicating a source
+    /// leaf's full canonical attributes -- release blocker item 2,
+    /// `docs/logical-series-identity-design.md`). This method lets such a
+    /// caller instead hand the storage layer the exact bytes to persist, so
+    /// the destination's own identity-hash stamping recomputes precisely the
+    /// hash the source committed to, not one missing every key beyond the
+    /// timestamp column.
+    ///
+    /// `canonical_attrs` must already be exactly what
+    /// `sync_store::content::encode_canonical_attributes` would produce (a
+    /// canonical JSON object, sorted keys, no insignificant whitespace); a
+    /// backend that supports this is expected to validate that at
+    /// finalization and reject anything else, along with any value that
+    /// names a `timestamp_column` other than what
+    /// [`Self::set_temporal_metadata`] was (or will be) called with, since
+    /// the two would then disagree about which column is authoritative.
+    ///
+    /// The default is a no-op, for backends that do not support persisting
+    /// attributes byte-exactly (they fall back to
+    /// `set_temporal_metadata`'s single-key reconstruction).
+    fn set_exact_logical_attributes(&mut self, _canonical_attrs: Vec<u8>) {}
+
     /// Infer temporal bounds from the written parquet file by reading only the footer.
     /// After calling this, further writes will fail. Calls shutdown() internally.
     /// Returns (min_timestamp, max_timestamp, timestamp_column_name)

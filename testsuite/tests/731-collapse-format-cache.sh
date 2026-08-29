@@ -1,5 +1,5 @@
 #!/bin/bash
-# EXPERIMENT: version collapse must not double-count format-cached reads.
+# EXPERIMENT: pack-only version maintenance preserves format-cached reads.
 #
 # DESCRIPTION:
 #   External-format URLs (jsonlogs, oteljson, csv, weblog, excelhtml) are read
@@ -7,21 +7,18 @@
 #   to Parquet under {POND}/cache/{scheme}_{node}/v{N}_{hash}.parquet, and the
 #   query runs over those Parquets.
 #
-#   That cache was read by GLOBBING the node's cache directory, which is only
-#   correct while "every Parquet ever written" equals "every version that is
-#   live". Version collapse breaks exactly that equality: it replaces a run of
-#   versions with ONE merged version carrying the same bytes. The superseded
-#   versions' Parquets stay on disk, so the glob returned the merged version
-#   AND the versions it stands for -- every row counted twice.
-#
-#   The bug is silent. `pond cat` reads the pond directly and stays correct, so
-#   the raw file looks fine; only the typed/derived read doubles. It scales with
-#   collapse, so it grows precisely on the ponds that ingest the most.
+#   Native logical-series-v2 maintenance is pack-only: it publishes a bounded
+#   physical pack without replacing or deleting the immutable Oplog versions
+#   that key this cache. Raw and format-cached reads must therefore remain
+#   logically identical, and a repeated maintenance pass must settle without
+#   creating another pack.
 #
 # EXPECTED:
 #   - A derived series over a jsonlogs source reads the same row count before
 #     and after `pond maintain --collapse-versions`.
 #   - The raw bytes are unaffected either way.
+#   - First maintenance repacks the source; the second reports 0 repacked /
+#     already bounded and leaves the pack object count stable.
 #
 # History:
 #   Found on jmacd/analysis8 while testing materialize-series against selfmon's
@@ -35,6 +32,11 @@ echo "=== Experiment: collapse + format cache must not duplicate rows ==="
 
 export POND=/pond
 pond init --birthplace test-host >/dev/null
+
+PACKS=/pond/data/_packs
+count_pack_objects() {
+    find "${PACKS}/objects" -type f 2>/dev/null | wc -l | tr -d ' '
+}
 
 mkdir -p /var/log/metrics
 : > /var/log/metrics/pond.jsonl
@@ -77,11 +79,17 @@ DERIVED_BEFORE=$(pond cat --format table /derived-cpu 2>/dev/null | grep -c "202
 check '[ "'"${RAW_BEFORE}"'" = "9" ]' "raw series holds 9 lines (${RAW_BEFORE})"
 check '[ "'"${DERIVED_BEFORE}"'" = "9" ]' "derived series reads 9 rows (${DERIVED_BEFORE})"
 
-echo "--- collapse ---"
+echo "--- pack maintenance ---"
+BEFORE_PACKS=$(count_pack_objects)
 pond maintain --collapse-versions 1 > /tmp/731-collapse.log 2>&1
-grep -E "collapse|reclaim" /tmp/731-collapse.log
-check 'grep -qE "collapse: [1-9][0-9]* file\(s\) collapsed" /tmp/731-collapse.log' \
-    "the ingested series was actually collapsed"
+grep -E "pack maintenance|packs:|reclaim" /tmp/731-collapse.log
+check 'grep -qE "pack maintenance: [1-9][0-9]* candidate\(s\), [1-9][0-9]* repacked" /tmp/731-collapse.log' \
+    "the ingested series was physically repacked"
+check 'grep -qE "packs: [1-9][0-9]* object\(s\) written" /tmp/731-collapse.log' \
+    "maintenance reports bounded pack objects written"
+AFTER_PACKS=$(count_pack_objects)
+check '[ "'"${AFTER_PACKS}"'" -gt "'"${BEFORE_PACKS}"'" ]' \
+    "maintenance created local pack objects (${BEFORE_PACKS} -> ${AFTER_PACKS})"
 
 echo "--- after collapse ---"
 RAW_AFTER=$(pond cat /measure/pond.jsonl 2>/dev/null | grep -c "2024-01-01" || true)
@@ -90,17 +98,24 @@ check '[ "'"${RAW_AFTER}"'" = "9" ]' "raw series still holds 9 lines (${RAW_AFTE
 check '[ "'"${DERIVED_AFTER}"'" = "9" ]' \
     "derived series still reads 9 rows, not 18 (${DERIVED_AFTER})"
 
-# A second collapse pass must not compound the error either.
-pond maintain --collapse-versions 1 >/dev/null 2>&1 || true
+# A second pass must settle without changing either pack or query state.
+pond maintain --collapse-versions 1 > /tmp/731-collapse2.log 2>&1
+cat /tmp/731-collapse2.log
+check 'grep -qE "pack maintenance: [1-9][0-9]* candidate\(s\), 0 repacked, [1-9][0-9]* already bounded" /tmp/731-collapse2.log' \
+    "the repeated maintenance pass finds the source already bounded"
+check 'grep -qE "packs: 0 object\(s\) written" /tmp/731-collapse2.log' \
+    "the repeated maintenance pass writes no new pack objects"
+check '[ "$(count_pack_objects)" = "'"${AFTER_PACKS}"'" ]' \
+    "pack object count is stable across repeated maintenance"
 DERIVED_AGAIN=$(pond cat --format table /derived-cpu 2>/dev/null | grep -c "2024-01-01" || true)
 check '[ "'"${DERIVED_AGAIN}"'" = "9" ]' \
-    "a second collapse pass keeps the count at 9 (${DERIVED_AGAIN})"
+    "a second maintenance pass keeps the count at 9 (${DERIVED_AGAIN})"
 
 # Capture the status immediately: `check` evaluates its argument later, by
 # which point `$?` reflects check's own machinery, not fsck -- so an inline
 # `[ $? -eq 0 ]` is vacuously true and would pass even when fsck fails.
 pond fsck > /tmp/731-fsck.log 2>&1
 FSCK_RC=$?
-check '[ "'"${FSCK_RC}"'" -eq 0 ]' "pond fsck passes after collapse (rc=${FSCK_RC})"
+check '[ "'"${FSCK_RC}"'" -eq 0 ]' "pond fsck passes after pack maintenance (rc=${FSCK_RC})"
 
 check_finish

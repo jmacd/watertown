@@ -56,13 +56,13 @@ const META_PARTITION: &str = "meta";
 const POND_ID_KEY: &str = "pond_id";
 const CAPSULE_PREFIX: &str = "recovery";
 const CAPSULE_HISTORY_LIMIT: usize = 3;
-const RECIPE_NATIVE_FORMAT: &str = "dp.commit.3";
-const CAPSULE_README: &str = include_str!("../recovery/dp.commit.3/CAPSULE-README.md");
-const CAPSULE_FORMAT: &str = include_str!("../recovery/dp.commit.3/CAPSULE-FORMAT.md");
-const CAPSULE_TOOL: &str = include_str!("../recovery/dp.commit.3/capsule.py");
+const RECIPE_NATIVE_FORMAT: &str = "watertown.commit.v1";
+const CAPSULE_README: &str = include_str!("../recovery/watertown.commit.v1/CAPSULE-README.md");
+const CAPSULE_FORMAT: &str = include_str!("../recovery/watertown.commit.v1/CAPSULE-FORMAT.md");
+const CAPSULE_TOOL: &str = include_str!("../recovery/watertown.commit.v1/capsule.py");
 const CAPSULE_REQUIREMENTS: &str =
-    include_str!("../recovery/dp.commit.3/capsule-requirements.lock");
-const CAPSULE_RECOVER: &str = include_str!("../recovery/dp.commit.3/recover.sh");
+    include_str!("../recovery/watertown.commit.v1/capsule-requirements.lock");
+const CAPSULE_RECOVER: &str = include_str!("../recovery/watertown.commit.v1/recover.sh");
 
 /// Result of publishing one verified recovery-capsule generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,11 +372,11 @@ impl ContentRemote {
     /// The immutable hash-addressed object is created before the discoverable
     /// top-level bootstrap. Existing byte-identical objects make retries
     /// idempotent; differing objects are never overwritten.
-    pub async fn publish_recovery_recipe_dp_commit_3(
+    pub async fn publish_recovery_recipe_watertown_commit_v1(
         &self,
     ) -> Result<RecoveryRecipePublishOutcome> {
-        let bytes = crate::recovery_recipe_dp_commit_3();
-        let recipe_hash = crate::recovery_recipe_dp_commit_3_hash();
+        let bytes = crate::recovery_recipe_watertown_commit_v1();
+        let recipe_hash = crate::recovery_recipe_watertown_commit_v1_hash();
         let versioned_created = self
             .create_exact_object(
                 &Self::recovery_recipe_versioned_path(recipe_hash),
@@ -404,9 +404,9 @@ impl ContentRemote {
     /// The current kit is always installed at its hash-addressed path. If an
     /// older discoverable kit already exists, it is accepted only when its
     /// bytes match its own hash-addressed immutable copy.
-    pub async fn ensure_recovery_recipe_dp_commit_3(&self) -> Result<ObjectHash> {
-        let current = crate::recovery_recipe_dp_commit_3();
-        let current_hash = crate::recovery_recipe_dp_commit_3_hash();
+    pub async fn ensure_recovery_recipe_watertown_commit_v1(&self) -> Result<ObjectHash> {
+        let current = crate::recovery_recipe_watertown_commit_v1();
+        let current_hash = crate::recovery_recipe_watertown_commit_v1_hash();
         let _ = self
             .create_exact_object(
                 &Self::recovery_recipe_versioned_path(current_hash),
@@ -477,9 +477,9 @@ impl ContentRemote {
     }
 
     /// Verify the discoverable and immutable `dp.commit.3` recipe objects.
-    pub async fn inspect_recovery_recipe_dp_commit_3(&self) -> Result<ObjectHash> {
-        let expected = crate::recovery_recipe_dp_commit_3();
-        let hash = crate::recovery_recipe_dp_commit_3_hash();
+    pub async fn inspect_recovery_recipe_watertown_commit_v1(&self) -> Result<ObjectHash> {
+        let expected = crate::recovery_recipe_watertown_commit_v1();
+        let hash = crate::recovery_recipe_watertown_commit_v1_hash();
         for (path, label) in [
             (
                 Self::recovery_recipe_versioned_path(hash),
@@ -535,6 +535,62 @@ impl ContentRemote {
             value: tip.as_bytes().to_vec(),
         });
 
+        let txn_seq = self.store.last_txn_seq(self.pond_id).await? + 1;
+        let ts = chrono::Utc::now().timestamp_micros();
+        self.store
+            .apply_batch(self.pond_id, txn_seq, ts, ops)
+            .await?;
+        Ok(txn_seq)
+    }
+
+    /// Write `objects` to the remote's `objects` partition in one atomic
+    /// Delta commit, **without** touching any ref.
+    ///
+    /// This is [`Self::push_commit`] split in two (see [`Self::advance_ref`]
+    /// for the other half), so a caller that also has pack advertisements to
+    /// publish can durably land physical objects first, publish the packs
+    /// that name them, and only then advance the tip -- the ordering the
+    /// design doc's "Physical pack index" section and delivery gate 3
+    /// require. A crash between this call and [`Self::advance_ref`] leaves
+    /// the old ref intact (still resolvable, still fetchable): the new
+    /// objects are durable but simply unreferenced garbage until a retried
+    /// push finishes advancing the ref, never a ref pointing at an
+    /// incomplete or unfetchable closure.
+    ///
+    /// Returns the `txn_seq` allocated for this commit.
+    pub async fn push_objects(&mut self, objects: &[(ObjectHash, Vec<u8>)]) -> Result<i64> {
+        let ops: Vec<Op> = objects
+            .iter()
+            .map(|(hash, bytes)| Op::Put {
+                partition: OBJECTS_PARTITION.to_string(),
+                key: hash.to_hex(),
+                value: bytes.clone(),
+            })
+            .collect();
+        let txn_seq = self.store.last_txn_seq(self.pond_id).await? + 1;
+        let ts = chrono::Utc::now().timestamp_micros();
+        self.store
+            .apply_batch(self.pond_id, txn_seq, ts, ops)
+            .await?;
+        Ok(txn_seq)
+    }
+
+    /// Advance `ref_name` to `tip` in its own atomic Delta commit, touching
+    /// no object rows.
+    ///
+    /// Call this only once every physical object `tip`'s closure reaches
+    /// (directly or transitively via a series pack) is already durable --
+    /// see [`Self::push_objects`] and [`Self::publish_pack`] -- so the ref
+    /// never becomes visible pointing at an incomplete or unfetchable
+    /// closure.
+    ///
+    /// Returns the `txn_seq` allocated for this commit.
+    pub async fn advance_ref(&mut self, ref_name: &str, tip: ObjectHash) -> Result<i64> {
+        let ops = vec![Op::Put {
+            partition: REFS_PARTITION.to_string(),
+            key: ref_name.to_string(),
+            value: tip.as_bytes().to_vec(),
+        }];
         let txn_seq = self.store.last_txn_seq(self.pond_id).await? + 1;
         let ts = chrono::Utc::now().timestamp_micros();
         self.store
@@ -674,6 +730,294 @@ impl ContentRemote {
             Err(object_store::Error::NotFound { .. }) => Ok(false),
             Err(e) => Err(StoreError::Invariant(format!("blob head: {e}"))),
         }
+    }
+
+    /// The current Delta table version, so a caller can prove an operation
+    /// (such as [`Self::publish_pack`]) advanced no commit.
+    pub fn delta_version(&self) -> i64 {
+        self.store.delta_version()
+    }
+
+    /// Object-store key prefix for one series' pack advertisements: the
+    /// `_packs/series=<hex>` directory under which every pack index naming
+    /// that series lives.  See `docs/logical-series-identity-design.md`
+    /// delivery gate 3 and [`crate::pack_keys`].
+    fn pack_series_prefix(series_hash: ObjectHash) -> object_store::path::Path {
+        object_store::path::Path::from(crate::pack_keys::PACKS_ROOT)
+            .child(crate::pack_keys::series_dir_name(series_hash))
+    }
+
+    /// Object-store key for one pack advertisement:
+    /// `_packs/series=<series_hex>/pack=<pack_hex>`.
+    fn pack_index_path(series_hash: ObjectHash, pack_hash: ObjectHash) -> object_store::path::Path {
+        Self::pack_series_prefix(series_hash).child(crate::pack_keys::pack_file_name(pack_hash))
+    }
+
+    /// Every pack hash advertised for `series_hash`, as one listing of its
+    /// `_packs/series=<hex>/` prefix.
+    ///
+    /// Pack indexes are derived storage metadata excluded from the logical
+    /// content tree (the design doc's "Physical pack index" section), so
+    /// they cannot be discovered by walking the commit/tree object closure
+    /// the way inline objects and `_blobs` are. This is the one prefix
+    /// listing that answers "what packs exist for this series", matching
+    /// [`Self::list_blobs`]'s single-listing shape rather than a `HEAD` per
+    /// candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any entry under the prefix is not a well-formed
+    /// `pack=<64-hex>` key, or if the same pack hash is listed more than
+    /// once -- either would mean the object store's own listing is not
+    /// trustworthy, and this must not silently proceed on unverified data.
+    pub async fn list_pack_hashes(
+        &self,
+        series_hash: ObjectHash,
+    ) -> Result<std::collections::HashSet<ObjectHash>> {
+        use futures::StreamExt;
+
+        let prefix = Self::pack_series_prefix(series_hash);
+        let mut stream = self.store.object_store().list(Some(&prefix));
+        let mut out = std::collections::HashSet::new();
+        while let Some(meta) = stream.next().await {
+            let meta = meta.map_err(|e| StoreError::Invariant(format!("list packs: {e}")))?;
+            let Some(name) = meta.location.filename() else {
+                return Err(StoreError::Invariant(format!(
+                    "pack advertisement key has no filename: {}",
+                    meta.location
+                )));
+            };
+            let hash = crate::pack_keys::parse_pack_file_name(name).map_err(|e| {
+                StoreError::Invariant(format!(
+                    "malformed pack advertisement key {}: {e}",
+                    meta.location
+                ))
+            })?;
+            if !out.insert(hash) {
+                return Err(StoreError::Invariant(format!(
+                    "duplicate pack advertisement listing entry: {hash}"
+                )));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fetch one pack advertisement's raw `watertown.series-pack.v1` bytes by the
+    /// series it claims and its own content address, or `None` if absent.
+    ///
+    /// This fetches at the exact series-scoped key
+    /// (`_packs/series=<series_hex>/pack=<pack_hex>`) rather than a bare
+    /// `pack=<hex>` lookup, so resolving one pack never requires scanning
+    /// every series' advertisements -- the ambiguous global lookup the
+    /// design doc's key layout is deliberately shaped to avoid.
+    ///
+    /// The returned bytes are validated before being handed back: they must
+    /// hash to `pack_hash` (the object store's own key naming this entry is
+    /// not itself proof of content, only of address) and must decode to a
+    /// [`crate::content::PackIndex`] whose own `series_hash` field agrees
+    /// with `series_hash` (rejecting a pack index published, by mistake or
+    /// by attack, under the wrong series' directory).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored bytes do not hash to `pack_hash`, do
+    /// not decode as a `watertown.series-pack.v1` object, or decode to a pack index
+    /// naming a different series than `series_hash`.
+    pub async fn get_pack_index_bytes(
+        &self,
+        series_hash: ObjectHash,
+        pack_hash: ObjectHash,
+    ) -> Result<Option<Vec<u8>>> {
+        let path = Self::pack_index_path(series_hash, pack_hash);
+        let bytes = match self.store.object_store().get(&path).await {
+            Ok(res) => res
+                .bytes()
+                .await
+                .map_err(|e| StoreError::Invariant(format!("pack index get: {e}")))?
+                .to_vec(),
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(StoreError::Invariant(format!("pack index get: {e}"))),
+        };
+        let computed = ObjectHash::of_bytes(&bytes);
+        if computed != pack_hash {
+            return Err(StoreError::Invariant(format!(
+                "pack advertisement at series={} pack={} hashes to {} (content-address mismatch)",
+                series_hash.to_hex(),
+                pack_hash.to_hex(),
+                computed.to_hex()
+            )));
+        }
+        let decoded = crate::content::PackIndex::decode(&bytes).map_err(|e| {
+            StoreError::Invariant(format!(
+                "decode pack advertisement {}: {e}",
+                pack_hash.to_hex()
+            ))
+        })?;
+        if decoded.series_hash() != series_hash {
+            return Err(StoreError::Invariant(format!(
+                "pack advertisement {} listed under series={} declares series_hash {} (cross-series index)",
+                pack_hash.to_hex(),
+                series_hash.to_hex(),
+                decoded.series_hash().to_hex()
+            )));
+        }
+        Ok(Some(bytes))
+    }
+
+    /// True if the physical object `hash` is already durable on the remote,
+    /// checked with exactly one bounded exact-key lookup rather than a full
+    /// bucket listing: a pack's declared physical objects may be either
+    /// external blobs (`_blobs/blob=<hex>`, [`Self::has_blob`]) or inline
+    /// objects already published by the ordinary content push (the Delta
+    /// `objects` partition, [`Self::get_object`]). An initial pack over a
+    /// freshly folded series advertises exactly those already-pushed
+    /// per-version objects, so both locations must be checked; a repacked
+    /// maintenance pack's fresh physical objects are always external blobs
+    /// and satisfy the first check.
+    async fn has_physical_object(&self, hash: ObjectHash) -> Result<bool> {
+        if self.has_blob(hash).await? {
+            return Ok(true);
+        }
+        Ok(self.get_object(hash).await?.is_some())
+    }
+
+    /// [`Self::publish_pack_with_known_present`] with an empty known-present
+    /// set: every declared physical object is checked exactly, with no proof
+    /// assumed. Use this whenever the caller does not itself know (from
+    /// having just durably written them) which of a pack's physical objects
+    /// are already present.
+    pub async fn publish_pack(
+        &self,
+        series_hash: ObjectHash,
+        pack_index: &crate::content::PackIndex,
+        physical_blobs: &[(ObjectHash, Vec<u8>)],
+    ) -> Result<ObjectHash> {
+        self.publish_pack_with_known_present(
+            series_hash,
+            pack_index,
+            physical_blobs,
+            &std::collections::HashSet::new(),
+        )
+        .await
+    }
+
+    /// Publish one pack index and make it discoverable, uploading any of its
+    /// declared physical blobs that `physical_blobs` supplies and that the
+    /// remote does not already hold.
+    ///
+    /// `known_present` names physical object hashes the *caller* already
+    /// knows are durable on the remote -- typically because it just wrote
+    /// them itself in this same push, via [`Self::push_objects`] or
+    /// [`Self::put_blob`] -- and for which [`Self::has_physical_object`]'s
+    /// exact-key check (a `HEAD` plus, on a miss, a Delta lookup that can run
+    /// a full query over the objects partition) is therefore redundant
+    /// proof-of-presence. Every hash in `pack_index.physical_object_hashes()`
+    /// that is *not* in `known_present` is still checked exactly: this
+    /// parameter narrows re-probing to the objects a caller cannot already
+    /// vouch for, it never widens what is trusted unconditionally. A caller
+    /// with no such proof should use [`Self::publish_pack`] (an empty
+    /// known-present set), which preserves the original exact-validation
+    /// behavior for every declared object.
+    ///
+    /// Publication order is otherwise unchanged from [`Self::publish_pack`]:
+    /// physical objects first (the design doc's "Physical pack index"
+    /// section), pack index last, so a pack index never becomes visible
+    /// while any physical object it names is missing.
+    ///
+    /// This never touches Delta refs or the txn sequence: it operates
+    /// entirely through the same raw object-store surface as
+    /// [`Self::put_blob`]/[`Self::has_blob`], sibling to (not inside) the
+    /// Delta-managed `objects`/`refs` partitions.
+    ///
+    /// The write is idempotent and cheap to retry: if an advertisement
+    /// already exists at `pack_index`'s own content-addressed key, this
+    /// returns immediately without re-checking physical objects or
+    /// re-writing the (necessarily identical) bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `pack_index.series_hash()` does not equal
+    /// `series_hash` (refusing to publish a pack under the wrong series'
+    /// directory), or if any of `pack_index.physical_object_hashes()` not
+    /// covered by `known_present` is still absent from the store after
+    /// uploading every blob `physical_blobs` provides.
+    pub async fn publish_pack_with_known_present(
+        &self,
+        series_hash: ObjectHash,
+        pack_index: &crate::content::PackIndex,
+        physical_blobs: &[(ObjectHash, Vec<u8>)],
+        known_present: &std::collections::HashSet<ObjectHash>,
+    ) -> Result<ObjectHash> {
+        if pack_index.series_hash() != series_hash {
+            return Err(StoreError::Invariant(format!(
+                "refusing to publish pack under series={} for a pack index declaring series_hash={} (cross-series index)",
+                series_hash.to_hex(),
+                pack_index.series_hash().to_hex()
+            )));
+        }
+        let bytes = pack_index.encode();
+        let pack_hash = ObjectHash::of_bytes(&bytes);
+        debug_assert_eq!(
+            pack_hash,
+            pack_index.hash(),
+            "PackIndex::hash must equal blake3(encode())"
+        );
+
+        // Skip entirely when this exact advertisement already exists: the
+        // destination key is content-addressed, so an existing entry is
+        // necessarily byte-identical and every physical dependency it named
+        // was already confirmed present the first time it was published.
+        let path = Self::pack_index_path(series_hash, pack_hash);
+        if self.store.object_store().head(&path).await.is_ok() {
+            return Ok(pack_hash);
+        }
+
+        // Physical blobs first: upload only the caller-supplied bytes not
+        // already durable, one bounded exact-key check per distinct hash --
+        // unless the caller already knows (via `known_present`) that this
+        // exact hash is durable, in which case neither the check nor the
+        // upload is needed.
+        let mut uploaded: std::collections::HashSet<ObjectHash> = std::collections::HashSet::new();
+        for (hash, blob_bytes) in physical_blobs {
+            if uploaded.contains(hash)
+                || known_present.contains(hash)
+                || self.has_blob(*hash).await?
+            {
+                continue;
+            }
+            self.put_blob(*hash, &blob_bytes[..]).await?;
+            let _ = uploaded.insert(*hash);
+        }
+
+        // Never trust the caller's `physical_blobs` alone: require every
+        // declared physical object to be present (as either an external blob
+        // or an already-pushed inline object) before the index becomes
+        // visible -- except a hash the caller has already proven present via
+        // `known_present`, which is skipped entirely rather than re-probed.
+        // One bounded lookup per distinct hash not already known, not a
+        // bucket scan and not history-proportional re-verification of
+        // objects this same push just durably wrote.
+        let mut checked: std::collections::HashSet<ObjectHash> = std::collections::HashSet::new();
+        for hash in pack_index.physical_object_hashes() {
+            if known_present.contains(hash) || !checked.insert(*hash) {
+                continue;
+            }
+            if !self.has_physical_object(*hash).await? {
+                return Err(StoreError::Invariant(format!(
+                    "cannot publish pack {}: physical object {hash} is not present in the store",
+                    pack_hash.to_hex()
+                )));
+            }
+        }
+
+        // Index last: only reachable once every physical dependency above is
+        // confirmed durable.
+        self.store
+            .object_store()
+            .put(&path, bytes.into())
+            .await
+            .map_err(|e| StoreError::Invariant(format!("publish pack index: {e}")))?;
+        Ok(pack_hash)
     }
 
     /// Stream a large blob's raw bytes from `reader` into the remote blob store,
@@ -1975,15 +2319,24 @@ mod tests {
         let remote = ContentRemote::create_at(dir.path().join("remote"), Uuid::new_v4())
             .await
             .unwrap();
-        let first = remote.publish_recovery_recipe_dp_commit_3().await.unwrap();
+        let first = remote
+            .publish_recovery_recipe_watertown_commit_v1()
+            .await
+            .unwrap();
         assert!(first.versioned_created);
         assert!(first.discoverable_created);
         assert_eq!(
-            remote.inspect_recovery_recipe_dp_commit_3().await.unwrap(),
+            remote
+                .inspect_recovery_recipe_watertown_commit_v1()
+                .await
+                .unwrap(),
             first.recipe_hash
         );
 
-        let retry = remote.publish_recovery_recipe_dp_commit_3().await.unwrap();
+        let retry = remote
+            .publish_recovery_recipe_watertown_commit_v1()
+            .await
+            .unwrap();
         assert_eq!(retry.recipe_hash, first.recipe_hash);
         assert!(!retry.versioned_created);
         assert!(!retry.discoverable_created);
@@ -1997,8 +2350,18 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(remote.inspect_recovery_recipe_dp_commit_3().await.is_err());
-        assert!(remote.publish_recovery_recipe_dp_commit_3().await.is_err());
+        assert!(
+            remote
+                .inspect_recovery_recipe_watertown_commit_v1()
+                .await
+                .is_err()
+        );
+        assert!(
+            remote
+                .publish_recovery_recipe_watertown_commit_v1()
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -2029,7 +2392,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            remote.ensure_recovery_recipe_dp_commit_3().await.unwrap(),
+            remote
+                .ensure_recovery_recipe_watertown_commit_v1()
+                .await
+                .unwrap(),
             older_hash
         );
         assert_eq!(
@@ -2045,7 +2411,7 @@ mod tests {
                 .as_ref(),
             older
         );
-        let current_hash = crate::recovery_recipe_dp_commit_3_hash();
+        let current_hash = crate::recovery_recipe_watertown_commit_v1_hash();
         assert!(
             remote
                 .store
@@ -2075,7 +2441,7 @@ mod tests {
             max_event_time: None,
             logical_attributes: None,
         };
-        let manifest = CapsuleManifest::new(
+        let manifest = CapsuleManifest::new_v2(
             CapsuleSource {
                 pond_id: Uuid::nil().to_string(),
                 birthplace: "test".to_string(),
@@ -2161,7 +2527,7 @@ mod tests {
         let mut source = prior.source.clone();
         source.source_tip = ObjectHash::of_bytes(path.as_bytes());
         (
-            CapsuleManifest::new(source, entries).expect("extended capsule"),
+            CapsuleManifest::new_v2(source, entries).expect("extended capsule"),
             object,
         )
     }

@@ -25,9 +25,44 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
+use serde::{Deserialize, Serialize};
 use tlogfs::PondTxnMetadata;
 
 use crate::StewardError;
+
+const WRITE_FREEZE_FILE: &str = "write.freeze";
+const WRITE_FREEZE_FORMAT: &str = "watertown.write-freeze.v1";
+
+/// Durable declaration that a pond must reject all data writes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriteFreeze {
+    /// Marker format identifier.
+    pub format: String,
+    /// Pond identity at the time of the freeze.
+    pub pond_id: String,
+    /// Exact content tip protected by the freeze.
+    pub source_tip: Option<String>,
+    /// UTC time at which the marker was created.
+    pub frozen_at: DateTime<Utc>,
+    /// Process that created the marker.
+    pub frozen_by_pid: u32,
+    /// Operator-supplied reason for the freeze.
+    pub reason: String,
+}
+
+impl WriteFreeze {
+    pub(crate) fn new(pond_id: String, source_tip: Option<String>, reason: String) -> Self {
+        Self {
+            format: WRITE_FREEZE_FORMAT.to_string(),
+            pond_id,
+            source_tip,
+            frozen_at: Utc::now(),
+            frozen_by_pid: std::process::id(),
+            reason,
+        }
+    }
+}
 
 /// RAII handle that holds an exclusive advisory lock on `write.lock`
 /// for the lifetime of a write transaction.  Dropping the guard
@@ -41,6 +76,26 @@ pub(crate) struct WriteLockGuard {
 }
 
 impl WriteLockGuard {
+    /// Acquire the write lock and reject a persisted write freeze.
+    pub(crate) fn try_acquire_for_write(
+        control_dir: &Path,
+        txn_meta: &PondTxnMetadata,
+    ) -> Result<Self, StewardError> {
+        let guard = Self::try_acquire(control_dir, txn_meta)?;
+        if let Some(freeze) = read_write_freeze(control_dir)? {
+            return Err(StewardError::PondWriteFrozen {
+                path: write_freeze_path(control_dir),
+                details: format!(
+                    "frozen_at={}, source_tip={}, reason={}",
+                    freeze.frozen_at.to_rfc3339(),
+                    freeze.source_tip.as_deref().unwrap_or("<none>"),
+                    freeze.reason
+                ),
+            });
+        }
+        Ok(guard)
+    }
+
     /// Attempt to acquire the write lock for `control_dir`.
     ///
     /// On success, the lockfile body is replaced with the current
@@ -91,6 +146,80 @@ impl WriteLockGuard {
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
+}
+
+pub(crate) fn read_write_freeze(control_dir: &Path) -> Result<Option<WriteFreeze>, StewardError> {
+    let path = write_freeze_path(control_dir);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(StewardError::Io(error)),
+    };
+    let freeze: WriteFreeze =
+        serde_json::from_slice(&bytes).map_err(|error| StewardError::InvalidWriteFreeze {
+            path: path.clone(),
+            reason: error.to_string(),
+        })?;
+    if freeze.format != WRITE_FREEZE_FORMAT {
+        return Err(StewardError::InvalidWriteFreeze {
+            path,
+            reason: format!("unsupported format `{}`", freeze.format),
+        });
+    }
+    Ok(Some(freeze))
+}
+
+pub(crate) fn create_write_freeze(
+    control_dir: &Path,
+    freeze: &WriteFreeze,
+) -> Result<bool, StewardError> {
+    if read_write_freeze(control_dir)?.is_some() {
+        return Ok(false);
+    }
+
+    let path = write_freeze_path(control_dir);
+    let temporary = control_dir.join(format!(".write.freeze.{}.tmp", uuid::Uuid::new_v4()));
+    let mut bytes = serde_json::to_vec_pretty(freeze)?;
+    bytes.push(b'\n');
+    let result = (|| -> Result<(), StewardError> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &path)?;
+        sync_directory(control_dir)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result.map(|()| true)
+}
+
+pub(crate) fn remove_write_freeze(control_dir: &Path) -> Result<Option<WriteFreeze>, StewardError> {
+    let Some(freeze) = read_write_freeze(control_dir)? else {
+        return Ok(None);
+    };
+    std::fs::remove_file(write_freeze_path(control_dir))?;
+    sync_directory(control_dir)?;
+    Ok(Some(freeze))
+}
+
+fn write_freeze_path(control_dir: &Path) -> PathBuf {
+    control_dir.join(WRITE_FREEZE_FILE)
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<(), StewardError> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<(), StewardError> {
+    Ok(())
 }
 
 impl Drop for WriteLockGuard {
@@ -206,5 +335,44 @@ mod tests {
         }
         let _g2 = WriteLockGuard::try_acquire(dir.path(), &meta())
             .expect("re-acquire after drop should succeed");
+    }
+
+    #[test]
+    fn write_freeze_round_trips_and_blocks_write_acquisition() {
+        let dir = TempDir::new().expect("tempdir");
+        let freeze = WriteFreeze::new(
+            "pond-id".to_string(),
+            Some("tip".to_string()),
+            "format migration".to_string(),
+        );
+        {
+            let _guard = WriteLockGuard::try_acquire(dir.path(), &meta()).expect("admin lock");
+            assert!(create_write_freeze(dir.path(), &freeze).expect("create freeze"));
+            assert!(!create_write_freeze(dir.path(), &freeze).expect("idempotent freeze"));
+        }
+
+        assert_eq!(
+            read_write_freeze(dir.path()).expect("read freeze"),
+            Some(freeze.clone())
+        );
+        assert!(matches!(
+            WriteLockGuard::try_acquire_for_write(dir.path(), &meta()),
+            Err(StewardError::PondWriteFrozen { .. })
+        ));
+
+        {
+            let _guard = WriteLockGuard::try_acquire(dir.path(), &meta()).expect("admin lock");
+            assert_eq!(
+                remove_write_freeze(dir.path()).expect("remove freeze"),
+                Some(freeze)
+            );
+            assert!(
+                remove_write_freeze(dir.path())
+                    .expect("idempotent remove")
+                    .is_none()
+            );
+        }
+        let _guard = WriteLockGuard::try_acquire_for_write(dir.path(), &meta())
+            .expect("write after unfreeze");
     }
 }

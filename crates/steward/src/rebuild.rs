@@ -79,6 +79,34 @@ pub async fn rebuild_control_table(
         )));
     }
 
+    // Serialize against writers and refuse an active freeze rather than
+    // silently making the replacement writable.
+    let has_delta_log = control_path.join("_delta_log").exists();
+    let rebuild_meta = tlogfs::PondTxnMetadata::new(
+        0,
+        tlogfs::PondUserMetadata::new(vec!["pond".to_string(), "rebuild-control".to_string()]),
+    );
+    std::fs::create_dir_all(&control_path)?;
+    let _write_lock = crate::write_lock::WriteLockGuard::try_acquire(&control_path, &rebuild_meta)?;
+    if has_delta_log && !force {
+        return Err(StewardError::Aborted(format!(
+            "control table already exists at {}; pass --force to move it \
+             aside (to control.bak.<ts>) and rebuild",
+            control_path.display()
+        )));
+    }
+    if let Some(freeze) = crate::write_lock::read_write_freeze(&control_path)? {
+        return Err(StewardError::PondWriteFrozen {
+            path: control_path.join("write.freeze"),
+            details: format!(
+                "frozen_at={}, source_tip={}, reason={}; disable the freeze explicitly before rebuilding control state",
+                freeze.frozen_at.to_rfc3339(),
+                freeze.source_tip.as_deref().unwrap_or("<none>"),
+                freeze.reason
+            ),
+        });
+    }
+
     // 1) Recover the canonical pond identity from the data table.
     let pond_id_str = OpLogPersistence::peek_pond_id(&data_path)
         .await
@@ -160,24 +188,14 @@ pub async fn rebuild_control_table(
     //    so "exists" must mean "is a real Delta table" -- i.e. it has a
     //    `_delta_log/`.  A stale empty directory is silently removed and
     //    does not require `--force` (there is nothing to preserve).
-    let has_delta_log = control_path.join("_delta_log").exists();
     let backup_path = if has_delta_log {
-        if !force {
-            return Err(StewardError::Aborted(format!(
-                "control table already exists at {}; pass --force to move it \
-                 aside (to control.bak.<ts>) and rebuild",
-                control_path.display()
-            )));
-        }
         let ts = chrono::Utc::now().timestamp();
         let backup = control_path.with_file_name(format!("control.bak.{}", ts));
-        std::fs::rename(&control_path, &backup)?;
+        move_control_contents_preserving_lock(&control_path, &backup)?;
         Some(backup)
     } else {
-        if control_path.exists() {
-            // Stale empty scaffold from a failed open; discard it.
-            std::fs::remove_dir_all(&control_path)?;
-        }
+        // Preserve the write-lock inode while clearing a stale scaffold.
+        remove_control_contents_preserving_lock(&control_path)?;
         None
     };
 
@@ -225,4 +243,60 @@ pub async fn rebuild_control_table(
         last_txn_seq,
         backup_path,
     })
+}
+
+/// Move replaceable control-table contents while leaving `write.lock` at its
+/// stable pathname. Renaming the directory itself would move the locked inode
+/// away and let a concurrent writer create and acquire a different lock.
+fn move_control_contents_preserving_lock(
+    control_path: &Path,
+    backup: &Path,
+) -> Result<(), StewardError> {
+    std::fs::create_dir(backup)?;
+    let mut moved = Vec::new();
+    let result = (|| -> Result<(), StewardError> {
+        for entry in std::fs::read_dir(control_path)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name == "write.lock" || name == "write.freeze" {
+                continue;
+            }
+            std::fs::rename(entry.path(), backup.join(&name))?;
+            moved.push(name);
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        for name in moved.iter().rev() {
+            if let Err(rollback_error) = std::fs::rename(backup.join(name), control_path.join(name))
+            {
+                return Err(StewardError::Aborted(format!(
+                    "move control table to {} failed: {error}; rollback of {} also failed: {rollback_error}",
+                    backup.display(),
+                    name.to_string_lossy()
+                )));
+            }
+        }
+        std::fs::remove_dir(backup)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn remove_control_contents_preserving_lock(control_path: &Path) -> Result<(), StewardError> {
+    for entry in std::fs::read_dir(control_path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == "write.lock" || name == "write.freeze" {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
 }

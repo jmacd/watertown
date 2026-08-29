@@ -51,6 +51,7 @@ pub mod data_taxonomy;
 
 // Schema validation utilities
 pub mod schema_validation;
+pub mod series_identity;
 
 /// Extract State from provider::FactoryContext
 ///

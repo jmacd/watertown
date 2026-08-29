@@ -6,9 +6,19 @@
 //! commit to a [`ContentRemote`] (design Section 8, Decisions D6 and D7).
 //!
 //! This is the producer side of the single delta-managed content-addressed
-//! remote.  A push is one atomic Delta commit on the remote that writes the
-//! new object rows and advances the tip ref together; this module assembles
-//! the objects to send and the tip to point at.
+//! remote.  A push is now three ordered steps, not one atomic Delta commit
+//! (Item 2, `docs/logical-series-identity-design.md`): every physical object
+//! is written durably first (`ContentRemote::push_objects`, its own Delta
+//! commit that does not touch the ref), then every v2 series identity pack
+//! this push implies is published (`ContentRemote::publish_pack_with_known_present`,
+//! outside Delta entirely -- object-store keys under `_packs/`), and only
+//! then does the tip ref advance (`ContentRemote::advance_ref`, a final,
+//! separate Delta commit).  A crash or failure at any point before the last
+//! step leaves the OLD ref fully intact and fetchable: the new objects (and
+//! any packs published for them) are simply durable-but-unreferenced until a
+//! retried push finishes advancing the ref, never a ref naming an incomplete
+//! or unfetchable closure.  This module assembles the objects to send and the
+//! tip to point at.
 //!
 //! The objects are: the inline tree closure from
 //! [`materialize_content_objects`], the node manifest that commit references,
@@ -34,7 +44,8 @@ pub struct ContentPushOutcome {
     pub tip: ObjectHash,
     /// Number of objects written to the remote in this push.
     pub objects_pushed: usize,
-    /// The remote `txn_seq` allocated for this push.
+    /// The remote `txn_seq` allocated for the final ref-advance commit --
+    /// the commit that made this push visible to a consumer at all.
     pub remote_txn_seq: i64,
 }
 
@@ -157,11 +168,11 @@ async fn push_content_inner(
     ref_name: &str,
 ) -> Result<ContentPushOutcome, StewardError> {
     let _ = remote
-        .ensure_recovery_recipe_dp_commit_3()
+        .ensure_recovery_recipe_watertown_commit_v1()
         .await
         .map_err(|error| {
             StewardError::Content(format!(
-                "install required dp.commit.3 recovery recipe before backup push: {error}"
+                "install required watertown.commit.v1 recovery recipe before backup push: {error}"
             ))
         })?;
     let commit_log = crate::content_tree::read_log_leaves(
@@ -252,13 +263,69 @@ async fn push_content_inner(
         ));
     }
 
-    // The batched commit is one call carrying every inline object; what it
-    // costs is whatever the resulting Delta transaction actually performs.
-    let remote_txn_seq = remote
-        .push_commit(&objects, ref_name, tip)
+    // Physical objects durable first: write every inline object (small
+    // per-version blobs, the node manifest, and the commit-log objects) in
+    // one atomic Delta commit that does NOT yet touch `ref_name` -- see
+    // `ContentRemote::push_objects`. Every external blob above was already
+    // streamed (or found already present) before this point too. Only once
+    // this call returns are all of `objects` and `materialized.external_blobs`
+    // durable; only then are the packs below published, and only after that
+    // is the ref advanced (Item 2, `docs/logical-series-identity-design.md`):
+    // a crash after this write but before the ref moves leaves the OLD ref
+    // fully intact and fetchable, with the new objects simply durable but
+    // unreferenced, never a ref naming an incomplete or unfetchable closure.
+    let objects_txn_seq = remote
+        .push_objects(&objects)
         .await
         .map_err(|e| StewardError::Content(e.to_string()))?;
     let objects_pushed = objects.len();
+
+    // Every hash this push just proved durable -- either by writing it above
+    // (inline `objects`) or by streaming/confirming it earlier
+    // (`materialized.external_blobs`, all of which are, by this point, either
+    // freshly `put_blob`-ed or were already found in `present_blobs`).
+    // Passed to `publish_initial_series_packs` so publishing this push's
+    // identity packs never re-probes an object this same push already wrote
+    // (Item 3): the push path already knows these hashes are present, so
+    // `ContentRemote::publish_pack_with_known_present` skips the redundant
+    // exact-key/Delta-query check for exactly these, while still checking
+    // exactly (never trusting blindly) any hash a pack names that this push
+    // did not itself just write.
+    let mut known_present: std::collections::HashSet<ObjectHash> =
+        std::collections::HashSet::with_capacity(objects.len() + materialized.external_blobs.len());
+    for (hash, _) in &objects {
+        let _ = known_present.insert(*hash);
+    }
+    for hash in &materialized.external_blobs {
+        let _ = known_present.insert(*hash);
+    }
+
+    // Mint and publish this push's "initial" series identity packs only now
+    // that every inline object (small per-version blobs included) and every
+    // external blob are durable: a fresh `watertown.series.v1` series is otherwise
+    // unfetchable the moment it lands on the remote
+    // (`crate::content_tree::fetch_series_v2` requires an exact pack cover),
+    // and the pack built here advertises those exact already-published
+    // physical objects rather than minting or uploading new ones
+    // (`crate::content_tree::publish_initial_series_packs`).
+    let _ = crate::content_tree::publish_initial_series_packs(
+        remote,
+        &materialized.series_material,
+        &known_present,
+    )
+    .await?;
+
+    // Only now -- objects durable, packs published -- does the ref move.
+    // This is the commit that makes the push visible to a consumer at all;
+    // its `txn_seq` is what callers observe as "this push's txn_seq".
+    let remote_txn_seq = remote
+        .advance_ref(ref_name, tip)
+        .await
+        .map_err(|e| StewardError::Content(e.to_string()))?;
+    debug_assert!(
+        remote_txn_seq > objects_txn_seq,
+        "ref-advance commit must be sequenced strictly after the object commit"
+    );
 
     Ok(ContentPushOutcome {
         ref_name: ref_name.to_string(),

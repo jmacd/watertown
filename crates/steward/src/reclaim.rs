@@ -373,14 +373,25 @@ mod tests {
     /// collapses and reclaims as separate steps, exactly as `Ship::reclaim`
     /// brackets them internally.
     ///
-    /// It collapses in SEVERAL ROUNDS on purpose.  A single round produces one
-    /// merged run holding the highest version, so "drop everything at or below
-    /// the highest `collapsed_through`" and "drop everything inside some run's
-    /// range" select the same rows, and the test would pass under either rule.
-    /// Only once an earlier merged run sits BELOW a later run's
-    /// `collapsed_through` do the two rules disagree -- and the watermark rule
-    /// then deletes a live run.  The test asserts that shape was actually
-    /// reached before it concludes anything.
+    /// The window-merging `collapse_file_series` this test used to call
+    /// directly is unsupported for logical-series-v2 (BLOCKER 3): a merged row
+    /// cannot carry a single persisted logical leaf hash for the versions it
+    /// would absorb.  The only production-reachable way left to create a
+    /// merged row is `WD::async_writer_path_collapsing_with_type`, used by
+    /// content-pull replication to mirror a source pond's collapse -- it
+    /// supersedes *every* earlier version with one fresh baseline
+    /// (`collapsed_from` is always `None`, i.e. 0), not an arbitrary window.
+    /// So this test builds several rounds of "append, then mirror-collapse the
+    /// whole history so far" to accumulate genuinely superseded rows and dead
+    /// blobs for reclaim to act on, through a real write path rather than a
+    /// disabled internal helper.
+    ///
+    /// The range-containment-vs-watermark distinction the old tiered fixture
+    /// exercised (an earlier merge run sitting below a later run's
+    /// `collapsed_through`) is no longer reachable through any production
+    /// write path -- full-history mirror-collapse can only ever produce a
+    /// single live tier -- so that property is instead pinned directly against
+    /// synthetic data in `tlogfs::schema::tests::live_series_versions_uses_range_containment_not_watermark`.
     #[tokio::test]
     async fn deleting_superseded_rows_preserves_the_content_root() {
         let tmp = tempdir().expect("tempdir");
@@ -389,14 +400,14 @@ mod tests {
             .await
             .expect("create pond");
 
-        const MAX_LIVE: usize = 4;
-
         let meta = PondUserMetadata::new(vec!["test".into(), "reclaim-merkle".into()]);
         let mut seed = 0u64;
+        let mut cumulative: Vec<u8> = Vec::new();
         for _round in 0..3 {
             for _ in 0..12u64 {
                 let bytes = filler(seed);
                 seed += 1;
+                cumulative.extend_from_slice(&bytes);
                 ship.write_transaction(&meta, async move |fs| {
                     let root = fs.root().await?;
                     let mut w = root
@@ -417,37 +428,34 @@ mod tests {
                 .expect("append version");
             }
 
-            // Collapse ONLY -- no reclaim.  The pond accumulates superseded
-            // rows across rounds, which is precisely the state reclaim acts on.
-            let tx = ship.begin_write(&meta).await.expect("begin write");
-            {
-                let state = tx.state().expect("state");
-                // max_live must be > 1.  With max_live == 1 every round is
-                // forced to merge the previous round's accumulated run too, so
-                // the series is flattened back to one tier and the tiered shape
-                // this test needs never forms.
-                let candidates = state
-                    .list_collapsible_series(MAX_LIVE)
+            // Mirror-collapse the whole history so far into one fresh baseline
+            // version, exactly as content-pull replication would when mirroring
+            // a source pond's collapse. Every version written up to this point
+            // (including any earlier round's own merged baseline) becomes
+            // superseded, which is precisely the state reclaim acts on.
+            let round_snapshot = cumulative.clone();
+            ship.write_transaction(&meta, async move |fs| {
+                let root = fs.root().await?;
+                let mut w = root
+                    .async_writer_path_collapsing_with_type(
+                        "/events.series",
+                        tinyfs::EntryType::FilePhysicalSeries,
+                    )
+                    .await?;
+                w.write_all(&round_snapshot)
                     .await
-                    .expect("list collapsible");
-                assert!(!candidates.is_empty(), "series should be collapsible");
-                for id in candidates {
-                    let stats = state
-                        .collapse_file_series(id, MAX_LIVE)
-                        .await
-                        .expect("collapse");
-                    assert!(stats.collapsed, "collapse should have merged a window");
-                }
-            }
-            let _ = tx.commit().await.expect("commit collapse");
+                    .map_err(|e| crate::StewardError::Aborted(format!("write: {e}")))?;
+                w.shutdown()
+                    .await
+                    .map_err(|e| crate::StewardError::Aborted(format!("close: {e}")))?;
+                Ok(())
+            })
+            .await
+            .expect("mirror-collapse round");
         }
 
         let pond_id = ship.control_table().pond_id_uuid().to_string();
         let table = ship.data_persistence().table().clone();
-
-        // Prove the structure actually distinguishes the two rules, so a future
-        // change that flattens it turns this test red instead of toothless.
-        assert_tiered_beyond_a_watermark(&table, &pond_id).await;
 
         let before = crate::content_tree::compute_content_tree_for_table(table.clone(), &pond_id)
             .await
@@ -467,7 +475,11 @@ mod tests {
 
         assert!(
             stats.rows_deleted > 0,
-            "the collapse must have left superseded rows for this to prove anything"
+            "the mirror-collapse rounds must have left superseded rows for this to prove anything"
+        );
+        assert!(
+            stats.blobs_removed > 0,
+            "superseded loose-append blobs must actually be swept"
         );
 
         let after = crate::content_tree::compute_content_tree_for_table(new_table, &pond_id)
@@ -482,59 +494,20 @@ mod tests {
              received them would now diverge",
             stats.rows_deleted,
         );
-    }
 
-    /// Assert some LIVE row sits at or below the highest `collapsed_through`.
-    ///
-    /// That is exactly the case where a watermark ("everything below K is
-    /// dead") disagrees with range containment, because a merged run takes a
-    /// fresh highest version while standing for content mid-stream.  Without
-    /// this shape, the surrounding test cannot tell the two rules apart.
-    async fn assert_tiered_beyond_a_watermark(table: &deltalake::DeltaTable, pond_id: &str) {
-        let sql = super::SERIES_ROWS_SQL.replace("{pond_id}", pond_id);
-        let rows: Vec<super::SeriesRow> = super::query_rows(table, &sql).await.expect("scan rows");
-        assert!(!rows.is_empty(), "expected series rows");
-
-        // Group exactly as find_superseded does; versions are only comparable
-        // within one node.
-        let mut by_node: std::collections::HashMap<
-            (String, String, String),
-            Vec<(i64, tlogfs::schema::CollapseRange)>,
-        > = std::collections::HashMap::new();
-        for r in &rows {
-            by_node
-                .entry((r.pond_id.clone(), r.part_id.clone(), r.node_id.clone()))
-                .or_default()
-                .push((
-                    r.version,
-                    tlogfs::schema::CollapseRange::new(
-                        r.version,
-                        r.collapsed_from,
-                        r.collapsed_through,
-                    ),
-                ));
-        }
-
-        let tiered = by_node.values().any(|entries| {
-            let Some(watermark) = entries
-                .iter()
-                .filter(|(_, r)| r.merged)
-                .map(|(_, r)| r.hi)
-                .max()
-            else {
-                return false;
-            };
-            tlogfs::schema::live_series_versions(entries)
-                .into_iter()
-                .any(|v| v <= watermark)
-        });
-
-        assert!(
-            tiered,
-            "collapse produced only a single tier (every live version sits above its node's \
-             highest collapsed_through), so this test cannot distinguish range containment \
-             from a watermark; rows={rows:?}"
+        // The series is still fully readable, byte-identical, after reclaim.
+        let meta = PondUserMetadata::new(vec!["read".into()]);
+        let tx = ship.begin_read(&meta).await.expect("begin read");
+        let root = tx.root().await.expect("root");
+        let content = root
+            .read_file_path_to_vec("/events.series")
+            .await
+            .expect("read content after reclaim");
+        assert_eq!(
+            content, cumulative,
+            "content must still round-trip byte-identical after reclaim"
         );
+        _ = tx.commit().await.expect("commit read");
     }
 
     /// Distinct, incompressible bytes per version, so each lands as its own

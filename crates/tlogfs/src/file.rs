@@ -344,6 +344,14 @@ pub struct OpLogFileWriter {
     /// to `allocated_version - 1`, superseding every earlier version of this
     /// node (see [`FileMetadataWriter::set_collapse_prior`]).
     collapse_prior: bool,
+    /// Exact canonical logical-attributes bytes to persist verbatim, set by
+    /// [`FileMetadataWriter::set_exact_logical_attributes`] (release blocker
+    /// item 2, `docs/logical-series-identity-design.md`). Independent of
+    /// `precomputed_metadata`'s `timestamp_column`-only reconstruction and
+    /// applied on top of it in `store_file_content_ref`, so it round-trips
+    /// arbitrary attribute keys a source leaf carried, not just the single
+    /// well-known timestamp column.
+    precomputed_exact_attributes: Option<Vec<u8>>,
 }
 
 // OpLogFileWriter is Unpin because all its fields are Unpin
@@ -372,6 +380,7 @@ impl OpLogFileWriter {
             required_timestamp_column: None,
             allocated_version,
             collapse_prior,
+            precomputed_exact_attributes: None,
         }
     }
 }
@@ -388,6 +397,10 @@ impl FileMetadataWriter for OpLogFileWriter {
 
     fn set_mtime(&mut self, timestamp: i64) {
         self.precomputed_mtime = Some(timestamp);
+    }
+
+    fn set_exact_logical_attributes(&mut self, canonical_attrs: Vec<u8>) {
+        self.precomputed_exact_attributes = Some(canonical_attrs);
     }
 
     fn require_temporal_metadata(&mut self, timestamp_column: String) {
@@ -538,6 +551,7 @@ impl AsyncWrite for OpLogFileWriter {
             let required_timestamp_column = this.required_timestamp_column.clone();
             let allocated_version = this.allocated_version;
             let collapse_prior = this.collapse_prior;
+            let precomputed_exact_attributes = this.precomputed_exact_attributes.clone();
 
             let future = Box::pin(async move {
                 // Finalize HybridWriter to get content
@@ -712,7 +726,7 @@ impl AsyncWrite for OpLogFileWriter {
                     // version as superseding every earlier one it wrote.
                     let collapsed_through = collapse_prior.then(|| allocated_version - 1);
 
-                    state.store_file_content_ref(file_id, content_ref, metadata, Some(allocated_version), bao_outboard, collapsed_through, precomputed_mtime).await
+                    state.store_file_content_ref(file_id, content_ref, metadata, Some(allocated_version), bao_outboard, collapsed_through, precomputed_mtime, precomputed_exact_attributes).await
                         .map_other_context("Failed to store file")
                 }.await;
 

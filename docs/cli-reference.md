@@ -24,6 +24,7 @@
 | `pond remote remove --purge` | Detach AND drop the materialized mount entry | `pond remote remove --purge upstream` |
 | `pond push` | Push to push/both-mode remotes | `pond push` |
 | `pond capsule` | Install recovery recipes or verify portable capsules | `pond capsule recipe inspect azure` |
+| `pond freeze` | Persistently freeze, inspect, or re-enable pond data writes | `pond freeze status` |
 | `pond pull` | Pull from pull/both-mode remotes | `pond pull` |
 | `pond restore` | Bootstrap a whole-pond replica from a backup (disaster recovery) | `pond restore origin file:///mnt/backups/origin` |
 | `pond maintain` | Delta maintenance; `--compact` records a pushable Compact bundle | `pond maintain --compact` |
@@ -561,6 +562,12 @@ pond capsule inspect ./recovered
 
 # Verification-only spelling for automation.
 pond capsule verify ./recovered
+
+# Import into the nonexistent path named by POND using a fresh pond identity.
+# Import is experimental until bounded resume and active-remote preflight ship.
+POND=/srv/watertown/recovered pond capsule import ./recovered \
+  --birthplace watershop-capsule-rehearsal \
+  --experimental
 ```
 
 Every backup push installs the current hash-addressed recovery recipe and
@@ -574,7 +581,52 @@ objects but never replace an existing discoverable recipe.
 Inspection does not open or modify a pond. It validates the latest reference,
 canonical manifest, every physical object hash and size, every Parquet schema,
 every ordered logical file/table leaf hash, and each logical series root.
-See `recovery-capsule-design.md` for the format-upgrade and cleanup design.
+
+Import accepts only a nonexistent target. It constructs a private sibling
+staging pond with a fresh identity, persistently suppresses post-commit
+factories and automatic pushes, and atomically promotes the target only after
+an exact logical comparison. The importer currently leaves active-remote
+preflight to the operator and requires `--experimental`.
+
+See [capsule-recovery-runbook.md](capsule-recovery-runbook.md) for the complete
+writer-quiescence, exact-tip, staged-import, cutover, rollback, and retention
+procedure. See [recovery-capsule-design.md](recovery-capsule-design.md) for the
+format and trust model.
+
+---
+
+### pond freeze
+
+Manage the persistent local data-write freeze used for authoritative
+migrations:
+
+```bash
+# Fails if another process currently holds the pond write lock.
+pond freeze enable --reason "storage-format migration"
+
+# Show the protected exact content tip and freeze metadata.
+pond freeze status
+
+# Explicitly re-enable writes, for example when aborting before cutover.
+pond freeze disable
+```
+
+Freeze creation holds the same advisory lock used by all supported data-write
+paths and atomically creates `control/write.freeze`. Every later write checks
+that marker after acquiring the lock, so an already-open process cannot rely
+on stale configuration. Ordinary writes, replay, pull/import, compaction,
+reclamation, and control-history pruning are rejected with
+`PondWriteFrozen`; forced control rebuild refuses to remove an active marker.
+Reads, push, verify, recipe inspection, and capsule verification remain
+available.
+
+The freeze is local to this pond instance; it is not replicated to the remote.
+`pond freeze status` and `pond freeze disable` read the stable marker directly
+and remain available if the control Delta table is damaged and must be rebuilt.
+For an authoritative capsule migration, stop all source writers and their
+supervisors first, freeze the source, and verify that the recorded freeze tip,
+local tip, and final remote tip agree. Follow
+[capsule-recovery-runbook.md](capsule-recovery-runbook.md).
 
 ---
 
@@ -671,6 +723,9 @@ pond verify
 
 # Verify against only the named remote
 pond verify origin
+
+# Require exact equality; lag and an empty remote are failures
+pond verify --exact origin
 ```
 
 Output (per remote):
@@ -686,8 +741,11 @@ Output (per remote):
 - `[MISMATCH] verify <name>: remote tip at seq=<N> is not in this pond's history (diverged)`
   -- the remote published a commit this pond does not have.
 
-Each line is followed by the local and remote tip commit hashes.  Exit
-code is non-zero if any remote diverges or fails to load.
+Each line is followed by the local and remote tip commit hashes. By default,
+exit code is non-zero if any remote diverges or fails to load; an empty or
+behind remote is reported but remains a valid history prefix. With `--exact`,
+exit code is non-zero unless every selected remote is `UpToDate`. Use exact
+mode for migration and cutover gates.
 
 > Verify is symmetric: a replica bootstrapped from a remote (via
 > `pond pull`) verifies cleanly against that remote, because it rebuilds

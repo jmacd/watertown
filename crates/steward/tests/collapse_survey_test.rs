@@ -7,9 +7,15 @@
 //!
 //! A preview is only worth having if it predicts the thing it previews, so the
 //! property under test is agreement: the survey must name the same candidates
-//! the collapse then acts on, and must cost nothing to ask.  Both hold by
-//! construction today because the survey IS the discovery collapse runs, and
-//! these tests are what keep that true if the two are ever separated.
+//! that [`steward::Ship::collapse_versions`] would act on, and must cost
+//! nothing to ask. `Ship::collapse_versions` performs pack-only physical
+//! maintenance (design doc, delivery gate 7 and the pack-maintenance
+//! follow-up): it never rewrites/deletes Oplog rows, never changes
+//! `watertown.series.v1` manifests/root/version, and instead publishes bounded
+//! content-addressed physical packs. The coarse survey
+//! (`survey_collapsible_series`) remains a pure, side-effect-free discovery
+//! query regardless; the finer-grained `survey_pack_maintenance` is the one
+//! that must agree candidate-for-candidate with what a real run repacks.
 
 use steward::Ship;
 use tempfile::tempdir;
@@ -115,34 +121,75 @@ async fn asking_changes_nothing() {
     assert_eq!(first[0].total_bytes, second[0].total_bytes);
 }
 
-/// The survey must agree with the collapse it predicts.  This is the whole
-/// contract of a dry run: a preview that names a different candidate set than
-/// the operation would act on is misinformation, not caution.
+/// The survey must agree with what pack-only maintenance actually does:
+/// `survey_pack_maintenance` (the dry-run-safe, no-mutation preview) must
+/// name the same series, as [`steward::PackCandidateOutcome::NeedsRepack`],
+/// that a real `Ship::collapse_versions` call goes on to repack in the same
+/// process. A preview that named a different candidate set than what
+/// actually got repacked would be misinformation, not caution -- and the
+/// preview call itself must be provably inert (no pond state moves) whether
+/// or not it agrees.
 #[tokio::test]
-async fn the_survey_agrees_with_the_collapse_it_predicts() {
+async fn the_survey_agrees_with_what_collapse_repacks() {
+    use steward::PackCandidateOutcome;
+
     let (_t, mut ship) = pond_with_series().await;
 
-    let predicted = ship.survey_collapsible_series(1).await.expect("survey");
-    let report = ship.collapse_versions(1).await.expect("collapse");
-
+    let predicted = ship
+        .survey_pack_maintenance(1)
+        .await
+        .expect("pack maintenance survey");
+    let predicted_repacks: Vec<_> = predicted
+        .iter()
+        .filter(|c| c.outcome == PackCandidateOutcome::NeedsRepack)
+        .collect();
     assert_eq!(
-        report.candidates,
-        predicted.len(),
-        "collapse acted on a different candidate set than the survey reported"
-    );
-    assert!(
-        report.files_collapsed > 0,
-        "the candidate should have merged"
+        predicted_repacks.len(),
+        1,
+        "one series should be predicted for repack: {predicted:?}"
     );
 
-    // Having merged, the series no longer qualifies at the same threshold:
-    // the survey tracks the pond rather than repeating a stale answer.
-    let after = ship.survey_collapsible_series(1).await.expect("resurvey");
+    let seq_before = ship
+        .control_table()
+        .latest_spine_seq()
+        .await
+        .expect("seq before");
+
+    // The dry-run survey must not have moved anything before we run for
+    // real.
+    let seq_after_survey = ship
+        .control_table()
+        .latest_spine_seq()
+        .await
+        .expect("seq after survey");
+    assert_eq!(
+        seq_before, seq_after_survey,
+        "a dry-run survey must not advance the pond"
+    );
+
+    let report = ship
+        .collapse_versions(1)
+        .await
+        .expect("pack-only maintenance must succeed for a v2 pond with a real candidate");
+    assert_eq!(
+        report.series_repacked,
+        predicted_repacks.len(),
+        "the number of series actually repacked must match what the survey predicted"
+    );
+    assert_eq!(report.candidates, predicted.len());
+
+    // A repeated survey now finds nothing left to repack: the bounded layout
+    // just published already satisfies the same threshold.
+    let resurvey = ship
+        .survey_pack_maintenance(1)
+        .await
+        .expect("resurvey after real maintenance");
     assert!(
-        after
+        resurvey
             .iter()
-            .all(|c| c.live_versions < predicted[0].live_versions),
-        "post-collapse survey should reflect the merge: {after:?}"
+            .all(|c| c.outcome != PackCandidateOutcome::NeedsRepack),
+        "a repeated survey must find nothing left to repack once maintenance has settled: \
+         {resurvey:?}"
     );
 }
 

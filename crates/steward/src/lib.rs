@@ -32,6 +32,8 @@ pub mod limiter;
 pub mod limiter_usage;
 pub mod maintenance;
 pub mod metered_source;
+mod pack_maintenance;
+mod pack_store;
 mod rebuild;
 pub mod reclaim;
 mod remote_config;
@@ -48,8 +50,8 @@ pub use capsule_import::{CapsuleImportProvenance, CapsuleImportReport, import_ca
 pub use content_diff::{ContentComparison, ContentDiff, DiffKind, compare_content_trees};
 pub use content_objects::{ObjectInventory, ObjectKind, inventory_content_objects};
 pub use content_pull::{
-    FetchedGraph, FetchedObject, RebuildOutcome, fetch_object_graph, import_graft, import_pond,
-    rebuild_pond, replace_graft,
+    FetchedGraph, FetchedObject, FetchedSeriesV2, RebuildOutcome, fetch_object_graph, import_graft,
+    import_pond, rebuild_pond, replace_graft,
 };
 pub use content_push::{
     ContentPushOutcome, open_and_push_to_remote_limited, push_content_to_remote,
@@ -73,11 +75,13 @@ pub use limiter::{
 pub use limiter_usage::{
     LIMITER_USAGE_PENDING_KEY, LIMITER_USAGE_SERIES, LimiterUsageRow, UsageSample,
 };
+pub use pack_maintenance::{PackCandidateOutcome, PackMaintenanceCandidate};
 pub use rebuild::{RebuildReport, rebuild_control_table};
 pub use remote_config::{RemoteAttachment, RemoteConfigError, RemoteMode};
 pub use ship::{CollapseReport, CompactOutcome, Ship};
 pub use storage_profile::{ResolvedStorage, StorageProfileError};
 pub use tlogfs::{PondMetadata, PondTxnMetadata, PondUserMetadata};
+pub use write_lock::WriteFreeze;
 
 /// Recovery command result
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +135,12 @@ pub enum StewardError {
         holder_since: Option<chrono::DateTime<chrono::Utc>>,
         holder_txn_id: Option<String>,
     },
+
+    #[error("pond writes are frozen by {path}: {details}")]
+    PondWriteFrozen { path: PathBuf, details: String },
+
+    #[error("invalid pond write-freeze marker at {path}: {reason}")]
+    InvalidWriteFreeze { path: PathBuf, reason: String },
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -214,6 +224,27 @@ pub fn get_git_path(pond_path: &Path) -> PathBuf {
 #[must_use]
 pub fn get_tlog_path(pond_path: &Path) -> PathBuf {
     pond_path.join("tlog")
+}
+
+/// Read a pond's durable write-freeze marker without opening its control
+/// Delta table. This remains available when control state needs rebuilding.
+pub fn read_pond_write_freeze<P: AsRef<Path>>(
+    pond_path: P,
+) -> Result<Option<WriteFreeze>, StewardError> {
+    write_lock::read_write_freeze(&get_control_path(pond_path.as_ref()))
+}
+
+/// Remove a pond's durable write freeze without opening its control Delta
+/// table. The stable write lock prevents races with writers or rebuild.
+pub fn unfreeze_pond_writes<P: AsRef<Path>>(
+    pond_path: P,
+    meta: &PondUserMetadata,
+) -> Result<Option<WriteFreeze>, StewardError> {
+    let control_path = get_control_path(pond_path.as_ref());
+    std::fs::create_dir_all(&control_path)?;
+    let txn_meta = PondTxnMetadata::new(0, meta.clone());
+    let _write_lock = write_lock::WriteLockGuard::try_acquire(&control_path, &txn_meta)?;
+    write_lock::remove_write_freeze(&control_path)
 }
 
 // ---------------------------------------------------------------------------

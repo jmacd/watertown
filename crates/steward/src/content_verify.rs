@@ -62,9 +62,9 @@ pub struct ContentVerifyReport {
 
 /// Verify the pond's current content tip against `remote`'s `ref_name` tip.
 ///
-/// This reads the local commit spine and the remote ref; it does not rewrite
-/// anything.  It walks the local commit history (newest seq downward) to place
-/// the remote tip, so the relationship is exact rather than a seq comparison.
+/// This reads the authoritative pond-resident commit log and the remote ref; it
+/// does not rewrite anything. It walks local history to place the remote tip,
+/// so the relationship is exact rather than a seq comparison.
 ///
 /// # Errors
 ///
@@ -76,17 +76,29 @@ pub async fn verify_content_against_remote(
     remote: &ContentRemote,
     ref_name: &str,
 ) -> Result<ContentVerifyReport, StewardError> {
-    let tip_seq = ship.control_table().latest_spine_seq().await?;
-    let local_tip = if let Some(seq) = tip_seq {
-        ship.control_table()
-            .commit_hash_at(seq)
-            .await?
-            .map(|hex| ObjectHash::from_hex(&hex))
-            .transpose()
-            .map_err(|e| StewardError::Content(format!("invalid local tip hash: {e}")))?
-    } else {
-        None
-    };
+    let data_path = crate::get_data_path(ship.pond_path());
+    let data_url = url::Url::from_directory_path(&data_path)
+        .or_else(|_| url::Url::from_file_path(&data_path))
+        .map_err(|_| {
+            StewardError::Aborted(format!(
+                "cannot form a URL from pond data path {}",
+                data_path.display()
+            ))
+        })?;
+    let data_table = deltalake::open_table(data_url)
+        .await
+        .map_err(|error| StewardError::DeltaLake(error.to_string()))?;
+    let local_spines = crate::content_tree::read_log_spines(
+        data_table,
+        &ship.control_table().pond_id_uuid().to_string(),
+    )
+    .await?;
+    let tip_seq = local_spines.keys().max().copied();
+    let local_tip = tip_seq
+        .and_then(|seq| local_spines.get(&seq))
+        .map(|spine| ObjectHash::from_hex(&spine.commit_hash))
+        .transpose()
+        .map_err(|error| StewardError::Content(format!("invalid local tip hash: {error}")))?;
 
     let remote_tip = remote
         .get_tip(ref_name)
@@ -124,7 +136,12 @@ pub async fn verify_content_against_remote(
                         .seq,
                 )
             }
-            None => None,
+            None => {
+                return Err(StewardError::Content(format!(
+                    "remote tip {} has no commit object",
+                    rt.to_hex()
+                )));
+            }
         }
     } else {
         None
@@ -137,12 +154,13 @@ pub async fn verify_content_against_remote(
         (Some(local), Some(remote_t)) => {
             if local == remote_t {
                 ContentVerifyState::UpToDate
-            } else if let Some(found_seq) =
-                find_in_local_history(ship, remote_t, tip_seq.unwrap_or(0)).await?
-            {
+            } else if let Some(found_seq) = find_in_local_history(&local_spines, remote_t)? {
                 ContentVerifyState::RemoteBehind {
-                    local_unpushed: count_spine_between(ship, found_seq, tip_seq.unwrap_or(0))
-                        .await?,
+                    local_unpushed: count_spine_between(
+                        &local_spines,
+                        found_seq,
+                        tip_seq.unwrap_or(0),
+                    ),
                 }
             } else {
                 ContentVerifyState::Diverged
@@ -171,21 +189,17 @@ pub async fn verify_content_against_remote(
 /// from `tip_seq` downward.  Seqs that stamped no spine (compaction) return
 /// `None` from `commit_hash_at` and are skipped.  Returns `None` if no local
 /// commit matches, which means `target` is not in this pond's history.
-async fn find_in_local_history(
-    ship: &Ship,
+fn find_in_local_history(
+    spines: &std::collections::HashMap<i64, crate::CommitSpine>,
     target: ObjectHash,
-    tip_seq: i64,
 ) -> Result<Option<i64>, StewardError> {
-    let mut seq = tip_seq;
-    while seq > 0 {
-        if let Some(hex) = ship.control_table().commit_hash_at(seq).await? {
-            let hash = ObjectHash::from_hex(&hex)
-                .map_err(|e| StewardError::Content(format!("invalid commit hash at {seq}: {e}")))?;
-            if hash == target {
-                return Ok(Some(seq));
-            }
+    for (seq, spine) in spines {
+        let hash = ObjectHash::from_hex(&spine.commit_hash).map_err(|error| {
+            StewardError::Content(format!("invalid commit hash at {seq}: {error}"))
+        })?;
+        if hash == target {
+            return Ok(Some(*seq));
         }
-        seq -= 1;
     }
     Ok(None)
 }
@@ -195,18 +209,13 @@ async fn find_in_local_history(
 /// remote tip found at `low_exclusive`.  Content-preserving seqs (compaction)
 /// stamp no spine and are not counted, so a compaction between the two tips
 /// does not inflate the unpushed count.
-async fn count_spine_between(
-    ship: &Ship,
+fn count_spine_between(
+    spines: &std::collections::HashMap<i64, crate::CommitSpine>,
     low_exclusive: i64,
     high_inclusive: i64,
-) -> Result<i64, StewardError> {
-    let mut count = 0;
-    let mut seq = high_inclusive;
-    while seq > low_exclusive {
-        if ship.control_table().commit_hash_at(seq).await?.is_some() {
-            count += 1;
-        }
-        seq -= 1;
-    }
-    Ok(count)
+) -> i64 {
+    spines
+        .keys()
+        .filter(|seq| **seq > low_exclusive && **seq <= high_inclusive)
+        .count() as i64
 }

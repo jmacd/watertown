@@ -1,0 +1,4 @@
+# Installed only after review, preferably in a disposable virtual environment.
+blake3==1.0.8
+deltalake==1.2.1
+pyarrow==21.0.0

@@ -96,6 +96,78 @@ async fn second_push_advances_tip_atomically() {
     );
 }
 
+/// Item 2 (`docs/logical-series-identity-design.md`): `push_objects` writes
+/// new physical objects durably WITHOUT touching any ref. A caller that
+/// stops right there (simulating a crash before the ref-advance step) must
+/// see the old ref (or no ref) still intact and fully resolvable, while the
+/// new objects are already durable for a later retry to find and skip
+/// re-uploading.
+#[tokio::test]
+async fn push_objects_writes_durably_without_advancing_any_ref() {
+    let dir = TempDir::new().unwrap();
+    let mut remote = ContentRemote::create_at(dir.path(), pid()).await.unwrap();
+
+    // Establish an initial tip the "old" ref must remain pointed at.
+    let (h_c1, c1) = obj(b"commit-1");
+    remote
+        .push_commit(&[(h_c1, c1)], "main", h_c1)
+        .await
+        .unwrap();
+    assert_eq!(remote.get_tip("main").await.unwrap(), Some(h_c1));
+
+    // A second push's new objects land durably...
+    let (h_c2, c2) = obj(b"commit-2");
+    let (h_new, new) = obj(b"new-blob-for-commit-2");
+    remote
+        .push_objects(&[(h_c2, c2.clone()), (h_new, new.clone())])
+        .await
+        .unwrap();
+
+    // ...but simulating a crash right here -- before any ref-advance --
+    // must leave "main" exactly where it was: still resolvable, still
+    // naming a fully present, fetchable closure (the old commit).
+    assert_eq!(
+        remote.get_tip("main").await.unwrap(),
+        Some(h_c1),
+        "ref must not move until advance_ref is called explicitly"
+    );
+    assert!(
+        remote.has_object(h_c1).await.unwrap(),
+        "old tip's object must remain reachable through the unmoved ref"
+    );
+
+    // The new objects are nonetheless already durable, so a retried push can
+    // find and skip them rather than re-uploading.
+    assert_eq!(remote.get_object(h_c2).await.unwrap(), Some(c2));
+    assert_eq!(remote.get_object(h_new).await.unwrap(), Some(new));
+}
+
+/// Item 2: `advance_ref` alone moves only the ref, in its own commit, after
+/// objects were separately made durable by `push_objects`. Exercises the
+/// full split (objects, then ref) end to end and confirms the resulting
+/// state is indistinguishable from an equivalent single `push_commit`.
+#[tokio::test]
+async fn advance_ref_moves_the_ref_after_objects_are_already_durable() {
+    let dir = TempDir::new().unwrap();
+    let mut remote = ContentRemote::create_at(dir.path(), pid()).await.unwrap();
+
+    let (h_c1, c1) = obj(b"only-commit");
+    let objects_seq = remote.push_objects(&[(h_c1, c1.clone())]).await.unwrap();
+    assert_eq!(
+        remote.get_tip("main").await.unwrap(),
+        None,
+        "no ref exists yet -- only objects were written"
+    );
+
+    let ref_seq = remote.advance_ref("main", h_c1).await.unwrap();
+    assert!(
+        ref_seq > objects_seq,
+        "the ref-advance commit must be sequenced strictly after the object commit"
+    );
+    assert_eq!(remote.get_tip("main").await.unwrap(), Some(h_c1));
+    assert_eq!(remote.get_object(h_c1).await.unwrap(), Some(c1));
+}
+
 /// A large-file blob round-trips through the external blob store by hash: it
 /// is absent before the put, present after, and reads back byte-for-byte.
 #[tokio::test]

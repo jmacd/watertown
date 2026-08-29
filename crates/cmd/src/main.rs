@@ -83,6 +83,21 @@ enum ConfigCommand {
     },
 }
 
+/// Persistent pond-wide data-write freeze operations.
+#[derive(Debug, Subcommand)]
+enum FreezeCommand {
+    /// Reject future data writes; fails while another writer holds the pond.
+    Enable {
+        /// Auditable operator reason for freezing this pond.
+        #[arg(long)]
+        reason: String,
+    },
+    /// Report whether writes are frozen and show the protected content tip.
+    Status,
+    /// Re-enable data writes.
+    Disable,
+}
+
 #[derive(Parser)]
 #[command(author, version = env!("WATERTOWN_VERSION"), about = "Watertown - A very small data lake")]
 #[command(name = "pond")]
@@ -281,7 +296,11 @@ enum Commands {
         compact: bool,
         /// Also collapse multi-version `data:series` files whose live version
         /// count exceeds this threshold into a single merged version. Pass 0 to
-        /// disable (the default).
+        /// disable (the default). On a logical-series-v2 pond this is a
+        /// reported, exit-0 no-op instead: row-rewriting collapse would
+        /// destroy logical leaf identity, so it is skipped with a warning
+        /// (see docs/logical-series-identity-design.md) rather than run or
+        /// fail the command; checkpoint/vacuum/prune still proceed normally.
         #[arg(long, default_value = "0")]
         collapse_versions: usize,
         /// Also prune replicated control-table lifecycle history at or below a
@@ -351,6 +370,9 @@ enum Commands {
     Verify {
         /// Remote or backup name.  Omit to verify against every attachment.
         name: Option<String>,
+        /// Exit nonzero unless every remote tip exactly equals the local tip.
+        #[arg(long)]
+        exact: bool,
     },
     /// Show an operator-facing status aggregate: identity, local commit
     /// state, recovery health, and per-remote sync watermarks (D6).
@@ -404,6 +426,11 @@ enum Commands {
     Capsule {
         #[command(subcommand)]
         command: CapsuleCommand,
+    },
+    /// Manage the persistent pond-wide data-write freeze.
+    Freeze {
+        #[command(subcommand)]
+        command: FreezeCommand,
     },
     /// Show or set pond configuration
     Config {
@@ -696,7 +723,9 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Commands::Verify { name } => commands::verify_command(&ship_context, name).await,
+        Commands::Verify { name, exact } => {
+            commands::verify_command(&ship_context, name, exact).await
+        }
         Commands::Status => commands::status_command(&ship_context).await,
         Commands::Limits { format } => commands::limits_command(&ship_context, &format).await,
         Commands::Tlog { command } => match command {
@@ -790,6 +819,13 @@ async fn main() -> Result<()> {
                 let target = ship_context.resolve_pond_path()?;
                 commands::capsule_import_command(&path, &target, &birthplace, experimental).await
             }
+        },
+        Commands::Freeze { command } => match command {
+            FreezeCommand::Enable { reason } => {
+                commands::freeze_writes_command(&ship_context, reason).await
+            }
+            FreezeCommand::Status => commands::freeze_status_command(&ship_context).await,
+            FreezeCommand::Disable => commands::unfreeze_writes_command(&ship_context).await,
         },
         Commands::Config { command } => {
             let control_mode = match command {

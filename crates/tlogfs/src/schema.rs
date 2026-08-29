@@ -294,6 +294,35 @@ pub struct OplogEntry {
     /// the range it covers, and rows must be ordered for reading by range start
     /// rather than by `version` — see [`CollapseRange::sort_key`].
     pub collapsed_from: Option<i64>,
+
+    /// The immutable logical-series identity of this append
+    /// (`docs/logical-series-identity-design.md`): `blake3` (hex) of the
+    /// `watertown.series-leaf.v1` preimage over this version's canonical logical
+    /// bytes (`sync_store::content::file_leaf_hash` /
+    /// `table_leaf_hash`), computed once at write time and never recomputed
+    /// from physical (Parquet/Bao) encoding.
+    ///
+    /// `Some` for every nonempty `FilePhysicalSeries`/`TablePhysicalSeries`
+    /// append (one logical leaf per append); `None` for every other entry
+    /// type, and also `None` for an empty series append (an empty write
+    /// creates no logical leaf, per the design doc's nonempty-leaf
+    /// invariant) -- such a row contributes nothing to the ordered leaf
+    /// sequence steward's fold builds.
+    pub logical_leaf_hash: Option<String>,
+
+    /// This append's logical count: row count for a `TablePhysicalSeries`
+    /// leaf, byte count for a `FilePhysicalSeries` leaf. `Some` exactly when
+    /// [`Self::logical_leaf_hash`] is `Some`, and always `> 0` when present
+    /// (matching the nonempty-leaf invariant).
+    pub logical_count: Option<i64>,
+
+    /// The `TablePhysicalSeries` canonical schema fingerprint (`blake3` hex
+    /// of `sync_store::content::schema_fingerprint`), persisted per row so
+    /// steward's fold never needs to decode Parquet to learn it. `None` for
+    /// `FilePhysicalSeries` (whose leaves carry no schema) and for every
+    /// non-series entry type; also `None` on an empty `TablePhysicalSeries`
+    /// append, matching [`Self::logical_leaf_hash`].
+    pub series_schema_fingerprint: Option<String>,
 }
 
 /// The closed range of series versions a row occupies (loose row) or supersedes
@@ -450,6 +479,13 @@ impl ForArrow for OplogEntry {
             Arc::new(Field::new("bao_outboard", DataType::Binary, true)), // Bao-tree outboard for verified streaming
             Arc::new(Field::new("collapsed_through", DataType::Int64, true)), // Highest series version superseded by this merged row
             Arc::new(Field::new("collapsed_from", DataType::Int64, true)), // Lowest series version superseded by this merged row (None => 0)
+            Arc::new(Field::new("logical_leaf_hash", DataType::Utf8, true)), // v2 logical-series leaf identity (blake3 hex); None for non-series/empty rows
+            Arc::new(Field::new("logical_count", DataType::Int64, true)), // v2 logical row/byte count for this leaf
+            Arc::new(Field::new(
+                "series_schema_fingerprint",
+                DataType::Utf8,
+                true,
+            )), // v2 TablePhysicalSeries schema fingerprint (blake3 hex)
         ]
     }
 }
@@ -498,6 +534,9 @@ impl OplogEntry {
             bao_outboard: None,
             collapsed_through: None,
             collapsed_from: None,
+            logical_leaf_hash: None,
+            logical_count: None,
+            series_schema_fingerprint: None,
         }
     }
 
@@ -539,6 +578,9 @@ impl OplogEntry {
             bao_outboard: None,
             collapsed_through: None,
             collapsed_from: None,
+            logical_leaf_hash: None,
+            logical_count: None,
+            series_schema_fingerprint: None,
         }
     }
 
@@ -578,6 +620,9 @@ impl OplogEntry {
             bao_outboard: None,
             collapsed_through: None,
             collapsed_from: None,
+            logical_leaf_hash: None,
+            logical_count: None,
+            series_schema_fingerprint: None,
         }
     }
 
@@ -635,6 +680,9 @@ impl OplogEntry {
             bao_outboard: None,
             collapsed_through: None,
             collapsed_from: None,
+            logical_leaf_hash: None,
+            logical_count: None,
+            series_schema_fingerprint: None,
         }
     }
 
@@ -684,6 +732,9 @@ impl OplogEntry {
             bao_outboard: None,
             collapsed_through: None,
             collapsed_from: None,
+            logical_leaf_hash: None,
+            logical_count: None,
+            series_schema_fingerprint: None,
         }
     }
 
@@ -776,6 +827,9 @@ impl OplogEntry {
             bao_outboard: None,
             collapsed_through: None,
             collapsed_from: None,
+            logical_leaf_hash: None,
+            logical_count: None,
+            series_schema_fingerprint: None,
         }
     }
 
@@ -971,6 +1025,9 @@ impl OplogEntry {
             bao_outboard: None,
             collapsed_through: None,
             collapsed_from: None,
+            logical_leaf_hash: None,
+            logical_count: None,
+            series_schema_fingerprint: None,
         }
     }
 }
@@ -1070,5 +1127,123 @@ pub fn decode_directory_entries(
         Ok(entries)
     } else {
         Ok(Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `live_series_versions`/`is_superseded` must use RANGE CONTAINMENT, not
+    /// a scalar `max(collapsed_through)` watermark: a merged run is allocated
+    /// a fresh (highest) version while standing for content earlier in the
+    /// stream, so "everything at or below the highest `collapsed_through` is
+    /// dead" is a different (and wrong) rule from "everything inside some
+    /// run's `[lo, hi]` is dead".
+    ///
+    /// This tiered shape -- an earlier merge run's range NOT fully covered by
+    /// a later run's range, so both stay live -- is only reachable in this
+    /// synthetic form today: production's only reachable collapse-row source
+    /// (`WD::async_writer_path_collapsing_with_type`, used by content-pull
+    /// replication to mirror a source pond's collapse) always supersedes
+    /// every version back to the start (`collapsed_from` is always `None`,
+    /// i.e. lo=0), while the arbitrary-window `collapsed_from` a partial merge
+    /// would need is unsupported for logical-series-v2
+    /// (`TLogFSError::CollapseUnsupported`, BLOCKER 3). The distinguishing
+    /// logic must still be correct for any row shape this schema can express
+    /// -- including rows a peer created before this restriction existed -- so
+    /// it is pinned directly here rather than only through a production write
+    /// path.
+    #[test]
+    fn live_series_versions_uses_range_containment_not_watermark() {
+        // v1..=12 loose, v13 merges [0,12] (a pre-tiering, collapsed_from=None
+        // full-history run), v14..=25 loose, v26 merges only [13,25] -- a
+        // narrower, later window that does NOT cover v13's [0,12] range.
+        let mut rows: Vec<(i64, CollapseRange)> = Vec::new();
+        for v in 1..=12i64 {
+            rows.push((v, CollapseRange::new(v, None, None)));
+        }
+        rows.push((13, CollapseRange::new(13, None, Some(12))));
+        for v in 14..=25i64 {
+            rows.push((v, CollapseRange::new(v, None, None)));
+        }
+        rows.push((26, CollapseRange::new(26, Some(13), Some(25))));
+
+        let watermark = rows
+            .iter()
+            .filter(|(_, r)| r.merged)
+            .map(|(_, r)| r.hi)
+            .max()
+            .expect("at least one merged row");
+        assert_eq!(watermark, 25, "highest collapsed_through in this fixture");
+
+        let live = live_series_versions(&rows);
+
+        // The correct, range-containment rule: v13's range [0,12] is not
+        // covered by v26's range [13,25], so v13 stays live alongside v26.
+        assert!(
+            live.contains(&13),
+            "v13's merge range [0,12] is not covered by v26's [13,25]; it must stay live, got {live:?}"
+        );
+        assert!(live.contains(&26), "the newest merge is always live");
+        assert_eq!(
+            live.len(),
+            2,
+            "exactly the two merge rows are live: v13 and v26, got {live:?}"
+        );
+
+        // The rule this guards against: a scalar watermark would call any
+        // version number <= 25 dead, incorrectly killing v13 (13 <= 25) even
+        // though its content is live. Demonstrate the two rules disagree.
+        assert!(
+            live.iter().any(|&v| v <= watermark),
+            "this fixture must contain a live version at or below the watermark, or it cannot \
+             distinguish range containment from a watermark rule"
+        );
+    }
+
+    /// `live_series_entries` (the `OplogEntry`-based counterpart) must agree
+    /// with `live_series_versions` on the same tiered shape.
+    #[test]
+    fn live_series_entries_agrees_with_live_series_versions_on_tiered_runs() {
+        let id = FileID::new_in_partition(
+            FileID::root_for(tinyfs::local_pond_uuid()).part_id(),
+            EntryType::FilePhysicalSeries,
+            tinyfs::local_pond_uuid(),
+        );
+
+        fn entry(
+            id: FileID,
+            version: i64,
+            collapsed_from: Option<i64>,
+            collapsed_through: Option<i64>,
+        ) -> OplogEntry {
+            let mut e = OplogEntry::new_small_file(id, 0, version, Vec::new(), 0);
+            e.size = Some(1);
+            e.collapsed_from = collapsed_from;
+            e.collapsed_through = collapsed_through;
+            e
+        }
+
+        let mut records = Vec::new();
+        for v in 1..=12i64 {
+            records.push(entry(id, v, None, None));
+        }
+        records.push(entry(id, 13, None, Some(12)));
+        for v in 14..=25i64 {
+            records.push(entry(id, v, None, None));
+        }
+        records.push(entry(id, 26, Some(13), Some(25)));
+
+        let live_versions: Vec<i64> = live_series_entries(&records)
+            .into_iter()
+            .map(|e| e.version)
+            .collect();
+        assert_eq!(
+            live_versions,
+            vec![13, 26],
+            "live_series_entries must select the same live rows as live_series_versions, \
+             ordered oldest content first"
+        );
     }
 }

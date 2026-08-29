@@ -194,10 +194,14 @@ impl Steward {
     /// When `force` is true, checkpoint is always created.
     /// When `compact` is true, also merges small parquet files into larger ones.
     /// Returns a default (empty) report for Host stewards.
-    pub async fn maintain(&mut self, force: bool, compact: bool) -> MaintenanceReport {
+    pub async fn maintain(
+        &mut self,
+        force: bool,
+        compact: bool,
+    ) -> Result<MaintenanceReport, StewardError> {
         match self {
             Steward::Pond(ship) => ship.maintain(force, compact).await,
-            Steward::Host(_) => MaintenanceReport::default(),
+            Steward::Host(_) => Ok(MaintenanceReport::default()),
         }
     }
 
@@ -214,6 +218,25 @@ impl Steward {
     ) -> Result<Vec<tlogfs::CollapsibleSeries>, StewardError> {
         match self {
             Steward::Pond(ship) => ship.survey_collapsible_series(threshold).await,
+            Steward::Host(_) => Ok(Vec::new()),
+        }
+    }
+
+    /// Report which native v2 series pack maintenance would repack at
+    /// `threshold`, and the bounded physical layout it would publish,
+    /// without writing anything.
+    ///
+    /// Returns an empty survey for Host stewards, which hold no series.
+    ///
+    /// # Errors
+    /// Returns an error if the discovery read transaction, a series'
+    /// manifest fold, or this pond's local pack-index enumeration fails.
+    pub async fn survey_pack_maintenance(
+        &mut self,
+        threshold: usize,
+    ) -> Result<Vec<crate::PackMaintenanceCandidate>, StewardError> {
+        match self {
+            Steward::Pond(ship) => ship.survey_pack_maintenance(threshold).await,
             Steward::Host(_) => Ok(Vec::new()),
         }
     }

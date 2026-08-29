@@ -6,7 +6,7 @@
 //! of the single delta-managed content-addressed remote (design Section 8,
 //! Decisions D6 and D7).
 
-use steward::{Ship, push_content_to_remote};
+use steward::{ContentVerifyState, Ship, push_content_to_remote, verify_content_against_remote};
 use sync_store::ContentRemote;
 use sync_store::content::{Commit, ObjectHash};
 use tempfile::tempdir;
@@ -56,7 +56,7 @@ async fn push_lands_objects_and_decodable_tip() {
         .expect("push");
 
     let _ = remote
-        .inspect_recovery_recipe_dp_commit_3()
+        .inspect_recovery_recipe_watertown_commit_v1()
         .await
         .expect("push installs the Pond-free recovery recipe");
     assert!(outcome.objects_pushed >= 1);
@@ -159,4 +159,69 @@ async fn re_push_same_tip_is_idempotent() {
             .is_empty(),
         "native pushes do not maintain capsule generations"
     );
+}
+
+#[tokio::test]
+async fn verify_reads_authoritative_tip_with_stale_open_ship() {
+    let (pond_dir, mut writer) = new_pond("verify-fresh-tip").await;
+    write_file(&mut writer, "/a.txt", b"alpha").await;
+
+    let pond_id = uuid::Uuid::parse_str(writer.data_persistence().pond_id()).expect("pond id");
+    let remote_dir = tempdir().expect("remote dir");
+    let mut remote = ContentRemote::create_at(remote_dir.path().join("remote"), pond_id)
+        .await
+        .expect("create remote");
+    let first = push_content_to_remote(&writer, &mut remote, "main")
+        .await
+        .expect("push first tip");
+
+    let stale_open_ship = Ship::open_pond(pond_dir.path().join("pond"))
+        .await
+        .expect("open verifier before next write");
+    write_file(&mut writer, "/b.txt", b"beta").await;
+
+    let report = verify_content_against_remote(&stale_open_ship, &remote, "main")
+        .await
+        .expect("verify from stale-open Ship");
+    assert_ne!(report.local_tip, Some(first.tip));
+    assert_eq!(
+        report.state,
+        ContentVerifyState::RemoteBehind { local_unpushed: 1 }
+    );
+}
+
+#[tokio::test]
+async fn verify_rejects_remote_ref_with_missing_tip_object() {
+    let (_pond_dir, mut ship) = new_pond("verify-missing-tip").await;
+    write_file(&mut ship, "/a.txt", b"alpha").await;
+    let tip_seq = ship
+        .control_table()
+        .latest_spine_seq()
+        .await
+        .expect("read tip seq")
+        .expect("content tip");
+    let tip = ObjectHash::from_hex(
+        &ship
+            .control_table()
+            .commit_hash_at(tip_seq)
+            .await
+            .expect("read tip")
+            .expect("tip hash"),
+    )
+    .expect("decode tip");
+
+    let pond_id = uuid::Uuid::parse_str(ship.data_persistence().pond_id()).expect("pond id");
+    let remote_dir = tempdir().expect("remote dir");
+    let mut remote = ContentRemote::create_at(remote_dir.path().join("remote"), pond_id)
+        .await
+        .expect("create remote");
+    let _remote_seq = remote
+        .push_commit(&[], "main", tip)
+        .await
+        .expect("publish dangling tip ref");
+
+    let error = verify_content_against_remote(&ship, &remote, "main")
+        .await
+        .expect_err("dangling remote tip must fail verification");
+    assert!(error.to_string().contains("has no commit object"));
 }

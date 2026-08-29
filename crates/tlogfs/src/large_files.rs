@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::error::TLogFSError;
 use log::{debug, info};
 use parquet::basic::Compression;
 use std::future::Future;
@@ -192,6 +193,42 @@ pub async fn find_large_file_path<P: AsRef<Path>>(
     }
 
     Ok(None)
+}
+
+/// Read the full content of an externalized large file by its BLAKE3 hash,
+/// reconstructing it from the parquet-chunked storage under `_large_files/`.
+///
+/// Shared by [`crate::persistence::OpLogPersistence::read_large_file_bytes`]
+/// (public read-back API) and write-time logical-leaf stamping (which must
+/// read back externalized bytes for `Large` content refs to compute
+/// `logical_leaf_hash`), so the lookup/read logic lives in exactly one place.
+pub async fn read_external_bytes<P: AsRef<Path>>(
+    pond_path: P,
+    blake3: &str,
+) -> Result<Vec<u8>, TLogFSError> {
+    use tokio::io::AsyncReadExt;
+    let path = find_large_file_path(pond_path.as_ref(), blake3)
+        .await
+        .map_err(|e| TLogFSError::ArrowMessage(format!("locate large file {blake3}: {e}")))?
+        .ok_or_else(|| TLogFSError::LargeFileNotFound {
+            blake3: blake3.to_string(),
+            path: format!("_large_files/blake3={blake3}"),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "large file not found"),
+        })?;
+    let mut reader =
+        ParquetFileReader::new(path.clone())
+            .await
+            .map_err(|e| TLogFSError::LargeFileNotFound {
+                blake3: blake3.to_string(),
+                path: path.display().to_string(),
+                source: e,
+            })?;
+    let mut buf = Vec::new();
+    let _ = reader
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| TLogFSError::ArrowMessage(format!("read large file {blake3}: {e}")))?;
+    Ok(buf)
 }
 
 /// Check if content should be stored as large file

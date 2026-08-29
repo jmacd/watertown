@@ -48,24 +48,40 @@ mod capsule;
 mod commit;
 mod manifest;
 mod node_merkle;
+mod series_dispatch;
 mod series_leaf;
+mod series_manifest;
+mod series_merkle;
+mod series_pack;
+mod series_pack_builder;
 mod tree;
 
 pub use capsule::{
-    CAPSULE_FORMAT_V1, CapsuleEntry, CapsuleLeaf, CapsuleManifest, CapsuleNode, CapsuleObject,
-    CapsulePayloadKind, CapsuleSource, CapsuleVerifyReport, capsule_leaf_hash,
+    CAPSULE_FORMAT_V1, CAPSULE_FORMAT_V2, CapsuleEntry, CapsuleLeaf, CapsuleManifest, CapsuleNode,
+    CapsuleObject, CapsulePayloadKind, CapsuleSource, CapsuleVerifyReport, capsule_leaf_hash,
     capsule_manifest_bytes, capsule_root, capsule_series_root, decode_capsule_manifest,
     encode_capsule_attributes, read_capsule_manifest, verify_capsule_directory,
     verify_capsule_payload_directory, verify_capsule_payloads,
     verify_incremental_capsule_payload_directory,
 };
-pub use commit::{Commit, Provenance};
+pub use commit::{Commit, ContentModelVersion, Provenance};
 pub use manifest::{ManifestEntry, decode_manifest, encode_manifest, manifest_hash};
 pub use node_merkle::{NodeMerkle, rebuild_root as node_merkle_rebuild_root};
+pub use series_dispatch::{FetchedSeriesObject, decode_fetched_series_object};
 pub use series_leaf::{
     IncrementalFileLeafHasher, IncrementalTableLeafHasher, canonicalize_schema,
     encode_canonical_attributes, encode_canonical_batch_rows, encode_canonical_schema,
-    file_leaf_hash, schema_fingerprint, table_leaf_hash,
+    file_leaf_hash, file_leaf_hash_canonical, schema_fingerprint, table_leaf_hash,
+    table_leaf_hash_canonical,
+};
+pub use series_manifest::{PayloadKind, SeriesManifest};
+pub use series_merkle::{RangeProof, generate_range_proof, merkle_root, verify_range_proof};
+pub use series_pack::{
+    PackIndex, PackLeafDescriptor, select_exact_cover, verify_pack_against_manifest,
+};
+pub use series_pack_builder::{
+    BuiltSeriesPack, FileLeafInput, FilePackLayout, TableLeafInput, TablePackLayout,
+    build_file_pack, build_table_pack, encode_table_leaf_parquet,
 };
 pub use tree::{
     TreeEntry, VersionMeta, decode_recipe, decode_series, decode_tree, encode_recipe,
@@ -163,6 +179,10 @@ pub(crate) fn push_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 /// Append a `u64`-length-prefixed byte field to `buf`.
+///
+/// Used by [`series_leaf`] for the fields `docs/logical-series-identity-design.md`
+/// specifies as `u64`-framed (the canonical row/file payload and each
+/// variable-width scalar), which can exceed what a `u32` length can address.
 pub(crate) fn push_len_prefixed_u64(buf: &mut Vec<u8>, bytes: &[u8]) {
     let len = u64::try_from(bytes.len()).expect("field length exceeds u64::MAX");
     buf.extend_from_slice(&len.to_le_bytes());
@@ -221,7 +241,11 @@ impl<'a> Cursor<'a> {
     pub(crate) fn expect_tag(&mut self, tag: &[u8]) -> Result<(), String> {
         let got = self.take(tag.len())?;
         if got != tag {
-            return Err("bad magic header".to_string());
+            return Err(format!(
+                "bad magic header: expected {expected:?}, found {found:?}",
+                expected = String::from_utf8_lossy(tag),
+                found = String::from_utf8_lossy(got)
+            ));
         }
         Ok(())
     }
@@ -249,6 +273,13 @@ impl<'a> Cursor<'a> {
         let mut arr = [0u8; 8];
         arr.copy_from_slice(slice);
         Ok(i64::from_le_bytes(arr))
+    }
+
+    pub(crate) fn take_u64(&mut self) -> Result<u64, String> {
+        let slice = self.take(8)?;
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(slice);
+        Ok(u64::from_le_bytes(arr))
     }
 
     pub(crate) fn take_len_prefixed(&mut self) -> Result<&'a [u8], String> {
