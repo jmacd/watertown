@@ -86,7 +86,9 @@ use arrow_schema::Schema;
 use tinyfs::{EntryType, FileID};
 use tokio::io::AsyncReadExt;
 
-use sync_store::content::{ObjectHash, PackIndex, PackLeafDescriptor, SeriesManifest};
+use sync_store::content::{
+    ObjectHash, PackIndex, PackLeafDescriptor, SeriesManifest, effective_leaf_schema_fingerprint,
+};
 
 use crate::{StewardError, content_pull, content_tree, pack_store};
 
@@ -285,6 +287,41 @@ fn ceil_div(n: u64, d: u64) -> usize {
     usize::try_from(total).unwrap_or(usize::MAX)
 }
 
+fn proposed_physical_objects(
+    entry_type: EntryType,
+    manifest: &SeriesManifest,
+    ordered: &[content_tree::SeriesVersionData],
+) -> Result<usize, StewardError> {
+    if entry_type != EntryType::TablePhysicalSeries {
+        return Ok(ceil_div(manifest.logical_count(), layout_cap(entry_type)).max(1));
+    }
+
+    let mut objects = 0usize;
+    let mut run_fingerprint: Option<ObjectHash> = None;
+    let mut run_rows = 0u64;
+    for version in ordered.iter().filter(|v| v.logical_leaf_hash.is_some()) {
+        let fingerprint = version.schema_fingerprint.ok_or_else(|| {
+            StewardError::Content(
+                "leaf-bearing table version has no series_schema_fingerprint".to_string(),
+            )
+        })?;
+        let rows = u64::try_from(version.logical_count.ok_or_else(|| {
+            StewardError::Content("leaf-bearing table version has no logical_count".to_string())
+        })?)
+        .map_err(|_| StewardError::Content("table leaf logical_count is negative".to_string()))?;
+        if run_fingerprint != Some(fingerprint) {
+            objects = objects.saturating_add(ceil_div(run_rows, TABLE_PACK_MAX_ROWS_PER_OBJECT));
+            run_fingerprint = Some(fingerprint);
+            run_rows = 0;
+        }
+        run_rows = run_rows.checked_add(rows).ok_or_else(|| {
+            StewardError::Content("table schema-run row count overflows u64".to_string())
+        })?;
+    }
+    objects = objects.saturating_add(ceil_div(run_rows, TABLE_PACK_MAX_ROWS_PER_OBJECT));
+    Ok(objects.max(1))
+}
+
 fn candidate_from_series(
     series: &DiscoveredSeries,
     outcome: PackCandidateOutcome,
@@ -348,6 +385,15 @@ async fn current_pack_fanout(
         else {
             continue;
         };
+        for (descriptor_index, descriptor) in index.leaf_descriptors().iter().enumerate() {
+            let _ =
+                effective_leaf_schema_fingerprint(manifest, &index, descriptor).map_err(|e| {
+                    StewardError::Content(format!(
+                        "pack {pack_hash} descriptor {descriptor_index} is incompatible with series \
+                         {series_hash}: {e}"
+                    ))
+                })?;
+        }
         if index.leaf_start() == 0
             && index.leaf_end() == manifest.leaf_count()
             && index.total_leaf_count() == manifest.leaf_count()
@@ -499,8 +545,8 @@ async fn survey_all_v2_series(ship: &mut crate::Ship) -> Result<Vec<V2SeriesSurv
         let series_hash = manifest.hash();
         let (current_physical_objects, best_pack_hash) =
             current_pack_fanout(&pond_root, series_hash, &manifest).await?;
-        let cap = layout_cap(entry_type);
-        let proposed_physical_objects = ceil_div(manifest.logical_count(), cap).max(1);
+        let proposed_physical_objects =
+            proposed_physical_objects(entry_type, &manifest, &ordered_meta)?;
 
         // For a table series, a matching layout marker on the current best
         // full-range pack is a stronger, exact signal than the row-count
@@ -994,9 +1040,10 @@ async fn flush_table_object(
 ///
 /// # Errors
 ///
-/// Returns an error if the series manifest carries no schema fingerprint,
-/// if a leaf's Parquet bytes cannot be read, fetched, or decoded, if a
-/// decoded leaf's schema fingerprint does not match the manifest's, if a
+/// Returns an error if a leaf-bearing version carries no schema
+/// fingerprint, if a leaf's Parquet bytes cannot be read, fetched, or
+/// decoded, if a decoded leaf's schema fingerprint does not match that
+/// version's persisted fingerprint, if a
 /// leaf's decoded columns cannot be cast to the run's canonical schema, if
 /// a leaf's recomputed hash does not match its persisted
 /// `logical_leaf_hash` (corrupt row), or if the assembled [`PackIndex`]
@@ -1015,13 +1062,6 @@ async fn repack_table_series(
         .filter(|v| v.logical_leaf_hash.is_some())
         .collect();
 
-    let schema_fingerprint = series.manifest.schema_fingerprint().ok_or_else(|| {
-        StewardError::Content(format!(
-            "table series {} manifest has no schema_fingerprint",
-            series.file_id.node_id()
-        ))
-    })?;
-
     let mut whole_series_leaf_hashes = Vec::with_capacity(leaf_versions.len());
     let mut leaf_descriptors = Vec::with_capacity(leaf_versions.len());
     let mut physical_object_hashes: Vec<ObjectHash> = Vec::new();
@@ -1030,6 +1070,7 @@ async fn repack_table_series(
     let mut bytes_written = 0u64;
 
     let mut canonical_schema: Option<Arc<Schema>> = None;
+    let mut current_schema_fingerprint: Option<ObjectHash> = None;
     let mut pending_batches: Vec<RecordBatch> = Vec::new();
     let mut pending_rows: u64 = 0;
     // Incremental, proportional estimate of `pending_batches`' real
@@ -1046,6 +1087,43 @@ async fn repack_table_series(
 
     for v in &leaf_versions {
         let expected_leaf_hash = v.logical_leaf_hash.expect("filtered for Some above");
+        let leaf_schema_fingerprint = v.schema_fingerprint.ok_or_else(|| {
+            StewardError::Content(format!(
+                "leaf-bearing table series version {} for node {} has no \
+                 series_schema_fingerprint",
+                v.version,
+                series.file_id.node_id()
+            ))
+        })?;
+        if series.manifest.revision() == sync_store::content::SeriesManifestRevision::V1
+            && series.manifest.schema_fingerprint() != Some(leaf_schema_fingerprint)
+        {
+            return Err(StewardError::Content(format!(
+                "leaf-bearing table series version {} has schema fingerprint \
+                 {leaf_schema_fingerprint}, which does not match the v1 manifest's homogeneous \
+                 fingerprint {:?}",
+                v.version,
+                series.manifest.schema_fingerprint()
+            )));
+        }
+        if current_schema_fingerprint != Some(leaf_schema_fingerprint) {
+            if let Some(schema) = canonical_schema.as_ref() {
+                flush_table_object(
+                    pond_root,
+                    schema,
+                    &mut pending_batches,
+                    &mut physical_object_hashes,
+                    &mut objects_written,
+                    &mut bytes_written,
+                    &mut physical_byte_count,
+                )
+                .await?;
+            }
+            pending_rows = 0;
+            pending_bytes_estimate = 0;
+            canonical_schema = None;
+            current_schema_fingerprint = Some(leaf_schema_fingerprint);
+        }
         // Fetch this one leaf's inline content lazily, immediately before
         // decoding it, and let it drop once decoded -- never a whole
         // series' worth of inline leaves at once (finding 2). Owned
@@ -1073,9 +1151,11 @@ async fn repack_table_series(
                     ))
                 })?,
         };
-        let (decoded_schema, decoded_batches) =
-            content_pull::decode_table_object(bytes::Bytes::from(raw_bytes), schema_fingerprint)
-                .await?;
+        let (decoded_schema, decoded_batches) = content_pull::decode_table_object(
+            bytes::Bytes::from(raw_bytes),
+            leaf_schema_fingerprint,
+        )
+        .await?;
         let schema = match &canonical_schema {
             Some(schema) => Arc::clone(schema),
             None => {
@@ -1142,7 +1222,12 @@ async fn repack_table_series(
         }
 
         whole_series_leaf_hashes.push(leaf_input.leaf_hash());
-        leaf_descriptors.push(leaf_input.descriptor().clone());
+        leaf_descriptors.push(match series.manifest.revision() {
+            sync_store::content::SeriesManifestRevision::V1 => leaf_input.descriptor().clone(),
+            sync_store::content::SeriesManifestRevision::V2 => leaf_input
+                .descriptor()
+                .with_schema_fingerprint(leaf_schema_fingerprint),
+        });
 
         for batch in leaf_input.batches() {
             let total = batch.num_rows();
@@ -1257,18 +1342,32 @@ fn finish_pack_index(
     .map_err(StewardError::Content)?;
     let range_root = series.manifest.leaf_merkle_root();
 
-    let index = PackIndex::new(
-        series.series_hash,
-        0,
-        total_leaf_count,
-        total_leaf_count,
-        range_root,
-        range_proof,
-        physical_object_hashes,
-        series.manifest.logical_count(),
-        physical_byte_count,
-        leaf_descriptors,
-    )
+    let index = match series.manifest.revision() {
+        sync_store::content::SeriesManifestRevision::V1 => PackIndex::new(
+            series.series_hash,
+            0,
+            total_leaf_count,
+            total_leaf_count,
+            range_root,
+            range_proof,
+            physical_object_hashes,
+            series.manifest.logical_count(),
+            physical_byte_count,
+            leaf_descriptors,
+        ),
+        sync_store::content::SeriesManifestRevision::V2 => PackIndex::new_v2(
+            series.series_hash,
+            0,
+            total_leaf_count,
+            total_leaf_count,
+            range_root,
+            range_proof,
+            physical_object_hashes,
+            series.manifest.logical_count(),
+            physical_byte_count,
+            leaf_descriptors,
+        ),
+    }
     .map_err(StewardError::Content)?;
 
     sync_store::content::verify_pack_against_manifest(

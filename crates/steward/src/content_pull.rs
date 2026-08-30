@@ -31,8 +31,8 @@ use sync_store::content::{
     Commit, FetchedSeriesObject, IncrementalFileLeafHasher, ManifestEntry, ObjectHash, PackIndex,
     PackLeafDescriptor, PayloadKind, SeriesManifest, TreeEntry, VersionMeta,
     decode_fetched_series_object, decode_manifest, decode_recipe, decode_tree,
-    encode_table_leaf_parquet, schema_fingerprint, select_exact_cover, table_leaf_hash_canonical,
-    verify_pack_against_manifest,
+    effective_leaf_schema_fingerprint, encode_table_leaf_parquet, schema_fingerprint,
+    select_exact_cover, table_leaf_hash_canonical, verify_pack_against_manifest,
 };
 use tinyfs::{EntryType, NodeID, WD};
 use tlogfs::PondUserMetadata;
@@ -450,6 +450,14 @@ async fn fetch_series_v2(
                 "decode pack {pack_hash} for series {series_hash}: {e}"
             ))
         })?;
+        for (descriptor_index, descriptor) in pack.leaf_descriptors().iter().enumerate() {
+            let _ = effective_leaf_schema_fingerprint(&manifest, &pack, descriptor).map_err(|e| {
+                StewardError::Content(format!(
+                    "pack {pack_hash} descriptor {descriptor_index} is incompatible with series \
+                     {series_hash}: {e}"
+                ))
+            })?;
+        }
         candidates.push((pack_hash, pack));
     }
 
@@ -723,10 +731,11 @@ impl<'a> FileLeafPartitioner<'a> {
 
 /// Fetch, decode, and verify one table-payload (Parquet) pack
 /// (`docs/logical-series-identity-design.md` delivery gate 4): decode every
-/// physical object in order (checking its canonical schema fingerprint
-/// against `manifest.schema_fingerprint()` first), and partition the
-/// concatenated, row-order-preserving `RecordBatch` stream by the pack's
-/// descriptors.
+/// physical object in order and partition the concatenated,
+/// row-order-preserving `RecordBatch` stream by the pack's descriptors.
+/// Each object is checked against the effective schema fingerprint of the
+/// leaf currently being reconstructed. A schema transition is accepted only
+/// at a physical-object boundary.
 ///
 /// Buffering here is bounded *per physical object*, not per pack:
 /// [`decode_table_object`] decodes one object's row groups into memory
@@ -747,18 +756,12 @@ async fn fetch_and_verify_table_pack(
     graph: &mut FetchedGraph,
     blob_index: &mut Option<HashSet<ObjectHash>>,
 ) -> Result<Vec<ObjectHash>, StewardError> {
-    let expected_fingerprint = manifest.schema_fingerprint().ok_or_else(|| {
-        StewardError::Content(
-            "table series manifest declares no schema_fingerprint (payload kind mismatch)"
-                .to_string(),
-        )
-    })?;
-
-    let mut partitioner: Option<TableLeafPartitioner<'_>> = None;
+    let mut partitioner = TableLeafPartitioner::new(manifest, pack);
     let mut total_rows: u64 = 0;
     let mut total_physical_bytes: u64 = 0;
 
     for &object_hash in pack.physical_object_hashes() {
+        let expected_fingerprint = partitioner.expected_object_fingerprint()?;
         fetch_physical_object(remote, object_hash, graph, blob_index).await?;
         let (schema, batches) = match graph.objects.get(&object_hash) {
             Some(FetchedObject::Blob(bytes)) => {
@@ -810,13 +813,26 @@ async fn fetch_and_verify_table_pack(
                 )));
             }
         };
-        if partitioner.is_none() {
-            partitioner = Some(TableLeafPartitioner::new(schema, pack.leaf_descriptors()));
-        }
-        let part = partitioner.as_mut().expect("just set above");
+        let canonical_schema =
+            sync_store::content::canonicalize_schema(&schema).map_err(StewardError::Content)?;
         for batch in batches {
             total_rows += batch.num_rows() as u64;
-            part.feed(batch)?;
+            let mut columns = Vec::with_capacity(batch.num_columns());
+            for (column, field) in batch.columns().iter().zip(canonical_schema.fields()) {
+                columns.push(arrow_cast::cast(column, field.data_type()).map_err(|e| {
+                    StewardError::Content(format!(
+                        "normalize physical object {object_hash} column {:?}: {e}",
+                        field.name()
+                    ))
+                })?);
+            }
+            let normalized =
+                RecordBatch::try_new(Arc::clone(&canonical_schema), columns).map_err(|e| {
+                    StewardError::Content(format!(
+                        "normalize physical object {object_hash} schema: {e}"
+                    ))
+                })?;
+            partitioner.feed(normalized, expected_fingerprint)?;
         }
     }
     if total_physical_bytes != pack.physical_byte_count() {
@@ -825,11 +841,6 @@ async fn fetch_and_verify_table_pack(
             pack.physical_byte_count()
         )));
     }
-    let Some(partitioner) = partitioner else {
-        return Err(StewardError::Content(
-            "table pack names no physical objects (internal inconsistency)".to_string(),
-        ));
-    };
     if total_rows != pack.logical_count() {
         return Err(StewardError::Content(format!(
             "table pack decoded {total_rows} row(s) but declares logical_count {}",
@@ -844,38 +855,81 @@ async fn fetch_and_verify_table_pack(
 /// batches or physical objects), and produces exactly one recomputed leaf
 /// hash per descriptor. Holds at most one logical leaf's batches at a time.
 struct TableLeafPartitioner<'a> {
-    schema: Arc<Schema>,
-    descriptors: std::slice::Iter<'a, PackLeafDescriptor>,
-    current_descriptor: Option<&'a PackLeafDescriptor>,
+    manifest: &'a SeriesManifest,
+    pack: &'a PackIndex,
+    descriptors: &'a [PackLeafDescriptor],
+    next_descriptor: usize,
+    current_descriptor: Option<usize>,
+    current_schema: Option<Arc<Schema>>,
     current_batches: Vec<RecordBatch>,
     current_rows: u64,
     hashes: Vec<ObjectHash>,
 }
 
 impl<'a> TableLeafPartitioner<'a> {
-    fn new(schema: Arc<Schema>, descriptors: &'a [PackLeafDescriptor]) -> Self {
+    fn new(manifest: &'a SeriesManifest, pack: &'a PackIndex) -> Self {
         Self {
-            schema,
-            descriptors: descriptors.iter(),
+            manifest,
+            pack,
+            descriptors: pack.leaf_descriptors(),
+            next_descriptor: 0,
             current_descriptor: None,
+            current_schema: None,
             current_batches: Vec::new(),
             current_rows: 0,
-            hashes: Vec::with_capacity(descriptors.len()),
+            hashes: Vec::with_capacity(pack.leaf_descriptors().len()),
         }
     }
 
-    fn feed(&mut self, mut batch: RecordBatch) -> Result<(), StewardError> {
+    fn descriptor_fingerprint(&self, descriptor_index: usize) -> Result<ObjectHash, StewardError> {
+        let descriptor = self.descriptors.get(descriptor_index).ok_or_else(|| {
+            StewardError::Content(
+                "table pack's physical content extends beyond its declared leaf descriptors"
+                    .to_string(),
+            )
+        })?;
+        effective_leaf_schema_fingerprint(self.manifest, self.pack, descriptor)
+            .map_err(StewardError::Content)?
+            .ok_or_else(|| {
+                StewardError::Content(
+                    "table pack leaf resolved to no effective schema fingerprint".to_string(),
+                )
+            })
+    }
+
+    fn expected_object_fingerprint(&self) -> Result<ObjectHash, StewardError> {
+        self.descriptor_fingerprint(self.current_descriptor.unwrap_or(self.next_descriptor))
+    }
+
+    fn feed(
+        &mut self,
+        mut batch: RecordBatch,
+        object_fingerprint: ObjectHash,
+    ) -> Result<(), StewardError> {
         while batch.num_rows() > 0 {
             if self.current_descriptor.is_none() {
-                let Some(descriptor) = self.descriptors.next() else {
-                    return Err(StewardError::Content(
-                        "table pack's physical content extends beyond its declared leaf descriptors (trailing rows)"
-                            .to_string(),
-                    ));
-                };
-                self.current_descriptor = Some(descriptor);
+                let descriptor_index = self.next_descriptor;
+                let expected = self.descriptor_fingerprint(descriptor_index)?;
+                if expected != object_fingerprint {
+                    return Err(StewardError::Content(format!(
+                        "table physical object with schema fingerprint {object_fingerprint} \
+                         crosses a leaf schema transition; descriptor {descriptor_index} requires \
+                         {expected}"
+                    )));
+                }
+                self.next_descriptor += 1;
+                self.current_descriptor = Some(descriptor_index);
+                self.current_schema = Some(batch.schema());
             }
-            let descriptor = self.current_descriptor.expect("just set above");
+            let descriptor_index = self.current_descriptor.expect("just set above");
+            let descriptor = &self.descriptors[descriptor_index];
+            let expected = self.descriptor_fingerprint(descriptor_index)?;
+            if expected != object_fingerprint {
+                return Err(StewardError::Content(format!(
+                    "table logical leaf {descriptor_index} spans physical objects with different \
+                     schema fingerprints ({expected} then {object_fingerprint})"
+                )));
+            }
             let needed = descriptor.logical_count() - self.current_rows;
             let take = needed.min(batch.num_rows() as u64) as usize;
             self.current_batches.push(batch.slice(0, take));
@@ -883,7 +937,9 @@ impl<'a> TableLeafPartitioner<'a> {
             batch = batch.slice(take, batch.num_rows() - take);
             if self.current_rows == descriptor.logical_count() {
                 let hash = table_leaf_hash_canonical(
-                    &self.schema,
+                    self.current_schema
+                        .as_ref()
+                        .expect("current table leaf always has a schema"),
                     &self.current_batches,
                     descriptor.min_event_time(),
                     descriptor.max_event_time(),
@@ -894,18 +950,19 @@ impl<'a> TableLeafPartitioner<'a> {
                 self.current_batches.clear();
                 self.current_rows = 0;
                 self.current_descriptor = None;
+                self.current_schema = None;
             }
         }
         Ok(())
     }
 
-    fn finish(mut self) -> Result<Vec<ObjectHash>, StewardError> {
+    fn finish(self) -> Result<Vec<ObjectHash>, StewardError> {
         if self.current_descriptor.is_some() || !self.current_batches.is_empty() {
             return Err(StewardError::Content(
                 "table pack's physical content ended mid-leaf (truncated rows)".to_string(),
             ));
         }
-        if self.descriptors.next().is_some() {
+        if self.next_descriptor != self.descriptors.len() {
             return Err(StewardError::Content(
                 "table pack's physical content has fewer rows than its declared leaf descriptors"
                     .to_string(),
@@ -3221,45 +3278,41 @@ async fn materialize_table_series_v2(
     leaves_from: u64,
     replicated_mtime: Option<i64>,
 ) -> Result<(), StewardError> {
-    let expected_fingerprint = series.manifest.schema_fingerprint().ok_or_else(|| {
-        StewardError::Content(
-            "table series manifest declares no schema_fingerprint (payload kind mismatch)"
-                .to_string(),
-        )
-    })?;
     let total_leaves = series.manifest.leaf_count();
     if total_leaves == 0 {
-        // Unlike a `FilePhysicalSeries`, a genuinely empty
-        // `TablePhysicalSeries` cannot be materialized at all: any table
-        // series node this writes would itself need a schema fingerprint
-        // to be foldable into a valid `watertown.series.v1` manifest by this same
-        // destination's own future commits ([`SeriesManifest::new`]
-        // unconditionally requires one for [`PayloadKind::Table`]), and a
-        // zero-content write can never carry one (a real schema is only
-        // ever known from decoding nonempty Parquet bytes). Reject clearly
-        // here, before any destination mutation, rather than let
-        // `materialize_empty_series` create an un-foldable node whose
-        // corruption would only surface later as an opaque root mismatch
-        // or precommit fold failure (release blocker item 1,
-        // `docs/logical-series-identity-design.md`).
         return Err(StewardError::Content(format!(
-            "v2 table series {name:?} (node {node_id}) declares leaf_count() == 0 -- a table \
-             series with no logical leaves can never carry the schema fingerprint every \
-             watertown.series.v1 table manifest requires, so it cannot be materialized as a \
-             TablePhysicalSeries; refusing to create a node this destination could never fold \
-             back into a valid manifest itself"
+            "v2 table series {name:?} (node {node_id}) declares leaf_count() == 0; the current \
+             TablePhysicalSeries writer cannot create a schema-less zero-byte table version, so \
+             this empty table series cannot yet be materialized"
         )));
     }
     let mut leaf_index: u64 = 0;
     let mut node_created = false;
-    let mut current_descriptor: Option<&PackLeafDescriptor> = None;
+    let mut current_descriptor: Option<usize> = None;
     let mut current_batches: Vec<RecordBatch> = Vec::new();
     let mut current_rows: u64 = 0;
     let mut current_schema: Option<Arc<Schema>> = None;
 
     for (pack_hash, pack) in &series.packs {
-        let mut descriptors = pack.leaf_descriptors().iter();
+        let descriptors = pack.leaf_descriptors();
+        let mut next_descriptor = 0usize;
         for &object_hash in pack.physical_object_hashes() {
+            let descriptor_index = current_descriptor.unwrap_or(next_descriptor);
+            let descriptor = descriptors.get(descriptor_index).ok_or_else(|| {
+                StewardError::Content(
+                    "table series' physical content extends beyond its declared leaf descriptors"
+                        .to_string(),
+                )
+            })?;
+            let expected_fingerprint =
+                effective_leaf_schema_fingerprint(&series.manifest, pack, descriptor)
+                    .map_err(StewardError::Content)?
+                    .ok_or_else(|| {
+                        StewardError::Content(
+                            "table series leaf resolved to no effective schema fingerprint"
+                                .to_string(),
+                        )
+                    })?;
             let (schema, batches) = match graph.objects.get(&object_hash) {
                 Some(FetchedObject::Blob(bytes)) => {
                     let source = bytes::Bytes::from(bytes.clone());
@@ -3287,15 +3340,31 @@ async fn materialize_table_series_v2(
                     )));
                 }
             };
-            if current_schema.is_none() {
-                current_schema = Some(schema);
-            }
-            let schema = current_schema.clone().expect("just set above");
+            let canonical_schema =
+                sync_store::content::canonicalize_schema(&schema).map_err(StewardError::Content)?;
             for batch in batches {
+                let mut columns = Vec::with_capacity(batch.num_columns());
+                for (column, field) in batch.columns().iter().zip(canonical_schema.fields()) {
+                    columns.push(arrow_cast::cast(column, field.data_type()).map_err(|e| {
+                        StewardError::Content(format!(
+                            "normalize physical object {object_hash} column {:?}: {e}",
+                            field.name()
+                        ))
+                    })?);
+                }
+                let normalized = RecordBatch::try_new(Arc::clone(&canonical_schema), columns)
+                    .map_err(|e| {
+                        StewardError::Content(format!(
+                            "normalize physical object {object_hash} schema: {e}"
+                        ))
+                    })?;
                 feed_table_batch(
-                    batch,
-                    &schema,
-                    &mut descriptors,
+                    normalized,
+                    expected_fingerprint,
+                    &series.manifest,
+                    pack,
+                    descriptors,
+                    &mut next_descriptor,
                     pwd,
                     name,
                     node_id,
@@ -3307,6 +3376,7 @@ async fn materialize_table_series_v2(
                     &mut current_descriptor,
                     &mut current_batches,
                     &mut current_rows,
+                    &mut current_schema,
                     replicated_mtime,
                     total_leaves,
                 )
@@ -3319,7 +3389,7 @@ async fn materialize_table_series_v2(
                  boundary (a leaf never spans packs)"
             )));
         }
-        if descriptors.next().is_some() {
+        if next_descriptor != descriptors.len() {
             return Err(StewardError::Content(format!(
                 "table series pack {pack_hash} has fewer rows than its declared leaf descriptors"
             )));
@@ -3338,10 +3408,13 @@ async fn materialize_table_series_v2(
 /// through the leaf partitioner, writing out any leaf it completes at or
 /// after `leaves_from`.
 #[allow(clippy::too_many_arguments)]
-async fn feed_table_batch<'d>(
+async fn feed_table_batch(
     mut batch: RecordBatch,
-    schema: &Arc<Schema>,
-    descriptors: &mut std::slice::Iter<'d, PackLeafDescriptor>,
+    object_fingerprint: ObjectHash,
+    manifest: &SeriesManifest,
+    pack: &PackIndex,
+    descriptors: &[PackLeafDescriptor],
+    next_descriptor: &mut usize,
     pwd: &WD,
     name: &str,
     node_id: NodeID,
@@ -3350,24 +3423,55 @@ async fn feed_table_batch<'d>(
     leaf_index: &mut u64,
     leaves_from: u64,
     leaf_hashes: &[ObjectHash],
-    current_descriptor: &mut Option<&'d PackLeafDescriptor>,
+    current_descriptor: &mut Option<usize>,
     current_batches: &mut Vec<RecordBatch>,
     current_rows: &mut u64,
+    current_schema: &mut Option<Arc<Schema>>,
     replicated_mtime: Option<i64>,
     total_leaves: u64,
 ) -> Result<(), StewardError> {
     while batch.num_rows() > 0 {
         if current_descriptor.is_none() {
-            let Some(d) = descriptors.next() else {
+            let descriptor_index = *next_descriptor;
+            let Some(d) = descriptors.get(descriptor_index) else {
                 return Err(StewardError::Content(
                     "table series' physical content extends beyond its declared leaf \
                      descriptors (trailing rows)"
                         .to_string(),
                 ));
             };
-            *current_descriptor = Some(d);
+            let expected = effective_leaf_schema_fingerprint(manifest, pack, d)
+                .map_err(StewardError::Content)?
+                .ok_or_else(|| {
+                    StewardError::Content(
+                        "table series leaf resolved to no effective schema fingerprint".to_string(),
+                    )
+                })?;
+            if expected != object_fingerprint {
+                return Err(StewardError::Content(format!(
+                    "table physical object with schema fingerprint {object_fingerprint} crosses \
+                     a leaf schema transition; descriptor {descriptor_index} requires {expected}"
+                )));
+            }
+            *next_descriptor += 1;
+            *current_descriptor = Some(descriptor_index);
+            *current_schema = Some(batch.schema());
         }
-        let d = current_descriptor.expect("just set above");
+        let descriptor_index = current_descriptor.expect("just set above");
+        let d = &descriptors[descriptor_index];
+        let expected = effective_leaf_schema_fingerprint(manifest, pack, d)
+            .map_err(StewardError::Content)?
+            .ok_or_else(|| {
+                StewardError::Content(
+                    "table series leaf resolved to no effective schema fingerprint".to_string(),
+                )
+            })?;
+        if expected != object_fingerprint {
+            return Err(StewardError::Content(format!(
+                "table logical leaf {descriptor_index} spans physical objects with different \
+                 schema fingerprints ({expected} then {object_fingerprint})"
+            )));
+        }
         let needed = d.logical_count() - *current_rows;
         let take = needed.min(batch.num_rows() as u64) as usize;
         current_batches.push(batch.slice(0, take));
@@ -3375,7 +3479,9 @@ async fn feed_table_batch<'d>(
         batch = batch.slice(take, batch.num_rows() - take);
         if *current_rows == d.logical_count() {
             let hash = table_leaf_hash_canonical(
-                schema,
+                current_schema
+                    .as_ref()
+                    .expect("current table leaf always has a schema"),
                 current_batches,
                 d.min_event_time(),
                 d.max_event_time(),
@@ -3398,8 +3504,13 @@ async fn feed_table_batch<'d>(
                 )));
             }
             if *leaf_index >= leaves_from {
-                let parquet_bytes = encode_table_leaf_parquet(schema, current_batches)
-                    .map_err(StewardError::Content)?;
+                let parquet_bytes = encode_table_leaf_parquet(
+                    current_schema
+                        .as_ref()
+                        .expect("current table leaf always has a schema"),
+                    current_batches,
+                )
+                .map_err(StewardError::Content)?;
                 let is_last = *leaf_index + 1 == total_leaves;
                 let mut writer = if create && !*node_created {
                     *node_created = true;
@@ -3468,6 +3579,7 @@ async fn feed_table_batch<'d>(
             current_batches.clear();
             *current_rows = 0;
             *current_descriptor = None;
+            *current_schema = None;
             *leaf_index += 1;
         }
     }
@@ -3613,6 +3725,9 @@ fn series_versions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::{Int64Array, StringArray};
+    use arrow_schema::{DataType, Field};
+    use sync_store::content::{generate_range_proof, merkle_root};
 
     fn series_entry(child_hash: ObjectHash, timestamp: i64) -> ManifestEntry {
         ManifestEntry::new(
@@ -3700,5 +3815,66 @@ mod tests {
         assert!(detail.contains("blob 0 differs"), "{detail}");
         assert!(detail.contains(&expected_blob.to_hex()), "{detail}");
         assert!(detail.contains(&actual_blob.to_hex()), "{detail}");
+    }
+
+    #[test]
+    fn table_partitioner_rejects_object_crossing_schema_transition() {
+        let schema_a = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("label", DataType::Utf8, false),
+        ]));
+        let schema_b = Arc::new(Schema::new(vec![Field::new(
+            "measurement",
+            DataType::Int64,
+            false,
+        )]));
+        let fingerprint_a = schema_fingerprint(&schema_a).expect("fingerprint a");
+        let fingerprint_b = schema_fingerprint(&schema_b).expect("fingerprint b");
+        let leaves = vec![
+            ObjectHash::of_bytes(b"leaf-a"),
+            ObjectHash::of_bytes(b"leaf-b"),
+        ];
+        let manifest = SeriesManifest::new_v2(
+            PayloadKind::Table,
+            2,
+            2,
+            None,
+            None,
+            None,
+            merkle_root(&leaves),
+        )
+        .expect("manifest");
+        let descriptors = vec![
+            PackLeafDescriptor::new_with_schema(1, Some(fingerprint_a), None, None, None)
+                .expect("descriptor a"),
+            PackLeafDescriptor::new_with_schema(1, Some(fingerprint_b), None, None, None)
+                .expect("descriptor b"),
+        ];
+        let pack = PackIndex::new_v2(
+            manifest.hash(),
+            0,
+            2,
+            2,
+            manifest.leaf_merkle_root(),
+            generate_range_proof(&leaves, 0, 2).expect("proof"),
+            vec![ObjectHash::of_bytes(b"object")],
+            2,
+            100,
+            descriptors,
+        )
+        .expect("pack");
+        let batch = RecordBatch::try_new(
+            schema_a,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .expect("batch");
+        let mut partitioner = TableLeafPartitioner::new(&manifest, &pack);
+        let err = partitioner
+            .feed(batch, fingerprint_a)
+            .expect_err("one physical object must not cross the transition");
+        assert!(err.to_string().contains("crosses a leaf schema transition"));
     }
 }

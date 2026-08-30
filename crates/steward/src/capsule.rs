@@ -255,10 +255,49 @@ pub(crate) async fn build_recovery_capsule_from_materialized(
     })
 }
 
-/// Install the static `dp.commit.3` recovery recipe under a remote's budget.
+/// Static recovery recipe selected for an explicit remote operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryRecipeFlavor {
+    /// Current target-native `watertown.commit.v1` to logical `pondcapsule.2`.
+    TargetFormat,
+    /// Deliberate legacy `dp.commit.3` to opaque `pondcapsule.legacy.1` migration.
+    LegacyMigration,
+}
+
+impl RecoveryRecipeFlavor {
+    /// Stable operator-facing flavor name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::TargetFormat => "target-format",
+            Self::LegacyMigration => "legacy-migration",
+        }
+    }
+
+    /// Native backup format consumed by this recipe.
+    #[must_use]
+    pub const fn native_format(self) -> &'static str {
+        match self {
+            Self::TargetFormat => "watertown.commit.v1",
+            Self::LegacyMigration => "dp.commit.3",
+        }
+    }
+
+    /// Capsule format produced by this recipe.
+    #[must_use]
+    pub const fn capsule_format(self) -> &'static str {
+        match self {
+            Self::TargetFormat => "pondcapsule.2",
+            Self::LegacyMigration => "pondcapsule.legacy.1",
+        }
+    }
+}
+
+/// Install the selected static recovery recipe under a remote's budget.
 pub async fn open_and_publish_recovery_recipe_limited(
     url: &str,
     storage_options: HashMap<String, String>,
+    flavor: RecoveryRecipeFlavor,
     limits: &mut LimiterSet,
 ) -> Result<sync_store::RecoveryRecipePublishOutcome, StewardError> {
     crate::storage_meter::metered_op(
@@ -268,19 +307,30 @@ pub async fn open_and_publish_recovery_recipe_limited(
             let remote = sync_store::ContentRemote::open_at_url(url, storage_options)
                 .await
                 .map_err(|error| StewardError::Aborted(format!("open remote {url}: {error}")))?;
-            remote
-                .publish_recovery_recipe_watertown_commit_v1()
-                .await
-                .map_err(|error| StewardError::Content(format!("publish recovery recipe: {error}")))
+            match flavor {
+                RecoveryRecipeFlavor::TargetFormat => {
+                    remote.publish_recovery_recipe_watertown_commit_v1().await
+                }
+                RecoveryRecipeFlavor::LegacyMigration => {
+                    remote.publish_recovery_recipe_legacy_migration().await
+                }
+            }
+            .map_err(|error| {
+                StewardError::Content(format!(
+                    "publish {} recovery recipe: {error}",
+                    flavor.name()
+                ))
+            })
         }),
     )
     .await
 }
 
-/// Verify the static `dp.commit.3` recovery recipe under a remote's budget.
+/// Verify the selected static recovery recipe under a remote's budget.
 pub async fn open_and_inspect_recovery_recipe_limited(
     url: &str,
     storage_options: HashMap<String, String>,
+    flavor: RecoveryRecipeFlavor,
     limits: &mut LimiterSet,
 ) -> Result<ObjectHash, StewardError> {
     crate::storage_meter::metered_op(
@@ -290,10 +340,20 @@ pub async fn open_and_inspect_recovery_recipe_limited(
             let remote = sync_store::ContentRemote::open_at_url(url, storage_options)
                 .await
                 .map_err(|error| StewardError::Aborted(format!("open remote {url}: {error}")))?;
-            remote
-                .inspect_recovery_recipe_watertown_commit_v1()
-                .await
-                .map_err(|error| StewardError::Content(format!("inspect recovery recipe: {error}")))
+            match flavor {
+                RecoveryRecipeFlavor::TargetFormat => {
+                    remote.inspect_recovery_recipe_watertown_commit_v1().await
+                }
+                RecoveryRecipeFlavor::LegacyMigration => {
+                    remote.inspect_recovery_recipe_legacy_migration().await
+                }
+            }
+            .map_err(|error| {
+                StewardError::Content(format!(
+                    "inspect {} recovery recipe: {error}",
+                    flavor.name()
+                ))
+            })
         }),
     )
     .await

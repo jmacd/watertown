@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Magic-dispatch over a fetched series object: `dp.series.1` (v1, a plain
-//! ordered list of version blob hashes) versus `watertown.series.v1` (v2, a decoded
-//! [`super::series_manifest::SeriesManifest`]).
+//! Magic-dispatch over a fetched series object: `dp.series.1` (a plain
+//! ordered list of version blob hashes), `watertown.series.v1` (the
+//! homogeneous native manifest), or `watertown.series.v2` (the per-leaf-
+//! schema native manifest).
 //!
 //! `docs/logical-series-identity-design.md` delivery gate 4 ("Add a dual
 //! reader"). A `TreeEntry.child_hash` for a `FilePhysicalSeries` or
@@ -21,18 +22,20 @@
 //! series -- see `steward`'s explicit `SeriesV2` rejection in its
 //! planning/apply path (v2 native materialization is a later delivery gate).
 
-use super::series_manifest::{MANIFEST_MAGIC, SeriesManifest};
+use super::series_manifest::{MANIFEST_MAGIC_V1, MANIFEST_MAGIC_V2, SeriesManifest};
 use super::tree::SERIES_MAGIC;
 use super::{ObjectHash, decode_series};
 
-/// The decoded, dispatched form of a fetched series object -- whichever of
-/// the two known encodings its magic header named.
+/// The decoded, dispatched form of a fetched series object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchedSeriesObject {
     /// A `dp.series.1` object: the ordered per-version blob hashes
     /// [`super::decode_series`] already returns.
     V1(Vec<ObjectHash>),
     /// A `watertown.series.v1` object: a decoded [`SeriesManifest`].
+    ///
+    /// The manifest itself retains whether its exact native wire revision
+    /// was v1 or v2.
     V2(SeriesManifest),
 }
 
@@ -62,17 +65,26 @@ pub fn decode_fetched_series_object(bytes: &[u8]) -> Result<FetchedSeriesObject,
             .map(FetchedSeriesObject::V1)
             .map_err(|e| format!("dp.series.1 series object: {e}"));
     }
-    if bytes.starts_with(MANIFEST_MAGIC) {
+    if bytes.starts_with(MANIFEST_MAGIC_V1) {
         return SeriesManifest::decode(bytes)
             .map(FetchedSeriesObject::V2)
             .map_err(|e| format!("watertown.series.v1 series object: {e}"));
     }
-    let preview_len = bytes
-        .len()
-        .min(SERIES_MAGIC.len().max(MANIFEST_MAGIC.len()));
+    if bytes.starts_with(MANIFEST_MAGIC_V2) {
+        return SeriesManifest::decode(bytes)
+            .map(FetchedSeriesObject::V2)
+            .map_err(|e| format!("watertown.series.v2 series object: {e}"));
+    }
+    let preview_len = bytes.len().min(
+        SERIES_MAGIC
+            .len()
+            .max(MANIFEST_MAGIC_V1.len())
+            .max(MANIFEST_MAGIC_V2.len()),
+    );
     Err(format!(
-        "fetched series object matches neither known magic \
-         ({SERIES_MAGIC:?} for dp.series.1 or {MANIFEST_MAGIC:?} for watertown.series.v1); \
+        "fetched series object matches no known magic \
+         ({SERIES_MAGIC:?} for dp.series.1, {MANIFEST_MAGIC_V1:?} for \
+         watertown.series.v1, or {MANIFEST_MAGIC_V2:?} for watertown.series.v2); \
          got {} byte(s) starting with {:?}",
         bytes.len(),
         &bytes[..preview_len]
@@ -112,6 +124,22 @@ mod tests {
     }
 
     #[test]
+    fn dispatches_v3() {
+        let leaves = vec![h("x"), h("y"), h("z")];
+        let root = merkle_root(&leaves);
+        let manifest = SeriesManifest::new_v2(PayloadKind::Table, 30, 3, None, None, None, root)
+            .expect("valid manifest");
+        let bytes = manifest.encode();
+        match decode_fetched_series_object(&bytes).expect("decode v3") {
+            FetchedSeriesObject::V2(got) => {
+                assert_eq!(got, manifest);
+                assert_eq!(got.revision(), crate::content::SeriesManifestRevision::V2);
+            }
+            FetchedSeriesObject::V1(_) => panic!("expected native manifest"),
+        }
+    }
+
+    #[test]
     fn rejects_unknown_magic() {
         let bytes = b"dp.something-else.1\nrest of the bytes".to_vec();
         let err = decode_fetched_series_object(&bytes).expect_err("unknown magic must fail");
@@ -120,6 +148,10 @@ mod tests {
             err.contains("watertown.series.v1"),
             "error should name v2: {err}"
         );
+        assert!(
+            err.contains("watertown.series.v2"),
+            "error should name v3: {err}"
+        );
     }
 
     #[test]
@@ -127,6 +159,7 @@ mod tests {
         let err = decode_fetched_series_object(&[]).expect_err("empty bytes must fail");
         assert!(err.contains("dp.series.1"));
         assert!(err.contains("watertown.series.v1"));
+        assert!(err.contains("watertown.series.v2"));
     }
 
     #[test]

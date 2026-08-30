@@ -72,7 +72,7 @@ use super::series_leaf::{
     file_leaf_hash_canonical, schema_fingerprint, table_leaf_hash_canonical,
     validate_canonical_attributes,
 };
-use super::series_manifest::{PayloadKind, SeriesManifest};
+use super::series_manifest::{PayloadKind, SeriesManifest, SeriesManifestRevision};
 use super::series_merkle::{generate_range_proof, merkle_root};
 use super::series_pack::{PackIndex, PackLeafDescriptor, verify_pack_against_manifest};
 
@@ -588,18 +588,32 @@ pub fn build_file_pack(
     let range_proof = generate_range_proof(whole_series_leaf_hashes, start_usize, end_usize)?;
     let range_root = manifest.leaf_merkle_root();
 
-    let index = PackIndex::new(
-        manifest_hash,
-        leaf_start,
-        leaf_end,
-        manifest.leaf_count(),
-        range_root,
-        range_proof,
-        physical_object_hashes,
-        logical_count,
-        physical_byte_count,
-        descriptors,
-    )?;
+    let index = match manifest.revision() {
+        SeriesManifestRevision::V1 => PackIndex::new(
+            manifest_hash,
+            leaf_start,
+            leaf_end,
+            manifest.leaf_count(),
+            range_root,
+            range_proof,
+            physical_object_hashes,
+            logical_count,
+            physical_byte_count,
+            descriptors,
+        ),
+        SeriesManifestRevision::V2 => PackIndex::new_v2(
+            manifest_hash,
+            leaf_start,
+            leaf_end,
+            manifest.leaf_count(),
+            range_root,
+            range_proof,
+            physical_object_hashes,
+            logical_count,
+            physical_byte_count,
+            descriptors,
+        ),
+    }?;
 
     verify_pack_against_manifest(manifest_hash, manifest, &index, &range_leaf_hashes)?;
 
@@ -614,10 +628,10 @@ pub fn build_file_pack(
 /// splitting `leaves`' rows into self-contained Parquet physical objects
 /// per `layout`.
 ///
-/// Every leaf in `leaves` must share the identical canonical schema
-/// fingerprint (that of `leaves[0]`), and that fingerprint must equal
-/// `manifest.schema_fingerprint()`. See [`build_file_pack`]'s docs for the
-/// rest of what this checks before returning.
+/// For a legacy v1 manifest every leaf must retain the manifest's one
+/// homogeneous schema fingerprint. A v2 manifest accepts heterogeneous
+/// leaves, but physical Parquet objects are flushed at every schema-
+/// fingerprint transition so no object crosses a schema boundary.
 ///
 /// # Errors
 ///
@@ -645,15 +659,16 @@ pub fn build_table_pack(
     let Some(first) = leaves.first() else {
         return Err("a pack must cover at least one logical leaf".to_string());
     };
-    let schema = Arc::clone(first.schema());
     let fingerprint = first.schema_fingerprint();
-    for (i, leaf) in leaves.iter().enumerate().skip(1) {
-        if leaf.schema_fingerprint() != fingerprint {
-            return Err(format!(
-                "leaf {i} has schema fingerprint {} but leaf 0 has {fingerprint} (every leaf in a \
-                 table pack must share one canonical schema)",
-                leaf.schema_fingerprint()
-            ));
+    if manifest.revision() == SeriesManifestRevision::V1 {
+        for (i, leaf) in leaves.iter().enumerate().skip(1) {
+            if leaf.schema_fingerprint() != fingerprint {
+                return Err(format!(
+                    "leaf {i} has schema fingerprint {} but leaf 0 has {fingerprint} (a v1 table \
+                     manifest requires one homogeneous schema)",
+                    leaf.schema_fingerprint()
+                ));
+            }
         }
     }
     verify_manifest_binding(
@@ -661,7 +676,10 @@ pub fn build_table_pack(
         manifest,
         whole_series_leaf_hashes,
         PayloadKind::Table,
-        Some(fingerprint),
+        match manifest.revision() {
+            SeriesManifestRevision::V1 => Some(fingerprint),
+            SeriesManifestRevision::V2 => None,
+        },
     )?;
 
     let leaf_len = leaves.len() as u64;
@@ -679,14 +697,19 @@ pub fn build_table_pack(
         logical_count = logical_count
             .checked_add(leaf.row_count())
             .ok_or_else(|| "pack logical_count overflows u64".to_string())?;
-        descriptors.push(leaf.descriptor().clone());
+        descriptors.push(match manifest.revision() {
+            SeriesManifestRevision::V1 => leaf.descriptor().clone(),
+            SeriesManifestRevision::V2 => leaf
+                .descriptor()
+                .with_schema_fingerprint(leaf.schema_fingerprint()),
+        });
     }
 
     if leaf_start == 0 && leaf_end == manifest.leaf_count() {
         verify_full_range_aggregate(manifest, &descriptors, logical_count)?;
     }
 
-    let physical_objects = build_table_physical_objects(&schema, leaves, layout)?;
+    let physical_objects = build_table_physical_objects(leaves, layout)?;
     let physical_byte_count = checked_physical_byte_count(&physical_objects)?;
     let physical_object_hashes: Vec<ObjectHash> =
         physical_objects.iter().map(|(hash, _)| *hash).collect();
@@ -698,18 +721,32 @@ pub fn build_table_pack(
     let range_proof = generate_range_proof(whole_series_leaf_hashes, start_usize, end_usize)?;
     let range_root = manifest.leaf_merkle_root();
 
-    let index = PackIndex::new(
-        manifest_hash,
-        leaf_start,
-        leaf_end,
-        manifest.leaf_count(),
-        range_root,
-        range_proof,
-        physical_object_hashes,
-        logical_count,
-        physical_byte_count,
-        descriptors,
-    )?;
+    let index = match manifest.revision() {
+        SeriesManifestRevision::V1 => PackIndex::new(
+            manifest_hash,
+            leaf_start,
+            leaf_end,
+            manifest.leaf_count(),
+            range_root,
+            range_proof,
+            physical_object_hashes,
+            logical_count,
+            physical_byte_count,
+            descriptors,
+        ),
+        SeriesManifestRevision::V2 => PackIndex::new_v2(
+            manifest_hash,
+            leaf_start,
+            leaf_end,
+            manifest.leaf_count(),
+            range_root,
+            range_proof,
+            physical_object_hashes,
+            logical_count,
+            physical_byte_count,
+            descriptors,
+        ),
+    }?;
 
     verify_pack_against_manifest(manifest_hash, manifest, &index, &range_leaf_hashes)?;
 
@@ -771,7 +808,6 @@ fn build_file_physical_objects(leaves: &[FileLeafInput], cap: usize) -> Vec<(Obj
 ///
 /// Propagates a Parquet encode error from [`write_table_object`].
 fn build_table_physical_objects(
-    schema: &Arc<Schema>,
     leaves: &[TableLeafInput],
     layout: &TablePackLayout,
 ) -> Result<Vec<(ObjectHash, Vec<u8>)>, String> {
@@ -779,7 +815,23 @@ fn build_table_physical_objects(
     let mut objects = Vec::new();
     let mut current_pieces: Vec<RecordBatch> = Vec::new();
     let mut current_rows: u64 = 0;
+    let mut current_fingerprint: Option<ObjectHash> = None;
+    let mut current_schema: Option<Arc<Schema>> = None;
     for leaf in leaves {
+        if current_fingerprint != Some(leaf.schema_fingerprint()) {
+            if !current_pieces.is_empty() {
+                objects.push(write_table_object(
+                    current_schema
+                        .as_ref()
+                        .expect("pending table rows always have a schema"),
+                    &current_pieces,
+                )?);
+                current_pieces.clear();
+                current_rows = 0;
+            }
+            current_fingerprint = Some(leaf.schema_fingerprint());
+            current_schema = Some(Arc::clone(leaf.schema()));
+        }
         for batch in leaf.batches() {
             let total = batch.num_rows();
             let mut offset = 0usize;
@@ -793,7 +845,12 @@ fn build_table_physical_objects(
                     offset += take;
                 }
                 if current_rows == cap {
-                    objects.push(write_table_object(schema, &current_pieces)?);
+                    objects.push(write_table_object(
+                        current_schema
+                            .as_ref()
+                            .expect("pending table rows always have a schema"),
+                        &current_pieces,
+                    )?);
                     current_pieces.clear();
                     current_rows = 0;
                 }
@@ -801,7 +858,12 @@ fn build_table_physical_objects(
         }
     }
     if !current_pieces.is_empty() {
-        objects.push(write_table_object(schema, &current_pieces)?);
+        objects.push(write_table_object(
+            current_schema
+                .as_ref()
+                .expect("pending table rows always have a schema"),
+            &current_pieces,
+        )?);
     }
     Ok(objects)
 }
@@ -1756,7 +1818,81 @@ mod tests {
             &layout,
         )
         .expect_err("mismatched leaf schemas must fail");
-        assert!(err.contains("must share one canonical schema"));
+        assert!(err.contains("v1 table manifest requires one homogeneous schema"));
+    }
+
+    #[test]
+    fn v2_table_pack_splits_physical_objects_at_schema_transitions() {
+        let schema_a = i64_string_schema();
+        let schema_b = Arc::new(Schema::new(vec![Field::new(
+            "measurement",
+            DataType::Int64,
+            false,
+        )]));
+        let leaf_a = TableLeafInput::new(
+            schema_a.clone(),
+            vec![batch(&schema_a, &[1, 2], &["a", "b"])],
+            None,
+            None,
+            None,
+        )
+        .expect("leaf a");
+        let batch_b = RecordBatch::try_new(
+            schema_b.clone(),
+            vec![Arc::new(Int64Array::from(vec![3, 4]))],
+        )
+        .expect("batch b");
+        let leaf_b =
+            TableLeafInput::new(schema_b.clone(), vec![batch_b], None, None, None).expect("leaf b");
+        let leaves = vec![leaf_a, leaf_b];
+        let leaf_hashes: Vec<ObjectHash> = leaves.iter().map(TableLeafInput::leaf_hash).collect();
+        let manifest = SeriesManifest::new_v2(
+            PayloadKind::Table,
+            4,
+            2,
+            None,
+            None,
+            None,
+            whole_merkle_root(&leaf_hashes),
+        )
+        .expect("v2 manifest");
+        let built = build_table_pack(
+            manifest.hash(),
+            &manifest,
+            &leaf_hashes,
+            0,
+            &leaves,
+            &TablePackLayout::new(100).expect("layout"),
+        )
+        .expect("heterogeneous pack");
+
+        assert_eq!(
+            built.physical_objects.len(),
+            2,
+            "a large row cap must not merge rows across a schema transition"
+        );
+        assert_eq!(
+            built.index.revision(),
+            crate::content::PackIndexRevision::V2
+        );
+        assert_eq!(
+            built.index.leaf_descriptors()[0].schema_fingerprint(),
+            Some(leaves[0].schema_fingerprint())
+        );
+        assert_eq!(
+            built.index.leaf_descriptors()[1].schema_fingerprint(),
+            Some(leaves[1].schema_fingerprint())
+        );
+        let (decoded_a, _) = decode_parquet(&built.physical_objects[0].1);
+        let (decoded_b, _) = decode_parquet(&built.physical_objects[1].1);
+        assert_eq!(
+            schema_fingerprint(&decoded_a).expect("schema a fingerprint"),
+            leaves[0].schema_fingerprint()
+        );
+        assert_eq!(
+            schema_fingerprint(&decoded_b).expect("schema b fingerprint"),
+            leaves[1].schema_fingerprint()
+        );
     }
 
     #[test]

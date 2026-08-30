@@ -46,6 +46,7 @@
 
 mod capsule;
 mod commit;
+mod legacy_capsule;
 mod manifest;
 mod node_merkle;
 mod series_dispatch;
@@ -65,6 +66,14 @@ pub use capsule::{
     verify_incremental_capsule_payload_directory,
 };
 pub use commit::{Commit, ContentModelVersion, Provenance};
+pub use legacy_capsule::{
+    LEGACY_CAPSULE_FORMAT, LEGACY_NATIVE_FORMAT_DP_COMMIT_3, LegacyCapsuleEntry,
+    LegacyCapsuleManifest, LegacyCapsuleNode, LegacyCapsuleObject, LegacyCapsulePayloadKind,
+    LegacyCapsuleSource, LegacyCapsuleVerifyReport, LegacyCapsuleVersion,
+    decode_legacy_capsule_manifest, legacy_capsule_manifest_bytes, legacy_capsule_root,
+    read_legacy_capsule_manifest, verify_legacy_capsule_directory,
+    verify_legacy_capsule_payload_directory,
+};
 pub use manifest::{ManifestEntry, decode_manifest, encode_manifest, manifest_hash};
 pub use node_merkle::{NodeMerkle, rebuild_root as node_merkle_rebuild_root};
 pub use series_dispatch::{FetchedSeriesObject, decode_fetched_series_object};
@@ -74,10 +83,11 @@ pub use series_leaf::{
     file_leaf_hash, file_leaf_hash_canonical, schema_fingerprint, table_leaf_hash,
     table_leaf_hash_canonical,
 };
-pub use series_manifest::{PayloadKind, SeriesManifest};
+pub use series_manifest::{PayloadKind, SeriesManifest, SeriesManifestRevision};
 pub use series_merkle::{RangeProof, generate_range_proof, merkle_root, verify_range_proof};
 pub use series_pack::{
-    PackIndex, PackLeafDescriptor, select_exact_cover, verify_pack_against_manifest,
+    PackIndex, PackIndexRevision, PackLeafDescriptor, effective_leaf_schema_fingerprint,
+    select_exact_cover, verify_pack_against_manifest,
 };
 pub use series_pack_builder::{
     BuiltSeriesPack, FileLeafInput, FilePackLayout, TableLeafInput, TablePackLayout,

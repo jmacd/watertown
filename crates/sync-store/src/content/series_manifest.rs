@@ -1,17 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `watertown.series.v1` root object: the fetchable identity of one logical series.
+//! Native series-manifest root objects: the fetchable identity of one logical series.
 //!
 //! `docs/logical-series-identity-design.md` delivery gate 2. A
-//! [`SeriesManifest`] aggregates everything a `watertown.series.v1` object commits to
+//! [`SeriesManifest`] aggregates everything a native series object commits to
 //! over the whole ordered run of logical leaves (see
-//! [`super::series_leaf`]): the payload kind, the schema fingerprint (table
-//! only), the aggregate logical row/byte count, the leaf count, aggregate
-//! event-time bounds, canonical logical attributes, and the
+//! [`super::series_leaf`]): the payload kind, aggregate logical row/byte
+//! count, leaf count, aggregate event-time bounds, canonical logical
+//! attributes, and the
 //! [`super::series_merkle`] leaf Merkle root. Its own BLAKE3 hash --
 //! [`SeriesManifest::hash`] over [`SeriesManifest::encode`] -- is both the
 //! series' identity and the content address a `ManifestEntry.child_hash`
 //! (once wired up in a later gate) would name.
+//!
+//! `watertown.series.v1` additionally carried one homogeneous table schema
+//! fingerprint. Its strict decoder and byte-for-byte re-encoder remain for
+//! existing objects. `watertown.series.v2` drops that global field: table
+//! schemas are immutable per logical leaf, committed by each leaf hash and
+//! carried explicitly by the corresponding v2 pack descriptor.
 //!
 //! Packs are deliberately absent from this object: per the design doc,
 //! "Physical pack index" data is derived storage metadata, excluded from the
@@ -27,13 +33,9 @@ use super::series_leaf::{LEAF_HAS_MAX, LEAF_HAS_MIN, LEAF_KIND_FILE, LEAF_KIND_T
 use super::series_merkle::merkle_root;
 use super::{Cursor, ObjectHash, push_len_prefixed};
 
-/// Magic header for a `watertown.series.v1` root object.
-///
-/// `pub(crate)`: [`super::series_dispatch`] dispatches a fetched series
-/// object between this (v2) and [`super::tree::SERIES_MAGIC`] (v1) by
-/// inspecting the same magic bytes, so it must reference this exact constant
-/// rather than risk a second, potentially-divergent literal.
-pub(crate) const MANIFEST_MAGIC: &[u8] = b"watertown.series.v1\n";
+/// Magic headers for the two native series-manifest revisions.
+pub(crate) const MANIFEST_MAGIC_V1: &[u8] = b"watertown.series.v1\n";
+pub(crate) const MANIFEST_MAGIC_V2: &[u8] = b"watertown.series.v2\n";
 
 /// Known `bounds_flags` bits; any other bit set is a decode error, matching
 /// [`super::series_leaf`]'s and [`super::tree`]'s "unknown flag" convention.
@@ -47,11 +49,9 @@ const KNOWN_BOUNDS_FLAGS: u8 = LEAF_HAS_MIN | LEAF_HAS_MAX;
 /// never silently diverge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayloadKind {
-    /// Leaves are `TablePhysicalSeries` rows; a schema fingerprint is
-    /// required.
+    /// Leaves are `TablePhysicalSeries` rows.
     Table,
-    /// Leaves are `FilePhysicalSeries` byte ranges; a schema fingerprint is
-    /// forbidden.
+    /// Leaves are `FilePhysicalSeries` byte ranges.
     File,
 }
 
@@ -72,14 +72,25 @@ impl PayloadKind {
     }
 }
 
-/// The `watertown.series.v1` root object: one logical series' fetchable identity.
+/// The native wire revision retained by a decoded manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeriesManifestRevision {
+    /// Legacy homogeneous-table manifest with one global schema fingerprint.
+    V1,
+    /// Per-leaf-schema manifest with no global schema field.
+    V2,
+}
+
+/// One logical series' fetchable native identity.
 ///
 /// See the module docs for exactly what this commits to and why packs are
 /// excluded. Construct with [`SeriesManifest::new`] (or decode existing
 /// bytes with [`SeriesManifest::decode`]); both apply the same invariants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeriesManifest {
+    revision: SeriesManifestRevision,
     payload_kind: PayloadKind,
+    // Present only on decoded/constructed v1 homogeneous table manifests.
     schema_fingerprint: Option<ObjectHash>,
     logical_count: u64,
     leaf_count: u64,
@@ -90,7 +101,7 @@ pub struct SeriesManifest {
 }
 
 impl SeriesManifest {
-    /// Construct a validated `watertown.series.v1` root object.
+    /// Construct a validated legacy `watertown.series.v1` root object.
     ///
     /// `logical_attributes`, when given, must already be canonical logical-
     /// attribute bytes exactly as
@@ -121,6 +132,7 @@ impl SeriesManifest {
         leaf_merkle_root: ObjectHash,
     ) -> Result<Self, String> {
         validate(
+            SeriesManifestRevision::V1,
             payload_kind,
             schema_fingerprint,
             logical_count,
@@ -129,6 +141,7 @@ impl SeriesManifest {
             leaf_merkle_root,
         )?;
         Ok(Self {
+            revision: SeriesManifestRevision::V1,
             payload_kind,
             schema_fingerprint,
             logical_count,
@@ -140,13 +153,61 @@ impl SeriesManifest {
         })
     }
 
+    /// Construct a validated `watertown.series.v2` root object.
+    ///
+    /// Unlike [`Self::new`], this revision has no series-global schema
+    /// fingerprint. Every nonempty table leaf commits to its own schema in
+    /// its logical leaf hash, and a v2 pack carries that fingerprint on the
+    /// corresponding leaf descriptor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_v2(
+        payload_kind: PayloadKind,
+        logical_count: u64,
+        leaf_count: u64,
+        min_event_time: Option<i64>,
+        max_event_time: Option<i64>,
+        logical_attributes: Option<Vec<u8>>,
+        leaf_merkle_root: ObjectHash,
+    ) -> Result<Self, String> {
+        validate(
+            SeriesManifestRevision::V2,
+            payload_kind,
+            None,
+            logical_count,
+            leaf_count,
+            &logical_attributes,
+            leaf_merkle_root,
+        )?;
+        Ok(Self {
+            revision: SeriesManifestRevision::V2,
+            payload_kind,
+            schema_fingerprint: None,
+            logical_count,
+            leaf_count,
+            min_event_time,
+            max_event_time,
+            logical_attributes,
+            leaf_merkle_root,
+        })
+    }
+
+    /// The native wire revision this value encodes as.
+    #[must_use]
+    pub fn revision(&self) -> SeriesManifestRevision {
+        self.revision
+    }
+
     /// The series' payload kind.
     #[must_use]
     pub fn payload_kind(&self) -> PayloadKind {
         self.payload_kind
     }
 
-    /// The table schema fingerprint, or `None` for a file series.
+    /// The v1 homogeneous table schema fingerprint.
+    ///
+    /// This is `Some` only for a legacy `watertown.series.v1` table
+    /// manifest. A v2 table manifest intentionally returns `None`; consumers
+    /// obtain each leaf's effective fingerprint from its pack descriptor.
     #[must_use]
     pub fn schema_fingerprint(&self) -> Option<ObjectHash> {
         self.schema_fingerprint
@@ -192,10 +253,10 @@ impl SeriesManifest {
         self.leaf_merkle_root
     }
 
-    /// Serialize this object into its `watertown.series.v1` wire bytes:
+    /// Serialize this object into its retained native wire revision.
     ///
     /// ```text
-    /// MANIFEST_MAGIC
+    /// MANIFEST_MAGIC_V1
     /// u8      payload_kind
     /// u32 LE  schema_fingerprint length (0 or 32) + bytes
     /// u64 LE  logical_count
@@ -207,16 +268,24 @@ impl SeriesManifest {
     /// 32      leaf_merkle_root
     /// ```
     ///
+    /// The v2 encoding is identical after the magic and `payload_kind`
+    /// except that the schema-fingerprint length and bytes are omitted.
+    ///
     /// These bytes *are* the object; [`SeriesManifest::hash`] is `blake3` of
     /// exactly this encoding.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(64 + self.logical_attributes.as_ref().map_or(0, Vec::len));
-        buf.extend_from_slice(MANIFEST_MAGIC);
+        match self.revision {
+            SeriesManifestRevision::V1 => buf.extend_from_slice(MANIFEST_MAGIC_V1),
+            SeriesManifestRevision::V2 => buf.extend_from_slice(MANIFEST_MAGIC_V2),
+        }
         buf.push(self.payload_kind.to_wire());
-        match self.schema_fingerprint {
-            Some(h) => push_len_prefixed(&mut buf, h.as_bytes()),
-            None => push_len_prefixed(&mut buf, &[]),
+        if self.revision == SeriesManifestRevision::V1 {
+            match self.schema_fingerprint {
+                Some(h) => push_len_prefixed(&mut buf, h.as_bytes()),
+                None => push_len_prefixed(&mut buf, &[]),
+            }
         }
         buf.extend_from_slice(&self.logical_count.to_le_bytes());
         buf.extend_from_slice(&self.leaf_count.to_le_bytes());
@@ -248,7 +317,7 @@ impl SeriesManifest {
         ObjectHash::of_bytes(&self.encode())
     }
 
-    /// Decode a `watertown.series.v1` root object (the inverse of
+    /// Decode either native manifest revision (the inverse of
     /// [`SeriesManifest::encode`]), applying the same invariants as
     /// [`SeriesManifest::new`].
     ///
@@ -261,21 +330,43 @@ impl SeriesManifest {
     /// (if any) are not canonical JSON object bytes, or any of
     /// [`SeriesManifest::new`]'s invariants fail.
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
-        let mut cur = Cursor::new(bytes);
-        cur.expect_tag(MANIFEST_MAGIC)?;
-        let payload_kind = PayloadKind::from_wire(cur.take_u8()?)?;
-        let schema_bytes = cur.take_len_prefixed()?;
-        let schema_fingerprint = if schema_bytes.is_empty() {
-            None
-        } else if schema_bytes.len() == 32 {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(schema_bytes);
-            Some(ObjectHash::from_bytes(arr))
+        let revision = if bytes.starts_with(MANIFEST_MAGIC_V1) {
+            SeriesManifestRevision::V1
+        } else if bytes.starts_with(MANIFEST_MAGIC_V2) {
+            SeriesManifestRevision::V2
         } else {
+            let preview_len = bytes
+                .len()
+                .min(MANIFEST_MAGIC_V1.len().max(MANIFEST_MAGIC_V2.len()));
             return Err(format!(
-                "schema fingerprint must be 0 or 32 bytes, got {}",
-                schema_bytes.len()
+                "bad series manifest magic: expected {MANIFEST_MAGIC_V1:?} or \
+                 {MANIFEST_MAGIC_V2:?}, found {:?}",
+                &bytes[..preview_len]
             ));
+        };
+        let mut cur = Cursor::new(bytes);
+        cur.expect_tag(match revision {
+            SeriesManifestRevision::V1 => MANIFEST_MAGIC_V1,
+            SeriesManifestRevision::V2 => MANIFEST_MAGIC_V2,
+        })?;
+        let payload_kind = PayloadKind::from_wire(cur.take_u8()?)?;
+        let schema_fingerprint = match revision {
+            SeriesManifestRevision::V1 => {
+                let schema_bytes = cur.take_len_prefixed()?;
+                if schema_bytes.is_empty() {
+                    None
+                } else if schema_bytes.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(schema_bytes);
+                    Some(ObjectHash::from_bytes(arr))
+                } else {
+                    return Err(format!(
+                        "schema fingerprint must be 0 or 32 bytes, got {}",
+                        schema_bytes.len()
+                    ));
+                }
+            }
+            SeriesManifestRevision::V2 => None,
         };
         let logical_count = cur.take_u64()?;
         let leaf_count = cur.take_u64()?;
@@ -306,7 +397,17 @@ impl SeriesManifest {
                 cur.remaining()
             ));
         }
-        Self::new(
+        validate(
+            revision,
+            payload_kind,
+            schema_fingerprint,
+            logical_count,
+            leaf_count,
+            &logical_attributes,
+            leaf_merkle_root,
+        )?;
+        Ok(Self {
+            revision,
             payload_kind,
             schema_fingerprint,
             logical_count,
@@ -315,13 +416,14 @@ impl SeriesManifest {
             max_event_time,
             logical_attributes,
             leaf_merkle_root,
-        )
+        })
     }
 }
 
 /// Shared invariant checks for [`SeriesManifest::new`] and
 /// [`SeriesManifest::decode`].
 fn validate(
+    revision: SeriesManifestRevision,
     payload_kind: PayloadKind,
     schema_fingerprint: Option<ObjectHash>,
     logical_count: u64,
@@ -335,14 +437,20 @@ fn validate(
              logical_count={logical_count} leaf_count={leaf_count}"
         ));
     }
-    match (payload_kind, schema_fingerprint) {
-        (PayloadKind::Table, None) => {
-            return Err("a table series requires a schema fingerprint".to_string());
+    match revision {
+        SeriesManifestRevision::V1 => match (payload_kind, schema_fingerprint) {
+            (PayloadKind::Table, None) => {
+                return Err("a v1 table series requires a schema fingerprint".to_string());
+            }
+            (PayloadKind::File, Some(_)) => {
+                return Err("a file series must not carry a schema fingerprint".to_string());
+            }
+            _ => {}
+        },
+        SeriesManifestRevision::V2 if schema_fingerprint.is_some() => {
+            return Err("a v2 series manifest has no global schema fingerprint field".to_string());
         }
-        (PayloadKind::File, Some(_)) => {
-            return Err("a file series must not carry a schema fingerprint".to_string());
-        }
-        _ => {}
+        SeriesManifestRevision::V2 => {}
     }
     if let Some(attrs) = logical_attributes {
         if attrs.is_empty() {
@@ -402,9 +510,22 @@ mod tests {
         .unwrap()
     }
 
+    fn valid_v2_table() -> SeriesManifest {
+        SeriesManifest::new_v2(
+            PayloadKind::Table,
+            100,
+            3,
+            Some(10),
+            Some(20),
+            None,
+            merkle_root(&[h("l1"), h("l2"), h("l3")]),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn round_trips_encode_decode() {
-        for m in [valid_table(), valid_file()] {
+        for m in [valid_table(), valid_file(), valid_v2_table()] {
             let bytes = m.encode();
             let decoded = SeriesManifest::decode(&bytes).unwrap();
             assert_eq!(decoded, m);
@@ -445,6 +566,15 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("schema"));
+    }
+
+    #[test]
+    fn v2_table_has_no_global_schema_field() {
+        let manifest = valid_v2_table();
+        assert_eq!(manifest.revision(), SeriesManifestRevision::V2);
+        assert_eq!(manifest.payload_kind(), PayloadKind::Table);
+        assert_eq!(manifest.schema_fingerprint(), None);
+        assert!(manifest.encode().starts_with(MANIFEST_MAGIC_V2));
     }
 
     #[test]
@@ -614,7 +744,7 @@ mod tests {
     fn decode_rejects_unknown_payload_kind() {
         let mut bytes = valid_file().encode();
         // payload_kind is the first byte right after the magic.
-        bytes[MANIFEST_MAGIC.len()] = 0xaa;
+        bytes[MANIFEST_MAGIC_V1.len()] = 0xaa;
         assert!(SeriesManifest::decode(&bytes).is_err());
     }
 
@@ -624,7 +754,7 @@ mod tests {
         let bytes = m.encode();
         // Locate the bounds_flags byte: magic + kind(1) + schema len(4) +
         // schema bytes(0, file series) + logical_count(8) + leaf_count(8).
-        let flags_pos = MANIFEST_MAGIC.len() + 1 + 4 + 8 + 8;
+        let flags_pos = MANIFEST_MAGIC_V1.len() + 1 + 4 + 8 + 8;
         assert_eq!(bytes[flags_pos], 0);
         let mut mutated = bytes.clone();
         mutated[flags_pos] = 0b1000_0000;
@@ -636,7 +766,7 @@ mod tests {
         // Hand-build a table manifest whose schema fingerprint field claims
         // 5 bytes instead of 0 or 32.
         let mut buf = Vec::new();
-        buf.extend_from_slice(MANIFEST_MAGIC);
+        buf.extend_from_slice(MANIFEST_MAGIC_V1);
         buf.push(LEAF_KIND_TABLE);
         buf.extend_from_slice(&5u32.to_le_bytes());
         buf.extend_from_slice(&[0u8; 5]);
@@ -655,7 +785,7 @@ mod tests {
         // allocation: `take_len_prefixed` slices the existing buffer rather
         // than allocating from the declared length.
         let mut buf = Vec::new();
-        buf.extend_from_slice(MANIFEST_MAGIC);
+        buf.extend_from_slice(MANIFEST_MAGIC_V1);
         buf.push(LEAF_KIND_FILE);
         buf.extend_from_slice(&0u32.to_le_bytes());
         buf.extend_from_slice(&0u64.to_le_bytes());

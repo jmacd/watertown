@@ -1,10 +1,10 @@
 # Recovery Capsules and Format Upgrades
 
-> **Status:** `pondcapsule.1` remains the frozen migration input format.
-> `pondcapsule.2` is implemented as the new explicit output format for
-> `watertown.*.v1` ponds; native v2 pack-aware extraction is still in progress.
-> Phase one is implemented for `dp.commit.3`; production
-> publication and recovery exercises remain.
+> **Status:** `pondcapsule.1` and its published `dp.commit.3` recipe remain
+> frozen compatibility material. `pondcapsule.2` remains the homogeneous
+> logical capsule used by its existing producers/consumers.
+> `pondcapsule.legacy.1` is the separate opaque migration envelope for legacy
+> physical payloads, including table series whose schema evolved by version.
 >
 > This document is the authoritative design for the current static-recipe
 > mechanism. Superseded per-commit capsule publication is retained only in Git
@@ -45,6 +45,10 @@ portable capsule uses its own explicit `pondcapsule` namespace:
   Watertown ponds. It has a distinct manifest format identifier and root hash
   domain, while retaining the same verified logical payload model during the
   migration transition.
+- `pondcapsule.legacy.1` is an immutable opaque migration envelope with its own
+  `pondcapsule.legacy.root.1\n` root domain. It authenticates raw physical
+  objects and the native leaf-to-object/version mapping; it does not reuse or
+  reinterpret either earlier capsule protocol.
 
 The mechanism has two distinct artifacts:
 
@@ -67,7 +71,7 @@ For `dp.commit.3`, ContentRemote stores:
 Standard Delta and Parquet readers can access all of this without running a
 source-format `pond`.
 
-The static recipe:
+The frozen logical recipe:
 
 1. downloads the complete native backup;
 2. resolves live rows by greatest transaction sequence;
@@ -75,8 +79,17 @@ The static recipe:
 4. verifies the commit, node-Merkle root, tree/manifest agreement, and every
    content address;
 5. decodes the selected native graph;
-6. writes a `pondcapsule.2` manifest and plain payload objects; and
+6. writes its existing logical capsule manifest and plain payload objects; and
 7. verifies the portable capsule.
+
+The distinct `recovery/legacy-migration` recipe verifies the same legacy
+`dp.commit.3` graph but copies every physical table/file version as exact raw
+bytes into `pondcapsule.legacy.1`. It does not import PyArrow, inspect Parquet,
+compute canonical schemas/rows/table hashes, or require schemas to agree
+between versions. The target importer verifies the raw closure and
+`dp.series.1` mapping, analyzes and replays each table version separately,
+records a deterministic target replay report, and promotes only after every
+staged target leaf identity and metadata value matches that report.
 
 Capsule bytes are created only during recovery. Ordinary native pushes perform
 no capsule generation; before writing backup data, they idempotently ensure
@@ -96,7 +109,12 @@ Recipes use immutable, versioned paths:
 recovery/
   README.sh
   recipes/
-    dp.commit.3/
+    watertown.commit.v1/
+      <recipe-hash>/
+        README.sh
+  legacy-migration/
+    README.sh
+    recipes/
       <recipe-hash>/
         README.sh
 ```
@@ -107,12 +125,16 @@ Retries accept only byte-identical existing objects; differing content is never
 overwritten.
 
 Every native backup push idempotently installs the current hash-addressed
-recipe and verifies the discoverable recipe against its own immutable copy
-before writing backup data or advancing a ref. An existing discoverable recipe
-is never replaced, so an older binary cannot downgrade it and a newer binary
-cannot strand an existing backup. Old versioned recipes remain immutable. The
-explicit publish command remains a strict, idempotent provisioning, repair, and
-inspection aid for the current kit.
+`watertown.commit.v1` recipe and verifies the generic discoverable recipe
+against its own immutable copy before writing backup data or advancing a ref.
+An existing generic discoverable recipe is never replaced, so an older binary
+cannot downgrade it and a newer binary cannot strand an existing backup. Old
+versioned recipes remain immutable.
+
+The `dp.commit.3` to `pondcapsule.legacy.1` recipe exists only beneath the
+single `recovery/legacy-migration/` root. It is published and inspected only
+by the explicit legacy-migration commands and is never selected by automatic
+backup push.
 
 ### Bootstrap safety
 
@@ -127,7 +149,7 @@ inspection aid for the current kit.
 It contains no credentials, performs no network access, executes no extracted
 file, modifies no pond or backup, and deletes nothing.
 
-The extracted `dp.commit.3` kit contains:
+The extracted target-format `watertown.commit.v1` kit contains:
 
 - safety and operator instructions;
 - an independent native-format specification;
@@ -148,13 +170,21 @@ already-authenticated client.
 ```text
 pond capsule recipe publish <remote>
 pond capsule recipe inspect <remote>
+pond capsule recipe legacy-migration publish <remote>
+pond capsule recipe legacy-migration inspect <remote>
 pond capsule inspect <capsule-directory>
 pond capsule verify <capsule-directory>
 ```
 
 Recipe commands use a named remote attachment and its storage profile.
-Downloaded-capsule inspection and verification do not require a local pond.
-Every produced capsule also carries these operator commands at its root:
+The direct `publish`/`inspect` forms select the target-format
+`watertown.commit.v1` to `pondcapsule.2` recipe. The nested
+`legacy-migration` forms select the deliberate `dp.commit.3` to
+`pondcapsule.legacy.1` recipe.
+Downloaded logical-capsule inspection and verification do not require a local
+pond. Opaque `pondcapsule.legacy.1` verification uses the authenticated
+legacy-migration kit's `capsule.py`, not these generic CLI forms. Every
+produced capsule also carries these operator commands at its root:
 
 ```text
 python capsule.py verify CAPSULE

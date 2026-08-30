@@ -1247,7 +1247,17 @@ pub(crate) async fn log_tip_commit_hash(
     let Some(last) = leaves.last() else {
         return Ok(None);
     };
-    let commit = Commit::decode(last)
+    log_tip_hash(last)
+}
+
+fn log_tip_hash(bytes: &[u8]) -> Result<Option<ObjectHash>, StewardError> {
+    // A migration freeze must authenticate an old source tip without
+    // interpreting its legacy commit/tree schema. Old writers still need to
+    // be stopped separately because they do not honor the freeze marker.
+    if bytes.starts_with(b"dp.commit.3\n") {
+        return Ok(Some(ObjectHash::of_bytes(bytes)));
+    }
+    let commit = Commit::decode(bytes)
         .map_err(|e| StewardError::Content(format!("decode commit-log tip: {e}")))?;
     Ok(Some(commit.hash()))
 }
@@ -1521,12 +1531,35 @@ pub(crate) fn build_initial_pack_index(
             StewardError::Content("series version logical_count is negative".to_string())
         })?;
         let attrs = canonical_leaf_attributes(v)?;
-        let descriptor = sync_store::content::PackLeafDescriptor::new(
-            logical_count,
-            v.meta.min_event_time,
-            v.meta.max_event_time,
-            attrs,
-        )
+        let descriptor = match material.manifest.revision() {
+            sync_store::content::SeriesManifestRevision::V1 => {
+                if material.entry_type == EntryType::TablePhysicalSeries
+                    && v.schema_fingerprint != material.manifest.schema_fingerprint()
+                {
+                    return Err(StewardError::Content(format!(
+                        "v1 table manifest's homogeneous schema fingerprint {:?} does not match \
+                         leaf fingerprint {:?}",
+                        material.manifest.schema_fingerprint(),
+                        v.schema_fingerprint
+                    )));
+                }
+                sync_store::content::PackLeafDescriptor::new(
+                    logical_count,
+                    v.meta.min_event_time,
+                    v.meta.max_event_time,
+                    attrs,
+                )
+            }
+            sync_store::content::SeriesManifestRevision::V2 => {
+                sync_store::content::PackLeafDescriptor::new_with_schema(
+                    logical_count,
+                    v.schema_fingerprint,
+                    v.meta.min_event_time,
+                    v.meta.max_event_time,
+                    attrs,
+                )
+            }
+        }
         .map_err(StewardError::Content)?;
         whole_series_leaf_hashes.push(leaf_hash);
         physical_object_hashes.push(v.blob_hash);
@@ -1547,18 +1580,32 @@ pub(crate) fn build_initial_pack_index(
     .map_err(StewardError::Content)?;
     let range_root = material.manifest.leaf_merkle_root();
 
-    let pack = sync_store::content::PackIndex::new(
-        material.series_hash,
-        0,
-        total_leaf_count,
-        total_leaf_count,
-        range_root,
-        range_proof,
-        physical_object_hashes,
-        material.manifest.logical_count(),
-        physical_byte_count,
-        leaf_descriptors,
-    )
+    let pack = match material.manifest.revision() {
+        sync_store::content::SeriesManifestRevision::V1 => sync_store::content::PackIndex::new(
+            material.series_hash,
+            0,
+            total_leaf_count,
+            total_leaf_count,
+            range_root,
+            range_proof,
+            physical_object_hashes,
+            material.manifest.logical_count(),
+            physical_byte_count,
+            leaf_descriptors,
+        ),
+        sync_store::content::SeriesManifestRevision::V2 => sync_store::content::PackIndex::new_v2(
+            material.series_hash,
+            0,
+            total_leaf_count,
+            total_leaf_count,
+            range_root,
+            range_proof,
+            physical_object_hashes,
+            material.manifest.logical_count(),
+            physical_byte_count,
+            leaf_descriptors,
+        ),
+    }
     .map_err(StewardError::Content)?;
 
     // Self-check before ever handing this pack to a publisher: a pack built
@@ -2047,10 +2094,10 @@ fn series_version_data(
 /// series row can commit) and is rejected with an error rather than
 /// silently dropped, since silently skipping it would erase a real logical
 /// leaf from the series' identity without a trace. Either way, a leafless
-/// version's `series_schema_fingerprint` (a table-level property, not tied
-/// to any one leaf) still participates in the schema-fingerprint
-/// consistency check, since a metadata-only touch can still carry the
-/// series' schema.
+/// A leaf-bearing table version must carry its own
+/// `series_schema_fingerprint`; table versions are not required to agree.
+/// A metadata-only touch contributes no leaf and therefore no schema to the
+/// manifest.
 ///
 /// The returned `VersionMeta` -- the *one* series-level metadata record a v2
 /// series tree entry carries (`docs/logical-series-identity-design.md`,
@@ -2063,10 +2110,9 @@ fn series_version_data(
 /// Returns an error if `entry_type` is not a series type, if a nonempty
 /// version has no `logical_leaf_hash` (corrupt row), if a leaf-bearing
 /// version is missing its `logical_count`, if the aggregate `logical_count`
-/// overflows `u64`, if a table series' versions disagree about their schema
+/// overflows `u64`, if a leaf-bearing table version has no schema
 /// fingerprint, or if the assembled manifest fails
-/// [`SeriesManifest::new`]'s invariants (for example a table series with no
-/// schema fingerprint available from any version).
+/// [`SeriesManifest::new_v2`]'s invariants.
 pub(crate) fn build_series_manifest(
     entry_type: EntryType,
     versions: &[SeriesVersionData],
@@ -2085,24 +2131,10 @@ pub(crate) fn build_series_manifest(
     let mut logical_count: u64 = 0;
     let mut min_event_time: Option<i64> = None;
     let mut max_event_time: Option<i64> = None;
-    let mut schema_fingerprint: Option<ObjectHash> = None;
     let mut latest_meta: Option<VersionMeta> = None;
     let mut latest_raw_attrs: Option<String> = None;
 
     for v in versions {
-        if let Some(fp) = v.schema_fingerprint {
-            match schema_fingerprint {
-                None => schema_fingerprint = Some(fp),
-                Some(existing) if existing != fp => {
-                    return Err(StewardError::DeltaLake(
-                        "table series has inconsistent schema fingerprints across its versions"
-                            .to_string(),
-                    ));
-                }
-                _ => {}
-            }
-        }
-
         let Some(leaf_hash) = v.logical_leaf_hash else {
             // A leafless live version is only legitimate when it is truly
             // empty (zero physical bytes): a metadata-only touch that
@@ -2120,6 +2152,21 @@ pub(crate) fn build_series_manifest(
             }
             continue;
         };
+        match payload_kind {
+            PayloadKind::Table if v.schema_fingerprint.is_none() => {
+                return Err(StewardError::DeltaLake(
+                    "leaf-bearing table series version has no series_schema_fingerprint"
+                        .to_string(),
+                ));
+            }
+            PayloadKind::File if v.schema_fingerprint.is_some() => {
+                return Err(StewardError::DeltaLake(
+                    "leaf-bearing file series version must not carry a series_schema_fingerprint"
+                        .to_string(),
+                ));
+            }
+            _ => {}
+        }
         leaf_hashes.push(leaf_hash);
         let count = v.logical_count.ok_or_else(|| {
             StewardError::DeltaLake(
@@ -2151,9 +2198,8 @@ pub(crate) fn build_series_manifest(
         None => None,
     };
 
-    let manifest = SeriesManifest::new(
+    let manifest = SeriesManifest::new_v2(
         payload_kind,
-        schema_fingerprint,
         logical_count,
         leaf_hashes.len() as u64,
         min_event_time,
@@ -2409,6 +2455,15 @@ fn leaf_facts<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_commit_tip_uses_the_raw_object_hash_without_decoding() {
+        let legacy = b"dp.commit.3\nintentionally-not-a-current-commit";
+        assert_eq!(
+            log_tip_hash(legacy).expect("legacy tip"),
+            Some(ObjectHash::of_bytes(legacy))
+        );
+    }
 
     // Build an in-memory `content_live` table from OplogEntry rows so the narrow
     // scan can be exercised without a Delta table.
@@ -2801,20 +2856,10 @@ mod tests {
         assert_eq!(meta_1.extended_attributes, meta_2.extended_attributes);
     }
 
-    /// DIAGNOSTIC PROBE (not a permanent assertion of desired behavior):
-    /// a `TablePhysicalSeries` whose only version is genuinely empty
-    /// (`blob_size == 0`, no schema fingerprint -- the state
-    /// `tlogfs::persistence::stamp_and_validate_series_entry` currently
-    /// still accepts as version 1) can never carry a schema fingerprint,
-    /// but [`SeriesManifest::new`] unconditionally requires one for
-    /// [`PayloadKind::Table`] regardless of `leaf_count`. This probe
-    /// confirms the resulting fold failure surfaces as a clear, typed
-    /// error (not a panic or a corrupted manifest), which is what makes it
-    /// safe to reject the same state earlier, at the tlogfs write choke
-    /// point, with an equally clear message (release blocker item 1,
-    /// `docs/logical-series-identity-design.md`).
+    /// A genuinely empty table series has no leaf schema to record. The v2
+    /// manifest represents that state without inventing a global schema.
     #[test]
-    fn build_series_manifest_cannot_represent_a_genuinely_empty_table_series() {
+    fn build_series_manifest_represents_a_genuinely_empty_table_series() {
         let v_empty = SeriesVersionData {
             version: 4,
             blob_hash: ObjectHash::of_bytes(b""),
@@ -2833,15 +2878,104 @@ mod tests {
         };
         let versions = vec![v_empty];
 
-        let err = build_series_manifest(EntryType::TablePhysicalSeries, &versions).expect_err(
-            "a table series with no schema fingerprint from any version cannot be represented \
-             by SeriesManifest::new, which always requires one for PayloadKind::Table",
+        let (manifest, meta) =
+            build_series_manifest(EntryType::TablePhysicalSeries, &versions).expect("fold");
+        assert_eq!(manifest.payload_kind(), PayloadKind::Table);
+        assert_eq!(
+            manifest.revision(),
+            sync_store::content::SeriesManifestRevision::V2
         );
-        let message = err.to_string();
-        assert!(
-            message.contains("schema fingerprint"),
-            "expected a clear schema-fingerprint error, got: {message}"
+        assert_eq!(manifest.schema_fingerprint(), None);
+        assert_eq!(manifest.leaf_count(), 0);
+        assert_eq!(manifest.logical_count(), 0);
+        assert_eq!(meta.timestamp, Some(100));
+    }
+
+    #[test]
+    fn build_series_manifest_accepts_heterogeneous_table_leaf_schemas() {
+        let schema_a = ObjectHash::of_bytes(b"schema-a");
+        let schema_b = ObjectHash::of_bytes(b"schema-b");
+        let versions = vec![
+            SeriesVersionData {
+                version: 1,
+                blob_hash: ObjectHash::of_bytes(b"blob-a"),
+                content: None,
+                meta: VersionMeta {
+                    timestamp: Some(100),
+                    min_event_time: Some(1),
+                    max_event_time: Some(2),
+                    extended_attributes: None,
+                },
+                raw_extended_attributes: None,
+                logical_leaf_hash: Some(ObjectHash::of_bytes(b"leaf-a")),
+                logical_count: Some(3),
+                schema_fingerprint: Some(schema_a),
+                blob_size: 10,
+            },
+            SeriesVersionData {
+                version: 2,
+                blob_hash: ObjectHash::of_bytes(b"blob-b"),
+                content: None,
+                meta: VersionMeta {
+                    timestamp: Some(200),
+                    min_event_time: Some(3),
+                    max_event_time: Some(4),
+                    extended_attributes: None,
+                },
+                raw_extended_attributes: None,
+                logical_leaf_hash: Some(ObjectHash::of_bytes(b"leaf-b")),
+                logical_count: Some(5),
+                schema_fingerprint: Some(schema_b),
+                blob_size: 20,
+            },
+        ];
+
+        let (manifest, _) =
+            build_series_manifest(EntryType::TablePhysicalSeries, &versions).expect("fold");
+        assert_eq!(manifest.leaf_count(), 2);
+        assert_eq!(manifest.logical_count(), 8);
+        assert_eq!(manifest.schema_fingerprint(), None);
+
+        let material = SeriesPackMaterial {
+            series_hash: manifest.hash(),
+            entry_type: EntryType::TablePhysicalSeries,
+            manifest,
+            versions,
+        };
+        let pack = build_initial_pack_index(&material)
+            .expect("build initial pack")
+            .expect("nonempty pack");
+        assert_eq!(
+            pack.leaf_descriptors()[0].schema_fingerprint(),
+            Some(schema_a)
         );
+        assert_eq!(
+            pack.leaf_descriptors()[1].schema_fingerprint(),
+            Some(schema_b)
+        );
+    }
+
+    #[test]
+    fn build_series_manifest_rejects_table_leaf_without_schema() {
+        let version = SeriesVersionData {
+            version: 1,
+            blob_hash: ObjectHash::of_bytes(b"blob"),
+            content: None,
+            meta: VersionMeta {
+                timestamp: Some(100),
+                min_event_time: None,
+                max_event_time: None,
+                extended_attributes: None,
+            },
+            raw_extended_attributes: None,
+            logical_leaf_hash: Some(ObjectHash::of_bytes(b"leaf")),
+            logical_count: Some(1),
+            schema_fingerprint: None,
+            blob_size: 10,
+        };
+        let err = build_series_manifest(EntryType::TablePhysicalSeries, &[version])
+            .expect_err("schema-less table leaf must fail");
+        assert!(err.to_string().contains("series_schema_fingerprint"));
     }
 
     /// BLOCKER 3: a nonempty leafless live row (`blob_size > 0` but no

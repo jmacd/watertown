@@ -40,7 +40,7 @@ const TREE_MAGIC: &[u8] = b"watertown.tree.v1\n";
 /// Magic header for the cumulative series hash (D2).
 ///
 /// `pub(crate)`: [`super::series_dispatch`] dispatches a fetched series
-/// object between this (v1) and [`super::series_manifest::MANIFEST_MAGIC`]
+/// object between this legacy encoding and the native manifest magics
 /// (v2) by inspecting the same magic bytes, so it must reference this exact
 /// constant rather than risk a second, potentially-divergent literal.
 pub(crate) const SERIES_MAGIC: &[u8] = b"dp.series.1\n";

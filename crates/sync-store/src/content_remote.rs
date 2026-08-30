@@ -57,6 +57,7 @@ const POND_ID_KEY: &str = "pond_id";
 const CAPSULE_PREFIX: &str = "recovery";
 const CAPSULE_HISTORY_LIMIT: usize = 3;
 const RECIPE_NATIVE_FORMAT: &str = "watertown.commit.v1";
+const LEGACY_MIGRATION_RECIPE_PREFIX: &str = "recovery/legacy-migration";
 const CAPSULE_README: &str = include_str!("../recovery/watertown.commit.v1/CAPSULE-README.md");
 const CAPSULE_FORMAT: &str = include_str!("../recovery/watertown.commit.v1/CAPSULE-FORMAT.md");
 const CAPSULE_TOOL: &str = include_str!("../recovery/watertown.commit.v1/capsule.py");
@@ -322,6 +323,17 @@ impl ContentRemote {
         object_store::path::Path::from(format!("{CAPSULE_PREFIX}/README.sh"))
     }
 
+    fn legacy_migration_recipe_versioned_path(hash: ObjectHash) -> object_store::path::Path {
+        object_store::path::Path::from(format!(
+            "{LEGACY_MIGRATION_RECIPE_PREFIX}/recipes/{}/README.sh",
+            hash.to_hex()
+        ))
+    }
+
+    fn legacy_migration_recipe_discoverable_path() -> object_store::path::Path {
+        object_store::path::Path::from(format!("{LEGACY_MIGRATION_RECIPE_PREFIX}/README.sh"))
+    }
+
     async fn create_exact_object(
         &self,
         path: &object_store::path::Path,
@@ -367,7 +379,7 @@ impl ContentRemote {
         }
     }
 
-    /// Install the reviewed `dp.commit.3` recovery recipe exactly once.
+    /// Install the reviewed `watertown.commit.v1` recovery recipe exactly once.
     ///
     /// The immutable hash-addressed object is created before the discoverable
     /// top-level bootstrap. Existing byte-identical objects make retries
@@ -476,7 +488,7 @@ impl ContentRemote {
         }
     }
 
-    /// Verify the discoverable and immutable `dp.commit.3` recipe objects.
+    /// Verify the discoverable and immutable `watertown.commit.v1` recipe objects.
     pub async fn inspect_recovery_recipe_watertown_commit_v1(&self) -> Result<ObjectHash> {
         let expected = crate::recovery_recipe_watertown_commit_v1();
         let hash = crate::recovery_recipe_watertown_commit_v1_hash();
@@ -488,6 +500,72 @@ impl ContentRemote {
             (
                 Self::recovery_recipe_discoverable_path(),
                 "discoverable recovery recipe",
+            ),
+        ] {
+            let bytes = self
+                .store
+                .object_store()
+                .get(&path)
+                .await
+                .map_err(|error| StoreError::Invariant(format!("read {label}: {error}")))?
+                .bytes()
+                .await
+                .map_err(|error| StoreError::Invariant(format!("collect {label}: {error}")))?;
+            if bytes.as_ref() != expected {
+                return Err(StoreError::Invariant(format!(
+                    "{label} differs from recipe {hash}"
+                )));
+            }
+        }
+        Ok(hash)
+    }
+
+    /// Install the explicit `dp.commit.3` to `pondcapsule.legacy.1` migration recipe.
+    ///
+    /// This deliberate migration aid is independent from the target-format
+    /// recipe used by ordinary backup pushes. Its exact discoverable path is
+    /// `recovery/legacy-migration/README.sh`; its immutable copy is
+    /// `recovery/legacy-migration/recipes/<hash>/README.sh`. Both objects use
+    /// create-only writes. Byte-identical retries are idempotent and differing
+    /// pre-existing bytes are rejected without overwrite.
+    pub async fn publish_recovery_recipe_legacy_migration(
+        &self,
+    ) -> Result<RecoveryRecipePublishOutcome> {
+        let bytes = crate::recovery_recipe_legacy_migration();
+        let recipe_hash = crate::recovery_recipe_legacy_migration_hash();
+        let versioned_created = self
+            .create_exact_object(
+                &Self::legacy_migration_recipe_versioned_path(recipe_hash),
+                &bytes,
+                "versioned legacy-migration recovery recipe",
+            )
+            .await?;
+        let discoverable_created = self
+            .create_exact_object(
+                &Self::legacy_migration_recipe_discoverable_path(),
+                &bytes,
+                "discoverable legacy-migration recovery recipe",
+            )
+            .await?;
+        Ok(RecoveryRecipePublishOutcome {
+            recipe_hash,
+            versioned_created,
+            discoverable_created,
+        })
+    }
+
+    /// Verify both exact objects in the legacy-migration recipe namespace.
+    pub async fn inspect_recovery_recipe_legacy_migration(&self) -> Result<ObjectHash> {
+        let expected = crate::recovery_recipe_legacy_migration();
+        let hash = crate::recovery_recipe_legacy_migration_hash();
+        for (path, label) in [
+            (
+                Self::legacy_migration_recipe_versioned_path(hash),
+                "versioned legacy-migration recovery recipe",
+            ),
+            (
+                Self::legacy_migration_recipe_discoverable_path(),
+                "discoverable legacy-migration recovery recipe",
             ),
         ] {
             let bytes = self
@@ -2361,6 +2439,115 @@ mod tests {
                 .publish_recovery_recipe_watertown_commit_v1()
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_migration_recipe_is_immutable_and_independent() {
+        let dir = tempdir().unwrap();
+        let remote = ContentRemote::create_at(dir.path().join("remote"), Uuid::new_v4())
+            .await
+            .unwrap();
+
+        let legacy_hash = crate::recovery_recipe_legacy_migration_hash();
+        assert_eq!(
+            ContentRemote::legacy_migration_recipe_discoverable_path().to_string(),
+            "recovery/legacy-migration/README.sh"
+        );
+        assert_eq!(
+            ContentRemote::legacy_migration_recipe_versioned_path(legacy_hash).to_string(),
+            format!(
+                "recovery/legacy-migration/recipes/{}/README.sh",
+                legacy_hash.to_hex()
+            )
+        );
+
+        let target = remote
+            .publish_recovery_recipe_watertown_commit_v1()
+            .await
+            .unwrap();
+        let target_discoverable = remote
+            .store
+            .object_store()
+            .get(&ContentRemote::recovery_recipe_discoverable_path())
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+
+        let first = remote
+            .publish_recovery_recipe_legacy_migration()
+            .await
+            .unwrap();
+        assert!(first.versioned_created);
+        assert!(first.discoverable_created);
+        assert_ne!(first.recipe_hash, target.recipe_hash);
+        assert_eq!(
+            remote
+                .inspect_recovery_recipe_legacy_migration()
+                .await
+                .unwrap(),
+            first.recipe_hash
+        );
+        assert_eq!(
+            remote
+                .inspect_recovery_recipe_watertown_commit_v1()
+                .await
+                .unwrap(),
+            target.recipe_hash
+        );
+
+        let retry = remote
+            .publish_recovery_recipe_legacy_migration()
+            .await
+            .unwrap();
+        assert_eq!(retry.recipe_hash, first.recipe_hash);
+        assert!(!retry.versioned_created);
+        assert!(!retry.discoverable_created);
+
+        remote
+            .store
+            .object_store()
+            .put(
+                &ContentRemote::legacy_migration_recipe_discoverable_path(),
+                b"corrupt legacy bootstrap".to_vec().into(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            remote
+                .inspect_recovery_recipe_legacy_migration()
+                .await
+                .is_err()
+        );
+        assert!(
+            remote
+                .publish_recovery_recipe_legacy_migration()
+                .await
+                .is_err()
+        );
+
+        assert_eq!(
+            remote
+                .inspect_recovery_recipe_watertown_commit_v1()
+                .await
+                .unwrap(),
+            target.recipe_hash,
+            "legacy corruption must not affect the target-format recipe"
+        );
+        assert_eq!(
+            remote
+                .store
+                .object_store()
+                .get(&ContentRemote::recovery_recipe_discoverable_path())
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            target_discoverable,
+            "legacy publication must not rewrite recovery/README.sh"
         );
     }
 
