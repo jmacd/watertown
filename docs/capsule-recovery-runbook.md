@@ -1,16 +1,21 @@
 # Legacy Capsule Recovery and Storage-Format Migration Runbook
 
 This runbook is the operator procedure for migrating an authoritative
-`dp.commit.3` pond through the opaque `pondcapsule.legacy.1` envelope into a
+`dp.commit.3` pond through the opaque `pondcapsule.legacy.2` envelope into a
 fresh pond created by the current Watertown binary.
 
 This is not the normal target-format recovery path. The legacy recipe has its
 own explicit CLI operation and its own single object-store namespace:
 
 ```text
-recovery/legacy-migration/README.sh
-recovery/legacy-migration/recipes/<recipe-hash>/README.sh
+recovery/legacy-migration-v2/README.sh
+recovery/legacy-migration-v2/recipes/<recipe-hash>/README.sh
 ```
+
+The earlier `pondcapsule.legacy.1` recipe remains immutable but does not
+preserve synthetic dynamic-node metadata. Do not use it for a migration. The
+`legacy` name identifies the `dp.commit.3` source format, never the target
+pond format.
 
 The existing generic recipe remains the `watertown.commit.v1` to
 `pondcapsule.2` target-format recipe under `recovery/README.sh` and
@@ -24,7 +29,7 @@ overwriting the source pond, native backup, or either recipe namespace.
 The formats and trust model are specified in
 [recovery-capsule-design.md](recovery-capsule-design.md). The reviewed opaque
 extractor is embedded from
-[`crates/sync-store/recovery/legacy-migration/`](../crates/sync-store/recovery/legacy-migration/).
+[`crates/sync-store/recovery/legacy-migration-v2/`](../crates/sync-store/recovery/legacy-migration-v2/).
 
 ## Safety model
 
@@ -53,7 +58,7 @@ cross-process write lock, re-reads the source tip, and creates
 fails. Do not retry until that process is identified and stopped.
 
 Recipe publication is create-only. It can create the two exact
-`recovery/legacy-migration` objects above, accept byte-identical retries, or
+`recovery/legacy-migration-v2` objects above, accept byte-identical retries, or
 fail when a discoverable or immutable object already has different bytes. It
 does not provide remote delete, repair-by-overwrite, or namespace cleanup.
 
@@ -66,8 +71,8 @@ Create an incident or migration record outside both pond namespaces. Record:
 - every stopped service, timer, supervisor, and operator write path;
 - backup attachment name and exact object-store URL;
 - exact final native commit hash;
-- legacy-migration recipe hash and both exact remote object keys;
-- capsule format (`pondcapsule.legacy.1`) and root from
+- legacy-migration-v2 recipe hash and both exact remote object keys;
+- capsule format (`pondcapsule.legacy.2`) and root from
   `CAPSULE/recovery/refs/latest`;
 - target environment, path, namespace, identity, birthplace, and binary;
 - every command and its outcome;
@@ -82,13 +87,13 @@ and capsule root establish which snapshot was selected.
 
 Do not proceed to the next gate unless the current gate succeeds:
 
-1. The explicit legacy-migration recipe publishes and inspects successfully.
+1. The explicit legacy-migration-v2 recipe publishes and inspects successfully.
 2. Every old writer and restart mechanism is stopped outside Pond.
 3. The current binary's write freeze succeeds and records the exact source tip.
 4. A final push completes and `pond verify --exact` reports equal tips.
 5. The complete native backup and both legacy recipe objects are downloaded.
 6. The authenticated extractor creates and verifies
-   `pondcapsule.legacy.1` for the exact recorded commit.
+   `pondcapsule.legacy.2` for the exact recorded commit.
 7. Pond-free opaque materialization is inspected without claiming logical or
    Parquet validation.
 8. Experimental staged import succeeds into a nonexistent target.
@@ -104,7 +109,7 @@ accept a failed verification.
 ## 1. Prepare and rehearse
 
 Build or select the current binary that contains the legacy-compatible reader,
-legacy-safe freeze, `pondcapsule.legacy.1` importer, and explicit recipe
+legacy-safe freeze, `pondcapsule.legacy.2` importer, and explicit recipe
 commands. Keep the old source binary available for rollback, but do not use it
 after writer shutdown except under an approved rollback.
 
@@ -113,9 +118,9 @@ Use fresh destinations throughout:
 ```sh
 SOURCE_POND=/srv/watertown/source
 SOURCE_REMOTE=backup
-BOOTSTRAP=/srv/recovery/legacy-migration-README.sh
+BOOTSTRAP=/srv/recovery/legacy-migration-v2-README.sh
 BACKUP=/srv/recovery/native-backup
-KIT=/srv/recovery/legacy-migration-kit
+KIT=/srv/recovery/legacy-migration-v2-kit
 CAPSULE=/srv/recovery/legacy-capsule
 MATERIALIZED=/srv/recovery/legacy-materialized
 TARGET_POND=/srv/watertown/recovered
@@ -131,30 +136,30 @@ recorded recipe hash after publication.
 First execute the entire runbook against watershop and a disposable MinIO
 target. Do not reuse the production target namespace during rehearsal.
 
-## 2. Publish and inspect the legacy-migration recipe
+## 2. Publish and inspect the legacy-migration-v2 recipe
 
 While the source pond and its backup attachment are available, run the
 deliberate migration operation:
 
 ```sh
-POND="$SOURCE_POND" pond capsule recipe legacy-migration publish "$SOURCE_REMOTE"
-POND="$SOURCE_POND" pond capsule recipe legacy-migration inspect "$SOURCE_REMOTE"
+POND="$SOURCE_POND" pond capsule recipe legacy-migration-v2 publish "$SOURCE_REMOTE"
+POND="$SOURCE_POND" pond capsule recipe legacy-migration-v2 inspect "$SOURCE_REMOTE"
 ```
 
 The success log must identify all of:
 
 ```text
-flavor=legacy-migration
+flavor=legacy-migration-v2
 native_format=dp.commit.3
-capsule_format=pondcapsule.legacy.1
+capsule_format=pondcapsule.legacy.2
 ```
 
 Record the reported hash as `RECIPE_HASH`. Confirm with the object-store
 inventory that exactly these recipe keys exist:
 
 ```text
-recovery/legacy-migration/README.sh
-recovery/legacy-migration/recipes/<RECIPE_HASH>/README.sh
+recovery/legacy-migration-v2/README.sh
+recovery/legacy-migration-v2/recipes/<RECIPE_HASH>/README.sh
 ```
 
 Both objects must contain identical bytes. A retry is successful only when the
@@ -162,7 +167,7 @@ existing bytes are identical. Differing pre-existing bytes require
 investigation and a new reviewed plan; the command will not overwrite them.
 
 Ordinary backup push remains associated with the separate target-format
-recipe. It does not automatically publish this legacy-migration recipe and
+recipe. It does not automatically publish this legacy-migration-v2 recipe and
 does not make this explicit gate optional.
 
 ## 3. Stop old writers, then freeze with the current binary
@@ -175,7 +180,7 @@ Using only the current binary, persist the marker and record its source tip:
 
 ```sh
 POND="$SOURCE_POND" pond freeze enable \
-  --reason "dp.commit.3 to pondcapsule.legacy.1 migration"
+  --reason "dp.commit.3 to pondcapsule.legacy.2 migration"
 POND="$SOURCE_POND" pond freeze status
 ```
 
@@ -205,10 +210,10 @@ and record the replacement exact tip.
 
 The final push may exercise the generic target-format recipe compatibility
 check under `recovery/README.sh`. That independent behavior must neither
-replace nor be mistaken for the explicit legacy-migration namespace verified
+replace nor be mistaken for the explicit legacy-migration-v2 namespace verified
 in step 2.
 
-## 4. Authenticate and test the legacy-migration kit
+## 4. Authenticate and test the legacy-migration-v2 kit
 
 Authenticate separately. Credentials do not belong in commands, capsule
 metadata, or the recovery kit.
@@ -218,7 +223,7 @@ Fetch only the passive discoverable bootstrap. For MinIO:
 ```sh
 mc alias set ALIAS ENDPOINT
 mc cp \
-  ALIAS/BUCKET/PREFIX/recovery/legacy-migration/README.sh \
+  ALIAS/BUCKET/PREFIX/recovery/legacy-migration-v2/README.sh \
   "$BOOTSTRAP"
 ```
 
@@ -227,7 +232,7 @@ For Azure Blob Storage:
 ```sh
 azcopy login
 azcopy copy \
-  https://ACCOUNT.blob.core.windows.net/CONTAINER/PREFIX/recovery/legacy-migration/README.sh \
+  https://ACCOUNT.blob.core.windows.net/CONTAINER/PREFIX/recovery/legacy-migration-v2/README.sh \
   "$BOOTSTRAP"
 ```
 
@@ -283,13 +288,13 @@ against the source namespace. These commands only copy; remote retirement is a
 separate reviewed operation outside this runbook.
 
 The download must contain `_delta_log/`, `_blobs/` when external objects are
-present, and both legacy-migration recipe objects. Compare both downloaded
+present, and both legacy-migration-v2 recipe objects. Compare both downloaded
 copies with the independently authenticated bootstrap:
 
 ```sh
-cmp "$BACKUP/recovery/legacy-migration/README.sh" "$BOOTSTRAP"
+cmp "$BACKUP/recovery/legacy-migration-v2/README.sh" "$BOOTSTRAP"
 cmp \
-  "$BACKUP/recovery/legacy-migration/recipes/$RECIPE_HASH/README.sh" \
+  "$BACKUP/recovery/legacy-migration-v2/recipes/$RECIPE_HASH/README.sh" \
   "$BOOTSTRAP"
 ```
 
@@ -351,7 +356,7 @@ POND="$TARGET_POND" pond capsule import "$CAPSULE" \
   --experimental
 ```
 
-The importer detects `pondcapsule.legacy.1`, verifies its raw closure and
+The importer detects `pondcapsule.legacy.2`, verifies its raw closure and
 native per-version mapping, and prepares each physical version separately.
 For tables, the target importer opens each version's Parquet payload, derives
 that version's supported target schema, replays its rows into the current
@@ -410,7 +415,7 @@ capsule_format=pondcapsule.2
 
 Recover that new backup into another disposable pond using its independently
 authenticated `recovery/README.sh` target-format kit. This drill must not use
-the legacy-migration bootstrap, source backup, or intended production target.
+the legacy-migration-v2 bootstrap, source backup, or intended production target.
 It proves future disaster recovery after the old decoder and old pond are
 unavailable.
 
@@ -452,8 +457,8 @@ Retain through the rollback window and at least one scheduled recovery drill:
 
 - the old source pond;
 - the complete old native backup namespace;
-- both immutable and discoverable legacy-migration recipe objects;
-- the authenticated legacy-migration kit and dependency wheelhouse;
+- both immutable and discoverable legacy-migration-v2 recipe objects;
+- the authenticated legacy-migration-v2 kit and dependency wheelhouse;
 - exact source commit, recipe hash, and capsule root records;
 - the verified opaque capsule and deterministic replay report; and
 - the first verified target-format backup and its recovery record.

@@ -44,7 +44,8 @@ pub use content::{
     CAPSULE_FORMAT_V1, CAPSULE_FORMAT_V2, CapsuleEntry, CapsuleLeaf, CapsuleManifest, CapsuleNode,
     CapsuleObject, CapsulePayloadKind, CapsuleSource, CapsuleVerifyReport, Commit,
     IncrementalFileLeafHasher, IncrementalTableLeafHasher, LEGACY_CAPSULE_FORMAT,
-    LEGACY_NATIVE_FORMAT_DP_COMMIT_3, LegacyCapsuleEntry, LegacyCapsuleManifest, LegacyCapsuleNode,
+    LEGACY_CAPSULE_FORMAT_V1, LEGACY_CAPSULE_FORMAT_V2, LEGACY_NATIVE_FORMAT_DP_COMMIT_3,
+    LegacyCapsuleDynamicMetadata, LegacyCapsuleEntry, LegacyCapsuleManifest, LegacyCapsuleNode,
     LegacyCapsuleObject, LegacyCapsulePayloadKind, LegacyCapsuleSource, LegacyCapsuleVerifyReport,
     LegacyCapsuleVersion, ManifestEntry, NodeMerkle, ObjectHash, Provenance, TreeEntry,
     VersionMeta, canonicalize_schema, capsule_leaf_hash, capsule_manifest_bytes, capsule_root,
@@ -65,6 +66,7 @@ pub use metered_store::{
 pub use recovery_recipe::{
     recovery_recipe_dp_commit_3, recovery_recipe_dp_commit_3_hash,
     recovery_recipe_legacy_migration, recovery_recipe_legacy_migration_hash,
+    recovery_recipe_legacy_migration_v2, recovery_recipe_legacy_migration_v2_hash,
     recovery_recipe_watertown_commit_v1, recovery_recipe_watertown_commit_v1_hash,
 };
 pub use store::{AddPath, CompactMetrics, Op, RemovePath, Store, raw_object_store_at_url};

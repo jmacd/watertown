@@ -58,6 +58,7 @@ const CAPSULE_PREFIX: &str = "recovery";
 const CAPSULE_HISTORY_LIMIT: usize = 3;
 const RECIPE_NATIVE_FORMAT: &str = "watertown.commit.v1";
 const LEGACY_MIGRATION_RECIPE_PREFIX: &str = "recovery/legacy-migration";
+const LEGACY_MIGRATION_V2_RECIPE_PREFIX: &str = "recovery/legacy-migration-v2";
 const CAPSULE_README: &str = include_str!("../recovery/watertown.commit.v1/CAPSULE-README.md");
 const CAPSULE_FORMAT: &str = include_str!("../recovery/watertown.commit.v1/CAPSULE-FORMAT.md");
 const CAPSULE_TOOL: &str = include_str!("../recovery/watertown.commit.v1/capsule.py");
@@ -334,6 +335,16 @@ impl ContentRemote {
         object_store::path::Path::from(format!("{LEGACY_MIGRATION_RECIPE_PREFIX}/README.sh"))
     }
 
+    fn legacy_migration_v2_recipe_versioned_path(hash: ObjectHash) -> object_store::path::Path {
+        object_store::path::Path::from(format!(
+            "{LEGACY_MIGRATION_V2_RECIPE_PREFIX}/recipes/{hash}/README.sh"
+        ))
+    }
+
+    fn legacy_migration_v2_recipe_discoverable_path() -> object_store::path::Path {
+        object_store::path::Path::from(format!("{LEGACY_MIGRATION_V2_RECIPE_PREFIX}/README.sh"))
+    }
+
     async fn create_exact_object(
         &self,
         path: &object_store::path::Path,
@@ -566,6 +577,69 @@ impl ContentRemote {
             (
                 Self::legacy_migration_recipe_discoverable_path(),
                 "discoverable legacy-migration recovery recipe",
+            ),
+        ] {
+            let bytes = self
+                .store
+                .object_store()
+                .get(&path)
+                .await
+                .map_err(|error| StoreError::Invariant(format!("read {label}: {error}")))?
+                .bytes()
+                .await
+                .map_err(|error| StoreError::Invariant(format!("collect {label}: {error}")))?;
+            if bytes.as_ref() != expected {
+                return Err(StoreError::Invariant(format!(
+                    "{label} differs from recipe {hash}"
+                )));
+            }
+        }
+        Ok(hash)
+    }
+
+    /// Install the metadata-preserving `dp.commit.3` to
+    /// `pondcapsule.legacy.2` migration recipe.
+    ///
+    /// This is deliberately independent from the frozen legacy-migration
+    /// namespace, so a published `.legacy.1` bootstrap remains immutable.
+    pub async fn publish_recovery_recipe_legacy_migration_v2(
+        &self,
+    ) -> Result<RecoveryRecipePublishOutcome> {
+        let bytes = crate::recovery_recipe_legacy_migration_v2();
+        let recipe_hash = crate::recovery_recipe_legacy_migration_v2_hash();
+        let versioned_created = self
+            .create_exact_object(
+                &Self::legacy_migration_v2_recipe_versioned_path(recipe_hash),
+                &bytes,
+                "versioned legacy-migration-v2 recovery recipe",
+            )
+            .await?;
+        let discoverable_created = self
+            .create_exact_object(
+                &Self::legacy_migration_v2_recipe_discoverable_path(),
+                &bytes,
+                "discoverable legacy-migration-v2 recovery recipe",
+            )
+            .await?;
+        Ok(RecoveryRecipePublishOutcome {
+            recipe_hash,
+            versioned_created,
+            discoverable_created,
+        })
+    }
+
+    /// Verify both exact objects in the legacy-migration-v2 recipe namespace.
+    pub async fn inspect_recovery_recipe_legacy_migration_v2(&self) -> Result<ObjectHash> {
+        let expected = crate::recovery_recipe_legacy_migration_v2();
+        let hash = crate::recovery_recipe_legacy_migration_v2_hash();
+        for (path, label) in [
+            (
+                Self::legacy_migration_v2_recipe_versioned_path(hash),
+                "versioned legacy-migration-v2 recovery recipe",
+            ),
+            (
+                Self::legacy_migration_v2_recipe_discoverable_path(),
+                "discoverable legacy-migration-v2 recovery recipe",
             ),
         ] {
             let bytes = self
@@ -2506,6 +2580,25 @@ mod tests {
         assert!(!retry.versioned_created);
         assert!(!retry.discoverable_created);
 
+        let v2 = remote
+            .publish_recovery_recipe_legacy_migration_v2()
+            .await
+            .unwrap();
+        assert!(v2.versioned_created);
+        assert!(v2.discoverable_created);
+        assert_ne!(v2.recipe_hash, first.recipe_hash);
+        assert_eq!(
+            ContentRemote::legacy_migration_v2_recipe_discoverable_path().to_string(),
+            "recovery/legacy-migration-v2/README.sh"
+        );
+        assert_eq!(
+            remote
+                .inspect_recovery_recipe_legacy_migration_v2()
+                .await
+                .unwrap(),
+            v2.recipe_hash
+        );
+
         remote
             .store
             .object_store()
@@ -2526,6 +2619,14 @@ mod tests {
                 .publish_recovery_recipe_legacy_migration()
                 .await
                 .is_err()
+        );
+        assert_eq!(
+            remote
+                .inspect_recovery_recipe_legacy_migration_v2()
+                .await
+                .unwrap(),
+            v2.recipe_hash,
+            "legacy v1 corruption must not affect the v2 recipe"
         );
 
         assert_eq!(

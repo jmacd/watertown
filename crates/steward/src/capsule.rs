@@ -262,6 +262,8 @@ pub enum RecoveryRecipeFlavor {
     TargetFormat,
     /// Deliberate legacy `dp.commit.3` to opaque `pondcapsule.legacy.1` migration.
     LegacyMigration,
+    /// Legacy migration revision that preserves dynamic-node metadata.
+    LegacyMigrationV2,
 }
 
 impl RecoveryRecipeFlavor {
@@ -271,6 +273,7 @@ impl RecoveryRecipeFlavor {
         match self {
             Self::TargetFormat => "target-format",
             Self::LegacyMigration => "legacy-migration",
+            Self::LegacyMigrationV2 => "legacy-migration-v2",
         }
     }
 
@@ -280,6 +283,7 @@ impl RecoveryRecipeFlavor {
         match self {
             Self::TargetFormat => "watertown.commit.v1",
             Self::LegacyMigration => "dp.commit.3",
+            Self::LegacyMigrationV2 => "dp.commit.3",
         }
     }
 
@@ -289,6 +293,7 @@ impl RecoveryRecipeFlavor {
         match self {
             Self::TargetFormat => "pondcapsule.2",
             Self::LegacyMigration => "pondcapsule.legacy.1",
+            Self::LegacyMigrationV2 => "pondcapsule.legacy.2",
         }
     }
 }
@@ -313,6 +318,9 @@ pub async fn open_and_publish_recovery_recipe_limited(
                 }
                 RecoveryRecipeFlavor::LegacyMigration => {
                     remote.publish_recovery_recipe_legacy_migration().await
+                }
+                RecoveryRecipeFlavor::LegacyMigrationV2 => {
+                    remote.publish_recovery_recipe_legacy_migration_v2().await
                 }
             }
             .map_err(|error| {
@@ -346,6 +354,9 @@ pub async fn open_and_inspect_recovery_recipe_limited(
                 }
                 RecoveryRecipeFlavor::LegacyMigration => {
                     remote.inspect_recovery_recipe_legacy_migration().await
+                }
+                RecoveryRecipeFlavor::LegacyMigrationV2 => {
+                    remote.inspect_recovery_recipe_legacy_migration_v2().await
                 }
             }
             .map_err(|error| {

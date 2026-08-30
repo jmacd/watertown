@@ -59,6 +59,28 @@ const LEGACY_INTEGRATION_TEST: &str =
 const LEGACY_NATIVE_FIXTURES: &str =
     include_str!("../recovery/legacy-migration/native-fixtures.json");
 
+const LEGACY_V2_README: &str = include_str!("../recovery/legacy-migration-v2/README.md");
+const LEGACY_V2_FORMAT: &str = include_str!("../recovery/legacy-migration-v2/FORMAT.md");
+const LEGACY_V2_REQUIREMENTS: &str =
+    include_str!("../recovery/legacy-migration-v2/requirements.lock");
+const LEGACY_V2_INTEGRATION_REQUIREMENTS: &str =
+    include_str!("../recovery/legacy-migration-v2/integration-requirements.lock");
+const LEGACY_V2_CAPSULE_README: &str =
+    include_str!("../recovery/legacy-migration-v2/CAPSULE-README.md");
+const LEGACY_V2_CAPSULE_FORMAT: &str =
+    include_str!("../recovery/legacy-migration-v2/CAPSULE-FORMAT.md");
+const LEGACY_V2_CAPSULE_REQUIREMENTS: &str =
+    include_str!("../recovery/legacy-migration-v2/capsule-requirements.lock");
+const LEGACY_V2_CAPSULE_TOOL: &str = include_str!("../recovery/legacy-migration-v2/capsule.py");
+const LEGACY_V2_RECOVER: &str = include_str!("../recovery/legacy-migration-v2/recover.sh");
+const LEGACY_V2_CAPSULE_TEST: &str =
+    include_str!("../recovery/legacy-migration-v2/capsule_test.py");
+const LEGACY_V2_EXTRACTOR: &str = include_str!("../recovery/legacy-migration-v2/extract.py");
+const LEGACY_V2_INTEGRATION_TEST: &str =
+    include_str!("../recovery/legacy-migration-v2/integration_test.py");
+const LEGACY_V2_NATIVE_FIXTURES: &str =
+    include_str!("../recovery/legacy-migration-v2/native-fixtures.json");
+
 const FILES: &[(&str, &str)] = &[
     ("README.md", README),
     ("FORMAT.md", FORMAT),
@@ -224,6 +246,63 @@ pub fn recovery_recipe_legacy_migration() -> Vec<u8> {
 #[must_use]
 pub fn recovery_recipe_legacy_migration_hash() -> ObjectHash {
     recovery_recipe_hash(&recovery_recipe_legacy_migration())
+}
+
+/// Build the reviewable POSIX bootstrap for the metadata-preserving opaque
+/// legacy-migration kit. This is intentionally a separate immutable recipe
+/// from the frozen `pondcapsule.legacy.1` extractor.
+#[must_use]
+pub fn recovery_recipe_legacy_migration_v2() -> Vec<u8> {
+    let files = [
+        ("README.md", LEGACY_V2_README),
+        ("FORMAT.md", LEGACY_V2_FORMAT),
+        ("requirements.lock", LEGACY_V2_REQUIREMENTS),
+        (
+            "integration-requirements.lock",
+            LEGACY_V2_INTEGRATION_REQUIREMENTS,
+        ),
+        ("CAPSULE-README.md", LEGACY_V2_CAPSULE_README),
+        ("CAPSULE-FORMAT.md", LEGACY_V2_CAPSULE_FORMAT),
+        ("capsule-requirements.lock", LEGACY_V2_CAPSULE_REQUIREMENTS),
+        ("capsule.py", LEGACY_V2_CAPSULE_TOOL),
+        ("recover.sh", LEGACY_V2_RECOVER),
+        ("capsule_test.py", LEGACY_V2_CAPSULE_TEST),
+        ("extract.py", LEGACY_V2_EXTRACTOR),
+        ("integration_test.py", LEGACY_V2_INTEGRATION_TEST),
+        ("native-fixtures.json", LEGACY_V2_NATIVE_FIXTURES),
+    ];
+    let mut script = String::from(
+        "#!/bin/sh\nset -eu\numask 077\nDEST=${1:-watertown-legacy-migration-v2-kit}\n\
+         case \"$DEST\" in ''|'/'|'.'|'..'|-*) printf '%s\\n' 'unsafe destination' >&2; exit 2;; esac\n\
+         if [ -e \"$DEST\" ]; then printf '%s\\n' \"destination already exists: $DEST\" >&2; exit 2; fi\n\
+         mkdir -m 700 \"$DEST\"\n",
+    );
+    let mut checksums = String::new();
+    for (index, (name, contents)) in files.iter().enumerate() {
+        let delimiter = format!("__WATERTOWN_LEGACY_MIGRATION_V2_FILE_{index}__");
+        assert!(!contents.lines().any(|line| line == delimiter));
+        script.push_str(&format!(
+            "cat > \"$DEST/{name}\" <<'{delimiter}'\n{contents}{delimiter}\n"
+        ));
+        checksums.push_str(&format!(
+            "{:x}  {name}\n",
+            Sha256::digest(contents.as_bytes())
+        ));
+    }
+    script.push_str(&format!(
+        "cat > \"$DEST/SHA256SUMS\" <<'__WATERTOWN_LEGACY_MIGRATION_V2_CHECKSUMS__'\n\
+         {checksums}__WATERTOWN_LEGACY_MIGRATION_V2_CHECKSUMS__\n\
+         printf '%s\\n' \"Legacy migration v2 kit extracted to $DEST\" \
+         \"Review $DEST/README.md and every extracted file before continuing.\" \
+         \"Verify SHA256SUMS with sha256sum, or with shasum -a 256 on macOS.\"\n"
+    ));
+    script.into_bytes()
+}
+
+/// Domain-separated BLAKE3 identity of the metadata-preserving legacy recipe.
+#[must_use]
+pub fn recovery_recipe_legacy_migration_v2_hash() -> ObjectHash {
+    recovery_recipe_hash(&recovery_recipe_legacy_migration_v2())
 }
 
 pub(crate) fn recovery_recipe_hash(script: &[u8]) -> ObjectHash {
@@ -392,6 +471,35 @@ mod tests {
         assert_ne!(
             recovery_recipe_legacy_migration_hash(),
             recovery_recipe_watertown_commit_v1_hash()
+        );
+    }
+
+    #[test]
+    fn legacy_migration_v2_bootstrap_is_distinct_and_extracts_review_files() {
+        assert_eq!(
+            recovery_recipe_legacy_migration_v2(),
+            recovery_recipe_legacy_migration_v2()
+        );
+        let temporary = tempdir().unwrap();
+        let script = temporary.path().join("README.sh");
+        std::fs::write(&script, recovery_recipe_legacy_migration_v2()).unwrap();
+        let destination = temporary.path().join("kit");
+        assert!(
+            Command::new("sh")
+                .arg(&script)
+                .arg(&destination)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::fs::read_to_string(destination.join("CAPSULE-FORMAT.md"))
+                .unwrap()
+                .contains("pondcapsule.legacy.2")
+        );
+        assert_ne!(
+            recovery_recipe_legacy_migration_v2_hash(),
+            recovery_recipe_legacy_migration_hash()
         );
     }
 }
