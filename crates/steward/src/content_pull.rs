@@ -3408,12 +3408,12 @@ async fn materialize_table_series_v2(
 /// through the leaf partitioner, writing out any leaf it completes at or
 /// after `leaves_from`.
 #[allow(clippy::too_many_arguments)]
-async fn feed_table_batch<'d>(
+async fn feed_table_batch(
     mut batch: RecordBatch,
     object_fingerprint: ObjectHash,
     manifest: &SeriesManifest,
     pack: &PackIndex,
-    descriptors: &'d [PackLeafDescriptor],
+    descriptors: &[PackLeafDescriptor],
     next_descriptor: &mut usize,
     pwd: &WD,
     name: &str,
