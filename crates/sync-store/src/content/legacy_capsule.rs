@@ -2,8 +2,8 @@
 
 //! Opaque legacy-migration capsule envelope.
 //!
-//! `pondcapsule.legacy.1` is intentionally separate from the frozen logical
-//! `pondcapsule.1` and homogeneous-schema `pondcapsule.2` protocols. It
+//! `pondcapsule.legacy.1` and `pondcapsule.legacy.2` are intentionally separate
+//! from the frozen logical `pondcapsule.1` and homogeneous-schema `pondcapsule.2` protocols. They
 //! authenticates the exact legacy payload bytes and their native
 //! `dp.series.1` version mapping without interpreting Parquet.
 
@@ -15,12 +15,17 @@ use tinyfs::EntryType;
 
 use super::{ObjectHash, decode_recipe, decode_series};
 
-/// Opaque capsule format used only for legacy migration.
-pub const LEGACY_CAPSULE_FORMAT: &str = "pondcapsule.legacy.1";
+/// Frozen opaque capsule format that did not represent dynamic-node metadata.
+pub const LEGACY_CAPSULE_FORMAT_V1: &str = "pondcapsule.legacy.1";
+/// Opaque capsule format that preserves dynamic-node timestamps.
+pub const LEGACY_CAPSULE_FORMAT_V2: &str = "pondcapsule.legacy.2";
+/// Current opaque capsule format used for legacy migration.
+pub const LEGACY_CAPSULE_FORMAT: &str = LEGACY_CAPSULE_FORMAT_V2;
 /// Native source format accepted by `pondcapsule.legacy.1`.
 pub const LEGACY_NATIVE_FORMAT_DP_COMMIT_3: &str = "dp.commit.3";
 
-const LEGACY_CAPSULE_ROOT_DOMAIN: &[u8] = b"pondcapsule.legacy.root.1\n";
+const LEGACY_CAPSULE_ROOT_DOMAIN_V1: &[u8] = b"pondcapsule.legacy.root.1\n";
+const LEGACY_CAPSULE_ROOT_DOMAIN_V2: &[u8] = b"pondcapsule.legacy.root.2\n";
 const LEGACY_RECIPE_MAGIC: &[u8] = b"dp.recipe.1\n";
 
 /// Provenance of the verified legacy snapshot.
@@ -81,6 +86,17 @@ pub struct LegacyCapsuleVersion {
     pub extended_attributes: Option<String>,
 }
 
+/// Exact synthetic metadata persisted for a legacy dynamic node.
+///
+/// Dynamic nodes have no physical versions, but the native graph can retain
+/// one metadata record for their creation timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyCapsuleDynamicMetadata {
+    /// Dynamic node modification time in microseconds since the Unix epoch.
+    pub timestamp: i64,
+}
+
 /// Opaque content of one legacy namespace entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -96,6 +112,10 @@ pub enum LegacyCapsuleNode {
     Dynamic {
         /// Exact native recipe object.
         recipe: LegacyCapsuleObject,
+        /// Synthetic dynamic-node metadata. Absent in frozen
+        /// `pondcapsule.legacy.1` capsules.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<LegacyCapsuleDynamicMetadata>,
     },
     /// Physical file or table versions.
     Physical {
@@ -129,7 +149,7 @@ pub struct LegacyCapsuleEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LegacyCapsuleManifest {
-    /// Exactly [`LEGACY_CAPSULE_FORMAT`].
+    /// A supported legacy capsule format.
     pub format: String,
     /// Verified source snapshot provenance.
     pub source: LegacyCapsuleSource,
@@ -179,9 +199,10 @@ impl LegacyCapsuleManifest {
     ///
     /// Returns a specific error for the first invariant violation.
     pub fn validate(&self) -> Result<(), String> {
-        if self.format != LEGACY_CAPSULE_FORMAT {
+        if self.format != LEGACY_CAPSULE_FORMAT_V1 && self.format != LEGACY_CAPSULE_FORMAT_V2 {
             return Err(format!(
-                "unsupported legacy capsule format {:?}; expected {LEGACY_CAPSULE_FORMAT:?}",
+                "unsupported legacy capsule format {:?}; expected {LEGACY_CAPSULE_FORMAT_V1:?} \
+                 or {LEGACY_CAPSULE_FORMAT_V2:?}",
                 self.format
             ));
         }
@@ -236,7 +257,7 @@ impl LegacyCapsuleManifest {
                     entry.source_node_id
                 ));
             }
-            validate_entry(entry)?;
+            validate_entry(entry, self.format == LEGACY_CAPSULE_FORMAT_V2)?;
             let _ = entries_by_path.insert(entry.path.as_str(), entry);
         }
 
@@ -311,12 +332,17 @@ pub fn legacy_capsule_manifest_bytes(manifest: &LegacyCapsuleManifest) -> Result
 pub fn legacy_capsule_root(manifest: &LegacyCapsuleManifest) -> Result<ObjectHash, String> {
     let bytes = legacy_capsule_manifest_bytes(manifest)?;
     let mut hasher = blake3::Hasher::new();
-    let _ = hasher.update(LEGACY_CAPSULE_ROOT_DOMAIN);
+    let domain = match manifest.format.as_str() {
+        LEGACY_CAPSULE_FORMAT_V1 => LEGACY_CAPSULE_ROOT_DOMAIN_V1,
+        LEGACY_CAPSULE_FORMAT_V2 => LEGACY_CAPSULE_ROOT_DOMAIN_V2,
+        _ => unreachable!("manifest validation accepts only supported formats"),
+    };
+    let _ = hasher.update(domain);
     let _ = hasher.update(&bytes);
     Ok(ObjectHash::from_bytes(*hasher.finalize().as_bytes()))
 }
 
-/// Decode canonical `pondcapsule.legacy.1` JSON bytes.
+/// Decode canonical `pondcapsule.legacy.1` or `pondcapsule.legacy.2` JSON bytes.
 ///
 /// # Errors
 ///
@@ -445,7 +471,7 @@ fn verify_legacy_capsule_payload_directory_at_root(
                     )
                 })?;
             }
-            LegacyCapsuleNode::Dynamic { recipe } => {
+            LegacyCapsuleNode::Dynamic { recipe, .. } => {
                 let bytes = read_verified_object(objects_dir, recipe)?;
                 if !bytes.starts_with(LEGACY_RECIPE_MAGIC) {
                     return Err(format!(
@@ -501,14 +527,36 @@ fn verify_legacy_capsule_payload_directory_at_root(
     })
 }
 
-fn validate_entry(entry: &LegacyCapsuleEntry) -> Result<(), String> {
+fn validate_entry(
+    entry: &LegacyCapsuleEntry,
+    supports_dynamic_metadata: bool,
+) -> Result<(), String> {
     match (&entry.entry_type, &entry.node) {
         (EntryType::DirectoryPhysical, LegacyCapsuleNode::Directory)
-        | (EntryType::Symlink, LegacyCapsuleNode::Symlink { .. })
-        | (
+        | (EntryType::Symlink, LegacyCapsuleNode::Symlink { .. }) => Ok(()),
+        (
             EntryType::DirectoryDynamic | EntryType::FileDynamic | EntryType::TableDynamic,
-            LegacyCapsuleNode::Dynamic { .. },
-        ) => Ok(()),
+            LegacyCapsuleNode::Dynamic { metadata, .. },
+        ) => {
+            match (supports_dynamic_metadata, metadata) {
+                (false, Some(_)) => {
+                    return Err(format!(
+                        "legacy capsule path {:?} has dynamic metadata in frozen \
+                         {LEGACY_CAPSULE_FORMAT_V1}",
+                        entry.path
+                    ));
+                }
+                (true, None) => {
+                    return Err(format!(
+                        "legacy capsule path {:?} has no dynamic metadata in \
+                         {LEGACY_CAPSULE_FORMAT_V2}",
+                        entry.path
+                    ));
+                }
+                _ => {}
+            }
+            Ok(())
+        }
         (
             EntryType::FilePhysicalVersion
             | EntryType::FilePhysicalSeries
@@ -640,7 +688,7 @@ fn entry_objects(node: &LegacyCapsuleNode) -> Vec<&LegacyCapsuleObject> {
     match node {
         LegacyCapsuleNode::Directory => Vec::new(),
         LegacyCapsuleNode::Symlink { target } => vec![target],
-        LegacyCapsuleNode::Dynamic { recipe } => vec![recipe],
+        LegacyCapsuleNode::Dynamic { recipe, .. } => vec![recipe],
         LegacyCapsuleNode::Physical {
             series_object,
             versions,
@@ -934,5 +982,50 @@ mod tests {
         materialize(temporary.path(), &manifest, &payloads);
         let error = verify_legacy_capsule_directory(temporary.path()).unwrap_err();
         assert!(error.contains("mapping mismatch"), "{error}");
+    }
+
+    #[test]
+    fn preserves_dynamic_metadata_only_in_legacy_v2() {
+        let recipe = b"dp.recipe.1\n\x04\0\0\0testconfig".to_vec();
+        let source = LegacyCapsuleSource {
+            pond_id: "pond".to_string(),
+            birthplace: "legacy".to_string(),
+            source_tip: ObjectHash::of_bytes(b"tip"),
+            exported_at_micros: 1,
+            tool_version: "test".to_string(),
+            native_format: LEGACY_NATIVE_FORMAT_DP_COMMIT_3.to_string(),
+        };
+        let manifest = LegacyCapsuleManifest::new(
+            source,
+            vec![
+                LegacyCapsuleEntry {
+                    path: "/".to_string(),
+                    entry_type: EntryType::DirectoryPhysical,
+                    source_node_id: "root".to_string(),
+                    node: LegacyCapsuleNode::Directory,
+                },
+                LegacyCapsuleEntry {
+                    path: "/dynamic".to_string(),
+                    entry_type: EntryType::DirectoryDynamic,
+                    source_node_id: "dynamic".to_string(),
+                    node: LegacyCapsuleNode::Dynamic {
+                        recipe: object(&recipe),
+                        metadata: Some(LegacyCapsuleDynamicMetadata { timestamp: 42 }),
+                    },
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(manifest.format, LEGACY_CAPSULE_FORMAT_V2);
+        assert!(
+            legacy_capsule_manifest_bytes(&manifest)
+                .unwrap()
+                .windows(br#""metadata":{"timestamp":42}"#.len())
+                .any(|window| window == br#""metadata":{"timestamp":42}"#)
+        );
+
+        let mut frozen = manifest;
+        frozen.format = LEGACY_CAPSULE_FORMAT_V1.to_string();
+        assert!(frozen.validate().unwrap_err().contains("dynamic metadata"));
     }
 }

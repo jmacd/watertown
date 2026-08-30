@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Generic staged import: materialize a downloaded `pondcapsule.1`,
-//! `pondcapsule.2`, or opaque `pondcapsule.legacy.1` capsule
+//! `pondcapsule.2`, or opaque `pondcapsule.legacy.1`/`pondcapsule.legacy.2` capsule
 //! into a brand-new pond (`docs/recovery-capsule-design.md`, "Generic staged
 //! import").
 //!
@@ -75,10 +75,10 @@ use serde::{Deserialize, Serialize};
 use sync_store::content::{PayloadKind, SeriesManifest, merkle_root, recipe_hash};
 use sync_store::{
     CapsuleEntry, CapsuleLeaf, CapsuleManifest, CapsuleNode, CapsuleObject, CapsulePayloadKind,
-    IncrementalFileLeafHasher, IncrementalTableLeafHasher, LEGACY_CAPSULE_FORMAT,
-    LegacyCapsuleEntry, LegacyCapsuleManifest, LegacyCapsuleNode, LegacyCapsuleObject,
-    LegacyCapsulePayloadKind, LegacyCapsuleVersion, ManifestEntry, ObjectHash, VersionMeta,
-    canonicalize_schema, decode_manifest, decode_recipe, encode_canonical_attributes,
+    IncrementalFileLeafHasher, IncrementalTableLeafHasher, LEGACY_CAPSULE_FORMAT_V1,
+    LEGACY_CAPSULE_FORMAT_V2, LegacyCapsuleEntry, LegacyCapsuleManifest, LegacyCapsuleNode,
+    LegacyCapsuleObject, LegacyCapsulePayloadKind, LegacyCapsuleVersion, ManifestEntry, ObjectHash,
+    VersionMeta, canonicalize_schema, decode_manifest, decode_recipe, encode_canonical_attributes,
     encode_canonical_batch_rows, legacy_capsule_root, read_capsule_manifest,
     read_legacy_capsule_manifest, schema_fingerprint, verify_capsule_payload_directory,
     verify_legacy_capsule_payload_directory,
@@ -173,7 +173,10 @@ pub async fn import_capsule(
 ) -> Result<CapsuleImportReport, StewardError> {
     let parent = validate_import_target(target)?;
     let format = read_capsule_format(capsule_dir)?;
-    if format == LEGACY_CAPSULE_FORMAT {
+    if matches!(
+        format.as_str(),
+        LEGACY_CAPSULE_FORMAT_V1 | LEGACY_CAPSULE_FORMAT_V2
+    ) {
         return import_legacy_capsule(capsule_dir, target, parent, birthplace.into()).await;
     }
     import_logical_capsule(capsule_dir, target, parent, birthplace.into()).await
@@ -1285,7 +1288,7 @@ async fn write_legacy_entries(
                     })?;
                     let _ = parent_wd.create_symlink_path(name, target).await?;
                 }
-                LegacyCapsuleNode::Dynamic { recipe } => {
+                LegacyCapsuleNode::Dynamic { recipe, metadata } => {
                     let bytes = read_legacy_object(objects_dir, recipe)?;
                     let (factory, config) = decode_recipe(&bytes).map_err(|error| {
                         StewardError::Content(format!(
@@ -1294,7 +1297,13 @@ async fn write_legacy_entries(
                         ))
                     })?;
                     let _ = parent_wd
-                        .create_dynamic_path(name, entry.entry_type, &factory, config)
+                        .create_dynamic_path_with_mtime(
+                            name,
+                            entry.entry_type,
+                            &factory,
+                            config,
+                            metadata.as_ref().map(|metadata| metadata.timestamp),
+                        )
                         .await?;
                 }
                 LegacyCapsuleNode::Physical { .. } => {
@@ -1532,7 +1541,7 @@ async fn verify_staged_legacy_replay(
                     source_entry.path, target_entry.child_hash, target.hash
                 )));
             }
-            LegacyCapsuleNode::Dynamic { recipe } => {
+            LegacyCapsuleNode::Dynamic { recipe, metadata } => {
                 let bytes = read_legacy_object(objects_dir, recipe)?;
                 let (factory, config) = decode_recipe(&bytes).map_err(|error| {
                     StewardError::Content(format!(
@@ -1546,6 +1555,26 @@ async fn verify_staged_legacy_replay(
                         "staged legacy dynamic recipe {:?} hashes to {}, replay expected {}",
                         source_entry.path, target_entry.child_hash, expected
                     )));
+                }
+                if let Some(metadata) = metadata {
+                    let [target_metadata] = target_entry.versions.as_slice() else {
+                        return Err(StewardError::Content(format!(
+                            "staged legacy dynamic node {:?} has {} metadata versions; \
+                             expected exactly one",
+                            source_entry.path,
+                            target_entry.versions.len()
+                        )));
+                    };
+                    if target_metadata.timestamp != Some(metadata.timestamp)
+                        || target_metadata.min_event_time.is_some()
+                        || target_metadata.max_event_time.is_some()
+                        || target_metadata.extended_attributes.is_some()
+                    {
+                        return Err(StewardError::Content(format!(
+                            "staged legacy dynamic node {:?} metadata differs from source",
+                            source_entry.path
+                        )));
+                    }
                 }
             }
             _ => {}

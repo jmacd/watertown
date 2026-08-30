@@ -13,10 +13,10 @@ use serde::{Deserialize, Serialize};
 use steward::{ContentSource, LocalPondSource, Ship, build_recovery_capsule, import_capsule};
 use sync_store::content::{PackIndex, PackIndexRevision, SeriesManifest, SeriesManifestRevision};
 use sync_store::{
-    CapsuleManifest, CapsuleNode, ContentRemote, LegacyCapsuleEntry, LegacyCapsuleManifest,
-    LegacyCapsuleNode, LegacyCapsuleObject, LegacyCapsulePayloadKind, LegacyCapsuleSource,
-    LegacyCapsuleVersion, ObjectHash, capsule_manifest_bytes, capsule_root, decode_manifest,
-    legacy_capsule_manifest_bytes, legacy_capsule_root, read_capsule_manifest,
+    CapsuleManifest, CapsuleNode, ContentRemote, LegacyCapsuleDynamicMetadata, LegacyCapsuleEntry,
+    LegacyCapsuleManifest, LegacyCapsuleNode, LegacyCapsuleObject, LegacyCapsulePayloadKind,
+    LegacyCapsuleSource, LegacyCapsuleVersion, ObjectHash, capsule_manifest_bytes, capsule_root,
+    decode_manifest, legacy_capsule_manifest_bytes, legacy_capsule_root, read_capsule_manifest,
     verify_capsule_directory,
 };
 use tempfile::tempdir;
@@ -225,6 +225,7 @@ fn legacy_fixture() -> LegacyFixture {
                 source_node_id: "dynamic".to_string(),
                 node: LegacyCapsuleNode::Dynamic {
                     recipe: legacy_object(&recipe),
+                    metadata: Some(LegacyCapsuleDynamicMetadata { timestamp: 424_242 }),
                 },
             },
         ],
@@ -799,6 +800,15 @@ async fn imports_opaque_legacy_schema_evolution_and_publishes_per_leaf_pack_sche
         .iter()
         .find(|entry| entry.name == "tables" && entry.entry_type == EntryType::TablePhysicalSeries)
         .expect("table series manifest entry");
+    let dynamic_entry = manifest
+        .iter()
+        .find(|entry| entry.name == "10-legacy" && entry.entry_type == EntryType::FileDynamic)
+        .expect("dynamic manifest entry");
+    assert_eq!(dynamic_entry.versions.len(), 1);
+    assert_eq!(dynamic_entry.versions[0].timestamp, Some(424_242));
+    assert!(dynamic_entry.versions[0].min_event_time.is_none());
+    assert!(dynamic_entry.versions[0].max_event_time.is_none());
+    assert!(dynamic_entry.versions[0].extended_attributes.is_none());
     let series_hash = table_entry.child_hash;
     let series = SeriesManifest::decode(
         &source

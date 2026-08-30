@@ -256,6 +256,11 @@ enum CapsuleRecipeCommand {
         #[command(subcommand)]
         command: LegacyMigrationRecipeCommand,
     },
+    /// Operate on the metadata-preserving dp.commit.3 -> pondcapsule.legacy.2 recipe.
+    LegacyMigrationV2 {
+        #[command(subcommand)]
+        command: LegacyMigrationRecipeCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -840,6 +845,18 @@ async fn main() -> Result<()> {
                             commands::RecoveryRecipeAction::Inspect,
                         ),
                     },
+                    CapsuleRecipeCommand::LegacyMigrationV2 { command } => match command {
+                        LegacyMigrationRecipeCommand::Publish { name } => (
+                            name,
+                            steward::RecoveryRecipeFlavor::LegacyMigrationV2,
+                            commands::RecoveryRecipeAction::Publish,
+                        ),
+                        LegacyMigrationRecipeCommand::Inspect { name } => (
+                            name,
+                            steward::RecoveryRecipeFlavor::LegacyMigrationV2,
+                            commands::RecoveryRecipeAction::Inspect,
+                        ),
+                    },
                 };
                 commands::capsule_recipe_command(&ship_context, &name, flavor, action).await
             }
@@ -1086,6 +1103,29 @@ mod tests {
                 command: CapsuleCommand::Recipe {
                     command: CapsuleRecipeCommand::LegacyMigration {
                         command: LegacyMigrationRecipeCommand::Inspect { ref name }
+                    }
+                }
+            } if name == "backup"
+        ));
+    }
+
+    #[test]
+    fn parses_metadata_preserving_legacy_migration_recipe_commands() {
+        let publish = Cli::try_parse_from([
+            "pond",
+            "capsule",
+            "recipe",
+            "legacy-migration-v2",
+            "publish",
+            "backup",
+        ])
+        .unwrap();
+        assert!(matches!(
+            publish.command,
+            Commands::Capsule {
+                command: CapsuleCommand::Recipe {
+                    command: CapsuleRecipeCommand::LegacyMigrationV2 {
+                        command: LegacyMigrationRecipeCommand::Publish { ref name }
                     }
                 }
             } if name == "backup"

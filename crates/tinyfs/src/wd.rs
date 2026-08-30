@@ -1312,6 +1312,35 @@ impl WD {
         .await
     }
 
+    /// Create a dynamic node, preserving an explicit source modification time.
+    pub async fn create_dynamic_path_with_mtime<P: AsRef<Path>>(
+        &self,
+        path: P,
+        entry_type: EntryType,
+        factory_type: &str,
+        config_content: Vec<u8>,
+        mtime: Option<i64>,
+    ) -> Result<NodePath> {
+        let path_clone = path.as_ref().to_path_buf();
+        self.in_path(path.as_ref(), |wd, entry| async move {
+            wd.check_writable()?;
+            match entry {
+                Lookup::NotFound(_, name) => {
+                    let id = wd.id().new_child_id(entry_type);
+                    let node = wd
+                        .fs
+                        .create_dynamic_node(id, factory_type, config_content, mtime)
+                        .await?;
+                    wd.dref.insert(name.clone(), node.clone()).await?;
+                    Ok(NodePath::new(node, wd.dref.path().join(&name)))
+                }
+                Lookup::Found(_) => Err(Error::already_exists(&path_clone)),
+                Lookup::Empty(_) => Err(Error::empty_path()),
+            }
+        })
+        .await
+    }
+
     /// Read entire file content via path (convenience for tests/special cases)
     /// WARNING: Loads entire file into memory. Use async_reader_path() for streaming.
     pub async fn read_file_path_to_vec<P: AsRef<Path>>(&self, path: P) -> Result<Vec<u8>> {

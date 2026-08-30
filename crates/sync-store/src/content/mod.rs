@@ -67,7 +67,8 @@ pub use capsule::{
 };
 pub use commit::{Commit, ContentModelVersion, Provenance};
 pub use legacy_capsule::{
-    LEGACY_CAPSULE_FORMAT, LEGACY_NATIVE_FORMAT_DP_COMMIT_3, LegacyCapsuleEntry,
+    LEGACY_CAPSULE_FORMAT, LEGACY_CAPSULE_FORMAT_V1, LEGACY_CAPSULE_FORMAT_V2,
+    LEGACY_NATIVE_FORMAT_DP_COMMIT_3, LegacyCapsuleDynamicMetadata, LegacyCapsuleEntry,
     LegacyCapsuleManifest, LegacyCapsuleNode, LegacyCapsuleObject, LegacyCapsulePayloadKind,
     LegacyCapsuleSource, LegacyCapsuleVerifyReport, LegacyCapsuleVersion,
     decode_legacy_capsule_manifest, legacy_capsule_manifest_bytes, legacy_capsule_root,
