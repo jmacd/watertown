@@ -3,8 +3,9 @@
 > **Status:** `pondcapsule.1` and its published `dp.commit.3` recipe remain
 > frozen compatibility material. `pondcapsule.2` remains the homogeneous
 > logical capsule used by its existing producers/consumers. `pondcapsule.3`
-> is the current target-format recovery capsule and preserves per-leaf table
-> schemas for schema-evolved series.
+> preserves per-leaf table schemas for schema-evolved series. `pondcapsule.4`
+> is the current target-format recovery capsule and also preserves persisted
+> dynamic-node timestamps.
 > `pondcapsule.legacy.1` is the separate opaque migration envelope for legacy
 > physical payloads, including table series whose schema evolved by version.
 >
@@ -47,10 +48,12 @@ portable capsule uses its own explicit `pondcapsule` namespace:
   Watertown ponds. It has a distinct manifest format identifier and root hash
   domain, while retaining the same verified logical payload model during the
   migration transition.
-- `pondcapsule.3` is the current target-format recovery capsule. It has
-  distinct manifest and series-root domains, and commits each table leaf's
-  schema fingerprint so schema evolution is preserved without rewriting
-  physical Parquet leaves.
+- `pondcapsule.3` has distinct manifest and series-root domains, and commits
+  each table leaf's schema fingerprint so schema evolution is preserved without
+  rewriting physical Parquet leaves. It remains supported for compatibility.
+- `pondcapsule.4` is the current target-format recovery capsule. It has a
+  distinct manifest-root domain and preserves optional synthetic metadata for
+  dynamic nodes. It reuses V3's schema-aware series-root rules unchanged.
 - `pondcapsule.legacy.1` is an immutable opaque migration envelope with its own
   `pondcapsule.legacy.root.1\n` root domain. It authenticates raw physical
   objects and the native leaf-to-object/version mapping; it does not reuse or
@@ -184,7 +187,7 @@ pond capsule verify <capsule-directory>
 
 Recipe commands use a named remote attachment and its storage profile.
 The direct `publish`/`inspect` forms select the target-format
-`watertown.commit.v1` to `pondcapsule.3` recipe. The nested
+`watertown.commit.v1` to `pondcapsule.4` recipe. The nested
 `legacy-migration` forms select the deliberate `dp.commit.3` to
 `pondcapsule.legacy.1` recipe.
 Downloaded logical-capsule inspection and verification do not require a local

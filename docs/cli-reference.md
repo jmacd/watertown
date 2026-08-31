@@ -548,7 +548,7 @@ install or verify the small static recovery recipe before writing backup data.
 
 Install static native-format recovery recipes and verify portable logical
 recovery snapshots. The default recipe is the current target-format
-`watertown.commit.v1` to `pondcapsule.3` path. Legacy migration is a separate,
+`watertown.commit.v1` to `pondcapsule.4` path. Legacy migration is a separate,
 deliberate `dp.commit.3` to `pondcapsule.legacy.1` operation.
 
 ```bash

@@ -18,7 +18,7 @@ preserve synthetic dynamic-node metadata. Do not use it for a migration. The
 pond format.
 
 The existing generic recipe remains the `watertown.commit.v1` to
-`pondcapsule.3` target-format recipe under `recovery/README.sh` and
+`pondcapsule.4` target-format recipe under `recovery/README.sh` and
 `recovery/recipes/watertown.commit.v1/<recipe-hash>/README.sh`. Do not
 overwrite, reinterpret, or use that generic bootstrap for this migration.
 The discoverable bootstrap is immutable: when a newer reviewed generic kit is
@@ -104,7 +104,7 @@ Do not proceed to the next gate unless the current gate succeeds:
 9. The target passes replay-identity, metadata, application, and remote checks
    while post-commit dispatch remains suppressed.
 10. A separate `watertown.commit.v1` target-format backup is recovered using
-    the current hash-addressed generic `pondcapsule.3` recipe. It must include
+    the current hash-addressed generic `pondcapsule.4` recipe. It must include
     pack-aware series recovery when the source uses that representation.
 11. Exactly one pond is enabled as the authoritative writer.
 
@@ -348,7 +348,7 @@ It does not create symlinks, execute recipes, analyze Parquet, or establish
 target logical leaf identities.
 
 Do not substitute `pond capsule inspect` or `pond capsule verify` here: those
-commands describe logical `pondcapsule.1`/`pondcapsule.2`/`pondcapsule.3`
+commands describe logical `pondcapsule.1`/`pondcapsule.2`/`pondcapsule.3`/`pondcapsule.4`
 verification, not
 this opaque source envelope.
 
@@ -416,7 +416,7 @@ Those generic commands must report:
 ```text
 flavor=target-format
 native_format=watertown.commit.v1
-capsule_format=pondcapsule.3
+capsule_format=pondcapsule.4
 ```
 
 Recover that new backup into another disposable pond using the independently

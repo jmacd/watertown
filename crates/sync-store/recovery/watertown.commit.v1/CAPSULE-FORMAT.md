@@ -1,4 +1,4 @@
-# Portable capsule format: `pondcapsule.3`
+# Portable capsule format: `pondcapsule.4`
 
 This document describes the files needed to inspect a capsule without Pond or
 the Watertown source tree. Treat the capsule as read-only during recovery.
@@ -17,7 +17,7 @@ recovery/
   objects/blake3=<hash>       immutable payload bytes
 ```
 
-The capsule root is BLAKE3 over the ASCII domain `pondcapsule.root.3\n`
+The capsule root is BLAKE3 over the ASCII domain `pondcapsule.root.4\n`
 followed by the exact manifest bytes. The manifest names the source pond,
 source commit, every logical path, and the complete payload closure. Each
 payload descriptor records the BLAKE3 hash and exact byte size.
@@ -34,6 +34,8 @@ hash-authenticated `dp.commit.3` recovery kit.
 - Dynamic recipes use the source `watertown.recipe.v1` or legacy
   `dp.recipe.1` framing. Materialization emits the raw recipe plus
   `factory.json` and exact `config.bin`; it never executes the recipe.
+- A dynamic node's optional persisted metadata is a `metadata` object with
+  its `timestamp` in microseconds. V4 preserves this timestamp exactly.
 
 Physical objects may not align one-for-one with logical versions. The manifest
 therefore records ordered logical leaves and roots independently of object
@@ -50,7 +52,7 @@ timestamp recorded in the native tree metadata; the per-leaf bounds,
 attributes, counts, logical hashes, and (for tables) schemas are preserved
 exactly from the descriptors and decoded payload.
 Empty physical versions with source metadata are not representable in
-`pondcapsule.3`; extraction fails rather than silently dropping that metadata.
+`pondcapsule.4`; extraction fails rather than silently dropping that metadata.
 
 ## Materialized layout
 

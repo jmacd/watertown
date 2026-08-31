@@ -163,7 +163,7 @@ def build_native_backup(
     )
 
     children = [
-        ("dynamic", 5, digest(recipe_bytes), []),
+        ("dynamic", 5, digest(recipe_bytes), [metadata(104)]),
         ("file", 4, digest(EXTERNAL_FILE), [metadata(101)]),
         ("link", 3, digest(SYMLINK_TARGET), []),
         ("table", 8, digest(series), table_versions),
@@ -179,7 +179,7 @@ def build_native_backup(
     entries = [
         ("file", "root", "file", 4, digest(EXTERNAL_FILE), [metadata(101)]),
         ("link", "root", "link", 3, digest(SYMLINK_TARGET), []),
-        ("recipe", "root", "dynamic", 5, digest(recipe_bytes), []),
+        ("recipe", "root", "dynamic", 5, digest(recipe_bytes), [metadata(104)]),
         ("root", "", "", 1, tree_hash, []),
         ("table", "root", "table", 8, digest(series), table_versions),
     ]
@@ -443,11 +443,13 @@ def build_current_pack_backup(root: Path) -> None:
             raise AssertionError("pack decoder accepted trailing bytes")
     tree = (
         b"watertown.tree.v1\n"
-        + struct.pack("<I", 1)
+        + struct.pack("<I", 2)
+        + tree_entry("dynamic", 5, digest(RECIPE_BYTES), [metadata(104)])
         + tree_entry("table", 8, series_hash, [metadata(103)])
     )
     tree_hash = digest(tree)
     entries = [
+        ("dynamic", "root", "dynamic", 5, digest(RECIPE_BYTES), [metadata(104)]),
         ("root", "", "", 1, tree_hash, []),
         ("table", "root", "table", 8, series_hash, [metadata(103)]),
     ]
@@ -479,7 +481,15 @@ def build_current_pack_backup(root: Path) -> None:
     rows.append(
         (NIL_UUID, "meta", "pond_id", 1, False, POND_ID.encode(), digest(POND_ID.encode()), NOW)
     )
-    for value in (physical_one, physical_two, series, tree, manifest, commit):
+    for value in (
+        physical_one,
+        physical_two,
+        RECIPE_BYTES,
+        series,
+        tree,
+        manifest,
+        commit,
+    ):
         add("objects", digest(value).hex(), value)
     add("refs", "main", commit_hash)
     arrow = pa.table(
@@ -547,7 +557,13 @@ def main() -> int:
         )
         verified_manifest, report = load_and_verify(destination)
         assert report["root"] == root
-        assert verified_manifest["format"] == "pondcapsule.3"
+        assert verified_manifest["format"] == "pondcapsule.4"
+        dynamic_node = next(
+            entry["node"]
+            for entry in verified_manifest["entries"]
+            if entry["path"] == "/dynamic"
+        )
+        assert dynamic_node["metadata"] == {"timestamp": 104}
         table_node = next(
             entry["node"]
             for entry in verified_manifest["entries"]

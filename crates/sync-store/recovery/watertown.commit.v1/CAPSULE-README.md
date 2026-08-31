@@ -102,7 +102,7 @@ python /trusted/recovery-kit/capsule.py materialize \
   /path/to/CAPSULE /path/to/NEW-RECOVERED-DIRECTORY
 ```
 
-`pondcapsule.3` cannot encode an empty member of a multi-version series.
+`pondcapsule.4` cannot encode an empty member of a multi-version series.
 Extraction fails rather than silently dropping one. A single empty physical
 file or table is representable only when its native version metadata is empty;
 otherwise extraction fails rather than silently discarding that metadata.

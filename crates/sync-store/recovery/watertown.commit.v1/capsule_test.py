@@ -29,7 +29,7 @@ def write_capsule(root: Path, manifest: dict) -> None:
         manifest,
         ensure_ascii=False,
         separators=(",", ":"),
-        sort_keys=manifest["format"] == "pondcapsule.3",
+        sort_keys=manifest["format"] in {"pondcapsule.3", "pondcapsule.4"},
     ).encode()
     digest = blake3.blake3(ROOT_DOMAINS[manifest["format"]] + encoded).hexdigest()
     (root / "recovery" / "refs").mkdir(parents=True)

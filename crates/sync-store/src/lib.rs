@@ -41,14 +41,14 @@ pub use azure_registration::{AZURE_SCHEMES, register_azure_handlers};
 pub use s3_registration::register_s3_handlers;
 
 pub use content::{
-    CAPSULE_FORMAT_V1, CAPSULE_FORMAT_V2, CAPSULE_FORMAT_V3, CapsuleEntry, CapsuleLeaf,
-    CapsuleManifest, CapsuleNode, CapsuleObject, CapsulePayloadKind, CapsuleSource,
-    CapsuleVerifyReport, Commit, IncrementalFileLeafHasher, IncrementalTableLeafHasher,
-    LEGACY_CAPSULE_FORMAT, LEGACY_CAPSULE_FORMAT_V1, LEGACY_CAPSULE_FORMAT_V2,
-    LEGACY_NATIVE_FORMAT_DP_COMMIT_3, LegacyCapsuleDynamicMetadata, LegacyCapsuleEntry,
-    LegacyCapsuleManifest, LegacyCapsuleNode, LegacyCapsuleObject, LegacyCapsulePayloadKind,
-    LegacyCapsuleSource, LegacyCapsuleVerifyReport, LegacyCapsuleVersion, ManifestEntry,
-    NodeMerkle, ObjectHash, Provenance, TreeEntry, VersionMeta, canonicalize_schema,
+    CAPSULE_FORMAT_V1, CAPSULE_FORMAT_V2, CAPSULE_FORMAT_V3, CAPSULE_FORMAT_V4,
+    CapsuleDynamicMetadata, CapsuleEntry, CapsuleLeaf, CapsuleManifest, CapsuleNode, CapsuleObject,
+    CapsulePayloadKind, CapsuleSource, CapsuleVerifyReport, Commit, IncrementalFileLeafHasher,
+    IncrementalTableLeafHasher, LEGACY_CAPSULE_FORMAT, LEGACY_CAPSULE_FORMAT_V1,
+    LEGACY_CAPSULE_FORMAT_V2, LEGACY_NATIVE_FORMAT_DP_COMMIT_3, LegacyCapsuleDynamicMetadata,
+    LegacyCapsuleEntry, LegacyCapsuleManifest, LegacyCapsuleNode, LegacyCapsuleObject,
+    LegacyCapsulePayloadKind, LegacyCapsuleSource, LegacyCapsuleVerifyReport, LegacyCapsuleVersion,
+    ManifestEntry, NodeMerkle, ObjectHash, Provenance, TreeEntry, VersionMeta, canonicalize_schema,
     capsule_leaf_hash, capsule_manifest_bytes, capsule_root, capsule_series_root,
     capsule_series_root_v3, decode_capsule_manifest, decode_legacy_capsule_manifest,
     decode_manifest, decode_recipe, decode_series, decode_tree, encode_canonical_attributes,
