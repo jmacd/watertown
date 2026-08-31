@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract a pondcapsule.3 from a local watertown.commit.v1 Delta backup."""
+"""Extract a pondcapsule.4 from a local watertown.commit.v1 Delta backup."""
 
 from __future__ import annotations
 
@@ -88,6 +88,23 @@ def decode_metadata(cur: Cursor) -> dict[str, Any]:
         "extended_attributes": cur.text() if flags & 4 else None,
         "timestamp": cur.i64() if flags & 8 else None,
     }
+
+def dynamic_metadata(versions: list[dict[str, Any]], path: str) -> dict[str, int] | None:
+    if not versions:
+        return None
+    if len(versions) != 1:
+        raise FormatError(
+            f"dynamic node {path} has {len(versions)} metadata records; expected at most one"
+        )
+    metadata = versions[0]
+    if (
+        metadata["timestamp"] is None
+        or metadata["min_event_time"] is not None
+        or metadata["max_event_time"] is not None
+        or metadata["extended_attributes"] is not None
+    ):
+        raise FormatError(f"dynamic node {path} has unsupported metadata")
+    return {"timestamp": metadata["timestamp"]}
 
 
 def decode_commit(data: bytes) -> dict[str, Any]:
@@ -1521,6 +1538,9 @@ def _extract_graph(source: Path, destination: Path, ref_name: str | None,
                 decode_recipe(backup.read_object(child_hash))
                 node = {"kind": "dynamic", "recipe": _copy_payload(
                     recipe_path, objects_dir, child_hash, blake3)}
+                metadata = dynamic_metadata(native["versions"], paths[native["node_id"]])
+                if metadata is not None:
+                    node["metadata"] = metadata
             else:
                 payload_kind = "file" if entry_type.startswith("file:") else "table"
                 series = decode_series(backup.read_object(child_hash)) \
@@ -1564,12 +1584,12 @@ def _extract_graph(source: Path, destination: Path, ref_name: str | None,
                             if is_series:
                                 raise FormatError(
                                     f"series {paths[native['node_id']]} contains an empty file "
-                                    "version that pondcapsule.3 cannot represent"
+                                    "version that pondcapsule.4 cannot represent"
                                 )
                             if any(value is not None for value in metadata.values()):
                                 raise FormatError(
                                     f"empty file version {paths[native['node_id']]} carries "
-                                    "metadata that pondcapsule.3 cannot represent"
+                                    "metadata that pondcapsule.4 cannot represent"
                                 )
                             (objects_dir / f"blake3={digest.hex()}").unlink()
                             continue
@@ -1597,12 +1617,12 @@ def _extract_graph(source: Path, destination: Path, ref_name: str | None,
                             if is_series:
                                 raise FormatError(
                                     f"series {paths[native['node_id']]} contains an empty table "
-                                    "version that pondcapsule.3 cannot represent"
+                                    "version that pondcapsule.4 cannot represent"
                                 )
                             if any(value is not None for value in metadata.values()):
                                 raise FormatError(
                                     f"empty table version {paths[native['node_id']]} carries "
-                                    "metadata that pondcapsule.3 cannot represent"
+                                    "metadata that pondcapsule.4 cannot represent"
                                 )
                             continue
                         def table_parts(parquet: Any = parquet, schema: Any = schema) -> Iterator[bytes]:
@@ -1652,7 +1672,7 @@ def _extract_graph(source: Path, destination: Path, ref_name: str | None,
             })
         entries.sort(key=lambda entry: entry["path"].encode())
         manifest = {
-            "format": "pondcapsule.3",
+            "format": "pondcapsule.4",
             "source": {
                 "pond_id": backup.pond_id,
                 "birthplace": birthplace,
@@ -1664,7 +1684,7 @@ def _extract_graph(source: Path, destination: Path, ref_name: str | None,
         }
         manifest_bytes = json.dumps(
             manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
-        capsule_root = blake3.blake3(b"pondcapsule.root.3\n" + manifest_bytes).hexdigest()
+        capsule_root = blake3.blake3(b"pondcapsule.root.4\n" + manifest_bytes).hexdigest()
         (manifests_dir / f"{capsule_root}.json").write_bytes(manifest_bytes)
         (refs_dir / "latest").write_text(capsule_root + "\n", encoding="ascii")
         kit = Path(__file__).resolve().parent

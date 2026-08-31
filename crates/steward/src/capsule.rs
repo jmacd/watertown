@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use sync_store::content::{FetchedSeriesObject, decode_fetched_series_object};
 use sync_store::{
-    CapsuleEntry, CapsuleLeaf, CapsuleManifest, CapsuleNode, CapsuleObject, CapsulePayloadKind,
-    CapsuleSource, IncrementalFileLeafHasher, IncrementalTableLeafHasher, ObjectHash,
-    capsule_series_root_v3, decode_manifest, decode_recipe, encode_canonical_attributes,
-    encode_canonical_batch_rows, schema_fingerprint,
+    CapsuleDynamicMetadata, CapsuleEntry, CapsuleLeaf, CapsuleManifest, CapsuleNode, CapsuleObject,
+    CapsulePayloadKind, CapsuleSource, IncrementalFileLeafHasher, IncrementalTableLeafHasher,
+    ManifestEntry, ObjectHash, capsule_series_root_v3, decode_manifest, decode_recipe,
+    encode_canonical_attributes, encode_canonical_batch_rows, schema_fingerprint,
 };
 use tinyfs::EntryType;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -176,8 +176,11 @@ pub(crate) async fn build_recovery_capsule_from_materialized(
             }
 
             EntryType::DirectoryDynamic | EntryType::FileDynamic | EntryType::TableDynamic => {
+                let metadata = dynamic_metadata(native, &path)?;
                 let recipe = match prior_node {
-                    Some(CapsuleNode::Dynamic { recipe }) if recipe.hash == native.child_hash => {
+                    Some(CapsuleNode::Dynamic { recipe, .. })
+                        if recipe.hash == native.child_hash =>
+                    {
                         let _ = reused_payloads.insert(recipe.hash);
                         recipe.clone()
                     }
@@ -194,7 +197,7 @@ pub(crate) async fn build_recovery_capsule_from_materialized(
                         recipe
                     }
                 };
-                CapsuleNode::Dynamic { recipe }
+                CapsuleNode::Dynamic { recipe, metadata }
             }
             EntryType::FilePhysicalVersion
             | EntryType::FilePhysicalSeries
@@ -230,7 +233,7 @@ pub(crate) async fn build_recovery_capsule_from_materialized(
         exported_at_micros: source_commit.provenance.time_micros,
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    let manifest = CapsuleManifest::new_v3(source, entries).map_err(StewardError::Content)?;
+    let manifest = CapsuleManifest::new_v4(source, entries).map_err(StewardError::Content)?;
     let declared: HashSet<ObjectHash> = manifest
         .payload_objects()
         .map_err(StewardError::Content)?
@@ -255,10 +258,43 @@ pub(crate) async fn build_recovery_capsule_from_materialized(
     })
 }
 
+fn dynamic_metadata(
+    native: &ManifestEntry,
+    path: &str,
+) -> Result<Option<CapsuleDynamicMetadata>, StewardError> {
+    match native.versions.as_slice() {
+        [] => Ok(None),
+        [metadata]
+            if metadata.min_event_time.is_none()
+                && metadata.max_event_time.is_none()
+                && metadata.extended_attributes.is_none() =>
+        {
+            let timestamp = metadata.timestamp.ok_or_else(|| {
+                StewardError::Content(format!(
+                    "dynamic node {path:?} has a metadata record without a timestamp"
+                ))
+            })?;
+            Ok(Some(CapsuleDynamicMetadata { timestamp }))
+        }
+        [metadata] => Err(StewardError::Content(format!(
+            "dynamic node {path:?} has unsupported metadata: timestamp={:?}, \
+             min_event_time={:?}, max_event_time={:?}, extended_attributes={:?}",
+            metadata.timestamp,
+            metadata.min_event_time,
+            metadata.max_event_time,
+            metadata.extended_attributes
+        ))),
+        metadata => Err(StewardError::Content(format!(
+            "dynamic node {path:?} has {} metadata records; expected at most one",
+            metadata.len()
+        ))),
+    }
+}
+
 /// Static recovery recipe selected for an explicit remote operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryRecipeFlavor {
-    /// Current target-native `watertown.commit.v1` to logical `pondcapsule.3`.
+    /// Current target-native `watertown.commit.v1` to logical `pondcapsule.4`.
     TargetFormat,
     /// Deliberate legacy `dp.commit.3` to opaque `pondcapsule.legacy.1` migration.
     LegacyMigration,
@@ -291,7 +327,7 @@ impl RecoveryRecipeFlavor {
     #[must_use]
     pub const fn capsule_format(self) -> &'static str {
         match self {
-            Self::TargetFormat => "pondcapsule.3",
+            Self::TargetFormat => "pondcapsule.4",
             Self::LegacyMigration => "pondcapsule.legacy.1",
             Self::LegacyMigrationV2 => "pondcapsule.legacy.2",
         }
@@ -373,7 +409,7 @@ pub async fn open_and_inspect_recovery_recipe_limited(
 async fn build_physical_node(
     ship: &Ship,
     materialized: &crate::content_tree::MaterializedObjects,
-    native: &sync_store::ManifestEntry,
+    native: &ManifestEntry,
     path: &str,
     prior_node: Option<&CapsuleNode>,
     payloads: &mut CapsulePayloads,
@@ -824,10 +860,8 @@ fn insert_payload(
     Ok(object)
 }
 
-fn resolve_paths(
-    entries: &[sync_store::ManifestEntry],
-) -> Result<HashMap<String, String>, StewardError> {
-    let by_id: HashMap<&str, &sync_store::ManifestEntry> = entries
+fn resolve_paths(entries: &[ManifestEntry]) -> Result<HashMap<String, String>, StewardError> {
+    let by_id: HashMap<&str, &ManifestEntry> = entries
         .iter()
         .map(|entry| (entry.node_id.as_str(), entry))
         .collect();
@@ -846,7 +880,7 @@ fn resolve_paths(
 
 fn resolve_path(
     node_id: &str,
-    entries: &HashMap<&str, &sync_store::ManifestEntry>,
+    entries: &HashMap<&str, &ManifestEntry>,
     paths: &mut HashMap<String, String>,
     visiting: &mut HashSet<String>,
 ) -> Result<String, StewardError> {

@@ -2,7 +2,7 @@
 
 This reviewed kit validates a downloaded `watertown.commit.v1` native ContentRemote
 backup and converts supported content into a
-portable `pondcapsule.3` without importing anything and without running Pond.
+portable `pondcapsule.4` without importing anything and without running Pond.
 It is not itself a capsule. Every produced capsule contains
 `CAPSULE-README.md`, `CAPSULE-FORMAT.md`, `capsule.py`,
 `capsule-requirements.lock`, and `recover.sh` at its root for Pond-free
@@ -134,11 +134,12 @@ objects remain supported. A nonempty pack-aware series without a complete
 local `_packs/series=<hash>/` advertisement set is rejected; the kit never
 guesses pack layout or contacts another remote.
 
-Legacy `dp.recipe.1` dynamic recipes are retained as inert raw bytes and are
+Dynamic-node timestamps are retained in the authenticated manifest. Legacy
+`dp.recipe.1` dynamic recipes are retained as inert raw bytes and are
 decoded only to expose their factory name and raw configuration; neither
 legacy nor current recipes are executed.
 
-`pondcapsule.3` cannot encode an empty member of a multi-version series.
+`pondcapsule.4` cannot encode an empty member of a multi-version series.
 Extraction fails closed when one is encountered rather than silently changing
 series order or metadata. A single empty physical file or table node remains
 representable only when its native version metadata is empty. Extraction fails

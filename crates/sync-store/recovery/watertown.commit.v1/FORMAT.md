@@ -70,3 +70,9 @@ fingerprint for each leaf, so schema evolution is preserved.
 supported with their original ordered physical-object semantics. Pack-aware
 series require their advertisements to be present locally; this offline kit
 does not fetch missing advertisements or objects from another remote.
+
+Dynamic nodes may carry no metadata or exactly one metadata record. When
+present, it must contain only a timestamp; the extractor writes that timestamp
+to the `pondcapsule.4` dynamic-node `metadata` object. Multiple records, a
+missing timestamp, event bounds, or extended attributes are rejected rather
+than discarded.

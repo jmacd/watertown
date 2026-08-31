@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify or safely materialize a pondcapsule.2 or .3 without Pond."""
+"""Verify or safely materialize a pondcapsule.2, .3, or .4 without Pond."""
 
 from __future__ import annotations
 
@@ -34,10 +34,12 @@ HASH_RE = re.compile(r"[0-9a-f]{64}")
 ROOT_DOMAINS = {
     "pondcapsule.2": b"pondcapsule.root.2\n",
     "pondcapsule.3": b"pondcapsule.root.3\n",
+    "pondcapsule.4": b"pondcapsule.root.4\n",
 }
 SERIES_DOMAINS = {
     "pondcapsule.2": b"pondcapsule.series.1\n",
     "pondcapsule.3": b"pondcapsule.series.3\n",
+    "pondcapsule.4": b"pondcapsule.series.3\n",
 }
 LEAF_DOMAIN = b"watertown.series-leaf.v1\n"
 ROWS_DOMAIN = b"watertown.series-rows.v1\n"
@@ -143,7 +145,10 @@ def _ordered_manifest(value: dict[str, Any]) -> dict[str, Any]:
         if node["kind"] == "symlink":
             return {"kind": "symlink", "target": ordered_object(node["target"])}
         if node["kind"] == "dynamic":
-            return {"kind": "dynamic", "recipe": ordered_object(node["recipe"])}
+            result = {"kind": "dynamic", "recipe": ordered_object(node["recipe"])}
+            if "metadata" in node:
+                result["metadata"] = {"timestamp": node["metadata"]["timestamp"]}
+            return result
         result = {
             "kind": "physical",
             "payload_kind": node["payload_kind"],
@@ -193,7 +198,7 @@ def _canonical_json(value: dict[str, Any]) -> bytes:
         separators=(",", ":"),
         # V3 passes through serde_json::Value, whose map serialization is
         # lexical; V2 retains its original struct-field ordering.
-        sort_keys=value["format"] == "pondcapsule.3",
+        sort_keys=value["format"] in {"pondcapsule.3", "pondcapsule.4"},
     ).encode()
 
 
@@ -265,7 +270,7 @@ def _series_root(
         flags |= int(leaf["max_event_time"] is not None) << 1
         flags |= int(leaf["logical_attributes"] is not None) << 2
         leaf_schema = leaf.get("schema_fingerprint")
-        if format == "pondcapsule.3" and leaf_schema is not None:
+        if format in {"pondcapsule.3", "pondcapsule.4"} and leaf_schema is not None:
             flags |= 0x08
         digest.update(bytes([flags]))
         if leaf["min_event_time"] is not None:
@@ -275,7 +280,7 @@ def _series_root(
         if leaf["logical_attributes"] is not None:
             encoded = leaf["logical_attributes"].encode()
             digest.update(struct.pack("<Q", len(encoded)) + encoded)
-        if format == "pondcapsule.3" and leaf_schema is not None:
+        if format in {"pondcapsule.3", "pondcapsule.4"} and leaf_schema is not None:
             digest.update(bytes.fromhex(leaf_schema))
     return digest.hexdigest()
 
@@ -332,9 +337,17 @@ def _validate_manifest(value: Any, blake3: Any) -> dict[str, Any]:
             if prior_size != descriptor["size"]:
                 raise CapsuleError(f"object {descriptor['hash']} has conflicting sizes")
         elif kind == "dynamic":
-            node = _keys(entry["node"], {"kind", "recipe"}, f"{where}.node")
+            expected = {"kind", "recipe"}
+            if format == "pondcapsule.4" and "metadata" in entry["node"]:
+                expected.add("metadata")
+            node = _keys(entry["node"], expected, f"{where}.node")
             if entry_type not in {"dir:dynamic", "file:dynamic", "table:dynamic"}:
                 raise CapsuleError(f"{where} dynamic content/type mismatch")
+            if "metadata" in node:
+                metadata = _keys(
+                    node["metadata"], {"timestamp"}, f"{where}.node.metadata"
+                )
+                _i64(metadata["timestamp"], f"{where}.node.metadata.timestamp")
             descriptor = _object_descriptor(node["recipe"], f"{where}.node.recipe")
             prior_size = object_sizes.setdefault(descriptor["hash"], descriptor["size"])
             if prior_size != descriptor["size"]:
@@ -359,7 +372,8 @@ def _validate_manifest(value: Any, blake3: Any) -> dict[str, Any]:
             fingerprint = node.get("schema_fingerprint")
             if payload_kind == "file":
                 if fingerprint is not None or (
-                    format == "pondcapsule.3" and "schema_fingerprint" in node
+                    format in {"pondcapsule.3", "pondcapsule.4"}
+                    and "schema_fingerprint" in node
                 ):
                     raise CapsuleError(f"{where} file must not declare a schema")
             elif fingerprint is not None:
@@ -447,9 +461,9 @@ def _validate_manifest(value: Any, blake3: Any) -> dict[str, Any]:
                 raise CapsuleError(f"{where} file leaf must not declare a schema")
             if payload_kind == "table" and not objects:
                 raise CapsuleError(f"{where} table has no Parquet schema carrier")
-            if format == "pondcapsule.3" and payload_kind == "table" and not leaves and fingerprint is None:
+            if format in {"pondcapsule.3", "pondcapsule.4"} and payload_kind == "table" and not leaves and fingerprint is None:
                 raise CapsuleError(f"{where} empty table must declare a node schema")
-            if format == "pondcapsule.3" and payload_kind == "table" and any(
+            if format in {"pondcapsule.3", "pondcapsule.4"} and payload_kind == "table" and any(
                 leaf.get("schema_fingerprint") is None for leaf in leaves
             ):
                 raise CapsuleError(f"{where} v3 table leaves must declare a schema")

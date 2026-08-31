@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Generic staged import: materialize a downloaded `pondcapsule.1`,
-//! `pondcapsule.2`, `pondcapsule.3`, or opaque
+//! `pondcapsule.2`, `pondcapsule.3`, `pondcapsule.4`, or opaque
 //! `pondcapsule.legacy.1`/`pondcapsule.legacy.2` capsule
 //! into a brand-new pond (`docs/recovery-capsule-design.md`, "Generic staged
 //! import").
@@ -75,8 +75,8 @@ use parquet::file::properties::WriterProperties;
 use serde::{Deserialize, Serialize};
 use sync_store::content::{PayloadKind, SeriesManifest, merkle_root, recipe_hash};
 use sync_store::{
-    CAPSULE_FORMAT_V3, CapsuleEntry, CapsuleLeaf, CapsuleManifest, CapsuleNode, CapsuleObject,
-    CapsulePayloadKind, IncrementalFileLeafHasher, IncrementalTableLeafHasher,
+    CAPSULE_FORMAT_V3, CAPSULE_FORMAT_V4, CapsuleEntry, CapsuleLeaf, CapsuleManifest, CapsuleNode,
+    CapsuleObject, CapsulePayloadKind, IncrementalFileLeafHasher, IncrementalTableLeafHasher,
     LEGACY_CAPSULE_FORMAT_V1, LEGACY_CAPSULE_FORMAT_V2, LegacyCapsuleEntry, LegacyCapsuleManifest,
     LegacyCapsuleNode, LegacyCapsuleObject, LegacyCapsulePayloadKind, LegacyCapsuleVersion,
     ManifestEntry, ObjectHash, VersionMeta, canonicalize_schema, decode_manifest, decode_recipe,
@@ -286,7 +286,10 @@ async fn import_logical_capsule(
         &mut ship,
         &manifest,
         &objects_dir,
-        manifest.format == CAPSULE_FORMAT_V3,
+        matches!(
+            manifest.format.as_str(),
+            CAPSULE_FORMAT_V3 | CAPSULE_FORMAT_V4
+        ),
     )
     .await
     {
@@ -2256,7 +2259,7 @@ async fn write_entries(
     ship: &mut Ship,
     manifest: &CapsuleManifest,
     objects_dir: &Path,
-    v3: bool,
+    schema_evolved: bool,
 ) -> Result<(), StewardError> {
     let meta = PondUserMetadata::new(vec!["capsule".to_string(), "import".to_string()]);
     let tx = ship.begin_write_suppressed(&meta).await?;
@@ -2282,7 +2285,7 @@ async fn write_entries(
                 objects_dir,
                 &mut dirs,
                 &entry.path,
-                v3,
+                schema_evolved,
             )
             .await?;
         }
@@ -2302,7 +2305,7 @@ async fn write_entry(
     objects_dir: &Path,
     dirs: &mut std::collections::HashMap<String, WD>,
     path: &str,
-    v3: bool,
+    schema_evolved: bool,
 ) -> Result<(), StewardError> {
     match &entry.node {
         CapsuleNode::Directory => {
@@ -2316,13 +2319,19 @@ async fn write_entry(
             })?;
             let _ = parent_wd.create_symlink_path(name, target_str).await?;
         }
-        CapsuleNode::Dynamic { recipe } => {
+        CapsuleNode::Dynamic { recipe, metadata } => {
             let bytes = read_object(objects_dir, recipe)?;
             let (factory, config) = decode_recipe(&bytes).map_err(|error| {
                 StewardError::Content(format!("decode dynamic recipe for {path:?}: {error}"))
             })?;
             let _ = parent_wd
-                .create_dynamic_path(name, entry.entry_type, &factory, config)
+                .create_dynamic_path_with_mtime(
+                    name,
+                    entry.entry_type,
+                    &factory,
+                    config,
+                    metadata.as_ref().map(|metadata| metadata.timestamp),
+                )
                 .await?;
         }
         CapsuleNode::Physical {
@@ -2357,7 +2366,7 @@ async fn write_entry(
                             leaves,
                             objects_dir,
                             *schema_fingerprint,
-                            v3,
+                            schema_evolved,
                         )
                         .await?;
                     }
@@ -2561,7 +2570,7 @@ async fn write_table_entry(
     leaves: &[CapsuleLeaf],
     objects_dir: &Path,
     _node_schema_fingerprint: Option<ObjectHash>,
-    v3: bool,
+    schema_evolved: bool,
 ) -> Result<(), StewardError> {
     let mut leaf_index = 0usize;
     let mut collected = 0u64;
@@ -2588,7 +2597,7 @@ async fn write_table_entry(
                 object.hash
             ))
         })?;
-        if !v3 {
+        if !schema_evolved {
             if let Some(schema) = &schema {
                 if schema.as_ref() != object_schema.as_ref() {
                     return Err(StewardError::Content(format!(
@@ -2614,7 +2623,7 @@ async fn write_table_entry(
                         "table {name:?} payload stream has rows after its final logical leaf"
                     ))
                 })?;
-                let leaf_schema = if v3 {
+                let leaf_schema = if schema_evolved {
                     let expected = leaf.schema_fingerprint.ok_or_else(|| {
                         StewardError::Content(format!(
                             "v3 table {name:?} leaf {leaf_index} has no schema fingerprint"
@@ -2803,9 +2812,20 @@ fn assert_logical_match(source: &CapsuleManifest, rebuilt: &CapsuleManifest) -> 
                     return Err(format!("{:?} symlink target changed", expected.path));
                 }
             }
-            (CapsuleNode::Dynamic { recipe: want }, CapsuleNode::Dynamic { recipe: got }) => {
-                if source.format == rebuilt.format && want != got {
-                    return Err(format!("{:?} dynamic recipe changed", expected.path));
+            (
+                CapsuleNode::Dynamic {
+                    recipe: want_recipe,
+                    metadata: want_metadata,
+                },
+                CapsuleNode::Dynamic {
+                    recipe: got_recipe,
+                    metadata: got_metadata,
+                },
+            ) => {
+                if source.format == rebuilt.format
+                    && (want_recipe != got_recipe || want_metadata != got_metadata)
+                {
+                    return Err(format!("{:?} dynamic node changed", expected.path));
                 }
             }
             (

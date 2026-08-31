@@ -7,7 +7,7 @@ use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use parquet::arrow::ArrowWriter;
 use steward::{Ship, build_recovery_capsule, build_recovery_capsule_incremental};
 use sync_store::{
-    CAPSULE_FORMAT_V3, CapsuleNode, CapsulePayloadKind, ContentRemote, ObjectHash, capsule_root,
+    CAPSULE_FORMAT_V4, CapsuleNode, CapsulePayloadKind, ContentRemote, ObjectHash, capsule_root,
     verify_capsule_directory,
 };
 use tempfile::tempdir;
@@ -86,7 +86,7 @@ async fn builds_portable_live_inventory_with_ordered_series_leaves() {
         "unchanged source tip must produce one stable capsule generation"
     );
     capsule.manifest.validate().expect("valid manifest");
-    assert_eq!(capsule.manifest.format, CAPSULE_FORMAT_V3);
+    assert_eq!(capsule.manifest.format, CAPSULE_FORMAT_V4);
     assert_eq!(capsule.manifest.source.birthplace, "capsule-test");
     assert_eq!(
         capsule.manifest.payload_objects().expect("objects").len(),

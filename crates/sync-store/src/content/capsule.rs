@@ -23,10 +23,13 @@ pub const CAPSULE_FORMAT_V1: &str = "pondcapsule.1";
 pub const CAPSULE_FORMAT_V2: &str = "pondcapsule.2";
 /// The third portable capsule format, with a schema identity on every table leaf.
 pub const CAPSULE_FORMAT_V3: &str = "pondcapsule.3";
+/// The fourth portable capsule format, preserving dynamic-node metadata.
+pub const CAPSULE_FORMAT_V4: &str = "pondcapsule.4";
 
 const CAPSULE_ROOT_DOMAIN: &[u8] = b"pondcapsule.root.1\n";
 const CAPSULE_ROOT_DOMAIN_V2: &[u8] = b"pondcapsule.root.2\n";
 const CAPSULE_ROOT_DOMAIN_V3: &[u8] = b"pondcapsule.root.3\n";
+const CAPSULE_ROOT_DOMAIN_V4: &[u8] = b"pondcapsule.root.4\n";
 const CAPSULE_SERIES_DOMAIN: &[u8] = b"pondcapsule.series.1\n";
 const CAPSULE_SERIES_DOMAIN_V3: &[u8] = b"pondcapsule.series.3\n";
 const LOGICAL_LEAF_DOMAIN: &[u8] = b"watertown.series-leaf.v1\n";
@@ -69,6 +72,17 @@ pub struct CapsuleObject {
     pub size: u64,
 }
 
+/// Exact synthetic metadata persisted for a dynamic node.
+///
+/// Dynamic nodes have no physical versions, but a native manifest can retain
+/// one record containing their creation timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapsuleDynamicMetadata {
+    /// Dynamic node modification time in microseconds since the Unix epoch.
+    pub timestamp: i64,
+}
+
 /// One ordered logical append leaf in a physical file or table stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -88,7 +102,7 @@ pub struct CapsuleLeaf {
     pub logical_attributes: Option<String>,
     /// BLAKE3 of this table leaf's canonical Arrow schema.
     ///
-    /// Present for every table leaf only in `pondcapsule.3`. Files never
+    /// Present for every table leaf in `pondcapsule.3` and `.4`. Files never
     /// declare schemas; v1/v2 keep their frozen representation without it.
     #[serde(
         default,
@@ -113,6 +127,12 @@ pub enum CapsuleNode {
     Dynamic {
         /// Object containing the native recipe bytes.
         recipe: CapsuleObject,
+        /// Synthetic dynamic-node metadata.
+        ///
+        /// Absent in frozen `pondcapsule.1` through `.3` capsules. A V4
+        /// producer records it whenever the native node carries it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<CapsuleDynamicMetadata>,
     },
     /// A physical file or table stream.
     Physical {
@@ -198,6 +218,11 @@ impl CapsuleManifest {
         Self::new_with_format(CAPSULE_FORMAT_V3, source, entries)
     }
 
+    /// Construct and validate a v4 manifest.
+    pub fn new_v4(source: CapsuleSource, entries: Vec<CapsuleEntry>) -> Result<Self, String> {
+        Self::new_with_format(CAPSULE_FORMAT_V4, source, entries)
+    }
+
     fn new_with_format(
         format: &str,
         source: CapsuleSource,
@@ -221,11 +246,11 @@ impl CapsuleManifest {
     pub fn validate(&self) -> Result<(), String> {
         if !matches!(
             self.format.as_str(),
-            CAPSULE_FORMAT_V1 | CAPSULE_FORMAT_V2 | CAPSULE_FORMAT_V3
+            CAPSULE_FORMAT_V1 | CAPSULE_FORMAT_V2 | CAPSULE_FORMAT_V3 | CAPSULE_FORMAT_V4
         ) {
             return Err(format!(
                 "unsupported capsule format {:?}; expected {CAPSULE_FORMAT_V1:?}, \
-                 {CAPSULE_FORMAT_V2:?}, or {CAPSULE_FORMAT_V3:?}",
+                 {CAPSULE_FORMAT_V2:?}, {CAPSULE_FORMAT_V3:?}, or {CAPSULE_FORMAT_V4:?}",
                 self.format
             ));
         }
@@ -322,7 +347,7 @@ impl CapsuleManifest {
 /// Returns an error if validation or serialization fails.
 pub fn capsule_manifest_bytes(manifest: &CapsuleManifest) -> Result<Vec<u8>, String> {
     manifest.validate()?;
-    if manifest.format != CAPSULE_FORMAT_V3 {
+    if !is_schema_evolved_format(&manifest.format) {
         return serde_json::to_vec(manifest)
             .map_err(|error| format!("encode capsule manifest: {error}"));
     }
@@ -360,6 +385,7 @@ pub fn capsule_root(manifest: &CapsuleManifest) -> Result<ObjectHash, String> {
         CAPSULE_FORMAT_V1 => CAPSULE_ROOT_DOMAIN,
         CAPSULE_FORMAT_V2 => CAPSULE_ROOT_DOMAIN_V2,
         CAPSULE_FORMAT_V3 => CAPSULE_ROOT_DOMAIN_V3,
+        CAPSULE_FORMAT_V4 => CAPSULE_ROOT_DOMAIN_V4,
         _ => unreachable!("manifest validation checks the capsule format"),
     });
     hasher.update(&bytes);
@@ -711,7 +737,7 @@ pub fn verify_incremental_capsule_payload_directory(
         }
         match &entry.node {
             CapsuleNode::Directory => {}
-            CapsuleNode::Symlink { target } | CapsuleNode::Dynamic { recipe: target } => {
+            CapsuleNode::Symlink { target } | CapsuleNode::Dynamic { recipe: target, .. } => {
                 if staged_payload_exists(objects_dir, target.hash)? {
                     verify_payload_file(objects_dir, target)?;
                 } else {
@@ -742,7 +768,7 @@ pub fn verify_incremental_capsule_payload_directory(
                     for object in objects {
                         verify_payload_file(objects_dir, object)?;
                     }
-                    if manifest.format == CAPSULE_FORMAT_V3
+                    if is_schema_evolved_format(&manifest.format)
                         && *payload_kind == CapsulePayloadKind::Table
                     {
                         verify_table_stream_v3_directory(
@@ -798,7 +824,7 @@ pub fn verify_incremental_capsule_payload_directory(
                     }
                 }
                 if !staged_objects.is_empty() {
-                    if manifest.format == CAPSULE_FORMAT_V3
+                    if is_schema_evolved_format(&manifest.format)
                         && *payload_kind == CapsulePayloadKind::Table
                     {
                         verify_table_stream_v3_directory(
@@ -893,7 +919,7 @@ fn verify_capsule_payload_directory_at_root(
                     )?;
                 }
                 CapsulePayloadKind::Table => {
-                    if manifest.format == CAPSULE_FORMAT_V3 {
+                    if is_schema_evolved_format(&manifest.format) {
                         verify_table_stream_v3_directory(
                             objects_dir,
                             &entry.path,
@@ -1518,7 +1544,7 @@ where
                     verify_file_stream(&mut read_payload, &entry.path, objects, leaves)?;
                 }
                 CapsulePayloadKind::Table => {
-                    if manifest.format == CAPSULE_FORMAT_V3 {
+                    if is_schema_evolved_format(&manifest.format) {
                         verify_table_stream_v3(
                             &mut read_payload,
                             &entry.path,
@@ -1924,11 +1950,15 @@ fn capsule_series_root_for_format(
     schema_fingerprint: Option<ObjectHash>,
     leaves: &[CapsuleLeaf],
 ) -> ObjectHash {
-    if format == CAPSULE_FORMAT_V3 {
+    if is_schema_evolved_format(format) {
         capsule_series_root_v3(payload_kind, schema_fingerprint, leaves)
     } else {
         capsule_series_root(payload_kind, schema_fingerprint, leaves)
     }
+}
+
+fn is_schema_evolved_format(format: &str) -> bool {
+    matches!(format, CAPSULE_FORMAT_V3 | CAPSULE_FORMAT_V4)
 }
 
 fn validate_entry(entry: &CapsuleEntry, format: &str) -> Result<(), String> {
@@ -1940,11 +1970,18 @@ fn validate_entry(entry: &CapsuleEntry, format: &str) -> Result<(), String> {
     }
     match (&entry.node, entry.entry_type) {
         (CapsuleNode::Directory, EntryType::DirectoryPhysical)
-        | (CapsuleNode::Symlink { .. }, EntryType::Symlink)
-        | (
-            CapsuleNode::Dynamic { .. },
+        | (CapsuleNode::Symlink { .. }, EntryType::Symlink) => {}
+        (
+            CapsuleNode::Dynamic { metadata, .. },
             EntryType::DirectoryDynamic | EntryType::FileDynamic | EntryType::TableDynamic,
-        ) => {}
+        ) => {
+            if metadata.is_some() && format != CAPSULE_FORMAT_V4 {
+                return Err(format!(
+                    "capsule path {:?} has dynamic metadata unsupported by {format}",
+                    entry.path
+                ));
+            }
+        }
         (
             CapsuleNode::Physical {
                 payload_kind,
@@ -1983,7 +2020,7 @@ fn validate_entry(entry: &CapsuleEntry, format: &str) -> Result<(), String> {
                     ));
                 }
                 CapsulePayloadKind::Table
-                    if format != CAPSULE_FORMAT_V3 && schema_fingerprint.is_none() =>
+                    if !is_schema_evolved_format(format) && schema_fingerprint.is_none() =>
                 {
                     return Err(format!(
                         "capsule table path {:?} must declare a schema fingerprint",
@@ -2008,7 +2045,7 @@ fn validate_entry(entry: &CapsuleEntry, format: &str) -> Result<(), String> {
                 CapsulePayloadKind::File | CapsulePayloadKind::Table => {}
             }
             if *payload_kind == CapsulePayloadKind::Table
-                && format == CAPSULE_FORMAT_V3
+                && is_schema_evolved_format(format)
                 && leaves.is_empty()
                 && schema_fingerprint.is_none()
             {
@@ -2047,7 +2084,7 @@ fn validate_entry(entry: &CapsuleEntry, format: &str) -> Result<(), String> {
                     ));
                 }
                 if *payload_kind == CapsulePayloadKind::Table {
-                    if format == CAPSULE_FORMAT_V3 {
+                    if is_schema_evolved_format(format) {
                         let leaf_schema = leaf.schema_fingerprint.ok_or_else(|| {
                             format!(
                                 "capsule v3 table path {:?} leaf {index} must declare a schema fingerprint",
@@ -2129,7 +2166,7 @@ fn entry_objects(node: &CapsuleNode) -> Box<dyn Iterator<Item = &CapsuleObject> 
     match node {
         CapsuleNode::Directory => Box::new(std::iter::empty()),
         CapsuleNode::Symlink { target } => Box::new(std::iter::once(target)),
-        CapsuleNode::Dynamic { recipe } => Box::new(std::iter::once(recipe)),
+        CapsuleNode::Dynamic { recipe, .. } => Box::new(std::iter::once(recipe)),
         CapsuleNode::Physical { objects, .. } => Box::new(objects.iter()),
     }
 }
@@ -2940,6 +2977,33 @@ mod tests {
     }
 
     #[test]
+    fn v4_authenticates_dynamic_node_metadata() {
+        let dynamic = CapsuleEntry {
+            path: "/dynamic".to_string(),
+            entry_type: EntryType::DirectoryDynamic,
+            source_node_id: "dynamic".to_string(),
+            node: CapsuleNode::Dynamic {
+                recipe: object("recipe"),
+                metadata: Some(CapsuleDynamicMetadata { timestamp: 42 }),
+            },
+        };
+        let v3 = CapsuleManifest::new_v3(source(), vec![root(), dynamic.clone()]);
+        assert!(
+            v3.unwrap_err()
+                .contains("dynamic metadata unsupported by pondcapsule.3")
+        );
+
+        let v4 = CapsuleManifest::new_v4(source(), vec![root(), dynamic]).unwrap();
+        let encoded = capsule_manifest_bytes(&v4).unwrap();
+        assert!(
+            String::from_utf8(encoded.clone())
+                .unwrap()
+                .contains(r#""metadata":{"timestamp":42}"#)
+        );
+        assert_eq!(decode_capsule_manifest(&encoded).unwrap(), v4);
+    }
+
+    #[test]
     fn logical_file_leaf_matches_v2_golden_vector() {
         let payload = b"pressure,depth\n1.0,2.0\n";
         let logical_hash = capsule_leaf_hash(
@@ -2989,6 +3053,7 @@ mod tests {
                     source_node_id: "dynamic".to_string(),
                     node: CapsuleNode::Dynamic {
                         recipe: object("recipe"),
+                        metadata: None,
                     },
                 },
                 CapsuleEntry {

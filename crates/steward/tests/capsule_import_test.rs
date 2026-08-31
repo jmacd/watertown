@@ -306,8 +306,12 @@ fn assert_logical_projection(expected: &CapsuleManifest, actual: &CapsuleManifes
                 assert_eq!(expected, actual);
             }
             (
-                CapsuleNode::Dynamic { recipe: _expected },
-                CapsuleNode::Dynamic { recipe: _actual },
+                CapsuleNode::Dynamic {
+                    recipe: _expected, ..
+                },
+                CapsuleNode::Dynamic {
+                    recipe: _actual, ..
+                },
             ) => {
                 // Legacy v1 capsules serialize dynamic recipes under `dp.recipe.1` while
                 // the rebuilt pond uses the current `watertown.recipe.v1` framing; the
@@ -510,6 +514,22 @@ async fn imports_every_node_kind_and_verifies_the_logical_contract() {
     assert_eq!(*schema_fingerprint, None);
     assert!(leaves.iter().all(|leaf| leaf.schema_fingerprint.is_some()));
     assert_ne!(leaves[0].schema_fingerprint, leaves[2].schema_fingerprint);
+    let source_dynamic = source_manifest
+        .entries
+        .iter()
+        .find(|entry| entry.path == "/system/run/10-capsule-import-test")
+        .expect("source dynamic entry");
+    let CapsuleNode::Dynamic {
+        metadata: source_metadata,
+        ..
+    } = &source_dynamic.node
+    else {
+        panic!("source dynamic entry must be dynamic")
+    };
+    assert!(
+        source_metadata.is_some(),
+        "source dynamic mtime is captured"
+    );
     let report = import_capsule(&capsule_dir, &target, "capsule-import-test-target")
         .await
         .expect("import capsule");
@@ -592,7 +612,14 @@ async fn imports_every_node_kind_and_verifies_the_logical_contract() {
         .iter()
         .find(|entry| entry.path == "/system/run/10-capsule-import-test")
         .expect("dynamic entry present");
-    assert!(matches!(dynamic_entry.node, CapsuleNode::Dynamic { .. }));
+    let CapsuleNode::Dynamic {
+        metadata: rebuilt_metadata,
+        ..
+    } = &dynamic_entry.node
+    else {
+        panic!("rebuilt dynamic entry must be dynamic")
+    };
+    assert_eq!(rebuilt_metadata, source_metadata);
 
     // The symlink's target payload hash must be preserved exactly, even
     // though the rebuilt manifest carries a fresh source_node_id and pond
