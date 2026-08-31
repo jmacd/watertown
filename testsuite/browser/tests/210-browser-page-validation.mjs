@@ -72,10 +72,21 @@ function check(cond, msg) {
 async function testPage(browser, page) {
   const url = `${BASE_URL}${BASE_PATH}${page.path}`;
   const errors = [];
+  const diagnostics = [];
   const tab = await browser.newPage();
 
   // Collect JS errors and non-trivial HTTP failures
   tab.on("pageerror", (err) => errors.push(err.message));
+  tab.on("console", (message) => {
+    if (["error", "warning"].includes(message.type())) {
+      diagnostics.push(`${message.type()}: ${message.text()}`);
+    }
+  });
+  tab.on("requestfailed", (request) => {
+    diagnostics.push(
+      `request failed: ${request.failure()?.errorText || "unknown error"}: ${request.url()}`
+    );
+  });
   tab.on("response", (res) => {
     const u = res.url();
     if (
@@ -202,6 +213,22 @@ async function testPage(browser, page) {
         });
       });
       check(chartRendered, "chart rendered SVG (DuckDB-WASM + Vega-Lite)");
+
+      if (!chartRendered) {
+        const chartState = await tab.evaluate(() => {
+          const container = document.querySelector(".chart-container");
+          const emptyState = container?.querySelector(".empty-state");
+          return {
+            text: container?.textContent?.trim() || "",
+            emptyState: emptyState?.textContent?.trim() || "",
+          };
+        });
+        console.log(`    chart state: ${chartState.text || "(empty)"}`);
+        if (chartState.emptyState) {
+          console.log(`    empty state: ${chartState.emptyState}`);
+        }
+        diagnostics.forEach((message) => console.log(`    DIAGNOSTIC: ${message}`));
+      }
 
       if (chartRendered) {
         // Check SVG has actual plot content (paths/lines, not just empty axes)
