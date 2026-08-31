@@ -4917,7 +4917,8 @@ mod node_factory {
             .map_err(error_utils::to_tinyfs_error)?;
 
         // Create context with all template variables (vars, export, and any other keys)
-        let mut context = FactoryContext::new(state.as_provider_context(), id);
+        let mut context = FactoryContext::new(state.as_provider_context(), id)
+            .with_node_mtime(oplog_entry.timestamp);
 
         // For cross-pond imports: if this node belongs to a foreign pond,
         // set the effective_root so factory path resolution stays within

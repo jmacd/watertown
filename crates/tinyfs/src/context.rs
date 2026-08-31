@@ -212,6 +212,11 @@ pub struct FactoryContext {
     /// Current transaction sequence number from persistence layer
     /// Provided by Steward for backup/replication operations
     pub txn_seq: i64,
+    /// Persisted modification time for the dynamic node being materialized.
+    ///
+    /// Dynamic factory implementations use this for node metadata only; it
+    /// is intentionally not inherited by virtual children they create.
+    pub node_mtime: Option<i64>,
     /// Effective root for path resolution. When set, factories resolve
     /// absolute paths relative to this node rather than the global root.
     /// Used for cross-pond imports where foreign factories must resolve
@@ -228,6 +233,7 @@ impl FactoryContext {
             file_id,
             pond_metadata: None,
             txn_seq: 0,
+            node_mtime: None,
             effective_root: None,
         }
     }
@@ -244,6 +250,7 @@ impl FactoryContext {
             file_id,
             pond_metadata: Some(pond_metadata),
             txn_seq: 0,
+            node_mtime: None,
             effective_root: None,
         }
     }
@@ -252,6 +259,13 @@ impl FactoryContext {
     #[must_use]
     pub fn with_txn_seq(mut self, txn_seq: i64) -> Self {
         self.txn_seq = txn_seq;
+        self
+    }
+
+    /// Set the persisted modification time for the dynamic node.
+    #[must_use]
+    pub fn with_node_mtime(mut self, node_mtime: i64) -> Self {
+        self.node_mtime = Some(node_mtime);
         self
     }
 

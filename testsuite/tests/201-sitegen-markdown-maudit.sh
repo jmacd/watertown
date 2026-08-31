@@ -8,7 +8,7 @@
 #           → temporal-reduce → sitegen (pond run /site.yaml build)
 #
 # Data: 2 sites (NorthDock, SouthDock) × 2 params (Temperature, DO)
-#       1 year (2025) at 1h resolution
+#       1 year ending at test execution, at 1h resolution
 set -e
 source check.sh
 
@@ -25,13 +25,19 @@ OUTDIR=/tmp/sitegen-dist
 echo ""
 echo "--- Step 1: Create synthetic sensors ---"
 
-cat > /tmp/sensors.yaml << 'YAML'
+# Keep the generated dashboard current so chart.js's live-monitoring default
+# window always contains test data.
+START_DATE=$(date -u -d "365 days ago" +%Y-%m-%dT00:00:00Z 2>/dev/null \
+          || date -u -v-365d +%Y-%m-%dT00:00:00Z)
+END_DATE=$(date -u +%Y-%m-%dT00:00:00Z)
+
+cat > /tmp/sensors.yaml << YAML
 entries:
   - name: "north_temperature"
     factory: "synthetic-timeseries"
     config:
-      start: "2025-06-01T00:00:00Z"
-      end:   "2026-06-01T00:00:00Z"
+      start: "${START_DATE}"
+      end:   "${END_DATE}"
       interval: "1h"
       points:
         - name: "temperature.C"
@@ -48,8 +54,8 @@ entries:
   - name: "north_do"
     factory: "synthetic-timeseries"
     config:
-      start: "2025-06-01T00:00:00Z"
-      end:   "2026-06-01T00:00:00Z"
+      start: "${START_DATE}"
+      end:   "${END_DATE}"
       interval: "1h"
       points:
         - name: "do.mgL"
@@ -67,8 +73,8 @@ entries:
   - name: "south_temperature"
     factory: "synthetic-timeseries"
     config:
-      start: "2025-06-01T00:00:00Z"
-      end:   "2026-06-01T00:00:00Z"
+      start: "${START_DATE}"
+      end:   "${END_DATE}"
       interval: "1h"
       points:
         - name: "temperature.C"
@@ -85,8 +91,8 @@ entries:
   - name: "south_do"
     factory: "synthetic-timeseries"
     config:
-      start: "2025-06-01T00:00:00Z"
-      end:   "2026-06-01T00:00:00Z"
+      start: "${START_DATE}"
+      end:   "${END_DATE}"
       interval: "1h"
       points:
         - name: "do.mgL"

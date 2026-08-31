@@ -30,11 +30,9 @@ start_vite() {
     local site_root="$1"
     local base_path="${2:-/}"
 
-    lsof -ti:${PORT} 2>/dev/null | xargs -r kill -9 2>/dev/null || true
-    sleep 0.5
-
     SITE_ROOT="${site_root}" BASE_PATH="${base_path}" \
-        npx vite --port ${PORT} --strictPort --config "${SCRIPT_DIR}/vite.config.js" &
+        "${SCRIPT_DIR}/node_modules/.bin/vite" --port ${PORT} --strictPort \
+        --config "${SCRIPT_DIR}/vite.config.js" &
     VITE_PID=$!
 
     local url="http://localhost:${PORT}${base_path}"
@@ -55,7 +53,6 @@ stop_vite() {
         wait "${VITE_PID}" 2>/dev/null || true
         VITE_PID=""
     fi
-    lsof -ti:${PORT} 2>/dev/null | xargs -r kill -9 2>/dev/null || true
 }
 
 cleanup() {

@@ -10,7 +10,7 @@ use sync_store::content::{FetchedSeriesObject, decode_fetched_series_object};
 use sync_store::{
     CapsuleEntry, CapsuleLeaf, CapsuleManifest, CapsuleNode, CapsuleObject, CapsulePayloadKind,
     CapsuleSource, IncrementalFileLeafHasher, IncrementalTableLeafHasher, ObjectHash,
-    capsule_series_root, decode_manifest, decode_recipe, encode_canonical_attributes,
+    capsule_series_root_v3, decode_manifest, decode_recipe, encode_canonical_attributes,
     encode_canonical_batch_rows, schema_fingerprint,
 };
 use tinyfs::EntryType;
@@ -230,7 +230,7 @@ pub(crate) async fn build_recovery_capsule_from_materialized(
         exported_at_micros: source_commit.provenance.time_micros,
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    let manifest = CapsuleManifest::new_v2(source, entries).map_err(StewardError::Content)?;
+    let manifest = CapsuleManifest::new_v3(source, entries).map_err(StewardError::Content)?;
     let declared: HashSet<ObjectHash> = manifest
         .payload_objects()
         .map_err(StewardError::Content)?
@@ -258,7 +258,7 @@ pub(crate) async fn build_recovery_capsule_from_materialized(
 /// Static recovery recipe selected for an explicit remote operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryRecipeFlavor {
-    /// Current target-native `watertown.commit.v1` to logical `pondcapsule.2`.
+    /// Current target-native `watertown.commit.v1` to logical `pondcapsule.3`.
     TargetFormat,
     /// Deliberate legacy `dp.commit.3` to opaque `pondcapsule.legacy.1` migration.
     LegacyMigration,
@@ -291,7 +291,7 @@ impl RecoveryRecipeFlavor {
     #[must_use]
     pub const fn capsule_format(self) -> &'static str {
         match self {
-            Self::TargetFormat => "pondcapsule.2",
+            Self::TargetFormat => "pondcapsule.3",
             Self::LegacyMigration => "pondcapsule.legacy.1",
             Self::LegacyMigrationV2 => "pondcapsule.legacy.2",
         }
@@ -472,6 +472,7 @@ async fn build_physical_node(
     let mut objects = Vec::new();
     let mut leaves = Vec::new();
     let mut table_schema = manifest_table_schema;
+    let mut schema_evolved = false;
     for (hash, metadata) in payload_versions {
         let attributes = metadata
             .extended_attributes
@@ -494,15 +495,17 @@ async fn build_physical_node(
             metadata.max_event_time,
             attributes.as_deref(),
         ) {
-            if let Some(schema) = schema {
+            if let Some(schema) = schema
+                && !schema_evolved
+            {
                 if let Some(expected) = table_schema
                     && expected != schema
                 {
-                    return Err(StewardError::Content(format!(
-                        "reused table schema changes within capsule node {path}: {expected} != {schema}"
-                    )));
+                    table_schema = None;
+                    schema_evolved = true;
+                } else {
+                    table_schema = Some(schema);
                 }
-                table_schema = Some(schema);
             }
             let _ = reused_payloads.insert(object.hash);
             objects.push(object);
@@ -571,14 +574,16 @@ async fn build_physical_node(
                 let fingerprint = schema_fingerprint(&schema).map_err(|error| {
                     StewardError::Content(format!("fingerprint table schema for {path}: {error}"))
                 })?;
-                if let Some(expected) = table_schema
-                    && expected != fingerprint
-                {
-                    return Err(StewardError::Content(format!(
-                        "table schema changes within capsule node {path}: {expected} != {fingerprint}"
-                    )));
+                if !schema_evolved {
+                    if let Some(expected) = table_schema
+                        && expected != fingerprint
+                    {
+                        table_schema = None;
+                        schema_evolved = true;
+                    } else {
+                        table_schema = Some(fingerprint);
+                    }
                 }
-                table_schema = Some(fingerprint);
                 let mut logical_count = 0u64;
                 let mut canonical_rows_len = 0u64;
                 for batch in builder.build().map_err(|error| {
@@ -662,9 +667,6 @@ async fn build_physical_node(
                 (logical_hash, logical_count, Some(fingerprint))
             }
         };
-        if let Some(schema) = schema {
-            table_schema = Some(schema);
-        }
         objects.push(object);
         leaves.push(CapsuleLeaf {
             logical_hash,
@@ -673,14 +675,15 @@ async fn build_physical_node(
             min_event_time: metadata.min_event_time,
             max_event_time: metadata.max_event_time,
             logical_attributes: attributes,
+            schema_fingerprint: schema,
         });
     }
-    if payload_kind == CapsulePayloadKind::Table && table_schema.is_none() {
+    if payload_kind == CapsulePayloadKind::Table && table_schema.is_none() && !schema_evolved {
         return Err(StewardError::Content(format!(
             "table node {path} has no readable schema"
         )));
     }
-    let logical_root = capsule_series_root(payload_kind, table_schema, &leaves);
+    let logical_root = capsule_series_root_v3(payload_kind, table_schema, &leaves);
     Ok(CapsuleNode::Physical {
         payload_kind,
         schema_fingerprint: table_schema,
@@ -702,7 +705,7 @@ fn reusable_prior_leaf(
 ) -> Option<(CapsuleObject, CapsuleLeaf, Option<ObjectHash>)> {
     let CapsuleNode::Physical {
         payload_kind: prior_kind,
-        schema_fingerprint,
+        schema_fingerprint: _,
         objects,
         leaves,
         ..
@@ -723,7 +726,12 @@ fn reusable_prior_leaf(
                 && leaf.max_event_time == max_event_time
                 && leaf.logical_attributes.as_deref() == logical_attributes
         })
-        .map(|(object, leaf)| (object.clone(), leaf.clone(), *schema_fingerprint))
+        .and_then(|(object, leaf)| match payload_kind {
+            CapsulePayloadKind::File => Some((object.clone(), leaf.clone(), None)),
+            CapsulePayloadKind::Table => leaf
+                .schema_fingerprint
+                .map(|schema| (object.clone(), leaf.clone(), Some(schema))),
+        })
 }
 
 async fn stage_payload(

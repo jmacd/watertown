@@ -81,6 +81,13 @@ the complete logical path. This deliberately avoids collisions and excessive
 path growth on common filesystems; use `inventory.json`, not filename guessing,
 as the authoritative mapping.
 
+Schema-evolved table series materialize one Parquet file per logical leaf; the
+leaf's schema is recorded in `inventory.json` metadata and verified before
+writing. Native pack advertisements retain no per-leaf write timestamp, so
+their materialized leaf metadata records the authenticated aggregate native
+series timestamp while preserving each leaf's count, bounds, attributes, and
+schema exactly.
+
 The destination must not already exist. Verification completes before any
 result is promoted into place.
 
@@ -95,7 +102,7 @@ python /trusted/recovery-kit/capsule.py materialize \
   /path/to/CAPSULE /path/to/NEW-RECOVERED-DIRECTORY
 ```
 
-`pondcapsule.2` cannot encode an empty member of a multi-version series.
+`pondcapsule.3` cannot encode an empty member of a multi-version series.
 Extraction fails rather than silently dropping one. A single empty physical
 file or table is representable only when its native version metadata is empty;
 otherwise extraction fails rather than silently discarding that metadata.

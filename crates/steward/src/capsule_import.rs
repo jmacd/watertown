@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Generic staged import: materialize a downloaded `pondcapsule.1`,
-//! `pondcapsule.2`, or opaque `pondcapsule.legacy.1`/`pondcapsule.legacy.2` capsule
+//! `pondcapsule.2`, `pondcapsule.3`, or opaque
+//! `pondcapsule.legacy.1`/`pondcapsule.legacy.2` capsule
 //! into a brand-new pond (`docs/recovery-capsule-design.md`, "Generic staged
 //! import").
 //!
@@ -74,14 +75,14 @@ use parquet::file::properties::WriterProperties;
 use serde::{Deserialize, Serialize};
 use sync_store::content::{PayloadKind, SeriesManifest, merkle_root, recipe_hash};
 use sync_store::{
-    CapsuleEntry, CapsuleLeaf, CapsuleManifest, CapsuleNode, CapsuleObject, CapsulePayloadKind,
-    IncrementalFileLeafHasher, IncrementalTableLeafHasher, LEGACY_CAPSULE_FORMAT_V1,
-    LEGACY_CAPSULE_FORMAT_V2, LegacyCapsuleEntry, LegacyCapsuleManifest, LegacyCapsuleNode,
-    LegacyCapsuleObject, LegacyCapsulePayloadKind, LegacyCapsuleVersion, ManifestEntry, ObjectHash,
-    VersionMeta, canonicalize_schema, decode_manifest, decode_recipe, encode_canonical_attributes,
-    encode_canonical_batch_rows, legacy_capsule_root, read_capsule_manifest,
-    read_legacy_capsule_manifest, schema_fingerprint, verify_capsule_payload_directory,
-    verify_legacy_capsule_payload_directory,
+    CAPSULE_FORMAT_V3, CapsuleEntry, CapsuleLeaf, CapsuleManifest, CapsuleNode, CapsuleObject,
+    CapsulePayloadKind, IncrementalFileLeafHasher, IncrementalTableLeafHasher,
+    LEGACY_CAPSULE_FORMAT_V1, LEGACY_CAPSULE_FORMAT_V2, LegacyCapsuleEntry, LegacyCapsuleManifest,
+    LegacyCapsuleNode, LegacyCapsuleObject, LegacyCapsulePayloadKind, LegacyCapsuleVersion,
+    ManifestEntry, ObjectHash, VersionMeta, canonicalize_schema, decode_manifest, decode_recipe,
+    encode_canonical_attributes, encode_canonical_batch_rows, legacy_capsule_root,
+    read_capsule_manifest, read_legacy_capsule_manifest, schema_fingerprint,
+    verify_capsule_payload_directory, verify_legacy_capsule_payload_directory,
 };
 use tinyfs::{EntryType, WD};
 use tlogfs::schema::OplogEntry;
@@ -281,7 +282,14 @@ async fn import_logical_capsule(
         ))
     })?;
 
-    if let Err(error) = write_entries(&mut ship, &manifest, &objects_dir).await {
+    if let Err(error) = write_entries(
+        &mut ship,
+        &manifest,
+        &objects_dir,
+        manifest.format == CAPSULE_FORMAT_V3,
+    )
+    .await
+    {
         return Err(StewardError::Content(format!(
             "capsule import failed while staging at {} (left in place for inspection): {error}",
             staging.display()
@@ -2248,6 +2256,7 @@ async fn write_entries(
     ship: &mut Ship,
     manifest: &CapsuleManifest,
     objects_dir: &Path,
+    v3: bool,
 ) -> Result<(), StewardError> {
     let meta = PondUserMetadata::new(vec!["capsule".to_string(), "import".to_string()]);
     let tx = ship.begin_write_suppressed(&meta).await?;
@@ -2266,7 +2275,16 @@ async fn write_entries(
                     ))
                 })?
                 .clone();
-            write_entry(&parent_wd, name, entry, objects_dir, &mut dirs, &entry.path).await?;
+            write_entry(
+                &parent_wd,
+                name,
+                entry,
+                objects_dir,
+                &mut dirs,
+                &entry.path,
+                v3,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -2284,6 +2302,7 @@ async fn write_entry(
     objects_dir: &Path,
     dirs: &mut std::collections::HashMap<String, WD>,
     path: &str,
+    v3: bool,
 ) -> Result<(), StewardError> {
     match &entry.node {
         CapsuleNode::Directory => {
@@ -2308,6 +2327,7 @@ async fn write_entry(
         }
         CapsuleNode::Physical {
             payload_kind,
+            schema_fingerprint,
             objects,
             leaves,
             ..
@@ -2336,6 +2356,8 @@ async fn write_entry(
                             objects,
                             leaves,
                             objects_dir,
+                            *schema_fingerprint,
+                            v3,
                         )
                         .await?;
                     }
@@ -2538,6 +2560,8 @@ async fn write_table_entry(
     objects: &[CapsuleObject],
     leaves: &[CapsuleLeaf],
     objects_dir: &Path,
+    _node_schema_fingerprint: Option<ObjectHash>,
+    v3: bool,
 ) -> Result<(), StewardError> {
     let mut leaf_index = 0usize;
     let mut collected = 0u64;
@@ -2564,15 +2588,17 @@ async fn write_table_entry(
                 object.hash
             ))
         })?;
-        if let Some(schema) = &schema {
-            if schema.as_ref() != object_schema.as_ref() {
-                return Err(StewardError::Content(format!(
-                    "Parquet payload {} for {name:?} has a different logical schema",
-                    object.hash
-                )));
+        if !v3 {
+            if let Some(schema) = &schema {
+                if schema.as_ref() != object_schema.as_ref() {
+                    return Err(StewardError::Content(format!(
+                        "Parquet payload {} for {name:?} has a different logical schema",
+                        object.hash
+                    )));
+                }
+            } else {
+                schema = Some(object_schema.clone());
             }
-        } else {
-            schema = Some(object_schema);
         }
         let reader = builder.build().map_err(|error| {
             StewardError::Content(format!("build Parquet reader for {name:?}: {error}"))
@@ -2581,11 +2607,6 @@ async fn write_table_entry(
             let batch = batch.map_err(|error| {
                 StewardError::Content(format!("read Parquet rows for {name:?}: {error}"))
             })?;
-            let batch = canonicalize_table_batch(
-                batch,
-                schema.as_ref().expect("schema established by first object"),
-                name,
-            )?;
             let mut offset = 0usize;
             while offset < batch.num_rows() {
                 let leaf = leaves.get(leaf_index).ok_or_else(|| {
@@ -2593,6 +2614,33 @@ async fn write_table_entry(
                         "table {name:?} payload stream has rows after its final logical leaf"
                     ))
                 })?;
+                let leaf_schema = if v3 {
+                    let expected = leaf.schema_fingerprint.ok_or_else(|| {
+                        StewardError::Content(format!(
+                            "v3 table {name:?} leaf {leaf_index} has no schema fingerprint"
+                        ))
+                    })?;
+                    let actual = schema_fingerprint(object_schema.as_ref()).map_err(|error| {
+                        StewardError::Content(format!(
+                            "fingerprint Parquet schema for payload {} in {name:?}: {error}",
+                            object.hash
+                        ))
+                    })?;
+                    if actual != expected {
+                        return Err(StewardError::Content(format!(
+                            "Parquet payload {} for {name:?} crosses into leaf {leaf_index} \
+                             with schema {actual}, but that leaf requires {expected}",
+                            object.hash
+                        )));
+                    }
+                    object_schema.clone()
+                } else {
+                    schema
+                        .as_ref()
+                        .expect("v1/v2 schema established by first object")
+                        .clone()
+                };
+                let batch = canonicalize_table_batch(batch.clone(), &leaf_schema, name)?;
                 let remaining = leaf.logical_count.checked_sub(collected).ok_or_else(|| {
                     StewardError::Content(format!(
                         "table {name:?} leaf {leaf_index} row count overflow"
@@ -2610,19 +2658,13 @@ async fn write_table_entry(
                         })?;
                         let properties = WriterProperties::builder().build();
                         pending = Some(
-                            ArrowWriter::try_new(
-                                file,
-                                schema
-                                    .as_ref()
-                                    .expect("schema established by first object")
-                                    .clone(),
-                                Some(properties),
-                            )
-                            .map_err(|error| {
-                                StewardError::Content(format!(
-                                    "open Parquet encoder for {name:?} leaf: {error}"
-                                ))
-                            })?,
+                            ArrowWriter::try_new(file, leaf_schema, Some(properties)).map_err(
+                                |error| {
+                                    StewardError::Content(format!(
+                                        "open Parquet encoder for {name:?} leaf: {error}"
+                                    ))
+                                },
+                            )?,
                         );
                     }
                     pending

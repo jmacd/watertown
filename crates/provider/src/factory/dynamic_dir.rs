@@ -292,7 +292,7 @@ impl Metadata for DynamicDirDirectory {
             blake3: None,
             bao_outboard: None,
             entry_type: EntryType::DirectoryDynamic,
-            timestamp: 0,
+            timestamp: self.context.node_mtime.unwrap_or(0),
         })
     }
 }

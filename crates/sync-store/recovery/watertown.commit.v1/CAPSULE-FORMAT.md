@@ -1,4 +1,4 @@
-# Portable capsule format: `pondcapsule.2`
+# Portable capsule format: `pondcapsule.3`
 
 This document describes the files needed to inspect a capsule without Pond or
 the Watertown source tree. Treat the capsule as read-only during recovery.
@@ -17,7 +17,7 @@ recovery/
   objects/blake3=<hash>       immutable payload bytes
 ```
 
-The capsule root is BLAKE3 over the ASCII domain `pondcapsule.root.2\n`
+The capsule root is BLAKE3 over the ASCII domain `pondcapsule.root.3\n`
 followed by the exact manifest bytes. The manifest names the source pond,
 source commit, every logical path, and the complete payload closure. Each
 payload descriptor records the BLAKE3 hash and exact byte size.
@@ -31,15 +31,26 @@ hash-authenticated `dp.commit.3` recovery kit.
 - File payloads are exact byte streams.
 - Table payloads are standard Parquet.
 - Symlink targets are raw bytes and are never activated.
-- Dynamic recipes use the source `watertown.recipe.v1` framing. Materialization emits
-  the raw recipe plus `factory.json` and exact `config.bin`; it never
-  executes the recipe.
+- Dynamic recipes use the source `watertown.recipe.v1` or legacy
+  `dp.recipe.1` framing. Materialization emits the raw recipe plus
+  `factory.json` and exact `config.bin`; it never executes the recipe.
 
 Physical objects may not align one-for-one with logical versions. The manifest
 therefore records ordered logical leaves and roots independently of object
 boundaries. `capsule.py verify` checks both physical bytes and logical content.
+Every table leaf carries its required 64-character lowercase BLAKE3
+`schema_fingerprint`; file leaves never carry that field. A schema-evolved
+table omits the node-level `schema_fingerprint` entirely, while a homogeneous
+table may carry it and every leaf must equal it. Physical Parquet schema
+transitions must occur at physical-object boundaries.
+
+Native pack descriptors do not contain an individual write timestamp. For a
+pack-aware series, `source_timestamp` is the authenticated aggregate series
+timestamp recorded in the native tree metadata; the per-leaf bounds,
+attributes, counts, logical hashes, and (for tables) schemas are preserved
+exactly from the descriptors and decoded payload.
 Empty physical versions with source metadata are not representable in
-`pondcapsule.2`; extraction fails rather than silently dropping that metadata.
+`pondcapsule.3`; extraction fails rather than silently dropping that metadata.
 
 ## Materialized layout
 

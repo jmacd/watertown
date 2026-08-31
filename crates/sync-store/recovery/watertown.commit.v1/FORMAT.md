@@ -40,14 +40,33 @@ Native object magic and framing:
 watertown.commit.v1\n   content model byte, commit and provenance
 watertown.tree.v1\n     canonical directory entries
 watertown.manifest.v1\n source node identities and metadata
-watertown.series.v1\n   logical-series summary and Merkle root
+dp.series.1\n              legacy ordered physical-hash list
+watertown.series.v1\n   homogeneous logical-series manifest and Merkle root
+watertown.series.v2\n   current per-leaf-schema logical-series manifest and Merkle root
+watertown.series-pack.v1\n legacy pack index and range proof
+watertown.series-pack.v2\n current pack index with per-leaf schema fingerprints
 watertown.recipe.v1\n   dynamic factory type and raw configuration
+dp.recipe.1\n          legacy dynamic factory type and raw configuration
 ```
 
 Integers are little-endian. Strings and variable byte fields use an unsigned
 32-bit little-endian length followed by exact bytes. Hashes are 32 raw BLAKE3
 bytes. `native-fixtures.json` contains commit, tree, manifest, series, and recipe
 objects whose shared framing bytes are checked by the independent decoder and
-the Rust source codecs. The v2 physical-row and pack mapping remains
-fail-closed in this first standalone kit; a `watertown.series.v1` object is diagnosed
-as unsupported rather than misread as a v1 physical hash list.
+the Rust source codecs.
+
+For a nonempty `watertown.series.v1` or `.v2` node, the extractor requires
+the sibling pack advertisements at
+`_packs/series=<series-hash>/pack=<pack-hash>`. Every advertised filename,
+content hash, index framing, descriptor, schema fingerprint, physical object,
+exact cover, and range proof is checked. Each selected pack's physical stream
+is independently partitioned by its own descriptor range, with no bytes or
+rows permitted to cross from another pack; its leaf hashes and range proof
+are validated before verified ranges are concatenated in leaf order. Table
+objects are standard Parquet. A `.v2` table's descriptor supplies the schema
+fingerprint for each leaf, so schema evolution is preserved.
+
+`dp.series.1`, `dp.manifest.2`, `dp.tree.2`, and `dp.recipe.1` remain
+supported with their original ordered physical-object semantics. Pack-aware
+series require their advertisements to be present locally; this offline kit
+does not fetch missing advertisements or objects from another remote.
