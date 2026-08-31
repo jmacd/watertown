@@ -390,11 +390,56 @@ impl ContentRemote {
         }
     }
 
+    /// Verify that the discoverable bootstrap is immutable and backed by its
+    /// own hash-addressed copy. The discoverable bootstrap may predate the
+    /// current kit, so it is not required to equal the current recipe bytes.
+    async fn inspect_discoverable_recovery_recipe(&self) -> Result<ObjectHash> {
+        let discoverable = Self::recovery_recipe_discoverable_path();
+        let existing = self
+            .store
+            .object_store()
+            .get(&discoverable)
+            .await
+            .map_err(|error| {
+                StoreError::Invariant(format!("read discoverable recovery recipe: {error}"))
+            })?
+            .bytes()
+            .await
+            .map_err(|error| {
+                StoreError::Invariant(format!("collect discoverable recovery recipe: {error}"))
+            })?;
+        let existing_hash = crate::recovery_recipe::recovery_recipe_hash(&existing);
+        let immutable = self
+            .store
+            .object_store()
+            .get(&Self::recovery_recipe_versioned_path(existing_hash))
+            .await
+            .map_err(|error| {
+                StoreError::Invariant(format!(
+                    "read immutable copy of discoverable recovery recipe: {error}"
+                ))
+            })?
+            .bytes()
+            .await
+            .map_err(|error| {
+                StoreError::Invariant(format!(
+                    "collect immutable copy of discoverable recovery recipe: {error}"
+                ))
+            })?;
+        if immutable != existing {
+            return Err(StoreError::Invariant(
+                "discoverable recovery recipe differs from its immutable copy".to_string(),
+            ));
+        }
+        Ok(existing_hash)
+    }
+
     /// Install the reviewed `watertown.commit.v1` recovery recipe exactly once.
     ///
     /// The immutable hash-addressed object is created before the discoverable
-    /// top-level bootstrap. Existing byte-identical objects make retries
-    /// idempotent; differing objects are never overwritten.
+    /// top-level bootstrap. A valid older discoverable bootstrap remains
+    /// immutable; the current kit is selected by its reported hash-addressed
+    /// object. Differing objects are never overwritten.
     pub async fn publish_recovery_recipe_watertown_commit_v1(
         &self,
     ) -> Result<RecoveryRecipePublishOutcome> {
@@ -407,13 +452,31 @@ impl ContentRemote {
                 "versioned recovery recipe",
             )
             .await?;
-        let discoverable_created = self
-            .create_exact_object(
-                &Self::recovery_recipe_discoverable_path(),
-                &bytes,
-                "discoverable recovery recipe",
+        let discoverable = Self::recovery_recipe_discoverable_path();
+        let discoverable_created = match self
+            .store
+            .object_store()
+            .put_opts(
+                &discoverable,
+                bytes.into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..PutOptions::default()
+                },
             )
-            .await?;
+            .await
+        {
+            Ok(_) => true,
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let _ = self.inspect_discoverable_recovery_recipe().await?;
+                false
+            }
+            Err(error) => {
+                return Err(StoreError::Invariant(format!(
+                    "create discoverable recovery recipe: {error}"
+                )));
+            }
+        };
         Ok(RecoveryRecipePublishOutcome {
             recipe_hash,
             versioned_created,
@@ -453,45 +516,7 @@ impl ContentRemote {
         {
             Ok(_) => Ok(current_hash),
             Err(object_store::Error::AlreadyExists { .. }) => {
-                let existing = self
-                    .store
-                    .object_store()
-                    .get(&discoverable)
-                    .await
-                    .map_err(|error| {
-                        StoreError::Invariant(format!("read discoverable recovery recipe: {error}"))
-                    })?
-                    .bytes()
-                    .await
-                    .map_err(|error| {
-                        StoreError::Invariant(format!(
-                            "collect discoverable recovery recipe: {error}"
-                        ))
-                    })?;
-                let existing_hash = crate::recovery_recipe::recovery_recipe_hash(&existing);
-                let immutable = self
-                    .store
-                    .object_store()
-                    .get(&Self::recovery_recipe_versioned_path(existing_hash))
-                    .await
-                    .map_err(|error| {
-                        StoreError::Invariant(format!(
-                            "read immutable copy of discoverable recovery recipe: {error}"
-                        ))
-                    })?
-                    .bytes()
-                    .await
-                    .map_err(|error| {
-                        StoreError::Invariant(format!(
-                            "collect immutable copy of discoverable recovery recipe: {error}"
-                        ))
-                    })?;
-                if immutable != existing {
-                    return Err(StoreError::Invariant(
-                        "discoverable recovery recipe differs from its immutable copy".to_string(),
-                    ));
-                }
-                Ok(existing_hash)
+                self.inspect_discoverable_recovery_recipe().await
             }
             Err(error) => Err(StoreError::Invariant(format!(
                 "create discoverable recovery recipe: {error}"
@@ -499,35 +524,33 @@ impl ContentRemote {
         }
     }
 
-    /// Verify the discoverable and immutable `watertown.commit.v1` recipe objects.
+    /// Verify the current immutable `watertown.commit.v1` recipe and the
+    /// discoverable bootstrap that may reference a prior immutable recipe.
     pub async fn inspect_recovery_recipe_watertown_commit_v1(&self) -> Result<ObjectHash> {
         let expected = crate::recovery_recipe_watertown_commit_v1();
         let hash = crate::recovery_recipe_watertown_commit_v1_hash();
-        for (path, label) in [
-            (
-                Self::recovery_recipe_versioned_path(hash),
-                "versioned recovery recipe",
-            ),
-            (
-                Self::recovery_recipe_discoverable_path(),
-                "discoverable recovery recipe",
-            ),
-        ] {
-            let bytes = self
-                .store
-                .object_store()
-                .get(&path)
-                .await
-                .map_err(|error| StoreError::Invariant(format!("read {label}: {error}")))?
-                .bytes()
-                .await
-                .map_err(|error| StoreError::Invariant(format!("collect {label}: {error}")))?;
-            if bytes.as_ref() != expected {
-                return Err(StoreError::Invariant(format!(
-                    "{label} differs from recipe {hash}"
-                )));
-            }
+        let path = Self::recovery_recipe_versioned_path(hash);
+        let bytes = self
+            .store
+            .object_store()
+            .get(&path)
+            .await
+            .map_err(|error| {
+                StoreError::Invariant(format!("read current versioned recovery recipe: {error}"))
+            })?
+            .bytes()
+            .await
+            .map_err(|error| {
+                StoreError::Invariant(format!(
+                    "collect current versioned recovery recipe: {error}"
+                ))
+            })?;
+        if bytes.as_ref() != expected {
+            return Err(StoreError::Invariant(format!(
+                "current versioned recovery recipe differs from recipe {hash}"
+            )));
         }
+        let _ = self.inspect_discoverable_recovery_recipe().await?;
         Ok(hash)
     }
 
@@ -2708,6 +2731,21 @@ mod tests {
                 .await
                 .is_ok()
         );
+        assert_eq!(
+            remote
+                .inspect_recovery_recipe_watertown_commit_v1()
+                .await
+                .unwrap(),
+            current_hash,
+            "inspection selects the current immutable kit while retaining the older bootstrap"
+        );
+        let published = remote
+            .publish_recovery_recipe_watertown_commit_v1()
+            .await
+            .unwrap();
+        assert_eq!(published.recipe_hash, current_hash);
+        assert!(!published.versioned_created);
+        assert!(!published.discoverable_created);
     }
 
     fn test_capsule(payload: &[u8]) -> (CapsuleManifest, BTreeMap<ObjectHash, Vec<u8>>) {
@@ -2728,6 +2766,7 @@ mod tests {
             min_event_time: None,
             max_event_time: None,
             logical_attributes: None,
+            schema_fingerprint: None,
         };
         let manifest = CapsuleManifest::new_v2(
             CapsuleSource {
@@ -2794,6 +2833,7 @@ mod tests {
             min_event_time: None,
             max_event_time: None,
             logical_attributes: None,
+            schema_fingerprint: None,
         };
         let mut entries = prior.entries.clone();
         entries.push(CapsuleEntry {

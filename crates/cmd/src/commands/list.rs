@@ -189,6 +189,43 @@ mod tests {
             result.map_err(|e| anyhow::anyhow!("Failed to create directory: {}", e))?;
             Ok(())
         }
+
+        async fn create_pond_dynamic_directory(&self, path: &str, mtime: i64) -> Result<()> {
+            let mut ship = self.ship_context.open_pond().await?;
+            let tx = ship
+                .begin_write(&steward::PondUserMetadata::new(vec![
+                    "test_setup".to_string(),
+                    path.to_string(),
+                ]))
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to begin transaction: {}", e))?;
+
+            let result = {
+                let fs = &*tx;
+                let root = fs.root().await?;
+                root.create_dynamic_path_with_mtime(
+                    path,
+                    tinyfs::EntryType::DirectoryDynamic,
+                    "dynamic-dir",
+                    br#"entries:
+  - name: child
+    factory: test-dir
+    config:
+      name: child
+"#
+                    .to_vec(),
+                    Some(mtime),
+                )
+                .await
+            };
+
+            _ = result.map_err(|e| anyhow::anyhow!("Failed to create dynamic directory: {}", e))?;
+            _ = tx
+                .commit()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to commit transaction: {}", e))?;
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -302,6 +339,27 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].contains("testdir"));
         assert!(results[0].contains("[DIR]")); // Directory emoji
+    }
+
+    #[tokio::test]
+    async fn test_list_long_preserves_dynamic_directory_mtime() {
+        let setup = TestSetup::new().await.expect("Failed to create test setup");
+        setup
+            .create_pond_dynamic_directory("analysis", 1_785_725_641_564_536)
+            .await
+            .expect("Failed to create dynamic directory");
+
+        let mut results = Vec::new();
+        list_command(&setup.ship_context, "analysis", false, true, |output| {
+            results.push(output.to_string())
+        })
+        .await
+        .expect("List command failed");
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].contains("dynamic-directory"));
+        assert!(results[0].contains("2026-08-03 02:54:01"));
+        assert!(!results[0].contains("1970-01-01 00:00:00"));
     }
 
     #[tokio::test]

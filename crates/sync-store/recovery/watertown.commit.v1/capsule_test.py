@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,7 +13,7 @@ import blake3
 
 from capsule import (
     CapsuleError,
-    ROOT_DOMAIN,
+    ROOT_DOMAINS,
     _canonical_schema,
     _encoded_logical_path,
     _rename_no_replace,
@@ -24,8 +25,13 @@ from capsule import (
 
 
 def write_capsule(root: Path, manifest: dict) -> None:
-    encoded = json.dumps(manifest, separators=(",", ":")).encode()
-    digest = blake3.blake3(ROOT_DOMAIN + encoded).hexdigest()
+    encoded = json.dumps(
+        manifest,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=manifest["format"] == "pondcapsule.3",
+    ).encode()
+    digest = blake3.blake3(ROOT_DOMAINS[manifest["format"]] + encoded).hexdigest()
     (root / "recovery" / "refs").mkdir(parents=True)
     (root / "recovery" / "manifests").mkdir()
     (root / "recovery" / "objects").mkdir()
@@ -35,7 +41,7 @@ def write_capsule(root: Path, manifest: dict) -> None:
 
 def minimal_manifest() -> dict:
     return {
-        "format": "pondcapsule.2",
+        "format": "pondcapsule.3",
         "source": {
             "pond_id": "pond-test",
             "birthplace": "fixture",
@@ -94,7 +100,6 @@ class CapsuleTest(unittest.TestCase):
                     "node": {
                         "kind": "physical",
                         "payload_kind": "file",
-                        "schema_fingerprint": None,
                         "logical_root": _series_root("file", None, [], blake3),
                         "objects": [],
                         "leaves": [],
@@ -112,6 +117,54 @@ class CapsuleTest(unittest.TestCase):
             )
             self.assertTrue(recovered.is_file())
             self.assertEqual(recovered.read_bytes(), b"")
+
+    def test_v3_schema_fields_are_strict(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="capsule-unit-") as temporary:
+            root = Path(temporary) / "capsule"
+            manifest = minimal_manifest()
+            manifest["entries"].append(
+                {
+                    "path": "/file",
+                    "entry_type": "file:physical:version",
+                    "source_node_id": "file",
+                    "node": {
+                        "kind": "physical",
+                        "payload_kind": "file",
+                        "schema_fingerprint": None,
+                        "logical_root": _series_root("file", None, [], blake3),
+                        "objects": [],
+                        "leaves": [],
+                    },
+                }
+            )
+            write_capsule(root, manifest)
+            with self.assertRaisesRegex(CapsuleError, "file must not declare a schema"):
+                load_and_verify(root)
+
+            leaf = {
+                "logical_hash": "00" * 32,
+                "logical_count": 1,
+                "source_timestamp": 0,
+                "min_event_time": None,
+                "max_event_time": None,
+                "logical_attributes": None,
+            }
+            manifest["entries"][-1] = {
+                "path": "/table",
+                "entry_type": "table:physical:version",
+                "source_node_id": "table",
+                "node": {
+                    "kind": "physical",
+                    "payload_kind": "table",
+                    "logical_root": _series_root("table", None, [leaf], blake3),
+                    "objects": [{"hash": "11" * 32, "size": 1}],
+                    "leaves": [leaf],
+                },
+            }
+            shutil.rmtree(root)
+            write_capsule(root, manifest)
+            with self.assertRaisesRegex(CapsuleError, "v3 table leaves must declare a schema"):
+                load_and_verify(root)
 
     def test_noncanonical_path_fails(self) -> None:
         with tempfile.TemporaryDirectory(prefix="capsule-unit-") as temporary:
@@ -173,7 +226,7 @@ class CapsuleTest(unittest.TestCase):
             )
             write_capsule(root, manifest)
             (root / "recovery" / "objects" / f"blake3={digest}").write_bytes(recipe)
-            with self.assertRaisesRegex(CapsuleError, "watertown.recipe.v1 framing"):
+            with self.assertRaisesRegex(CapsuleError, "dp.recipe.1 framing"):
                 load_and_verify(root)
 
     def test_reordered_manifest_fields_fail(self) -> None:
@@ -185,7 +238,13 @@ class CapsuleTest(unittest.TestCase):
                 "format": canonical["format"],
                 "source": canonical["source"],
             }
-            write_capsule(root, reordered)
+            encoded = json.dumps(reordered, separators=(",", ":")).encode()
+            digest = blake3.blake3(ROOT_DOMAINS["pondcapsule.3"] + encoded).hexdigest()
+            (root / "recovery" / "refs").mkdir(parents=True)
+            (root / "recovery" / "manifests").mkdir()
+            (root / "recovery" / "objects").mkdir()
+            (root / "recovery" / "refs" / "latest").write_text(digest + "\n")
+            (root / "recovery" / "manifests" / f"{digest}.json").write_bytes(encoded)
             with self.assertRaises(CapsuleError):
                 load_and_verify(root)
 
@@ -220,11 +279,14 @@ class CapsuleTest(unittest.TestCase):
             }
             batches = list(_table_batches(root, entry, pa, pq))
             self.assertEqual(
-                [batch.column(0).to_pylist() for _, batch in batches],
+                [batch.column(0).to_pylist() for _, batch, _ in batches],
                 [["a", "b"], ["c", "d"]],
             )
             self.assertTrue(
-                all(pa.types.is_string(schema.field("value").type) for schema, _ in batches)
+                all(
+                    pa.types.is_string(schema.field("value").type)
+                    for schema, _, _ in batches
+                )
             )
 
     def test_no_replace_promotion_refuses_a_racing_destination(self) -> None:

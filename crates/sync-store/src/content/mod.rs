@@ -58,9 +58,10 @@ mod series_pack_builder;
 mod tree;
 
 pub use capsule::{
-    CAPSULE_FORMAT_V1, CAPSULE_FORMAT_V2, CapsuleEntry, CapsuleLeaf, CapsuleManifest, CapsuleNode,
-    CapsuleObject, CapsulePayloadKind, CapsuleSource, CapsuleVerifyReport, capsule_leaf_hash,
-    capsule_manifest_bytes, capsule_root, capsule_series_root, decode_capsule_manifest,
+    CAPSULE_FORMAT_V1, CAPSULE_FORMAT_V2, CAPSULE_FORMAT_V3, CapsuleEntry, CapsuleLeaf,
+    CapsuleManifest, CapsuleNode, CapsuleObject, CapsulePayloadKind, CapsuleSource,
+    CapsuleVerifyReport, capsule_leaf_hash, capsule_manifest_bytes, capsule_root,
+    capsule_series_root, capsule_series_root_v3, decode_capsule_manifest,
     encode_capsule_attributes, read_capsule_manifest, verify_capsule_directory,
     verify_capsule_payload_directory, verify_capsule_payloads,
     verify_incremental_capsule_payload_directory,

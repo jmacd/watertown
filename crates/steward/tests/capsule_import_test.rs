@@ -30,25 +30,6 @@ fn meta(label: &str) -> PondUserMetadata {
     PondUserMetadata::new(vec!["capsule-import-test".into(), label.into()])
 }
 
-fn table_batch(timestamp: i64, value: &str) -> RecordBatch {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new(
-            "timestamp",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            false,
-        ),
-        Field::new("value", DataType::Utf8, false),
-    ]));
-    RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(TimestampMicrosecondArray::from(vec![timestamp])),
-            Arc::new(StringArray::from(vec![value])),
-        ],
-    )
-    .expect("record batch")
-}
-
 fn legacy_table_batch(timestamp: i64, value: &str, note: Option<&str>) -> RecordBatch {
     let mut fields = vec![
         Field::new(
@@ -404,12 +385,13 @@ async fn build_source_capsule(
             .await?;
         }
         for (timestamp, value) in [(100, "a"), (200, "b"), (300, "c")] {
+            let batch = legacy_table_batch(
+                timestamp,
+                value,
+                (timestamp == 300).then_some("schema-evolved"),
+            );
             let _ = root
-                .write_series_from_batch(
-                    "/data/table.series",
-                    &table_batch(timestamp, value),
-                    Some("timestamp"),
-                )
+                .write_series_from_batch("/data/table.series", &batch, Some("timestamp"))
                 .await?;
         }
         let _ = root
@@ -512,6 +494,22 @@ async fn imports_every_node_kind_and_verifies_the_logical_contract() {
     let (capsule_dir, _source_ship, source_manifest) = build_source_capsule(temporary.path()).await;
 
     let target = temporary.path().join("restored");
+    let source_table = source_manifest
+        .entries
+        .iter()
+        .find(|entry| entry.path == "/data/table.series")
+        .expect("source table series");
+    let CapsuleNode::Physical {
+        schema_fingerprint,
+        leaves,
+        ..
+    } = &source_table.node
+    else {
+        panic!("source table series must be physical")
+    };
+    assert_eq!(*schema_fingerprint, None);
+    assert!(leaves.iter().all(|leaf| leaf.schema_fingerprint.is_some()));
+    assert_ne!(leaves[0].schema_fingerprint, leaves[2].schema_fingerprint);
     let report = import_capsule(&capsule_dir, &target, "capsule-import-test-target")
         .await
         .expect("import capsule");

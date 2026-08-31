@@ -2,7 +2,7 @@
 
 This reviewed kit validates a downloaded `watertown.commit.v1` native ContentRemote
 backup and converts supported content into a
-portable `pondcapsule.2` without importing anything and without running Pond.
+portable `pondcapsule.3` without importing anything and without running Pond.
 It is not itself a capsule. Every produced capsule contains
 `CAPSULE-README.md`, `CAPSULE-FORMAT.md`, `capsule.py`,
 `capsule-requirements.lock`, and `recover.sh` at its root for Pond-free
@@ -122,12 +122,23 @@ plus inventories. Symlinks and recipes remain inert data; they are never
 activated or executed. Dynamic recipes are also decoded into a factory name
 and exact configuration bytes for inspection.
 
-The v2 logical-series physical-row and pack mapping is deliberately fail-closed
-in this first kit: a `watertown.series.v1` series is diagnosed as unsupported rather
-than being mistaken for a v1 physical hash list. This probe must pass before
-the v2 pack-aware extractor is used for a migration.
+The kit supports both pack-aware native series revisions:
+`watertown.series.v1` with `watertown.series-pack.v1`, and the current
+`watertown.series.v2` with per-leaf table schema fingerprints in
+`watertown.series-pack.v2`. It strictly validates every locally advertised
+pack, chooses a deterministic exact cover, validates each selected range
+proof against the series manifest, recomputes logical leaf hashes from the
+decoded physical stream, and preserves descriptor bounds, canonical
+attributes, and per-leaf schemas in the capsule. Legacy `dp.series.1`
+objects remain supported. A nonempty pack-aware series without a complete
+local `_packs/series=<hash>/` advertisement set is rejected; the kit never
+guesses pack layout or contacts another remote.
 
-`pondcapsule.2` cannot encode an empty member of a multi-version series.
+Legacy `dp.recipe.1` dynamic recipes are retained as inert raw bytes and are
+decoded only to expose their factory name and raw configuration; neither
+legacy nor current recipes are executed.
+
+`pondcapsule.3` cannot encode an empty member of a multi-version series.
 Extraction fails closed when one is encountered rather than silently changing
 series order or metadata. A single empty physical file or table node remains
 representable only when its native version metadata is empty. Extraction fails

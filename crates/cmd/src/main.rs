@@ -241,12 +241,12 @@ enum CapsuleCommand {
 
 #[derive(Debug, Subcommand)]
 enum CapsuleRecipeCommand {
-    /// Install the target-format watertown.commit.v1 -> pondcapsule.2 recipe.
+    /// Install the target-format watertown.commit.v1 -> pondcapsule.3 recipe.
     Publish {
         /// Backup attachment name.
         name: String,
     },
-    /// Verify the target-format watertown.commit.v1 -> pondcapsule.2 recipe.
+    /// Verify the target-format watertown.commit.v1 -> pondcapsule.3 recipe.
     Inspect {
         /// Remote attachment name.
         name: String,

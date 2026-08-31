@@ -18,9 +18,13 @@ preserve synthetic dynamic-node metadata. Do not use it for a migration. The
 pond format.
 
 The existing generic recipe remains the `watertown.commit.v1` to
-`pondcapsule.2` target-format recipe under `recovery/README.sh` and
+`pondcapsule.3` target-format recipe under `recovery/README.sh` and
 `recovery/recipes/watertown.commit.v1/<recipe-hash>/README.sh`. Do not
 overwrite, reinterpret, or use that generic bootstrap for this migration.
+The discoverable bootstrap is immutable: when a newer reviewed generic kit is
+published, retrieve its explicitly reported hash-addressed object rather than
+assuming `recovery/README.sh` changed. Recipe inspection verifies both the
+current hash-addressed kit and the independent discoverable bootstrap.
 
 Use this procedure only after rehearsing the complete sequence against a
 disposable staging namespace. Recovery and cutover never require deleting or
@@ -100,7 +104,8 @@ Do not proceed to the next gate unless the current gate succeeds:
 9. The target passes replay-identity, metadata, application, and remote checks
    while post-commit dispatch remains suppressed.
 10. A separate `watertown.commit.v1` target-format backup is recovered using
-    the generic `pondcapsule.2` recipe.
+    the current hash-addressed generic `pondcapsule.3` recipe. It must include
+    pack-aware series recovery when the source uses that representation.
 11. Exactly one pond is enabled as the authoritative writer.
 
 Any mismatch is a stop condition. Do not repair, skip, overwrite, or silently
@@ -343,7 +348,8 @@ It does not create symlinks, execute recipes, analyze Parquet, or establish
 target logical leaf identities.
 
 Do not substitute `pond capsule inspect` or `pond capsule verify` here: those
-commands describe logical `pondcapsule.1`/`pondcapsule.2` verification, not
+commands describe logical `pondcapsule.1`/`pondcapsule.2`/`pondcapsule.3`
+verification, not
 this opaque source envelope.
 
 ## 8. Import into a fresh target pond
@@ -410,11 +416,12 @@ Those generic commands must report:
 ```text
 flavor=target-format
 native_format=watertown.commit.v1
-capsule_format=pondcapsule.2
+capsule_format=pondcapsule.3
 ```
 
-Recover that new backup into another disposable pond using its independently
-authenticated `recovery/README.sh` target-format kit. This drill must not use
+Recover that new backup into another disposable pond using the independently
+authenticated current hash-addressed target-format kit reported by recipe
+inspection. This drill must not use
 the legacy-migration-v2 bootstrap, source backup, or intended production target.
 It proves future disaster recovery after the old decoder and old pond are
 unavailable.
