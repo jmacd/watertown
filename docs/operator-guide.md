@@ -466,18 +466,78 @@ footprint.
 
 ### Capsule recovery and storage-format migration
 
-Portable `pondcapsule.1` recovery reconstructs logical pond content into a
-fresh pond created by the current binary. It is the migration path when a
-native backup format should not be copied directly into the target.
+Use a portable capsule when a native backup format must be recovered by a
+future Watertown version or migrated into a fresh pond. The current
+`watertown.commit.v1` recovery recipe produces `pondcapsule.4`. V4 preserves
+the schema identity of every table leaf and persisted dynamic-node timestamps.
+`pondcapsule.1` through `.3` remain readable frozen compatibility formats, but
+V3 and earlier cannot recover dynamic metadata they did not encode.
+
+This is not the routine `pond pull` path. A capsule is a deliberate,
+authenticated recovery boundary:
+
+1. Quiesce every source writer and restart mechanism. For a format migration,
+   use the current binary to freeze the source and record its exact tip:
+
+   ```bash
+   POND="$SOURCE_POND" pond freeze enable --reason "approved storage-format migration"
+   POND="$SOURCE_POND" pond freeze status
+   ```
+
+   Old source binaries may not honor the freeze marker, so stopping their
+   service, timer, supervisor, and operator sessions is still required.
+
+2. Publish and inspect the current target-format recipe, then push and verify
+   the selected exact native snapshot:
+
+   ```bash
+   POND="$SOURCE_POND" pond capsule recipe publish backup
+   POND="$SOURCE_POND" pond capsule recipe inspect backup
+   POND="$SOURCE_POND" pond push backup
+   POND="$SOURCE_POND" pond verify --exact backup
+   ```
+
+   Record the exact source tip and the recipe hash printed by `inspect`.
+   Retrieve the hash-addressed bootstrap at
+   `recovery/recipes/watertown.commit.v1/<recipe-hash>/README.sh`; do not
+   assume the older discoverable `recovery/README.sh` is the current kit.
+   Authenticate the bootstrap with the documented `pondcapsule.recipe.1`
+   domain hash before executing it.
+
+3. Using the authenticated kit, download a complete read-only copy of the
+   native backup, extract by the recorded commit hash, and verify the capsule:
+
+   ```bash
+   python extract.py "$BACKUP" "$CAPSULE" \
+     --commit "$SOURCE_TIP" --birthplace "$SOURCE_BIRTHPLACE"
+   python "$CAPSULE/capsule.py" verify "$CAPSULE"
+   python "$CAPSULE/capsule.py" materialize "$CAPSULE" "$MATERIALIZED"
+   ```
+
+   `CAPSULE` and `MATERIALIZED` must not exist before creation. Keep the
+   backup, capsule, and materialized output read-only after verification.
+
+4. Import only into a new target. Import keeps post-commit dispatch and
+   automatic pushes suppressed until the operator deliberately promotes it:
+
+   ```bash
+   POND="$TARGET_POND" pond capsule import "$CAPSULE" \
+     --birthplace "$TARGET_BIRTHPLACE" --experimental
+   POND="$TARGET_POND" pond fsck --quick
+   POND="$TARGET_POND" pond remote list
+   ```
+
+   Review `CAPSULE_IMPORT_PROVENANCE.json`, validate critical data, schemas,
+   timestamps, and remotes, and ensure the target does not resolve to source
+   storage. Attach or retain only an isolated target backup. Enable
+   `post_commit_dispatch` and start exactly one writer only after those
+   checks, including a separate target-format backup/recovery drill, succeed.
 
 Follow [capsule-recovery-runbook.md](capsule-recovery-runbook.md) for the
-complete watershop rehearsal and Azure production procedure. In particular,
-an authoritative migration requires stopping every source writer, running
-`pond freeze enable`, verifying a final push at the exact protected commit,
-keeping the imported pond inert while its remotes are reviewed, and proving
-recovery from the target native format before cutover. Use
-`pond freeze status` to record the source tip and `pond freeze disable` only
-for an explicit pre-cutover rollback.
+complete watershop rehearsal and Azure production procedure. It specifies the
+immutable-recipe authentication, source shutdown, remote review, recovery
+drill, cutover, and rollback gates in detail. Use `pond freeze disable` only
+for an explicit pre-cutover rollback after the target remains inert.
 
 ### Destructive recovery
 
@@ -611,6 +671,12 @@ MONITORING
 RECOVERY
   pond recover                                Resolve incomplete transactions
   pond rebuild-control [--force]              Rebuild control table from data
+  pond capsule recipe publish <backup>        Publish current V4 recovery kit
+  pond capsule recipe inspect <backup>        Inspect current V4 recovery kit
+  pond capsule verify <capsule-dir>           Verify a downloaded V1-V4 capsule
+  pond capsule import <capsule-dir> --birthplace <label> --experimental
+                                              Import only into a new inert pond
+  pond freeze enable|status|disable            Guard a migration source
   pond emergency ...                          Destructive recovery
 ```
 
