@@ -390,13 +390,9 @@ impl ContentRemote {
         }
     }
 
-    /// Verify that the discoverable bootstrap is immutable and backed by its
-    /// own hash-addressed copy. The discoverable bootstrap may predate the
-    /// current kit, so it is not required to equal the current recipe bytes.
-    async fn inspect_discoverable_recovery_recipe(&self) -> Result<ObjectHash> {
+    async fn read_discoverable_recovery_recipe(&self) -> Result<Vec<u8>> {
         let discoverable = Self::recovery_recipe_discoverable_path();
-        let existing = self
-            .store
+        self.store
             .object_store()
             .get(&discoverable)
             .await
@@ -407,7 +403,15 @@ impl ContentRemote {
             .await
             .map_err(|error| {
                 StoreError::Invariant(format!("collect discoverable recovery recipe: {error}"))
-            })?;
+            })
+            .map(|bytes| bytes.to_vec())
+    }
+
+    /// Verify that the discoverable bootstrap is immutable and backed by its
+    /// own hash-addressed copy. The discoverable bootstrap may predate the
+    /// current kit, so it is not required to equal the current recipe bytes.
+    async fn inspect_discoverable_recovery_recipe(&self) -> Result<ObjectHash> {
+        let existing = self.read_discoverable_recovery_recipe().await?;
         let existing_hash = crate::recovery_recipe::recovery_recipe_hash(&existing);
         let immutable = self
             .store
@@ -432,6 +436,55 @@ impl ContentRemote {
             ));
         }
         Ok(existing_hash)
+    }
+
+    /// Complete the immutable closure for an existing discoverable bootstrap
+    /// published before hash-addressed copies were introduced.
+    async fn backfill_discoverable_recovery_recipe(&self) -> Result<ObjectHash> {
+        let existing = self.read_discoverable_recovery_recipe().await?;
+        let supported_recipes = [
+            crate::recovery_recipe_dp_commit_3(),
+            crate::recovery_recipe_watertown_commit_v1(),
+        ];
+        let existing_hash = crate::recovery_recipe::recovery_recipe_hash(&existing);
+        let immutable_path = Self::recovery_recipe_versioned_path(existing_hash);
+        match self.store.object_store().get(&immutable_path).await {
+            Ok(immutable) => {
+                let immutable = immutable.bytes().await.map_err(|error| {
+                    StoreError::Invariant(format!(
+                        "collect immutable copy of discoverable recovery recipe: {error}"
+                    ))
+                })?;
+                if immutable.as_ref() != existing {
+                    return Err(StoreError::Invariant(
+                        "discoverable recovery recipe differs from its immutable copy".to_string(),
+                    ));
+                }
+                Ok(existing_hash)
+            }
+            Err(object_store::Error::NotFound { .. }) => {
+                if !supported_recipes
+                    .iter()
+                    .any(|recipe| recipe.as_slice() == existing.as_slice())
+                {
+                    return Err(StoreError::Invariant(
+                        "discoverable recovery recipe does not match a reviewed historic recipe"
+                            .to_string(),
+                    ));
+                }
+                let _ = self
+                    .create_exact_object(
+                        &immutable_path,
+                        &existing,
+                        "immutable copy of discoverable recovery recipe",
+                    )
+                    .await?;
+                Ok(existing_hash)
+            }
+            Err(error) => Err(StoreError::Invariant(format!(
+                "read immutable copy of discoverable recovery recipe: {error}"
+            ))),
+        }
     }
 
     /// Install the reviewed `watertown.commit.v1` recovery recipe exactly once.
@@ -468,7 +521,7 @@ impl ContentRemote {
         {
             Ok(_) => true,
             Err(object_store::Error::AlreadyExists { .. }) => {
-                let _ = self.inspect_discoverable_recovery_recipe().await?;
+                let _ = self.backfill_discoverable_recovery_recipe().await?;
                 false
             }
             Err(error) => {
@@ -516,7 +569,7 @@ impl ContentRemote {
         {
             Ok(_) => Ok(current_hash),
             Err(object_store::Error::AlreadyExists { .. }) => {
-                self.inspect_discoverable_recovery_recipe().await
+                self.backfill_discoverable_recovery_recipe().await
             }
             Err(error) => Err(StoreError::Invariant(format!(
                 "create discoverable recovery recipe: {error}"
@@ -2536,6 +2589,68 @@ mod tests {
                 .publish_recovery_recipe_watertown_commit_v1()
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn recipe_publish_backfills_historic_discoverable_kit() {
+        let dir = tempdir().unwrap();
+        let remote = ContentRemote::create_at(dir.path().join("remote"), Uuid::new_v4())
+            .await
+            .unwrap();
+        let historic = crate::recovery_recipe_dp_commit_3();
+        let historic_hash = crate::recovery_recipe::recovery_recipe_hash(&historic);
+        remote
+            .store
+            .object_store()
+            .put(
+                &ContentRemote::recovery_recipe_discoverable_path(),
+                historic.clone().into(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            remote
+                .inspect_recovery_recipe_watertown_commit_v1()
+                .await
+                .is_err(),
+            "inspection must fail until the discoverable bootstrap has an immutable copy"
+        );
+        let published = remote
+            .publish_recovery_recipe_watertown_commit_v1()
+            .await
+            .unwrap();
+        assert!(published.versioned_created);
+        assert!(!published.discoverable_created);
+        assert_eq!(
+            remote
+                .store
+                .object_store()
+                .get(&ContentRemote::recovery_recipe_versioned_path(
+                    historic_hash
+                ))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            historic.as_slice()
+        );
+        assert_eq!(
+            remote
+                .inspect_recovery_recipe_watertown_commit_v1()
+                .await
+                .unwrap(),
+            crate::recovery_recipe_watertown_commit_v1_hash()
+        );
+        assert_eq!(
+            remote
+                .ensure_recovery_recipe_watertown_commit_v1()
+                .await
+                .unwrap(),
+            historic_hash
         );
     }
 
