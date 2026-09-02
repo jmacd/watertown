@@ -9,6 +9,7 @@ the Watertown source tree. Treat the capsule as read-only during recovery.
 CAPSULE-README.md             human recovery runbook
 CAPSULE-FORMAT.md             this format reference
 capsule.py                    independent verifier and materializer
+parquet_schema.py             logical schema decoder shared by recovery tools
 capsule-requirements.lock     exact direct Python dependencies
 recover.sh                    one-command recovery wrapper
 recovery/

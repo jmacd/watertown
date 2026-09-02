@@ -41,7 +41,7 @@ command -v "$PYTHON" >/dev/null 2>&1 || {
     exit 2
 }
 
-for name in CAPSULE-README.md CAPSULE-FORMAT.md capsule.py capsule-requirements.lock recover.sh; do
+for name in CAPSULE-README.md CAPSULE-FORMAT.md capsule.py parquet_schema.py capsule-requirements.lock recover.sh; do
     [ -f "$CAPSULE/$name" ] || {
         printf '%s\n' "capsule is missing recovery aid: $name" >&2
         exit 1

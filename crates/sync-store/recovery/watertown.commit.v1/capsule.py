@@ -19,6 +19,8 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Iterator
 
+from parquet_schema import read_parquet_schema
+
 ENTRY_TYPES = {
     "dir:physical",
     "dir:dynamic",
@@ -780,7 +782,7 @@ def _table_batches(
     canonical_schema: bytes | None = None
     for descriptor in entry["node"]["objects"]:
         parquet = pq.ParquetFile(_object_path(capsule, descriptor))
-        schema = parquet.schema_arrow
+        schema = read_parquet_schema(parquet, pa, CapsuleError)
         encoded = _canonical_schema(schema, pa)
         fingerprint = __import__("blake3").blake3(encoded).hexdigest()
         if expected is not None and fingerprint != expected:
@@ -800,6 +802,8 @@ def _table_batches(
                     if pa.types.is_dictionary(data_type):
                         data_type = data_type.value_type
                         column = column.dictionary_decode()
+                    if column.type != data_type:
+                        column = column.cast(data_type)
                     fields.append(
                         pa.field(
                             field.name,

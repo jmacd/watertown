@@ -4,7 +4,7 @@ This reviewed kit validates a downloaded `watertown.commit.v1` native ContentRem
 backup and converts supported content into a
 portable `pondcapsule.4` without importing anything and without running Pond.
 It is not itself a capsule. Every produced capsule contains
-`CAPSULE-README.md`, `CAPSULE-FORMAT.md`, `capsule.py`,
+`CAPSULE-README.md`, `CAPSULE-FORMAT.md`, `capsule.py`, `parquet_schema.py`,
 `capsule-requirements.lock`, and `recover.sh` at its root for Pond-free
 verification and materialization.
 
@@ -110,7 +110,7 @@ latest ref, canonical manifest/root, topology, object closure, Parquet schemas,
 logical leaves, and series roots.
 
 For a capsule downloaded separately from object storage, compare its
-`CAPSULE-README.md`, `CAPSULE-FORMAT.md`, `capsule.py`,
+`CAPSULE-README.md`, `CAPSULE-FORMAT.md`, `capsule.py`, `parquet_schema.py`,
 `capsule-requirements.lock`, and `recover.sh` byte for byte with this
 hash-authenticated kit before execution. The capsule root authenticates the
 manifest and payload data, not executable helper files. Prefer running this

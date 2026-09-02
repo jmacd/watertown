@@ -29,7 +29,7 @@ scripts beside this README. Obtain the `watertown.commit.v1` recovery kit and it
 After authenticating and extracting that kit, compare all capsule aids:
 
 ```sh
-for name in CAPSULE-README.md CAPSULE-FORMAT.md capsule.py \
+for name in CAPSULE-README.md CAPSULE-FORMAT.md capsule.py parquet_schema.py \
   capsule-requirements.lock recover.sh; do
   cmp "/trusted/recovery-kit/$name" "./$name" || exit 1
 done

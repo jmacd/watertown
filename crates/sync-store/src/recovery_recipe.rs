@@ -31,6 +31,7 @@ const V4_CAPSULE_FORMAT: &str = include_str!("../recovery/watertown.commit.v1/CA
 const V4_CAPSULE_REQUIREMENTS: &str =
     include_str!("../recovery/watertown.commit.v1/capsule-requirements.lock");
 const V4_CAPSULE_TOOL: &str = include_str!("../recovery/watertown.commit.v1/capsule.py");
+const V4_PARQUET_SCHEMA: &str = include_str!("../recovery/watertown.commit.v1/parquet_schema.py");
 const V4_RECOVER: &str = include_str!("../recovery/watertown.commit.v1/recover.sh");
 const V4_CAPSULE_TEST: &str = include_str!("../recovery/watertown.commit.v1/capsule_test.py");
 const V4_DOWNLOAD_AZCOPY: &str = include_str!("../recovery/watertown.commit.v1/download-azcopy.sh");
@@ -151,6 +152,7 @@ pub fn recovery_recipe_watertown_commit_v1() -> Vec<u8> {
         ("CAPSULE-FORMAT.md", V4_CAPSULE_FORMAT),
         ("capsule-requirements.lock", V4_CAPSULE_REQUIREMENTS),
         ("capsule.py", V4_CAPSULE_TOOL),
+        ("parquet_schema.py", V4_PARQUET_SCHEMA),
         ("recover.sh", V4_RECOVER),
         ("capsule_test.py", V4_CAPSULE_TEST),
         ("download-azcopy.sh", V4_DOWNLOAD_AZCOPY),

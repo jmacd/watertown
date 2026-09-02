@@ -16,6 +16,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Iterator
 
+from parquet_schema import read_parquet_schema
+
 ENTRY_TYPES = {
     1: "dir:physical",
     2: "dir:dynamic",
@@ -536,6 +538,11 @@ def canonical_batch_rows(schema: Any, batch: Any, pa: Any) -> bytes:
         column = batch.column(index)
         if pa.types.is_dictionary(column.type):
             column = column.dictionary_decode()
+        data_type = (
+            field.type.value_type if pa.types.is_dictionary(field.type) else field.type
+        )
+        if column.type != data_type:
+            column = column.cast(data_type)
         columns.append((field.type.value_type if pa.types.is_dictionary(field.type) else field.type, column))
     for row in range(batch.num_rows):
         for data_type, column in columns:
@@ -1007,7 +1014,7 @@ def _reconstruct_pack_leaves(
         index, rows = 0, 0
         for payload in payload_paths:
             parquet = pq.ParquetFile(payload)
-            schema = parquet.schema_arrow
+            schema = read_parquet_schema(parquet, pa, FormatError)
             fingerprint = blake3.blake3(canonical_schema(schema, pa)).digest()
             for batch in parquet.iter_batches():
                 offset = 0
@@ -1227,7 +1234,7 @@ def _pack_stream_node(
             leaf_index, leaf_rows = 0, 0
             for payload_path in payload_paths:
                 parquet = pq.ParquetFile(payload_path)
-                schema = parquet.schema_arrow
+                schema = read_parquet_schema(parquet, pa, FormatError)
                 fingerprint = blake3.blake3(canonical_schema(schema, pa)).digest()
                 if leaf_index >= len(descriptors):
                     raise FormatError(f"table pack for {path} has rows after its final leaf")
@@ -1603,7 +1610,7 @@ def _extract_graph(source: Path, destination: Path, ref_name: str | None,
                             metadata, attributes, blake3)
                     else:
                         parquet = pq.ParquetFile(payload_path)
-                        schema = parquet.schema_arrow
+                        schema = read_parquet_schema(parquet, pa, FormatError)
                         current_fingerprint = blake3.blake3(canonical_schema(schema, pa)).digest()
                         if fingerprint is not None and fingerprint != current_fingerprint:
                             raise FormatError(f"table schema changes within {paths[native['node_id']]}")
@@ -1692,6 +1699,7 @@ def _extract_graph(source: Path, destination: Path, ref_name: str | None,
             ("CAPSULE-README.md", "CAPSULE-README.md"),
             ("CAPSULE-FORMAT.md", "CAPSULE-FORMAT.md"),
             ("capsule.py", "capsule.py"),
+            ("parquet_schema.py", "parquet_schema.py"),
             ("capsule-requirements.lock", "capsule-requirements.lock"),
             ("recover.sh", "recover.sh"),
         ):

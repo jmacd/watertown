@@ -31,6 +31,7 @@ from extract import (
     extract,
     node_manifest_root,
 )
+from parquet_schema import read_parquet_schema
 
 NIL_UUID = "00000000-0000-0000-0000-000000000000"
 POND_ID = "11111111-1111-1111-1111-111111111111"
@@ -55,6 +56,36 @@ def length_prefixed(value: bytes) -> bytes:
 
 def metadata(timestamp: int) -> bytes:
     return b"\x08" + struct.pack("<q", timestamp)
+
+
+def verify_embedded_arrow_schema() -> None:
+    logical = pa.schema(
+        [pa.field("timestamp", pa.timestamp("s", tz="+00:00"), nullable=False)]
+    )
+    physical = pa.schema([pa.field("timestamp", pa.int64(), nullable=False)])
+    embedded = __import__("base64").b64encode(logical.serialize().to_pybytes())
+
+    class Metadata:
+        metadata = {b"ARROW:schema": embedded}
+
+    class Parquet:
+        schema_arrow = physical
+        metadata = Metadata()
+
+    resolved = read_parquet_schema(Parquet(), pa, FormatError)
+    assert resolved == logical
+    assert canonical_schema(resolved, pa) == canonical_schema(logical, pa)
+    batch = pa.RecordBatch.from_arrays(
+        [pa.array([1, 2], type=pa.int64())], schema=physical
+    )
+    assert canonical_batch_rows(resolved, batch, pa) == canonical_batch_rows(
+        logical,
+        pa.RecordBatch.from_arrays(
+            [pa.array([1, 2], type=pa.timestamp("s", tz="+00:00"))],
+            schema=logical,
+        ),
+        pa,
+    )
 
 
 def tree_entry(name: str, kind: int, child: bytes, versions: list[bytes]) -> bytes:
@@ -332,8 +363,10 @@ def _pack(
 
 
 def build_current_pack_backup(root: Path) -> None:
+    verify_embedded_arrow_schema()
     schema_one = pa.schema(
         [
+            pa.field("observed_at", pa.timestamp("s", tz="+00:00"), False),
             pa.field("reading", pa.int64(), True),
             pa.field("label", pa.string(), False),
         ],
@@ -341,6 +374,7 @@ def build_current_pack_backup(root: Path) -> None:
     )
     schema_two = pa.schema(
         [
+            pa.field("observed_at", pa.timestamp("s", tz="+00:00"), False),
             pa.field("reading", pa.int64(), True),
             pa.field("label", pa.string(), False),
             pa.field("quality", pa.string(), True),
@@ -349,11 +383,16 @@ def build_current_pack_backup(root: Path) -> None:
     )
     logical_tables = [
         pa.Table.from_arrays(
-            [pa.array([1, None], type=pa.int64()), pa.array(["a", "b"])],
+            [
+                pa.array([1, 2], type=pa.timestamp("s", tz="+00:00")),
+                pa.array([1, None], type=pa.int64()),
+                pa.array(["a", "b"]),
+            ],
             schema=schema_one,
         ),
         pa.Table.from_arrays(
             [
+                pa.array([3, 4], type=pa.timestamp("s", tz="+00:00")),
                 pa.array([3, 4], type=pa.int64()),
                 pa.array(["c", "d"]),
                 pa.array(["good", None]),
@@ -362,6 +401,7 @@ def build_current_pack_backup(root: Path) -> None:
         ),
         pa.Table.from_arrays(
             [
+                pa.array([5], type=pa.timestamp("s", tz="+00:00")),
                 pa.array([5], type=pa.int64()),
                 pa.array(["e"]),
                 pa.array(["suspect"]),
