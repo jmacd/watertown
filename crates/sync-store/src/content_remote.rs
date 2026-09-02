@@ -62,6 +62,8 @@ const LEGACY_MIGRATION_V2_RECIPE_PREFIX: &str = "recovery/legacy-migration-v2";
 const CAPSULE_README: &str = include_str!("../recovery/watertown.commit.v1/CAPSULE-README.md");
 const CAPSULE_FORMAT: &str = include_str!("../recovery/watertown.commit.v1/CAPSULE-FORMAT.md");
 const CAPSULE_TOOL: &str = include_str!("../recovery/watertown.commit.v1/capsule.py");
+const CAPSULE_PARQUET_SCHEMA: &str =
+    include_str!("../recovery/watertown.commit.v1/parquet_schema.py");
 const CAPSULE_REQUIREMENTS: &str =
     include_str!("../recovery/watertown.commit.v1/capsule-requirements.lock");
 const CAPSULE_RECOVER: &str = include_str!("../recovery/watertown.commit.v1/recover.sh");
@@ -1709,6 +1711,10 @@ impl ContentRemote {
             ("CAPSULE-FORMAT.md", CAPSULE_FORMAT.as_bytes().to_vec()),
             ("capsule.py", CAPSULE_TOOL.as_bytes().to_vec()),
             (
+                "parquet_schema.py",
+                CAPSULE_PARQUET_SCHEMA.as_bytes().to_vec(),
+            ),
+            (
                 "capsule-requirements.lock",
                 CAPSULE_REQUIREMENTS.as_bytes().to_vec(),
             ),
@@ -2399,6 +2405,7 @@ fn parse_capsule_generation_key(key: &str) -> std::result::Result<Option<ObjectH
             | "CAPSULE-README.md"
             | "CAPSULE-FORMAT.md"
             | "capsule.py"
+            | "parquet_schema.py"
             | "capsule-requirements.lock"
             | "recover.sh"
     ) {
@@ -2420,6 +2427,7 @@ fn capsule_object_list(root: ObjectHash, objects: &[crate::content::CapsuleObjec
         "CAPSULE-README.md",
         "CAPSULE-FORMAT.md",
         "capsule.py",
+        "parquet_schema.py",
         "capsule-requirements.lock",
         "recover.sh",
     ] {
@@ -2476,6 +2484,7 @@ fn capsule_az_script(root: ObjectHash) -> String {
              \"recovery/generations/{root}/CAPSULE-README.md\") target=\"$DEST/CAPSULE-README.md\" ;;\n\
              \"recovery/generations/{root}/CAPSULE-FORMAT.md\") target=\"$DEST/CAPSULE-FORMAT.md\" ;;\n\
              \"recovery/generations/{root}/capsule.py\") target=\"$DEST/capsule.py\" ;;\n\
+             \"recovery/generations/{root}/parquet_schema.py\") target=\"$DEST/parquet_schema.py\" ;;\n\
              \"recovery/generations/{root}/capsule-requirements.lock\") target=\"$DEST/capsule-requirements.lock\" ;;\n\
              \"recovery/generations/{root}/recover.sh\") target=\"$DEST/recover.sh\" ;;\n\
              *) exit 1 ;;\n\
@@ -2504,6 +2513,7 @@ fn capsule_mc_script(root: ObjectHash) -> String {
              \"recovery/generations/{root}/CAPSULE-README.md\") target=\"$DEST/CAPSULE-README.md\" ;;\n\
              \"recovery/generations/{root}/CAPSULE-FORMAT.md\") target=\"$DEST/CAPSULE-FORMAT.md\" ;;\n\
              \"recovery/generations/{root}/capsule.py\") target=\"$DEST/capsule.py\" ;;\n\
+             \"recovery/generations/{root}/parquet_schema.py\") target=\"$DEST/parquet_schema.py\" ;;\n\
              \"recovery/generations/{root}/capsule-requirements.lock\") target=\"$DEST/capsule-requirements.lock\" ;;\n\
              \"recovery/generations/{root}/recover.sh\") target=\"$DEST/recover.sh\" ;;\n\
              *) exit 1 ;;\n\
@@ -3012,6 +3022,10 @@ mod tests {
             CAPSULE_TOOL
         );
         assert_eq!(
+            std::fs::read_to_string(generation.join("parquet_schema.py")).unwrap(),
+            CAPSULE_PARQUET_SCHEMA
+        );
+        assert_eq!(
             std::fs::read_to_string(generation.join("capsule-requirements.lock")).unwrap(),
             CAPSULE_REQUIREMENTS
         );
@@ -3024,6 +3038,7 @@ mod tests {
             "CAPSULE-README.md",
             "CAPSULE-FORMAT.md",
             "capsule.py",
+            "parquet_schema.py",
             "capsule-requirements.lock",
             "recover.sh",
         ] {
@@ -3136,6 +3151,7 @@ mod tests {
             assert!(script.contains("CAPSULE-README.md"));
             assert!(script.contains("CAPSULE-FORMAT.md"));
             assert!(script.contains("capsule.py"));
+            assert!(script.contains("parquet_schema.py"));
             assert!(script.contains("capsule-requirements.lock"));
             assert!(script.contains("recover.sh"));
             assert!(script.contains("target=\"$DEST/capsule.py\""));
@@ -3180,6 +3196,7 @@ mod tests {
             "RUNBOOK.txt",
             "capsule-requirements.lock",
             "capsule.py",
+            "parquet_schema.py",
             "checksums",
             "download-az.sh",
             "download-mc.sh",
