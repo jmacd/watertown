@@ -31,8 +31,7 @@ const V4_CAPSULE_FORMAT: &str = include_str!("../recovery/watertown.commit.v1/CA
 const V4_CAPSULE_REQUIREMENTS: &str =
     include_str!("../recovery/watertown.commit.v1/capsule-requirements.lock");
 const V4_CAPSULE_TOOL: &str = include_str!("../recovery/watertown.commit.v1/capsule.py");
-const V4_PARQUET_SCHEMA: &str =
-    include_str!("../recovery/watertown.commit.v1/parquet_schema.py");
+const V4_PARQUET_SCHEMA: &str = include_str!("../recovery/watertown.commit.v1/parquet_schema.py");
 const V4_RECOVER: &str = include_str!("../recovery/watertown.commit.v1/recover.sh");
 const V4_CAPSULE_TEST: &str = include_str!("../recovery/watertown.commit.v1/capsule_test.py");
 const V4_DOWNLOAD_AZCOPY: &str = include_str!("../recovery/watertown.commit.v1/download-azcopy.sh");
