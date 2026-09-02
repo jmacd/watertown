@@ -24,6 +24,8 @@ from extract import (
     _leaf_hash,
     _merkle_root,
     _reconstruct_pack_leaves,
+    _series_root,
+    _pack_stream_node,
     canonical_batch_rows,
     canonical_schema,
     decode_pack,
@@ -86,6 +88,90 @@ def verify_embedded_arrow_schema() -> None:
         ),
         pa,
     )
+
+
+def verify_uniform_v2_node_schema() -> None:
+    with tempfile.TemporaryDirectory(prefix="watertown-uniform-pack-") as temporary:
+        root = Path(temporary)
+        schema = pa.schema([pa.field("reading", pa.int64(), nullable=False)])
+        table = pa.Table.from_arrays([pa.array([1, 2], type=pa.int64())], schema=schema)
+        physical_path = root / "uniform.parquet"
+        pq.write_table(table, physical_path)
+        physical = physical_path.read_bytes()
+        schema_hash = digest(canonical_schema(schema, pa))
+        rows = b"".join(
+            canonical_batch_rows(schema, batch, pa) for batch in table.to_batches()
+        )
+        payload = b"watertown.series-rows.v1\n" + struct.pack("<Q", table.num_rows) + rows
+        leaf = _leaf_hash(
+            0,
+            schema_hash,
+            table.num_rows,
+            iter([payload]),
+            len(payload),
+            {
+                "min_event_time": 1,
+                "max_event_time": 2,
+                "extended_attributes": None,
+                "timestamp": None,
+            },
+            '{"uniform":true}',
+            blake3,
+        )
+        series_hash = digest(b"uniform-v2-series")
+        series = {
+            "kind": "table",
+            "revision": 2,
+            "schema_fingerprint": None,
+            "logical_count": table.num_rows,
+            "leaf_count": 1,
+            "min_event_time": 1,
+            "max_event_time": 2,
+            "logical_attributes": '{"series":"uniform"}',
+            "leaf_merkle_root": _merkle_root([leaf], blake3),
+        }
+        descriptor = _descriptor(table.num_rows, schema_hash, 1, 2, '{"uniform":true}')
+        pack = _pack(
+            series_hash,
+            [leaf],
+            0,
+            1,
+            [physical],
+            [descriptor],
+        )
+
+        class Backup:
+            def pack_indexes(self, requested_hash: bytes) -> list[tuple[bytes, bytes]]:
+                assert requested_hash == series_hash
+                return [(digest(pack), pack)]
+
+            def object_path(self, requested_hash: bytes) -> Path:
+                assert requested_hash == digest(physical)
+                return physical_path
+
+        objects = root / "objects"
+        objects.mkdir()
+        node = _pack_stream_node(
+            Backup(),
+            objects,
+            {
+                "entry_type": "table:physical:series",
+                "versions": [{"timestamp": 101}],
+            },
+            "/uniform.series",
+            series_hash,
+            series,
+            pa,
+            pq,
+            blake3,
+        )
+        assert node["schema_fingerprint"] == schema_hash.hex()
+        assert node["logical_root"] == _series_root(
+            "table",
+            schema_hash,
+            node["leaves"],
+            blake3,
+        )
 
 
 def tree_entry(name: str, kind: int, child: bytes, versions: list[bytes]) -> bytes:
@@ -364,6 +450,7 @@ def _pack(
 
 def build_current_pack_backup(root: Path) -> None:
     verify_embedded_arrow_schema()
+    verify_uniform_v2_node_schema()
     schema_one = pa.schema(
         [
             pa.field("observed_at", pa.timestamp("s", tz="+00:00"), False),

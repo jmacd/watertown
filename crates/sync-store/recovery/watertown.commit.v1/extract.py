@@ -1351,25 +1351,36 @@ def _pack_stream_node(
         series["min_event_time"], series["max_event_time"]
     ):
         raise FormatError(f"selected packs for {path} have aggregate bounds unlike the series")
+    leaf_schemas = {leaf.get("schema_fingerprint") for leaf in leaves}
+    node_schema = (
+        next(iter(leaf_schemas))
+        if series["kind"] == "table"
+        and len(leaf_schemas) == 1
+        and None not in leaf_schemas
+        else series["schema_fingerprint"].hex()
+        if series["schema_fingerprint"] is not None
+        else None
+    )
     result = {
         "kind": "physical",
         "payload_kind": series["kind"],
-        # The per-leaf fingerprints retain schema evolution. A v2 native
-        # manifest deliberately has no homogeneous series-level schema.
+        # Per-leaf fingerprints retain schema evolution. When every leaf
+        # shares one fingerprint, normalize it into the capsule's
+        # homogeneous node-level schema too.
         "logical_root": _series_root(
             series["kind"],
-            series["schema_fingerprint"],
+            bytes.fromhex(node_schema) if node_schema is not None else None,
             leaves,
             blake3,
         ),
         "objects": objects,
         "leaves": leaves,
     }
-    if series["schema_fingerprint"] is not None:
+    if node_schema is not None:
         result = {
             "kind": result["kind"],
             "payload_kind": result["payload_kind"],
-            "schema_fingerprint": series["schema_fingerprint"].hex(),
+            "schema_fingerprint": node_schema,
             "logical_root": result["logical_root"],
             "objects": result["objects"],
             "leaves": result["leaves"],
