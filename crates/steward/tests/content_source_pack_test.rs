@@ -49,7 +49,6 @@ fn build_series_and_pack(leaf_labels: &[&str], blob_label: &str) -> (ObjectHash,
     let root = merkle_root(&leaves);
     let manifest = SeriesManifest::new(
         PayloadKind::File,
-        None,
         leaves.len() as u64 * 3,
         leaves.len() as u64,
         None,

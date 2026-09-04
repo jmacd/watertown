@@ -12,8 +12,9 @@ from pathlib import Path
 import blake3
 
 from capsule import (
+    CAPSULE_FORMAT,
     CapsuleError,
-    ROOT_DOMAINS,
+    ROOT_DOMAIN,
     _canonical_schema,
     _encoded_logical_path,
     _rename_no_replace,
@@ -29,9 +30,9 @@ def write_capsule(root: Path, manifest: dict) -> None:
         manifest,
         ensure_ascii=False,
         separators=(",", ":"),
-        sort_keys=manifest["format"] in {"pondcapsule.3", "pondcapsule.4"},
+        sort_keys=True,
     ).encode()
-    digest = blake3.blake3(ROOT_DOMAINS[manifest["format"]] + encoded).hexdigest()
+    digest = blake3.blake3(ROOT_DOMAIN + encoded).hexdigest()
     (root / "recovery" / "refs").mkdir(parents=True)
     (root / "recovery" / "manifests").mkdir()
     (root / "recovery" / "objects").mkdir()
@@ -41,7 +42,7 @@ def write_capsule(root: Path, manifest: dict) -> None:
 
 def minimal_manifest() -> dict:
     return {
-        "format": "pondcapsule.3",
+        "format": CAPSULE_FORMAT,
         "source": {
             "pond_id": "pond-test",
             "birthplace": "fixture",
@@ -118,7 +119,7 @@ class CapsuleTest(unittest.TestCase):
             self.assertTrue(recovered.is_file())
             self.assertEqual(recovered.read_bytes(), b"")
 
-    def test_v3_schema_fields_are_strict(self) -> None:
+    def test_schema_fields_are_strict(self) -> None:
         with tempfile.TemporaryDirectory(prefix="capsule-unit-") as temporary:
             root = Path(temporary) / "capsule"
             manifest = minimal_manifest()
@@ -163,8 +164,26 @@ class CapsuleTest(unittest.TestCase):
             }
             shutil.rmtree(root)
             write_capsule(root, manifest)
-            with self.assertRaisesRegex(CapsuleError, "v3 table leaves must declare a schema"):
+            with self.assertRaisesRegex(CapsuleError, "table leaves must declare a schema"):
                 load_and_verify(root)
+
+    def test_obsolete_capsule_formats_are_rejected(self) -> None:
+        for obsolete in (
+            "pondcapsule.1",
+            "pondcapsule.2",
+            "pondcapsule.3",
+            "pondcapsule.legacy.1",
+            "pondcapsule.legacy.2",
+        ):
+            with self.subTest(obsolete=obsolete), tempfile.TemporaryDirectory(
+                prefix="capsule-unit-"
+            ) as temporary:
+                root = Path(temporary) / "capsule"
+                manifest = minimal_manifest()
+                manifest["format"] = obsolete
+                write_capsule(root, manifest)
+                with self.assertRaisesRegex(CapsuleError, "unsupported capsule format"):
+                    load_and_verify(root)
 
     def test_noncanonical_path_fails(self) -> None:
         with tempfile.TemporaryDirectory(prefix="capsule-unit-") as temporary:
@@ -210,7 +229,7 @@ class CapsuleTest(unittest.TestCase):
     def test_malformed_dynamic_recipe_fails_verification(self) -> None:
         with tempfile.TemporaryDirectory(prefix="capsule-unit-") as temporary:
             root = Path(temporary) / "capsule"
-            recipe = b"not-a-dp-recipe"
+            recipe = b"not-a-current-recipe"
             digest = blake3.blake3(recipe).hexdigest()
             manifest = minimal_manifest()
             manifest["entries"].append(
@@ -226,7 +245,7 @@ class CapsuleTest(unittest.TestCase):
             )
             write_capsule(root, manifest)
             (root / "recovery" / "objects" / f"blake3={digest}").write_bytes(recipe)
-            with self.assertRaisesRegex(CapsuleError, "dp.recipe.1 framing"):
+            with self.assertRaisesRegex(CapsuleError, "watertown.recipe.v1 framing"):
                 load_and_verify(root)
 
     def test_reordered_manifest_fields_fail(self) -> None:
@@ -239,7 +258,7 @@ class CapsuleTest(unittest.TestCase):
                 "source": canonical["source"],
             }
             encoded = json.dumps(reordered, separators=(",", ":")).encode()
-            digest = blake3.blake3(ROOT_DOMAINS["pondcapsule.3"] + encoded).hexdigest()
+            digest = blake3.blake3(ROOT_DOMAIN + encoded).hexdigest()
             (root / "recovery" / "refs").mkdir(parents=True)
             (root / "recovery" / "manifests").mkdir()
             (root / "recovery" / "objects").mkdir()

@@ -1,78 +1,50 @@
-# Native backup format: `watertown.commit.v1` (logical-series v2)
+# Native backup format: `watertown.commit.v1`
 
-The downloaded source is a Delta table with columns:
+This recovery kit accepts only the current Watertown native content model.
+Every structured object is strict: the exact magic below is required,
+truncation and trailing bytes are errors, and no historical magic is
+recognized.
 
-```text
-pond_id UTF-8
-partition_key UTF-8
-item_key UTF-8
-txn_seq i64
-deleted bool
-value binary
-value_blake3 binary[32]
-ts_micros i64
-```
+## Content graph
 
-For each `(pond_id, partition_key, item_key)`, the live row is the row with the
-greatest `txn_seq`; a live row whose `deleted` value is true is absent.
+The Delta table contains content-addressed rows and refs:
 
-The source pond UUID is the live row at:
+- `partition_key=objects`, `item_key=<blake3 hex>` stores inline object bytes.
+- `partition_key=refs`, `item_key=<name>` stores a 32-byte commit hash.
+- large physical payloads are stored beneath `_blobs/blob=<blake3 hex>`.
+- pack indexes are advertised beneath `_packs/series=<series hash>/pack=<pack hash>`.
 
-```text
-pond_id       = 00000000-0000-0000-0000-000000000000
-partition_key = meta
-item_key      = pond_id
-```
+The table must use the current `pond_id, partition_key` partition layout.
 
-For the source pond UUID:
-
-- `partition_key=refs`, `item_key=<name>` stores a raw 32-byte commit hash.
-- `partition_key=objects`, `item_key=<lowercase hash hex>` stores exact native
-  object bytes.
-- `_blobs/blob=<lowercase hash hex>` stores exact external payload bytes.
-
-Every value must match `value_blake3`; every object or blob must match the hash
-in its key.
-
-Native object magic and framing:
+## Retained native object magics
 
 ```text
-watertown.commit.v1\n   content model byte, commit and provenance
-watertown.tree.v1\n     canonical directory entries
-watertown.manifest.v1\n source node identities and metadata
-dp.series.1\n              legacy ordered physical-hash list
-watertown.series.v1\n   homogeneous logical-series manifest and Merkle root
-watertown.series.v2\n   current per-leaf-schema logical-series manifest and Merkle root
-watertown.series-pack.v1\n legacy pack index and range proof
-watertown.series-pack.v2\n current pack index with per-leaf schema fingerprints
-watertown.recipe.v1\n   dynamic factory type and raw configuration
-dp.recipe.1\n          legacy dynamic factory type and raw configuration
+watertown.commit.v1\n
+watertown.tree.v1\n
+watertown.manifest.v1\n
+watertown.series.v2\n
+watertown.series-pack.v2\n
+watertown.series-range-proof.v1\n
+watertown.recipe.v1\n
 ```
 
-Integers are little-endian. Strings and variable byte fields use an unsigned
-32-bit little-endian length followed by exact bytes. Hashes are 32 raw BLAKE3
-bytes. `native-fixtures.json` contains commit, tree, manifest, series, and recipe
-objects whose shared framing bytes are checked by the independent decoder and
-the Rust source codecs.
+Logical table identity continues to use these stable hashing domains:
 
-For a nonempty `watertown.series.v1` or `.v2` node, the extractor requires
-the sibling pack advertisements at
-`_packs/series=<series-hash>/pack=<pack-hash>`. Every advertised filename,
-content hash, index framing, descriptor, schema fingerprint, physical object,
-exact cover, and range proof is checked. Each selected pack's physical stream
-is independently partitioned by its own descriptor range, with no bytes or
-rows permitted to cross from another pack; its leaf hashes and range proof
-are validated before verified ranges are concatenated in leaf order. Table
-objects are standard Parquet. A `.v2` table's descriptor supplies the schema
-fingerprint for each leaf, so schema evolution is preserved.
+```text
+watertown.series-schema.v1\n
+watertown.series-rows.v1\n
+watertown.series-leaf.v1\n
+watertown.series-merkle.v1\n
+```
 
-`dp.series.1`, `dp.manifest.2`, `dp.tree.2`, and `dp.recipe.1` remain
-supported with their original ordered physical-object semantics. Pack-aware
-series require their advertisements to be present locally; this offline kit
-does not fetch missing advertisements or objects from another remote.
+A series manifest commits to payload kind, aggregate logical count, leaf
+count, event-time bounds, canonical logical attributes, and the ordered leaf
+Merkle root. Table schema identity is per leaf and is carried by each
+`watertown.series-pack.v2` descriptor.
 
-Dynamic nodes may carry no metadata or exactly one metadata record. When
-present, it must contain only a timestamp; the extractor writes that timestamp
-to the `pondcapsule.4` dynamic-node `metadata` object. Multiple records, a
-missing timestamp, event bounds, or extended attributes are rejected rather
-than discarded.
+The extractor verifies object hashes, manifest/tree topology, exact pack
+coverage, per-pack range proofs, physical payload hashes and sizes, canonical
+logical rows or bytes, per-leaf schema fingerprints, aggregate bounds, and
+the commit's node-manifest root before producing a capsule.
+
+The only emitted portable format is `pondcapsule.4`.

@@ -464,30 +464,29 @@ A mirror re-fetch rebuilds the local content closure from the remote's
 published tip; a cross-pond pull refreshes only the foreign pond's
 footprint.
 
-### Capsule recovery and storage-format migration
+### Capsule recovery
 
-Use a portable capsule when a native backup format must be recovered by a
-future Watertown version or migrated into a fresh pond. The current
+Use a portable capsule when a native backup must be recovered into a fresh
+pond. The current
 `watertown.commit.v1` recovery recipe produces `pondcapsule.4`. V4 preserves
 the schema identity of every table leaf and persisted dynamic-node timestamps.
-`pondcapsule.1` through `.3` remain readable frozen compatibility formats, but
-V3 and earlier cannot recover dynamic metadata they did not encode.
+No historical capsule or native object format is accepted.
 
 This is not the routine `pond pull` path. A capsule is a deliberate,
 authenticated recovery boundary:
 
-1. Quiesce every source writer and restart mechanism. For a format migration,
-   use the current binary to freeze the source and record its exact tip:
+1. Quiesce every source writer and restart mechanism. Use the current binary
+   to freeze the source and record its exact tip:
 
    ```bash
    POND="$SOURCE_POND" pond freeze enable --reason "approved storage-format migration"
    POND="$SOURCE_POND" pond freeze status
    ```
 
-   Old source binaries may not honor the freeze marker, so stopping their
-   service, timer, supervisor, and operator sessions is still required.
+   Stopping the service, timer, supervisor, and operator sessions is still
+   required.
 
-2. Publish and inspect the current target-format recipe, then push and verify
+2. Publish and inspect the current recipe, then push and verify
    the selected exact native snapshot:
 
    ```bash
@@ -499,8 +498,10 @@ authenticated recovery boundary:
 
    Record the exact source tip and the recipe hash printed by `inspect`.
    Retrieve the hash-addressed bootstrap at
-   `recovery/recipes/watertown.commit.v1/<recipe-hash>/README.sh`; do not
-   assume the older discoverable `recovery/README.sh` is the current kit.
+   `recovery/recipes/watertown.commit.v1/<recipe-hash>/README.sh`. The
+   discoverable `recovery/README.sh` may be older; authenticate its exact bytes
+   against the immutable object at the path named by its own recipe hash.
+   Missing or mismatched immutable copies are errors.
    Authenticate the bootstrap with the documented `pondcapsule.recipe.1`
    domain hash before executing it.
 
@@ -531,7 +532,7 @@ authenticated recovery boundary:
    timestamps, and remotes, and ensure the target does not resolve to source
    storage. Attach or retain only an isolated target backup. Enable
    `post_commit_dispatch` and start exactly one writer only after those
-   checks, including a separate target-format backup/recovery drill, succeed.
+   checks, including a separate current-format backup/recovery drill, succeed.
 
 Follow [capsule-recovery-runbook.md](capsule-recovery-runbook.md) for the
 complete watershop rehearsal and Azure production procedure. It specifies the

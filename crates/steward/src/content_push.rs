@@ -302,7 +302,7 @@ async fn push_content_inner(
 
     // Mint and publish this push's "initial" series identity packs only now
     // that every inline object (small per-version blobs included) and every
-    // external blob are durable: a fresh `watertown.series.v1` series is otherwise
+    // external blob are durable: a fresh `watertown.series.v2` series is otherwise
     // unfetchable the moment it lands on the remote
     // (`crate::content_tree::fetch_series_v2` requires an exact pack cover),
     // and the pack built here advertises those exact already-published

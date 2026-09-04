@@ -43,7 +43,7 @@ pub mod storage_profile;
 mod write_lock;
 
 pub use capsule::{
-    CapsuleBuild, RecoveryRecipeFlavor, build_recovery_capsule, build_recovery_capsule_incremental,
+    CapsuleBuild, build_recovery_capsule, build_recovery_capsule_incremental,
     open_and_inspect_recovery_recipe_limited, open_and_publish_recovery_recipe_limited,
 };
 pub use capsule_import::{CapsuleImportProvenance, CapsuleImportReport, import_capsule};

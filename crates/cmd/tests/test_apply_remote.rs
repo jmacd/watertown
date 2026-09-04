@@ -168,6 +168,7 @@ spec:
   limits:
     bytes: /sys/limits/backup-bytes
     ops: /sys/limits/backup-ops
+  overwrite: true
 "#
     )
 }
@@ -263,6 +264,40 @@ async fn apply_creates_a_governed_backup_in_one_document() {
     push_command(&ctx, Some("origin".to_string()))
         .await
         .expect("push under a generous budget must succeed");
+}
+
+#[tokio::test]
+async fn reapplying_an_unchanged_governed_backup_is_a_noop() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let pond = tmp.path().join("pond");
+    let url = sync_store::testing::in_memory_remote_url("apply-governed-noop");
+    let yaml = governed_backup_yaml(&url, 100, 10_000);
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "test-host").await.expect("init");
+
+    apply_yaml(&ctx, tmp.path(), &yaml)
+        .await
+        .expect("first apply");
+    let before_steward = ctx.open_pond().await.expect("open before");
+    let before = before_steward
+        .as_pond()
+        .expect("pond steward")
+        .last_write_seq();
+
+    apply_yaml(&ctx, tmp.path(), &yaml)
+        .await
+        .expect("second apply");
+    let after_steward = ctx.open_pond().await.expect("open after");
+    let after = after_steward
+        .as_pond()
+        .expect("pond steward")
+        .last_write_seq();
+
+    assert_eq!(
+        after, before,
+        "an unchanged remote apply must not create a config commit"
+    );
 }
 
 /// The monitoring API reports one bounded row per configured limiter without
@@ -470,10 +505,7 @@ async fn a_missing_limiter_node_is_refused() {
         .await
         .expect("write");
 
-    // The attachment is well-formed, so it applies; the *push* is what
-    // discovers the budget does not exist -- and refuses rather than
-    // proceeding ungoverned.
-    apply_yaml(
+    let err = apply_yaml(
         &ctx,
         tmp.path(),
         &format!(
@@ -482,14 +514,16 @@ async fn a_missing_limiter_node_is_refused() {
         ),
     )
     .await
-    .expect("apply");
-
-    let err = push_command(&ctx, Some("origin".to_string()))
-        .await
-        .expect_err("push with a missing limiter must be refused");
+    .expect_err("attach with a missing limiter must be refused");
     assert!(
         format!("{err:#}").contains("does-not-exist"),
         "unexpected error: {err:#}"
+    );
+
+    let mut ship = ctx.open_pond().await.expect("open");
+    assert!(
+        list_remote_names(&mut ship).await.expect("list").is_empty(),
+        "a refused attachment must leave no trace"
     );
 }
 

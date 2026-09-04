@@ -28,8 +28,12 @@ from extract import (
     _pack_stream_node,
     canonical_batch_rows,
     canonical_schema,
-    decode_pack,
+    decode_commit,
     decode_manifest,
+    decode_pack,
+    decode_recipe,
+    decode_series,
+    decode_tree,
     extract,
     node_manifest_root,
 )
@@ -90,7 +94,7 @@ def verify_embedded_arrow_schema() -> None:
     )
 
 
-def verify_uniform_v2_node_schema() -> None:
+def verify_uniform_node_schema() -> None:
     with tempfile.TemporaryDirectory(prefix="watertown-uniform-pack-") as temporary:
         root = Path(temporary)
         schema = pa.schema([pa.field("reading", pa.int64(), nullable=False)])
@@ -121,8 +125,6 @@ def verify_uniform_v2_node_schema() -> None:
         series_hash = digest(b"uniform-v2-series")
         series = {
             "kind": "table",
-            "revision": 2,
-            "schema_fingerprint": None,
             "logical_count": table.num_rows,
             "leaf_count": 1,
             "min_event_time": 1,
@@ -203,189 +205,6 @@ def manifest_entry(
     )
 
 
-def build_native_backup(
-    root: Path,
-    *,
-    include_empty_singleton: bool = False,
-    include_empty_series_version: bool = False,
-    legacy_recipe: bool = False,
-) -> None:
-    recipe_bytes = (
-        b"dp.recipe.1\n"
-        + struct.pack("<I", len(b"legacy-fixture-factory"))
-        + b"legacy-fixture-factory"
-        + b'{"source":"legacy-integration"}'
-        if legacy_recipe
-        else RECIPE_BYTES
-    )
-    table_path = root.parent / "fixture.parquet"
-    schema = pa.schema(
-        [
-            pa.field("reading", pa.int64(), True),
-            pa.field("label", pa.string(), False),
-            pa.field("precise", pa.decimal128(38, 6), True),
-        ],
-        metadata={b"origin": b"fixture"},
-    )
-    pq.write_table(
-        pa.Table.from_arrays(
-            [
-                pa.array([1, None, 3], type=pa.int64()),
-                pa.array(["a", "b", "c"]),
-                pa.array(
-                    [
-                        Decimal("12345678901234567890123456789012.345678"),
-                        None,
-                        Decimal("-99999999999999999999999999999999.999999"),
-                    ],
-                    type=pa.decimal128(38, 6),
-                ),
-            ],
-            schema=schema,
-        ),
-        table_path,
-    )
-    table = table_path.read_bytes()
-    table_path.unlink()
-    empty_table = None
-    if include_empty_series_version:
-        empty_path = root.parent / "empty-fixture.parquet"
-        pq.write_table(
-            pa.Table.from_batches(
-                [
-                    pa.RecordBatch.from_arrays(
-                        [
-                            pa.array([], type=pa.int64()),
-                            pa.array([], type=pa.string()),
-                            pa.array([], type=pa.decimal128(38, 6)),
-                        ],
-                        schema=schema,
-                    )
-                ],
-                schema=schema,
-            ),
-            empty_path,
-        )
-        empty_table = empty_path.read_bytes()
-        empty_path.unlink()
-    table_hashes = [digest(table)]
-    table_versions = [metadata(102)]
-    if empty_table is not None:
-        table_hashes.append(digest(empty_table))
-        table_versions.append(metadata(103))
-    series = (
-        b"dp.series.1\n"
-        + struct.pack("<I", len(table_hashes))
-        + b"".join(table_hashes)
-    )
-
-    children = [
-        ("dynamic", 5, digest(recipe_bytes), [metadata(104)]),
-        ("file", 4, digest(EXTERNAL_FILE), [metadata(101)]),
-        ("link", 3, digest(SYMLINK_TARGET), []),
-        ("table", 8, digest(series), table_versions),
-    ]
-    if include_empty_singleton:
-        children.insert(1, ("empty", 4, digest(b""), [metadata(100)]))
-    tree = (
-        b"watertown.tree.v1\n"
-        + struct.pack("<I", len(children))
-        + b"".join(tree_entry(*entry) for entry in children)
-    )
-    tree_hash = digest(tree)
-    entries = [
-        ("file", "root", "file", 4, digest(EXTERNAL_FILE), [metadata(101)]),
-        ("link", "root", "link", 3, digest(SYMLINK_TARGET), []),
-        ("recipe", "root", "dynamic", 5, digest(recipe_bytes), [metadata(104)]),
-        ("root", "", "", 1, tree_hash, []),
-        ("table", "root", "table", 8, digest(series), table_versions),
-    ]
-    if include_empty_singleton:
-        entries.insert(0, ("empty", "root", "empty", 4, digest(b""), [metadata(100)]))
-    manifest = (
-        b"watertown.manifest.v1\n"
-        + struct.pack("<I", len(entries))
-        + b"".join(manifest_entry(*entry) for entry in entries)
-    )
-    manifest_hash = digest(manifest)
-    manifest_root = node_manifest_root(decode_manifest(manifest), blake3)
-    commit = (
-        b"watertown.commit.v1\n"
-        + b"\x01"
-        + tree_hash
-        + b"\0"
-        + manifest_hash
-        + manifest_root
-        + length_prefixed(POND_ID.encode())
-        + struct.pack("<qq", 2, NOW)
-        + length_prefixed(b"integration-test")
-        + length_prefixed(b"recover fixture")
-    )
-    commit_hash = digest(commit)
-    inline = {
-        digest(table): table,
-        digest(SYMLINK_TARGET): SYMLINK_TARGET,
-        digest(recipe_bytes): recipe_bytes,
-        digest(series): series,
-        tree_hash: tree,
-        manifest_hash: manifest,
-        commit_hash: commit,
-    }
-    if include_empty_singleton:
-        inline[digest(b"")] = b""
-    if empty_table is not None:
-        inline[digest(empty_table)] = empty_table
-
-    rows: list[tuple[str, str, str, int, bool, bytes, bytes, int]] = []
-
-    def add(
-        pond_id: str,
-        partition: str,
-        key: str,
-        sequence: int,
-        deleted: bool,
-        value: bytes,
-    ) -> None:
-        rows.append(
-            (
-                pond_id,
-                partition,
-                key,
-                sequence,
-                deleted,
-                value,
-                digest(value),
-                NOW,
-            )
-        )
-
-    add(NIL_UUID, "meta", "pond_id", 1, False, POND_ID.encode())
-    for object_hash, value in inline.items():
-        add(POND_ID, "objects", object_hash.hex(), 1, False, value)
-    add(POND_ID, "refs", "main", 1, False, b"\xff" * 32)
-    add(POND_ID, "refs", "main", 2, False, commit_hash)
-    dead = b"unreachable historical object"
-    add(POND_ID, "objects", digest(dead).hex(), 1, False, dead)
-    add(POND_ID, "objects", digest(dead).hex(), 2, True, b"")
-
-    arrow = pa.table(
-        {
-            "pond_id": pa.array([row[0] for row in rows], type=pa.string()),
-            "partition_key": pa.array([row[1] for row in rows], type=pa.string()),
-            "item_key": pa.array([row[2] for row in rows], type=pa.string()),
-            "txn_seq": pa.array([row[3] for row in rows], type=pa.int64()),
-            "deleted": pa.array([row[4] for row in rows], type=pa.bool_()),
-            "value": pa.array([row[5] for row in rows], type=pa.binary()),
-            "value_blake3": pa.array([row[6] for row in rows], type=pa.binary()),
-            "ts_micros": pa.array([row[7] for row in rows], type=pa.int64()),
-        }
-    )
-    write_deltalake(root, arrow, partition_by=["pond_id", "partition_key"])
-    blobs = root / "_blobs"
-    blobs.mkdir()
-    (blobs / f"blob={digest(EXTERNAL_FILE).hex()}").write_bytes(EXTERNAL_FILE)
-
-
 def _proof_bytes(leaves: list[str], start: int, end: int) -> bytes:
     nodes: list[tuple[int, int, bytes]] = []
 
@@ -450,7 +269,7 @@ def _pack(
 
 def build_current_pack_backup(root: Path) -> None:
     verify_embedded_arrow_schema()
-    verify_uniform_v2_node_schema()
+    verify_uniform_node_schema()
     schema_one = pa.schema(
         [
             pa.field("observed_at", pa.timestamp("s", tz="+00:00"), False),
@@ -638,6 +457,25 @@ def build_current_pack_backup(root: Path) -> None:
         (directory / f"pack={digest(pack).hex()}").write_bytes(pack)
 
 
+def verify_obsolete_formats_rejected() -> None:
+    obsolete = [
+        (decode_commit, b"dp.commit.3\n"),
+        (decode_manifest, b"dp.manifest.2\n"),
+        (decode_tree, b"dp.tree.2\n"),
+        (decode_series, b"dp.series.1\n"),
+        (decode_series, b"watertown.series.v1\n"),
+        (decode_pack, b"watertown.series-pack.v1\n"),
+        (decode_recipe, b"dp.recipe.1\n"),
+    ]
+    for decoder, value in obsolete:
+        try:
+            decoder(value)
+        except FormatError:
+            pass
+        else:
+            raise AssertionError(f"{decoder.__name__} accepted obsolete format {value!r}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -649,14 +487,7 @@ def main() -> int:
     pond = args.pond.resolve() if args.pond is not None else None
     if pond is not None and not pond.is_file():
         parser.error(f"pond binary does not exist: {pond}")
-
-    fixtures = json.loads(
-        Path(__file__).with_name("native-fixtures.json").read_text())
-    fixture_manifest = decode_manifest(bytes.fromhex(fixtures["manifest_hex"]))
-    assert (
-        node_manifest_root(fixture_manifest, blake3).hex()
-        == fixtures["manifest_root_hex"]
-    )
+    verify_obsolete_formats_rejected()
 
     with tempfile.TemporaryDirectory(prefix="watertown-recipe-test-") as temporary:
         workspace = Path(temporary)
@@ -717,7 +548,9 @@ def main() -> int:
         assert third_table.column("reading").to_pylist() == [5]
         assert third_table.column("quality").to_pylist() == ["suspect"]
         wrapper_recovered = workspace / "wrapper-materialized"
-        if sys.version_info >= (3, 13):
+        # pyarrow 21 publishes wheels through Python 3.13; avoid attempting a
+        # source build on newer interpreters in this wrapper smoke test.
+        if (3, 13) <= sys.version_info < (3, 14):
             wrapper_environment = workspace / "wrapper-environment"
             subprocess.run(
                 [
@@ -758,27 +591,6 @@ def main() -> int:
                 check=True,
             )
         print(f"integration capsule verified and materialized: {root}")
-
-        legacy_source = workspace / "native-legacy"
-        legacy_destination = workspace / "legacy-capsule"
-        build_native_backup(legacy_source, legacy_recipe=True)
-        legacy_root = extract(
-            legacy_source, legacy_destination, "main", None, "legacy-fixture"
-        )
-        _, legacy_report = load_and_verify(legacy_destination)
-        assert legacy_report["root"] == legacy_root
-        legacy_materialized = workspace / "legacy-materialized"
-        materialize(legacy_destination, legacy_materialized)
-        legacy_recipe = (
-            legacy_materialized
-            / "dynamic-recipes"
-            / _encoded_logical_path("/dynamic")
-        )
-        assert (legacy_recipe / "recipe.bin").read_bytes().startswith(b"dp.recipe.1\n")
-        assert json.loads((legacy_recipe / "factory.json").read_text()) == {
-            "factory": "legacy-fixture-factory"
-        }
-        assert (legacy_recipe / "config.bin").read_bytes() == b'{"source":"legacy-integration"}'
 
         corrupt_source = workspace / "native-corrupt-proof"
         build_current_pack_backup(corrupt_source)
@@ -828,8 +640,8 @@ def main() -> int:
             _reconstruct_pack_leaves(
                 [first_fragment, successor],
                 [fragment_descriptor, fragment_descriptor],
-                {"kind": "file", "revision": 1},
-                {"revision": 1},
+                {"kind": "file"},
+                {},
                 "/fragment",
                 0,
                 None,
@@ -841,8 +653,8 @@ def main() -> int:
             _reconstruct_pack_leaves(
                 [first_fragment],
                 [fragment_descriptor],
-                {"kind": "file", "revision": 1},
-                {"revision": 1},
+                {"kind": "file"},
+                {},
                 "/fragment",
                 0,
                 None,
@@ -854,35 +666,6 @@ def main() -> int:
         else:
             raise AssertionError("pack-local validation accepted a successor fragment")
 
-        empty_singleton_source = workspace / "native-empty-singleton"
-        build_native_backup(empty_singleton_source, include_empty_singleton=True)
-        try:
-            extract(
-                empty_singleton_source,
-                workspace / "empty-singleton-capsule",
-                "main",
-                None,
-                "fixture",
-            )
-        except FormatError as error:
-            assert "empty file version" in str(error) and "metadata" in str(error), error
-        else:
-            raise AssertionError("extractor silently dropped empty singleton metadata")
-
-        empty_source = workspace / "native-empty-series"
-        build_native_backup(empty_source, include_empty_series_version=True)
-        try:
-            extract(
-                empty_source,
-                workspace / "empty-series-capsule",
-                "main",
-                None,
-                "fixture",
-            )
-        except FormatError as error:
-            assert "empty table version" in str(error), error
-        else:
-            raise AssertionError("extractor silently dropped an empty series version")
     return 0
 
 

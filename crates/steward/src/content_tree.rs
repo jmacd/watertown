@@ -149,7 +149,7 @@ pub struct MaterializedObjects {
     /// only on a default-constructed value; a real fold always produces one.
     pub manifest: Option<(ObjectHash, Vec<u8>)>,
     /// Everything [`publish_initial_series_packs`] needs to mint one
-    /// whole-range "initial" identity pack per `watertown.series.v1` series folded
+    /// whole-range "initial" identity pack per `watertown.series.v2` series folded
     /// in this materialization, without re-walking the pond. Not itself a
     /// pushed object (a `PackIndex` is derived storage metadata excluded
     /// from the content tree), so it is not counted by [`Self::len`]/
@@ -164,12 +164,12 @@ pub struct MaterializedObjects {
 ///
 /// See [`publish_initial_series_packs`] for how this is consumed and why:
 /// the dual reader (`crate::content_pull::fetch_series_v2`) requires an
-/// exact pack cover before it will trust any `watertown.series.v1` content, so a
+/// exact pack cover before it will trust any `watertown.series.v2` content, so a
 /// freshly-folded v2 series is otherwise unfetchable the moment it is
 /// pushed.
 #[derive(Debug, Clone)]
 pub(crate) struct SeriesPackMaterial {
-    /// The series' own content address -- the `watertown.series.v1` manifest hash,
+    /// The series' own content address -- the `watertown.series.v2` manifest hash,
     /// and the key packs are published under.
     pub(crate) series_hash: ObjectHash,
     /// `FilePhysicalSeries` or `TablePhysicalSeries`; nothing else is ever
@@ -319,7 +319,7 @@ pub(crate) struct SeriesVersionData {
     /// requirement below).
     pub(crate) meta: VersionMeta,
     /// This version's raw (un-canonicalized) `extended_attributes` JSON as
-    /// persisted on the row. Needed to compute `watertown.series.v1`'s
+    /// persisted on the row. Needed to compute `watertown.series.v2`'s
     /// `logical_attributes` via
     /// [`sync_store::content::encode_canonical_attributes`], whose
     /// canonical-JSON convention is distinct from this module's own
@@ -480,7 +480,7 @@ pub(crate) struct SpineInputs {
 /// to explain a root mismatch at node and series-version granularity.
 pub(crate) struct FoldedContentState {
     pub manifest: Vec<ManifestEntry>,
-    pub series_versions: HashMap<String, Vec<ObjectHash>>,
+    pub series_leaf_hashes: HashMap<String, Vec<ObjectHash>>,
     pub root_tree_hash: ObjectHash,
     pub node_manifest_hash: ObjectHash,
     pub node_manifest_root: ObjectHash,
@@ -503,15 +503,15 @@ pub(crate) async fn in_txn_content_state(
     let manifest = node_manifest_entries(&index);
     let node_manifest_hash = manifest_hash(&manifest).map_err(StewardError::Content)?;
     let node_manifest_root = node_merkle_rebuild_root(&manifest).map_err(StewardError::Content)?;
-    let series_versions = index
-        .series_versions
+    let series_leaf_hashes = index
+        .series_leaf_hashes
         .iter()
         .filter(|((row_pond_id, _), _)| row_pond_id == pond_id)
-        .map(|((_, node_id), versions)| (node_id.clone(), versions.clone()))
+        .map(|((_, node_id), hashes)| (node_id.clone(), hashes.clone()))
         .collect();
     Ok(FoldedContentState {
         manifest,
-        series_versions,
+        series_leaf_hashes,
         root_tree_hash: index.root_tree_hash,
         node_manifest_hash,
         node_manifest_root,
@@ -741,7 +741,7 @@ pub(crate) async fn incremental_spine_inputs(
     // New content hash of every touched series: its committed version blobs
     // followed by this transaction's appended versions, pruned by range
     // containment and ordered oldest content first, exactly as [`fold_rows`]
-    // does, then folded into one watertown.series.v1 manifest.
+    // does, then folded into one watertown.series.v2 manifest.
     for (node, appended) in &series_new {
         let (mut versions, mut ranges) =
             read_series_committed(committed_table.clone(), local_pond_id, node).await?;
@@ -1251,12 +1251,6 @@ pub(crate) async fn log_tip_commit_hash(
 }
 
 fn log_tip_hash(bytes: &[u8]) -> Result<Option<ObjectHash>, StewardError> {
-    // A migration freeze must authenticate an old source tip without
-    // interpreting its legacy commit/tree schema. Old writers still need to
-    // be stopped separately because they do not honor the freeze marker.
-    if bytes.starts_with(b"dp.commit.3\n") {
-        return Ok(Some(ObjectHash::of_bytes(bytes)));
-    }
     let commit = Commit::decode(bytes)
         .map_err(|e| StewardError::Content(format!("decode commit-log tip: {e}")))?;
     Ok(Some(commit.hash()))
@@ -1531,35 +1525,13 @@ pub(crate) fn build_initial_pack_index(
             StewardError::Content("series version logical_count is negative".to_string())
         })?;
         let attrs = canonical_leaf_attributes(v)?;
-        let descriptor = match material.manifest.revision() {
-            sync_store::content::SeriesManifestRevision::V1 => {
-                if material.entry_type == EntryType::TablePhysicalSeries
-                    && v.schema_fingerprint != material.manifest.schema_fingerprint()
-                {
-                    return Err(StewardError::Content(format!(
-                        "v1 table manifest's homogeneous schema fingerprint {:?} does not match \
-                         leaf fingerprint {:?}",
-                        material.manifest.schema_fingerprint(),
-                        v.schema_fingerprint
-                    )));
-                }
-                sync_store::content::PackLeafDescriptor::new(
-                    logical_count,
-                    v.meta.min_event_time,
-                    v.meta.max_event_time,
-                    attrs,
-                )
-            }
-            sync_store::content::SeriesManifestRevision::V2 => {
-                sync_store::content::PackLeafDescriptor::new_with_schema(
-                    logical_count,
-                    v.schema_fingerprint,
-                    v.meta.min_event_time,
-                    v.meta.max_event_time,
-                    attrs,
-                )
-            }
-        }
+        let descriptor = sync_store::content::PackLeafDescriptor::new_with_schema(
+            logical_count,
+            v.schema_fingerprint,
+            v.meta.min_event_time,
+            v.meta.max_event_time,
+            attrs,
+        )
         .map_err(StewardError::Content)?;
         whole_series_leaf_hashes.push(leaf_hash);
         physical_object_hashes.push(v.blob_hash);
@@ -1580,32 +1552,18 @@ pub(crate) fn build_initial_pack_index(
     .map_err(StewardError::Content)?;
     let range_root = material.manifest.leaf_merkle_root();
 
-    let pack = match material.manifest.revision() {
-        sync_store::content::SeriesManifestRevision::V1 => sync_store::content::PackIndex::new(
-            material.series_hash,
-            0,
-            total_leaf_count,
-            total_leaf_count,
-            range_root,
-            range_proof,
-            physical_object_hashes,
-            material.manifest.logical_count(),
-            physical_byte_count,
-            leaf_descriptors,
-        ),
-        sync_store::content::SeriesManifestRevision::V2 => sync_store::content::PackIndex::new_v2(
-            material.series_hash,
-            0,
-            total_leaf_count,
-            total_leaf_count,
-            range_root,
-            range_proof,
-            physical_object_hashes,
-            material.manifest.logical_count(),
-            physical_byte_count,
-            leaf_descriptors,
-        ),
-    }
+    let pack = sync_store::content::PackIndex::new(
+        material.series_hash,
+        0,
+        total_leaf_count,
+        total_leaf_count,
+        range_root,
+        range_proof,
+        physical_object_hashes,
+        material.manifest.logical_count(),
+        physical_byte_count,
+        leaf_descriptors,
+    )
     .map_err(StewardError::Content)?;
 
     // Self-check before ever handing this pack to a publisher: a pack built
@@ -1627,7 +1585,7 @@ pub(crate) fn build_initial_pack_index(
 /// series captured in `materialized.series_material`
 /// (`docs/logical-series-identity-design.md`).
 ///
-/// A freshly-folded `watertown.series.v1` manifest is otherwise unfetchable the
+/// A freshly-folded `watertown.series.v2` manifest is otherwise unfetchable the
 /// moment it is pushed: the dual reader
 /// (`crate::content_pull::fetch_series_v2`) requires an exact pack cover
 /// before it will trust any series content, and nothing else in this
@@ -2081,7 +2039,7 @@ fn series_version_data(
     })
 }
 
-/// Build a series node's `watertown.series.v1` [`SeriesManifest`] and its single
+/// Build a series node's `watertown.series.v2` [`SeriesManifest`] and its single
 /// aggregate [`VersionMeta`] from its live versions in fold order (oldest
 /// first).
 ///
@@ -2112,7 +2070,7 @@ fn series_version_data(
 /// version is missing its `logical_count`, if the aggregate `logical_count`
 /// overflows `u64`, if a leaf-bearing table version has no schema
 /// fingerprint, or if the assembled manifest fails
-/// [`SeriesManifest::new_v2`]'s invariants.
+/// [`SeriesManifest::new`]'s invariants.
 pub(crate) fn build_series_manifest(
     entry_type: EntryType,
     versions: &[SeriesVersionData],
@@ -2198,7 +2156,7 @@ pub(crate) fn build_series_manifest(
         None => None,
     };
 
-    let manifest = SeriesManifest::new_v2(
+    let manifest = SeriesManifest::new(
         payload_kind,
         logical_count,
         leaf_hashes.len() as u64,
@@ -2357,7 +2315,7 @@ fn hash_child(
             let (manifest, meta) = build_series_manifest(entry_type, versions)?;
             let hash = manifest.hash();
             if let Some(sink) = sink {
-                // The v2 watertown.series.v1 manifest object, plus each version's
+                // The v2 watertown.series.v2 manifest object, plus each version's
                 // physical blob: small versions inline, large (externalized)
                 // versions by hash (D7). Physical blobs stay available for
                 // initial pack publication/fetch even though the series'
@@ -2457,12 +2415,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_commit_tip_uses_the_raw_object_hash_without_decoding() {
-        let legacy = b"dp.commit.3\nintentionally-not-a-current-commit";
-        assert_eq!(
-            log_tip_hash(legacy).expect("legacy tip"),
-            Some(ObjectHash::of_bytes(legacy))
-        );
+    fn obsolete_commit_tip_is_rejected() {
+        let obsolete = b"dp.commit.3\nintentionally-not-a-current-commit";
+        assert!(log_tip_hash(obsolete).is_err());
     }
 
     // Build an in-memory `content_live` table from OplogEntry rows so the narrow
@@ -2693,7 +2648,7 @@ mod tests {
             .get(&one_series_child.child_hash)
             .expect("manifest object materialized under its own hash");
         let manifest_one = SeriesManifest::decode(manifest_bytes_one)
-            .expect("decode watertown.series.v1 manifest");
+            .expect("decode watertown.series.v2 manifest");
         assert_eq!(manifest_one.payload_kind(), PayloadKind::File);
         assert_eq!(manifest_one.logical_count(), 4, "4 bytes in v1");
         assert_eq!(manifest_one.leaf_count(), 1);
@@ -2740,7 +2695,7 @@ mod tests {
             .get(&two_series_child.child_hash)
             .expect("manifest object materialized under its own hash");
         let manifest_two = SeriesManifest::decode(manifest_bytes_two)
-            .expect("decode watertown.series.v1 manifest");
+            .expect("decode watertown.series.v2 manifest");
         assert_eq!(manifest_two.logical_count(), 10, "4 + 6 bytes across both");
         assert_eq!(manifest_two.leaf_count(), 2);
         assert_eq!(
@@ -2881,11 +2836,6 @@ mod tests {
         let (manifest, meta) =
             build_series_manifest(EntryType::TablePhysicalSeries, &versions).expect("fold");
         assert_eq!(manifest.payload_kind(), PayloadKind::Table);
-        assert_eq!(
-            manifest.revision(),
-            sync_store::content::SeriesManifestRevision::V2
-        );
-        assert_eq!(manifest.schema_fingerprint(), None);
         assert_eq!(manifest.leaf_count(), 0);
         assert_eq!(manifest.logical_count(), 0);
         assert_eq!(meta.timestamp, Some(100));
@@ -2934,8 +2884,6 @@ mod tests {
             build_series_manifest(EntryType::TablePhysicalSeries, &versions).expect("fold");
         assert_eq!(manifest.leaf_count(), 2);
         assert_eq!(manifest.logical_count(), 8);
-        assert_eq!(manifest.schema_fingerprint(), None);
-
         let material = SeriesPackMaterial {
             series_hash: manifest.hash(),
             entry_type: EntryType::TablePhysicalSeries,

@@ -11,7 +11,7 @@
 //! persisted directly on the Oplog row (`logical_leaf_hash`,
 //! `logical_count`, and, for tables, `series_schema_fingerprint`). Steward's
 //! fold (`steward/src/content_tree.rs`) later just reads these columns to
-//! build the ordered `watertown.series.v1` manifest; it never re-derives identity
+//! build the ordered `watertown.series.v2` manifest; it never re-derives identity
 //! from physical (Parquet/Bao) encoding. This module is the single place
 //! that computes the hash, so the fold and the writer can never disagree
 //! about what a leaf's identity is.

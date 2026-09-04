@@ -46,10 +46,8 @@
 
 mod capsule;
 mod commit;
-mod legacy_capsule;
 mod manifest;
 mod node_merkle;
-mod series_dispatch;
 mod series_leaf;
 mod series_manifest;
 mod series_merkle;
@@ -58,46 +56,35 @@ mod series_pack_builder;
 mod tree;
 
 pub use capsule::{
-    CAPSULE_FORMAT_V1, CAPSULE_FORMAT_V2, CAPSULE_FORMAT_V3, CAPSULE_FORMAT_V4,
-    CapsuleDynamicMetadata, CapsuleEntry, CapsuleLeaf, CapsuleManifest, CapsuleNode, CapsuleObject,
-    CapsulePayloadKind, CapsuleSource, CapsuleVerifyReport, capsule_leaf_hash,
-    capsule_manifest_bytes, capsule_root, capsule_series_root, capsule_series_root_v3,
+    CAPSULE_FORMAT_V4, CapsuleDynamicMetadata, CapsuleEntry, CapsuleLeaf, CapsuleManifest,
+    CapsuleNode, CapsuleObject, CapsulePayloadKind, CapsuleSource, CapsuleVerifyReport,
+    capsule_leaf_hash, capsule_manifest_bytes, capsule_root, capsule_series_root,
     decode_capsule_manifest, encode_capsule_attributes, read_capsule_manifest,
     verify_capsule_directory, verify_capsule_payload_directory, verify_capsule_payloads,
     verify_incremental_capsule_payload_directory,
 };
 pub use commit::{Commit, ContentModelVersion, Provenance};
-pub use legacy_capsule::{
-    LEGACY_CAPSULE_FORMAT, LEGACY_CAPSULE_FORMAT_V1, LEGACY_CAPSULE_FORMAT_V2,
-    LEGACY_NATIVE_FORMAT_DP_COMMIT_3, LegacyCapsuleDynamicMetadata, LegacyCapsuleEntry,
-    LegacyCapsuleManifest, LegacyCapsuleNode, LegacyCapsuleObject, LegacyCapsulePayloadKind,
-    LegacyCapsuleSource, LegacyCapsuleVerifyReport, LegacyCapsuleVersion,
-    decode_legacy_capsule_manifest, legacy_capsule_manifest_bytes, legacy_capsule_root,
-    read_legacy_capsule_manifest, verify_legacy_capsule_directory,
-    verify_legacy_capsule_payload_directory,
-};
 pub use manifest::{ManifestEntry, decode_manifest, encode_manifest, manifest_hash};
 pub use node_merkle::{NodeMerkle, rebuild_root as node_merkle_rebuild_root};
-pub use series_dispatch::{FetchedSeriesObject, decode_fetched_series_object};
 pub use series_leaf::{
     IncrementalFileLeafHasher, IncrementalTableLeafHasher, canonicalize_schema,
     encode_canonical_attributes, encode_canonical_batch_rows, encode_canonical_schema,
     file_leaf_hash, file_leaf_hash_canonical, schema_fingerprint, table_leaf_hash,
     table_leaf_hash_canonical,
 };
-pub use series_manifest::{PayloadKind, SeriesManifest, SeriesManifestRevision};
+pub use series_manifest::{PayloadKind, SeriesManifest};
 pub use series_merkle::{RangeProof, generate_range_proof, merkle_root, verify_range_proof};
 pub use series_pack::{
-    PackIndex, PackIndexRevision, PackLeafDescriptor, effective_leaf_schema_fingerprint,
-    select_exact_cover, verify_pack_against_manifest,
+    PackIndex, PackLeafDescriptor, effective_leaf_schema_fingerprint, select_exact_cover,
+    verify_pack_against_manifest,
 };
 pub use series_pack_builder::{
     BuiltSeriesPack, FileLeafInput, FilePackLayout, TableLeafInput, TablePackLayout,
     build_file_pack, build_table_pack, encode_table_leaf_parquet,
 };
 pub use tree::{
-    TreeEntry, VersionMeta, decode_recipe, decode_series, decode_tree, encode_recipe,
-    encode_series, encode_tree, recipe_hash, series_hash, tree_hash,
+    TreeEntry, VersionMeta, decode_recipe, decode_tree, encode_recipe, encode_tree, recipe_hash,
+    tree_hash,
 };
 
 use std::fmt;

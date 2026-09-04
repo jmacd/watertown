@@ -6,7 +6,7 @@
 //! --collapse-versions N` (`docs/logical-series-identity-design.md`).
 //!
 //! This module never rewrites or deletes an Oplog append row, never
-//! changes a `watertown.series.v1` manifest/tree/commit root, Delta version, or txn
+//! changes a `watertown.series.v2` manifest/tree/commit root, Delta version, or txn
 //! sequence, and never changes logical metadata. What it *does* do is
 //! discover native v2 series whose current physical representation is
 //! fragmented past a requested threshold and publish a smaller, bounded set
@@ -24,7 +24,7 @@
 //! series' already-committed logical content, never a replacement for the
 //! Oplog rows themselves. [`crate::content_tree::build_series_manifest`]
 //! (the exact same fold every push/verify path uses) is called on the
-//! series' live rows to get the untouched, canonical `watertown.series.v1`
+//! series' live rows to get the untouched, canonical `watertown.series.v2`
 //! manifest; every leaf hash a fresh pack claims is recomputed from the
 //! real, live-fetched content and checked against that persisted leaf hash
 //! before it is trusted (requirement 3's "recompute/verify"); and the
@@ -152,7 +152,7 @@ pub enum PackCandidateOutcome {
 pub struct PackMaintenanceCandidate {
     /// The series node's identity.
     pub file_id: FileID,
-    /// The series' `watertown.series.v1` manifest hash, or `None` for
+    /// The series' `watertown.series.v2` manifest hash, or `None` for
     /// [`PackCandidateOutcome::UnsupportedLegacy`] (a pre-v2 series has no
     /// v2 manifest to hash).
     pub series_hash: Option<ObjectHash>,
@@ -1095,17 +1095,6 @@ async fn repack_table_series(
                 series.file_id.node_id()
             ))
         })?;
-        if series.manifest.revision() == sync_store::content::SeriesManifestRevision::V1
-            && series.manifest.schema_fingerprint() != Some(leaf_schema_fingerprint)
-        {
-            return Err(StewardError::Content(format!(
-                "leaf-bearing table series version {} has schema fingerprint \
-                 {leaf_schema_fingerprint}, which does not match the v1 manifest's homogeneous \
-                 fingerprint {:?}",
-                v.version,
-                series.manifest.schema_fingerprint()
-            )));
-        }
         if current_schema_fingerprint != Some(leaf_schema_fingerprint) {
             if let Some(schema) = canonical_schema.as_ref() {
                 flush_table_object(
@@ -1222,12 +1211,11 @@ async fn repack_table_series(
         }
 
         whole_series_leaf_hashes.push(leaf_input.leaf_hash());
-        leaf_descriptors.push(match series.manifest.revision() {
-            sync_store::content::SeriesManifestRevision::V1 => leaf_input.descriptor().clone(),
-            sync_store::content::SeriesManifestRevision::V2 => leaf_input
+        leaf_descriptors.push(
+            leaf_input
                 .descriptor()
                 .with_schema_fingerprint(leaf_schema_fingerprint),
-        });
+        );
 
         for batch in leaf_input.batches() {
             let total = batch.num_rows();
@@ -1342,32 +1330,18 @@ fn finish_pack_index(
     .map_err(StewardError::Content)?;
     let range_root = series.manifest.leaf_merkle_root();
 
-    let index = match series.manifest.revision() {
-        sync_store::content::SeriesManifestRevision::V1 => PackIndex::new(
-            series.series_hash,
-            0,
-            total_leaf_count,
-            total_leaf_count,
-            range_root,
-            range_proof,
-            physical_object_hashes,
-            series.manifest.logical_count(),
-            physical_byte_count,
-            leaf_descriptors,
-        ),
-        sync_store::content::SeriesManifestRevision::V2 => PackIndex::new_v2(
-            series.series_hash,
-            0,
-            total_leaf_count,
-            total_leaf_count,
-            range_root,
-            range_proof,
-            physical_object_hashes,
-            series.manifest.logical_count(),
-            physical_byte_count,
-            leaf_descriptors,
-        ),
-    }
+    let index = PackIndex::new(
+        series.series_hash,
+        0,
+        total_leaf_count,
+        total_leaf_count,
+        range_root,
+        range_proof,
+        physical_object_hashes,
+        series.manifest.logical_count(),
+        physical_byte_count,
+        leaf_descriptors,
+    )
     .map_err(StewardError::Content)?;
 
     sync_store::content::verify_pack_against_manifest(

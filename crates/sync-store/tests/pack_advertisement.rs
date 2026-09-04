@@ -41,7 +41,6 @@ fn build_series_and_pack(
     let root = merkle_root(&leaves);
     let manifest = SeriesManifest::new(
         PayloadKind::File,
-        None,
         leaves.len() as u64 * 7,
         leaves.len() as u64,
         None,
@@ -81,7 +80,6 @@ fn build_split_layout(
     let root = merkle_root(&leaves);
     let manifest = SeriesManifest::new(
         PayloadKind::File,
-        None,
         leaves.len() as u64 * 7,
         leaves.len() as u64,
         None,

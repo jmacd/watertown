@@ -28,10 +28,9 @@ use parquet::file::reader::ChunkReader;
 
 use crate::content_source::ContentSource;
 use sync_store::content::{
-    Commit, FetchedSeriesObject, IncrementalFileLeafHasher, ManifestEntry, ObjectHash, PackIndex,
-    PackLeafDescriptor, PayloadKind, SeriesManifest, TreeEntry, VersionMeta,
-    decode_fetched_series_object, decode_manifest, decode_recipe, decode_tree,
-    effective_leaf_schema_fingerprint, encode_table_leaf_parquet, schema_fingerprint,
+    Commit, IncrementalFileLeafHasher, ManifestEntry, ObjectHash, PackIndex, PackLeafDescriptor,
+    PayloadKind, SeriesManifest, TreeEntry, VersionMeta, decode_manifest, decode_recipe,
+    decode_tree, effective_leaf_schema_fingerprint, encode_table_leaf_parquet, schema_fingerprint,
     select_exact_cover, table_leaf_hash_canonical, verify_pack_against_manifest,
 };
 use tinyfs::{EntryType, NodeID, WD};
@@ -48,14 +47,12 @@ pub enum FetchedObject {
     Tree(Vec<TreeEntry>),
     /// A leaf blob: a file version's bytes, a symlink target, or recipe bytes.
     Blob(Vec<u8>),
-    /// A multi-version series: its ordered version blob hashes.
-    Series(Vec<ObjectHash>),
     /// A large leaf blob that lives out-of-row in the remote blob store and is
     /// deliberately *not* buffered (Decision D7).  Its bytes are streamed from
     /// the remote straight into the local writer at rebuild time, keyed by this
     /// object's hash; only its presence is recorded here.
     External,
-    /// A verified `watertown.series.v1` logical series
+    /// A verified `watertown.series.v2` logical series
     /// (`docs/logical-series-identity-design.md` delivery gate 4).
     ///
     /// By the time this variant exists in [`FetchedGraph::objects`], the
@@ -64,16 +61,12 @@ pub enum FetchedObject {
     /// recomputed from real decoded content have all been fetched and
     /// cryptographically verified against each other (see
     /// [`fetch_series_v2`]). Planning/apply code dispatches this variant to
-    /// native v2 materialization ([`plan_series_v2_leaves`]/
-    /// [`materialize_series_v2`]) rather than ever reinterpreting it as a
-    /// v1 [`FetchedObject::Series`] (see [`series_versions`], which rejects
-    /// this variant defensively since it must never be reached for one).
+    /// native materialization ([`plan_series_v2_leaves`]/
+    /// [`materialize_series_v2`]).
     SeriesV2(Box<FetchedSeriesV2>),
 }
 
-/// The immutable, verified state of one fetched `watertown.series.v1` logical series:
-/// enough information for a future v2 materializer to rebuild it, without
-/// this delivery gate implementing that rebuild itself.
+/// The immutable, verified state of one fetched `watertown.series.v2` logical series.
 ///
 /// Every field here has already been cryptographically bound to every other:
 /// `leaf_hashes` were recomputed from the real decoded content of
@@ -84,7 +77,7 @@ pub enum FetchedObject {
 /// this is built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchedSeriesV2 {
-    /// The `watertown.series.v1` object's own content address -- the hash the owning
+    /// The `watertown.series.v2` object's own content address -- the hash the owning
     /// tree entry's `child_hash` named.
     pub manifest_hash: ObjectHash,
     /// The decoded series manifest.
@@ -102,8 +95,7 @@ pub struct FetchedSeriesV2 {
     /// Every physical object hash the selected packs name, in first-seen
     /// order across `packs`, deduplicated. Each one is also present in
     /// [`FetchedGraph::objects`] as a [`FetchedObject::Blob`] or
-    /// [`FetchedObject::External`] entry, exactly like an ordinary v1
-    /// version blob, so a future materializer can reuse the same
+    /// [`FetchedObject::External`] entry, so the materializer can reuse the
     /// inline/external adoption path apply already uses.
     pub physical_object_hashes: Vec<ObjectHash>,
 }
@@ -296,14 +288,13 @@ async fn fetch_tree(
     Ok(())
 }
 
-/// Fetch a series object -- v1 (`dp.series.1`) or v2 (`watertown.series.v1`),
-/// dispatched by magic header -- and everything it names.
+/// Fetch a `watertown.series.v2` object and everything it names.
 ///
 /// `entry_type` is the owning tree entry's declared kind
-/// (`FilePhysicalSeries` or `TablePhysicalSeries`); for a v2 series it must
+/// (`FilePhysicalSeries` or `TablePhysicalSeries`); it must
 /// agree with the manifest's own [`PayloadKind`] (`docs/logical-series-
 /// identity-design.md` delivery gate 4), since nothing else ties a
-/// `watertown.series.v1` object's payload kind to the directory position naming it.
+/// `watertown.series.v2` object's payload kind to the directory position naming it.
 async fn fetch_series(
     remote: &dyn ContentSource,
     series_hash: ObjectHash,
@@ -325,43 +316,28 @@ async fn fetch_series(
                     Ok(())
                 }
             }
-            FetchedObject::Series(_) => Ok(()),
             _ => Err(StewardError::Content(format!(
                 "object {series_hash} was already fetched as a non-series object"
             ))),
         };
     }
     let bytes = fetch_verified(remote, series_hash).await?;
-    match decode_fetched_series_object(&bytes)
-        .map_err(|e| StewardError::Content(format!("decode series: {e}")))?
-    {
-        FetchedSeriesObject::V1(versions) => {
-            let _ = graph
-                .objects
-                .insert(series_hash, FetchedObject::Series(versions.clone()));
-            let _ = graph.bytes.insert(series_hash, bytes);
-            for version in versions {
-                fetch_blob(remote, version, graph, blob_index).await?;
-            }
-            Ok(())
-        }
-        FetchedSeriesObject::V2(manifest) => {
-            fetch_series_v2(
-                remote,
-                series_hash,
-                entry_type,
-                manifest,
-                bytes,
-                graph,
-                blob_index,
-            )
-            .await
-        }
-    }
+    let manifest = SeriesManifest::decode(&bytes)
+        .map_err(|e| StewardError::Content(format!("decode series: {e}")))?;
+    fetch_series_v2(
+        remote,
+        series_hash,
+        entry_type,
+        manifest,
+        bytes,
+        graph,
+        blob_index,
+    )
+    .await
 }
 
 /// Map a series-carrying tree entry type to the [`PayloadKind`] its
-/// `watertown.series.v1` manifest must declare.
+/// `watertown.series.v2` manifest must declare.
 ///
 /// Only ever called with a series entry type (the two callers -- [`fetch_tree`]'s
 /// match arm and [`fetch_series`] -- both guarantee that), so any other value
@@ -374,7 +350,7 @@ fn expected_payload_kind(entry_type: EntryType) -> PayloadKind {
     }
 }
 
-/// Fetch, discover, and fully verify a `watertown.series.v1` logical series
+/// Fetch, discover, and fully verify a `watertown.series.v2` logical series
 /// (`docs/logical-series-identity-design.md` delivery gate 4).
 ///
 /// This is the heart of the dual reader's v2 side. It:
@@ -1296,7 +1272,7 @@ enum ApplyOp {
     },
     /// Unlink a target node that is absent from the source.
     Delete { parent_path: String, name: String },
-    /// Create (adopting `node_id`) or append to a native `watertown.series.v1` v2
+    /// Create (adopting `node_id`) or append to a native `watertown.series.v2` v2
     /// logical series (`docs/logical-series-identity-design.md`, release
     /// blocker item 1). Unlike [`ApplyOp::File`], a v2 series carries no
     /// buffered version list here: its physical content already lives in the
@@ -1310,7 +1286,7 @@ enum ApplyOp {
         node_id: String,
         create: bool,
         entry_type: EntryType,
-        /// The `watertown.series.v1` manifest object's hash -- this node's
+        /// The `watertown.series.v2` manifest object's hash -- this node's
         /// `child_hash` -- naming the verified [`FetchedSeriesV2`] in
         /// `graph.objects` to materialize from.
         manifest_hash: ObjectHash,
@@ -1323,7 +1299,7 @@ enum ApplyOp {
         /// ([`replicated_mtime`]), adopted verbatim on the *last* leaf this
         /// operation writes so the destination's own subsequent fold
         /// recomputes the identical aggregate `VersionMeta` (mtime is not
-        /// part of the `watertown.series.v1` manifest hash, but is part of the
+        /// part of the `watertown.series.v2` manifest hash, but is part of the
         /// destination's own `build_series_manifest` aggregation, which
         /// takes it from the latest leaf-bearing version).
         replicated_mtime: Option<i64>,
@@ -1736,7 +1712,7 @@ fn first_replica_divergence(
             expected.entry_type,
             EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries
         ) {
-            let expected_versions = series_versions(graph, expected.child_hash)?;
+            let expected_versions = &series_v2(graph, expected.child_hash)?.leaf_hashes;
             let actual_versions = actual_series
                 .get(*node_id)
                 .map(Vec::as_slice)
@@ -1745,7 +1721,7 @@ fn first_replica_divergence(
             for index in 0..compared {
                 if expected_versions[index] != actual_versions[index] {
                     return Ok(Some(format!(
-                        "series node {node_id} ({:?}) blob {index} differs: expected {}, actual {}",
+                        "series node {node_id} ({:?}) leaf {index} differs: expected {}, actual {}",
                         expected.name,
                         expected_versions[index].to_hex(),
                         actual_versions[index].to_hex()
@@ -1754,7 +1730,7 @@ fn first_replica_divergence(
             }
             if expected_versions.len() != actual_versions.len() {
                 return Ok(Some(format!(
-                    "series node {node_id} ({:?}) blob count differs: expected {}, actual {}",
+                    "series node {node_id} ({:?}) leaf count differs: expected {}, actual {}",
                     expected.name,
                     expected_versions.len(),
                     actual_versions.len()
@@ -1866,7 +1842,7 @@ fn preview_validation_error(
         .cloned()
         .map(|entry| (entry.node_id.clone(), entry))
         .collect();
-    match first_replica_divergence(graph, &actual_nodes, &preview.series_versions)? {
+    match first_replica_divergence(graph, &actual_nodes, &preview.series_leaf_hashes)? {
         Some(detail) => mismatch.push_str(&format!("; first divergence: {detail}")),
         None => mismatch.push_str("; manifests match field-by-field"),
     }
@@ -2211,7 +2187,7 @@ fn plan_one(
     entry: &ManifestEntry,
     graph: &FetchedGraph,
     target_nodes: &HashMap<String, ManifestEntry>,
-    target_series: &HashMap<String, Vec<ObjectHash>>,
+    _target_series: &HashMap<String, Vec<ObjectHash>>,
     target_series_leaves: &HashMap<String, Vec<ObjectHash>>,
     ops: &mut Vec<ApplyOp>,
     outcome: &mut RebuildOutcome,
@@ -2289,49 +2265,27 @@ fn plan_one(
             if create {
                 outcome.series += 1;
             }
-            match graph.objects.get(&entry.child_hash) {
-                Some(FetchedObject::SeriesV2(_)) => {
-                    let series = series_v2(graph, entry.child_hash)?;
-                    let leaves_from = plan_series_v2_leaves(
-                        entry,
-                        series,
-                        target_series_leaves,
-                        existing.map(|t| t.child_hash),
-                    )?;
-                    // Always emit the op on create (adopting the node even
-                    // if, defensively, it turned out to need no leaves), and
-                    // otherwise only when there is a real suffix to append.
-                    if create || leaves_from < series.leaf_hashes.len() as u64 {
-                        ops.push(ApplyOp::SeriesV2 {
-                            parent: entry.parent_node_id.clone(),
-                            name: entry.name.clone(),
-                            node_id: entry.node_id.clone(),
-                            create,
-                            entry_type: entry.entry_type,
-                            manifest_hash: entry.child_hash,
-                            leaves_from,
-                            replicated_mtime: replicated_mtime(entry),
-                        });
-                    }
-                }
-                _ => {
-                    let (versions, collapse_first) = plan_series_versions(
-                        entry,
-                        graph,
-                        target_series,
-                        existing.map(|t| t.child_hash),
-                        meta_changed,
-                    )?;
-                    ops.push(ApplyOp::File {
-                        parent: entry.parent_node_id.clone(),
-                        name: entry.name.clone(),
-                        node_id: entry.node_id.clone(),
-                        create,
-                        entry_type: entry.entry_type,
-                        versions,
-                        collapse_first,
-                    });
-                }
+            let series = series_v2(graph, entry.child_hash)?;
+            let leaves_from = plan_series_v2_leaves(
+                entry,
+                series,
+                target_series_leaves,
+                existing.map(|t| t.child_hash),
+            )?;
+            // Always emit the op on create (adopting the node even
+            // if, defensively, it turned out to need no leaves), and
+            // otherwise only when there is a real suffix to append.
+            if create || leaves_from < series.leaf_hashes.len() as u64 {
+                ops.push(ApplyOp::SeriesV2 {
+                    parent: entry.parent_node_id.clone(),
+                    name: entry.name.clone(),
+                    node_id: entry.node_id.clone(),
+                    create,
+                    entry_type: entry.entry_type,
+                    manifest_hash: entry.child_hash,
+                    leaves_from,
+                    replicated_mtime: replicated_mtime(entry),
+                });
             }
         }
         EntryType::Symlink => {
@@ -2386,87 +2340,11 @@ fn replicated_mtime(entry: &ManifestEntry) -> Option<i64> {
     entry.versions.last().and_then(|meta| meta.timestamp)
 }
 
-/// Decide which series version blobs to write and whether the first replaces the
-/// versions already held.
-///
-/// The common case is append-only: the versions the target holds are a prefix of
-/// the incoming list, and only the appended suffix is written (Section 8.5.3).
-/// But a source-side compaction (`pond maintain --collapse-versions`) legitimately
-/// *replaces* many superseded versions with a single merged version, so the
-/// incoming list is no longer a prefix-extension of what a caught-up mirror holds.
-/// That case is replicated by rewriting the full incoming list with the first
-/// version marked to collapse the held ones (`collapse_first = true`), using the
-/// source's own merged bytes -- the pre-collapse versions are gone from the source
-/// and cannot be re-fetched, so the mirror must adopt the merged version directly.
-fn plan_series_versions(
-    entry: &ManifestEntry,
-    graph: &FetchedGraph,
-    target_series: &HashMap<String, Vec<ObjectHash>>,
-    existing_child_hash: Option<ObjectHash>,
-    meta_changed: bool,
-) -> Result<(Vec<PlannedVersion>, bool), StewardError> {
-    let incoming = series_versions(graph, entry.child_hash)?;
-
-    // The manifest entry carries one VersionMeta per live version, in the same
-    // order as the series object's hashes. A mismatch means the two objects
-    // disagree about the node's shape, so the metadata cannot be aligned with
-    // the bytes it describes; rebuilding from it would silently attach the
-    // wrong bounds to a version.
-    if !entry.versions.is_empty() && entry.versions.len() != incoming.len() {
-        return Err(StewardError::Content(format!(
-            "series node {} has {} version(s) but its entry carries {} metadata record(s)",
-            entry.node_id,
-            incoming.len(),
-            entry.versions.len()
-        )));
-    }
-    let meta_at = |index: usize| entry.versions.get(index);
-
-    let held = match existing_child_hash {
-        None => &[][..],
-        Some(child_hash) if child_hash == entry.child_hash && !meta_changed => {
-            return Ok((Vec::new(), false));
-        }
-        Some(_) => target_series
-            .get(&entry.node_id)
-            .map(Vec::as_slice)
-            .ok_or_else(|| {
-                StewardError::Content(format!(
-                    "series node {} changed but its current versions are unknown",
-                    entry.node_id
-                ))
-            })?,
-    };
-
-    // Append-only fast path: the incoming list extends what is already held, so
-    // write only the missing suffix.
-    if !meta_changed && incoming.len() >= held.len() && incoming[..held.len()] == *held {
-        let suffix = incoming[held.len()..]
-            .iter()
-            .enumerate()
-            .map(|(offset, hash)| planned_version(graph, *hash, meta_at(held.len() + offset)))
-            .collect::<Result<Vec<_>, _>>()?;
-        return Ok((suffix, false));
-    }
-
-    // Divergent history: the held versions are no longer a prefix of the source's
-    // live series (a compaction replaced them). Rewrite the full incoming list;
-    // the first version collapses everything the target held.
-    let full = incoming
-        .iter()
-        .enumerate()
-        .map(|(index, hash)| planned_version(graph, *hash, meta_at(index)))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((full, true))
-}
-
-/// Resolve a `watertown.series.v1` object to its verified [`FetchedSeriesV2`] state.
+/// Resolve a `watertown.series.v2` object to its verified [`FetchedSeriesV2`] state.
 ///
 /// # Errors
 ///
-/// Returns an error if the object at `series_hash` is not a verified v2
-/// series (a v1 series or any other object shape), or is missing from the
-/// graph.
+/// Returns an error if the object at `series_hash` is not a verified series.
 fn series_v2(
     graph: &FetchedGraph,
     series_hash: ObjectHash,
@@ -2474,11 +2352,11 @@ fn series_v2(
     match graph.objects.get(&series_hash) {
         Some(FetchedObject::SeriesV2(series)) => Ok(series),
         Some(_) => Err(StewardError::Content(format!(
-            "expected a v2 (watertown.series.v1) series at {} but found a different object shape",
+            "expected a watertown.series.v2 series at {} but found a different object shape",
             series_hash.to_hex()
         ))),
         None => Err(StewardError::Content(format!(
-            "v2 series object {} missing from graph",
+            "series object {} missing from graph",
             series_hash.to_hex()
         ))),
     }
@@ -2487,14 +2365,13 @@ fn series_v2(
 /// Decide the suffix of a v2 logical series' leaves the target still needs
 /// (release blocker item 1, `docs/logical-series-identity-design.md`).
 ///
-/// A `watertown.series.v1` series' `child_hash` is its manifest hash, which is a pure
+/// A `watertown.series.v2` series' `child_hash` is its manifest hash, which is a pure
 /// function of its whole logical content (leaf hashes, aggregate bounds,
 /// schema, attributes -- everything except mtime); an unchanged `child_hash`
 /// therefore means an unchanged logical state, full stop.
 ///
-/// Unlike [`plan_series_versions`], there is no collapse/rewrite case here:
-/// `pond maintain --collapse-versions` is an explicit no-op on a v2 series
-/// (item 4), so a verified v2 series never legitimately un-prefixes what a
+/// `pond maintain --collapse-versions` is an explicit no-op on a logical
+/// series, so a verified series never legitimately un-prefixes what a
 /// caught-up mirror already holds. If the target's already-materialized leaf
 /// hashes are not an exact prefix of the source's, that is corruption or an
 /// unsupported non-append change, not a case to reconcile by rewriting.
@@ -2806,7 +2683,7 @@ fn timestamp_column(meta: &VersionMeta) -> String {
         )
 }
 
-/// Materialize a verified `watertown.series.v1` logical series into the destination
+/// Materialize a verified `watertown.series.v2` logical series into the destination
 /// as native tlogfs rows (release blocker item 1,
 /// `docs/logical-series-identity-design.md`).
 ///
@@ -2961,7 +2838,7 @@ fn descriptor_timestamp_column(descriptor: &PackLeafDescriptor) -> Result<String
     }
 }
 
-/// Materialize a `watertown.series.v1` `FilePhysicalSeries` whose manifest declares
+/// Materialize a `watertown.series.v2` `FilePhysicalSeries` whose manifest declares
 /// `leaf_count() == 0` (release blocker item 1,
 /// `docs/logical-series-identity-design.md`): a legitimately empty,
 /// metadata-only series that has never carried a logical leaf (for example a
@@ -3687,135 +3564,12 @@ fn planned_version(
     })
 }
 
-/// Resolve a series object to its ordered v1 version blob hashes.
-///
-/// # Errors
-///
-/// Returns an error if `series_hash` names something other than a v1
-/// [`FetchedObject::Series`]. A [`FetchedObject::SeriesV2`] is rejected
-/// here defensively -- native v2 materialization is planned/applied through
-/// [`plan_series_v2_leaves`]/[`materialize_series_v2`] instead, dispatched
-/// in [`plan_one`] before this function is ever reached for a v2 object, so
-/// hitting this branch means that dispatch was bypassed, not that v2
-/// materialization is unimplemented (see [`FetchedObject::SeriesV2`]'s docs
-/// for what fetch verification already guarantees about it).
-fn series_versions(
-    graph: &FetchedGraph,
-    series_hash: ObjectHash,
-) -> Result<&[ObjectHash], StewardError> {
-    match graph.objects.get(&series_hash) {
-        Some(FetchedObject::Series(versions)) => Ok(versions),
-        Some(FetchedObject::SeriesV2(_)) => Err(StewardError::Content(format!(
-            "series {} is a v2 (watertown.series.v1) logical series and must be planned/applied via \
-             plan_series_v2_leaves/materialize_series_v2, not as a v1 series (internal \
-             dispatch error)",
-            series_hash.to_hex()
-        ))),
-        Some(_) => Err(StewardError::Content(format!(
-            "expected a series at {} but found a non-series object",
-            series_hash.to_hex()
-        ))),
-        None => Err(StewardError::Content(format!(
-            "series object {} missing from graph",
-            series_hash.to_hex()
-        ))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Field};
     use sync_store::content::{generate_range_proof, merkle_root};
-
-    fn series_entry(child_hash: ObjectHash, timestamp: i64) -> ManifestEntry {
-        ManifestEntry::new(
-            "series-node",
-            "root",
-            "events.series",
-            EntryType::FilePhysicalSeries,
-            child_hash,
-            vec![VersionMeta {
-                timestamp: Some(timestamp),
-                ..VersionMeta::default()
-            }],
-        )
-    }
-
-    #[test]
-    fn series_metadata_divergence_forces_full_rewrite() {
-        let blob_hash = ObjectHash::of_bytes(b"unchanged");
-        let series_hash = ObjectHash::of_bytes(b"series");
-        let entry = series_entry(series_hash, 2);
-        let mut graph = FetchedGraph::default();
-        _ = graph
-            .objects
-            .insert(blob_hash, FetchedObject::Blob(b"unchanged".to_vec()));
-        _ = graph
-            .objects
-            .insert(series_hash, FetchedObject::Series(vec![blob_hash]));
-        let target_series = HashMap::from([("series-node".to_string(), vec![blob_hash])]);
-
-        let (versions, collapse_first) =
-            plan_series_versions(&entry, &graph, &target_series, Some(series_hash), true)
-                .expect("metadata repair plan");
-
-        assert_eq!(versions.len(), 1);
-        assert!(collapse_first);
-        assert_eq!(versions[0].meta.timestamp, Some(2));
-    }
-
-    #[test]
-    fn divergence_diagnostic_identifies_series_metadata_field() {
-        let blob_hash = ObjectHash::of_bytes(b"unchanged");
-        let series_hash = ObjectHash::of_bytes(b"series");
-        let mut graph = FetchedGraph {
-            manifest: vec![series_entry(series_hash, 2)],
-            ..FetchedGraph::default()
-        };
-        _ = graph
-            .objects
-            .insert(series_hash, FetchedObject::Series(vec![blob_hash]));
-        let actual_nodes =
-            HashMap::from([("series-node".to_string(), series_entry(series_hash, 1))]);
-        let actual_series = HashMap::from([("series-node".to_string(), vec![blob_hash])]);
-
-        let detail = first_replica_divergence(&graph, &actual_nodes, &actual_series)
-            .expect("diagnosis")
-            .expect("divergence");
-
-        assert!(detail.contains("version 0 timestamp differs"), "{detail}");
-        assert!(
-            detail.contains("expected Some(2), actual Some(1)"),
-            "{detail}"
-        );
-    }
-
-    #[test]
-    fn divergence_diagnostic_identifies_series_blob() {
-        let expected_blob = ObjectHash::of_bytes(b"expected");
-        let actual_blob = ObjectHash::of_bytes(b"actual");
-        let series_hash = ObjectHash::of_bytes(b"series");
-        let mut graph = FetchedGraph {
-            manifest: vec![series_entry(series_hash, 2)],
-            ..FetchedGraph::default()
-        };
-        _ = graph
-            .objects
-            .insert(series_hash, FetchedObject::Series(vec![expected_blob]));
-        let actual_nodes =
-            HashMap::from([("series-node".to_string(), series_entry(series_hash, 2))]);
-        let actual_series = HashMap::from([("series-node".to_string(), vec![actual_blob])]);
-
-        let detail = first_replica_divergence(&graph, &actual_nodes, &actual_series)
-            .expect("diagnosis")
-            .expect("divergence");
-
-        assert!(detail.contains("blob 0 differs"), "{detail}");
-        assert!(detail.contains(&expected_blob.to_hex()), "{detail}");
-        assert!(detail.contains(&actual_blob.to_hex()), "{detail}");
-    }
 
     #[test]
     fn table_partitioner_rejects_object_crossing_schema_transition() {
@@ -3834,7 +3588,7 @@ mod tests {
             ObjectHash::of_bytes(b"leaf-a"),
             ObjectHash::of_bytes(b"leaf-b"),
         ];
-        let manifest = SeriesManifest::new_v2(
+        let manifest = SeriesManifest::new(
             PayloadKind::Table,
             2,
             2,
@@ -3850,7 +3604,7 @@ mod tests {
             PackLeafDescriptor::new_with_schema(1, Some(fingerprint_b), None, None, None)
                 .expect("descriptor b"),
         ];
-        let pack = PackIndex::new_v2(
+        let pack = PackIndex::new(
             manifest.hash(),
             0,
             2,
