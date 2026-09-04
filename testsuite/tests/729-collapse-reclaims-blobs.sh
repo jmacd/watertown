@@ -15,7 +15,7 @@
 #   series into a smaller, bounded set of content-addressed physical pack
 #   objects published under this pond's own local `data/_packs` namespace,
 #   without ever rewriting an Oplog row, superseding a row that is still
-#   live, or changing a series' `watertown.series.v1` manifest, content root, Delta
+#   live, or changing a series' `watertown.series.v2` manifest, content root, Delta
 #   version, or txn sequence. This test drives that through the CLI: it
 #   grows a series whose every version exceeds the large-file threshold
 #   (64 KiB) so each lands as its own blob, then asserts that a dry run

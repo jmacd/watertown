@@ -4,7 +4,7 @@
 //! hashes, and contiguous range membership proofs over it.
 //!
 //! `docs/logical-series-identity-design.md` delivery gate 2. This module
-//! knows nothing about `watertown.series.v1` root objects, `watertown.series-pack.v1` pack
+//! knows nothing about `watertown.series.v2` root objects, `watertown.series-pack.v2` pack
 //! indexes, Parquet, or Bao; it is pure, order-sensitive Merkle math over an
 //! already-computed ordered list of leaf hashes (each produced by
 //! [`super::series_leaf::table_leaf_hash`] or

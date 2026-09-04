@@ -46,7 +46,7 @@ pub struct CompactOutcome {
 /// ([`Ship::collapse_versions`]).
 ///
 /// Every field describes *physical* pack state only: no Oplog append row,
-/// `watertown.series.v1` manifest, tree/commit root, Delta version, or txn sequence
+/// `watertown.series.v2` manifest, tree/commit root, Delta version, or txn sequence
 /// is ever touched by this operation (`docs/logical-series-identity-design.md`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CollapseReport {
@@ -1095,7 +1095,7 @@ impl Ship {
     /// (`docs/logical-series-identity-design.md`).
     ///
     /// **This never rewrites or deletes an Oplog append row, never changes
-    /// a `watertown.series.v1` manifest/tree/commit root, Delta version, or txn
+    /// a `watertown.series.v2` manifest/tree/commit root, Delta version, or txn
     /// sequence, and never changes logical metadata.** Every physical
     /// object this publishes is durably written and content-addressed
     /// *before* the [`sync_store::content::PackIndex`] naming it is
@@ -2511,7 +2511,7 @@ mod tests {
     /// once a series exceeds the requested threshold's physical object
     /// count, it is repacked into a bounded physical pack published under
     /// this pond's own `data/_packs`, while every Oplog row, the series'
-    /// `watertown.series.v1` manifest, and the Delta write sequence are left
+    /// `watertown.series.v2` manifest, and the Delta write sequence are left
     /// completely untouched. A threshold nobody exceeds still no-ops
     /// cleanly, and repeated maintenance settles (idempotent).
     #[tokio::test]

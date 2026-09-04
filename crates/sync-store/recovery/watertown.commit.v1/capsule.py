@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify or safely materialize a pondcapsule.2, .3, or .4 without Pond."""
+"""Verify or safely materialize a pondcapsule.4 without Pond."""
 
 from __future__ import annotations
 
@@ -33,16 +33,9 @@ ENTRY_TYPES = {
     "table:dynamic",
 }
 HASH_RE = re.compile(r"[0-9a-f]{64}")
-ROOT_DOMAINS = {
-    "pondcapsule.2": b"pondcapsule.root.2\n",
-    "pondcapsule.3": b"pondcapsule.root.3\n",
-    "pondcapsule.4": b"pondcapsule.root.4\n",
-}
-SERIES_DOMAINS = {
-    "pondcapsule.2": b"pondcapsule.series.1\n",
-    "pondcapsule.3": b"pondcapsule.series.3\n",
-    "pondcapsule.4": b"pondcapsule.series.3\n",
-}
+CAPSULE_FORMAT = "pondcapsule.4"
+ROOT_DOMAIN = b"pondcapsule.root.4\n"
+SERIES_DOMAIN = b"pondcapsule.series.3\n"
 LEAF_DOMAIN = b"watertown.series-leaf.v1\n"
 ROWS_DOMAIN = b"watertown.series-rows.v1\n"
 
@@ -158,7 +151,7 @@ def _ordered_manifest(value: dict[str, Any]) -> dict[str, Any]:
             "objects": [ordered_object(item) for item in node["objects"]],
             "leaves": [ordered_leaf(item) for item in node["leaves"]],
         }
-        if value["format"] == "pondcapsule.2" or "schema_fingerprint" in node:
+        if "schema_fingerprint" in node:
             result["schema_fingerprint"] = node.get("schema_fingerprint")
             # Rust's serde field order puts the optional schema before root.
             result = {
@@ -198,9 +191,7 @@ def _canonical_json(value: dict[str, Any]) -> bytes:
         _ordered_manifest(value),
         ensure_ascii=False,
         separators=(",", ":"),
-        # V3 passes through serde_json::Value, whose map serialization is
-        # lexical; V2 retains its original struct-field ordering.
-        sort_keys=value["format"] in {"pondcapsule.3", "pondcapsule.4"},
+        sort_keys=True,
     ).encode()
 
 
@@ -259,9 +250,8 @@ def _path(value: Any, where: str) -> str:
 
 def _series_root(
     payload_kind: str, fingerprint: str | None, leaves: list[dict[str, Any]], blake3: Any,
-    format: str = "pondcapsule.3",
 ) -> str:
-    digest = blake3.blake3(SERIES_DOMAINS[format])
+    digest = blake3.blake3(SERIES_DOMAIN)
     digest.update(b"\0" if payload_kind == "file" else b"\1")
     digest.update(b"\0" if fingerprint is None else b"\1" + bytes.fromhex(fingerprint))
     digest.update(struct.pack("<Q", len(leaves)))
@@ -272,7 +262,7 @@ def _series_root(
         flags |= int(leaf["max_event_time"] is not None) << 1
         flags |= int(leaf["logical_attributes"] is not None) << 2
         leaf_schema = leaf.get("schema_fingerprint")
-        if format in {"pondcapsule.3", "pondcapsule.4"} and leaf_schema is not None:
+        if leaf_schema is not None:
             flags |= 0x08
         digest.update(bytes([flags]))
         if leaf["min_event_time"] is not None:
@@ -282,7 +272,7 @@ def _series_root(
         if leaf["logical_attributes"] is not None:
             encoded = leaf["logical_attributes"].encode()
             digest.update(struct.pack("<Q", len(encoded)) + encoded)
-        if format in {"pondcapsule.3", "pondcapsule.4"} and leaf_schema is not None:
+        if leaf_schema is not None:
             digest.update(bytes.fromhex(leaf_schema))
     return digest.hexdigest()
 
@@ -290,7 +280,7 @@ def _series_root(
 def _validate_manifest(value: Any, blake3: Any) -> dict[str, Any]:
     manifest = _keys(value, {"format", "source", "entries"}, "manifest")
     format = manifest["format"]
-    if format not in ROOT_DOMAINS:
+    if format != CAPSULE_FORMAT:
         raise CapsuleError("unsupported capsule format")
     source = _keys(
         manifest["source"],
@@ -340,7 +330,7 @@ def _validate_manifest(value: Any, blake3: Any) -> dict[str, Any]:
                 raise CapsuleError(f"object {descriptor['hash']} has conflicting sizes")
         elif kind == "dynamic":
             expected = {"kind", "recipe"}
-            if format == "pondcapsule.4" and "metadata" in entry["node"]:
+            if "metadata" in entry["node"]:
                 expected.add("metadata")
             node = _keys(entry["node"], expected, f"{where}.node")
             if entry_type not in {"dir:dynamic", "file:dynamic", "table:dynamic"}:
@@ -358,7 +348,7 @@ def _validate_manifest(value: Any, blake3: Any) -> dict[str, Any]:
             expected_node_keys = {
                 "kind", "payload_kind", "logical_root", "objects", "leaves"
             }
-            if format == "pondcapsule.2" or "schema_fingerprint" in entry["node"]:
+            if "schema_fingerprint" in entry["node"]:
                 expected_node_keys.add("schema_fingerprint")
             node = _keys(entry["node"], expected_node_keys, f"{where}.node")
             payload_kind = node["payload_kind"]
@@ -373,18 +363,13 @@ def _validate_manifest(value: Any, blake3: Any) -> dict[str, Any]:
                 raise CapsuleError(f"{where} physical payload/type mismatch")
             fingerprint = node.get("schema_fingerprint")
             if payload_kind == "file":
-                if fingerprint is not None or (
-                    format in {"pondcapsule.3", "pondcapsule.4"}
-                    and "schema_fingerprint" in node
-                ):
+                if fingerprint is not None or "schema_fingerprint" in node:
                     raise CapsuleError(f"{where} file must not declare a schema")
             elif fingerprint is not None:
                 fingerprint = _hash(fingerprint, f"{where}.node.schema_fingerprint")
-            elif format == "pondcapsule.2":
-                raise CapsuleError(f"{where} table must declare a schema")
             elif "schema_fingerprint" in node:
                 raise CapsuleError(
-                    f"{where} v3 schema-evolved table must omit its node schema"
+                    f"{where} table must omit a null node schema"
                 )
             _hash(node["logical_root"], f"{where}.node.logical_root")
             if not isinstance(node["objects"], list) or not isinstance(node["leaves"], list):
@@ -463,16 +448,12 @@ def _validate_manifest(value: Any, blake3: Any) -> dict[str, Any]:
                 raise CapsuleError(f"{where} file leaf must not declare a schema")
             if payload_kind == "table" and not objects:
                 raise CapsuleError(f"{where} table has no Parquet schema carrier")
-            if format in {"pondcapsule.3", "pondcapsule.4"} and payload_kind == "table" and not leaves and fingerprint is None:
+            if payload_kind == "table" and not leaves and fingerprint is None:
                 raise CapsuleError(f"{where} empty table must declare a node schema")
-            if format in {"pondcapsule.3", "pondcapsule.4"} and payload_kind == "table" and any(
+            if payload_kind == "table" and any(
                 leaf.get("schema_fingerprint") is None for leaf in leaves
             ):
-                raise CapsuleError(f"{where} v3 table leaves must declare a schema")
-            if format == "pondcapsule.2" and payload_kind == "table" and any(
-                "schema_fingerprint" in leaf for leaf in leaves
-            ):
-                raise CapsuleError(f"{where} v2 table leaves must not declare a schema")
+                raise CapsuleError(f"{where} table leaves must declare a schema")
             if payload_kind == "table" and fingerprint is not None and any(
                 "schema_fingerprint" in leaf and leaf["schema_fingerprint"] != fingerprint
                 for leaf in leaves
@@ -480,7 +461,7 @@ def _validate_manifest(value: Any, blake3: Any) -> dict[str, Any]:
                 raise CapsuleError(
                     f"{where} table leaf schema differs from its homogeneous schema"
                 )
-            computed = _series_root(payload_kind, fingerprint, leaves, blake3, format)
+            computed = _series_root(payload_kind, fingerprint, leaves, blake3)
             if computed != node["logical_root"]:
                 raise CapsuleError(f"{where} logical series root mismatch")
         else:
@@ -910,7 +891,7 @@ def load_and_verify(capsule: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     manifest = _validate_manifest(_json(manifest_bytes), blake3)
     if _canonical_json(manifest) != manifest_bytes:
         raise CapsuleError("capsule manifest is not canonically encoded")
-    computed_root = blake3.blake3(ROOT_DOMAINS[manifest["format"]] + manifest_bytes).hexdigest()
+    computed_root = blake3.blake3(ROOT_DOMAIN + manifest_bytes).hexdigest()
     if computed_root != root:
         raise CapsuleError(f"manifest hashes to {computed_root}, latest names {root}")
     declared, physical_bytes = _verify_objects(capsule, manifest, blake3)
@@ -953,14 +934,9 @@ def _encoded_logical_path(path: str) -> Path:
 
 
 def _decode_dynamic_recipe(data: bytes) -> tuple[str, bytes]:
-    if data.startswith(b"watertown.recipe.v1\n"):
-        magic = b"watertown.recipe.v1\n"
-    elif data.startswith(b"dp.recipe.1\n"):
-        magic = b"dp.recipe.1\n"
-    else:
-        raise CapsuleError(
-            "dynamic recipe does not use watertown.recipe.v1 or dp.recipe.1 framing"
-        )
+    magic = b"watertown.recipe.v1\n"
+    if not data.startswith(magic):
+        raise CapsuleError("dynamic recipe does not use watertown.recipe.v1 framing")
     if len(data) < len(magic) + 4:
         raise CapsuleError("dynamic recipe framing is truncated")
     name_length = struct.unpack_from("<I", data, len(magic))[0]

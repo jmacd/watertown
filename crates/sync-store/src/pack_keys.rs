@@ -7,7 +7,7 @@
 //! content tree, so it cannot be discovered through the commit/tree object
 //! closure the way an inline object or a `_blobs/blob=<hash>` physical blob
 //! can. Every backend instead advertises pack indexes under one namespace,
-//! keyed first by the `watertown.series.v1` series hash and then by the pack's own
+//! keyed first by the `watertown.series.v2` series hash and then by the pack's own
 //! content address:
 //!
 //! ```text

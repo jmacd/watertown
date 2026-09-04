@@ -146,7 +146,7 @@ pub enum TLogFSError {
     /// `leaf_count`, and a table series can only ever obtain one from a
     /// real, nonempty Parquet append (see [`Self::SeriesZeroRowAppend`]),
     /// so a genuinely empty table series can never be folded into a valid
-    /// `watertown.series.v1` manifest -- steward's own source-side fold
+    /// `watertown.series.v2` manifest -- steward's own source-side fold
     /// (`build_series_manifest`) would fail this node with an opaque
     /// "table series requires a schema fingerprint" error at the next
     /// commit that touches it. Reject clearly here instead, before the row

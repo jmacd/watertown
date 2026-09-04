@@ -1,78 +1,47 @@
-# Portable capsule format: `pondcapsule.4`
+# Portable recovery capsule: `pondcapsule.4`
 
-This document describes the files needed to inspect a capsule without Pond or
-the Watertown source tree. Treat the capsule as read-only during recovery.
+`pondcapsule.4` is the only supported portable recovery format.
 
 ## Layout
 
 ```text
-CAPSULE-README.md             human recovery runbook
-CAPSULE-FORMAT.md             this format reference
-capsule.py                    independent verifier and materializer
-parquet_schema.py             logical schema decoder shared by recovery tools
-capsule-requirements.lock     exact direct Python dependencies
-recover.sh                    one-command recovery wrapper
 recovery/
-  refs/latest                 one lowercase capsule-root hash plus newline
-  manifests/<root>.json       canonical UTF-8 JSON manifest
-  objects/blake3=<hash>       immutable payload bytes
+  refs/latest
+  manifests/<capsule-root>.json
+  objects/blake3=<payload-hash>
+CAPSULE-README.md
+CAPSULE-FORMAT.md
+capsule.py
+parquet_schema.py
+capsule-requirements.lock
+recover.sh
 ```
 
-The capsule root is BLAKE3 over the ASCII domain `pondcapsule.root.4\n`
-followed by the exact manifest bytes. The manifest names the source pond,
-source commit, every logical path, and the complete payload closure. Each
-payload descriptor records the BLAKE3 hash and exact byte size.
+`refs/latest` is exactly one lowercase 64-character BLAKE3 hash plus a
+newline. The named manifest is canonical JSON. Its authenticated root is:
 
-The root authenticates the manifest and payload data. Recovery-aid files at the
-capsule root are authenticated by comparison with the independently
-hash-authenticated `dp.commit.3` recovery kit.
+```text
+BLAKE3("pondcapsule.root.4\n" || canonical_manifest_json)
+```
 
-## Payloads
+Physical nodes contain an ordered object stream and ordered logical leaves.
+Their logical root uses the retained current capsule series domain:
 
-- File payloads are exact byte streams.
-- Table payloads are standard Parquet.
-- Symlink targets are raw bytes and are never activated.
-- Dynamic recipes use the source `watertown.recipe.v1` or legacy
-  `dp.recipe.1` framing. Materialization emits the raw recipe plus
-  `factory.json` and exact `config.bin`; it never executes the recipe.
-- A dynamic node's optional persisted metadata is a `metadata` object with
-  its `timestamp` in microseconds. V4 preserves this timestamp exactly.
+```text
+BLAKE3("pondcapsule.series.3\n" || framed node and leaf descriptors)
+```
 
-Physical objects may not align one-for-one with logical versions. The manifest
-therefore records ordered logical leaves and roots independently of object
-boundaries. `capsule.py verify` checks both physical bytes and logical content.
-Every table leaf carries its required 64-character lowercase BLAKE3
-`schema_fingerprint`; file leaves never carry that field. A schema-evolved
-table omits the node-level `schema_fingerprint` entirely, while a homogeneous
-table may carry it and every leaf must equal it. Physical Parquet schema
-transitions must occur at physical-object boundaries.
+Every table leaf carries its own `schema_fingerprint`. A homogeneous table
+may also carry the same fingerprint at the node level; a schema-evolved table
+omits the node-level field. An empty table must retain a node-level schema
+fingerprint and a Parquet schema carrier.
 
-Native pack descriptors do not contain an individual write timestamp. For a
-pack-aware series, `source_timestamp` is the authenticated aggregate series
-timestamp recorded in the native tree metadata; the per-leaf bounds,
-attributes, counts, logical hashes, and (for tables) schemas are preserved
-exactly from the descriptors and decoded payload.
-Empty physical versions with source metadata are not representable in
-`pondcapsule.4`; extraction fails rather than silently dropping that metadata.
+Logical leaf hashes use the native stable domains
+`watertown.series-schema.v1`, `watertown.series-rows.v1`, and
+`watertown.series-leaf.v1`. Dynamic recipe payloads must use
+`watertown.recipe.v1`; the verifier never executes them.
 
-## Materialized layout
-
-Materialization writes separate `directories/`, `files/`, `tables/`,
-`symlinks/`, and `dynamic-recipes/` roots. Every logical path becomes one
-bounded ASCII directory name containing a basename hint and a SHA-256 digest of
-the exact full UTF-8 path. This prevents collisions and excessive path growth
-on common filesystems. `inventory.json` is the authoritative mapping from
-original logical paths to output files.
-
-File versions end in `.bin`; table versions are ordinary `.parquet` files.
-Symlink targets and dynamic configurations remain inert files. The destination
-must not already exist and is promoted only after complete verification and
-materialization.
-
-## Trust and snapshot selection
-
-Content hashes establish integrity, not freshness. Preserve the expected
-capsule root or native commit hash through an independent channel such as an
-incident record, offline inventory, signed message, or separate account.
-During recovery, compare that trusted value with `recovery/refs/latest` before
-accepting the snapshot.
+The verifier rejects unknown fields, noncanonical paths or JSON, duplicate
+entries, inconsistent object sizes, undeclared objects, invalid schemas,
+logical-root mismatches, payload hash mismatches, and every obsolete capsule
+or native child encoding.

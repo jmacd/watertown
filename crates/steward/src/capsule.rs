@@ -6,11 +6,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use sync_store::content::{FetchedSeriesObject, decode_fetched_series_object};
+use sync_store::content::SeriesManifest;
 use sync_store::{
     CapsuleDynamicMetadata, CapsuleEntry, CapsuleLeaf, CapsuleManifest, CapsuleNode, CapsuleObject,
     CapsulePayloadKind, CapsuleSource, IncrementalFileLeafHasher, IncrementalTableLeafHasher,
-    ManifestEntry, ObjectHash, capsule_series_root_v3, decode_manifest, decode_recipe,
+    ManifestEntry, ObjectHash, capsule_series_root, decode_manifest, decode_recipe,
     encode_canonical_attributes, encode_canonical_batch_rows, schema_fingerprint,
 };
 use tinyfs::EntryType;
@@ -233,7 +233,7 @@ pub(crate) async fn build_recovery_capsule_from_materialized(
         exported_at_micros: source_commit.provenance.time_micros,
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    let manifest = CapsuleManifest::new_v4(source, entries).map_err(StewardError::Content)?;
+    let manifest = CapsuleManifest::new(source, entries).map_err(StewardError::Content)?;
     let declared: HashSet<ObjectHash> = manifest
         .payload_objects()
         .map_err(StewardError::Content)?
@@ -291,54 +291,10 @@ fn dynamic_metadata(
     }
 }
 
-/// Static recovery recipe selected for an explicit remote operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecoveryRecipeFlavor {
-    /// Current target-native `watertown.commit.v1` to logical `pondcapsule.4`.
-    TargetFormat,
-    /// Deliberate legacy `dp.commit.3` to opaque `pondcapsule.legacy.1` migration.
-    LegacyMigration,
-    /// Legacy migration revision that preserves dynamic-node metadata.
-    LegacyMigrationV2,
-}
-
-impl RecoveryRecipeFlavor {
-    /// Stable operator-facing flavor name.
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::TargetFormat => "target-format",
-            Self::LegacyMigration => "legacy-migration",
-            Self::LegacyMigrationV2 => "legacy-migration-v2",
-        }
-    }
-
-    /// Native backup format consumed by this recipe.
-    #[must_use]
-    pub const fn native_format(self) -> &'static str {
-        match self {
-            Self::TargetFormat => "watertown.commit.v1",
-            Self::LegacyMigration => "dp.commit.3",
-            Self::LegacyMigrationV2 => "dp.commit.3",
-        }
-    }
-
-    /// Capsule format produced by this recipe.
-    #[must_use]
-    pub const fn capsule_format(self) -> &'static str {
-        match self {
-            Self::TargetFormat => "pondcapsule.4",
-            Self::LegacyMigration => "pondcapsule.legacy.1",
-            Self::LegacyMigrationV2 => "pondcapsule.legacy.2",
-        }
-    }
-}
-
-/// Install the selected static recovery recipe under a remote's budget.
+/// Install the current static recovery recipe under a remote's budget.
 pub async fn open_and_publish_recovery_recipe_limited(
     url: &str,
     storage_options: HashMap<String, String>,
-    flavor: RecoveryRecipeFlavor,
     limits: &mut LimiterSet,
 ) -> Result<sync_store::RecoveryRecipePublishOutcome, StewardError> {
     crate::storage_meter::metered_op(
@@ -348,33 +304,19 @@ pub async fn open_and_publish_recovery_recipe_limited(
             let remote = sync_store::ContentRemote::open_at_url(url, storage_options)
                 .await
                 .map_err(|error| StewardError::Aborted(format!("open remote {url}: {error}")))?;
-            match flavor {
-                RecoveryRecipeFlavor::TargetFormat => {
-                    remote.publish_recovery_recipe_watertown_commit_v1().await
-                }
-                RecoveryRecipeFlavor::LegacyMigration => {
-                    remote.publish_recovery_recipe_legacy_migration().await
-                }
-                RecoveryRecipeFlavor::LegacyMigrationV2 => {
-                    remote.publish_recovery_recipe_legacy_migration_v2().await
-                }
-            }
-            .map_err(|error| {
-                StewardError::Content(format!(
-                    "publish {} recovery recipe: {error}",
-                    flavor.name()
-                ))
-            })
+            remote
+                .publish_recovery_recipe_watertown_commit_v1()
+                .await
+                .map_err(|error| StewardError::Content(format!("publish recovery recipe: {error}")))
         }),
     )
     .await
 }
 
-/// Verify the selected static recovery recipe under a remote's budget.
+/// Verify the current static recovery recipe under a remote's budget.
 pub async fn open_and_inspect_recovery_recipe_limited(
     url: &str,
     storage_options: HashMap<String, String>,
-    flavor: RecoveryRecipeFlavor,
     limits: &mut LimiterSet,
 ) -> Result<ObjectHash, StewardError> {
     crate::storage_meter::metered_op(
@@ -384,23 +326,10 @@ pub async fn open_and_inspect_recovery_recipe_limited(
             let remote = sync_store::ContentRemote::open_at_url(url, storage_options)
                 .await
                 .map_err(|error| StewardError::Aborted(format!("open remote {url}: {error}")))?;
-            match flavor {
-                RecoveryRecipeFlavor::TargetFormat => {
-                    remote.inspect_recovery_recipe_watertown_commit_v1().await
-                }
-                RecoveryRecipeFlavor::LegacyMigration => {
-                    remote.inspect_recovery_recipe_legacy_migration().await
-                }
-                RecoveryRecipeFlavor::LegacyMigrationV2 => {
-                    remote.inspect_recovery_recipe_legacy_migration_v2().await
-                }
-            }
-            .map_err(|error| {
-                StewardError::Content(format!(
-                    "inspect {} recovery recipe: {error}",
-                    flavor.name()
-                ))
-            })
+            remote
+                .inspect_recovery_recipe_watertown_commit_v1()
+                .await
+                .map_err(|error| StewardError::Content(format!("inspect recovery recipe: {error}")))
         }),
     )
     .await
@@ -435,63 +364,41 @@ async fn build_physical_node(
             let bytes = materialized.inline.get(&native.child_hash).ok_or_else(|| {
                 StewardError::Content(format!("series object {} is missing", native.child_hash))
             })?;
-            match decode_fetched_series_object(bytes).map_err(|error| {
+            let manifest = SeriesManifest::decode(bytes).map_err(|error| {
                 StewardError::Content(format!("decode series object for {path}: {error}"))
-            })? {
-                FetchedSeriesObject::V1(hashes) => {
-                    if hashes.len() != native.versions.len() {
-                        return Err(StewardError::Content(format!(
-                            "{path} has {} payload versions but {} metadata versions",
-                            hashes.len(),
-                            native.versions.len()
-                        )));
-                    }
-                    (
-                        hashes
-                            .into_iter()
-                            .zip(native.versions.iter().cloned())
-                            .collect(),
-                        None,
-                    )
-                }
-                FetchedSeriesObject::V2(manifest) => {
-                    let series = materialized
-                        .series_material
-                        .iter()
-                        .find(|series| series.series_hash == native.child_hash)
-                        .ok_or_else(|| {
-                            StewardError::Content(format!(
-                                "physical material for v2 series {path} is missing"
-                            ))
-                        })?;
-                    if series.entry_type != native.entry_type {
-                        return Err(StewardError::Content(format!(
-                            "v2 series {path} material has type {:?}, expected {:?}",
-                            series.entry_type, native.entry_type
-                        )));
-                    }
-                    if series.manifest != manifest {
-                        return Err(StewardError::Content(format!(
-                            "v2 series {path} material does not match its manifest"
-                        )));
-                    }
-                    let versions: Vec<_> = series
-                        .versions
-                        .iter()
-                        .filter(|version| version.logical_leaf_hash.is_some())
-                        .map(|version| (version.blob_hash, version.meta.clone()))
-                        .collect();
-                    if versions.len() as u64 != manifest.leaf_count() {
-                        return Err(StewardError::Content(format!(
-                            "v2 series {path} has {} physical leaf versions but its manifest \
-                             declares {}",
-                            versions.len(),
-                            manifest.leaf_count()
-                        )));
-                    }
-                    (versions, manifest.schema_fingerprint())
-                }
+            })?;
+            let series = materialized
+                .series_material
+                .iter()
+                .find(|series| series.series_hash == native.child_hash)
+                .ok_or_else(|| {
+                    StewardError::Content(format!("physical material for series {path} is missing"))
+                })?;
+            if series.entry_type != native.entry_type {
+                return Err(StewardError::Content(format!(
+                    "series {path} material has type {:?}, expected {:?}",
+                    series.entry_type, native.entry_type
+                )));
             }
+            if series.manifest != manifest {
+                return Err(StewardError::Content(format!(
+                    "series {path} material does not match its manifest"
+                )));
+            }
+            let versions: Vec<_> = series
+                .versions
+                .iter()
+                .filter(|version| version.logical_leaf_hash.is_some())
+                .map(|version| (version.blob_hash, version.meta.clone()))
+                .collect();
+            if versions.len() as u64 != manifest.leaf_count() {
+                return Err(StewardError::Content(format!(
+                    "series {path} has {} physical leaf versions but its manifest declares {}",
+                    versions.len(),
+                    manifest.leaf_count()
+                )));
+            }
+            (versions, None)
         }
         EntryType::FilePhysicalVersion | EntryType::TablePhysicalVersion => {
             if native.versions.len() != 1 {
@@ -557,13 +464,13 @@ async fn build_physical_node(
                 if object.size == 0 {
                     if is_series {
                         return Err(StewardError::Content(format!(
-                            "series {path} contains an empty file version that pondcapsule.1 \
+                            "series {path} contains an empty file version that pondcapsule.4 \
                              cannot represent"
                         )));
                     }
                     if !metadata.is_empty() {
                         return Err(StewardError::Content(format!(
-                            "empty file version {path} carries metadata that pondcapsule.1 \
+                            "empty file version {path} carries metadata that pondcapsule.4 \
                               cannot represent"
                         )));
                     }
@@ -654,13 +561,13 @@ async fn build_physical_node(
                 if logical_count == 0 {
                     if is_series {
                         return Err(StewardError::Content(format!(
-                            "series {path} contains an empty table version that pondcapsule.1 \
+                            "series {path} contains an empty table version that pondcapsule.4 \
                              cannot represent"
                         )));
                     }
                     if !metadata.is_empty() {
                         return Err(StewardError::Content(format!(
-                            "empty table version {path} carries metadata that pondcapsule.1 \
+                            "empty table version {path} carries metadata that pondcapsule.4 \
                               cannot represent"
                         )));
                     }
@@ -719,7 +626,7 @@ async fn build_physical_node(
             "table node {path} has no readable schema"
         )));
     }
-    let logical_root = capsule_series_root_v3(payload_kind, table_schema, &leaves);
+    let logical_root = capsule_series_root(payload_kind, table_schema, &leaves);
     Ok(CapsuleNode::Physical {
         payload_kind,
         schema_fingerprint: table_schema,

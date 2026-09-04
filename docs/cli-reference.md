@@ -547,18 +547,13 @@ install or verify the small static recovery recipe before writing backup data.
 ### pond capsule
 
 Install static native-format recovery recipes and verify portable logical
-recovery snapshots. The default recipe is the current target-format
-`watertown.commit.v1` to `pondcapsule.4` path. Legacy migration is a separate,
-deliberate `dp.commit.3` to `pondcapsule.legacy.1` operation.
+recovery snapshots. The only recipe is the current
+`watertown.commit.v1` to `pondcapsule.4` path.
 
 ```bash
-# Install or verify the current target-format recipe.
+# Install or verify the current recipe.
 pond capsule recipe publish azure
 pond capsule recipe inspect azure
-
-# Install or verify the explicit opaque legacy-migration recipe.
-pond capsule recipe legacy-migration publish azure
-pond capsule recipe legacy-migration inspect azure
 
 # Verify and summarize a capsule downloaded into ./recovered/recovery/.
 pond capsule inspect ./recovered
@@ -573,23 +568,23 @@ POND=/srv/watertown/recovered pond capsule import ./recovered \
   --experimental
 ```
 
-Every backup push installs the current target-format hash-addressed recipe and
-verifies any existing generic discoverable recipe against its immutable copy
-before advancing the native ref. Explicit target-format publication creates
+Every backup push installs the current hash-addressed recipe. If the
+discoverable recipe is absent it is created with current bytes. If it already
+exists, it is left unchanged only when its exact bytes match its own
+hash-addressed immutable copy. Missing or mismatched immutable copies fail
+without backfill. Explicit publication creates
 `recovery/recipes/watertown.commit.v1/<recipe-hash>/README.sh` before
 `recovery/README.sh`.
 
-The legacy operation instead creates exactly
-`recovery/legacy-migration/recipes/<recipe-hash>/README.sh` before
-`recovery/legacy-migration/README.sh`. It is never selected automatically by
-backup push. Both flavors use create-only writes: retries accept only
-byte-identical objects, and differing bytes are never overwritten.
+Writes are create-only: retries accept only byte-identical objects, and
+differing bytes are never overwritten.
 
 Inspection does not open or modify a pond. It validates the latest reference,
 canonical manifest, every physical object hash and size, every Parquet schema,
 every ordered logical file/table leaf hash, and each logical series root.
 
-Import accepts only a nonexistent target. It constructs a private sibling
+Inspection and import accept only `pondcapsule.4`; obsolete capsule formats
+are rejected. Import accepts only a nonexistent target. It constructs a private sibling
 staging pond with a fresh identity, persistently suppresses post-commit
 factories and automatic pushes, and atomically promotes the target only after
 an exact logical comparison. The importer currently leaves active-remote
