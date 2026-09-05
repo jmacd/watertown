@@ -50,8 +50,8 @@ pub use capsule_import::{CapsuleImportProvenance, CapsuleImportReport, import_ca
 pub use content_diff::{ContentComparison, ContentDiff, DiffKind, compare_content_trees};
 pub use content_objects::{ObjectInventory, ObjectKind, inventory_content_objects};
 pub use content_pull::{
-    FetchedGraph, FetchedObject, FetchedSeriesV2, RebuildOutcome, fetch_object_graph, import_graft,
-    import_pond, rebuild_pond, replace_graft,
+    FetchedGraph, FetchedObject, FetchedSeriesV2, RebuildOutcome, fetch_object_graph,
+    fetch_object_graph_since, import_graft, import_pond, rebuild_pond, replace_graft,
 };
 pub use content_push::{
     ContentPushOutcome, open_and_push_to_remote_limited, push_content_to_remote,

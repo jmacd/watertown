@@ -319,6 +319,7 @@ struct ReadCounts {
     blob_bytes: AtomicU64,
     blob_requests: Mutex<Vec<ObjectHash>>,
     object_bytes: AtomicU64,
+    object_requests: Mutex<Vec<ObjectHash>>,
     pack_index_bytes: AtomicU64,
 }
 
@@ -368,6 +369,11 @@ impl ContentSource for CountingSource<'_> {
     }
 
     async fn get_object(&self, hash: ObjectHash) -> Result<Option<Vec<u8>>, StewardError> {
+        self.counts
+            .object_requests
+            .lock()
+            .expect("object_requests lock")
+            .push(hash);
         let value = ContentSource::get_object(self.inner, hash).await?;
         if let Some(bytes) = &value {
             let _ = self
@@ -613,6 +619,85 @@ async fn push_includes_ancestry_across_multiple_local_commits() {
     assert!(
         graph.commits.len() >= 3,
         "two unpushed local commits must not break the remote commit chain"
+    );
+}
+
+#[tokio::test]
+async fn incremental_fetch_bounds_ancestry_at_known_tip() {
+    let (_t, mut src) = new_pond("bounded-ancestry-src").await;
+    write_file(&mut src, "/initial.txt", b"initial").await;
+    write_file(&mut src, "/baseline.txt", b"baseline").await;
+    let (_rt, mut remote) = push(&src).await;
+    let old_tip = remote
+        .get_tip("main")
+        .await
+        .expect("read old tip")
+        .expect("old tip");
+    let old_commit_bytes = remote
+        .get_object(old_tip)
+        .await
+        .expect("read old commit")
+        .expect("old commit");
+    let old_parent = sync_store::content::Commit::decode(&old_commit_bytes)
+        .expect("decode old commit")
+        .parent_commit_hash
+        .expect("old parent");
+
+    write_file(&mut src, "/next.txt", b"next").await;
+    repush(&src, &mut remote).await;
+
+    let source = CountingSource::new(&remote);
+    let graph = steward::fetch_object_graph_since(&source, "main", Some(old_tip))
+        .await
+        .expect("fetch bounded ancestry");
+
+    assert_eq!(
+        graph.commits.len(),
+        2,
+        "one new commit plus the known boundary must be fetched"
+    );
+    assert_eq!(
+        graph.commits.last().map(|(hash, _)| *hash),
+        Some(old_tip),
+        "the known ancestor must be included as the fast-forward proof boundary"
+    );
+    assert!(
+        !source
+            .counts
+            .object_requests
+            .lock()
+            .unwrap()
+            .contains(&old_parent),
+        "no commit older than the durable prior tip may be requested"
+    );
+}
+
+#[tokio::test]
+async fn incremental_fetch_walks_to_genesis_when_ancestry_boundary_is_absent() {
+    let (_t, mut src) = new_pond("missing-ancestry-boundary-src").await;
+    write_file(&mut src, "/initial.txt", b"initial").await;
+    write_file(&mut src, "/next.txt", b"next").await;
+    let (_rt, remote) = push(&src).await;
+    let unrelated = ObjectHash::of_bytes(b"not a commit in this source");
+
+    let graph = steward::fetch_object_graph_since(&remote, "main", Some(unrelated))
+        .await
+        .expect("fetch complete ancestry");
+
+    assert!(
+        graph
+            .commits
+            .iter()
+            .all(|(commit_hash, _)| *commit_hash != unrelated),
+        "an unrelated boundary must not be accepted as ancestry"
+    );
+    assert_eq!(
+        graph
+            .commits
+            .last()
+            .map(|(_, commit)| commit.parent_commit_hash),
+        Some(None),
+        "a missing boundary must force the authenticated walk to genesis"
     );
 }
 
