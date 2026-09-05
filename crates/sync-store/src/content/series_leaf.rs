@@ -7,7 +7,7 @@
 //! and [`super::manifest`]: it turns project-owned logical content -- a
 //! schema, an ordered run of [`RecordBatch`] rows, or an appended file byte
 //! range -- into stable bytes and a `blake3` leaf hash. It knows nothing about
-//! Delta Lake, Parquet, Bao outboards, packs, or the `watertown.series.v1` root object
+//! Delta Lake, Parquet, Bao outboards, packs, or the `watertown.series.v2` root object
 //! that will later chain these leaves together; those are later delivery
 //! gates. Physical encoding never contributes: chunking a `RecordBatch`
 //! differently, or storing a string column dictionary-encoded instead of
@@ -53,7 +53,7 @@
 //!   min/max-event-time presence flags, and length-prefixed canonical logical
 //!   attributes.
 //!
-//! Decoding (and therefore the `watertown.series.v1` root object, packs, readers, and
+//! Decoding (and therefore the `watertown.series.v2` root object, packs, readers, and
 //! migration) is out of scope for this gate; only the pure, one-directional
 //! encode-and-hash path is implemented and tested here.
 
@@ -72,28 +72,13 @@ use super::{ObjectHash, push_len_prefixed, push_len_prefixed_u64};
 
 /// Magic header for canonical schema bytes (the input to [`schema_fingerprint`]).
 const SCHEMA_MAGIC: &[u8] = b"watertown.series-schema.v1\n";
-const LEGACY_SCHEMA_MAGIC: &[u8] = b"dp.series-schema.1\n";
 
 /// Magic header for the canonical table-row payload.
 const ROWS_MAGIC: &[u8] = b"watertown.series-rows.v1\n";
-const LEGACY_ROWS_MAGIC: &[u8] = b"dp.series-rows.1\n";
 
 /// Domain-separation tag for a leaf preimage, exactly as specified in
 /// `docs/logical-series-identity-design.md`.
 const LEAF_MAGIC: &[u8] = b"watertown.series-leaf.v1\n";
-const LEGACY_LEAF_MAGIC: &[u8] = b"dp.series-leaf.1\n";
-
-pub(crate) const fn legacy_leaf_magic() -> &'static [u8] {
-    LEGACY_LEAF_MAGIC
-}
-
-pub(crate) const fn legacy_schema_magic() -> &'static [u8] {
-    LEGACY_SCHEMA_MAGIC
-}
-
-pub(crate) const fn legacy_rows_magic() -> &'static [u8] {
-    LEGACY_ROWS_MAGIC
-}
 
 /// `payload_kind` byte for a table leaf.
 ///
@@ -101,7 +86,7 @@ pub(crate) const fn legacy_rows_magic() -> &'static [u8] {
 /// value is part of a hashed wire format and must never move just because an
 /// unrelated enum gains or reorders variants, so it is minted fresh here.
 ///
-/// `pub(crate)`: [`super::series_manifest`]'s `watertown.series.v1` root object
+/// `pub(crate)`: [`super::series_manifest`]'s `watertown.series.v2` root object
 /// records the same payload kind at the series level, and must use this exact
 /// wire value rather than mint a second, potentially-divergent encoding of
 /// "table or file".

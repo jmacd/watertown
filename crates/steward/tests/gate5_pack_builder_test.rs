@@ -172,7 +172,6 @@ async fn file_series_repack_layouts_fetch_identical_logical_content() {
     let root = sync_store::content::merkle_root(&leaf_hashes);
     let manifest = SeriesManifest::new(
         PayloadKind::File,
-        None,
         bytes.len() as u64,
         leaf_lens.len() as u64,
         None,
@@ -291,7 +290,6 @@ async fn table_series_repack_layouts_fetch_identical_logical_content() {
     let leaf_row_counts = [5usize, 7, 8];
     assert_eq!(leaf_row_counts.iter().sum::<usize>(), rows.len());
 
-    let fingerprint = sync_store::content::schema_fingerprint(&schema).expect("fingerprint");
     let mut leaves = Vec::with_capacity(leaf_row_counts.len());
     let mut offset = 0usize;
     for &count in &leaf_row_counts {
@@ -309,7 +307,6 @@ async fn table_series_repack_layouts_fetch_identical_logical_content() {
     let root = sync_store::content::merkle_root(&leaf_hashes);
     let manifest = SeriesManifest::new(
         PayloadKind::Table,
-        Some(fingerprint),
         rows.len() as u64,
         leaf_row_counts.len() as u64,
         None,

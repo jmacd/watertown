@@ -6,7 +6,7 @@ usage() {
     printf '%s\n' \
         "usage: sh $0 CAPSULE NEW_DESTINATION [WHEELHOUSE]" \
         "" \
-        "Verifies and materializes a pondcapsule.2 without Pond." \
+        "Verifies and materializes a pondcapsule.4 without Pond." \
         "Set PYTHON to override python3.13 and RECOVERY_VENV to choose the venv." \
         "If WHEELHOUSE is given, package installation is strictly offline." >&2
     exit 2
@@ -36,8 +36,8 @@ command -v "$PYTHON" >/dev/null 2>&1 || {
     printf '%s\n' "$PYTHON is not installed; Python 3.13 is required" >&2
     exit 2
 }
-"$PYTHON" -c 'import sys; raise SystemExit(sys.version_info < (3, 13))' || {
-    printf '%s\n' "$PYTHON is older than the required Python 3.13" >&2
+"$PYTHON" -c 'import sys; raise SystemExit(sys.version_info[:2] != (3, 13))' || {
+    printf '%s\n' "$PYTHON must be Python 3.13 for the locked recovery dependencies" >&2
     exit 2
 }
 

@@ -6,7 +6,7 @@
 //! --collapse-versions N` (`docs/logical-series-identity-design.md`).
 //!
 //! This module never rewrites or deletes an Oplog append row, never
-//! changes a `watertown.series.v1` manifest/tree/commit root, Delta version, or txn
+//! changes a `watertown.series.v2` manifest/tree/commit root, Delta version, or txn
 //! sequence, and never changes logical metadata. What it *does* do is
 //! discover native v2 series whose current physical representation is
 //! fragmented past a requested threshold and publish a smaller, bounded set
@@ -24,7 +24,7 @@
 //! series' already-committed logical content, never a replacement for the
 //! Oplog rows themselves. [`crate::content_tree::build_series_manifest`]
 //! (the exact same fold every push/verify path uses) is called on the
-//! series' live rows to get the untouched, canonical `watertown.series.v1`
+//! series' live rows to get the untouched, canonical `watertown.series.v2`
 //! manifest; every leaf hash a fresh pack claims is recomputed from the
 //! real, live-fetched content and checked against that persisted leaf hash
 //! before it is trusted (requirement 3's "recompute/verify"); and the
@@ -87,7 +87,8 @@ use tinyfs::{EntryType, FileID};
 use tokio::io::AsyncReadExt;
 
 use sync_store::content::{
-    ObjectHash, PackIndex, PackLeafDescriptor, SeriesManifest, effective_leaf_schema_fingerprint,
+    ObjectHash, PackIndex, PackLeafDescriptor, PackObjectSpan, SeriesManifest,
+    effective_leaf_schema_fingerprint,
 };
 
 use crate::{StewardError, content_pull, content_tree, pack_store};
@@ -152,7 +153,7 @@ pub enum PackCandidateOutcome {
 pub struct PackMaintenanceCandidate {
     /// The series node's identity.
     pub file_id: FileID,
-    /// The series' `watertown.series.v1` manifest hash, or `None` for
+    /// The series' `watertown.series.v2` manifest hash, or `None` for
     /// [`PackCandidateOutcome::UnsupportedLegacy`] (a pre-v2 series has no
     /// v2 manifest to hash).
     pub series_hash: Option<ObjectHash>,
@@ -735,7 +736,7 @@ impl FileObjectAccumulator {
         &mut self,
         pond_root: &Path,
         mut chunk: &[u8],
-        physical_object_hashes: &mut Vec<ObjectHash>,
+        object_spans: &mut Vec<PackObjectSpan>,
         objects_written: &mut usize,
         bytes_written: &mut u64,
     ) -> Result<(), StewardError> {
@@ -745,13 +746,8 @@ impl FileObjectAccumulator {
             self.buf.extend_from_slice(&chunk[..take]);
             chunk = &chunk[take..];
             if self.buf.len() == self.cap {
-                self.flush(
-                    pond_root,
-                    physical_object_hashes,
-                    objects_written,
-                    bytes_written,
-                )
-                .await?;
+                self.flush(pond_root, object_spans, objects_written, bytes_written)
+                    .await?;
             }
         }
         Ok(())
@@ -760,7 +756,7 @@ impl FileObjectAccumulator {
     async fn flush(
         &mut self,
         pond_root: &Path,
-        physical_object_hashes: &mut Vec<ObjectHash>,
+        object_spans: &mut Vec<PackObjectSpan>,
         objects_written: &mut usize,
         bytes_written: &mut u64,
     ) -> Result<(), StewardError> {
@@ -770,7 +766,14 @@ impl FileObjectAccumulator {
         let bytes = std::mem::take(&mut self.buf);
         let len = bytes.len() as u64;
         let (hash, wrote) = pack_store::write_pack_object(pond_root, &bytes).await?;
-        physical_object_hashes.push(hash);
+        let end = self
+            .total_bytes
+            .checked_add(len)
+            .ok_or_else(|| StewardError::Content("file pack span overflow".to_string()))?;
+        object_spans.push(
+            PackObjectSpan::new(hash, self.total_bytes, end, self.total_bytes, end)
+                .map_err(StewardError::Content)?,
+        );
         // Unconditional: this object's actual bytes are part of the pack's
         // final physical footprint whether or not this run had to write
         // them anew.
@@ -786,17 +789,12 @@ impl FileObjectAccumulator {
     async fn finish(
         &mut self,
         pond_root: &Path,
-        physical_object_hashes: &mut Vec<ObjectHash>,
+        object_spans: &mut Vec<PackObjectSpan>,
         objects_written: &mut usize,
         bytes_written: &mut u64,
     ) -> Result<(), StewardError> {
-        self.flush(
-            pond_root,
-            physical_object_hashes,
-            objects_written,
-            bytes_written,
-        )
-        .await
+        self.flush(pond_root, object_spans, objects_written, bytes_written)
+            .await
     }
 }
 
@@ -840,7 +838,7 @@ async fn repack_file_series(
 
     let mut whole_series_leaf_hashes = Vec::with_capacity(leaf_versions.len());
     let mut leaf_descriptors = Vec::with_capacity(leaf_versions.len());
-    let mut physical_object_hashes: Vec<ObjectHash> = Vec::new();
+    let mut object_spans: Vec<PackObjectSpan> = Vec::new();
     let mut objects_written = 0usize;
     let mut bytes_written = 0u64;
     let cap = usize::try_from(FILE_PACK_MAX_BYTES_PER_OBJECT).unwrap_or(usize::MAX);
@@ -887,7 +885,7 @@ async fn repack_file_series(
                     .feed(
                         pond_root,
                         &bytes,
-                        &mut physical_object_hashes,
+                        &mut object_spans,
                         &mut objects_written,
                         &mut bytes_written,
                     )
@@ -915,7 +913,7 @@ async fn repack_file_series(
                         .feed(
                             pond_root,
                             &buf[..n],
-                            &mut physical_object_hashes,
+                            &mut object_spans,
                             &mut objects_written,
                             &mut bytes_written,
                         )
@@ -933,7 +931,8 @@ async fn repack_file_series(
             )));
         }
 
-        let descriptor = PackLeafDescriptor::new(
+        let descriptor = PackLeafDescriptor::new_with_leaf_hash(
+            recomputed,
             logical_count,
             v.meta.min_event_time,
             v.meta.max_event_time,
@@ -947,7 +946,7 @@ async fn repack_file_series(
     accumulator
         .finish(
             pond_root,
-            &mut physical_object_hashes,
+            &mut object_spans,
             &mut objects_written,
             &mut bytes_written,
         )
@@ -962,12 +961,12 @@ async fn repack_file_series(
     // output, not derived from input sizes, so it stays correct even if
     // that ever changes.
     let physical_byte_count = accumulator.total_bytes;
-    let final_physical_objects = physical_object_hashes.len();
+    let final_physical_objects = object_spans.len();
 
     let index = finish_pack_index(
         series,
         whole_series_leaf_hashes,
-        physical_object_hashes,
+        object_spans,
         leaf_descriptors,
         physical_byte_count,
     )?;
@@ -988,7 +987,9 @@ async fn flush_table_object(
     pond_root: &Path,
     schema: &Arc<Schema>,
     pending: &mut Vec<RecordBatch>,
-    physical_object_hashes: &mut Vec<ObjectHash>,
+    object_spans: &mut Vec<PackObjectSpan>,
+    pending_rows: u64,
+    logical_cursor: u64,
     objects_written: &mut usize,
     bytes_written: &mut u64,
     physical_byte_count: &mut u64,
@@ -1001,13 +1002,28 @@ async fn flush_table_object(
     pending.clear();
     let len = bytes.len() as u64;
     let (hash, wrote) = pack_store::write_pack_object(pond_root, &bytes).await?;
-    physical_object_hashes.push(hash);
+    let logical_start = logical_cursor
+        .checked_sub(pending_rows)
+        .ok_or_else(|| StewardError::Content("table pack logical span underflow".to_string()))?;
+    let physical_end = physical_byte_count
+        .checked_add(len)
+        .ok_or_else(|| StewardError::Content("table pack physical span overflow".to_string()))?;
+    object_spans.push(
+        PackObjectSpan::new(
+            hash,
+            logical_start,
+            logical_cursor,
+            *physical_byte_count,
+            physical_end,
+        )
+        .map_err(StewardError::Content)?,
+    );
     // Unconditional: this object's actual encoded Parquet bytes are part of
     // the pack's real final physical footprint whether or not this run had
     // to write them anew -- this, not the original leaves' `blob_size`, is
     // `physical_byte_count` (requirement 1); a table repack re-encodes
     // Parquet, so the two can differ.
-    *physical_byte_count += len;
+    *physical_byte_count = physical_end;
     if wrote {
         *objects_written += 1;
         *bytes_written += len;
@@ -1064,7 +1080,7 @@ async fn repack_table_series(
 
     let mut whole_series_leaf_hashes = Vec::with_capacity(leaf_versions.len());
     let mut leaf_descriptors = Vec::with_capacity(leaf_versions.len());
-    let mut physical_object_hashes: Vec<ObjectHash> = Vec::new();
+    let mut object_spans: Vec<PackObjectSpan> = Vec::new();
     let mut physical_byte_count: u64 = 0;
     let mut objects_written = 0usize;
     let mut bytes_written = 0u64;
@@ -1073,6 +1089,7 @@ async fn repack_table_series(
     let mut current_schema_fingerprint: Option<ObjectHash> = None;
     let mut pending_batches: Vec<RecordBatch> = Vec::new();
     let mut pending_rows: u64 = 0;
+    let mut logical_cursor: u64 = 0;
     // Incremental, proportional estimate of `pending_batches`' real
     // in-memory footprint: `RecordBatch::get_array_memory_size()` reports
     // a zero-copy slice's *entire underlying buffer* size, not a
@@ -1095,24 +1112,15 @@ async fn repack_table_series(
                 series.file_id.node_id()
             ))
         })?;
-        if series.manifest.revision() == sync_store::content::SeriesManifestRevision::V1
-            && series.manifest.schema_fingerprint() != Some(leaf_schema_fingerprint)
-        {
-            return Err(StewardError::Content(format!(
-                "leaf-bearing table series version {} has schema fingerprint \
-                 {leaf_schema_fingerprint}, which does not match the v1 manifest's homogeneous \
-                 fingerprint {:?}",
-                v.version,
-                series.manifest.schema_fingerprint()
-            )));
-        }
         if current_schema_fingerprint != Some(leaf_schema_fingerprint) {
             if let Some(schema) = canonical_schema.as_ref() {
                 flush_table_object(
                     pond_root,
                     schema,
                     &mut pending_batches,
-                    &mut physical_object_hashes,
+                    &mut object_spans,
+                    pending_rows,
+                    logical_cursor,
                     &mut objects_written,
                     &mut bytes_written,
                     &mut physical_byte_count,
@@ -1222,12 +1230,11 @@ async fn repack_table_series(
         }
 
         whole_series_leaf_hashes.push(leaf_input.leaf_hash());
-        leaf_descriptors.push(match series.manifest.revision() {
-            sync_store::content::SeriesManifestRevision::V1 => leaf_input.descriptor().clone(),
-            sync_store::content::SeriesManifestRevision::V2 => leaf_input
+        leaf_descriptors.push(
+            leaf_input
                 .descriptor()
                 .with_schema_fingerprint(leaf_schema_fingerprint),
-        });
+        );
 
         for batch in leaf_input.batches() {
             let total = batch.num_rows();
@@ -1243,6 +1250,9 @@ async fn repack_table_series(
                 if take > 0 {
                     pending_batches.push(batch.slice(offset, take));
                     pending_rows += take as u64;
+                    logical_cursor = logical_cursor.checked_add(take as u64).ok_or_else(|| {
+                        StewardError::Content("table pack logical span overflow".to_string())
+                    })?;
                     pending_bytes_estimate += batch_mem * (take as u64) / (total as u64).max(1);
                     offset += take;
                 }
@@ -1253,7 +1263,9 @@ async fn repack_table_series(
                         pond_root,
                         &schema,
                         &mut pending_batches,
-                        &mut physical_object_hashes,
+                        &mut object_spans,
+                        pending_rows,
+                        logical_cursor,
                         &mut objects_written,
                         &mut bytes_written,
                         &mut physical_byte_count,
@@ -1276,19 +1288,21 @@ async fn repack_table_series(
         pond_root,
         &schema,
         &mut pending_batches,
-        &mut physical_object_hashes,
+        &mut object_spans,
+        pending_rows,
+        logical_cursor,
         &mut objects_written,
         &mut bytes_written,
         &mut physical_byte_count,
     )
     .await?;
 
-    let final_physical_objects = physical_object_hashes.len();
+    let final_physical_objects = object_spans.len();
 
     let index = finish_pack_index(
         series,
         whole_series_leaf_hashes,
-        physical_object_hashes,
+        object_spans,
         leaf_descriptors,
         physical_byte_count,
     )?;
@@ -1320,7 +1334,7 @@ async fn repack_table_series(
 fn finish_pack_index(
     series: &DiscoveredSeries,
     whole_series_leaf_hashes: Vec<ObjectHash>,
-    physical_object_hashes: Vec<ObjectHash>,
+    object_spans: Vec<PackObjectSpan>,
     leaf_descriptors: Vec<PackLeafDescriptor>,
     physical_byte_count: u64,
 ) -> Result<PackIndex, StewardError> {
@@ -1342,32 +1356,18 @@ fn finish_pack_index(
     .map_err(StewardError::Content)?;
     let range_root = series.manifest.leaf_merkle_root();
 
-    let index = match series.manifest.revision() {
-        sync_store::content::SeriesManifestRevision::V1 => PackIndex::new(
-            series.series_hash,
-            0,
-            total_leaf_count,
-            total_leaf_count,
-            range_root,
-            range_proof,
-            physical_object_hashes,
-            series.manifest.logical_count(),
-            physical_byte_count,
-            leaf_descriptors,
-        ),
-        sync_store::content::SeriesManifestRevision::V2 => PackIndex::new_v2(
-            series.series_hash,
-            0,
-            total_leaf_count,
-            total_leaf_count,
-            range_root,
-            range_proof,
-            physical_object_hashes,
-            series.manifest.logical_count(),
-            physical_byte_count,
-            leaf_descriptors,
-        ),
-    }
+    let index = PackIndex::new_with_spans(
+        series.series_hash,
+        0,
+        total_leaf_count,
+        total_leaf_count,
+        range_root,
+        range_proof,
+        object_spans,
+        series.manifest.logical_count(),
+        physical_byte_count,
+        leaf_descriptors,
+    )
     .map_err(StewardError::Content)?;
 
     sync_store::content::verify_pack_against_manifest(

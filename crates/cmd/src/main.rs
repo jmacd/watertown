@@ -206,17 +206,17 @@ enum CapsuleCommand {
         #[command(subcommand)]
         command: CapsuleRecipeCommand,
     },
-    /// Verify a downloaded logical pondcapsule.1/2 without opening a pond.
+    /// Verify a downloaded pondcapsule.4 without opening a pond.
     Inspect {
         /// Directory containing the downloaded `recovery/` tree.
         path: PathBuf,
     },
-    /// Verify a logical pondcapsule.1/2 and all leaf identities.
+    /// Verify a pondcapsule.4 and all leaf identities.
     Verify {
         /// Directory containing the downloaded `recovery/` tree.
         path: PathBuf,
     },
-    /// Import a logical or opaque legacy capsule into a brand-new pond.
+    /// Import a pondcapsule.4 into a brand-new pond.
     ///
     /// The target must not already exist. A private sibling staging
     /// directory is created next to it, given a fresh pond identity, and
@@ -241,36 +241,12 @@ enum CapsuleCommand {
 
 #[derive(Debug, Subcommand)]
 enum CapsuleRecipeCommand {
-    /// Install the target-format watertown.commit.v1 -> pondcapsule.4 recipe.
+    /// Install the watertown.commit.v1 -> pondcapsule.4 recipe.
     Publish {
         /// Backup attachment name.
         name: String,
     },
-    /// Verify the target-format watertown.commit.v1 -> pondcapsule.4 recipe.
-    Inspect {
-        /// Remote attachment name.
-        name: String,
-    },
-    /// Operate on the deliberate dp.commit.3 -> pondcapsule.legacy.1 migration recipe.
-    LegacyMigration {
-        #[command(subcommand)]
-        command: LegacyMigrationRecipeCommand,
-    },
-    /// Operate on the metadata-preserving dp.commit.3 -> pondcapsule.legacy.2 recipe.
-    LegacyMigrationV2 {
-        #[command(subcommand)]
-        command: LegacyMigrationRecipeCommand,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum LegacyMigrationRecipeCommand {
-    /// Install the legacy-migration recipe without overwriting differences.
-    Publish {
-        /// Backup attachment name.
-        name: String,
-    },
-    /// Verify both objects in the recovery/legacy-migration namespace.
+    /// Verify the watertown.commit.v1 -> pondcapsule.4 recipe.
     Inspect {
         /// Remote attachment name.
         name: String,
@@ -822,43 +798,15 @@ async fn main() -> Result<()> {
         },
         Commands::Capsule { command } => match command {
             CapsuleCommand::Recipe { command } => {
-                let (name, flavor, action) = match command {
-                    CapsuleRecipeCommand::Publish { name } => (
-                        name,
-                        steward::RecoveryRecipeFlavor::TargetFormat,
-                        commands::RecoveryRecipeAction::Publish,
-                    ),
-                    CapsuleRecipeCommand::Inspect { name } => (
-                        name,
-                        steward::RecoveryRecipeFlavor::TargetFormat,
-                        commands::RecoveryRecipeAction::Inspect,
-                    ),
-                    CapsuleRecipeCommand::LegacyMigration { command } => match command {
-                        LegacyMigrationRecipeCommand::Publish { name } => (
-                            name,
-                            steward::RecoveryRecipeFlavor::LegacyMigration,
-                            commands::RecoveryRecipeAction::Publish,
-                        ),
-                        LegacyMigrationRecipeCommand::Inspect { name } => (
-                            name,
-                            steward::RecoveryRecipeFlavor::LegacyMigration,
-                            commands::RecoveryRecipeAction::Inspect,
-                        ),
-                    },
-                    CapsuleRecipeCommand::LegacyMigrationV2 { command } => match command {
-                        LegacyMigrationRecipeCommand::Publish { name } => (
-                            name,
-                            steward::RecoveryRecipeFlavor::LegacyMigrationV2,
-                            commands::RecoveryRecipeAction::Publish,
-                        ),
-                        LegacyMigrationRecipeCommand::Inspect { name } => (
-                            name,
-                            steward::RecoveryRecipeFlavor::LegacyMigrationV2,
-                            commands::RecoveryRecipeAction::Inspect,
-                        ),
-                    },
+                let (name, action) = match command {
+                    CapsuleRecipeCommand::Publish { name } => {
+                        (name, commands::RecoveryRecipeAction::Publish)
+                    }
+                    CapsuleRecipeCommand::Inspect { name } => {
+                        (name, commands::RecoveryRecipeAction::Inspect)
+                    }
                 };
-                commands::capsule_recipe_command(&ship_context, &name, flavor, action).await
+                commands::capsule_recipe_command(&ship_context, &name, action).await
             }
             CapsuleCommand::Inspect { path } | CapsuleCommand::Verify { path } => {
                 commands::capsule_inspect_command(&path)
@@ -1067,68 +1015,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_explicit_legacy_migration_recipe_commands() {
-        let publish = Cli::try_parse_from([
-            "pond",
-            "capsule",
-            "recipe",
-            "legacy-migration",
-            "publish",
-            "backup",
-        ])
-        .unwrap();
-        assert!(matches!(
-            publish.command,
-            Commands::Capsule {
-                command: CapsuleCommand::Recipe {
-                    command: CapsuleRecipeCommand::LegacyMigration {
-                        command: LegacyMigrationRecipeCommand::Publish { ref name }
-                    }
-                }
-            } if name == "backup"
-        ));
-
-        let inspect = Cli::try_parse_from([
-            "pond",
-            "capsule",
-            "recipe",
-            "legacy-migration",
-            "inspect",
-            "backup",
-        ])
-        .unwrap();
-        assert!(matches!(
-            inspect.command,
-            Commands::Capsule {
-                command: CapsuleCommand::Recipe {
-                    command: CapsuleRecipeCommand::LegacyMigration {
-                        command: LegacyMigrationRecipeCommand::Inspect { ref name }
-                    }
-                }
-            } if name == "backup"
-        ));
-    }
-
-    #[test]
-    fn parses_metadata_preserving_legacy_migration_recipe_commands() {
-        let publish = Cli::try_parse_from([
-            "pond",
-            "capsule",
-            "recipe",
-            "legacy-migration-v2",
-            "publish",
-            "backup",
-        ])
-        .unwrap();
-        assert!(matches!(
-            publish.command,
-            Commands::Capsule {
-                command: CapsuleCommand::Recipe {
-                    command: CapsuleRecipeCommand::LegacyMigrationV2 {
-                        command: LegacyMigrationRecipeCommand::Publish { ref name }
-                    }
-                }
-            } if name == "backup"
-        ));
+    fn rejects_removed_legacy_recipe_namespace() {
+        for namespace in ["legacy-migration", "legacy-migration-v2"] {
+            assert!(
+                Cli::try_parse_from(["pond", "capsule", "recipe", namespace, "publish", "backup",])
+                    .is_err()
+            );
+        }
     }
 }

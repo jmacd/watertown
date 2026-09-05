@@ -96,6 +96,31 @@ async fn publish_upstream(tmp: &TempDir, name: &str) -> String {
     url
 }
 
+async fn publish_large_upstream(tmp: &TempDir, name: &str) -> String {
+    const TWO_MIB: usize = 2 * 1024 * 1024;
+
+    let producer = tmp.path().join(format!("producer-{name}"));
+    let url = sync_store::testing::in_memory_remote_url(name);
+    let ctx = ctx_for(&producer, vec!["pond", "init"]);
+    init_command(&ctx, "producer-host")
+        .await
+        .expect("init producer");
+    write_small_file(&ctx, "/large.bin", &vec![0xA5; TWO_MIB])
+        .await
+        .expect("write large file");
+    apply_yaml(
+        &ctx,
+        tmp.path(),
+        &governed_backup_yaml_with_burst(&url, 1024, 100_000, 8),
+    )
+    .await
+    .expect("apply producer backup");
+    push_command(&ctx, Some("origin".to_string()))
+        .await
+        .expect("publish large upstream");
+    url
+}
+
 /// A pull-mode attachment governed by a byte and an ops limiter.
 fn governed_pull_yaml(url: &str, mib_per_day: u64, ops_per_hour: u64) -> String {
     format!(
@@ -136,6 +161,15 @@ spec:
 }
 
 fn governed_backup_yaml(url: &str, mib_per_day: u64, ops_per_hour: u64) -> String {
+    governed_backup_yaml_with_burst(url, mib_per_day, ops_per_hour, 2)
+}
+
+fn governed_backup_yaml_with_burst(
+    url: &str,
+    mib_per_day: u64,
+    ops_per_hour: u64,
+    byte_burst_mib: u64,
+) -> String {
     format!(
         r#"version: v1
 kind: mknod
@@ -146,7 +180,7 @@ spec:
   config:
     unit: MiB/day
     limit: {mib_per_day}
-    burst: 2
+    burst: {byte_burst_mib}
 ---
 version: v1
 kind: mknod
@@ -168,6 +202,7 @@ spec:
   limits:
     bytes: /sys/limits/backup-bytes
     ops: /sys/limits/backup-ops
+  overwrite: true
 "#
     )
 }
@@ -263,6 +298,40 @@ async fn apply_creates_a_governed_backup_in_one_document() {
     push_command(&ctx, Some("origin".to_string()))
         .await
         .expect("push under a generous budget must succeed");
+}
+
+#[tokio::test]
+async fn reapplying_an_unchanged_governed_backup_is_a_noop() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let pond = tmp.path().join("pond");
+    let url = sync_store::testing::in_memory_remote_url("apply-governed-noop");
+    let yaml = governed_backup_yaml(&url, 100, 10_000);
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "test-host").await.expect("init");
+
+    apply_yaml(&ctx, tmp.path(), &yaml)
+        .await
+        .expect("first apply");
+    let before_steward = ctx.open_pond().await.expect("open before");
+    let before = before_steward
+        .as_pond()
+        .expect("pond steward")
+        .last_write_seq();
+
+    apply_yaml(&ctx, tmp.path(), &yaml)
+        .await
+        .expect("second apply");
+    let after_steward = ctx.open_pond().await.expect("open after");
+    let after = after_steward
+        .as_pond()
+        .expect("pond steward")
+        .last_write_seq();
+
+    assert_eq!(
+        after, before,
+        "an unchanged remote apply must not create a config commit"
+    );
 }
 
 /// The monitoring API reports one bounded row per configured limiter without
@@ -470,10 +539,7 @@ async fn a_missing_limiter_node_is_refused() {
         .await
         .expect("write");
 
-    // The attachment is well-formed, so it applies; the *push* is what
-    // discovers the budget does not exist -- and refuses rather than
-    // proceeding ungoverned.
-    apply_yaml(
+    let err = apply_yaml(
         &ctx,
         tmp.path(),
         &format!(
@@ -482,14 +548,16 @@ async fn a_missing_limiter_node_is_refused() {
         ),
     )
     .await
-    .expect("apply");
-
-    let err = push_command(&ctx, Some("origin".to_string()))
-        .await
-        .expect_err("push with a missing limiter must be refused");
+    .expect_err("attach with a missing limiter must be refused");
     assert!(
         format!("{err:#}").contains("does-not-exist"),
         "unexpected error: {err:#}"
+    );
+
+    let mut ship = ctx.open_pond().await.expect("open");
+    assert!(
+        list_remote_names(&mut ship).await.expect("list").is_empty(),
+        "a refused attachment must leave no trace"
     );
 }
 
@@ -1476,6 +1544,44 @@ async fn an_applied_pull_remote_is_actually_governed() {
     assert!(
         msg.contains("rate limit") || msg.contains("retry in"),
         "expected a rate-limit refusal, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn a_pull_refuses_a_blob_larger_than_the_remaining_byte_burst() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let url = publish_large_upstream(&tmp, "pull-byte-refused").await;
+    let key = sync_store::RemoteKey::new(&url);
+    let observed_before = sync_store::observed_under(&key).1;
+
+    let pond = tmp.path().join("consumer");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+
+    // The daily allowance is generous, but governed_pull_yaml's 1 MiB burst
+    // cannot admit the upstream's 2 MiB blob in one response.
+    apply_yaml(&ctx, tmp.path(), &governed_pull_yaml(&url, 100, 100_000))
+        .await
+        .expect("apply");
+
+    let err = pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect_err("pull must be refused by the byte burst");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("rate limit") || msg.contains("retry in"),
+        "expected a typed rate-limit refusal, got: {msg}"
+    );
+    assert!(
+        msg.contains("/sys/limits/pull-bytes"),
+        "the oversized body must be refused by the byte limiter, not an unrelated budget: {msg}"
+    );
+
+    let observed_after = sync_store::observed_under(&key).1;
+    assert!(
+        observed_after.saturating_sub(observed_before) < 2 * 1024 * 1024,
+        "the oversized blob body must not be consumed before refusal"
     );
 }
 

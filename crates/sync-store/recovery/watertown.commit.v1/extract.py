@@ -140,12 +140,7 @@ def decode_commit(data: bytes) -> dict[str, Any]:
 
 def decode_manifest(data: bytes) -> list[dict[str, Any]]:
     cur = Cursor(data)
-    if data.startswith(b"watertown.manifest.v1\n"):
-        cur.tag(b"watertown.manifest.v1\n")
-    elif data.startswith(b"dp.manifest.2\n"):
-        cur.tag(b"dp.manifest.2\n")
-    else:
-        raise FormatError("expected native manifest magic watertown.manifest.v1 or dp.manifest.2")
+    cur.tag(b"watertown.manifest.v1\n")
     entries = []
     for _ in range(cur.u32()):
         node_id, parent, name = cur.text(), cur.text(), cur.text()
@@ -173,12 +168,7 @@ def decode_manifest(data: bytes) -> list[dict[str, Any]]:
 
 def decode_tree(data: bytes) -> list[dict[str, Any]]:
     cur = Cursor(data)
-    if data.startswith(b"watertown.tree.v1\n"):
-        cur.tag(b"watertown.tree.v1\n")
-    elif data.startswith(b"dp.tree.2\n"):
-        cur.tag(b"dp.tree.2\n")
-    else:
-        raise FormatError("expected native tree magic watertown.tree.v1 or dp.tree.2")
+    cur.tag(b"watertown.tree.v1\n")
     entries = []
     for _ in range(cur.u32()):
         name = cur.text()
@@ -202,30 +192,10 @@ def decode_tree(data: bytes) -> list[dict[str, Any]]:
 
 def decode_series(data: bytes) -> dict[str, Any]:
     cur = Cursor(data)
-    if data.startswith(b"dp.series.1\n"):
-        cur.tag(b"dp.series.1\n")
-        result = {
-            "format": "dp.series.1",
-            "hashes": [cur.hash() for _ in range(cur.u32())],
-        }
-        cur.finish()
-        return result
-    if data.startswith(b"watertown.series.v1\n"):
-        revision, magic = 1, b"watertown.series.v1\n"
-    elif data.startswith(b"watertown.series.v2\n"):
-        revision, magic = 2, b"watertown.series.v2\n"
-    else:
-        raise FormatError(
-            "expected series magic dp.series.1, watertown.series.v1, or "
-            "watertown.series.v2"
-        )
-    cur.tag(magic)
+    cur.tag(b"watertown.series.v2\n")
     kind = cur.u8()
     if kind not in (0, 1):
         raise FormatError(f"unsupported series payload kind {kind}")
-    schema = cur.take(cur.u32()) if revision == 1 else b""
-    if revision == 1 and len(schema) not in (0, 32):
-        raise FormatError("series schema fingerprint must be 0 or 32 bytes")
     logical_count = struct.unpack("<Q", cur.take(8))[0]
     leaf_count = struct.unpack("<Q", cur.take(8))[0]
     flags = cur.u8()
@@ -241,20 +211,14 @@ def decode_series(data: bytes) -> dict[str, Any]:
         raise FormatError(
             "series logical_count and leaf_count must both be zero or both be nonzero"
         )
-    if revision == 1 and ((kind == 0 and not schema) or (kind == 1 and schema)):
-        raise FormatError(
-            "a v1 table series requires a schema fingerprint and a file series forbids one"
-        )
     empty_root = _merkle_root([], __import__("blake3"))
     if (leaf_count == 0 and root != empty_root) or (
         leaf_count > 0 and root == empty_root
     ):
         raise FormatError("series leaf count and Merkle root disagree")
     result: dict[str, Any] = {
-        "format": f"watertown.series.v{revision}",
-        "revision": revision,
+        "format": "watertown.series.v2",
         "kind": "table" if kind == 0 else "file",
-        "schema_fingerprint": schema or None,
         "logical_count": logical_count,
         "leaf_count": leaf_count,
         "min_event_time": minimum,
@@ -310,16 +274,8 @@ def _decode_range_proof(data: bytes, total: int, start: int, end: int) -> list[t
 
 
 def decode_pack(data: bytes) -> dict[str, Any]:
-    if data.startswith(b"watertown.series-pack.v1\n"):
-        revision, magic = 1, b"watertown.series-pack.v1\n"
-    elif data.startswith(b"watertown.series-pack.v2\n"):
-        revision, magic = 2, b"watertown.series-pack.v2\n"
-    else:
-        raise FormatError(
-            "expected pack magic watertown.series-pack.v1 or watertown.series-pack.v2"
-        )
     cur = Cursor(data)
-    cur.tag(magic)
+    cur.tag(b"watertown.series-pack.v2\n")
     series_hash = cur.hash()
     leaf_start, leaf_end, total_leaf_count = cur.u64(), cur.u64(), cur.u64()
     range_root = cur.hash()
@@ -331,8 +287,8 @@ def decode_pack(data: bytes) -> dict[str, Any]:
     descriptors = []
     for _ in range(cur.u32()):
         count = cur.u64()
-        schema = cur.take(cur.u32()) if revision == 2 else b""
-        if revision == 2 and len(schema) not in (0, 32):
+        schema = cur.take(cur.u32())
+        if len(schema) not in (0, 32):
             raise FormatError("pack leaf schema fingerprint must be 0 or 32 bytes")
         flags = cur.u8()
         if flags & ~0x03:
@@ -360,7 +316,6 @@ def decode_pack(data: bytes) -> dict[str, Any]:
     if descriptor_total > (1 << 64) - 1 or descriptor_total != logical_count:
         raise FormatError("pack descriptor counts do not equal pack logical_count")
     return {
-        "revision": revision,
         "series_hash": series_hash,
         "leaf_start": leaf_start,
         "leaf_end": leaf_end,
@@ -376,12 +331,7 @@ def decode_pack(data: bytes) -> dict[str, Any]:
 
 def decode_recipe(data: bytes) -> tuple[str, bytes]:
     cur = Cursor(data)
-    if data.startswith(b"watertown.recipe.v1\n"):
-        cur.tag(b"watertown.recipe.v1\n")
-    elif data.startswith(b"dp.recipe.1\n"):
-        cur.tag(b"dp.recipe.1\n")
-    else:
-        raise FormatError("expected native recipe magic watertown.recipe.v1 or dp.recipe.1")
+    cur.tag(b"watertown.recipe.v1\n")
     factory = cur.text()
     config = cur.take(len(data) - cur.offset)
     return factory, config
@@ -770,20 +720,16 @@ def _select_exact_cover(
 
 
 def _pack_schema_fingerprint(
-    series: dict[str, Any], pack: dict[str, Any], descriptor: dict[str, Any]
+    series: dict[str, Any], _pack: dict[str, Any], descriptor: dict[str, Any]
 ) -> bytes | None:
     if series["kind"] == "file":
         if descriptor["schema_fingerprint"] is not None:
             raise FormatError("file pack descriptor carries a schema fingerprint")
         return None
     descriptor_schema = descriptor["schema_fingerprint"]
-    if descriptor_schema is not None:
-        if series["schema_fingerprint"] is not None and descriptor_schema != series["schema_fingerprint"]:
-            raise FormatError("pack descriptor schema differs from its v1 series schema")
-        return descriptor_schema
-    if series["revision"] == 1 and pack["revision"] == 1:
-        return series["schema_fingerprint"]
-    raise FormatError("table pack descriptor is missing its required schema fingerprint")
+    if descriptor_schema is None:
+        raise FormatError("table pack descriptor is missing its required schema fingerprint")
+    return descriptor_schema
 
 
 class NativeBackup:
@@ -1073,10 +1019,9 @@ def _reconstruct_pack_leaves(
             "max_event_time": descriptor["max_event_time"],
             "logical_attributes": attributes,
         }
-        if series["revision"] == 2:
-            leaf["schema_fingerprint"] = _pack_schema_fingerprint(
-                series, pack, descriptor
-            ).hex()
+        leaf["schema_fingerprint"] = _pack_schema_fingerprint(
+            series, pack, descriptor
+        ).hex()
         leaves.append(leaf)
     return leaves
 
@@ -1144,10 +1089,7 @@ def _pack_stream_node(
         physical_byte_count += pack_bytes
         payload_paths.extend(pack_paths)
         selected_streams.append((pack, pack_paths))
-        descriptors.extend(
-            [{**descriptor, "_pack_revision": pack["revision"]}
-             for descriptor in pack["descriptors"]]
-        )
+        descriptors.extend(pack["descriptors"])
     if sum(descriptor["logical_count"] for descriptor in descriptors) != series["logical_count"]:
         raise FormatError(f"selected packs for {path} do not match the series logical count")
     if physical_byte_count < 1:
@@ -1239,7 +1181,7 @@ def _pack_stream_node(
                 if leaf_index >= len(descriptors):
                     raise FormatError(f"table pack for {path} has rows after its final leaf")
                 expected = _pack_schema_fingerprint(
-                    series, {"revision": descriptors[leaf_index]["_pack_revision"]},
+                    series, {},
                     descriptors[leaf_index],
                 )
                 if fingerprint != expected:
@@ -1251,7 +1193,7 @@ def _pack_stream_node(
                             raise FormatError(f"table pack for {path} has rows after its final leaf")
                         expected = _pack_schema_fingerprint(
                             series,
-                            {"revision": descriptors[leaf_index]["_pack_revision"]},
+                            {},
                             descriptors[leaf_index],
                         )
                         if fingerprint != expected:
@@ -1280,7 +1222,7 @@ def _pack_stream_node(
         hashers = []
         for descriptor, length in zip(descriptors, canonical_lengths):
             fingerprint = _pack_schema_fingerprint(
-                series, {"revision": descriptor["_pack_revision"]}, descriptor
+                series, {}, descriptor
             )
             payload_size = len(b"watertown.series-rows.v1\n") + 8 + length
             digest = blake3.blake3()
@@ -1316,10 +1258,9 @@ def _pack_stream_node(
                 "max_event_time": descriptor["max_event_time"],
                 "logical_attributes": attributes,
             }
-            if series["revision"] == 2:
-                leaf["schema_fingerprint"] = _pack_schema_fingerprint(
-                    series, {"revision": descriptor["_pack_revision"]}, descriptor
-                ).hex()
+            leaf["schema_fingerprint"] = _pack_schema_fingerprint(
+                series, {}, descriptor
+            ).hex()
             leaves.append(leaf)
 
     offset = 0
@@ -1337,7 +1278,7 @@ def _pack_stream_node(
     if series["kind"] == "table":
         for leaf, descriptor in zip(leaves, descriptors):
             leaf["schema_fingerprint"] = _pack_schema_fingerprint(
-                series, {"revision": descriptor["_pack_revision"]}, descriptor
+                series, {}, descriptor
             ).hex()
     min_event_time = min(
         (leaf["min_event_time"] for leaf in leaves if leaf["min_event_time"] is not None),
@@ -1357,8 +1298,6 @@ def _pack_stream_node(
         if series["kind"] == "table"
         and len(leaf_schemas) == 1
         and None not in leaf_schemas
-        else series["schema_fingerprint"].hex()
-        if series["schema_fingerprint"] is not None
         else None
     )
     result = {
@@ -1718,70 +1657,6 @@ def _extract_graph(source: Path, destination: Path, ref_name: str | None,
         return capsule_root
 
 
-def verify_fixtures(path: Path) -> None:
-    fixture = json.loads(path.read_text())
-    legacy_commit_bytes = bytes.fromhex(fixture["commit_hex"])
-    commit_bytes = b"watertown.commit.v1\n\x01" + legacy_commit_bytes[len(b"dp.commit.3\n"):]
-    manifest_bytes = bytes.fromhex(fixture["manifest_hex"])
-    tree_bytes = bytes.fromhex(fixture["tree_hex"])
-    series_bytes = bytes.fromhex(fixture["series_hex"])
-    recipe_bytes = bytes.fromhex(fixture["recipe_hex"])
-    commit = decode_commit(commit_bytes)
-    assert commit["pond_id"] == "pond-x" and commit["seq"] == -7
-    assert commit["parent_commit_hash"] == bytes(range(32, 64))
-    manifest = decode_manifest(manifest_bytes)
-    assert [entry["node_id"] for entry in manifest] == ["node-file", "root"]
-    assert manifest[0]["versions"][0]["extended_attributes"] == '{"a":1}'
-    assert manifest[0]["versions"][1]["timestamp"] == 124
-    tree = decode_tree(tree_bytes)
-    assert len(tree) == 1 and tree[0]["name"] == "data.bin"
-    assert tree[0]["versions"] == manifest[0]["versions"]
-    assert decode_series(series_bytes) == {
-        "format": "dp.series.1",
-        "hashes": [bytes(range(64, 96)), bytes(range(96, 128))],
-    }
-    assert decode_recipe(recipe_bytes) == ("factory-x", b"\0\xffconfig")
-
-    malformed = [
-        (decode_commit, commit_bytes + b"\0"),
-        (decode_manifest, manifest_bytes[:-1]),
-        (decode_tree, tree_bytes + b"\0"),
-        (decode_series, series_bytes[:-1]),
-        (decode_recipe, b"not-a-recipe"),
-    ]
-    for decoder, value in malformed:
-        try:
-            decoder(value)
-        except FormatError:
-            pass
-        else:
-            raise AssertionError(f"{decoder.__name__} accepted malformed input")
-    for attributes in ('{"fraction":1.5}', '{"too_large":18446744073709551616}'):
-        try:
-            canonical_attributes(attributes)
-        except FormatError:
-            pass
-        else:
-            raise AssertionError("canonical attributes accepted unsupported numbers")
-
-    with tempfile.TemporaryDirectory(prefix="watertown-extract-test-") as temporary:
-        root = Path(temporary)
-        source = root / "source"
-        destination = root / "destination"
-        source.mkdir()
-        destination.mkdir()
-        (source / "source").write_text("source")
-        (destination / "destination").write_text("destination")
-        try:
-            _rename_no_replace(source, destination)
-        except FormatError:
-            pass
-        else:
-            raise AssertionError("no-replace promotion accepted an existing destination")
-        assert (source / "source").read_text() == "source"
-        assert (destination / "destination").read_text() == "destination"
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", nargs="?", type=Path)
@@ -1790,13 +1665,8 @@ def main() -> int:
     selector.add_argument("--ref")
     selector.add_argument("--commit")
     parser.add_argument("--birthplace")
-    parser.add_argument("--verify-fixtures", type=Path)
     args = parser.parse_args()
     try:
-        if args.verify_fixtures is not None:
-            verify_fixtures(args.verify_fixtures)
-            print("native fixtures verified")
-            return 0
         if args.source is None or args.destination is None or args.birthplace is None:
             parser.error("source, destination, and --birthplace are required for extraction")
         if args.ref is None and args.commit is None:

@@ -20,6 +20,8 @@
 use crate::common::ShipContext;
 use anyhow::{Result, anyhow};
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::sync::Arc;
 use steward::{
     ContentSource, REMOTE_MODE_PREFIX, REMOTE_MOUNT_PATH_PREFIX, SYS_DIR, SYS_REMOTES_DIR,
 };
@@ -29,6 +31,43 @@ use tokio::io::AsyncWriteExt;
 // Re-export the types that moved to steward so existing callers using
 // `commands::remote::{RemoteAttachment, RemoteMode}` keep working.
 pub use steward::{RemoteAttachment, RemoteMode};
+
+#[derive(Debug)]
+struct AttachmentProbeMeter;
+
+impl sync_store::StorageMeter for AttachmentProbeMeter {
+    fn check(&self, _ops: u64, _bytes: u64) -> std::result::Result<(), String> {
+        Ok(())
+    }
+
+    fn record(&self, _ops: u64, _bytes: u64) {}
+}
+
+async fn run_remote_probe<T>(
+    url: &str,
+    operation: impl Future<Output = sync_store::Result<T>>,
+) -> sync_store::Result<T> {
+    // Attachment validation is a one-time operator action, not part of the
+    // configured recurring push/pull allowance. Bind it explicitly so its
+    // provider traffic is observed but cannot become arrears that poison the
+    // first scheduled operation.
+    let key = sync_store::RemoteKey::new(url);
+    let binding = sync_store::bind_meter(&key, Arc::new(AttachmentProbeMeter));
+    let outcome = operation.await;
+    drop(binding);
+    outcome
+}
+
+fn remote_is_uninitialized(error: &sync_store::StoreError) -> bool {
+    matches!(
+        error,
+        sync_store::StoreError::Delta(
+            deltalake::DeltaTableError::NotATable(_)
+                | deltalake::DeltaTableError::NotInitialized
+                | deltalake::DeltaTableError::InvalidTableLocation(_)
+        )
+    )
+}
 
 /// Filter passed to [`list_remotes_command`] for displaying a subset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,6 +268,25 @@ pub async fn attach_remote(
     let mode_str = mode.as_str();
 
     let mut ship = ship_context.open_pond().await?;
+    let existing_attachment_yaml = match load_remote_attachment(&mut ship, name).await {
+        Ok(existing) => Some(
+            serde_yaml::to_string(&existing)
+                .map_err(|e| anyhow!("failed to serialize existing remote `{name}`: {e}"))?,
+        ),
+        Err(_) => None,
+    };
+    let existing_mode = ship
+        .control_table()
+        .raw_config_get(&format!("{REMOTE_MODE_PREFIX}{name}"))
+        .await
+        .map_err(|e| anyhow!("failed to read mode for remote `{name}`: {e}"))?
+        .unwrap_or_else(|| RemoteMode::Push.as_str().to_string());
+    let existing_mount = ship
+        .control_table()
+        .raw_config_get(&format!("{REMOTE_MOUNT_PATH_PREFIX}{name}"))
+        .await
+        .map_err(|e| anyhow!("failed to read mount for remote `{name}`: {e}"))?
+        .unwrap_or_default();
 
     let watermark_migration = if migrate_watermark {
         Some(prepare_watermark_migration(&mut ship, name, url, mode, mount_path, overwrite).await?)
@@ -277,6 +335,15 @@ pub async fn attach_remote(
             .ok_or_else(|| anyhow!("attach requires a pond steward (not a host steward)"))?;
         steward::storage_profile::prepare_storage(pond, &attachment).await?
     };
+    let limit_spec = attachment.resolved_limits()?;
+    {
+        let pond = ship
+            .as_pond_mut()
+            .ok_or_else(|| anyhow!("attach requires a pond steward (not a host steward)"))?;
+        let _limits = steward::LimiterSet::open(pond, &limit_spec)
+            .await
+            .map_err(|e| anyhow!("bind limiters for remote `{name}`: {e}"))?;
+    }
     let is_import = mode == RemoteMode::Pull && matches!(mount_path, Some(p) if p != "/");
     if is_import {
         // Cross-pond import: content-addressed pull (graph fetch + foreign-pond
@@ -305,8 +372,11 @@ pub async fn attach_remote(
                 }
             }
         } else {
-            match sync_store::ContentRemote::open_at_url(&attachment.url, storage_options.clone())
-                .await
+            match run_remote_probe(
+                &attachment.url,
+                sync_store::ContentRemote::open_at_url(&attachment.url, storage_options.clone()),
+            )
+            .await
             {
                 Ok(remote) => {
                     verify_watermark_destination(
@@ -317,9 +387,9 @@ pub async fn attach_remote(
                     .await?;
                     remote.pond_id()
                 }
-                Err(_) => {
+                Err(error) => {
                     return Err(anyhow!(
-                        "remote `{}` at {} is not a content remote; pull-mode remotes must \
+                        "remote `{}` at {} is not a content remote ({error}); pull-mode remotes must \
                          point at an existing pond. The consumer cannot initialize an empty \
                          upstream remote.",
                         name,
@@ -347,7 +417,11 @@ pub async fn attach_remote(
         );
     } else {
         // Mirror restart, backup, or push/both: content-addressed remote.
-        match sync_store::ContentRemote::open_at_url(&attachment.url, storage_options.clone()).await
+        match run_remote_probe(
+            &attachment.url,
+            sync_store::ContentRemote::open_at_url(&attachment.url, storage_options.clone()),
+        )
+        .await
         {
             Ok(remote) => {
                 if remote.pond_id() != local_pond_id {
@@ -369,19 +443,22 @@ pub async fn attach_remote(
                     local_pond_id
                 );
             }
-            Err(_) if mode == RemoteMode::Pull => {
+            Err(error) if mode == RemoteMode::Pull => {
                 return Err(anyhow!(
-                    "remote `{}` at {} is not a content remote; pull-mode mirrors must point at \
+                    "remote `{}` at {} is not a content remote ({error}); pull-mode mirrors must point at \
                      an existing pond. The consumer cannot initialize an empty upstream remote.",
                     name,
                     attachment.url
                 ));
             }
-            Err(_) => {
-                let _ = sync_store::ContentRemote::create_at_url(
+            Err(error) if remote_is_uninitialized(&error) => {
+                let _ = run_remote_probe(
                     &attachment.url,
-                    local_pond_id,
-                    storage_options,
+                    sync_store::ContentRemote::create_at_url(
+                        &attachment.url,
+                        local_pond_id,
+                        storage_options,
+                    ),
                 )
                 .await
                 .map_err(|e| {
@@ -399,7 +476,26 @@ pub async fn attach_remote(
                     local_pond_id
                 );
             }
+            Err(error) => {
+                return Err(anyhow!(
+                    "failed to inspect remote `{}` at {}: {}",
+                    name,
+                    attachment.url,
+                    error
+                ));
+            }
         }
+    }
+
+    let mount_value = mount_path.unwrap_or("");
+    if overwrite
+        && !migrate_watermark
+        && existing_attachment_yaml.as_deref() == Some(yaml.as_str())
+        && existing_mode == mode_str
+        && existing_mount == mount_value
+    {
+        log::info!("remote {} already has the requested configuration", name);
+        return Ok(());
     }
 
     // Record the operating mode BEFORE the data write commits.  The
@@ -418,7 +514,6 @@ pub async fn attach_remote(
     // this; push/both leave it empty so a future `pond remote add`
     // -overwriting- a backup with a pull entry starts from a clean slate.
     let mount_key = format!("{REMOTE_MOUNT_PATH_PREFIX}{name}");
-    let mount_value = mount_path.unwrap_or("");
     ship.control_table_mut()
         .raw_config_set(&mount_key, mount_value)
         .await
@@ -758,40 +853,42 @@ async fn validate_no_foreign_store_id_collision(
         if existing_name == new_name {
             continue;
         }
-        let attachment = match load_remote_attachment(ship, &existing_name).await {
-            Ok(a) => a,
-            Err(_) => continue,
-        };
+        let attachment = load_remote_attachment(ship, &existing_name)
+            .await
+            .map_err(|e| anyhow!("read existing remote `{existing_name}`: {e}"))?;
         let mode_str = ship
             .control_table()
             .raw_config_get(&format!("{REMOTE_MODE_PREFIX}{existing_name}"))
             .await
             .map_err(|e| anyhow!("read mode for `{}`: {}", existing_name, e))?
             .unwrap_or_else(|| "push".to_string());
-        let parsed_mode = match RemoteMode::parse(&mode_str) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
+        let parsed_mode = RemoteMode::parse(&mode_str)
+            .map_err(|e| anyhow!("parse mode for existing remote `{existing_name}`: {e}"))?;
         if parsed_mode != RemoteMode::Pull {
             continue;
         }
         // Probe the existing remote to learn its store_id.
-        let pond = match ship.as_pond_mut() {
-            Some(p) => p,
-            None => continue,
-        };
-        let storage_options =
-            match steward::storage_profile::prepare_storage(pond, &attachment).await {
-                Ok(o) => o,
-                // A probe that cannot be configured tells us nothing about a
-                // mount conflict; the attachment's own validation reports it.
-                Err(_) => continue,
-            };
-        let existing_store_id =
-            match sync_store::ContentRemote::open_at_url(&attachment.url, storage_options).await {
-                Ok(r) => r.pond_id(),
-                Err(_) => continue,
-            };
+        let pond = ship
+            .as_pond_mut()
+            .ok_or_else(|| anyhow!("remote collision check requires a pond steward"))?;
+        let storage_options = steward::storage_profile::prepare_storage(pond, &attachment)
+            .await
+            .map_err(|e| anyhow!("configure existing remote `{existing_name}`: {e}"))?;
+        let _ = attachment
+            .resolved_limits()
+            .map_err(|e| anyhow!("existing remote `{existing_name}`: {e}"))?;
+        let existing = run_remote_probe(
+            &attachment.url,
+            sync_store::ContentRemote::open_at_url(&attachment.url, storage_options),
+        )
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "probe existing pull remote `{existing_name}` at {}: {e}",
+                attachment.url
+            )
+        })?;
+        let existing_store_id = existing.pond_id();
         if existing_store_id == new_store_id {
             if overwrite {
                 return Err(anyhow!(
@@ -1000,20 +1097,17 @@ pub async fn list_remotes_command(
         "NAME", "URL", "MODE", "MOUNT", "PUSHED_TIP", "PULLED_TIP"
     );
     for name in entries {
-        let attachment = match load_remote_attachment(&mut ship, &name).await {
-            Ok(a) => a,
-            Err(e) => {
-                log::warn!("[WARN] could not read /sys/remotes/{}: {}", name, e);
-                continue;
-            }
-        };
+        let attachment = load_remote_attachment(&mut ship, &name)
+            .await
+            .map_err(|error| anyhow!("could not read /sys/remotes/{name}: {error}"))?;
         let mode = ship
             .control_table()
             .raw_config_get(&format!("{REMOTE_MODE_PREFIX}{name}"))
             .await
-            .unwrap_or_default()
+            .map_err(|error| anyhow!("could not read mode for remote `{name}`: {error}"))?
             .unwrap_or_else(|| "push".to_string());
-        let parsed_mode = RemoteMode::parse(&mode).unwrap_or(RemoteMode::Push);
+        let parsed_mode = RemoteMode::parse(&mode)
+            .map_err(|error| anyhow!("could not read mode for remote `{name}`: {error}"))?;
         match filter {
             Some(RemoteListFilter::BackupsOnly) if !parsed_mode.pushes() => continue,
             _ => {}
@@ -1022,20 +1116,24 @@ pub async fn list_remotes_command(
             .control_table()
             .raw_config_get(&format!("{REMOTE_MOUNT_PATH_PREFIX}{name}"))
             .await
-            .unwrap_or_default()
+            .map_err(|error| anyhow!("could not read mount for remote `{name}`: {error}"))?
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "-".to_string());
         let pushed_tip = short_tip(
             ship.control_table()
                 .raw_config_get(&format!("last_pushed_tip:{}", attachment.url))
                 .await
-                .unwrap_or_default(),
+                .map_err(|error| {
+                    anyhow!("could not read pushed tip for remote `{name}`: {error}")
+                })?,
         );
         let pulled_tip = short_tip(
             ship.control_table()
                 .raw_config_get(&format!("last_pulled_tip:{}", attachment.url))
                 .await
-                .unwrap_or_default(),
+                .map_err(|error| {
+                    anyhow!("could not read pulled tip for remote `{name}`: {error}")
+                })?,
         );
         println!(
             "{:<20} {:<50} {:<6} {:<20} {:<18} {:<18}",

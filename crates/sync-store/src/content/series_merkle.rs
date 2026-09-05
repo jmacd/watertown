@@ -4,7 +4,7 @@
 //! hashes, and contiguous range membership proofs over it.
 //!
 //! `docs/logical-series-identity-design.md` delivery gate 2. This module
-//! knows nothing about `watertown.series.v1` root objects, `watertown.series-pack.v1` pack
+//! knows nothing about `watertown.series.v2` root objects, `watertown.series-pack.v2` pack
 //! indexes, Parquet, or Bao; it is pure, order-sensitive Merkle math over an
 //! already-computed ordered list of leaf hashes (each produced by
 //! [`super::series_leaf::table_leaf_hash`] or
@@ -344,7 +344,7 @@ pub fn verify_range_proof(
 /// [`expected_positions`] exactly, in order, with no extras or omissions.
 /// Shared by [`decode_range_proof`] (strict decode), [`verify_range_proof`]
 /// (defense in depth for a [`RangeProof`] built or mutated without going
-/// through decode), and [`super::series_pack::PackIndex::new`] (so a pack
+/// through decode), and [`super::series_pack::PackIndex::new_with_spans`] (so a pack
 /// index directly constructed, rather than decoded, gets the identical
 /// shape check).
 ///

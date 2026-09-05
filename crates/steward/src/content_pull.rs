@@ -28,11 +28,11 @@ use parquet::file::reader::ChunkReader;
 
 use crate::content_source::ContentSource;
 use sync_store::content::{
-    Commit, FetchedSeriesObject, IncrementalFileLeafHasher, ManifestEntry, ObjectHash, PackIndex,
-    PackLeafDescriptor, PayloadKind, SeriesManifest, TreeEntry, VersionMeta,
-    decode_fetched_series_object, decode_manifest, decode_recipe, decode_tree,
-    effective_leaf_schema_fingerprint, encode_table_leaf_parquet, schema_fingerprint,
-    select_exact_cover, table_leaf_hash_canonical, verify_pack_against_manifest,
+    Commit, IncrementalFileLeafHasher, ManifestEntry, ObjectHash, PackIndex, PackLeafDescriptor,
+    PackObjectSpan, PayloadKind, SeriesManifest, TreeEntry, VersionMeta, decode_manifest,
+    decode_recipe, decode_tree, effective_leaf_schema_fingerprint, encode_table_leaf_parquet,
+    schema_fingerprint, select_exact_cover, table_leaf_hash_canonical,
+    verify_pack_against_manifest,
 };
 use tinyfs::{EntryType, NodeID, WD};
 use tlogfs::PondUserMetadata;
@@ -48,43 +48,29 @@ pub enum FetchedObject {
     Tree(Vec<TreeEntry>),
     /// A leaf blob: a file version's bytes, a symlink target, or recipe bytes.
     Blob(Vec<u8>),
-    /// A multi-version series: its ordered version blob hashes.
-    Series(Vec<ObjectHash>),
     /// A large leaf blob that lives out-of-row in the remote blob store and is
     /// deliberately *not* buffered (Decision D7).  Its bytes are streamed from
     /// the remote straight into the local writer at rebuild time, keyed by this
     /// object's hash; only its presence is recorded here.
     External,
-    /// A verified `watertown.series.v1` logical series
+    /// A verified `watertown.series.v2` logical series
     /// (`docs/logical-series-identity-design.md` delivery gate 4).
     ///
     /// By the time this variant exists in [`FetchedGraph::objects`], the
-    /// series manifest, every advertised pack candidate, every physical
-    /// object the selected exact cover names, and every logical leaf hash
-    /// recomputed from real decoded content have all been fetched and
-    /// cryptographically verified against each other (see
-    /// [`fetch_series_v2`]). Planning/apply code dispatches this variant to
-    /// native v2 materialization ([`plan_series_v2_leaves`]/
-    /// [`materialize_series_v2`]) rather than ever reinterpreting it as a
-    /// v1 [`FetchedObject::Series`] (see [`series_versions`], which rejects
-    /// this variant defensively since it must never be reached for one).
+    /// series manifest and selected v3 pack metadata have been fetched and
+    /// authenticated. Physical objects remain unfetched until materialization
+    /// knows the destination's durable logical prefix.
     SeriesV2(Box<FetchedSeriesV2>),
 }
 
-/// The immutable, verified state of one fetched `watertown.series.v1` logical series:
-/// enough information for a future v2 materializer to rebuild it, without
-/// this delivery gate implementing that rebuild itself.
+/// The immutable, verified state of one fetched `watertown.series.v2` logical series.
 ///
-/// Every field here has already been cryptographically bound to every other:
-/// `leaf_hashes` were recomputed from the real decoded content of
-/// `physical_object_hashes` (per the packs in `packs`), each pack was checked
-/// with [`verify_pack_against_manifest`] against `manifest`, and `manifest`
-/// is the object that hashed to `manifest_hash` (the same hash the owning
-/// `TreeEntry.child_hash` named). See [`fetch_series_v2`] for exactly how
-/// this is built.
+/// `leaf_hashes` come from v3 descriptors whose range proofs were verified
+/// against `manifest`. Physical pack objects are intentionally not fetched
+/// until materialization, after the destination prefix has been validated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchedSeriesV2 {
-    /// The `watertown.series.v1` object's own content address -- the hash the owning
+    /// The `watertown.series.v2` object's own content address -- the hash the owning
     /// tree entry's `child_hash` named.
     pub manifest_hash: ObjectHash,
     /// The decoded series manifest.
@@ -95,16 +81,12 @@ pub struct FetchedSeriesV2 {
     /// `[0, manifest.leaf_count())` with no gap and no overlap.
     pub packs: Vec<(ObjectHash, PackIndex)>,
     /// Every logical leaf's identity hash, in leaf order across the whole
-    /// series (`0..manifest.leaf_count()`), recomputed from the selected
-    /// packs' real decoded physical content -- not merely copied from any
-    /// pack's own declared data.
+    /// series (`0..manifest.leaf_count()`), authenticated by each selected
+    /// pack's range proof against the manifest root.
     pub leaf_hashes: Vec<ObjectHash>,
     /// Every physical object hash the selected packs name, in first-seen
-    /// order across `packs`, deduplicated. Each one is also present in
-    /// [`FetchedGraph::objects`] as a [`FetchedObject::Blob`] or
-    /// [`FetchedObject::External`] entry, exactly like an ordinary v1
-    /// version blob, so a future materializer can reuse the same
-    /// inline/external adoption path apply already uses.
+    /// order across `packs`, deduplicated. These are metadata references only;
+    /// the corresponding payloads are fetched on demand during materialization.
     pub physical_object_hashes: Vec<ObjectHash>,
 }
 
@@ -180,23 +162,11 @@ pub async fn fetch_object_graph(
         return Ok(FetchedGraph::default());
     };
 
-    // Snapshot the whole `objects` partition once so every inline-object read
-    // below is an in-memory lookup rather than a per-hash full-table Delta scan
-    // (turns an O(objects x table-size) clone into a single scan).  The snapshot
-    // is per-operation: clear it before returning so a later read or re-pull
-    // never sees stale bytes.
-    remote
-        .preload_objects()
-        .await
-        .map_err(|e| StewardError::Content(e.to_string()))?;
-
-    let result = descend_from_tip(remote, tip).await;
-    remote.clear_object_cache();
-    result
+    descend_from_tip(remote, tip).await
 }
 
-/// Build the fetched graph from `tip`: walk the commit chain, then descend the
-/// tip commit's root tree.  Assumes the caller has preloaded the object cache.
+/// Build the fetched graph from `tip`: fetch the exact commits and metadata
+/// objects named by the tip, then descend its root tree.
 async fn descend_from_tip(
     remote: &dyn ContentSource,
     tip: ObjectHash,
@@ -228,10 +198,7 @@ async fn descend_from_tip(
     if let Some((_, tip_commit)) = graph.commits.first() {
         let root = tip_commit.root_tree_hash;
         let manifest_hash = tip_commit.node_manifest_hash;
-        // Populated on first use by `fetch_blob`, so a closure with no external
-        // blobs never spends a request asking about them.
-        let mut blob_index: Option<HashSet<ObjectHash>> = None;
-        fetch_tree(remote, root, &mut graph, &mut blob_index).await?;
+        fetch_tree(remote, root, &mut graph).await?;
         graph.manifest = fetch_manifest(remote, manifest_hash).await?;
     }
 
@@ -253,7 +220,6 @@ async fn fetch_tree(
     remote: &dyn ContentSource,
     tree_hash: ObjectHash,
     graph: &mut FetchedGraph,
-    blob_index: &mut Option<HashSet<ObjectHash>>,
 ) -> Result<(), StewardError> {
     // Iterative worklist to avoid async recursion on the directory tree.
     let mut stack = vec![tree_hash];
@@ -273,14 +239,7 @@ async fn fetch_tree(
             match entry.entry_type {
                 EntryType::DirectoryPhysical => stack.push(entry.child_hash),
                 EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries => {
-                    fetch_series(
-                        remote,
-                        entry.child_hash,
-                        entry.entry_type,
-                        graph,
-                        blob_index,
-                    )
-                    .await?;
+                    fetch_series(remote, entry.child_hash, entry.entry_type, graph).await?;
                 }
                 EntryType::FilePhysicalVersion
                 | EntryType::TablePhysicalVersion
@@ -288,7 +247,7 @@ async fn fetch_tree(
                 | EntryType::DirectoryDynamic
                 | EntryType::FileDynamic
                 | EntryType::TableDynamic => {
-                    fetch_blob(remote, entry.child_hash, graph, blob_index).await?;
+                    fetch_blob(remote, entry.child_hash, graph).await?;
                 }
             }
         }
@@ -296,20 +255,18 @@ async fn fetch_tree(
     Ok(())
 }
 
-/// Fetch a series object -- v1 (`dp.series.1`) or v2 (`watertown.series.v1`),
-/// dispatched by magic header -- and everything it names.
+/// Fetch a `watertown.series.v2` object and everything it names.
 ///
 /// `entry_type` is the owning tree entry's declared kind
-/// (`FilePhysicalSeries` or `TablePhysicalSeries`); for a v2 series it must
+/// (`FilePhysicalSeries` or `TablePhysicalSeries`); it must
 /// agree with the manifest's own [`PayloadKind`] (`docs/logical-series-
 /// identity-design.md` delivery gate 4), since nothing else ties a
-/// `watertown.series.v1` object's payload kind to the directory position naming it.
+/// `watertown.series.v2` object's payload kind to the directory position naming it.
 async fn fetch_series(
     remote: &dyn ContentSource,
     series_hash: ObjectHash,
     entry_type: EntryType,
     graph: &mut FetchedGraph,
-    blob_index: &mut Option<HashSet<ObjectHash>>,
 ) -> Result<(), StewardError> {
     if let Some(existing) = graph.objects.get(&series_hash) {
         return match existing {
@@ -325,43 +282,19 @@ async fn fetch_series(
                     Ok(())
                 }
             }
-            FetchedObject::Series(_) => Ok(()),
             _ => Err(StewardError::Content(format!(
                 "object {series_hash} was already fetched as a non-series object"
             ))),
         };
     }
     let bytes = fetch_verified(remote, series_hash).await?;
-    match decode_fetched_series_object(&bytes)
-        .map_err(|e| StewardError::Content(format!("decode series: {e}")))?
-    {
-        FetchedSeriesObject::V1(versions) => {
-            let _ = graph
-                .objects
-                .insert(series_hash, FetchedObject::Series(versions.clone()));
-            let _ = graph.bytes.insert(series_hash, bytes);
-            for version in versions {
-                fetch_blob(remote, version, graph, blob_index).await?;
-            }
-            Ok(())
-        }
-        FetchedSeriesObject::V2(manifest) => {
-            fetch_series_v2(
-                remote,
-                series_hash,
-                entry_type,
-                manifest,
-                bytes,
-                graph,
-                blob_index,
-            )
-            .await
-        }
-    }
+    let manifest = SeriesManifest::decode(&bytes)
+        .map_err(|e| StewardError::Content(format!("decode series: {e}")))?;
+    fetch_series_v2(remote, series_hash, entry_type, manifest, bytes, graph).await
 }
 
 /// Map a series-carrying tree entry type to the [`PayloadKind`] its
-/// `watertown.series.v1` manifest must declare.
+/// `watertown.series.v2` manifest must declare.
 ///
 /// Only ever called with a series entry type (the two callers -- [`fetch_tree`]'s
 /// match arm and [`fetch_series`] -- both guarantee that), so any other value
@@ -374,7 +307,7 @@ fn expected_payload_kind(entry_type: EntryType) -> PayloadKind {
     }
 }
 
-/// Fetch, discover, and fully verify a `watertown.series.v1` logical series
+/// Fetch, discover, and authenticate a `watertown.series.v2` logical series
 /// (`docs/logical-series-identity-design.md` delivery gate 4).
 ///
 /// This is the heart of the dual reader's v2 side. It:
@@ -385,21 +318,15 @@ fn expected_payload_kind(entry_type: EntryType) -> PayloadKind {
 ///    for this series, fetches and decodes each one (rejecting a malformed
 ///    or vanished candidate outright rather than silently skipping it);
 /// 3. chooses a deterministic exact cover with [`select_exact_cover`];
-/// 4. for every selected pack, in cover order, fetches every physical object
-///    it names (registering each as an ordinary [`FetchedObject::Blob`] or
-///    [`FetchedObject::External`] entry so a future materializer can reuse
-///    them exactly as apply already reuses v1 version blobs), decodes and
-///    concatenates them in order, partitions the result by the pack's
-///    [`PackLeafDescriptor`]s, and recomputes every logical leaf hash from
-///    that real content;
-/// 5. checks each pack with [`verify_pack_against_manifest`];
+/// 4. authenticates each pack's descriptor hashes and range proof against the
+///    independently fetched manifest, without fetching physical payloads;
+/// 5. records the authenticated descriptor hashes as the series leaf sequence;
 /// 6. checks that the selected packs' logical counts sum to
 ///    `manifest.logical_count()` and that their descriptors' aggregate
 ///    event-time bounds agree with the manifest's own aggregate bounds.
 ///
-/// Only after every one of those checks passes does this insert a
-/// [`FetchedObject::SeriesV2`] into `graph` -- verification happens
-/// completely before that insertion, never after.
+/// Payload bytes are fetched later by [`materialize_series_v2`], after
+/// [`plan_series_v2_leaves`] has verified the destination's durable prefix.
 async fn fetch_series_v2(
     remote: &dyn ContentSource,
     series_hash: ObjectHash,
@@ -407,7 +334,6 @@ async fn fetch_series_v2(
     manifest: SeriesManifest,
     manifest_bytes: Vec<u8>,
     graph: &mut FetchedGraph,
-    blob_index: &mut Option<HashSet<ObjectHash>>,
 ) -> Result<(), StewardError> {
     let expected_kind = expected_payload_kind(entry_type);
     if manifest.payload_kind() != expected_kind {
@@ -478,22 +404,21 @@ async fn fetch_series_v2(
         selected_packs.push((pack_hash, pack));
     }
 
-    // Fetch, decode, and verify every selected pack's physical content in
-    // cover order, recomputing real leaf hashes as we go.
+    // Authenticate every selected pack from metadata alone. Pack decoding
+    // already validates the descriptor hashes against its range proof and
+    // declared range root; this additional check binds that root to the
+    // independently fetched manifest.
     let mut all_leaf_hashes: Vec<ObjectHash> = Vec::with_capacity(manifest.leaf_count() as usize);
     let mut physical_object_hashes: Vec<ObjectHash> = Vec::new();
     let mut seen_physical: HashSet<ObjectHash> = HashSet::new();
     let mut total_logical: u64 = 0;
 
     for (pack_hash, pack) in &selected_packs {
-        let leaf_hashes = match manifest.payload_kind() {
-            PayloadKind::File => {
-                fetch_and_verify_file_pack(remote, pack, graph, blob_index).await?
-            }
-            PayloadKind::Table => {
-                fetch_and_verify_table_pack(remote, pack, &manifest, graph, blob_index).await?
-            }
-        };
+        let leaf_hashes: Vec<ObjectHash> = pack
+            .leaf_descriptors()
+            .iter()
+            .map(PackLeafDescriptor::logical_leaf_hash)
+            .collect();
         verify_pack_against_manifest(series_hash, &manifest, pack, &leaf_hashes).map_err(|e| {
             StewardError::Content(format!(
                 "pack {pack_hash} failed verification against series {series_hash}: {e}"
@@ -573,405 +498,6 @@ fn verify_aggregate_bounds(
     Ok(())
 }
 
-/// Fetch, register, and return one physical pack object's location: either
-/// its buffered bytes (inline) or a marker that it must be streamed
-/// (external), exactly the same duality [`fetch_blob`] already records for
-/// ordinary v1 version blobs -- reused here so pack physical objects are
-/// available for a future materializer through the identical apply-time
-/// path.
-async fn fetch_physical_object(
-    remote: &dyn ContentSource,
-    hash: ObjectHash,
-    graph: &mut FetchedGraph,
-    blob_index: &mut Option<HashSet<ObjectHash>>,
-) -> Result<(), StewardError> {
-    fetch_blob(remote, hash, graph, blob_index).await
-}
-
-/// Fetch, decode, and verify one file-payload pack
-/// (`docs/logical-series-identity-design.md` delivery gate 4): stream every
-/// physical object it names, in order, feeding the concatenated bytes into
-/// an [`IncrementalFileLeafHasher`]-per-leaf partitioner so a leaf that
-/// crosses a physical-object boundary is handled transparently and no
-/// physical object -- however large -- is ever buffered whole for an
-/// external blob.
-///
-/// Returns the pack's recomputed leaf hashes in order, ready for
-/// [`verify_pack_against_manifest`].
-async fn fetch_and_verify_file_pack(
-    remote: &dyn ContentSource,
-    pack: &PackIndex,
-    graph: &mut FetchedGraph,
-    blob_index: &mut Option<HashSet<ObjectHash>>,
-) -> Result<Vec<ObjectHash>, StewardError> {
-    let mut partitioner = FileLeafPartitioner::new(pack.leaf_descriptors());
-    let mut total_physical_bytes: u64 = 0;
-
-    for &object_hash in pack.physical_object_hashes() {
-        fetch_physical_object(remote, object_hash, graph, blob_index).await?;
-        match graph.objects.get(&object_hash) {
-            Some(FetchedObject::Blob(bytes)) => {
-                total_physical_bytes += bytes.len() as u64;
-                partitioner.feed(bytes)?;
-            }
-            Some(FetchedObject::External) => {
-                let mut reader = remote
-                    .get_blob_reader(object_hash)
-                    .await
-                    .map_err(|e| StewardError::Content(format!("stream physical object {object_hash}: {e}")))?
-                    .ok_or_else(|| {
-                        StewardError::Content(format!(
-                            "physical object {object_hash} vanished from the remote blob store during streaming"
-                        ))
-                    })?;
-                let mut hasher = blake3::Hasher::new();
-                let mut buf = vec![0u8; 256 * 1024];
-                loop {
-                    let n = reader.read(&mut buf).await.map_err(|e| {
-                        StewardError::Content(format!("read physical object {object_hash}: {e}"))
-                    })?;
-                    if n == 0 {
-                        break;
-                    }
-                    let _ = hasher.update(&buf[..n]);
-                    total_physical_bytes += n as u64;
-                    partitioner.feed(&buf[..n])?;
-                }
-                let computed = ObjectHash::from_bytes(*hasher.finalize().as_bytes());
-                if computed != object_hash {
-                    return Err(StewardError::Content(format!(
-                        "physical object hashes to {computed} but was fetched as {object_hash}"
-                    )));
-                }
-            }
-            other => {
-                return Err(StewardError::Content(format!(
-                    "expected a physical blob object at {object_hash} but found {other:?}"
-                )));
-            }
-        }
-    }
-    if total_physical_bytes != pack.physical_byte_count() {
-        return Err(StewardError::Content(format!(
-            "pack declares physical_byte_count {} but its physical objects total {total_physical_bytes} byte(s)",
-            pack.physical_byte_count()
-        )));
-    }
-    partitioner.finish()
-}
-
-/// Streaming partitioner for a file pack: consumes concatenated physical
-/// bytes in arbitrary chunks (which may cross leaf boundaries either way --
-/// several tiny leaves in one chunk, or one leaf spanning many chunks/objects)
-/// and produces exactly one recomputed leaf hash per descriptor, in order.
-struct FileLeafPartitioner<'a> {
-    descriptors: std::slice::Iter<'a, PackLeafDescriptor>,
-    current: Option<IncrementalFileLeafHasher>,
-    hashes: Vec<ObjectHash>,
-}
-
-impl<'a> FileLeafPartitioner<'a> {
-    fn new(descriptors: &'a [PackLeafDescriptor]) -> Self {
-        Self {
-            descriptors: descriptors.iter(),
-            current: None,
-            hashes: Vec::with_capacity(descriptors.len()),
-        }
-    }
-
-    fn feed(&mut self, mut chunk: &[u8]) -> Result<(), StewardError> {
-        while !chunk.is_empty() {
-            if self.current.is_none() {
-                let Some(descriptor) = self.descriptors.next() else {
-                    return Err(StewardError::Content(
-                        "file pack's physical content extends beyond its declared leaf descriptors (trailing bytes)"
-                            .to_string(),
-                    ));
-                };
-                let hasher = IncrementalFileLeafHasher::new(
-                    descriptor.logical_count(),
-                    descriptor.min_event_time(),
-                    descriptor.max_event_time(),
-                    descriptor.logical_attributes(),
-                )
-                .map_err(StewardError::Content)?;
-                self.current = Some(hasher);
-            }
-            let hasher = self.current.as_mut().expect("just set above");
-            let remaining = hasher.remaining();
-            let take = remaining.min(chunk.len() as u64) as usize;
-            hasher
-                .write(&chunk[..take])
-                .map_err(StewardError::Content)?;
-            chunk = &chunk[take..];
-            if hasher.remaining() == 0 {
-                let finished = self.current.take().expect("present, just written to");
-                self.hashes
-                    .push(finished.finish().map_err(StewardError::Content)?);
-            }
-        }
-        Ok(())
-    }
-
-    fn finish(mut self) -> Result<Vec<ObjectHash>, StewardError> {
-        if self.current.is_some() {
-            return Err(StewardError::Content(
-                "file pack's physical content ended mid-leaf (truncated)".to_string(),
-            ));
-        }
-        if self.descriptors.next().is_some() {
-            return Err(StewardError::Content(
-                "file pack's physical content is shorter than its declared leaf descriptors"
-                    .to_string(),
-            ));
-        }
-        Ok(self.hashes)
-    }
-}
-
-/// Fetch, decode, and verify one table-payload (Parquet) pack
-/// (`docs/logical-series-identity-design.md` delivery gate 4): decode every
-/// physical object in order and partition the concatenated,
-/// row-order-preserving `RecordBatch` stream by the pack's descriptors.
-/// Each object is checked against the effective schema fingerprint of the
-/// leaf currently being reconstructed. A schema transition is accepted only
-/// at a physical-object boundary.
-///
-/// Buffering here is bounded *per physical object*, not per pack:
-/// [`decode_table_object`] decodes one object's row groups into memory
-/// before this function feeds them onward, so a pack spanning many objects
-/// never holds more than one object's decoded rows at a time. Within that,
-/// [`TableLeafPartitioner`] itself buffers at most one logical leaf's
-/// batches while assembling its canonical row hash. A future refinement
-/// could stream row groups one at a time instead of a whole object, but a
-/// single Parquet physical object is already a bounded, individually-sized
-/// unit exactly like an ordinary v1 version blob -- never "the whole pack".
-///
-/// Returns the pack's recomputed leaf hashes in order, ready for
-/// [`verify_pack_against_manifest`].
-async fn fetch_and_verify_table_pack(
-    remote: &dyn ContentSource,
-    pack: &PackIndex,
-    manifest: &SeriesManifest,
-    graph: &mut FetchedGraph,
-    blob_index: &mut Option<HashSet<ObjectHash>>,
-) -> Result<Vec<ObjectHash>, StewardError> {
-    let mut partitioner = TableLeafPartitioner::new(manifest, pack);
-    let mut total_rows: u64 = 0;
-    let mut total_physical_bytes: u64 = 0;
-
-    for &object_hash in pack.physical_object_hashes() {
-        let expected_fingerprint = partitioner.expected_object_fingerprint()?;
-        fetch_physical_object(remote, object_hash, graph, blob_index).await?;
-        let (schema, batches) = match graph.objects.get(&object_hash) {
-            Some(FetchedObject::Blob(bytes)) => {
-                total_physical_bytes += bytes.len() as u64;
-                // Release blocker item 3
-                // (`docs/logical-series-identity-design.md`): check the
-                // running total against the pack's declared
-                // `physical_byte_count` before Parquet-decoding this
-                // object, so a malformed/oversized declaration fails fast
-                // rather than paying for decompression first.
-                if total_physical_bytes > pack.physical_byte_count() {
-                    return Err(StewardError::Content(format!(
-                        "pack declares physical_byte_count {} but its physical objects already \
-                         total at least {total_physical_bytes} byte(s) through object \
-                         {object_hash} -- aborting before decoding it",
-                        pack.physical_byte_count()
-                    )));
-                }
-                let source = bytes::Bytes::from(bytes.clone());
-                decode_table_object(source, expected_fingerprint)
-                    .await
-                    .map_err(|e| {
-                        StewardError::Content(format!("decode physical object {object_hash}: {e}"))
-                    })?
-            }
-            Some(FetchedObject::External) => {
-                let (file, byte_count) = spool_external_object(remote, object_hash).await?;
-                total_physical_bytes += byte_count;
-                // Same fail-fast check as the inline-blob arm above, applied
-                // to the actual spooled byte count rather than a trusted
-                // metadata field.
-                if total_physical_bytes > pack.physical_byte_count() {
-                    return Err(StewardError::Content(format!(
-                        "pack declares physical_byte_count {} but its physical objects already \
-                         total at least {total_physical_bytes} byte(s) through object \
-                         {object_hash} -- aborting before decoding it",
-                        pack.physical_byte_count()
-                    )));
-                }
-                decode_table_object(file, expected_fingerprint)
-                    .await
-                    .map_err(|e| {
-                        StewardError::Content(format!("decode physical object {object_hash}: {e}"))
-                    })?
-            }
-            other => {
-                return Err(StewardError::Content(format!(
-                    "expected a physical blob object at {object_hash} but found {other:?}"
-                )));
-            }
-        };
-        let canonical_schema =
-            sync_store::content::canonicalize_schema(&schema).map_err(StewardError::Content)?;
-        for batch in batches {
-            total_rows += batch.num_rows() as u64;
-            let mut columns = Vec::with_capacity(batch.num_columns());
-            for (column, field) in batch.columns().iter().zip(canonical_schema.fields()) {
-                columns.push(arrow_cast::cast(column, field.data_type()).map_err(|e| {
-                    StewardError::Content(format!(
-                        "normalize physical object {object_hash} column {:?}: {e}",
-                        field.name()
-                    ))
-                })?);
-            }
-            let normalized =
-                RecordBatch::try_new(Arc::clone(&canonical_schema), columns).map_err(|e| {
-                    StewardError::Content(format!(
-                        "normalize physical object {object_hash} schema: {e}"
-                    ))
-                })?;
-            partitioner.feed(normalized, expected_fingerprint)?;
-        }
-    }
-    if total_physical_bytes != pack.physical_byte_count() {
-        return Err(StewardError::Content(format!(
-            "pack declares physical_byte_count {} but its physical objects total {total_physical_bytes} byte(s)",
-            pack.physical_byte_count()
-        )));
-    }
-    if total_rows != pack.logical_count() {
-        return Err(StewardError::Content(format!(
-            "table pack decoded {total_rows} row(s) but declares logical_count {}",
-            pack.logical_count()
-        )));
-    }
-    partitioner.finish()
-}
-
-/// Streaming partitioner for a table pack: consumes decoded `RecordBatch`es
-/// in order, splitting them by each descriptor's row count (a leaf may span
-/// batches or physical objects), and produces exactly one recomputed leaf
-/// hash per descriptor. Holds at most one logical leaf's batches at a time.
-struct TableLeafPartitioner<'a> {
-    manifest: &'a SeriesManifest,
-    pack: &'a PackIndex,
-    descriptors: &'a [PackLeafDescriptor],
-    next_descriptor: usize,
-    current_descriptor: Option<usize>,
-    current_schema: Option<Arc<Schema>>,
-    current_batches: Vec<RecordBatch>,
-    current_rows: u64,
-    hashes: Vec<ObjectHash>,
-}
-
-impl<'a> TableLeafPartitioner<'a> {
-    fn new(manifest: &'a SeriesManifest, pack: &'a PackIndex) -> Self {
-        Self {
-            manifest,
-            pack,
-            descriptors: pack.leaf_descriptors(),
-            next_descriptor: 0,
-            current_descriptor: None,
-            current_schema: None,
-            current_batches: Vec::new(),
-            current_rows: 0,
-            hashes: Vec::with_capacity(pack.leaf_descriptors().len()),
-        }
-    }
-
-    fn descriptor_fingerprint(&self, descriptor_index: usize) -> Result<ObjectHash, StewardError> {
-        let descriptor = self.descriptors.get(descriptor_index).ok_or_else(|| {
-            StewardError::Content(
-                "table pack's physical content extends beyond its declared leaf descriptors"
-                    .to_string(),
-            )
-        })?;
-        effective_leaf_schema_fingerprint(self.manifest, self.pack, descriptor)
-            .map_err(StewardError::Content)?
-            .ok_or_else(|| {
-                StewardError::Content(
-                    "table pack leaf resolved to no effective schema fingerprint".to_string(),
-                )
-            })
-    }
-
-    fn expected_object_fingerprint(&self) -> Result<ObjectHash, StewardError> {
-        self.descriptor_fingerprint(self.current_descriptor.unwrap_or(self.next_descriptor))
-    }
-
-    fn feed(
-        &mut self,
-        mut batch: RecordBatch,
-        object_fingerprint: ObjectHash,
-    ) -> Result<(), StewardError> {
-        while batch.num_rows() > 0 {
-            if self.current_descriptor.is_none() {
-                let descriptor_index = self.next_descriptor;
-                let expected = self.descriptor_fingerprint(descriptor_index)?;
-                if expected != object_fingerprint {
-                    return Err(StewardError::Content(format!(
-                        "table physical object with schema fingerprint {object_fingerprint} \
-                         crosses a leaf schema transition; descriptor {descriptor_index} requires \
-                         {expected}"
-                    )));
-                }
-                self.next_descriptor += 1;
-                self.current_descriptor = Some(descriptor_index);
-                self.current_schema = Some(batch.schema());
-            }
-            let descriptor_index = self.current_descriptor.expect("just set above");
-            let descriptor = &self.descriptors[descriptor_index];
-            let expected = self.descriptor_fingerprint(descriptor_index)?;
-            if expected != object_fingerprint {
-                return Err(StewardError::Content(format!(
-                    "table logical leaf {descriptor_index} spans physical objects with different \
-                     schema fingerprints ({expected} then {object_fingerprint})"
-                )));
-            }
-            let needed = descriptor.logical_count() - self.current_rows;
-            let take = needed.min(batch.num_rows() as u64) as usize;
-            self.current_batches.push(batch.slice(0, take));
-            self.current_rows += take as u64;
-            batch = batch.slice(take, batch.num_rows() - take);
-            if self.current_rows == descriptor.logical_count() {
-                let hash = table_leaf_hash_canonical(
-                    self.current_schema
-                        .as_ref()
-                        .expect("current table leaf always has a schema"),
-                    &self.current_batches,
-                    descriptor.min_event_time(),
-                    descriptor.max_event_time(),
-                    descriptor.logical_attributes(),
-                )
-                .map_err(StewardError::Content)?;
-                self.hashes.push(hash);
-                self.current_batches.clear();
-                self.current_rows = 0;
-                self.current_descriptor = None;
-                self.current_schema = None;
-            }
-        }
-        Ok(())
-    }
-
-    fn finish(self) -> Result<Vec<ObjectHash>, StewardError> {
-        if self.current_descriptor.is_some() || !self.current_batches.is_empty() {
-            return Err(StewardError::Content(
-                "table pack's physical content ended mid-leaf (truncated rows)".to_string(),
-            ));
-        }
-        if self.next_descriptor != self.descriptors.len() {
-            return Err(StewardError::Content(
-                "table pack's physical content has fewer rows than its declared leaf descriptors"
-                    .to_string(),
-            ));
-        }
-        Ok(self.hashes)
-    }
-}
-
 /// Decode one Parquet physical object, checking its canonical schema
 /// fingerprint against `expected_fingerprint` before returning any rows.
 ///
@@ -1042,7 +568,7 @@ where
 ///
 /// Returns the rewound file (positioned at the start, ready to read) plus
 /// the exact byte count streamed, so the caller can cross-check it against
-/// the pack's declared `physical_byte_count`.
+/// the object's declared v3 physical span.
 async fn spool_external_object(
     remote: &dyn ContentSource,
     hash: ObjectHash,
@@ -1105,7 +631,6 @@ async fn fetch_blob(
     remote: &dyn ContentSource,
     hash: ObjectHash,
     graph: &mut FetchedGraph,
-    blob_index: &mut Option<HashSet<ObjectHash>>,
 ) -> Result<(), StewardError> {
     if graph.objects.contains_key(&hash) {
         return Ok(());
@@ -1122,24 +647,13 @@ async fn fetch_blob(
         let _ = graph.bytes.insert(hash, bytes);
         return Ok(());
     }
-    // Not an inline row: it must be a large external blob in the remote blob
-    // store.  Confirm its presence now so a missing object still fails the fetch
-    // early, but do not download it -- its bytes stream at rebuild time.
-    //
-    // Presence comes from a single listing taken on first use, not a probe per
-    // blob: probing costs a request for every blob in the closure, which is a
-    // cost proportional to the pond's history rather than to what the pull
-    // actually transfers.
-    let index = match blob_index {
-        Some(index) => index,
-        none => none.insert(
-            remote
-                .list_blobs()
-                .await
-                .map_err(|e| StewardError::Content(e.to_string()))?,
-        ),
-    };
-    if !index.contains(&hash) {
+    // Not an inline row: check the exact external key. Never list the complete
+    // blob partition merely to establish one referenced object's presence.
+    if !remote
+        .has_blob(hash)
+        .await
+        .map_err(|e| StewardError::Content(e.to_string()))?
+    {
         return Err(StewardError::Content(format!(
             "object {} is absent from the remote (inline and blob store)",
             hash.to_hex()
@@ -1296,21 +810,19 @@ enum ApplyOp {
     },
     /// Unlink a target node that is absent from the source.
     Delete { parent_path: String, name: String },
-    /// Create (adopting `node_id`) or append to a native `watertown.series.v1` v2
+    /// Create (adopting `node_id`) or append to a native `watertown.series.v2` v2
     /// logical series (`docs/logical-series-identity-design.md`, release
     /// blocker item 1). Unlike [`ApplyOp::File`], a v2 series carries no
-    /// buffered version list here: its physical content already lives in the
-    /// fetched [`FetchedGraph`] (`graph.objects`/`graph.bytes`, exactly like
-    /// an ordinary v1 version blob), so apply resolves `manifest_hash` back
-    /// into the graph's verified [`FetchedSeriesV2`] and reconstructs each
-    /// needed logical leaf from its packs' physical objects.
+    /// buffered version list here: apply resolves `manifest_hash` back into
+    /// the graph's authenticated [`FetchedSeriesV2`], then fetches only pack
+    /// objects whose spans intersect the missing logical suffix.
     SeriesV2 {
         parent: String,
         name: String,
         node_id: String,
         create: bool,
         entry_type: EntryType,
-        /// The `watertown.series.v1` manifest object's hash -- this node's
+        /// The `watertown.series.v2` manifest object's hash -- this node's
         /// `child_hash` -- naming the verified [`FetchedSeriesV2`] in
         /// `graph.objects` to materialize from.
         manifest_hash: ObjectHash,
@@ -1323,7 +835,7 @@ enum ApplyOp {
         /// ([`replicated_mtime`]), adopted verbatim on the *last* leaf this
         /// operation writes so the destination's own subsequent fold
         /// recomputes the identical aggregate `VersionMeta` (mtime is not
-        /// part of the `watertown.series.v1` manifest hash, but is part of the
+        /// part of the `watertown.series.v2` manifest hash, but is part of the
         /// destination's own `build_series_manifest` aggregation, which
         /// takes it from the latest leaf-bearing version).
         replicated_mtime: Option<i64>,
@@ -1736,7 +1248,7 @@ fn first_replica_divergence(
             expected.entry_type,
             EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries
         ) {
-            let expected_versions = series_versions(graph, expected.child_hash)?;
+            let expected_versions = &series_v2(graph, expected.child_hash)?.leaf_hashes;
             let actual_versions = actual_series
                 .get(*node_id)
                 .map(Vec::as_slice)
@@ -1745,7 +1257,7 @@ fn first_replica_divergence(
             for index in 0..compared {
                 if expected_versions[index] != actual_versions[index] {
                     return Ok(Some(format!(
-                        "series node {node_id} ({:?}) blob {index} differs: expected {}, actual {}",
+                        "series node {node_id} ({:?}) leaf {index} differs: expected {}, actual {}",
                         expected.name,
                         expected_versions[index].to_hex(),
                         actual_versions[index].to_hex()
@@ -1754,7 +1266,7 @@ fn first_replica_divergence(
             }
             if expected_versions.len() != actual_versions.len() {
                 return Ok(Some(format!(
-                    "series node {node_id} ({:?}) blob count differs: expected {}, actual {}",
+                    "series node {node_id} ({:?}) leaf count differs: expected {}, actual {}",
                     expected.name,
                     expected_versions.len(),
                     actual_versions.len()
@@ -1866,7 +1378,7 @@ fn preview_validation_error(
         .cloned()
         .map(|entry| (entry.node_id.clone(), entry))
         .collect();
-    match first_replica_divergence(graph, &actual_nodes, &preview.series_versions)? {
+    match first_replica_divergence(graph, &actual_nodes, &preview.series_leaf_hashes)? {
         Some(detail) => mismatch.push_str(&format!("; first divergence: {detail}")),
         None => mismatch.push_str("; manifests match field-by-field"),
     }
@@ -2211,7 +1723,7 @@ fn plan_one(
     entry: &ManifestEntry,
     graph: &FetchedGraph,
     target_nodes: &HashMap<String, ManifestEntry>,
-    target_series: &HashMap<String, Vec<ObjectHash>>,
+    _target_series: &HashMap<String, Vec<ObjectHash>>,
     target_series_leaves: &HashMap<String, Vec<ObjectHash>>,
     ops: &mut Vec<ApplyOp>,
     outcome: &mut RebuildOutcome,
@@ -2289,49 +1801,27 @@ fn plan_one(
             if create {
                 outcome.series += 1;
             }
-            match graph.objects.get(&entry.child_hash) {
-                Some(FetchedObject::SeriesV2(_)) => {
-                    let series = series_v2(graph, entry.child_hash)?;
-                    let leaves_from = plan_series_v2_leaves(
-                        entry,
-                        series,
-                        target_series_leaves,
-                        existing.map(|t| t.child_hash),
-                    )?;
-                    // Always emit the op on create (adopting the node even
-                    // if, defensively, it turned out to need no leaves), and
-                    // otherwise only when there is a real suffix to append.
-                    if create || leaves_from < series.leaf_hashes.len() as u64 {
-                        ops.push(ApplyOp::SeriesV2 {
-                            parent: entry.parent_node_id.clone(),
-                            name: entry.name.clone(),
-                            node_id: entry.node_id.clone(),
-                            create,
-                            entry_type: entry.entry_type,
-                            manifest_hash: entry.child_hash,
-                            leaves_from,
-                            replicated_mtime: replicated_mtime(entry),
-                        });
-                    }
-                }
-                _ => {
-                    let (versions, collapse_first) = plan_series_versions(
-                        entry,
-                        graph,
-                        target_series,
-                        existing.map(|t| t.child_hash),
-                        meta_changed,
-                    )?;
-                    ops.push(ApplyOp::File {
-                        parent: entry.parent_node_id.clone(),
-                        name: entry.name.clone(),
-                        node_id: entry.node_id.clone(),
-                        create,
-                        entry_type: entry.entry_type,
-                        versions,
-                        collapse_first,
-                    });
-                }
+            let series = series_v2(graph, entry.child_hash)?;
+            let leaves_from = plan_series_v2_leaves(
+                entry,
+                series,
+                target_series_leaves,
+                existing.map(|t| t.child_hash),
+            )?;
+            // Always emit the op on create (adopting the node even
+            // if, defensively, it turned out to need no leaves), and
+            // otherwise only when there is a real suffix to append.
+            if create || leaves_from < series.leaf_hashes.len() as u64 {
+                ops.push(ApplyOp::SeriesV2 {
+                    parent: entry.parent_node_id.clone(),
+                    name: entry.name.clone(),
+                    node_id: entry.node_id.clone(),
+                    create,
+                    entry_type: entry.entry_type,
+                    manifest_hash: entry.child_hash,
+                    leaves_from,
+                    replicated_mtime: replicated_mtime(entry),
+                });
             }
         }
         EntryType::Symlink => {
@@ -2386,87 +1876,11 @@ fn replicated_mtime(entry: &ManifestEntry) -> Option<i64> {
     entry.versions.last().and_then(|meta| meta.timestamp)
 }
 
-/// Decide which series version blobs to write and whether the first replaces the
-/// versions already held.
-///
-/// The common case is append-only: the versions the target holds are a prefix of
-/// the incoming list, and only the appended suffix is written (Section 8.5.3).
-/// But a source-side compaction (`pond maintain --collapse-versions`) legitimately
-/// *replaces* many superseded versions with a single merged version, so the
-/// incoming list is no longer a prefix-extension of what a caught-up mirror holds.
-/// That case is replicated by rewriting the full incoming list with the first
-/// version marked to collapse the held ones (`collapse_first = true`), using the
-/// source's own merged bytes -- the pre-collapse versions are gone from the source
-/// and cannot be re-fetched, so the mirror must adopt the merged version directly.
-fn plan_series_versions(
-    entry: &ManifestEntry,
-    graph: &FetchedGraph,
-    target_series: &HashMap<String, Vec<ObjectHash>>,
-    existing_child_hash: Option<ObjectHash>,
-    meta_changed: bool,
-) -> Result<(Vec<PlannedVersion>, bool), StewardError> {
-    let incoming = series_versions(graph, entry.child_hash)?;
-
-    // The manifest entry carries one VersionMeta per live version, in the same
-    // order as the series object's hashes. A mismatch means the two objects
-    // disagree about the node's shape, so the metadata cannot be aligned with
-    // the bytes it describes; rebuilding from it would silently attach the
-    // wrong bounds to a version.
-    if !entry.versions.is_empty() && entry.versions.len() != incoming.len() {
-        return Err(StewardError::Content(format!(
-            "series node {} has {} version(s) but its entry carries {} metadata record(s)",
-            entry.node_id,
-            incoming.len(),
-            entry.versions.len()
-        )));
-    }
-    let meta_at = |index: usize| entry.versions.get(index);
-
-    let held = match existing_child_hash {
-        None => &[][..],
-        Some(child_hash) if child_hash == entry.child_hash && !meta_changed => {
-            return Ok((Vec::new(), false));
-        }
-        Some(_) => target_series
-            .get(&entry.node_id)
-            .map(Vec::as_slice)
-            .ok_or_else(|| {
-                StewardError::Content(format!(
-                    "series node {} changed but its current versions are unknown",
-                    entry.node_id
-                ))
-            })?,
-    };
-
-    // Append-only fast path: the incoming list extends what is already held, so
-    // write only the missing suffix.
-    if !meta_changed && incoming.len() >= held.len() && incoming[..held.len()] == *held {
-        let suffix = incoming[held.len()..]
-            .iter()
-            .enumerate()
-            .map(|(offset, hash)| planned_version(graph, *hash, meta_at(held.len() + offset)))
-            .collect::<Result<Vec<_>, _>>()?;
-        return Ok((suffix, false));
-    }
-
-    // Divergent history: the held versions are no longer a prefix of the source's
-    // live series (a compaction replaced them). Rewrite the full incoming list;
-    // the first version collapses everything the target held.
-    let full = incoming
-        .iter()
-        .enumerate()
-        .map(|(index, hash)| planned_version(graph, *hash, meta_at(index)))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((full, true))
-}
-
-/// Resolve a `watertown.series.v1` object to its verified [`FetchedSeriesV2`] state.
+/// Resolve a `watertown.series.v2` object to its verified [`FetchedSeriesV2`] state.
 ///
 /// # Errors
 ///
-/// Returns an error if the object at `series_hash` is not a verified v2
-/// series (a v1 series or any other object shape), or is missing from the
-/// graph.
+/// Returns an error if the object at `series_hash` is not a verified series.
 fn series_v2(
     graph: &FetchedGraph,
     series_hash: ObjectHash,
@@ -2474,11 +1888,11 @@ fn series_v2(
     match graph.objects.get(&series_hash) {
         Some(FetchedObject::SeriesV2(series)) => Ok(series),
         Some(_) => Err(StewardError::Content(format!(
-            "expected a v2 (watertown.series.v1) series at {} but found a different object shape",
+            "expected a watertown.series.v2 series at {} but found a different object shape",
             series_hash.to_hex()
         ))),
         None => Err(StewardError::Content(format!(
-            "v2 series object {} missing from graph",
+            "series object {} missing from graph",
             series_hash.to_hex()
         ))),
     }
@@ -2487,14 +1901,13 @@ fn series_v2(
 /// Decide the suffix of a v2 logical series' leaves the target still needs
 /// (release blocker item 1, `docs/logical-series-identity-design.md`).
 ///
-/// A `watertown.series.v1` series' `child_hash` is its manifest hash, which is a pure
+/// A `watertown.series.v2` series' `child_hash` is its manifest hash, which is a pure
 /// function of its whole logical content (leaf hashes, aggregate bounds,
 /// schema, attributes -- everything except mtime); an unchanged `child_hash`
 /// therefore means an unchanged logical state, full stop.
 ///
-/// Unlike [`plan_series_versions`], there is no collapse/rewrite case here:
-/// `pond maintain --collapse-versions` is an explicit no-op on a v2 series
-/// (item 4), so a verified v2 series never legitimately un-prefixes what a
+/// `pond maintain --collapse-versions` is an explicit no-op on a logical
+/// series, so a verified series never legitimately un-prefixes what a
 /// caught-up mirror already holds. If the target's already-materialized leaf
 /// hashes are not an exact prefix of the source's, that is corruption or an
 /// unsupported non-append change, not a case to reconcile by rewriting.
@@ -2540,10 +1953,10 @@ fn plan_series_v2_leaves(
 }
 
 /// Apply an ordered plan within an open transaction, adopting source node ids.
-/// Small versions write from buffered bytes; large external versions stream from
-/// the remote blob store straight into the writer, never buffered (D7). A v2
-/// series' logical leaves are reconstructed from `graph`'s already-fetched
-/// physical objects and independently re-verified before being written (see
+/// Small versions write from buffered bytes; large external versions stream
+/// from the remote blob store straight into the writer, never buffered (D7).
+/// A v2 series fetches its required pack payloads on demand and independently
+/// re-verifies each suffix leaf before writing it (see
 /// [`materialize_series_v2`]).
 async fn apply_ops(
     root_node_id: &str,
@@ -2553,6 +1966,8 @@ async fn apply_ops(
     graph: &FetchedGraph,
 ) -> Result<(), StewardError> {
     let mut dir_wd: HashMap<String, WD> = HashMap::new();
+    let mut pack_object_cache: HashMap<ObjectHash, VerifiedPackObject> = HashMap::new();
+    let mut pack_object_uses = pack_object_use_counts(ops, graph)?;
     let _ = dir_wd.insert(root_node_id.to_string(), root_wd.clone());
 
     for op in ops {
@@ -2678,8 +2093,9 @@ async fn apply_ops(
                     *create,
                     *entry_type,
                     series,
-                    graph,
                     remote,
+                    &mut pack_object_cache,
+                    &mut pack_object_uses,
                     *leaves_from,
                     *replicated_mtime,
                 )
@@ -2687,7 +2103,49 @@ async fn apply_ops(
             }
         }
     }
+    if !pack_object_uses.is_empty() || !pack_object_cache.is_empty() {
+        return Err(StewardError::Content(
+            "physical pack object cache retained unconsumed planned uses".to_string(),
+        ));
+    }
     Ok(())
+}
+
+fn pack_object_use_counts(
+    ops: &[ApplyOp],
+    graph: &FetchedGraph,
+) -> Result<HashMap<ObjectHash, usize>, StewardError> {
+    let mut uses = HashMap::new();
+    for op in ops {
+        let ApplyOp::SeriesV2 {
+            manifest_hash,
+            leaves_from,
+            ..
+        } = op
+        else {
+            continue;
+        };
+        let series = series_v2(graph, *manifest_hash)?;
+        for (_, pack) in &series.packs {
+            if *leaves_from >= pack.leaf_end() {
+                continue;
+            }
+            let (_, logical_prefix) = suffix_start_in_pack(pack, *leaves_from)?;
+            for span in pack
+                .object_spans()
+                .iter()
+                .filter(|span| span.logical_end() > logical_prefix)
+            {
+                let count = uses.entry(span.object_hash()).or_insert(0usize);
+                *count = count.checked_add(1).ok_or_else(|| {
+                    StewardError::Content(
+                        "physical pack object use count overflows usize".to_string(),
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(uses)
 }
 
 /// Write one file/series version through `writer`, then finalize it.  An inline
@@ -2806,26 +2264,105 @@ fn timestamp_column(meta: &VersionMeta) -> String {
         )
 }
 
-/// Materialize a verified `watertown.series.v1` logical series into the destination
+enum VerifiedPackObject {
+    Memory(bytes::Bytes),
+    File { file: std::fs::File, len: u64 },
+}
+
+impl VerifiedPackObject {
+    fn len(&self) -> u64 {
+        match self {
+            Self::Memory(bytes) => bytes.len() as u64,
+            Self::File { len, .. } => *len,
+        }
+    }
+}
+
+async fn ensure_pack_object<'a>(
+    remote: &dyn ContentSource,
+    span: &PackObjectSpan,
+    cache: &'a mut HashMap<ObjectHash, VerifiedPackObject>,
+) -> Result<&'a VerifiedPackObject, StewardError> {
+    let hash = span.object_hash();
+    let expected_len = span.physical_len();
+    if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(hash) {
+        let object = if let Some(bytes) = remote
+            .get_object(hash)
+            .await
+            .map_err(|e| StewardError::Content(format!("fetch physical object {hash}: {e}")))?
+        {
+            verify(hash, &bytes)?;
+            VerifiedPackObject::Memory(bytes::Bytes::from(bytes))
+        } else {
+            let (file, len) = spool_external_object(remote, hash).await?;
+            VerifiedPackObject::File { file, len }
+        };
+        let _ = entry.insert(object);
+    }
+    let object = cache
+        .get(&hash)
+        .expect("pack object was found or inserted above");
+    if object.len() != expected_len {
+        return Err(StewardError::Content(format!(
+            "physical object {hash} has {} byte(s), but its v3 pack span declares {expected_len}",
+            object.len()
+        )));
+    }
+    Ok(object)
+}
+
+fn release_pack_object(
+    hash: ObjectHash,
+    cache: &mut HashMap<ObjectHash, VerifiedPackObject>,
+    uses: &mut HashMap<ObjectHash, usize>,
+) -> Result<(), StewardError> {
+    let remaining = uses.get_mut(&hash).ok_or_else(|| {
+        StewardError::Content(format!(
+            "physical object {hash} was fetched without a planned use"
+        ))
+    })?;
+    *remaining = remaining.checked_sub(1).ok_or_else(|| {
+        StewardError::Content(format!("physical object {hash} use count underflow"))
+    })?;
+    if *remaining == 0 {
+        let _ = uses.remove(&hash);
+        let _ = cache.remove(&hash);
+    }
+    Ok(())
+}
+
+fn suffix_start_in_pack(pack: &PackIndex, leaves_from: u64) -> Result<(usize, u64), StewardError> {
+    let skipped_leaves = leaves_from
+        .saturating_sub(pack.leaf_start())
+        .min(pack.leaf_end() - pack.leaf_start());
+    let skipped = usize::try_from(skipped_leaves).map_err(|_| {
+        StewardError::Content("pack suffix leaf offset does not fit in usize".to_string())
+    })?;
+    let logical_prefix =
+        pack.leaf_descriptors()[..skipped]
+            .iter()
+            .try_fold(0u64, |sum, descriptor| {
+                sum.checked_add(descriptor.logical_count()).ok_or_else(|| {
+                    StewardError::Content(
+                        "pack descriptor logical prefix overflows u64 during materialization"
+                            .to_string(),
+                    )
+                })
+            })?;
+    Ok((skipped, logical_prefix))
+}
+
+/// Materialize a verified `watertown.series.v2` logical series into the destination
 /// as native tlogfs rows (release blocker item 1,
 /// `docs/logical-series-identity-design.md`).
 ///
 /// Writes exactly one Oplog append per logical leaf
 /// (`crates/tlogfs/src/series_identity.rs`), in leaf order, skipping every
 /// leaf before `leaves_from` (already held by the target) and independently
-/// re-verifying every leaf about to be written -- recomputed from `graph`'s
-/// already-fetched, already-verified pack physical objects using the exact
-/// same canonical-hash algorithm [`fetch_series_v2`] used to build `series`
-/// -- against `series.leaf_hashes[i]` *before* it is ever handed to a
-/// writer, so a divergent reconstruction is caught before any write, not
-/// merely before commit.
-///
-/// Reuses `graph.objects`/`graph.bytes`, which already hold every selected
-/// pack's physical objects as ordinary [`FetchedObject::Blob`]/
-/// [`FetchedObject::External`] entries exactly like a v1 version blob, so no
-/// additional remote round-trip happens for content already durable in
-/// `graph`; a large external physical object is streamed from `remote` and
-/// re-hashed exactly as [`stream_external_blob`] does for v1.
+/// re-verifying every leaf about to be written against its authenticated v3
+/// descriptor hash *before* handing it to a writer. Physical objects are
+/// fetched here, after prefix validation, and only when their logical span
+/// intersects the missing suffix.
 async fn materialize_series_v2(
     pwd: &WD,
     name: &str,
@@ -2833,8 +2370,9 @@ async fn materialize_series_v2(
     create: bool,
     entry_type: EntryType,
     series: &FetchedSeriesV2,
-    graph: &FetchedGraph,
     remote: &dyn ContentSource,
+    object_cache: &mut HashMap<ObjectHash, VerifiedPackObject>,
+    object_uses: &mut HashMap<ObjectHash, usize>,
     leaves_from: u64,
     replicated_mtime: Option<i64>,
 ) -> Result<(), StewardError> {
@@ -2846,8 +2384,9 @@ async fn materialize_series_v2(
                 node_id,
                 create,
                 series,
-                graph,
                 remote,
+                object_cache,
+                object_uses,
                 leaves_from,
                 replicated_mtime,
             )
@@ -2860,8 +2399,9 @@ async fn materialize_series_v2(
                 node_id,
                 create,
                 series,
-                graph,
                 remote,
+                object_cache,
+                object_uses,
                 leaves_from,
                 replicated_mtime,
             )
@@ -2961,7 +2501,7 @@ fn descriptor_timestamp_column(descriptor: &PackLeafDescriptor) -> Result<String
     }
 }
 
-/// Materialize a `watertown.series.v1` `FilePhysicalSeries` whose manifest declares
+/// Materialize a `watertown.series.v2` `FilePhysicalSeries` whose manifest declares
 /// `leaf_count() == 0` (release blocker item 1,
 /// `docs/logical-series-identity-design.md`): a legitimately empty,
 /// metadata-only series that has never carried a logical leaf (for example a
@@ -3024,8 +2564,9 @@ async fn materialize_file_series_v2(
     node_id: NodeID,
     create: bool,
     series: &FetchedSeriesV2,
-    graph: &FetchedGraph,
     remote: &dyn ContentSource,
+    object_cache: &mut HashMap<ObjectHash, VerifiedPackObject>,
+    object_uses: &mut HashMap<ObjectHash, usize>,
     leaves_from: u64,
     replicated_mtime: Option<i64>,
 ) -> Result<(), StewardError> {
@@ -3033,24 +2574,40 @@ async fn materialize_file_series_v2(
     if total_leaves == 0 {
         return materialize_empty_series(pwd, name, node_id, create, replicated_mtime).await;
     }
-    let mut leaf_index: u64 = 0;
+    let mut leaf_index = leaves_from;
     let mut node_created = false;
-    // Leaf-in-progress state, live only while one leaf's bytes are being
-    // assembled from (possibly many) physical objects/chunks. Never carried
-    // across a pack boundary: packs tile disjoint leaf ranges, so a
-    // leftover `hasher` at the end of a pack's objects is corruption.
-    let mut hasher: Option<IncrementalFileLeafHasher> = None;
-    let mut buffer: Option<Vec<u8>> = None;
-    let mut descriptor: Option<&PackLeafDescriptor> = None;
 
     for (pack_hash, pack) in &series.packs {
-        let mut descriptors = pack.leaf_descriptors().iter();
-        for &object_hash in pack.physical_object_hashes() {
-            match graph.objects.get(&object_hash) {
-                Some(FetchedObject::Blob(bytes)) => {
-                    let bytes = bytes.clone();
+        if leaves_from >= pack.leaf_end() {
+            continue;
+        }
+        let (first_descriptor, logical_prefix) = suffix_start_in_pack(pack, leaves_from)?;
+        let mut descriptors = pack.leaf_descriptors()[first_descriptor..].iter();
+        let mut hasher: Option<IncrementalFileLeafHasher> = None;
+        let mut buffer: Option<Vec<u8>> = None;
+        let mut descriptor: Option<&PackLeafDescriptor> = None;
+
+        for span in pack
+            .object_spans()
+            .iter()
+            .filter(|span| span.logical_end() > logical_prefix)
+        {
+            let skip = logical_prefix.saturating_sub(span.logical_start());
+            let object = ensure_pack_object(remote, span, object_cache).await?;
+            match object {
+                VerifiedPackObject::Memory(bytes) => {
+                    let start = usize::try_from(skip).map_err(|_| {
+                        StewardError::Content(format!(
+                            "file pack {pack_hash} prefix skip does not fit in usize"
+                        ))
+                    })?;
                     feed_file_chunk(
-                        &bytes,
+                        bytes.get(start..).ok_or_else(|| {
+                            StewardError::Content(format!(
+                                "file pack {pack_hash} prefix skip {skip} exceeds physical object {}",
+                                span.object_hash()
+                            ))
+                        })?,
                         &mut descriptors,
                         pwd,
                         name,
@@ -3068,32 +2625,33 @@ async fn materialize_file_series_v2(
                     )
                     .await?;
                 }
-                Some(FetchedObject::External) => {
-                    let mut reader = remote
-                        .get_blob_reader(object_hash)
+                VerifiedPackObject::File { file, .. } => {
+                    let mut file = tokio::fs::File::from_std(file.try_clone().map_err(|e| {
+                        StewardError::Content(format!(
+                            "clone verified physical object {}: {e}",
+                            span.object_hash()
+                        ))
+                    })?);
+                    let _ = file
+                        .seek(std::io::SeekFrom::Start(skip))
                         .await
                         .map_err(|e| {
                             StewardError::Content(format!(
-                                "stream physical object {object_hash}: {e}"
-                            ))
-                        })?
-                        .ok_or_else(|| {
-                            StewardError::Content(format!(
-                                "physical object {object_hash} vanished from the remote blob store during streaming"
+                                "seek verified physical object {}: {e}",
+                                span.object_hash()
                             ))
                         })?;
-                    let mut object_hasher = blake3::Hasher::new();
                     let mut buf = vec![0u8; 256 * 1024];
                     loop {
-                        let n = reader.read(&mut buf).await.map_err(|e| {
+                        let n = file.read(&mut buf).await.map_err(|e| {
                             StewardError::Content(format!(
-                                "read physical object {object_hash}: {e}"
+                                "read verified physical object {}: {e}",
+                                span.object_hash()
                             ))
                         })?;
                         if n == 0 {
                             break;
                         }
-                        let _ = object_hasher.update(&buf[..n]);
                         feed_file_chunk(
                             &buf[..n],
                             &mut descriptors,
@@ -3113,19 +2671,9 @@ async fn materialize_file_series_v2(
                         )
                         .await?;
                     }
-                    let computed = ObjectHash::from_bytes(*object_hasher.finalize().as_bytes());
-                    if computed != object_hash {
-                        return Err(StewardError::Content(format!(
-                            "physical object hashes to {computed} but was fetched as {object_hash}"
-                        )));
-                    }
-                }
-                other => {
-                    return Err(StewardError::Content(format!(
-                        "expected a physical blob object at {object_hash} but found {other:?}"
-                    )));
                 }
             }
+            release_pack_object(span.object_hash(), object_cache, object_uses)?;
         }
         if hasher.is_some() {
             return Err(StewardError::Content(format!(
@@ -3273,8 +2821,9 @@ async fn materialize_table_series_v2(
     node_id: NodeID,
     create: bool,
     series: &FetchedSeriesV2,
-    graph: &FetchedGraph,
     remote: &dyn ContentSource,
+    object_cache: &mut HashMap<ObjectHash, VerifiedPackObject>,
+    object_uses: &mut HashMap<ObjectHash, usize>,
     leaves_from: u64,
     replicated_mtime: Option<i64>,
 ) -> Result<(), StewardError> {
@@ -3286,17 +2835,25 @@ async fn materialize_table_series_v2(
              this empty table series cannot yet be materialized"
         )));
     }
-    let mut leaf_index: u64 = 0;
+    let mut leaf_index = leaves_from;
     let mut node_created = false;
-    let mut current_descriptor: Option<usize> = None;
-    let mut current_batches: Vec<RecordBatch> = Vec::new();
-    let mut current_rows: u64 = 0;
-    let mut current_schema: Option<Arc<Schema>> = None;
 
     for (pack_hash, pack) in &series.packs {
+        if leaves_from >= pack.leaf_end() {
+            continue;
+        }
         let descriptors = pack.leaf_descriptors();
-        let mut next_descriptor = 0usize;
-        for &object_hash in pack.physical_object_hashes() {
+        let (mut next_descriptor, logical_prefix) = suffix_start_in_pack(pack, leaves_from)?;
+        let mut current_descriptor: Option<usize> = None;
+        let mut current_batches: Vec<RecordBatch> = Vec::new();
+        let mut current_rows: u64 = 0;
+        let mut current_schema: Option<Arc<Schema>> = None;
+
+        for span in pack
+            .object_spans()
+            .iter()
+            .filter(|span| span.logical_end() > logical_prefix)
+        {
             let descriptor_index = current_descriptor.unwrap_or(next_descriptor);
             let descriptor = descriptors.get(descriptor_index).ok_or_else(|| {
                 StewardError::Content(
@@ -3313,41 +2870,82 @@ async fn materialize_table_series_v2(
                                 .to_string(),
                         )
                     })?;
-            let (schema, batches) = match graph.objects.get(&object_hash) {
-                Some(FetchedObject::Blob(bytes)) => {
-                    let source = bytes::Bytes::from(bytes.clone());
-                    decode_table_object(source, expected_fingerprint)
+            let object = ensure_pack_object(remote, span, object_cache).await?;
+            let (schema, batches) = match object {
+                VerifiedPackObject::Memory(bytes) => {
+                    decode_table_object(bytes.clone(), expected_fingerprint)
                         .await
                         .map_err(|e| {
                             StewardError::Content(format!(
-                                "decode physical object {object_hash}: {e}"
+                                "decode physical object {}: {e}",
+                                span.object_hash()
                             ))
                         })?
                 }
-                Some(FetchedObject::External) => {
-                    let (file, _byte_count) = spool_external_object(remote, object_hash).await?;
+                VerifiedPackObject::File { file, .. } => {
+                    let mut file = file.try_clone().map_err(|e| {
+                        StewardError::Content(format!(
+                            "clone verified physical object {}: {e}",
+                            span.object_hash()
+                        ))
+                    })?;
+                    let _ = std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0)).map_err(
+                        |e| {
+                            StewardError::Content(format!(
+                                "rewind verified physical object {}: {e}",
+                                span.object_hash()
+                            ))
+                        },
+                    )?;
                     decode_table_object(file, expected_fingerprint)
                         .await
                         .map_err(|e| {
                             StewardError::Content(format!(
-                                "decode physical object {object_hash}: {e}"
+                                "decode physical object {}: {e}",
+                                span.object_hash()
                             ))
                         })?
                 }
-                other => {
-                    return Err(StewardError::Content(format!(
-                        "expected a physical blob object at {object_hash} but found {other:?}"
-                    )));
-                }
             };
+            let decoded_rows = batches.iter().try_fold(0u64, |sum, batch| {
+                sum.checked_add(batch.num_rows() as u64).ok_or_else(|| {
+                    StewardError::Content(format!(
+                        "physical object {} row count overflows u64",
+                        span.object_hash()
+                    ))
+                })
+            })?;
+            let expected_rows = span.logical_end() - span.logical_start();
+            if decoded_rows != expected_rows {
+                return Err(StewardError::Content(format!(
+                    "physical object {} decoded {decoded_rows} row(s), but its v3 pack span declares {}",
+                    span.object_hash(),
+                    expected_rows
+                )));
+            }
             let canonical_schema =
                 sync_store::content::canonicalize_schema(&schema).map_err(StewardError::Content)?;
-            for batch in batches {
+            let mut rows_to_skip = logical_prefix.saturating_sub(span.logical_start());
+            for mut batch in batches {
+                if rows_to_skip >= batch.num_rows() as u64 {
+                    rows_to_skip -= batch.num_rows() as u64;
+                    continue;
+                }
+                if rows_to_skip > 0 {
+                    let skip = usize::try_from(rows_to_skip).map_err(|_| {
+                        StewardError::Content(format!(
+                            "table pack {pack_hash} prefix row count does not fit in usize"
+                        ))
+                    })?;
+                    batch = batch.slice(skip, batch.num_rows() - skip);
+                    rows_to_skip = 0;
+                }
                 let mut columns = Vec::with_capacity(batch.num_columns());
                 for (column, field) in batch.columns().iter().zip(canonical_schema.fields()) {
                     columns.push(arrow_cast::cast(column, field.data_type()).map_err(|e| {
                         StewardError::Content(format!(
-                            "normalize physical object {object_hash} column {:?}: {e}",
+                            "normalize physical object {} column {:?}: {e}",
+                            span.object_hash(),
                             field.name()
                         ))
                     })?);
@@ -3355,7 +2953,8 @@ async fn materialize_table_series_v2(
                 let normalized = RecordBatch::try_new(Arc::clone(&canonical_schema), columns)
                     .map_err(|e| {
                         StewardError::Content(format!(
-                            "normalize physical object {object_hash} schema: {e}"
+                            "normalize physical object {} schema: {e}",
+                            span.object_hash()
                         ))
                     })?;
                 feed_table_batch(
@@ -3382,6 +2981,7 @@ async fn materialize_table_series_v2(
                 )
                 .await?;
             }
+            release_pack_object(span.object_hash(), object_cache, object_uses)?;
         }
         if current_descriptor.is_some() {
             return Err(StewardError::Content(format!(
@@ -3687,138 +3287,14 @@ fn planned_version(
     })
 }
 
-/// Resolve a series object to its ordered v1 version blob hashes.
-///
-/// # Errors
-///
-/// Returns an error if `series_hash` names something other than a v1
-/// [`FetchedObject::Series`]. A [`FetchedObject::SeriesV2`] is rejected
-/// here defensively -- native v2 materialization is planned/applied through
-/// [`plan_series_v2_leaves`]/[`materialize_series_v2`] instead, dispatched
-/// in [`plan_one`] before this function is ever reached for a v2 object, so
-/// hitting this branch means that dispatch was bypassed, not that v2
-/// materialization is unimplemented (see [`FetchedObject::SeriesV2`]'s docs
-/// for what fetch verification already guarantees about it).
-fn series_versions(
-    graph: &FetchedGraph,
-    series_hash: ObjectHash,
-) -> Result<&[ObjectHash], StewardError> {
-    match graph.objects.get(&series_hash) {
-        Some(FetchedObject::Series(versions)) => Ok(versions),
-        Some(FetchedObject::SeriesV2(_)) => Err(StewardError::Content(format!(
-            "series {} is a v2 (watertown.series.v1) logical series and must be planned/applied via \
-             plan_series_v2_leaves/materialize_series_v2, not as a v1 series (internal \
-             dispatch error)",
-            series_hash.to_hex()
-        ))),
-        Some(_) => Err(StewardError::Content(format!(
-            "expected a series at {} but found a non-series object",
-            series_hash.to_hex()
-        ))),
-        None => Err(StewardError::Content(format!(
-            "series object {} missing from graph",
-            series_hash.to_hex()
-        ))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Field};
-    use sync_store::content::{generate_range_proof, merkle_root};
-
-    fn series_entry(child_hash: ObjectHash, timestamp: i64) -> ManifestEntry {
-        ManifestEntry::new(
-            "series-node",
-            "root",
-            "events.series",
-            EntryType::FilePhysicalSeries,
-            child_hash,
-            vec![VersionMeta {
-                timestamp: Some(timestamp),
-                ..VersionMeta::default()
-            }],
-        )
-    }
+    use sync_store::content::{PackObjectSpan, generate_range_proof, merkle_root};
 
     #[test]
-    fn series_metadata_divergence_forces_full_rewrite() {
-        let blob_hash = ObjectHash::of_bytes(b"unchanged");
-        let series_hash = ObjectHash::of_bytes(b"series");
-        let entry = series_entry(series_hash, 2);
-        let mut graph = FetchedGraph::default();
-        _ = graph
-            .objects
-            .insert(blob_hash, FetchedObject::Blob(b"unchanged".to_vec()));
-        _ = graph
-            .objects
-            .insert(series_hash, FetchedObject::Series(vec![blob_hash]));
-        let target_series = HashMap::from([("series-node".to_string(), vec![blob_hash])]);
-
-        let (versions, collapse_first) =
-            plan_series_versions(&entry, &graph, &target_series, Some(series_hash), true)
-                .expect("metadata repair plan");
-
-        assert_eq!(versions.len(), 1);
-        assert!(collapse_first);
-        assert_eq!(versions[0].meta.timestamp, Some(2));
-    }
-
-    #[test]
-    fn divergence_diagnostic_identifies_series_metadata_field() {
-        let blob_hash = ObjectHash::of_bytes(b"unchanged");
-        let series_hash = ObjectHash::of_bytes(b"series");
-        let mut graph = FetchedGraph {
-            manifest: vec![series_entry(series_hash, 2)],
-            ..FetchedGraph::default()
-        };
-        _ = graph
-            .objects
-            .insert(series_hash, FetchedObject::Series(vec![blob_hash]));
-        let actual_nodes =
-            HashMap::from([("series-node".to_string(), series_entry(series_hash, 1))]);
-        let actual_series = HashMap::from([("series-node".to_string(), vec![blob_hash])]);
-
-        let detail = first_replica_divergence(&graph, &actual_nodes, &actual_series)
-            .expect("diagnosis")
-            .expect("divergence");
-
-        assert!(detail.contains("version 0 timestamp differs"), "{detail}");
-        assert!(
-            detail.contains("expected Some(2), actual Some(1)"),
-            "{detail}"
-        );
-    }
-
-    #[test]
-    fn divergence_diagnostic_identifies_series_blob() {
-        let expected_blob = ObjectHash::of_bytes(b"expected");
-        let actual_blob = ObjectHash::of_bytes(b"actual");
-        let series_hash = ObjectHash::of_bytes(b"series");
-        let mut graph = FetchedGraph {
-            manifest: vec![series_entry(series_hash, 2)],
-            ..FetchedGraph::default()
-        };
-        _ = graph
-            .objects
-            .insert(series_hash, FetchedObject::Series(vec![expected_blob]));
-        let actual_nodes =
-            HashMap::from([("series-node".to_string(), series_entry(series_hash, 2))]);
-        let actual_series = HashMap::from([("series-node".to_string(), vec![actual_blob])]);
-
-        let detail = first_replica_divergence(&graph, &actual_nodes, &actual_series)
-            .expect("diagnosis")
-            .expect("divergence");
-
-        assert!(detail.contains("blob 0 differs"), "{detail}");
-        assert!(detail.contains(&expected_blob.to_hex()), "{detail}");
-        assert!(detail.contains(&actual_blob.to_hex()), "{detail}");
-    }
-
-    #[test]
-    fn table_partitioner_rejects_object_crossing_schema_transition() {
+    fn pack_construction_rejects_object_crossing_schema_transition() {
         let schema_a = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("label", DataType::Utf8, false),
@@ -3834,7 +3310,7 @@ mod tests {
             ObjectHash::of_bytes(b"leaf-a"),
             ObjectHash::of_bytes(b"leaf-b"),
         ];
-        let manifest = SeriesManifest::new_v2(
+        let manifest = SeriesManifest::new(
             PayloadKind::Table,
             2,
             2,
@@ -3845,36 +3321,44 @@ mod tests {
         )
         .expect("manifest");
         let descriptors = vec![
-            PackLeafDescriptor::new_with_schema(1, Some(fingerprint_a), None, None, None)
-                .expect("descriptor a"),
-            PackLeafDescriptor::new_with_schema(1, Some(fingerprint_b), None, None, None)
-                .expect("descriptor b"),
+            PackLeafDescriptor::new_with_leaf_hash_and_schema(
+                leaves[0],
+                1,
+                Some(fingerprint_a),
+                None,
+                None,
+                None,
+            )
+            .expect("descriptor a"),
+            PackLeafDescriptor::new_with_leaf_hash_and_schema(
+                leaves[1],
+                1,
+                Some(fingerprint_b),
+                None,
+                None,
+                None,
+            )
+            .expect("descriptor b"),
         ];
-        let pack = PackIndex::new_v2(
+        let err = PackIndex::new_with_spans(
             manifest.hash(),
             0,
             2,
             2,
             manifest.leaf_merkle_root(),
             generate_range_proof(&leaves, 0, 2).expect("proof"),
-            vec![ObjectHash::of_bytes(b"object")],
+            vec![
+                PackObjectSpan::new(ObjectHash::of_bytes(b"object"), 0, 2, 0, 100)
+                    .expect("object span"),
+            ],
             2,
             100,
             descriptors,
         )
-        .expect("pack");
-        let batch = RecordBatch::try_new(
-            schema_a,
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2])),
-                Arc::new(StringArray::from(vec!["a", "b"])),
-            ],
-        )
-        .expect("batch");
-        let mut partitioner = TableLeafPartitioner::new(&manifest, &pack);
-        let err = partitioner
-            .feed(batch, fingerprint_a)
-            .expect_err("one physical object must not cross the transition");
-        assert!(err.to_string().contains("crosses a leaf schema transition"));
+        .expect_err("one physical object must not cross the transition");
+        assert!(
+            err.contains("crosses a schema-fingerprint transition"),
+            "{err}"
+        );
     }
 }

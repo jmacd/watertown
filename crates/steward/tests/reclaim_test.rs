@@ -471,13 +471,13 @@ async fn reclaim_does_not_orphan_a_native_v2_series_pack() {
     }
 
     // The one *published* pack advertisement directory for a series
-    // (`data/_packs/series=<hex>`), read directly off disk -- distinct from
+    // (`data/_packs/v3/series=<hex>`), read directly off disk -- distinct from
     // `ContentSource::list_pack_hashes`, which also always reports a
     // synthesized-on-the-fly initial pack regardless of what has been
     // published.
     fn published_pack_hashes(pond: &Path, series_hash: ObjectHash) -> HashSet<ObjectHash> {
         let dir = steward::get_data_path(pond)
-            .join(sync_store::pack_keys::PACKS_ROOT)
+            .join(sync_store::pack_keys::PACK_INDEX_ROOT)
             .join(sync_store::pack_keys::series_dir_name(series_hash));
         match std::fs::read_dir(&dir) {
             Ok(rd) => rd

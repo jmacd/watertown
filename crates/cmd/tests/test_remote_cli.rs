@@ -160,6 +160,49 @@ async fn pond_remote_push_pull_roundtrip() {
         .expect("list src");
 }
 
+#[tokio::test]
+async fn pond_remote_list_rejects_unreadable_attachment() {
+    init_log();
+    let scratch = TempDir::new().expect("tempdir");
+    let pond_path = scratch.path().join("pond");
+    let remote_path = scratch.path().join("remote");
+    let remote_url = format!("file://{}", remote_path.display());
+    let ctx = ctx_for(&pond_path, vec!["pond", "init"]);
+    init_command(&ctx, "test-host").await.expect("init pond");
+    add_backup_command(
+        &ctx,
+        "broken",
+        &remote_url,
+        false,
+        None,
+        None,
+        None,
+        None,
+        false,
+        false,
+    )
+    .await
+    .expect("create remote attachment");
+    write_small_file(
+        &ctx,
+        &remote_config_path("broken"),
+        b"not: [valid remote yaml",
+        vec!["test", "write-broken-remote"],
+    )
+    .await
+    .expect("write malformed remote attachment");
+
+    let error = list_remotes_command(&ctx, None)
+        .await
+        .expect_err("remote list must reject an unreadable attachment");
+    assert!(
+        error
+            .to_string()
+            .contains("could not read /sys/remotes/broken"),
+        "unexpected error: {error}"
+    );
+}
+
 /// Regression test for P1-BUG-LF-REPLICATION (D5.9): a file larger than
 /// `tlogfs::large_files::LARGE_FILE_THRESHOLD` (64 KiB) is externalized
 /// into `<pond>/data/_large_files/blake3_16=…/blake3=….parquet`, and

@@ -7,7 +7,7 @@
 //! payload objects; a compatible importer verifies this module's logical
 //! contract before writing a fresh pond.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use bytes::Bytes;
@@ -17,21 +17,11 @@ use tinyfs::EntryType;
 
 use super::ObjectHash;
 
-/// Recovery-capsule format identifier.
-pub const CAPSULE_FORMAT_V1: &str = "pondcapsule.1";
-/// The second portable capsule format used by newly-created Watertown ponds.
-pub const CAPSULE_FORMAT_V2: &str = "pondcapsule.2";
-/// The third portable capsule format, with a schema identity on every table leaf.
-pub const CAPSULE_FORMAT_V3: &str = "pondcapsule.3";
-/// The fourth portable capsule format, preserving dynamic-node metadata.
+/// Current recovery-capsule format identifier.
 pub const CAPSULE_FORMAT_V4: &str = "pondcapsule.4";
 
-const CAPSULE_ROOT_DOMAIN: &[u8] = b"pondcapsule.root.1\n";
-const CAPSULE_ROOT_DOMAIN_V2: &[u8] = b"pondcapsule.root.2\n";
-const CAPSULE_ROOT_DOMAIN_V3: &[u8] = b"pondcapsule.root.3\n";
 const CAPSULE_ROOT_DOMAIN_V4: &[u8] = b"pondcapsule.root.4\n";
-const CAPSULE_SERIES_DOMAIN: &[u8] = b"pondcapsule.series.1\n";
-const CAPSULE_SERIES_DOMAIN_V3: &[u8] = b"pondcapsule.series.3\n";
+const CAPSULE_SERIES_DOMAIN: &[u8] = b"pondcapsule.series.3\n";
 const LOGICAL_LEAF_DOMAIN: &[u8] = b"watertown.series-leaf.v1\n";
 
 /// Provenance of the live snapshot represented by a capsule.
@@ -87,7 +77,7 @@ pub struct CapsuleDynamicMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapsuleLeaf {
-    /// BLAKE3 logical identity under the capsule v1 canonical leaf rules.
+    /// BLAKE3 logical identity under the current canonical leaf rules.
     #[serde(with = "hash_serde")]
     pub logical_hash: ObjectHash,
     /// Byte count for files or row count for tables.
@@ -102,8 +92,7 @@ pub struct CapsuleLeaf {
     pub logical_attributes: Option<String>,
     /// BLAKE3 of this table leaf's canonical Arrow schema.
     ///
-    /// Present for every table leaf in `pondcapsule.3` and `.4`. Files never
-    /// declare schemas; v1/v2 keep their frozen representation without it.
+    /// Present for every table leaf. Files never declare schemas.
     #[serde(
         default,
         with = "optional_hash_serde",
@@ -129,8 +118,7 @@ pub enum CapsuleNode {
         recipe: CapsuleObject,
         /// Synthetic dynamic-node metadata.
         ///
-        /// Absent in frozen `pondcapsule.1` through `.3` capsules. A V4
-        /// producer records it whenever the native node carries it.
+        /// Present whenever the native node carries synthetic metadata.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metadata: Option<CapsuleDynamicMetadata>,
     },
@@ -172,7 +160,7 @@ pub struct CapsuleEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapsuleManifest {
-    /// Must equal one of the supported `pondcapsule.*` format identifiers.
+    /// Must equal [`CAPSULE_FORMAT_V4`].
     pub format: String,
     /// Source snapshot provenance.
     pub source: CapsuleSource,
@@ -196,7 +184,7 @@ pub struct CapsuleVerifyReport {
 }
 
 impl CapsuleManifest {
-    /// Construct and validate a v1 manifest.
+    /// Construct and validate a current `pondcapsule.4` manifest.
     ///
     /// Entries are sorted canonically before validation and encoding.
     ///
@@ -205,32 +193,10 @@ impl CapsuleManifest {
     /// Returns an error for an invalid source, path topology, entry/content
     /// mismatch, logical descriptor, or noncanonical attribute object.
     pub fn new(source: CapsuleSource, entries: Vec<CapsuleEntry>) -> Result<Self, String> {
-        Self::new_with_format(CAPSULE_FORMAT_V1, source, entries)
-    }
-
-    /// Construct and validate a v2 manifest for the new Watertown native format.
-    pub fn new_v2(source: CapsuleSource, entries: Vec<CapsuleEntry>) -> Result<Self, String> {
-        Self::new_with_format(CAPSULE_FORMAT_V2, source, entries)
-    }
-
-    /// Construct and validate a v3 manifest.
-    pub fn new_v3(source: CapsuleSource, entries: Vec<CapsuleEntry>) -> Result<Self, String> {
-        Self::new_with_format(CAPSULE_FORMAT_V3, source, entries)
-    }
-
-    /// Construct and validate a v4 manifest.
-    pub fn new_v4(source: CapsuleSource, entries: Vec<CapsuleEntry>) -> Result<Self, String> {
-        Self::new_with_format(CAPSULE_FORMAT_V4, source, entries)
-    }
-
-    fn new_with_format(
-        format: &str,
-        source: CapsuleSource,
-        mut entries: Vec<CapsuleEntry>,
-    ) -> Result<Self, String> {
+        let mut entries = entries;
         entries.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
         let manifest = Self {
-            format: format.to_string(),
+            format: CAPSULE_FORMAT_V4.to_string(),
             source,
             entries,
         };
@@ -244,13 +210,9 @@ impl CapsuleManifest {
     ///
     /// Returns a specific diagnostic for the first violated capsule invariant.
     pub fn validate(&self) -> Result<(), String> {
-        if !matches!(
-            self.format.as_str(),
-            CAPSULE_FORMAT_V1 | CAPSULE_FORMAT_V2 | CAPSULE_FORMAT_V3 | CAPSULE_FORMAT_V4
-        ) {
+        if self.format != CAPSULE_FORMAT_V4 {
             return Err(format!(
-                "unsupported capsule format {:?}; expected {CAPSULE_FORMAT_V1:?}, \
-                 {CAPSULE_FORMAT_V2:?}, {CAPSULE_FORMAT_V3:?}, or {CAPSULE_FORMAT_V4:?}",
+                "unsupported capsule format {:?}; expected {CAPSULE_FORMAT_V4:?}",
                 self.format
             ));
         }
@@ -283,7 +245,7 @@ impl CapsuleManifest {
                 }
             }
             prior_path = Some(&entry.path);
-            validate_entry(entry, &self.format)?;
+            validate_entry(entry)?;
             let _ = entries_by_path.insert(entry.path.as_str(), entry);
         }
 
@@ -347,10 +309,6 @@ impl CapsuleManifest {
 /// Returns an error if validation or serialization fails.
 pub fn capsule_manifest_bytes(manifest: &CapsuleManifest) -> Result<Vec<u8>, String> {
     manifest.validate()?;
-    if !is_schema_evolved_format(&manifest.format) {
-        return serde_json::to_vec(manifest)
-            .map_err(|error| format!("encode capsule manifest: {error}"));
-    }
     let mut value = serde_json::to_value(manifest)
         .map_err(|error| format!("encode capsule manifest: {error}"))?;
     let entries = value
@@ -370,7 +328,7 @@ pub fn capsule_manifest_bytes(manifest: &CapsuleManifest) -> Result<Vec<u8>, Str
             let _ = node.remove("schema_fingerprint");
         }
     }
-    serde_json::to_vec(&value).map_err(|error| format!("encode v3 capsule manifest: {error}"))
+    serde_json::to_vec(&value).map_err(|error| format!("encode capsule manifest: {error}"))
 }
 
 /// Compute the domain-separated BLAKE3 root of a canonical manifest.
@@ -381,21 +339,15 @@ pub fn capsule_manifest_bytes(manifest: &CapsuleManifest) -> Result<Vec<u8>, Str
 pub fn capsule_root(manifest: &CapsuleManifest) -> Result<ObjectHash, String> {
     let bytes = capsule_manifest_bytes(manifest)?;
     let mut hasher = blake3::Hasher::new();
-    hasher.update(match manifest.format.as_str() {
-        CAPSULE_FORMAT_V1 => CAPSULE_ROOT_DOMAIN,
-        CAPSULE_FORMAT_V2 => CAPSULE_ROOT_DOMAIN_V2,
-        CAPSULE_FORMAT_V3 => CAPSULE_ROOT_DOMAIN_V3,
-        CAPSULE_FORMAT_V4 => CAPSULE_ROOT_DOMAIN_V4,
-        _ => unreachable!("manifest validation checks the capsule format"),
-    });
+    hasher.update(CAPSULE_ROOT_DOMAIN_V4);
     hasher.update(&bytes);
     Ok(ObjectHash::from_bytes(*hasher.finalize().as_bytes()))
 }
 
 /// Compute one physical node's logical series root.
 ///
-/// The root commits to payload kind, table schema identity, and every ordered
-/// logical leaf descriptor. Physical payload objects do not contribute.
+/// Every table leaf's schema fingerprint is framed into the root. Physical
+/// payload objects do not contribute.
 #[must_use]
 pub fn capsule_series_root(
     payload_kind: CapsulePayloadKind,
@@ -404,70 +356,6 @@ pub fn capsule_series_root(
 ) -> ObjectHash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(CAPSULE_SERIES_DOMAIN);
-    hasher.update(&[match payload_kind {
-        CapsulePayloadKind::File => 0,
-        CapsulePayloadKind::Table => 1,
-    }]);
-    match schema_fingerprint {
-        Some(hash) => {
-            hasher.update(&[1]);
-            hasher.update(hash.as_bytes());
-        }
-
-        None => {
-            hasher.update(&[0]);
-        }
-    }
-    hasher.update(
-        &u64::try_from(leaves.len())
-            .expect("capsule leaf count exceeds u64::MAX")
-            .to_le_bytes(),
-    );
-    for leaf in leaves {
-        hasher.update(leaf.logical_hash.as_bytes());
-        hasher.update(&leaf.logical_count.to_le_bytes());
-        let mut flags = 0u8;
-        if leaf.min_event_time.is_some() {
-            flags |= 0x01;
-        }
-        if leaf.max_event_time.is_some() {
-            flags |= 0x02;
-        }
-        if leaf.logical_attributes.is_some() {
-            flags |= 0x04;
-        }
-        hasher.update(&[flags]);
-        if let Some(minimum) = leaf.min_event_time {
-            hasher.update(&minimum.to_le_bytes());
-        }
-        if let Some(maximum) = leaf.max_event_time {
-            hasher.update(&maximum.to_le_bytes());
-        }
-        if let Some(attributes) = &leaf.logical_attributes {
-            hasher.update(
-                &u64::try_from(attributes.len())
-                    .expect("capsule logical attributes exceed u64::MAX")
-                    .to_le_bytes(),
-            );
-            hasher.update(attributes.as_bytes());
-        }
-    }
-    ObjectHash::from_bytes(*hasher.finalize().as_bytes())
-}
-
-/// Compute a v3 physical node's logical series root.
-///
-/// Unlike v1/v2, every table leaf's schema fingerprint is framed into the
-/// root. The distinct domain prevents a v2 root from being reinterpreted as a
-/// v3 root.
-#[must_use]
-pub fn capsule_series_root_v3(
-    payload_kind: CapsulePayloadKind,
-    schema_fingerprint: Option<ObjectHash>,
-    leaves: &[CapsuleLeaf],
-) -> ObjectHash {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(CAPSULE_SERIES_DOMAIN_V3);
     hasher.update(&[match payload_kind {
         CapsulePayloadKind::File => 0,
         CapsulePayloadKind::Table => 1,
@@ -768,9 +656,7 @@ pub fn verify_incremental_capsule_payload_directory(
                     for object in objects {
                         verify_payload_file(objects_dir, object)?;
                     }
-                    if is_schema_evolved_format(&manifest.format)
-                        && *payload_kind == CapsulePayloadKind::Table
-                    {
+                    if *payload_kind == CapsulePayloadKind::Table {
                         verify_table_stream_v3_directory(
                             objects_dir,
                             &entry.path,
@@ -779,15 +665,7 @@ pub fn verify_incremental_capsule_payload_directory(
                             leaves,
                         )?;
                     } else {
-                        verify_staged_physical(
-                            objects_dir,
-                            &entry.path,
-                            *payload_kind,
-                            *schema_fingerprint,
-                            objects,
-                            leaves,
-                            manifest.format == CAPSULE_FORMAT_V1,
-                        )?;
+                        verify_file_stream_directory(objects_dir, &entry.path, objects, leaves)?;
                     }
                     continue;
                 }
@@ -824,9 +702,7 @@ pub fn verify_incremental_capsule_payload_directory(
                     }
                 }
                 if !staged_objects.is_empty() {
-                    if is_schema_evolved_format(&manifest.format)
-                        && *payload_kind == CapsulePayloadKind::Table
-                    {
+                    if *payload_kind == CapsulePayloadKind::Table {
                         verify_table_stream_v3_directory(
                             objects_dir,
                             &entry.path,
@@ -835,14 +711,11 @@ pub fn verify_incremental_capsule_payload_directory(
                             &staged_leaves,
                         )?;
                     } else {
-                        verify_staged_physical(
+                        verify_file_stream_directory(
                             objects_dir,
                             &entry.path,
-                            *payload_kind,
-                            *schema_fingerprint,
                             &staged_objects,
                             &staged_leaves,
-                            manifest.format == CAPSULE_FORMAT_V1,
                         )?;
                     }
                 }
@@ -857,31 +730,6 @@ fn staged_payload_exists(objects_dir: &Path, hash: ObjectHash) -> Result<bool, S
         .join(format!("blake3={}", hash.to_hex()))
         .try_exists()
         .map_err(|error| format!("inspect staged capsule payload {hash}: {error}"))
-}
-
-fn verify_staged_physical(
-    objects_dir: &Path,
-    path: &str,
-    payload_kind: CapsulePayloadKind,
-    schema_fingerprint: Option<ObjectHash>,
-    objects: &[CapsuleObject],
-    leaves: &[CapsuleLeaf],
-    legacy: bool,
-) -> Result<(), String> {
-    match payload_kind {
-        CapsulePayloadKind::File => {
-            verify_file_stream_directory(objects_dir, path, objects, leaves, legacy)
-        }
-        CapsulePayloadKind::Table => verify_table_stream_directory(
-            objects_dir,
-            path,
-            schema_fingerprint
-                .ok_or_else(|| format!("table {path:?} has no schema fingerprint"))?,
-            objects,
-            leaves,
-            legacy,
-        ),
-    }
 }
 
 fn verify_capsule_payload_directory_at_root(
@@ -910,43 +758,19 @@ fn verify_capsule_payload_directory_at_root(
         {
             match payload_kind {
                 CapsulePayloadKind::File => {
-                    verify_file_stream_directory(
-                        objects_dir,
-                        &entry.path,
-                        objects,
-                        leaves,
-                        manifest.format == CAPSULE_FORMAT_V1,
-                    )?;
+                    verify_file_stream_directory(objects_dir, &entry.path, objects, leaves)?;
                 }
                 CapsulePayloadKind::Table => {
-                    if is_schema_evolved_format(&manifest.format) {
-                        verify_table_stream_v3_directory(
-                            objects_dir,
-                            &entry.path,
-                            *schema_fingerprint,
-                            objects,
-                            leaves,
-                        )?;
-                    } else {
-                        verify_table_stream_directory(
-                            objects_dir,
-                            &entry.path,
-                            schema_fingerprint.ok_or_else(|| {
-                                format!("table {} has no schema fingerprint", entry.path)
-                            })?,
-                            objects,
-                            leaves,
-                            manifest.format == CAPSULE_FORMAT_V1,
-                        )?;
-                    }
+                    verify_table_stream_v3_directory(
+                        objects_dir,
+                        &entry.path,
+                        *schema_fingerprint,
+                        objects,
+                        leaves,
+                    )?;
                 }
             }
-            let computed = capsule_series_root_for_format(
-                &manifest.format,
-                *payload_kind,
-                *schema_fingerprint,
-                leaves,
-            );
+            let computed = capsule_series_root(*payload_kind, *schema_fingerprint, leaves);
             if computed != *logical_root {
                 return Err(format!(
                     "capsule path {:?} series root mismatch",
@@ -1003,12 +827,11 @@ fn verify_file_stream_directory(
     path: &str,
     objects: &[CapsuleObject],
     leaves: &[CapsuleLeaf],
-    legacy: bool,
 ) -> Result<(), String> {
     let mut leaf_index = 0usize;
     let mut hasher = leaves
         .first()
-        .map(|leaf| new_file_leaf_hasher(leaf, legacy))
+        .map(new_file_leaf_hasher)
         .transpose()
         .map_err(|error| format!("prepare file {path:?} leaf 0: {error}"))?;
     let mut buffer = vec![0u8; 1024 * 1024];
@@ -1051,7 +874,7 @@ fn verify_file_stream_directory(
                     leaf_index += 1;
                     hasher = leaves
                         .get(leaf_index)
-                        .map(|leaf| new_file_leaf_hasher(leaf, legacy))
+                        .map(new_file_leaf_hasher)
                         .transpose()
                         .map_err(|error| {
                             format!("prepare file {path:?} leaf {leaf_index}: {error}")
@@ -1071,14 +894,8 @@ fn verify_file_stream_directory(
 
 fn new_file_leaf_hasher(
     leaf: &CapsuleLeaf,
-    legacy: bool,
 ) -> Result<super::series_leaf::IncrementalFileLeafHasher, String> {
-    super::series_leaf::IncrementalFileLeafHasher::new_with_magic(
-        if legacy {
-            super::series_leaf::legacy_leaf_magic()
-        } else {
-            b"watertown.series-leaf.v1\n"
-        },
+    super::series_leaf::IncrementalFileLeafHasher::new(
         leaf.logical_count,
         leaf.min_event_time,
         leaf.max_event_time,
@@ -1127,7 +944,6 @@ fn verify_table_stream_v3_directory(
                         schemas[leaf_index].as_ref(),
                         leaf,
                         canonical_lengths[leaf_index],
-                        false,
                     )?);
                 }
                 let remaining = leaf
@@ -1308,207 +1124,19 @@ fn scan_table_stream_v3_directory(
     Ok((schemas, canonical_lengths))
 }
 
-fn verify_table_stream_directory(
-    objects_dir: &Path,
-    path: &str,
-    expected_schema: ObjectHash,
-    objects: &[CapsuleObject],
-    leaves: &[CapsuleLeaf],
-    legacy: bool,
-) -> Result<(), String> {
-    let mut schema: Option<std::sync::Arc<arrow_schema::Schema>> = None;
-    let mut canonical_lengths = vec![0u64; leaves.len()];
-    let mut leaf_index = 0usize;
-    let mut leaf_rows = 0u64;
-
-    for object in objects {
-        let file =
-            std::fs::File::open(objects_dir.join(format!("blake3={}", object.hash.to_hex())))
-                .map_err(|error| format!("open table {path:?} object {}: {error}", object.hash))?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|error| format!("open table {path:?} object {}: {error}", object.hash))?;
-        let canonical_schema =
-            super::series_leaf::canonicalize_schema(builder.schema().as_ref())
-                .map_err(|error| format!("canonicalize table {path:?} schema: {error}"))?;
-        let fingerprint = if legacy {
-            super::series_leaf::schema_fingerprint_with_magic(
-                &canonical_schema,
-                super::series_leaf::legacy_schema_magic(),
-            )
-        } else {
-            super::series_leaf::schema_fingerprint(&canonical_schema)
-        }
-        .map_err(|error| format!("fingerprint table {path:?}: {error}"))?;
-        if fingerprint != expected_schema {
-            return Err(format!(
-                "table {path:?} object {} schema hashes to {fingerprint}, expected {expected_schema}",
-                object.hash
-            ));
-        }
-        if let Some(prior) = &schema {
-            if prior.as_ref() != canonical_schema.as_ref() {
-                return Err(format!(
-                    "table {path:?} has logically inconsistent Arrow schemas"
-                ));
-            }
-        } else {
-            schema = Some(canonical_schema);
-        }
-        for batch in builder
-            .build()
-            .map_err(|error| format!("build table {path:?} reader: {error}"))?
-        {
-            let batch = batch.map_err(|error| format!("read table {path:?} rows: {error}"))?;
-            let mut offset = 0usize;
-            while offset < batch.num_rows() {
-                let leaf = leaves.get(leaf_index).ok_or_else(|| {
-                    format!("table {path:?} has rows after its final logical leaf")
-                })?;
-                let remaining = leaf
-                    .logical_count
-                    .checked_sub(leaf_rows)
-                    .ok_or_else(|| format!("table {path:?} leaf {leaf_index} row underflow"))?;
-                let take = usize::try_from(remaining)
-                    .unwrap_or(usize::MAX)
-                    .min(batch.num_rows() - offset);
-                let slice = batch.slice(offset, take);
-                let bytes = super::series_leaf::encode_canonical_batch_rows(
-                    schema.as_ref().expect("table schema established"),
-                    &slice,
-                )
-                .map_err(|error| {
-                    format!("encode table {path:?} leaf {leaf_index} rows: {error}")
-                })?;
-                canonical_lengths[leaf_index] = canonical_lengths[leaf_index]
-                    .checked_add(u64::try_from(bytes.len()).map_err(|_| {
-                        format!("table {path:?} leaf {leaf_index} bytes exceed u64::MAX")
-                    })?)
-                    .ok_or_else(|| {
-                        format!("table {path:?} leaf {leaf_index} bytes exceed u64::MAX")
-                    })?;
-                leaf_rows += take as u64;
-                offset += take;
-                if leaf_rows == leaf.logical_count {
-                    leaf_index += 1;
-                    leaf_rows = 0;
-                }
-            }
-        }
-    }
-    let schema = schema.ok_or_else(|| format!("table {path:?} has no Parquet schema carrier"))?;
-    if leaf_index != leaves.len() || leaf_rows != 0 {
-        return Err(format!(
-            "table {path:?} ended after {leaf_index} of {} logical leaves",
-            leaves.len()
-        ));
-    }
-    if leaves.is_empty() {
-        return Ok(());
-    }
-
-    let mut leaf_index = 0usize;
-    let mut leaf_rows = 0u64;
-    let mut hasher = Some(new_table_leaf_hasher(
-        &schema,
-        &leaves[0],
-        canonical_lengths[0],
-        legacy,
-    )?);
-    for object in objects {
-        let file =
-            std::fs::File::open(objects_dir.join(format!("blake3={}", object.hash.to_hex())))
-                .map_err(|error| {
-                    format!("reopen table {path:?} object {}: {error}", object.hash)
-                })?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|error| format!("reopen table {path:?} object {}: {error}", object.hash))?
-            .build()
-            .map_err(|error| format!("rebuild table {path:?} reader: {error}"))?;
-        for batch in reader {
-            let batch = batch.map_err(|error| format!("reread table {path:?} rows: {error}"))?;
-            let mut offset = 0usize;
-            while offset < batch.num_rows() {
-                let leaf = &leaves[leaf_index];
-                let remaining = leaf.logical_count - leaf_rows;
-                let take = usize::try_from(remaining)
-                    .unwrap_or(usize::MAX)
-                    .min(batch.num_rows() - offset);
-                let slice = batch.slice(offset, take);
-                hasher
-                    .as_mut()
-                    .expect("active table leaf hasher")
-                    .write_batch(&slice)
-                    .map_err(|error| format!("hash table {path:?} leaf {leaf_index}: {error}"))?;
-                leaf_rows += take as u64;
-                offset += take;
-                if leaf_rows == leaf.logical_count {
-                    let computed = hasher
-                        .take()
-                        .expect("completed table leaf hasher")
-                        .finish()
-                        .map_err(|error| {
-                            format!("finish table {path:?} leaf {leaf_index}: {error}")
-                        })?;
-                    if computed != leaf.logical_hash {
-                        return Err(format!(
-                            "table {path:?} leaf {leaf_index} hashes to {computed}, manifest names {}",
-                            leaf.logical_hash
-                        ));
-                    }
-                    leaf_index += 1;
-                    leaf_rows = 0;
-                    hasher = leaves
-                        .get(leaf_index)
-                        .map(|leaf| {
-                            new_table_leaf_hasher(
-                                &schema,
-                                leaf,
-                                canonical_lengths[leaf_index],
-                                legacy,
-                            )
-                        })
-                        .transpose()?;
-                }
-            }
-        }
-    }
-    if leaf_index != leaves.len() {
-        return Err(format!(
-            "table {path:?} ended after {leaf_index} of {} logical leaves",
-            leaves.len()
-        ));
-    }
-    Ok(())
-}
-
 fn new_table_leaf_hasher(
     schema: &arrow_schema::Schema,
     leaf: &CapsuleLeaf,
     canonical_rows_len: u64,
-    legacy: bool,
 ) -> Result<super::series_leaf::IncrementalTableLeafHasher, String> {
-    if legacy {
-        super::series_leaf::IncrementalTableLeafHasher::new_with_magic_and_rows_domain(
-            super::series_leaf::legacy_leaf_magic(),
-            schema,
-            leaf.logical_count,
-            canonical_rows_len,
-            leaf.min_event_time,
-            leaf.max_event_time,
-            leaf.logical_attributes.as_deref().map(str::as_bytes),
-            super::series_leaf::legacy_rows_magic(),
-            super::series_leaf::legacy_schema_magic(),
-        )
-    } else {
-        super::series_leaf::IncrementalTableLeafHasher::new(
-            schema,
-            leaf.logical_count,
-            canonical_rows_len,
-            leaf.min_event_time,
-            leaf.max_event_time,
-            leaf.logical_attributes.as_deref().map(str::as_bytes),
-        )
-    }
+    super::series_leaf::IncrementalTableLeafHasher::new(
+        schema,
+        leaf.logical_count,
+        canonical_rows_len,
+        leaf.min_event_time,
+        leaf.max_event_time,
+        leaf.logical_attributes.as_deref().map(str::as_bytes),
+    )
 }
 
 fn verify_capsule_with<F>(
@@ -1544,33 +1172,16 @@ where
                     verify_file_stream(&mut read_payload, &entry.path, objects, leaves)?;
                 }
                 CapsulePayloadKind::Table => {
-                    if is_schema_evolved_format(&manifest.format) {
-                        verify_table_stream_v3(
-                            &mut read_payload,
-                            &entry.path,
-                            *schema_fingerprint,
-                            objects,
-                            leaves,
-                        )?;
-                    } else {
-                        verify_table_stream(
-                            &mut read_payload,
-                            &entry.path,
-                            schema_fingerprint.ok_or_else(|| {
-                                format!("table {} has no schema fingerprint", entry.path)
-                            })?,
-                            objects,
-                            leaves,
-                        )?;
-                    }
+                    verify_table_stream_v3(
+                        &mut read_payload,
+                        &entry.path,
+                        *schema_fingerprint,
+                        objects,
+                        leaves,
+                    )?;
                 }
             }
-            let computed = capsule_series_root_for_format(
-                &manifest.format,
-                *payload_kind,
-                *schema_fingerprint,
-                leaves,
-            );
+            let computed = capsule_series_root(*payload_kind, *schema_fingerprint, leaves);
             if computed != *logical_root {
                 return Err(format!(
                     "capsule path {:?} series root mismatch",
@@ -1638,106 +1249,6 @@ fn verify_file_stream(
             ));
         }
         offset = end;
-    }
-    Ok(())
-}
-
-fn verify_table_stream(
-    read_payload: &mut impl FnMut(ObjectHash) -> Result<Vec<u8>, String>,
-    path: &str,
-    expected_schema: ObjectHash,
-    objects: &[CapsuleObject],
-    leaves: &[CapsuleLeaf],
-) -> Result<(), String> {
-    let mut schema: Option<std::sync::Arc<arrow_schema::Schema>> = None;
-    let mut batches = VecDeque::new();
-    let mut total_rows = 0u64;
-    for object in objects {
-        let bytes = read_payload(object.hash)?;
-        verify_payload(object, &bytes)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes))
-            .map_err(|error| format!("open table {path:?} object {}: {error}", object.hash))?;
-        let object_schema = builder.schema().as_ref().clone();
-        let canonical_schema = super::series_leaf::canonicalize_schema(&object_schema)
-            .map_err(|error| format!("canonicalize table {path:?} schema: {error}"))?;
-        let fingerprint = super::series_leaf::schema_fingerprint(&canonical_schema)
-            .map_err(|error| format!("fingerprint table {path:?}: {error}"))?;
-        if fingerprint != expected_schema {
-            return Err(format!(
-                "table {path:?} object {} schema hashes to {fingerprint}, expected {expected_schema}",
-                object.hash
-            ));
-        }
-        if let Some(prior) = &schema {
-            if prior.as_ref() != canonical_schema.as_ref() {
-                return Err(format!(
-                    "table {path:?} has logically inconsistent Arrow schemas"
-                ));
-            }
-        } else {
-            schema = Some(canonical_schema);
-        }
-        for batch in builder
-            .build()
-            .map_err(|error| format!("build table {path:?} reader: {error}"))?
-        {
-            let batch = batch.map_err(|error| format!("read table {path:?} rows: {error}"))?;
-            total_rows = total_rows
-                .checked_add(batch.num_rows() as u64)
-                .ok_or_else(|| format!("table {path:?} row count exceeds u64::MAX"))?;
-            if batch.num_rows() > 0 {
-                batches.push_back(batch);
-            }
-        }
-    }
-    let schema = schema.ok_or_else(|| format!("table {path:?} has no Parquet schema carrier"))?;
-    let declared = leaves.iter().try_fold(0u64, |total, leaf| {
-        total
-            .checked_add(leaf.logical_count)
-            .ok_or_else(|| format!("table {path:?} logical count exceeds u64::MAX"))
-    })?;
-    if total_rows != declared {
-        return Err(format!(
-            "table {path:?} stream has {total_rows} rows, leaves declare {declared}"
-        ));
-    }
-
-    for (index, leaf) in leaves.iter().enumerate() {
-        let mut remaining = usize::try_from(leaf.logical_count)
-            .map_err(|_| format!("table {path:?} leaf {index} is too large for this platform"))?;
-        let mut leaf_batches = Vec::new();
-        while remaining > 0 {
-            let batch = batches
-                .pop_front()
-                .ok_or_else(|| format!("table {path:?} ended while reconstructing leaf {index}"))?;
-            if batch.num_rows() <= remaining {
-                remaining -= batch.num_rows();
-                leaf_batches.push(batch);
-            } else {
-                leaf_batches.push(batch.slice(0, remaining));
-                batches.push_front(batch.slice(remaining, batch.num_rows() - remaining));
-                remaining = 0;
-            }
-        }
-        let computed = super::series_leaf::table_leaf_hash(
-            &schema,
-            &leaf_batches,
-            leaf.min_event_time,
-            leaf.max_event_time,
-            leaf.logical_attributes.as_deref(),
-        )
-        .map_err(|error| format!("hash table {path:?} leaf {index}: {error}"))?;
-        if computed != leaf.logical_hash {
-            return Err(format!(
-                "table {path:?} leaf {index} hashes to {computed}, manifest names {}",
-                leaf.logical_hash
-            ));
-        }
-    }
-    if !batches.is_empty() {
-        return Err(format!(
-            "table {path:?} has unrepresented rows after its last leaf"
-        ));
     }
     Ok(())
 }
@@ -1871,7 +1382,6 @@ fn verify_table_stream_v3(
             schemas[0].as_ref(),
             &leaves[0],
             canonical_lengths[0],
-            false,
         )?)
     };
     for (index, batch) in records {
@@ -1892,7 +1402,6 @@ fn verify_table_stream_v3(
                 schemas[current].as_ref(),
                 &leaves[current],
                 canonical_lengths[current],
-                false,
             )?);
         }
         hasher
@@ -1919,7 +1428,6 @@ fn verify_table_stream_v3(
                 schemas[current].as_ref(),
                 &leaves[current],
                 canonical_lengths[current],
-                false,
             )?);
         }
     }
@@ -1944,24 +1452,7 @@ fn verify_payload(object: &CapsuleObject, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn capsule_series_root_for_format(
-    format: &str,
-    payload_kind: CapsulePayloadKind,
-    schema_fingerprint: Option<ObjectHash>,
-    leaves: &[CapsuleLeaf],
-) -> ObjectHash {
-    if is_schema_evolved_format(format) {
-        capsule_series_root_v3(payload_kind, schema_fingerprint, leaves)
-    } else {
-        capsule_series_root(payload_kind, schema_fingerprint, leaves)
-    }
-}
-
-fn is_schema_evolved_format(format: &str) -> bool {
-    matches!(format, CAPSULE_FORMAT_V3 | CAPSULE_FORMAT_V4)
-}
-
-fn validate_entry(entry: &CapsuleEntry, format: &str) -> Result<(), String> {
+fn validate_entry(entry: &CapsuleEntry) -> Result<(), String> {
     if entry.source_node_id.is_empty() {
         return Err(format!(
             "capsule path {:?} has an empty source_node_id",
@@ -1975,12 +1466,7 @@ fn validate_entry(entry: &CapsuleEntry, format: &str) -> Result<(), String> {
             CapsuleNode::Dynamic { metadata, .. },
             EntryType::DirectoryDynamic | EntryType::FileDynamic | EntryType::TableDynamic,
         ) => {
-            if metadata.is_some() && format != CAPSULE_FORMAT_V4 {
-                return Err(format!(
-                    "capsule path {:?} has dynamic metadata unsupported by {format}",
-                    entry.path
-                ));
-            }
+            let _ = metadata;
         }
         (
             CapsuleNode::Physical {
@@ -2012,22 +1498,11 @@ fn validate_entry(entry: &CapsuleEntry, format: &str) -> Result<(), String> {
                     entry.path
                 ));
             }
-            match payload_kind {
-                CapsulePayloadKind::File if schema_fingerprint.is_some() => {
-                    return Err(format!(
-                        "capsule file path {:?} must not declare a schema fingerprint",
-                        entry.path
-                    ));
-                }
-                CapsulePayloadKind::Table
-                    if !is_schema_evolved_format(format) && schema_fingerprint.is_none() =>
-                {
-                    return Err(format!(
-                        "capsule table path {:?} must declare a schema fingerprint",
-                        entry.path
-                    ));
-                }
-                CapsulePayloadKind::File | CapsulePayloadKind::Table => {}
+            if *payload_kind == CapsulePayloadKind::File && schema_fingerprint.is_some() {
+                return Err(format!(
+                    "capsule file path {:?} must not declare a schema fingerprint",
+                    entry.path
+                ));
             }
             match payload_kind {
                 CapsulePayloadKind::File if leaves.is_empty() != objects.is_empty() => {
@@ -2045,12 +1520,11 @@ fn validate_entry(entry: &CapsuleEntry, format: &str) -> Result<(), String> {
                 CapsulePayloadKind::File | CapsulePayloadKind::Table => {}
             }
             if *payload_kind == CapsulePayloadKind::Table
-                && is_schema_evolved_format(format)
                 && leaves.is_empty()
                 && schema_fingerprint.is_none()
             {
                 return Err(format!(
-                    "empty v3 table path {:?} must declare a node schema fingerprint",
+                    "empty table path {:?} must declare a node schema fingerprint",
                     entry.path
                 ));
             }
@@ -2084,31 +1558,23 @@ fn validate_entry(entry: &CapsuleEntry, format: &str) -> Result<(), String> {
                     ));
                 }
                 if *payload_kind == CapsulePayloadKind::Table {
-                    if is_schema_evolved_format(format) {
-                        let leaf_schema = leaf.schema_fingerprint.ok_or_else(|| {
-                            format!(
-                                "capsule v3 table path {:?} leaf {index} must declare a schema fingerprint",
-                                entry.path
-                            )
-                        })?;
-                        if let Some(node_schema) = schema_fingerprint
-                            && *node_schema != leaf_schema
-                        {
-                            return Err(format!(
-                                "capsule v3 table path {:?} leaf {index} schema fingerprint differs from node schema",
-                                entry.path
-                            ));
-                        }
-                    } else if leaf.schema_fingerprint.is_some() {
+                    let leaf_schema = leaf.schema_fingerprint.ok_or_else(|| {
+                        format!(
+                            "capsule table path {:?} leaf {index} must declare a schema fingerprint",
+                            entry.path
+                        )
+                    })?;
+                    if let Some(node_schema) = schema_fingerprint
+                        && *node_schema != leaf_schema
+                    {
                         return Err(format!(
-                            "capsule v1/v2 table path {:?} leaf {index} must not declare a schema fingerprint",
+                            "capsule table path {:?} leaf {index} schema fingerprint differs from node schema",
                             entry.path
                         ));
                     }
                 }
             }
-            let computed_root =
-                capsule_series_root_for_format(format, *payload_kind, *schema_fingerprint, leaves);
+            let computed_root = capsule_series_root(*payload_kind, *schema_fingerprint, leaves);
             if *logical_root != computed_root {
                 return Err(format!(
                     "capsule path {:?} logical root mismatch: declared {}, computed {}",
@@ -2393,9 +1859,9 @@ mod tests {
             min_event_time: None,
             max_event_time: None,
             logical_attributes: None,
-            schema_fingerprint: None,
+            schema_fingerprint: Some(schema_fingerprint),
         };
-        let manifest = CapsuleManifest::new_v2(
+        let manifest = CapsuleManifest::new(
             source(),
             vec![
                 root(),
@@ -2437,7 +1903,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_schema_evolved_table_commits_and_verifies_each_leaf_schema() {
+    fn table_commits_and_verifies_each_leaf_schema() {
         let first_schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Utf8,
@@ -2512,7 +1978,7 @@ mod tests {
                 size: second_bytes.len() as u64,
             },
         ];
-        let manifest = CapsuleManifest::new_v3(
+        let manifest = CapsuleManifest::new(
             source(),
             vec![
                 root(),
@@ -2523,11 +1989,7 @@ mod tests {
                     node: CapsuleNode::Physical {
                         payload_kind: CapsulePayloadKind::Table,
                         schema_fingerprint: None,
-                        logical_root: capsule_series_root_v3(
-                            CapsulePayloadKind::Table,
-                            None,
-                            &leaves,
-                        ),
+                        logical_root: capsule_series_root(CapsulePayloadKind::Table, None, &leaves),
                         objects: objects.clone(),
                         leaves,
                     },
@@ -2535,20 +1997,6 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_ne!(
-            capsule_series_root(
-                CapsulePayloadKind::Table,
-                None,
-                match &manifest.entries[1].node {
-                    CapsuleNode::Physical { leaves, .. } => leaves,
-                    _ => unreachable!(),
-                }
-            ),
-            match &manifest.entries[1].node {
-                CapsuleNode::Physical { logical_root, .. } => *logical_root,
-                _ => unreachable!(),
-            }
-        );
         let payloads = BTreeMap::from([
             (objects[0].hash, first_bytes),
             (objects[1].hash, second_bytes),
@@ -2562,7 +2010,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_rejects_a_schema_transition_inside_one_parquet_object() {
+    fn rejects_a_schema_transition_inside_one_parquet_object() {
         let first_schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Utf8,
@@ -2615,7 +2063,7 @@ mod tests {
                 schema_fingerprint: Some(second_fingerprint),
             },
         ];
-        let manifest = CapsuleManifest::new_v3(
+        let manifest = CapsuleManifest::new(
             source(),
             vec![
                 root(),
@@ -2626,11 +2074,7 @@ mod tests {
                     node: CapsuleNode::Physical {
                         payload_kind: CapsulePayloadKind::Table,
                         schema_fingerprint: None,
-                        logical_root: capsule_series_root_v3(
-                            CapsulePayloadKind::Table,
-                            None,
-                            &leaves,
-                        ),
+                        logical_root: capsule_series_root(CapsulePayloadKind::Table, None, &leaves),
                         objects: vec![object.clone()],
                         leaves,
                     },
@@ -2644,7 +2088,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_rejects_missing_or_conflicting_leaf_schemas() {
+    fn rejects_missing_or_conflicting_leaf_schemas() {
         let schema = hash("schema");
         let leaf = CapsuleLeaf {
             logical_hash: hash("leaf"),
@@ -2658,7 +2102,7 @@ mod tests {
         let node = CapsuleNode::Physical {
             payload_kind: CapsulePayloadKind::Table,
             schema_fingerprint: None,
-            logical_root: capsule_series_root_v3(
+            logical_root: capsule_series_root(
                 CapsulePayloadKind::Table,
                 None,
                 std::slice::from_ref(&leaf),
@@ -2667,7 +2111,7 @@ mod tests {
             leaves: vec![leaf.clone()],
         };
         assert!(
-            CapsuleManifest::new_v3(
+            CapsuleManifest::new(
                 source(),
                 vec![
                     root(),
@@ -2684,13 +2128,13 @@ mod tests {
         );
         let mut conflicting = leaf;
         conflicting.schema_fingerprint = Some(hash("other"));
-        let root_hash = capsule_series_root_v3(
+        let root_hash = capsule_series_root(
             CapsulePayloadKind::Table,
             Some(schema),
             std::slice::from_ref(&conflicting),
         );
         assert!(
-            CapsuleManifest::new_v3(
+            CapsuleManifest::new(
                 source(),
                 vec![
                     root(),
@@ -2723,7 +2167,7 @@ mod tests {
             leaves: vec![conflicting],
         };
         assert!(
-            CapsuleManifest::new_v2(
+            CapsuleManifest::new(
                 source(),
                 vec![
                     root(),
@@ -2736,7 +2180,7 @@ mod tests {
                 ],
             )
             .unwrap_err()
-            .contains("v1/v2")
+            .contains("differs from node schema")
         );
     }
 
@@ -2833,7 +2277,7 @@ mod tests {
     }
 
     #[test]
-    fn logical_attributes_require_v2_canonical_json() {
+    fn logical_attributes_require_canonical_json() {
         let mut unsorted = file("/bad", "bad", "x");
         let CapsuleNode::Physical { leaves, .. } = &mut unsorted.node else {
             unreachable!()
@@ -2956,28 +2400,30 @@ mod tests {
         let manifest = CapsuleManifest::new(source(), vec![root()]).unwrap();
         assert_eq!(
             capsule_root(&manifest).unwrap().to_hex(),
-            "9b6891de5b45220d72199fe63df2e7417260ad03e1de2fb66a2ebb1ac41e375f"
+            "97f50c9d59371f625f099c7cc258c1bdfaab630e49b5e35c497b98109906756f"
         );
     }
 
     #[test]
-    fn v2_manifest_uses_distinct_format_and_root_domain() {
-        let source = source();
-        let entries = vec![root()];
-        let v1 = CapsuleManifest::new(source.clone(), entries.clone()).unwrap();
-        let v2 = CapsuleManifest::new_v2(source, entries).unwrap();
-        assert_eq!(v2.format, CAPSULE_FORMAT_V2);
-        assert_ne!(capsule_root(&v1).unwrap(), capsule_root(&v2).unwrap());
-        assert_eq!(
-            decode_capsule_manifest(&capsule_manifest_bytes(&v2).unwrap())
-                .unwrap()
-                .format,
-            CAPSULE_FORMAT_V2
-        );
+    fn rejects_obsolete_capsule_formats() {
+        let manifest = CapsuleManifest::new(source(), vec![root()]).unwrap();
+        let value = serde_json::to_value(manifest).unwrap();
+        for obsolete in [
+            "pondcapsule.1",
+            "pondcapsule.2",
+            "pondcapsule.3",
+            "pondcapsule.legacy.1",
+            "pondcapsule.legacy.2",
+        ] {
+            let mut value = value.clone();
+            value["format"] = serde_json::Value::String(obsolete.to_string());
+            let bytes = serde_json::to_vec(&value).unwrap();
+            assert!(decode_capsule_manifest(&bytes).is_err(), "{obsolete}");
+        }
     }
 
     #[test]
-    fn v4_authenticates_dynamic_node_metadata() {
+    fn authenticates_dynamic_node_metadata() {
         let dynamic = CapsuleEntry {
             path: "/dynamic".to_string(),
             entry_type: EntryType::DirectoryDynamic,
@@ -2987,24 +2433,18 @@ mod tests {
                 metadata: Some(CapsuleDynamicMetadata { timestamp: 42 }),
             },
         };
-        let v3 = CapsuleManifest::new_v3(source(), vec![root(), dynamic.clone()]);
-        assert!(
-            v3.unwrap_err()
-                .contains("dynamic metadata unsupported by pondcapsule.3")
-        );
-
-        let v4 = CapsuleManifest::new_v4(source(), vec![root(), dynamic]).unwrap();
-        let encoded = capsule_manifest_bytes(&v4).unwrap();
+        let manifest = CapsuleManifest::new(source(), vec![root(), dynamic]).unwrap();
+        let encoded = capsule_manifest_bytes(&manifest).unwrap();
         assert!(
             String::from_utf8(encoded.clone())
                 .unwrap()
                 .contains(r#""metadata":{"timestamp":42}"#)
         );
-        assert_eq!(decode_capsule_manifest(&encoded).unwrap(), v4);
+        assert_eq!(decode_capsule_manifest(&encoded).unwrap(), manifest);
     }
 
     #[test]
-    fn logical_file_leaf_matches_v2_golden_vector() {
+    fn logical_file_leaf_matches_golden_vector() {
         let payload = b"pressure,depth\n1.0,2.0\n";
         let logical_hash = capsule_leaf_hash(
             CapsulePayloadKind::File,
@@ -3041,7 +2481,7 @@ mod tests {
             min_event_time: Some(100),
             max_event_time: Some(100),
             logical_attributes: None,
-            schema_fingerprint: None,
+            schema_fingerprint: Some(schema),
         }];
         let manifest = CapsuleManifest::new(
             source(),
@@ -3086,7 +2526,7 @@ mod tests {
         let bytes = capsule_manifest_bytes(&manifest).unwrap();
         assert_eq!(
             capsule_root(&manifest).unwrap().to_hex(),
-            "0cebe535670d309ec8bde50d530e997a8bbb186d26ce2d94bb94764929241f62"
+            "b640d8c531694cdc7a9e2f388cd50283a11a9040f1a921b5cff23154b25704b1"
         );
         assert_eq!(decode_capsule_manifest(&bytes).unwrap(), manifest);
     }

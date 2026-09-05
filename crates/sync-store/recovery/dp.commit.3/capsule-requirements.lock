@@ -1,3 +1,0 @@
-# Exact direct dependencies for capsule.py. Review and install only in a disposable environment.
-blake3==1.0.8
-pyarrow==21.0.0

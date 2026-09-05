@@ -178,7 +178,7 @@ async fn maintained_pack_for_series(
         .child_hash;
 
     let series_dir = steward::get_data_path(pond_path)
-        .join(sync_store::pack_keys::PACKS_ROOT)
+        .join(sync_store::pack_keys::PACK_INDEX_ROOT)
         .join(sync_store::pack_keys::series_dir_name(series_hash));
     let published: Vec<sync_store::content::ObjectHash> = std::fs::read_dir(&series_dir)
         .expect("read maintained series advertisement directory")
@@ -305,7 +305,7 @@ async fn collapse_versions_repacks_a_table_series() {
     let series_hash = series_entry.child_hash;
 
     let series_dir = steward::get_data_path(&pond_path)
-        .join(sync_store::pack_keys::PACKS_ROOT)
+        .join(sync_store::pack_keys::PACK_INDEX_ROOT)
         .join(sync_store::pack_keys::series_dir_name(series_hash));
     let published: Vec<sync_store::content::ObjectHash> = std::fs::read_dir(&series_dir)
         .expect("read published pack advertisement directory")
@@ -485,7 +485,7 @@ async fn collapse_versions_repacks_a_table_series_mixing_dictionary_and_plain_la
     let series_hash = series_entry.child_hash;
 
     let series_dir = steward::get_data_path(&pond_path)
-        .join(sync_store::pack_keys::PACKS_ROOT)
+        .join(sync_store::pack_keys::PACK_INDEX_ROOT)
         .join(sync_store::pack_keys::series_dir_name(series_hash));
     let published: Vec<sync_store::content::ObjectHash> = std::fs::read_dir(&series_dir)
         .expect("read published pack advertisement directory")
@@ -622,6 +622,14 @@ async fn collapse_versions_splits_table_pack_at_schema_transitions() {
         2,
         "the large row cap would produce one object without the mandatory schema boundary"
     );
+    assert_eq!(
+        pack.object_spans()
+            .iter()
+            .map(|span| (span.logical_start(), span.logical_end()))
+            .collect::<Vec<_>>(),
+        vec![(0, 2), (2, 4)],
+        "table object spans must stop exactly at schema-run boundaries"
+    );
     let mut object_fingerprints = Vec::new();
     for &hash in pack.physical_object_hashes() {
         let mut reader = source
@@ -725,7 +733,7 @@ async fn collapse_versions_produces_a_pack_whose_leaf_spans_a_physical_object_bo
     let series_hash = series_entry.child_hash;
 
     let series_dir = steward::get_data_path(&pond_path)
-        .join(sync_store::pack_keys::PACKS_ROOT)
+        .join(sync_store::pack_keys::PACK_INDEX_ROOT)
         .join(sync_store::pack_keys::series_dir_name(series_hash));
     let published: Vec<sync_store::content::ObjectHash> = std::fs::read_dir(&series_dir)
         .expect("read published pack advertisement directory")
@@ -745,6 +753,25 @@ async fn collapse_versions_produces_a_pack_whose_leaf_spans_a_physical_object_bo
         pack.physical_object_hashes().len(),
         2,
         "7.5 MiB of leaves over a 4 MiB per-object cap must bound to exactly two physical objects"
+    );
+    let four_mib = 4 * 1024 * 1024u64;
+    let total = full_content.len() as u64;
+    assert_eq!(
+        pack.object_spans()
+            .iter()
+            .map(|span| {
+                (
+                    span.logical_start(),
+                    span.logical_end(),
+                    span.physical_start(),
+                    span.physical_end(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            (0, four_mib, 0, four_mib),
+            (four_mib, total, four_mib, total)
+        ]
     );
 
     let mut reconstructed = Vec::new();
@@ -775,7 +802,7 @@ async fn collapse_versions_produces_a_pack_whose_leaf_spans_a_physical_object_bo
 
 /// If a repack fails after durably writing its physical objects but before
 /// publishing the pack index that would name them (simulated here by
-/// making the series' own `_packs/series=<hex>` advertisement directory
+/// making the series' own `_packs/v3/series=<hex>` advertisement directory
 /// unwritable), `collapse_versions` must fail cleanly: the call returns an
 /// error, no pack index is published (no advertisement can ever name a
 /// missing object, but equally no advertisement should exist at all here),
@@ -835,7 +862,7 @@ async fn collapse_versions_fails_cleanly_before_publishing_an_index() {
             .expect("a native v2 candidate has a series_hash");
 
         let series_dir = steward::get_data_path(&pond_path)
-            .join(sync_store::pack_keys::PACKS_ROOT)
+            .join(sync_store::pack_keys::PACK_INDEX_ROOT)
             .join(sync_store::pack_keys::series_dir_name(series_hash));
         std::fs::create_dir_all(&series_dir).expect("pre-create series pack directory");
         std::fs::set_permissions(&series_dir, std::fs::Permissions::from_mode(0o555))
@@ -1143,7 +1170,8 @@ async fn repeated_append_and_remaintain_reclaims_obsolete_series_advertisements_
         .await
         .expect("create pond");
 
-    let packs_root = steward::get_data_path(&pond_path).join(sync_store::pack_keys::PACKS_ROOT);
+    let packs_root =
+        steward::get_data_path(&pond_path).join(sync_store::pack_keys::PACK_INDEX_ROOT);
 
     let count_series_dirs = || -> usize {
         std::fs::read_dir(&packs_root)
@@ -1493,6 +1521,103 @@ async fn maintenance_reuses_unchanged_prefix_objects_after_incremental_append() 
     assert_eq!(settled.already_bounded, 1);
     assert_eq!(settled.pack_objects_written, 0);
     assert_eq!(settled.pack_bytes_written, 0);
+}
+
+#[tokio::test]
+async fn v3_republication_reuses_shared_pack_objects_without_payload_writes() {
+    let temp_dir = tempdir().expect("tempdir");
+    let pond_path = temp_dir.path().join("v3_republish_pond");
+    let mut ship = Ship::create_pond(&pond_path, "test-host")
+        .await
+        .expect("create pond");
+
+    for (index, bytes) in [b"first".as_slice(), b"second", b"third"]
+        .into_iter()
+        .enumerate()
+    {
+        let bytes = bytes.to_vec();
+        ship.write_transaction(&meta("v3-republish-append"), async move |fs| {
+            let root = fs.root().await?;
+            if index == 0 {
+                _ = root.create_dir_path("data").await?;
+            }
+            let mut writer = root
+                .async_writer_path_with_type(
+                    "/data/republish.series",
+                    EntryType::FilePhysicalSeries,
+                )
+                .await?;
+            writer.write_all(&bytes).await.map_other()?;
+            writer.shutdown().await.map_other()?;
+            Ok(())
+        })
+        .await
+        .expect("append series leaf");
+    }
+
+    let first = ship
+        .collapse_versions(1)
+        .await
+        .expect("initial maintenance");
+    assert_eq!(first.series_repacked, 1);
+    assert_eq!(first.pack_objects_written, 1);
+
+    let source = LocalPondSource::open(&pond_path)
+        .await
+        .expect("open source");
+    let (series_hash, pack) = maintained_pack_for_series(
+        &source,
+        &pond_path,
+        "republish.series",
+        EntryType::FilePhysicalSeries,
+    )
+    .await;
+    drop(source);
+
+    let v3_series_dir = steward::get_data_path(&pond_path)
+        .join(sync_store::pack_keys::PACK_INDEX_ROOT)
+        .join(sync_store::pack_keys::series_dir_name(series_hash));
+    std::fs::remove_dir_all(&v3_series_dir).expect("remove v3 advertisement");
+
+    let mut obsolete_v2_bytes = pack.encode();
+    obsolete_v2_bytes[..b"watertown.series-pack.v2\n".len()]
+        .copy_from_slice(b"watertown.series-pack.v2\n");
+    let obsolete_v2_hash = sync_store::content::ObjectHash::of_bytes(&obsolete_v2_bytes);
+    let obsolete_v2_dir = steward::get_data_path(&pond_path)
+        .join(sync_store::pack_keys::PACKS_ROOT)
+        .join(sync_store::pack_keys::series_dir_name(series_hash));
+    std::fs::create_dir_all(&obsolete_v2_dir).expect("create obsolete v2 directory");
+    std::fs::write(
+        obsolete_v2_dir.join(sync_store::pack_keys::pack_file_name(obsolete_v2_hash)),
+        obsolete_v2_bytes,
+    )
+    .expect("write obsolete v2 advertisement");
+
+    let republished = ship
+        .collapse_versions(1)
+        .await
+        .expect("regenerate v3 advertisement");
+    assert_eq!(republished.series_repacked, 1);
+    assert_eq!(
+        republished.pack_objects_written, 0,
+        "deterministic v3 regeneration must reuse shared content-addressed objects"
+    );
+    assert_eq!(
+        republished.pack_bytes_written, 0,
+        "v3 metadata republication must upload no already-present payload bytes"
+    );
+    assert!(
+        v3_series_dir
+            .join(sync_store::pack_keys::pack_file_name(pack.hash()))
+            .is_file(),
+        "the missing v3 advertisement must be regenerated"
+    );
+    assert!(
+        obsolete_v2_dir
+            .join(sync_store::pack_keys::pack_file_name(obsolete_v2_hash))
+            .is_file(),
+        "the inert v2 advertisement remains available for rollback"
+    );
 }
 
 /// Requirement 3's core acceptance test: a table series whose rows are few

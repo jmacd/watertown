@@ -12,23 +12,10 @@ use super::{Cursor, ObjectHash, push_len_prefixed};
 
 /// Magic header distinguishing a serialized commit from a raw blob (D2).
 ///
-/// Bumped to `.4` for the logical-series-v2 reset
-/// (`docs/logical-series-identity-design.md`): a fresh pond is v2-only after
-/// reset (no v1/v2 mixed-writer support, no migration), and a commit now
-/// carries an explicit [`ContentModelVersion`] tag alongside the magic so a
-/// decoder never has to *infer* which content model a commit's
-/// `root_tree_hash` was built under. An earlier commit (`.3` or older) cannot
-/// be decoded by this version, which is intentional under the clean-reset
-/// encoding policy (D2) and the reset decision above: old pre-reset pond
-/// history is not expected to remain openable.
+/// The commit carries an explicit [`ContentModelVersion`] tag alongside the
+/// magic so a decoder never has to infer which content model built its
+/// `root_tree_hash`. Only the current logical-series-v2 model is accepted.
 const COMMIT_MAGIC: &[u8] = b"watertown.commit.v1\n";
-
-/// The one prior commit magic this reset retired (D2, `docs/logical-series-identity-design.md`):
-/// `dp.commit.3` was one field shorter (no `content_model_version` byte).
-/// Recognized here purely so [`Commit::decode`] can name the real cause --
-/// "this pond predates the reset" -- instead of a generic "bad magic header"
-/// that gives no actionable next step.
-const PRE_RESET_COMMIT_MAGIC: &[u8] = b"dp.commit.3\n";
 
 /// Which content-addressing model a commit's `root_tree_hash` (and the rest
 /// of its tree) was built under.
@@ -47,7 +34,7 @@ const PRE_RESET_COMMIT_MAGIC: &[u8] = b"dp.commit.3\n";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentModelVersion {
     /// The v2 logical-series identity model: series nodes commit to a
-    /// `watertown.series.v1` manifest over persisted logical leaf hashes (BLAKE3 over
+    /// `watertown.series.v2` manifest over persisted logical leaf hashes (BLAKE3 over
     /// canonical logical bytes), not to a physical-blob Merkle tree.
     LogicalSeriesV2,
 }
@@ -194,23 +181,8 @@ impl Commit {
     ///
     /// Returns an error if the magic header is wrong, `content_model_version`
     /// is not a recognized byte (see [`ContentModelVersion::from_wire`]), or
-    /// the buffer is truncated or otherwise malformed. If the bytes carry the
-    /// known pre-reset `dp.commit.3` magic specifically, the error clearly
-    /// diagnoses that a destructive reset (re-initializing the pond) is
-    /// required rather than reporting a generic bad-magic-header failure --
-    /// no in-place migration from that layout is provided (D2, the reset
-    /// decision in `docs/logical-series-identity-design.md`).
+    /// the buffer is truncated or otherwise malformed.
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.starts_with(PRE_RESET_COMMIT_MAGIC) {
-            return Err(format!(
-                "pre-reset commit magic {magic:?} found: this pond predates the logical-series-v2 \
-                 reset and cannot be opened by this version -- no in-place migration is provided; \
-                 re-initialize the pond (e.g. `pond init` into a fresh directory) and restore from \
-                 a remote with `pond remote add` + `pond pull`, per \
-                 docs/logical-series-identity-design.md",
-                magic = String::from_utf8_lossy(PRE_RESET_COMMIT_MAGIC).trim_end()
-            ));
-        }
         let mut cur = Cursor::new(bytes);
         cur.expect_tag(COMMIT_MAGIC)?;
         let content_model_version = ContentModelVersion::from_wire(cur.take_u8()?)?;
@@ -420,19 +392,10 @@ mod tests {
 
     #[test]
     fn decode_rejects_old_dp_commit_3_magic() {
-        // dp.commit.3 (pre-reset, one field shorter: no content_model_version
-        // byte) must not decode under watertown.commit.v1, per the reset decision
-        // (docs/logical-series-identity-design.md): old pre-reset pond
-        // history is not expected to remain openable. Item 8: the error must
-        // clearly diagnose that a destructive reset is required, not merely
-        // report a generic bad-magic-header failure.
         let mut bytes = Commit::new(model(), root(), None, manifest(), mroot(), prov()).encode();
         bytes[..b"dp.commit.3\n".len()].copy_from_slice(b"dp.commit.3\n");
-        let err = Commit::decode(&bytes).expect_err("pre-reset dp.commit.3 magic must not decode");
-        assert!(
-            err.contains("pre-reset") && err.contains("re-initialize"),
-            "error must clearly diagnose that a destructive reset is required: {err}"
-        );
+        let err = Commit::decode(&bytes).expect_err("obsolete commit magic must not decode");
+        assert!(err.contains("bad magic header"));
     }
 
     #[test]
