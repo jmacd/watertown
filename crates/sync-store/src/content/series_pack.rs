@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `watertown.series-pack.v2` pack index: a physical pack's proof of membership in a
+//! `watertown.series-pack.v3` pack index: a physical pack's proof of membership in a
 //! logical series, and the verification helper that checks a pack against a
 //! decoded series manifest.
 //!
@@ -28,25 +28,18 @@
 //!
 //! A [`PackIndex`] carries exactly one [`PackLeafDescriptor`] for each
 //! logical leaf in `[leaf_start, leaf_end)`, in leaf order -- the accepted
-//! per-leaf descriptor model for this pack codec. Each descriptor is
-//! independent per-leaf metadata (logical row/byte count, optional
+//! per-leaf descriptor model for this pack codec. Each descriptor carries
+//! the authenticated logical leaf hash plus independent per-leaf metadata
+//! (logical row/byte count, optional
 //! min/max event-time bounds, optional canonical logical attributes); it
-//! carries no physical byte offsets and does not name which physical object
-//! holds it.
+//! carries no physical byte offsets.
 //!
-//! [`PackIndex::physical_object_hashes`] instead remains an ordered stream
-//! of content-addressed physical objects, completely independent of leaf
-//! boundaries: a reader is expected to decode each physical object's logical
-//! content in order, concatenate those decoded contents into one logical
-//! stream (rows for a table pack, bytes for a file pack), and then partition
-//! that stream using the descriptors' `logical_count`s, in order, to recover
-//! each leaf's own slice. This is what permits a leaf to cross a physical
-//! object boundary, and a physical object to hold any number of leaves (zero
-//! is impossible only because a pack must name at least one object, but one
-//! object may still span many leaves or one leaf may still span many
-//! objects). Decoding physical objects and performing that partition is a
-//! later delivery gate (the dual reader); this module only defines and
-//! validates the descriptor data the reader will need.
+//! [`PackIndex::object_spans`] records the ordered physical objects together
+//! with each object's pack-relative logical interval (bytes for files, rows
+//! for tables) and cumulative physical-byte interval.  Logical object
+//! boundaries remain independent of leaf boundaries, but the explicit spans
+//! let an incremental reader omit objects wholly contained in a locally-held,
+//! authenticated leaf prefix.
 
 use std::collections::BTreeMap;
 
@@ -58,7 +51,7 @@ use super::series_merkle::{
 use super::{Cursor, ObjectHash, push_len_prefixed};
 
 /// Magic header for the current pack-index wire format.
-const PACK_MAGIC: &[u8] = b"watertown.series-pack.v2\n";
+const PACK_MAGIC: &[u8] = b"watertown.series-pack.v3\n";
 
 /// Known `bounds_flags` bits for a [`PackLeafDescriptor`]; any other bit set
 /// is a decode error, matching [`super::series_leaf`]'s and
@@ -69,9 +62,12 @@ const KNOWN_DESCRIPTOR_BOUNDS_FLAGS: u8 = LEAF_HAS_MIN | LEAF_HAS_MAX;
 /// on the wire: a `u64` logical count, a `u8` bounds-flags byte, and a `u32`
 /// (zero) logical-attributes length, with no bounds or attribute bytes
 /// present. Used to bound a hostile descriptor count's pre-allocation.
-const MIN_DESCRIPTOR_WIRE_BYTES: usize = 8 + 4 + 1 + 4;
+const MIN_DESCRIPTOR_WIRE_BYTES: usize = 32 + 8 + 4 + 1 + 4;
 
-/// One logical leaf's per-leaf metadata within a `watertown.series-pack.v2` pack
+/// One encoded [`PackObjectSpan`]: hash plus four `u64` interval endpoints.
+const OBJECT_SPAN_WIRE_BYTES: usize = 32 + 8 + 8 + 8 + 8;
+
+/// One logical leaf's per-leaf metadata within a `watertown.series-pack.v3` pack
 /// index: exactly one descriptor for each logical leaf in
 /// `[leaf_start, leaf_end)`, in leaf order.
 ///
@@ -85,10 +81,13 @@ const MIN_DESCRIPTOR_WIRE_BYTES: usize = 8 + 4 + 1 + 4;
 /// object. See the module docs for how a reader is expected to use these
 /// against the physical object stream.
 ///
-/// Fields are private and only reachable through validated construction
-/// ([`PackLeafDescriptor::new`]) or strict decode (via [`PackIndex::decode`]).
+/// Fields are private and only reachable through validated v3 construction
+/// ([`PackLeafDescriptor::new_with_leaf_hash`] or
+/// [`PackLeafDescriptor::new_with_leaf_hash_and_schema`]) or strict decode
+/// (via [`PackIndex::decode`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackLeafDescriptor {
+    logical_leaf_hash: ObjectHash,
     logical_count: u64,
     schema_fingerprint: Option<ObjectHash>,
     min_event_time: Option<i64>,
@@ -103,23 +102,9 @@ struct DecodedDescriptorMetadata {
 }
 
 impl PackLeafDescriptor {
-    /// Construct a validated per-leaf pack descriptor.
-    ///
-    /// `logical_attributes`, when given, must already be canonical logical-
-    /// attribute bytes exactly as
-    /// [`super::series_leaf::encode_canonical_attributes`] would produce them;
-    /// pass `None`, not `Some(b"{}".to_vec())`, for "no logical attributes at
-    /// all" -- an absent value and an empty object are distinct, matching the
-    /// per-leaf and per-series conventions.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - `logical_count` is `0` (an empty leaf is not a supported model: see
-    ///   the module docs);
-    /// - `logical_attributes` is `Some` but not canonical JSON object bytes,
-    ///   or is `Some(&[])` (which must instead be `None`).
-    pub fn new(
+    /// Construct a v3 descriptor carrying its logical leaf hash.
+    pub fn new_with_leaf_hash(
+        logical_leaf_hash: ObjectHash,
         logical_count: u64,
         min_event_time: Option<i64>,
         max_event_time: Option<i64>,
@@ -127,6 +112,7 @@ impl PackLeafDescriptor {
     ) -> Result<Self, String> {
         validate_descriptor(logical_count, &logical_attributes)?;
         Ok(Self {
+            logical_leaf_hash,
             logical_count,
             schema_fingerprint: None,
             min_event_time,
@@ -135,13 +121,10 @@ impl PackLeafDescriptor {
         })
     }
 
-    /// Construct a descriptor for the v2 pack codec, optionally carrying
-    /// this leaf's schema fingerprint.
-    ///
-    /// Table descriptors must pass `Some`; file descriptors must pass
-    /// `None`. That payload-kind rule is checked when the pack is verified
-    /// against its independently fetched manifest.
-    pub fn new_with_schema(
+    /// Construct a descriptor for the v3 pack codec, carrying its logical
+    /// leaf hash and optionally its schema fingerprint.
+    pub fn new_with_leaf_hash_and_schema(
+        logical_leaf_hash: ObjectHash,
         logical_count: u64,
         schema_fingerprint: Option<ObjectHash>,
         min_event_time: Option<i64>,
@@ -150,6 +133,7 @@ impl PackLeafDescriptor {
     ) -> Result<Self, String> {
         validate_descriptor(logical_count, &logical_attributes)?;
         Ok(Self {
+            logical_leaf_hash,
             logical_count,
             schema_fingerprint,
             min_event_time,
@@ -165,13 +149,27 @@ impl PackLeafDescriptor {
         descriptor
     }
 
+    /// Return a clone carrying the authenticated logical leaf hash.
+    #[must_use]
+    pub fn with_logical_leaf_hash(&self, logical_leaf_hash: ObjectHash) -> Self {
+        let mut descriptor = self.clone();
+        descriptor.logical_leaf_hash = logical_leaf_hash;
+        descriptor
+    }
+
+    /// This leaf's logical identity hash.
+    #[must_use]
+    pub fn logical_leaf_hash(&self) -> ObjectHash {
+        self.logical_leaf_hash
+    }
+
     /// This leaf's logical row (table) or byte (file) count.
     #[must_use]
     pub fn logical_count(&self) -> u64 {
         self.logical_count
     }
 
-    /// The schema fingerprint intrinsically carried by a v2 descriptor.
+    /// The schema fingerprint intrinsically carried by a v3 descriptor.
     ///
     /// Table descriptors carry `Some`; file descriptors carry `None`.
     #[must_use]
@@ -198,6 +196,7 @@ impl PackLeafDescriptor {
     }
 
     fn encode_into(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(self.logical_leaf_hash.as_bytes());
         buf.extend_from_slice(&self.logical_count.to_le_bytes());
         match self.schema_fingerprint {
             Some(fingerprint) => push_len_prefixed(buf, fingerprint.as_bytes()),
@@ -229,6 +228,7 @@ impl PackLeafDescriptor {
 
     /// Decode one current-format descriptor from `cur`.
     fn decode_from(cur: &mut Cursor<'_>) -> Result<Self, String> {
+        let logical_leaf_hash = cur.take_hash()?;
         let logical_count = cur.take_u64()?;
         let schema_bytes = cur.take_len_prefixed()?;
         let schema_fingerprint = if schema_bytes.is_empty() {
@@ -244,7 +244,8 @@ impl PackLeafDescriptor {
             ));
         };
         let metadata = Self::decode_bounds_and_attributes(cur)?;
-        Self::new_with_schema(
+        Self::new_with_leaf_hash_and_schema(
+            logical_leaf_hash,
             logical_count,
             schema_fingerprint,
             metadata.min_event_time,
@@ -262,6 +263,7 @@ impl PackLeafDescriptor {
                 "unknown pack leaf descriptor bounds flags: {flags:#04x}"
             ));
         }
+
         let min_event_time = if flags & LEAF_HAS_MIN != 0 {
             Some(cur.take_i64()?)
         } else {
@@ -286,7 +288,82 @@ impl PackLeafDescriptor {
     }
 }
 
-/// Shared invariant checks for [`PackLeafDescriptor::new`] and
+/// One physical object's position in a pack's logical and encoded streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackObjectSpan {
+    object_hash: ObjectHash,
+    logical_start: u64,
+    logical_end: u64,
+    physical_start: u64,
+    physical_end: u64,
+}
+
+impl PackObjectSpan {
+    /// Construct one nonempty object span.
+    pub fn new(
+        object_hash: ObjectHash,
+        logical_start: u64,
+        logical_end: u64,
+        physical_start: u64,
+        physical_end: u64,
+    ) -> Result<Self, String> {
+        if logical_start >= logical_end {
+            return Err(format!(
+                "pack object logical span must be nonempty: [{logical_start}, {logical_end})"
+            ));
+        }
+        if physical_start >= physical_end {
+            return Err(format!(
+                "pack object physical span must be nonempty: [{physical_start}, {physical_end})"
+            ));
+        }
+        Ok(Self {
+            object_hash,
+            logical_start,
+            logical_end,
+            physical_start,
+            physical_end,
+        })
+    }
+
+    #[must_use]
+    /// Return the content hash naming this physical object.
+    pub fn object_hash(&self) -> ObjectHash {
+        self.object_hash
+    }
+
+    #[must_use]
+    /// Return the inclusive start in the pack-relative logical stream.
+    pub fn logical_start(&self) -> u64 {
+        self.logical_start
+    }
+
+    #[must_use]
+    /// Return the exclusive end in the pack-relative logical stream.
+    pub fn logical_end(&self) -> u64 {
+        self.logical_end
+    }
+
+    #[must_use]
+    /// Return the inclusive start in the concatenated physical byte stream.
+    pub fn physical_start(&self) -> u64 {
+        self.physical_start
+    }
+
+    #[must_use]
+    /// Return the exclusive end in the concatenated physical byte stream.
+    pub fn physical_end(&self) -> u64 {
+        self.physical_end
+    }
+
+    #[must_use]
+    /// Return this object's encoded byte length.
+    pub fn physical_len(&self) -> u64 {
+        self.physical_end - self.physical_start
+    }
+}
+
+/// Shared invariant checks for descriptor construction and
 /// [`PackLeafDescriptor::decode_from`].
 fn validate_descriptor(
     logical_count: u64,
@@ -310,7 +387,7 @@ fn validate_descriptor(
     Ok(())
 }
 
-/// A `watertown.series-pack.v2` pack index: one contiguous logical-leaf range,
+/// A `watertown.series-pack.v3` pack index: one contiguous logical-leaf range,
 /// covered by one or more physical objects, together with its membership
 /// proof against a named series.
 ///
@@ -319,7 +396,7 @@ fn validate_descriptor(
 /// `start`/`end` parameters.
 ///
 /// Fields are private and only reachable through validated construction
-/// ([`PackIndex::new`]) or strict decode ([`PackIndex::decode`]).
+/// ([`PackIndex::new_with_spans`]) or strict decode ([`PackIndex::decode`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackIndex {
     series_hash: ObjectHash,
@@ -328,6 +405,7 @@ pub struct PackIndex {
     total_leaf_count: u64,
     range_root: ObjectHash,
     range_proof: RangeProof,
+    object_spans: Vec<PackObjectSpan>,
     physical_object_hashes: Vec<ObjectHash>,
     logical_count: u64,
     physical_byte_count: u64,
@@ -335,43 +413,16 @@ pub struct PackIndex {
 }
 
 impl PackIndex {
-    /// Construct a validated pack index.
-    ///
-    /// `range_root` is **not** a standalone hash of just this range's
-    /// leaves: because an arbitrary `[leaf_start, leaf_end)` range generally
-    /// does not align to any single node of the canonical
-    /// [`super::series_merkle`] tree, there is no such standalone value in
-    /// general. `range_root` is instead the *whole-series* root that
-    /// `range_proof`, folded together with this range's actual leaf hashes,
-    /// must reduce to -- see [`super::series_merkle::verify_range_proof`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - `leaf_start >= leaf_end` (the range must be nonempty);
-    /// - `leaf_end > total_leaf_count` (the range must be in bounds);
-    /// - `physical_object_hashes` is empty (a repeated hash is fine and
-    ///   meaningful: the physical stream may reference the same
-    ///   content-addressed object more than once, and readers concatenate
-    ///   entries in this exact order -- see
-    ///   `new_accepts_ordered_duplicate_objects`);
-    /// - `range_proof`'s node shape does not exactly match what
-    ///   [`super::series_merkle::verify_range_proof`]'s shape check expects
-    ///   for `(total_leaf_count, leaf_start, leaf_end)`;
-    /// - `leaf_descriptors.len()` does not exactly equal
-    ///   `leaf_end - leaf_start` (one descriptor per leaf in the range, no
-    ///   more, no fewer);
-    /// - the descriptors' `logical_count`s do not sum to `logical_count`
-    ///   (including when that sum would overflow `u64`).
+    /// Construct a strictly validated v3 pack index.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub fn new_with_spans(
         series_hash: ObjectHash,
         leaf_start: u64,
         leaf_end: u64,
         total_leaf_count: u64,
         range_root: ObjectHash,
         range_proof: RangeProof,
-        physical_object_hashes: Vec<ObjectHash>,
+        object_spans: Vec<PackObjectSpan>,
         logical_count: u64,
         physical_byte_count: u64,
         leaf_descriptors: Vec<PackLeafDescriptor>,
@@ -380,11 +431,14 @@ impl PackIndex {
             leaf_start,
             leaf_end,
             total_leaf_count,
+            range_root,
             &range_proof,
-            &physical_object_hashes,
+            &object_spans,
             &leaf_descriptors,
             logical_count,
+            physical_byte_count,
         )?;
+        let physical_object_hashes = object_spans.iter().map(|span| span.object_hash).collect();
         Ok(Self {
             series_hash,
             leaf_start,
@@ -392,6 +446,7 @@ impl PackIndex {
             total_leaf_count,
             range_root,
             range_proof,
+            object_spans,
             physical_object_hashes,
             logical_count,
             physical_byte_count,
@@ -424,7 +479,7 @@ impl PackIndex {
     }
 
     /// The whole-series root `range_proof` must reduce this range's actual
-    /// leaf hashes to. See [`PackIndex::new`]'s docs for why this is not a
+    /// leaf hashes to. See [`PackIndex::new_with_spans`]'s docs for why this is not a
     /// standalone range-only hash.
     #[must_use]
     pub fn range_root(&self) -> ObjectHash {
@@ -438,10 +493,18 @@ impl PackIndex {
         &self.range_proof
     }
 
-    /// The ordered, deduplicated physical object hashes composing this pack.
+    /// The ordered physical object hashes composing this pack.
+    ///
+    /// Hashes may repeat when identical content occurs more than once.
     #[must_use]
     pub fn physical_object_hashes(&self) -> &[ObjectHash] {
         &self.physical_object_hashes
+    }
+
+    /// Ordered physical objects and their pack-relative logical/physical spans.
+    #[must_use]
+    pub fn object_spans(&self) -> &[PackObjectSpan] {
+        &self.object_spans
     }
 
     /// The declared logical count this pack covers: total rows (table) or
@@ -469,7 +532,7 @@ impl PackIndex {
         &self.leaf_descriptors
     }
 
-    /// Serialize this pack index into its `watertown.series-pack.v2` wire bytes:
+    /// Serialize this pack index into its `watertown.series-pack.v3` wire bytes:
     ///
     /// ```text
     /// PACK_MAGIC
@@ -479,15 +542,22 @@ impl PackIndex {
     /// u64 LE  total_leaf_count
     /// 32      range_root
     /// u32 LE  range_proof length + encoded range proof bytes
-    /// u32 LE  physical object count, then that many 32-byte hashes
     /// u64 LE  logical_count
     /// u64 LE  physical_byte_count
     /// u32 LE  leaf descriptor count, then that many descriptors:
+    ///           32      logical_leaf_hash
     ///           u64 LE  logical_count
+    ///           u32 LE  schema_fingerprint length (0 or 32) + bytes
     ///           u8      bounds_flags
     ///           [i64 LE min_event_time]
     ///           [i64 LE max_event_time]
     ///           u32 LE  logical_attributes length (0 = absent) + bytes
+    /// u32 LE  object span count, then that many spans:
+    ///           32      object_hash
+    ///           u64 LE  logical_start
+    ///           u64 LE  logical_end
+    ///           u64 LE  physical_start
+    ///           u64 LE  physical_end
     /// ```
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -501,10 +571,12 @@ impl PackIndex {
                 + 32
                 + 4
                 + proof_bytes.len()
-                + 4
-                + self.physical_object_hashes.len() * 32
                 + 8
-                + 8,
+                + 8
+                + 4
+                + self.leaf_descriptors.len() * MIN_DESCRIPTOR_WIRE_BYTES
+                + 4
+                + self.object_spans.len() * OBJECT_SPAN_WIRE_BYTES,
         );
         buf.extend_from_slice(PACK_MAGIC);
         buf.extend_from_slice(self.series_hash.as_bytes());
@@ -513,12 +585,6 @@ impl PackIndex {
         buf.extend_from_slice(&self.total_leaf_count.to_le_bytes());
         buf.extend_from_slice(self.range_root.as_bytes());
         push_len_prefixed(&mut buf, &proof_bytes);
-        let object_count = u32::try_from(self.physical_object_hashes.len())
-            .expect("physical object count exceeds u32::MAX");
-        buf.extend_from_slice(&object_count.to_le_bytes());
-        for object_hash in &self.physical_object_hashes {
-            buf.extend_from_slice(object_hash.as_bytes());
-        }
         buf.extend_from_slice(&self.logical_count.to_le_bytes());
         buf.extend_from_slice(&self.physical_byte_count.to_le_bytes());
         let descriptor_count = u32::try_from(self.leaf_descriptors.len())
@@ -526,6 +592,16 @@ impl PackIndex {
         buf.extend_from_slice(&descriptor_count.to_le_bytes());
         for descriptor in &self.leaf_descriptors {
             descriptor.encode_into(&mut buf);
+        }
+        let object_count =
+            u32::try_from(self.object_spans.len()).expect("physical object count exceeds u32::MAX");
+        buf.extend_from_slice(&object_count.to_le_bytes());
+        for span in &self.object_spans {
+            buf.extend_from_slice(span.object_hash.as_bytes());
+            buf.extend_from_slice(&span.logical_start.to_le_bytes());
+            buf.extend_from_slice(&span.logical_end.to_le_bytes());
+            buf.extend_from_slice(&span.physical_start.to_le_bytes());
+            buf.extend_from_slice(&span.physical_end.to_le_bytes());
         }
         buf
     }
@@ -537,9 +613,9 @@ impl PackIndex {
         ObjectHash::of_bytes(&self.encode())
     }
 
-    /// Decode a `watertown.series-pack.v2` pack index (the inverse of
+    /// Decode a `watertown.series-pack.v3` pack index (the inverse of
     /// [`PackIndex::encode`]), applying the same invariants as
-    /// [`PackIndex::new`].
+    /// [`PackIndex::new_with_spans`].
     ///
     /// # Errors
     ///
@@ -548,7 +624,7 @@ impl PackIndex {
     /// own strict decode (see
     /// [`super::series_merkle::decode_range_proof`]), a leaf descriptor's
     /// `bounds_flags` has an unknown bit set or its logical attributes are
-    /// not canonical JSON, or any of [`PackIndex::new`]'s invariants fail
+    /// not canonical JSON, or any of [`PackIndex::new_with_spans`]'s invariants fail
     /// (nonempty/in-bounds range, a nonempty and duplicate-free physical
     /// object list, exactly one descriptor per leaf, descriptor counts
     /// summing to `logical_count`).
@@ -573,11 +649,6 @@ impl PackIndex {
             leaf_start_usize,
             leaf_end_usize,
         )?;
-        let object_count = cur.take_u32()? as usize;
-        let mut physical_object_hashes = Vec::with_capacity(cur.bounded_capacity(object_count, 32));
-        for _ in 0..object_count {
-            physical_object_hashes.push(cur.take_hash()?);
-        }
         let logical_count = cur.take_u64()?;
         let physical_byte_count = cur.take_u64()?;
         let descriptor_count = cur.take_u32()? as usize;
@@ -586,20 +657,32 @@ impl PackIndex {
         for _ in 0..descriptor_count {
             leaf_descriptors.push(PackLeafDescriptor::decode_from(&mut cur)?);
         }
+        let object_count = cur.take_u32()? as usize;
+        let mut object_spans =
+            Vec::with_capacity(cur.bounded_capacity(object_count, OBJECT_SPAN_WIRE_BYTES));
+        for _ in 0..object_count {
+            object_spans.push(PackObjectSpan::new(
+                cur.take_hash()?,
+                cur.take_u64()?,
+                cur.take_u64()?,
+                cur.take_u64()?,
+                cur.take_u64()?,
+            )?);
+        }
         if !cur.is_empty() {
             return Err(format!(
                 "{} trailing byte(s) after pack index",
                 cur.remaining()
             ));
         }
-        Self::new(
+        Self::new_with_spans(
             series_hash,
             leaf_start,
             leaf_end,
             total_leaf_count,
             range_root,
             range_proof,
-            physical_object_hashes,
+            object_spans,
             logical_count,
             physical_byte_count,
             leaf_descriptors,
@@ -607,16 +690,18 @@ impl PackIndex {
     }
 }
 
-/// Shared invariant checks for [`PackIndex::new`] and [`PackIndex::decode`].
+/// Shared invariant checks for [`PackIndex::new_with_spans`] and [`PackIndex::decode`].
 #[allow(clippy::too_many_arguments)]
 fn validate(
     leaf_start: u64,
     leaf_end: u64,
     total_leaf_count: u64,
+    range_root: ObjectHash,
     range_proof: &RangeProof,
-    physical_object_hashes: &[ObjectHash],
+    object_spans: &[PackObjectSpan],
     leaf_descriptors: &[PackLeafDescriptor],
     logical_count: u64,
+    physical_byte_count: u64,
 ) -> Result<(), String> {
     if leaf_start >= leaf_end {
         return Err(format!(
@@ -628,7 +713,7 @@ fn validate(
             "pack leaf_end {leaf_end} exceeds total_leaf_count {total_leaf_count}"
         ));
     }
-    if physical_object_hashes.is_empty() {
+    if object_spans.is_empty() {
         return Err("pack must name at least one physical object".to_string());
     }
     // Repeated hashes are meaningful: the physical stream may contain the
@@ -656,6 +741,32 @@ fn validate(
             "pack leaf descriptor logical_count sum {descriptor_logical_sum} does not equal declared logical_count {logical_count}"
         ));
     }
+    let descriptor_hashes: Vec<ObjectHash> = leaf_descriptors
+        .iter()
+        .map(PackLeafDescriptor::logical_leaf_hash)
+        .collect();
+    let computed_root = verify_range_proof(
+        usize::try_from(total_leaf_count)
+            .map_err(|_| "total_leaf_count does not fit in usize on this platform".to_string())?,
+        usize::try_from(leaf_start)
+            .map_err(|_| "leaf_start does not fit in usize on this platform".to_string())?,
+        usize::try_from(leaf_end)
+            .map_err(|_| "leaf_end does not fit in usize on this platform".to_string())?,
+        &descriptor_hashes,
+        range_proof,
+    )?;
+    if computed_root != range_root {
+        return Err(
+            "pack descriptor leaf hashes and range proof do not reduce to range_root".to_string(),
+        );
+    }
+
+    validate_object_spans(
+        object_spans,
+        leaf_descriptors,
+        logical_count,
+        physical_byte_count,
+    )?;
     let leaf_start_u64 = leaf_start;
     let leaf_end_u64 = leaf_end;
     let total_leaf_count_u64 = total_leaf_count;
@@ -665,6 +776,109 @@ fn validate(
         leaf_start_u64,
         leaf_end_u64,
     )
+}
+
+fn validate_object_spans(
+    object_spans: &[PackObjectSpan],
+    leaf_descriptors: &[PackLeafDescriptor],
+    logical_count: u64,
+    physical_byte_count: u64,
+) -> Result<(), String> {
+    let all_file = leaf_descriptors
+        .iter()
+        .all(|descriptor| descriptor.schema_fingerprint().is_none());
+    let all_table = leaf_descriptors
+        .iter()
+        .all(|descriptor| descriptor.schema_fingerprint().is_some());
+    if !all_file && !all_table {
+        return Err("pack leaf descriptors mix absent and present schema fingerprints".to_string());
+    }
+
+    let mut logical_cursor = 0u64;
+    let mut physical_cursor = 0u64;
+    let mut lengths_by_hash: BTreeMap<ObjectHash, u64> = BTreeMap::new();
+    let mut leaf_ranges = Vec::with_capacity(leaf_descriptors.len());
+    let mut leaf_cursor = 0u64;
+    for descriptor in leaf_descriptors {
+        let end = leaf_cursor
+            .checked_add(descriptor.logical_count())
+            .ok_or_else(|| "pack leaf logical range overflows u64".to_string())?;
+        leaf_ranges.push((leaf_cursor, end, descriptor.schema_fingerprint()));
+        leaf_cursor = end;
+    }
+
+    for (index, span) in object_spans.iter().enumerate() {
+        if span.logical_start != logical_cursor {
+            return Err(format!(
+                "pack object span {index} logical_start {} does not continue cursor {logical_cursor}",
+                span.logical_start
+            ));
+        }
+        if span.physical_start != physical_cursor {
+            return Err(format!(
+                "pack object span {index} physical_start {} does not continue cursor {physical_cursor}",
+                span.physical_start
+            ));
+        }
+        let logical_len = span
+            .logical_end
+            .checked_sub(span.logical_start)
+            .ok_or_else(|| format!("pack object span {index} has an inverted logical interval"))?;
+        let physical_len = span
+            .physical_end
+            .checked_sub(span.physical_start)
+            .ok_or_else(|| format!("pack object span {index} has an inverted physical interval"))?;
+        if logical_len == 0 || physical_len == 0 {
+            return Err(format!("pack object span {index} must be nonempty"));
+        }
+        if all_file && logical_len != physical_len {
+            return Err(format!(
+                "file pack object span {index} covers {logical_len} logical byte(s) but {physical_len} physical byte(s)"
+            ));
+        }
+        if all_table {
+            let mut fingerprint: Option<ObjectHash> = None;
+            for (leaf_start, leaf_end, schema) in &leaf_ranges {
+                if *leaf_end <= span.logical_start || *leaf_start >= span.logical_end {
+                    continue;
+                }
+                if let Some(existing) = fingerprint
+                    && Some(existing) != *schema
+                {
+                    return Err(format!(
+                        "table pack object span {index} crosses a schema-fingerprint transition"
+                    ));
+                }
+                fingerprint = *schema;
+            }
+            if fingerprint.is_none() {
+                return Err(format!(
+                    "table pack object span {index} intersects no logical leaf"
+                ));
+            }
+        }
+        if let Some(previous_len) = lengths_by_hash.insert(span.object_hash, physical_len)
+            && previous_len != physical_len
+        {
+            return Err(format!(
+                "repeated physical object {} declares conflicting byte lengths {previous_len} and {physical_len}",
+                span.object_hash
+            ));
+        }
+        logical_cursor = span.logical_end;
+        physical_cursor = span.physical_end;
+    }
+    if logical_cursor != logical_count {
+        return Err(format!(
+            "pack object logical spans cover {logical_cursor} unit(s), expected {logical_count}"
+        ));
+    }
+    if physical_cursor != physical_byte_count {
+        return Err(format!(
+            "pack object physical spans cover {physical_cursor} byte(s), expected {physical_byte_count}"
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve one descriptor's schema fingerprint against its manifest.
@@ -757,6 +971,19 @@ pub fn verify_pack_against_manifest(
             "expected {expected_len} recomputed leaf hash(es) for pack range, got {}",
             range_leaf_hashes.len()
         ));
+    }
+    for (index, (descriptor, recomputed)) in pack
+        .leaf_descriptors()
+        .iter()
+        .zip(range_leaf_hashes)
+        .enumerate()
+    {
+        if descriptor.logical_leaf_hash() != *recomputed {
+            return Err(format!(
+                "pack leaf descriptor {index} declares logical hash {} but payload recomputed to {recomputed}",
+                descriptor.logical_leaf_hash()
+            ));
+        }
     }
     let leaf_start = usize::try_from(pack.leaf_start())
         .map_err(|_| "leaf_start does not fit in usize on this platform".to_string())?;
@@ -851,7 +1078,7 @@ pub fn select_exact_cover(
                 pack.total_leaf_count()
             ));
         }
-        // `PackIndex::new`/`decode` already guarantee leaf_start < leaf_end
+        // `PackIndex::new_with_spans`/`decode` already guarantee leaf_start < leaf_end
         // <= total_leaf_count, but re-check defensively: this function must
         // never trust an invariant it did not itself just verify.
         if pack.leaf_start() >= pack.leaf_end() || pack.leaf_end() > total_leaf_count {
@@ -979,17 +1206,18 @@ mod tests {
     ) -> PackIndex {
         let proof = generate_range_proof(leaves, start, end).unwrap();
         let root = merkle_root(leaves);
-        let descriptors = one_leaf_per_range(start, end, 10);
-        PackIndex::new(
+        let descriptors = one_leaf_per_range(leaves, start, end, 10);
+        let logical_count = (end - start) as u64 * 10;
+        PackIndex::new_with_spans(
             series_hash,
             start as u64,
             end as u64,
             leaves.len() as u64,
             root,
             proof,
-            vec![h("object-1")],
-            (end - start) as u64 * 10,
-            4096,
+            vec![PackObjectSpan::new(h("object-1"), 0, logical_count, 0, logical_count).unwrap()],
+            logical_count,
+            logical_count,
             descriptors,
         )
         .unwrap()
@@ -998,10 +1226,38 @@ mod tests {
     /// Build one [`PackLeafDescriptor`] per leaf in `[start, end)`, each with
     /// `logical_count` and no bounds or attributes -- the common case for
     /// tests that only care about pack-level invariants.
-    fn one_leaf_per_range(start: usize, end: usize, logical_count: u64) -> Vec<PackLeafDescriptor> {
+    fn one_leaf_per_range(
+        leaves: &[ObjectHash],
+        start: usize,
+        end: usize,
+        logical_count: u64,
+    ) -> Vec<PackLeafDescriptor> {
         (start..end)
-            .map(|_| PackLeafDescriptor::new(logical_count, None, None, None).unwrap())
+            .map(|index| {
+                PackLeafDescriptor::new_with_leaf_hash(
+                    leaves[index],
+                    logical_count,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+            })
             .collect()
+    }
+
+    fn descriptor_section_start(pack: &PackIndex) -> usize {
+        PACK_MAGIC.len()
+            + 32
+            + 8
+            + 8
+            + 8
+            + 32
+            + 4
+            + encode_range_proof(pack.range_proof()).len()
+            + 8
+            + 8
+            + 4
     }
 
     #[test]
@@ -1028,17 +1284,36 @@ mod tests {
         )
         .unwrap();
         let descriptors = vec![
-            PackLeafDescriptor::new_with_schema(10, Some(h("schema-a")), None, None, None).unwrap(),
-            PackLeafDescriptor::new_with_schema(10, Some(h("schema-b")), None, None, None).unwrap(),
+            PackLeafDescriptor::new_with_leaf_hash_and_schema(
+                leaves[0],
+                10,
+                Some(h("schema-a")),
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+            PackLeafDescriptor::new_with_leaf_hash_and_schema(
+                leaves[1],
+                10,
+                Some(h("schema-b")),
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
         ];
-        let pack = PackIndex::new(
+        let pack = PackIndex::new_with_spans(
             manifest.hash(),
             0,
             2,
             2,
             manifest.leaf_merkle_root(),
             generate_range_proof(&leaves, 0, 2).unwrap(),
-            vec![h("object-a"), h("object-b")],
+            vec![
+                PackObjectSpan::new(h("object-a"), 0, 10, 0, 50).unwrap(),
+                PackObjectSpan::new(h("object-b"), 10, 20, 50, 100).unwrap(),
+            ],
             20,
             100,
             descriptors,
@@ -1073,17 +1348,17 @@ mod tests {
             merkle_root(&leaves),
         )
         .unwrap();
-        let missing_schema = PackIndex::new(
+        let missing_schema = PackIndex::new_with_spans(
             table_manifest.hash(),
             0,
             1,
             1,
             table_manifest.leaf_merkle_root(),
             generate_range_proof(&leaves, 0, 1).unwrap(),
-            vec![h("object")],
+            vec![PackObjectSpan::new(h("object"), 0, 10, 0, 10).unwrap()],
             10,
-            100,
-            vec![PackLeafDescriptor::new(10, None, None, None).unwrap()],
+            10,
+            vec![PackLeafDescriptor::new_with_leaf_hash(leaves[0], 10, None, None, None).unwrap()],
         )
         .unwrap();
         let err = verify_pack_against_manifest(
@@ -1105,18 +1380,19 @@ mod tests {
             merkle_root(&leaves),
         )
         .unwrap();
-        let injected_schema = PackIndex::new(
+        let injected_schema = PackIndex::new_with_spans(
             file_manifest.hash(),
             0,
             1,
             1,
             file_manifest.leaf_merkle_root(),
             generate_range_proof(&leaves, 0, 1).unwrap(),
-            vec![h("object")],
+            vec![PackObjectSpan::new(h("object"), 0, 10, 0, 100).unwrap()],
             10,
             100,
             vec![
-                PackLeafDescriptor::new_with_schema(
+                PackLeafDescriptor::new_with_leaf_hash_and_schema(
+                    leaves[0],
                     10,
                     Some(h("injected-schema")),
                     None,
@@ -1155,6 +1431,178 @@ mod tests {
         let mut bytes = build_pack(&leaves, series_hash, 0, 2).encode();
         bytes[..b"watertown.series-pack.v1\n".len()].copy_from_slice(b"watertown.series-pack.v1\n");
         assert!(PackIndex::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_obsolete_pack_v2_magic() {
+        let (leaves, _manifest, series_hash) = build_series(&["a", "b"]);
+        let mut bytes = build_pack(&leaves, series_hash, 0, 2).encode();
+        bytes[..b"watertown.series-pack.v2\n".len()].copy_from_slice(b"watertown.series-pack.v2\n");
+        assert!(PackIndex::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_descriptor_leaf_hash_not_authenticated_by_proof() {
+        let (leaves, _manifest, series_hash) = build_series(&["a", "b"]);
+        let pack = build_pack(&leaves, series_hash, 0, 2);
+        let mut bytes = pack.encode();
+        bytes[descriptor_section_start(&pack)] ^= 0xff;
+        let err = PackIndex::decode(&bytes).unwrap_err();
+        assert!(err.contains("range proof"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn object_span_rejects_empty_ranges() {
+        assert!(PackObjectSpan::new(h("object"), 1, 1, 0, 1).is_err());
+        assert!(PackObjectSpan::new(h("object"), 0, 1, 2, 2).is_err());
+    }
+
+    #[test]
+    fn new_rejects_noncontiguous_object_spans_and_wrong_totals() {
+        let (leaves, _manifest, series_hash) = build_series(&["a", "b"]);
+        let proof = generate_range_proof(&leaves, 0, 2).unwrap();
+        let descriptors = one_leaf_per_range(&leaves, 0, 2, 10);
+        let err = PackIndex::new_with_spans(
+            series_hash,
+            0,
+            2,
+            2,
+            merkle_root(&leaves),
+            proof.clone(),
+            vec![
+                PackObjectSpan::new(h("a"), 0, 10, 0, 10).unwrap(),
+                PackObjectSpan::new(h("b"), 11, 20, 10, 20).unwrap(),
+            ],
+            20,
+            20,
+            descriptors.clone(),
+        )
+        .unwrap_err();
+        assert!(err.contains("logical_start"));
+
+        let err = PackIndex::new_with_spans(
+            series_hash,
+            0,
+            2,
+            2,
+            merkle_root(&leaves),
+            proof,
+            vec![PackObjectSpan::new(h("a"), 0, 19, 0, 19).unwrap()],
+            20,
+            20,
+            descriptors,
+        )
+        .unwrap_err();
+        assert!(err.contains("logical spans cover"));
+    }
+
+    #[test]
+    fn new_rejects_duplicate_hashes_with_different_lengths() {
+        let (leaves, _manifest, series_hash) = build_series(&["a", "b"]);
+        let object = h("same-object");
+        let err = PackIndex::new_with_spans(
+            series_hash,
+            0,
+            2,
+            2,
+            merkle_root(&leaves),
+            generate_range_proof(&leaves, 0, 2).unwrap(),
+            vec![
+                PackObjectSpan::new(object, 0, 5, 0, 5).unwrap(),
+                PackObjectSpan::new(object, 5, 20, 5, 20).unwrap(),
+            ],
+            20,
+            20,
+            one_leaf_per_range(&leaves, 0, 2, 10),
+        )
+        .unwrap_err();
+        assert!(err.contains("conflicting byte lengths"));
+    }
+
+    #[test]
+    fn new_rejects_file_object_with_different_logical_and_physical_lengths() {
+        let (leaves, _manifest, series_hash) = build_series(&["a", "b"]);
+        let err = PackIndex::new_with_spans(
+            series_hash,
+            0,
+            2,
+            2,
+            merkle_root(&leaves),
+            generate_range_proof(&leaves, 0, 2).unwrap(),
+            vec![PackObjectSpan::new(h("object"), 0, 20, 0, 21).unwrap()],
+            20,
+            21,
+            one_leaf_per_range(&leaves, 0, 2, 10),
+        )
+        .unwrap_err();
+        assert!(err.contains("file pack object"));
+    }
+
+    #[test]
+    fn new_rejects_wrong_physical_span_total() {
+        let leaves = vec![h("leaf")];
+        let descriptor = PackLeafDescriptor::new_with_leaf_hash_and_schema(
+            leaves[0],
+            20,
+            Some(h("schema")),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let err = PackIndex::new_with_spans(
+            h("series"),
+            0,
+            1,
+            1,
+            merkle_root(&leaves),
+            generate_range_proof(&leaves, 0, 1).unwrap(),
+            vec![PackObjectSpan::new(h("object"), 0, 20, 0, 19).unwrap()],
+            20,
+            20,
+            vec![descriptor],
+        )
+        .unwrap_err();
+        assert!(err.contains("physical spans cover"));
+    }
+
+    #[test]
+    fn new_rejects_table_object_crossing_schema_run() {
+        let leaves = vec![h("leaf-a"), h("leaf-b")];
+        let descriptors = vec![
+            PackLeafDescriptor::new_with_leaf_hash_and_schema(
+                leaves[0],
+                5,
+                Some(h("schema-a")),
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+            PackLeafDescriptor::new_with_leaf_hash_and_schema(
+                leaves[1],
+                5,
+                Some(h("schema-b")),
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+        ];
+        let err = PackIndex::new_with_spans(
+            h("series"),
+            0,
+            2,
+            2,
+            merkle_root(&leaves),
+            generate_range_proof(&leaves, 0, 2).unwrap(),
+            vec![PackObjectSpan::new(h("object"), 0, 10, 0, 100).unwrap()],
+            10,
+            100,
+            descriptors,
+        )
+        .unwrap_err();
+        assert!(err.contains("crosses a schema-fingerprint transition"));
     }
 
     #[test]
@@ -1269,14 +1717,14 @@ mod tests {
         let (leaves, _m, series_hash) = build_series(&["a", "b", "c"]);
         let proof = generate_range_proof(&leaves, 0, 3).unwrap();
         let root = merkle_root(&leaves);
-        let err = PackIndex::new(
+        let err = PackIndex::new_with_spans(
             series_hash,
             0,
             4, // exceeds total_leaf_count of 3
             3,
             root,
             proof,
-            vec![h("object-1")],
+            vec![PackObjectSpan::new(h("object-1"), 0, 10, 0, 10).unwrap()],
             10,
             10,
             Vec::new(),
@@ -1290,7 +1738,7 @@ mod tests {
         let (leaves, _m, series_hash) = build_series(&["a", "b", "c"]);
         let proof = generate_range_proof(&leaves, 0, 2).unwrap();
         let root = merkle_root(&leaves);
-        let err = PackIndex::new(
+        let err = PackIndex::new_with_spans(
             series_hash,
             0,
             2,
@@ -1311,17 +1759,20 @@ mod tests {
         let (leaves, _m, series_hash) = build_series(&["a", "b", "c"]);
         let proof = generate_range_proof(&leaves, 0, 2).unwrap();
         let root = merkle_root(&leaves);
-        let pack = PackIndex::new(
+        let pack = PackIndex::new_with_spans(
             series_hash,
             0,
             2,
             3,
             root,
             proof,
-            vec![h("object-1"), h("object-1")],
+            vec![
+                PackObjectSpan::new(h("object-1"), 0, 5, 0, 5).unwrap(),
+                PackObjectSpan::new(h("object-1"), 5, 10, 5, 10).unwrap(),
+            ],
             10,
             10,
-            one_leaf_per_range(0, 2, 5),
+            one_leaf_per_range(&leaves, 0, 2, 5),
         )
         .expect("an ordered physical stream may reuse one content object");
         assert_eq!(pack.physical_object_hashes().len(), 2);
@@ -1335,13 +1786,16 @@ mod tests {
 
     #[test]
     fn descriptor_new_rejects_zero_logical_count() {
-        let err = PackLeafDescriptor::new(0, None, None, None).unwrap_err();
+        let err =
+            PackLeafDescriptor::new_with_leaf_hash(h("leaf"), 0, None, None, None).unwrap_err();
         assert!(err.contains("positive"), "unexpected error: {err}");
     }
 
     #[test]
     fn descriptor_new_rejects_empty_some_attributes() {
-        let err = PackLeafDescriptor::new(1, None, None, Some(Vec::new())).unwrap_err();
+        let err =
+            PackLeafDescriptor::new_with_leaf_hash(h("leaf"), 1, None, None, Some(Vec::new()))
+                .unwrap_err();
         assert!(err.contains("absent"), "unexpected error: {err}");
     }
 
@@ -1350,14 +1804,23 @@ mod tests {
         // Non-canonical (insignificant whitespace) attribute bytes are valid
         // JSON but not the canonical bytes this codec requires.
         let non_canonical = b"{ \"a\": 1 }".to_vec();
-        let err = PackLeafDescriptor::new(1, None, None, Some(non_canonical)).unwrap_err();
+        let err =
+            PackLeafDescriptor::new_with_leaf_hash(h("leaf"), 1, None, None, Some(non_canonical))
+                .unwrap_err();
         assert!(err.contains("canonical"), "unexpected error: {err}");
     }
 
     #[test]
     fn descriptor_accepts_independent_optional_bounds_and_canonical_attributes() {
         let attrs = encode_canonical_attributes(r#"{"a":1}"#).unwrap();
-        let d = PackLeafDescriptor::new(7, Some(10), Some(20), Some(attrs.clone())).unwrap();
+        let d = PackLeafDescriptor::new_with_leaf_hash(
+            h("leaf"),
+            7,
+            Some(10),
+            Some(20),
+            Some(attrs.clone()),
+        )
+        .unwrap();
         assert_eq!(d.logical_count(), 7);
         assert_eq!(d.min_event_time(), Some(10));
         assert_eq!(d.max_event_time(), Some(20));
@@ -1365,9 +1828,9 @@ mod tests {
 
         // Bounds are independently optional: only a minimum, only a
         // maximum, or neither must all succeed distinctly from "both".
-        assert!(PackLeafDescriptor::new(7, Some(10), None, None).is_ok());
-        assert!(PackLeafDescriptor::new(7, None, Some(20), None).is_ok());
-        assert!(PackLeafDescriptor::new(7, None, None, None).is_ok());
+        assert!(PackLeafDescriptor::new_with_leaf_hash(h("leaf"), 7, Some(10), None, None).is_ok());
+        assert!(PackLeafDescriptor::new_with_leaf_hash(h("leaf"), 7, None, Some(20), None).is_ok());
+        assert!(PackLeafDescriptor::new_with_leaf_hash(h("leaf"), 7, None, None, None).is_ok());
     }
 
     // -- PackIndex + PackLeafDescriptor integration ---------------------------
@@ -1378,17 +1841,19 @@ mod tests {
         let proof = generate_range_proof(&leaves, 0, 1).unwrap();
         let root = merkle_root(&leaves);
         let attrs = encode_canonical_attributes(r#"{"k":"v"}"#).unwrap();
-        let descriptor = PackLeafDescriptor::new(42, Some(-5), Some(99), Some(attrs)).unwrap();
-        let pack = PackIndex::new(
+        let descriptor =
+            PackLeafDescriptor::new_with_leaf_hash(leaves[0], 42, Some(-5), Some(99), Some(attrs))
+                .unwrap();
+        let pack = PackIndex::new_with_spans(
             series_hash,
             0,
             1,
             1,
             root,
             proof,
-            vec![h("object-1")],
+            vec![PackObjectSpan::new(h("object-1"), 0, 42, 0, 42).unwrap()],
             42,
-            128,
+            42,
             vec![descriptor],
         )
         .unwrap();
@@ -1405,17 +1870,17 @@ mod tests {
         let (leaves, _m, series_hash) = build_series(&["a", "b", "c", "d", "e"]);
         let proof = generate_range_proof(&leaves, 1, 4).unwrap();
         let root = merkle_root(&leaves);
-        let err = PackIndex::new(
+        let err = PackIndex::new_with_spans(
             series_hash,
             1,
             4,
             5,
             root,
             proof,
-            vec![h("object-1")],
+            vec![PackObjectSpan::new(h("object-1"), 0, 30, 0, 30).unwrap()],
             30,
             10,
-            one_leaf_per_range(1, 3, 10), // range needs 3 descriptors, only 2 given
+            one_leaf_per_range(&leaves, 1, 3, 10), // range needs 3 descriptors, only 2 given
         )
         .unwrap_err();
         assert!(err.contains("leaf descriptor"), "unexpected error: {err}");
@@ -1426,17 +1891,17 @@ mod tests {
         let (leaves, _m, series_hash) = build_series(&["a", "b", "c", "d", "e"]);
         let proof = generate_range_proof(&leaves, 1, 4).unwrap();
         let root = merkle_root(&leaves);
-        let err = PackIndex::new(
+        let err = PackIndex::new_with_spans(
             series_hash,
             1,
             4,
             5,
             root,
             proof,
-            vec![h("object-1")],
+            vec![PackObjectSpan::new(h("object-1"), 0, 30, 0, 30).unwrap()],
             30,
             10,
-            one_leaf_per_range(1, 5, 10), // range needs 3 descriptors, 4 given
+            one_leaf_per_range(&leaves, 1, 5, 10), // range needs 3 descriptors, 4 given
         )
         .unwrap_err();
         assert!(err.contains("leaf descriptor"), "unexpected error: {err}");
@@ -1449,18 +1914,18 @@ mod tests {
         let root = merkle_root(&leaves);
         // Three descriptors summing to 29, but logical_count declares 30.
         let descriptors = vec![
-            PackLeafDescriptor::new(10, None, None, None).unwrap(),
-            PackLeafDescriptor::new(10, None, None, None).unwrap(),
-            PackLeafDescriptor::new(9, None, None, None).unwrap(),
+            PackLeafDescriptor::new_with_leaf_hash(leaves[1], 10, None, None, None).unwrap(),
+            PackLeafDescriptor::new_with_leaf_hash(leaves[2], 10, None, None, None).unwrap(),
+            PackLeafDescriptor::new_with_leaf_hash(leaves[3], 9, None, None, None).unwrap(),
         ];
-        let err = PackIndex::new(
+        let err = PackIndex::new_with_spans(
             series_hash,
             1,
             4,
             5,
             root,
             proof,
-            vec![h("object-1")],
+            vec![PackObjectSpan::new(h("object-1"), 0, 30, 0, 30).unwrap()],
             30,
             10,
             descriptors,
@@ -1478,10 +1943,9 @@ mod tests {
         // descriptor section starts right after physical_byte_count and a
         // u32 descriptor count, so its exact offset is computed rather than
         // hardcoded, keeping this test resilient to unrelated header changes.
-        let descriptor_section_start =
-            bytes.len() - (pack.leaf_descriptors.len() * MIN_DESCRIPTOR_WIRE_BYTES);
-        bytes[descriptor_section_start..descriptor_section_start + 8]
-            .copy_from_slice(&0u64.to_le_bytes());
+        let descriptor_section_start = descriptor_section_start(&pack);
+        let logical_count_start = descriptor_section_start + 32;
+        bytes[logical_count_start..logical_count_start + 8].copy_from_slice(&0u64.to_le_bytes());
         let err = PackIndex::decode(&bytes).unwrap_err();
         assert!(err.contains("positive"), "unexpected error: {err}");
     }
@@ -1491,12 +1955,11 @@ mod tests {
         let (leaves, _m, series_hash) = build_series(&["a", "b", "c", "d", "e"]);
         let pack = build_pack(&leaves, series_hash, 1, 4);
         let mut bytes = pack.encode();
-        let descriptor_section_start =
-            bytes.len() - (pack.leaf_descriptors.len() * MIN_DESCRIPTOR_WIRE_BYTES);
+        let descriptor_section_start = descriptor_section_start(&pack);
         // Set every descriptor's logical_count to u64::MAX so their sum
         // overflows u64 rather than merely mismatching.
         for i in 0..pack.leaf_descriptors.len() {
-            let start = descriptor_section_start + i * MIN_DESCRIPTOR_WIRE_BYTES;
+            let start = descriptor_section_start + i * MIN_DESCRIPTOR_WIRE_BYTES + 32;
             bytes[start..start + 8].copy_from_slice(&u64::MAX.to_le_bytes());
         }
         let err = PackIndex::decode(&bytes).unwrap_err();
@@ -1508,10 +1971,9 @@ mod tests {
         let (leaves, _m, series_hash) = build_series(&["a", "b", "c", "d", "e"]);
         let pack = build_pack(&leaves, series_hash, 1, 4);
         let mut bytes = pack.encode();
-        let descriptor_section_start =
-            bytes.len() - (pack.leaf_descriptors.len() * MIN_DESCRIPTOR_WIRE_BYTES);
+        let descriptor_section_start = descriptor_section_start(&pack);
         // The bounds_flags byte follows logical_count and the empty schema field.
-        let flags_pos = descriptor_section_start + 8 + 4;
+        let flags_pos = descriptor_section_start + 32 + 8 + 4;
         bytes[flags_pos] = 0b1111_1100;
         let err = PackIndex::decode(&bytes).unwrap_err();
         assert!(err.contains("unknown"), "unexpected error: {err}");
@@ -1523,34 +1985,34 @@ mod tests {
         let proof = generate_range_proof(&leaves, 0, 2).unwrap();
         let root = merkle_root(&leaves);
         let base_descriptors = vec![
-            PackLeafDescriptor::new(5, None, None, None).unwrap(),
-            PackLeafDescriptor::new(5, None, None, None).unwrap(),
+            PackLeafDescriptor::new_with_leaf_hash(leaves[0], 5, None, None, None).unwrap(),
+            PackLeafDescriptor::new_with_leaf_hash(leaves[1], 5, None, None, None).unwrap(),
         ];
         let mutated_descriptors = vec![
-            PackLeafDescriptor::new(5, Some(1), None, None).unwrap(),
-            PackLeafDescriptor::new(5, None, None, None).unwrap(),
+            PackLeafDescriptor::new_with_leaf_hash(leaves[0], 5, Some(1), None, None).unwrap(),
+            PackLeafDescriptor::new_with_leaf_hash(leaves[1], 5, None, None, None).unwrap(),
         ];
-        let pack_a = PackIndex::new(
+        let pack_a = PackIndex::new_with_spans(
             series_hash,
             0,
             2,
             3,
             root,
             proof.clone(),
-            vec![h("object-1")],
+            vec![PackObjectSpan::new(h("object-1"), 0, 10, 0, 10).unwrap()],
             10,
             10,
             base_descriptors,
         )
         .unwrap();
-        let pack_b = PackIndex::new(
+        let pack_b = PackIndex::new_with_spans(
             series_hash,
             0,
             2,
             3,
             root,
             proof,
-            vec![h("object-1")],
+            vec![PackObjectSpan::new(h("object-1"), 0, 10, 0, 10).unwrap()],
             10,
             10,
             mutated_descriptors,
@@ -1576,17 +2038,17 @@ mod tests {
         // Five leaf descriptors, one physical object: many leaves, one object.
         let proof_many_leaves = generate_range_proof(&leaves, 0, 5).unwrap();
         let root = merkle_root(&leaves);
-        let many_leaves_one_object = PackIndex::new(
+        let many_leaves_one_object = PackIndex::new_with_spans(
             series_hash,
             0,
             5,
             5,
             root,
             proof_many_leaves,
-            vec![h("single-object")],
+            vec![PackObjectSpan::new(h("single-object"), 0, 50, 0, 50).unwrap()],
             50,
-            4096,
-            one_leaf_per_range(0, 5, 10),
+            50,
+            one_leaf_per_range(&leaves, 0, 5, 10),
         )
         .unwrap();
         assert_eq!(many_leaves_one_object.leaf_descriptors().len(), 5);
@@ -1595,17 +2057,21 @@ mod tests {
         // One leaf descriptor, three physical objects: one leaf spanning
         // (from a reader's perspective) content assembled from many objects.
         let proof_one_leaf = generate_range_proof(&leaves, 0, 1).unwrap();
-        let one_leaf_many_objects = PackIndex::new(
+        let one_leaf_many_objects = PackIndex::new_with_spans(
             series_hash,
             0,
             1,
             5,
             root,
             proof_one_leaf,
-            vec![h("object-a"), h("object-b"), h("object-c")],
+            vec![
+                PackObjectSpan::new(h("object-a"), 0, 3, 0, 3).unwrap(),
+                PackObjectSpan::new(h("object-b"), 3, 7, 3, 7).unwrap(),
+                PackObjectSpan::new(h("object-c"), 7, 10, 7, 10).unwrap(),
+            ],
             10,
-            4096,
-            vec![PackLeafDescriptor::new(10, None, None, None).unwrap()],
+            10,
+            vec![PackLeafDescriptor::new_with_leaf_hash(leaves[0], 10, None, None, None).unwrap()],
         )
         .unwrap();
         assert_eq!(one_leaf_many_objects.leaf_descriptors().len(), 1);
@@ -1701,30 +2167,30 @@ mod tests {
         // both validly covering the whole range.
         let proof = generate_range_proof(&leaves, 0, leaves.len()).unwrap();
         let root = merkle_root(&leaves);
-        let pack_x = PackIndex::new(
+        let pack_x = PackIndex::new_with_spans(
             series_hash,
             0,
             leaves.len() as u64,
             leaves.len() as u64,
             root,
             proof.clone(),
-            vec![h("object-x")],
+            vec![PackObjectSpan::new(h("object-x"), 0, 50, 0, 50).unwrap()],
             50,
-            4096,
-            one_leaf_per_range(0, leaves.len(), 10),
+            50,
+            one_leaf_per_range(&leaves, 0, leaves.len(), 10),
         )
         .unwrap();
-        let pack_y = PackIndex::new(
+        let pack_y = PackIndex::new_with_spans(
             series_hash,
             0,
             leaves.len() as u64,
             leaves.len() as u64,
             root,
             proof,
-            vec![h("object-y")],
+            vec![PackObjectSpan::new(h("object-y"), 0, 50, 0, 50).unwrap()],
             50,
-            4096,
-            one_leaf_per_range(0, leaves.len(), 10),
+            50,
+            one_leaf_per_range(&leaves, 0, leaves.len(), 10),
         )
         .unwrap();
         assert_ne!(
@@ -1763,33 +2229,33 @@ mod tests {
         for i in 0..32 {
             let proof_a = generate_range_proof(&leaves, 2, 6).unwrap();
             tails_a.push(
-                PackIndex::new(
+                PackIndex::new_with_spans(
                     series_hash,
                     2,
                     6,
                     6,
                     merkle_root(&leaves),
                     proof_a,
-                    vec![h(&format!("tail-a-{i}"))],
+                    vec![PackObjectSpan::new(h(&format!("tail-a-{i}")), 0, 40, 0, 40).unwrap()],
                     40,
-                    4096,
-                    one_leaf_per_range(2, 6, 10),
+                    40,
+                    one_leaf_per_range(&leaves, 2, 6, 10),
                 )
                 .unwrap(),
             );
             let proof_b = generate_range_proof(&leaves, 4, 6).unwrap();
             tails_b.push(
-                PackIndex::new(
+                PackIndex::new_with_spans(
                     series_hash,
                     4,
                     6,
                     6,
                     merkle_root(&leaves),
                     proof_b,
-                    vec![h(&format!("tail-b-{i}"))],
+                    vec![PackObjectSpan::new(h(&format!("tail-b-{i}")), 0, 20, 0, 20).unwrap()],
                     20,
-                    4096,
-                    one_leaf_per_range(4, 6, 10),
+                    20,
+                    one_leaf_per_range(&leaves, 4, 6, 10),
                 )
                 .unwrap(),
             );

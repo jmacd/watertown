@@ -86,9 +86,9 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use object_store::{
-    Error as ObjectStoreError, GetOptions, GetResult, GetResultPayload, ListResult,
-    MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
-    PutResult, Result as ObjectStoreResult, UploadPart, path::Path as ObjectPath,
+    Error as ObjectStoreError, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    Result as ObjectStoreResult, UploadPart, path::Path as ObjectPath,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -110,7 +110,23 @@ pub trait StorageMeter: Send + Sync + fmt::Debug {
     /// surfaces `reason` to the caller.
     fn check(&self, ops: u64, bytes: u64) -> Result<(), String>;
 
-    /// Record what a request actually cost, after it happened.
+    /// Atomically admit and reserve a request.
+    ///
+    /// Implementations backed by a shared budget should override this method
+    /// so concurrent requests cannot all pass `check` against the same
+    /// remaining allowance. The default is suitable for meters that are
+    /// already atomic or are only used serially.
+    fn check_and_record(&self, ops: u64, bytes: u64) -> Result<(), String> {
+        self.check(ops, bytes)?;
+        self.record(ops, bytes);
+        Ok(())
+    }
+
+    /// Record traffic that crossed the provider boundary without admission.
+    ///
+    /// Ordinary requests use [`Self::check_and_record`]. This method remains
+    /// necessary for cleanup requests and for non-streaming APIs that reveal
+    /// additional provider-side pages only after they return.
     fn record(&self, ops: u64, bytes: u64);
 }
 
@@ -173,9 +189,16 @@ impl std::borrow::Borrow<str> for RemoteKey {
     }
 }
 
-/// The budget bound to each remote.
-static METERS: LazyLock<RwLock<HashMap<RemoteKey, Arc<dyn StorageMeter>>>> =
+#[derive(Clone)]
+struct MeterEntry {
+    id: u64,
+    meter: Arc<dyn StorageMeter>,
+}
+
+/// The budget bindings for each remote, in activation order.
+static METERS: LazyLock<RwLock<HashMap<RemoteKey, Vec<MeterEntry>>>> =
     LazyLock::new(RwLock::default);
+static NEXT_BINDING_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Traffic that reached a remote while no budget was bound to it, owed by the
 /// next binding.
@@ -191,15 +214,21 @@ static OBSERVED: LazyLock<RwLock<HashMap<RemoteKey, Arc<Observation>>>> =
 /// charged here -- on whatever task, in whatever spawned corner of the Delta
 /// layer it happens.
 ///
-/// Nested bindings on one key replace and then restore, so a wrapper inside a
-/// larger operation charges the inner budget while it lives, which is what a
-/// caller means by governing a sub-operation.
+/// The newest live binding on one key wins. Bindings carry identities and are
+/// removed from the stack by identity, so overlapping guards remain correct
+/// even when they finish out of activation order.
 #[must_use = "the budget is only bound while the binding is held"]
 pub fn bind_meter(key: &RemoteKey, meter: Arc<dyn StorageMeter>) -> MeterBinding {
-    let previous = METERS
+    let id = NEXT_BINDING_ID.fetch_add(1, Ordering::Relaxed);
+    METERS
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(key.clone(), Arc::clone(&meter));
+        .entry(key.clone())
+        .or_default()
+        .push(MeterEntry {
+            id,
+            meter: Arc::clone(&meter),
+        });
 
     // Charge whatever reached this remote while nothing was bound.  Work that
     // escaped a budget is carried, not forgiven: otherwise a path that spends
@@ -212,12 +241,17 @@ pub fn bind_meter(key: &RemoteKey, meter: Arc<dyn StorageMeter>) -> MeterBinding
             arrears.0,
             arrears.1
         );
-        meter.record(arrears.0, arrears.1);
+        if meter.check_and_record(arrears.0, arrears.1).is_err() {
+            // The traffic already happened. Preserve its cost even when the
+            // inherited debt exceeds the newly bound budget; the meter keeps
+            // the refusal so the guarded operation cannot report success.
+            meter.record(arrears.0, arrears.1);
+        }
     }
 
     MeterBinding {
         key: key.clone(),
-        previous,
+        id,
         arrears,
     }
 }
@@ -225,7 +259,7 @@ pub fn bind_meter(key: &RemoteKey, meter: Arc<dyn StorageMeter>) -> MeterBinding
 /// A budget bound to a remote, unbound when dropped.
 pub struct MeterBinding {
     key: RemoteKey,
-    previous: Option<Arc<dyn StorageMeter>>,
+    id: u64,
     arrears: (u64, u64),
 }
 
@@ -252,13 +286,15 @@ impl Drop for MeterBinding {
         let mut meters = METERS
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match self.previous.take() {
-            Some(m) => {
-                let _ = meters.insert(self.key.clone(), m);
+        let mut remove_key = false;
+        if let Some(entries) = meters.get_mut(&self.key) {
+            if let Some(position) = entries.iter().position(|entry| entry.id == self.id) {
+                entries.remove(position);
             }
-            None => {
-                let _ = meters.remove(&self.key);
-            }
+            remove_key = entries.is_empty();
+        }
+        if remove_key {
+            let _ = meters.remove(&self.key);
         }
     }
 }
@@ -272,13 +308,20 @@ fn meter_for(key: &RemoteKey) -> Option<Arc<dyn StorageMeter>> {
     let meters = METERS
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    matching_meter(&meters, key)
+}
+
+fn matching_meter(
+    meters: &HashMap<RemoteKey, Vec<MeterEntry>>,
+    key: &RemoteKey,
+) -> Option<Arc<dyn StorageMeter>> {
     if meters.is_empty() {
         return None;
     }
     let mut candidate: &str = key.as_str();
     loop {
-        if let Some(meter) = meters.get(candidate) {
-            return Some(Arc::clone(meter));
+        if let Some(meter) = meters.get(candidate).and_then(|entries| entries.last()) {
+            return Some(Arc::clone(&meter.meter));
         }
         match candidate.rfind('/') {
             Some(0) | None => return None,
@@ -307,8 +350,12 @@ fn take_arrears(key: &RemoteKey) -> (u64, u64) {
     total
 }
 
-/// Note traffic to `key` that no budget claimed.
-fn owe(key: &RemoteKey, ops: u64, bytes: u64) {
+/// Carry traffic that no live budget can claim into the next binding.
+///
+/// This is public for a bound meter whose lifetime has ended while an
+/// already-open response stream still exists. Such traffic must become
+/// arrears rather than disappearing into the retired meter.
+pub fn record_arrears(key: &RemoteKey, ops: u64, bytes: u64) {
     let mut arrears = ARREARS
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -388,17 +435,41 @@ impl Observation {
     }
 }
 
-/// Refuse up front if the budget cannot cover this request.
-fn check(meter: Option<&Arc<dyn StorageMeter>>, ops: u64, bytes: u64) -> ObjectStoreResult<()> {
-    let Some(meter) = meter else {
-        return Ok(());
-    };
-    meter
-        .check(ops, bytes)
-        .map_err(|reason| ObjectStoreError::Generic {
-            store: "metered",
-            source: reason.into(),
-        })
+/// Atomically reserve the budget before traffic reaches the provider.
+fn admit(
+    key: &RemoteKey,
+    meter: Option<&Arc<dyn StorageMeter>>,
+    ops: u64,
+    bytes: u64,
+) -> ObjectStoreResult<()> {
+    if let Some(meter) = meter {
+        meter
+            .check_and_record(ops, bytes)
+            .map_err(|reason| ObjectStoreError::Generic {
+                store: "metered",
+                source: reason.into(),
+            })?;
+    } else {
+        // Close the race between resolving no meter and a concurrent bind.
+        // Holding the registry read lock until either the newly-visible meter
+        // is charged or arrears are recorded ensures a binding cannot install
+        // itself and drain arrears in between those two events.
+        let meters = METERS
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(meter) = matching_meter(&meters, key) {
+            meter
+                .check_and_record(ops, bytes)
+                .map_err(|reason| ObjectStoreError::Generic {
+                    store: "metered",
+                    source: reason.into(),
+                })?;
+        } else {
+            record_arrears(key, ops, bytes);
+        }
+    }
+    observation(key).add(ops, bytes);
+    Ok(())
 }
 
 /// Charge a request that has been attempted.
@@ -416,12 +487,12 @@ fn record(key: &RemoteKey, meter: Option<&Arc<dyn StorageMeter>>, ops: u64, byte
     match meter {
         Some(meter) => meter.record(ops, bytes),
         // Nothing claimed this traffic, so it is owed rather than forgiven.
-        None => owe(key, ops, bytes),
+        None => record_arrears(key, ops, bytes),
     }
 }
 
 /// An [`ObjectStore`] that charges the budget bound to its remote for the
-/// requests and bytes it actually performs.
+/// requests and bytes it reserves before performing.
 pub struct MeteredStore {
     inner: Arc<dyn ObjectStore>,
     /// The remote this store speaks to, fixed when it was built.  Attribution
@@ -465,10 +536,8 @@ impl ObjectStore for MeteredStore {
     ) -> ObjectStoreResult<PutResult> {
         let meter = self.meter();
         let bytes = payload.content_length() as u64;
-        check(meter.as_ref(), 1, bytes)?;
-        let result = self.inner.put_opts(location, payload, opts).await;
-        record(&self.key, meter.as_ref(), 1, bytes);
-        result
+        admit(&self.key, meter.as_ref(), 1, bytes)?;
+        self.inner.put_opts(location, payload, opts).await
     }
 
     async fn put_multipart_opts(
@@ -477,9 +546,8 @@ impl ObjectStore for MeteredStore {
         opts: PutMultipartOptions,
     ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
         let meter = self.meter();
-        check(meter.as_ref(), 1, 0)?;
+        admit(&self.key, meter.as_ref(), 1, 0)?;
         let upload = self.inner.put_multipart_opts(location, opts).await;
-        record(&self.key, meter.as_ref(), 1, 0);
         Ok(Box::new(MeteredUpload {
             inner: upload?,
             key: self.key.clone(),
@@ -493,64 +561,53 @@ impl ObjectStore for MeteredStore {
         options: GetOptions,
     ) -> ObjectStoreResult<GetResult> {
         let meter = self.meter();
-        // A read's size is not knowable before it is made, so admission asks
-        // only whether any budget remains; the bytes are charged as they
-        // arrive.  This is the same shape the pull path already used.
-        check(meter.as_ref(), 1, 0)?;
+        let is_head = options.head;
+        admit(&self.key, meter.as_ref(), 1, 0)?;
         let result = self.inner.get_opts(location, options).await;
-        record(&self.key, meter.as_ref(), 1, 0);
-        let mut result = result?;
-        // Count bytes off the wire as they stream, not `meta.size`: a ranged
-        // read transfers less than the object, and a stream abandoned early
-        // transfers less than it promised.
-        if let GetResultPayload::Stream(stream) = result.payload {
-            let meter = meter.clone();
-            // The key travels with the stream: a read that outlives the call
-            // is still that remote's traffic, and there is no ambient state
-            // left to ask.
-            let key = self.key.clone();
-            result.payload = GetResultPayload::Stream(
-                stream
-                    .inspect(move |chunk| {
-                        if let Ok(bytes) = chunk {
-                            record(&key, meter.as_ref(), 0, bytes.len() as u64);
-                        }
-                    })
-                    .boxed(),
-            );
-        }
+        let result = result?;
+
+        // GetResult::range is the exact response range, unlike meta.size for
+        // a ranged request. Refuse before exposing the body so a single GET
+        // cannot consume an entire object after the byte budget is exhausted.
+        let response_bytes = if is_head {
+            0
+        } else {
+            result.range.end.saturating_sub(result.range.start)
+        };
+        // Reserve the complete response before exposing its body. Besides
+        // stopping oversized reads before they stream, this makes concurrent
+        // GET admission atomic and keeps an outliving stream paid for by the
+        // guard under which it was opened.
+        admit(&self.key, meter.as_ref(), 0, response_bytes)?;
         Ok(result)
     }
 
     async fn delete(&self, location: &ObjectPath) -> ObjectStoreResult<()> {
         let meter = self.meter();
-        check(meter.as_ref(), 1, 0)?;
-        let result = self.inner.delete(location).await;
-        record(&self.key, meter.as_ref(), 1, 0);
-        result
+        admit(&self.key, meter.as_ref(), 1, 0)?;
+        self.inner.delete(location).await
     }
 
     fn list(
         &self,
         prefix: Option<&ObjectPath>,
     ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-        let meter = self.meter();
-        // `list` is not async and cannot refuse, so the first page is charged
-        // here and further pages are charged as items arrive.
-        record(&self.key, meter.as_ref(), 1, 0);
-        let mut seen: u64 = 0;
         let key = self.key.clone();
-        self.inner
-            .list(prefix)
-            .inspect(move |item| {
-                if item.is_ok() {
-                    seen += 1;
-                    if seen.is_multiple_of(LIST_PAGE_SIZE) {
-                        record(&key, meter.as_ref(), 1, 0);
-                    }
+        let inner = self.inner.list(prefix);
+        futures::stream::try_unfold(
+            (inner, key, 0u64),
+            |(mut inner, key, item_index)| async move {
+                if item_index.is_multiple_of(LIST_PAGE_SIZE) {
+                    let meter = meter_for(&key);
+                    admit(&key, meter.as_ref(), 1, 0)?;
                 }
-            })
-            .boxed()
+                match inner.next().await {
+                    Some(item) => item.map(|item| Some((item, (inner, key, item_index + 1)))),
+                    None => Ok(None),
+                }
+            },
+        )
+        .boxed()
     }
 
     async fn list_with_delimiter(
@@ -558,21 +615,31 @@ impl ObjectStore for MeteredStore {
         prefix: Option<&ObjectPath>,
     ) -> ObjectStoreResult<ListResult> {
         let meter = self.meter();
-        check(meter.as_ref(), 1, 0)?;
+        admit(&self.key, meter.as_ref(), 1, 0)?;
         let result = self.inner.list_with_delimiter(prefix).await;
-        let pages = result.as_ref().map_or(1, |r| {
-            (r.objects.len() as u64).div_ceil(LIST_PAGE_SIZE).max(1)
-        });
-        record(&self.key, meter.as_ref(), pages, 0);
-        result
+        let result = result?;
+        let entries = result
+            .objects
+            .len()
+            .saturating_add(result.common_prefixes.len()) as u64;
+        let pages = entries.div_ceil(LIST_PAGE_SIZE).max(1);
+        let additional_pages = pages.saturating_sub(1);
+        if additional_pages > 0 {
+            // This API returns all pages at once. A successful admission
+            // reserves them; a refusal still records their already-incurred
+            // cost before returning the error.
+            if let Err(error) = admit(&self.key, meter.as_ref(), additional_pages, 0) {
+                record(&self.key, meter.as_ref(), additional_pages, 0);
+                return Err(error);
+            }
+        }
+        Ok(result)
     }
 
     async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> ObjectStoreResult<()> {
         let meter = self.meter();
-        check(meter.as_ref(), 1, 0)?;
-        let result = self.inner.copy(from, to).await;
-        record(&self.key, meter.as_ref(), 1, 0);
-        result
+        admit(&self.key, meter.as_ref(), 1, 0)?;
+        self.inner.copy(from, to).await
     }
 
     async fn copy_if_not_exists(
@@ -581,10 +648,8 @@ impl ObjectStore for MeteredStore {
         to: &ObjectPath,
     ) -> ObjectStoreResult<()> {
         let meter = self.meter();
-        check(meter.as_ref(), 1, 0)?;
-        let result = self.inner.copy_if_not_exists(from, to).await;
-        record(&self.key, meter.as_ref(), 1, 0);
-        result
+        admit(&self.key, meter.as_ref(), 1, 0)?;
+        self.inner.copy_if_not_exists(from, to).await
     }
 }
 
@@ -601,16 +666,14 @@ struct MeteredUpload {
 impl MultipartUpload for MeteredUpload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
         let bytes = data.content_length() as u64;
-        if let Err(error) = check(self.meter.as_ref(), 1, bytes) {
+        if let Err(error) = admit(&self.key, self.meter.as_ref(), 1, bytes) {
             return Box::pin(async move { Err(error) });
         }
-        record(&self.key, self.meter.as_ref(), 1, bytes);
         self.inner.put_part(data)
     }
 
     async fn complete(&mut self) -> ObjectStoreResult<PutResult> {
-        check(self.meter.as_ref(), 1, 0)?;
-        record(&self.key, self.meter.as_ref(), 1, 0);
+        admit(&self.key, self.meter.as_ref(), 1, 0)?;
         self.inner.complete().await
     }
 
@@ -626,6 +689,7 @@ impl MultipartUpload for MeteredUpload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::GetRange;
     use object_store::memory::InMemory;
     use std::sync::Mutex;
 
@@ -732,6 +796,124 @@ mod tests {
         assert_eq!(*meter.bytes.lock().unwrap(), 20);
     }
 
+    #[tokio::test]
+    async fn a_read_larger_than_the_byte_budget_is_refused_before_streaming() {
+        let meter = Arc::new(ByteBudget {
+            limit: 5,
+            used: Mutex::new(0),
+        });
+        let (store, key) = store("read-preflight-budget");
+        let path = ObjectPath::from("obj");
+        store
+            .inner
+            .put(&path, PutPayload::from_static(b"0123456789"))
+            .await
+            .unwrap();
+
+        let _binding = bind_meter(&key, meter.clone());
+        let err = store
+            .get(&path)
+            .await
+            .expect_err("response larger than the remaining budget must be refused");
+
+        assert!(err.to_string().contains("byte budget exceeded"), "{err}");
+        assert_eq!(
+            *meter.used.lock().unwrap(),
+            0,
+            "a body refused from its response headers must not be consumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exact_byte_budget_allows_one_read_then_refuses_the_next() {
+        let meter = Arc::new(ByteBudget {
+            limit: 10,
+            used: Mutex::new(0),
+        });
+        let (store, key) = store("read-exact-budget");
+        let path = ObjectPath::from("obj");
+        store
+            .inner
+            .put(&path, PutPayload::from_static(b"0123456789"))
+            .await
+            .unwrap();
+
+        let _binding = bind_meter(&key, meter.clone());
+        let first = store.get(&path).await.unwrap();
+        assert_eq!(
+            *meter.used.lock().unwrap(),
+            10,
+            "the complete response must be reserved before its body is exposed"
+        );
+        let first = first.bytes().await.unwrap();
+        assert_eq!(&first[..], b"0123456789");
+
+        let err = store
+            .get(&path)
+            .await
+            .expect_err("the same object must not be readable twice on a one-object budget");
+        assert!(err.to_string().contains("byte budget exceeded"), "{err}");
+        assert_eq!(*meter.used.lock().unwrap(), 10);
+    }
+
+    #[tokio::test]
+    async fn a_ranged_read_is_admitted_by_its_response_length() {
+        let meter = Arc::new(ByteBudget {
+            limit: 5,
+            used: Mutex::new(0),
+        });
+        let (store, key) = store("read-range-budget");
+        let path = ObjectPath::from("obj");
+        store
+            .inner
+            .put(&path, PutPayload::from_static(b"0123456789"))
+            .await
+            .unwrap();
+
+        let _binding = bind_meter(&key, meter.clone());
+        let result = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Bounded(2..7)),
+                    ..GetOptions::default()
+                },
+            )
+            .await
+            .expect("the five-byte response range fits the budget");
+        assert_eq!(&result.bytes().await.unwrap()[..], b"23456");
+        assert_eq!(*meter.used.lock().unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn head_does_not_spend_the_byte_budget() {
+        let meter = Arc::new(ByteBudget {
+            limit: 0,
+            used: Mutex::new(0),
+        });
+        let (store, key) = store("head-byte-budget");
+        let path = ObjectPath::from("obj");
+        store
+            .inner
+            .put(&path, PutPayload::from_static(b"0123456789"))
+            .await
+            .unwrap();
+
+        let _binding = bind_meter(&key, meter.clone());
+        let meta = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    head: true,
+                    ..GetOptions::default()
+                },
+            )
+            .await
+            .expect("HEAD transfers no body bytes");
+        assert_eq!(meta.meta.size, 10);
+        assert_eq!(*meter.used.lock().unwrap(), 0);
+    }
+
     /// A spent budget refuses the request rather than performing it.
     #[tokio::test]
     async fn a_spent_budget_refuses() {
@@ -748,6 +930,115 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("budget spent"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_spent_request_budget_refuses_a_lazy_list() {
+        let meter = Arc::new(Counter {
+            refuse: true,
+            ..Counter::default()
+        });
+        let (store, key) = store("spent-list-budget-refuses");
+
+        let _binding = bind_meter(&key, meter);
+        let results = store.list(None).collect::<Vec<_>>().await;
+
+        assert_eq!(results.len(), 1);
+        let err = results[0]
+            .as_ref()
+            .expect_err("list admission must fail before yielding provider results");
+        assert!(err.to_string().contains("budget spent"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_lazy_list_uses_the_meter_active_when_polled() {
+        let meter = Arc::new(Counter::default());
+        let (store, key) = store("lazy-list-binding");
+        let path = ObjectPath::from("obj");
+        store
+            .inner
+            .put(&path, PutPayload::from_static(b"x"))
+            .await
+            .unwrap();
+
+        let listing = store.list(None);
+        let binding = bind_meter(&key, meter.clone());
+        let results = listing.collect::<Vec<_>>().await;
+        drop(binding);
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok());
+        assert_eq!(
+            *meter.ops.lock().unwrap(),
+            1,
+            "meter selection must happen when the lazy request is polled"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_paginated_list_stops_before_an_unbudgeted_page() {
+        let meter = Arc::new(RequestBudget {
+            limit: 1,
+            used: Mutex::new(0),
+        });
+        let (store, key) = store("list-page-budget");
+        for index in 0..=(2 * LIST_PAGE_SIZE + 5) {
+            store
+                .inner
+                .put(
+                    &ObjectPath::from(format!("object-{index:04}")),
+                    PutPayload::from_static(b"x"),
+                )
+                .await
+                .unwrap();
+        }
+
+        let _binding = bind_meter(&key, meter.clone());
+        let results = store.list(None).collect::<Vec<_>>().await;
+
+        assert_eq!(
+            results.len(),
+            LIST_PAGE_SIZE as usize + 1,
+            "the list must end immediately after its first refused page"
+        );
+        assert!(results[..LIST_PAGE_SIZE as usize].iter().all(Result::is_ok));
+        let err = results[LIST_PAGE_SIZE as usize]
+            .as_ref()
+            .expect_err("the second modeled page must be refused");
+        assert!(err.to_string().contains("request budget exceeded"), "{err}");
+        assert_eq!(*meter.used.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_with_delimiter_refuses_unbudgeted_modeled_pages() {
+        let meter = Arc::new(RequestBudget {
+            limit: 1,
+            used: Mutex::new(0),
+        });
+        let (store, key) = store("delimiter-list-page-budget");
+        for index in 0..=LIST_PAGE_SIZE {
+            store
+                .inner
+                .put(
+                    &ObjectPath::from(format!("prefix-{index:04}/object")),
+                    PutPayload::from_static(b"x"),
+                )
+                .await
+                .unwrap();
+        }
+
+        let _binding = bind_meter(&key, meter.clone());
+        let err = store
+            .list_with_delimiter(None)
+            .await
+            .expect_err("the unbudgeted second modeled page must be refused");
+
+        assert!(err.to_string().contains("request budget exceeded"), "{err}");
+        assert_eq!(
+            *meter.used.lock().unwrap(),
+            2,
+            "pages already returned by the provider must remain charged"
+        );
     }
 
     /// Every multipart part is a separate physical request, so it must be
@@ -898,6 +1189,45 @@ mod tests {
         drop(binding);
 
         assert_eq!(*meter.ops.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn overlapping_same_key_bindings_can_finish_out_of_order() {
+        let first = Arc::new(Counter::default());
+        let second = Arc::new(Counter::default());
+        let third = Arc::new(Counter::default());
+        let (store, key) = store("overlapping-bindings");
+        let path = ObjectPath::from("obj");
+
+        let first_binding = bind_meter(&key, first.clone());
+        let second_binding = bind_meter(&key, second.clone());
+        drop(first_binding);
+
+        store
+            .put(&path, PutPayload::from_static(b"x"))
+            .await
+            .expect("newest live binding remains active");
+        assert_eq!(*first.ops.lock().unwrap(), 0);
+        assert_eq!(*second.ops.lock().unwrap(), 1);
+
+        drop(second_binding);
+        store
+            .put(&path, PutPayload::from_static(b"y"))
+            .await
+            .expect("traffic is carried as arrears after every binding ends");
+        assert_eq!(
+            *second.ops.lock().unwrap(),
+            1,
+            "dropping the newest binding must not restore an expired meter"
+        );
+
+        let third_binding = bind_meter(&key, third.clone());
+        assert_eq!(
+            *third.ops.lock().unwrap(),
+            1,
+            "the next live binding must inherit the unclaimed request"
+        );
+        drop(third_binding);
     }
 
     /// Traffic that happens with no budget bound is charged to the next one.

@@ -56,6 +56,7 @@ pub use content_remote::{ContentRemote, RecoveryRecipePublishOutcome};
 pub use error::{Result, StoreError};
 pub use metered_store::{
     MeterBinding, MeteredStore, Observation, RemoteKey, StorageMeter, bind_meter, observed_under,
+    record_arrears,
 };
 pub use recovery_recipe::{
     recovery_recipe_watertown_commit_v1, recovery_recipe_watertown_commit_v1_hash,

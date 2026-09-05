@@ -722,22 +722,22 @@ impl ContentRemote {
     }
 
     /// Object-store key prefix for one series' pack advertisements: the
-    /// `_packs/series=<hex>` directory under which every pack index naming
+    /// `_packs/v3/series=<hex>` directory under which every pack index naming
     /// that series lives.  See `docs/logical-series-identity-design.md`
     /// delivery gate 3 and [`crate::pack_keys`].
     fn pack_series_prefix(series_hash: ObjectHash) -> object_store::path::Path {
-        object_store::path::Path::from(crate::pack_keys::PACKS_ROOT)
+        object_store::path::Path::from(crate::pack_keys::PACK_INDEX_ROOT)
             .child(crate::pack_keys::series_dir_name(series_hash))
     }
 
     /// Object-store key for one pack advertisement:
-    /// `_packs/series=<series_hex>/pack=<pack_hex>`.
+    /// `_packs/v3/series=<series_hex>/pack=<pack_hex>`.
     fn pack_index_path(series_hash: ObjectHash, pack_hash: ObjectHash) -> object_store::path::Path {
         Self::pack_series_prefix(series_hash).child(crate::pack_keys::pack_file_name(pack_hash))
     }
 
     /// Every pack hash advertised for `series_hash`, as one listing of its
-    /// `_packs/series=<hex>/` prefix.
+    /// `_packs/v3/series=<hex>/` prefix.
     ///
     /// Pack indexes are derived storage metadata excluded from the logical
     /// content tree (the design doc's "Physical pack index" section), so
@@ -785,11 +785,11 @@ impl ContentRemote {
         Ok(out)
     }
 
-    /// Fetch one pack advertisement's raw `watertown.series-pack.v2` bytes by the
+    /// Fetch one pack advertisement's raw `watertown.series-pack.v3` bytes by the
     /// series it claims and its own content address, or `None` if absent.
     ///
     /// This fetches at the exact series-scoped key
-    /// (`_packs/series=<series_hex>/pack=<pack_hex>`) rather than a bare
+    /// (`_packs/v3/series=<series_hex>/pack=<pack_hex>`) rather than a bare
     /// `pack=<hex>` lookup, so resolving one pack never requires scanning
     /// every series' advertisements -- the ambiguous global lookup the
     /// design doc's key layout is deliberately shaped to avoid.
@@ -804,7 +804,7 @@ impl ContentRemote {
     /// # Errors
     ///
     /// Returns an error if the stored bytes do not hash to `pack_hash`, do
-    /// not decode as a `watertown.series-pack.v2` object, or decode to a pack index
+    /// not decode as a `watertown.series-pack.v3` object, or decode to a pack index
     /// naming a different series than `series_hash`.
     pub async fn get_pack_index_bytes(
         &self,

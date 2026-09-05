@@ -1472,7 +1472,7 @@ pub async fn materialize_content_objects(ship: &Ship) -> Result<MaterializedObje
 /// not yet advertised) without ever diverging. Shared by the remote
 /// publication path ([`publish_initial_series_packs`]) and
 /// [`crate::content_source::LocalPondSource`]'s on-demand materialization
-/// of `data/_packs/series=<hex>` for an unpushed local pond.
+/// of `data/_packs/v3/series=<hex>` for an unpushed local pond.
 ///
 /// # Errors
 ///
@@ -1504,8 +1504,9 @@ pub(crate) fn build_initial_pack_index(
         .collect();
 
     let mut whole_series_leaf_hashes = Vec::with_capacity(leaf_versions.len());
-    let mut physical_object_hashes = Vec::with_capacity(leaf_versions.len());
+    let mut object_spans = Vec::with_capacity(leaf_versions.len());
     let mut leaf_descriptors = Vec::with_capacity(leaf_versions.len());
+    let mut logical_cursor: u64 = 0;
     let mut physical_byte_count: u64 = 0;
     for v in &leaf_versions {
         let leaf_hash = v.logical_leaf_hash.ok_or_else(|| {
@@ -1525,7 +1526,8 @@ pub(crate) fn build_initial_pack_index(
             StewardError::Content("series version logical_count is negative".to_string())
         })?;
         let attrs = canonical_leaf_attributes(v)?;
-        let descriptor = sync_store::content::PackLeafDescriptor::new_with_schema(
+        let descriptor = sync_store::content::PackLeafDescriptor::new_with_leaf_hash_and_schema(
+            leaf_hash,
             logical_count,
             v.schema_fingerprint,
             v.meta.min_event_time,
@@ -1534,13 +1536,27 @@ pub(crate) fn build_initial_pack_index(
         )
         .map_err(StewardError::Content)?;
         whole_series_leaf_hashes.push(leaf_hash);
-        physical_object_hashes.push(v.blob_hash);
-        leaf_descriptors.push(descriptor);
-        physical_byte_count = physical_byte_count
+        let logical_end = logical_cursor.checked_add(logical_count).ok_or_else(|| {
+            StewardError::Content("series logical object span overflow".to_string())
+        })?;
+        let physical_end = physical_byte_count
             .checked_add(v.blob_size)
             .ok_or_else(|| {
                 StewardError::Content("series physical_byte_count aggregate overflow".to_string())
             })?;
+        object_spans.push(
+            sync_store::content::PackObjectSpan::new(
+                v.blob_hash,
+                logical_cursor,
+                logical_end,
+                physical_byte_count,
+                physical_end,
+            )
+            .map_err(StewardError::Content)?,
+        );
+        logical_cursor = logical_end;
+        physical_byte_count = physical_end;
+        leaf_descriptors.push(descriptor);
     }
 
     let total_leaf_count = whole_series_leaf_hashes.len() as u64;
@@ -1552,14 +1568,14 @@ pub(crate) fn build_initial_pack_index(
     .map_err(StewardError::Content)?;
     let range_root = material.manifest.leaf_merkle_root();
 
-    let pack = sync_store::content::PackIndex::new(
+    let pack = sync_store::content::PackIndex::new_with_spans(
         material.series_hash,
         0,
         total_leaf_count,
         total_leaf_count,
         range_root,
         range_proof,
-        physical_object_hashes,
+        object_spans,
         material.manifest.logical_count(),
         physical_byte_count,
         leaf_descriptors,
@@ -2900,6 +2916,24 @@ mod tests {
         assert_eq!(
             pack.leaf_descriptors()[1].schema_fingerprint(),
             Some(schema_b)
+        );
+        assert_eq!(
+            pack.leaf_descriptors()[0].logical_leaf_hash(),
+            ObjectHash::of_bytes(b"leaf-a")
+        );
+        assert_eq!(
+            pack.object_spans()
+                .iter()
+                .map(|span| {
+                    (
+                        span.logical_start(),
+                        span.logical_end(),
+                        span.physical_start(),
+                        span.physical_end(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![(0, 3, 0, 10), (3, 8, 10, 30)]
         );
     }
 

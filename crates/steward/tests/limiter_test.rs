@@ -8,12 +8,15 @@
 //!
 //! See `docs/rate-limiter-design.md`.
 
+use object_store::memory::InMemory;
+use object_store::{ObjectStore, PutPayload, path::Path as ObjectPath};
 use provider::factory::rate_limit::LimitUnit;
+use std::sync::Arc;
 use steward::{
     LIMITER_USAGE_SERIES, Limiter, LimiterError, LimiterSet, LimiterUsageRow, Ship, StewardError,
     push_content_to_remote_limited,
 };
-use sync_store::ContentRemote;
+use sync_store::{ContentRemote, MeteredStore, RemoteKey};
 use tempfile::tempdir;
 use tinyfs::async_helpers::convenience::create_file_path;
 use tlogfs::PondUserMetadata;
@@ -217,6 +220,141 @@ async fn a_multipart_blob_cannot_overrun_its_window_or_burst() {
     assert!(
         !remote.has_blob(hash).await.expect("probe refused blob"),
         "a refused multipart blob must not become visible"
+    );
+}
+
+#[tokio::test]
+async fn a_response_is_fully_reserved_before_its_meter_guard_finishes() {
+    let (_t, mut ship) = new_pond("limiter-outliving-stream").await;
+    write_limiter(&mut ship, "/quota", "MiB/day", 10.0, None).await;
+    let mut limits = LimiterSet::open(&mut ship, &[(LimitUnit::Bytes, "/quota".to_string())])
+        .await
+        .expect("bind first limiter");
+
+    let key = RemoteKey::new("mem://outliving-stream");
+    let inner = Arc::new(InMemory::new());
+    let path = ObjectPath::from("object");
+    let _ = inner
+        .put(&path, PutPayload::from_static(b"ten-bytes!"))
+        .await
+        .expect("seed inner store");
+    let store = MeteredStore::new(inner, key.clone());
+
+    let guard = steward::storage_meter::MeterGuard::new(key.as_str(), &mut limits);
+    let result = store.get(&path).await.expect("open governed response");
+    assert!(
+        guard.finish(&mut limits).is_none(),
+        "opening the response fits the budget"
+    );
+    assert_eq!(
+        limits.states()[0].used,
+        b"ten-bytes!".len() as u64,
+        "the complete response must be reserved before the guard closes"
+    );
+
+    let body = result
+        .bytes()
+        .await
+        .expect("the fully paid response may outlive its guard");
+    assert_eq!(&body[..], b"ten-bytes!");
+}
+
+#[tokio::test]
+async fn concurrent_gets_cannot_reserve_the_same_remaining_bytes() {
+    let (_t, mut ship) = new_pond("limiter-concurrent-get").await;
+    write_limiter(&mut ship, "/quota", "B/day", 10.0, None).await;
+    let mut limits = LimiterSet::open(&mut ship, &[(LimitUnit::Bytes, "/quota".to_string())])
+        .await
+        .expect("bind limiter");
+
+    let url = "mem://concurrent-get";
+    let key = RemoteKey::new(url);
+    let inner = Arc::new(InMemory::new());
+    let path = ObjectPath::from("object");
+    let _ = inner
+        .put(&path, PutPayload::from_static(b"0123456789"))
+        .await
+        .expect("seed inner store");
+    let store = MeteredStore::new(inner, key);
+
+    let guard = steward::storage_meter::MeterGuard::new(url, &mut limits);
+    let (left, right) = tokio::join!(store.get(&path), store.get(&path));
+    let successes = usize::from(left.is_ok()) + usize::from(right.is_ok());
+    assert_eq!(
+        successes, 1,
+        "only one complete response fits the shared ten-byte budget"
+    );
+    assert!(
+        guard.finish(&mut limits).is_some(),
+        "the competing response must latch a typed limiter refusal"
+    );
+    assert_eq!(
+        limits.states()[0].used,
+        10,
+        "a refused concurrent response must not overdraw the budget"
+    );
+}
+
+#[tokio::test]
+async fn a_swallowed_storage_refusal_still_fails_the_metered_operation() {
+    let (_t, mut ship) = new_pond("limiter-swallowed-refusal").await;
+    write_limiter(&mut ship, "/quota", "B/day", 1.0, None).await;
+    let mut limits = LimiterSet::open(&mut ship, &[(LimitUnit::Bytes, "/quota".to_string())])
+        .await
+        .expect("bind limiter");
+
+    let url = "mem://swallowed-refusal";
+    let key = RemoteKey::new(url);
+    let inner = Arc::new(InMemory::new());
+    let path = ObjectPath::from("object");
+    let _ = inner
+        .put(&path, PutPayload::from_static(b"too large"))
+        .await
+        .expect("seed inner store");
+    let store = MeteredStore::new(inner, key);
+
+    let result: Result<(), StewardError> =
+        steward::storage_meter::metered_op(url, &mut limits, async {
+            let _ignored = store.get(&path).await;
+            Ok(())
+        })
+        .await;
+
+    assert!(
+        matches!(result, Err(StewardError::RateLimited(_))),
+        "a latched refusal must outrank an apparently successful caller: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn inherited_traffic_over_budget_fails_even_without_another_store_call() {
+    let (_t, mut ship) = new_pond("limiter-inherited-refusal").await;
+    write_limiter(&mut ship, "/quota", "B/day", 1.0, None).await;
+
+    let url = "mem://inherited-refusal";
+    let key = RemoteKey::new(url);
+    let inner = Arc::new(InMemory::new());
+    let path = ObjectPath::from("object");
+    let store = MeteredStore::new(inner, key);
+    let _ = store
+        .put(&path, PutPayload::from_static(b"too large"))
+        .await
+        .expect("unbound traffic reaches the provider");
+
+    let mut limits = LimiterSet::open(&mut ship, &[(LimitUnit::Bytes, "/quota".to_string())])
+        .await
+        .expect("open limiter");
+    let result: Result<(), StewardError> =
+        steward::storage_meter::metered_op(url, &mut limits, async { Ok(()) }).await;
+
+    assert!(
+        matches!(result, Err(StewardError::RateLimited(_))),
+        "over-budget inherited traffic must latch a refusal: {result:?}"
+    );
+    assert_eq!(
+        limits.states()[0].used,
+        b"too large".len() as u64,
+        "already-incurred inherited traffic remains fully charged"
     );
 }
 

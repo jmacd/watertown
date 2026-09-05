@@ -11,7 +11,7 @@
 //! content address:
 //!
 //! ```text
-//! _packs/series=<64-hex series_hash>/pack=<64-hex pack_hash>
+//! _packs/v3/series=<64-hex series_hash>/pack=<64-hex pack_hash>
 //! ```
 //!
 //! This module holds only the pure string formatting/parsing for that
@@ -25,8 +25,17 @@
 
 use crate::content::ObjectHash;
 
-/// Top-level directory holding every series' pack advertisements.
+/// Stable root holding shared immutable pack objects and versioned indexes.
 pub const PACKS_ROOT: &str = "_packs";
+
+/// Version-isolated root holding v3 pack advertisements.
+///
+/// Readers and writers intentionally do not inspect advertisements directly
+/// under the former `_packs/series=...` layout, so a v2 sidecar cannot be
+/// mistaken for a v3 index. Physical objects remain shared under
+/// `_packs/objects` because their content hashes and deterministic bytes are
+/// independent of the index codec version.
+pub const PACK_INDEX_ROOT: &str = "_packs/v3";
 
 /// The directory name for one series' pack advertisements: `series=<hex>`.
 #[must_use]
@@ -193,6 +202,12 @@ mod tests {
 
     fn h(s: &str) -> ObjectHash {
         ObjectHash::of_bytes(s.as_bytes())
+    }
+
+    #[test]
+    fn pack_namespace_is_version_isolated() {
+        assert_eq!(PACKS_ROOT, "_packs");
+        assert_eq!(PACK_INDEX_ROOT, "_packs/v3");
     }
 
     #[test]

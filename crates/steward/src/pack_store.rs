@@ -10,7 +10,7 @@
 //! This is distinct from [`sync_store::ContentRemote`]'s pack advertisement
 //! (an `object_store` remote, written only by `pond push`): this module is
 //! the read/write side for the pond's OWN root directory, exactly the
-//! `_packs/series=<hex>/pack=<hex>` layout
+//! `_packs/v3/series=<hex>/pack=<hex>` layout
 //! [`crate::content_source::LocalPondSource`] already reads from
 //! (`sync_store::pack_keys`). Physical pack objects (the bounded, repacked
 //! byte ranges / Parquet objects a pack index names) live in a second,
@@ -46,16 +46,22 @@ pub(crate) fn packs_root(pond_root: &Path) -> PathBuf {
     get_data_path(pond_root).join(sync_store::pack_keys::PACKS_ROOT)
 }
 
+/// The versioned v3 pack-index root under a pond's data directory.
+#[must_use]
+pub(crate) fn pack_index_root(pond_root: &Path) -> PathBuf {
+    get_data_path(pond_root).join(sync_store::pack_keys::PACK_INDEX_ROOT)
+}
+
 /// The physical pack object sidecar directory: `data/_packs/objects`.
 #[must_use]
 pub(crate) fn pack_objects_dir(pond_root: &Path) -> PathBuf {
     packs_root(pond_root).join(PACK_OBJECTS_DIR)
 }
 
-/// One series' pack advertisement directory: `data/_packs/series=<hex>`.
+/// One series' pack advertisement directory: `data/_packs/v3/series=<hex>`.
 #[must_use]
 pub(crate) fn pack_series_dir(pond_root: &Path, series_hash: ObjectHash) -> PathBuf {
-    packs_root(pond_root).join(sync_store::pack_keys::series_dir_name(series_hash))
+    pack_index_root(pond_root).join(sync_store::pack_keys::series_dir_name(series_hash))
 }
 
 /// One physical pack object's on-disk path: `data/_packs/objects/<hex>`.
@@ -64,7 +70,7 @@ fn pack_object_path(pond_root: &Path, object_hash: ObjectHash) -> PathBuf {
     pack_objects_dir(pond_root).join(object_hash.to_hex())
 }
 
-/// One pack advertisement's on-disk path: `data/_packs/series=<hex>/pack=<hex>`.
+/// One pack advertisement's on-disk path: `data/_packs/v3/series=<hex>/pack=<hex>`.
 #[must_use]
 fn pack_index_path(pond_root: &Path, series_hash: ObjectHash, pack_hash: ObjectHash) -> PathBuf {
     pack_series_dir(pond_root, series_hash).join(sync_store::pack_keys::pack_file_name(pack_hash))
@@ -100,7 +106,7 @@ async fn write_atomic(final_path: &Path, bytes: &[u8]) -> Result<(), StewardErro
     })?;
     tokio::fs::create_dir_all(parent).await?;
     // `create_dir_all` may have just created `parent` itself (a brand new
-    // `series=<hex>` directory entry under `_packs/`, or `_packs/objects`
+    // `series=<hex>` directory entry under `_packs/v3/`, or `_packs/objects`
     // itself on a fresh pond): fsync it and its own parent unconditionally
     // (idempotent and cheap even when both already existed) so that new
     // directory's existence can never be lost to a crash independent of
@@ -224,7 +230,7 @@ pub(crate) async fn list_pack_object_hashes(
 }
 
 /// Publish one pack advertisement at its own content-addressed key
-/// (`data/_packs/series=<hex>/pack=<hex>`), unless it already exists (the
+/// (`data/_packs/v3/series=<hex>/pack=<hex>`), unless it already exists (the
 /// key is content-addressed, so an existing file is necessarily
 /// byte-identical). Returns the pack's own hash.
 ///
@@ -393,19 +399,18 @@ pub(crate) async fn list_local_pack_hashes(
     Ok(out)
 }
 
-/// Every series hash with at least one advertisement under `_packs/`, parsed
+/// Every series hash with at least one advertisement under `_packs/v3/`, parsed
 /// from `series=<hex>` directory names.
 ///
 /// # Errors
-/// Returns an error if the `_packs` root cannot be listed, or if it holds
-/// an entry (other than [`PACK_OBJECTS_DIR`] or common, harmless OS
-/// filesystem metadata such as `.DS_Store` -- see
+/// Returns an error if the `_packs/v3` root cannot be listed, or if it holds
+/// an entry (other than common, harmless OS filesystem metadata such as `.DS_Store` -- see
 /// [`sync_store::pack_keys::is_ignorable_directory_entry`]) whose name does
 /// not parse as `series=<hex>`.
 pub(crate) async fn list_local_series_hashes(
     pond_root: &Path,
 ) -> Result<Vec<ObjectHash>, StewardError> {
-    let root = packs_root(pond_root);
+    let root = pack_index_root(pond_root);
     let mut out = Vec::new();
     let mut entries = match tokio::fs::read_dir(&root).await {
         Ok(e) => e,
@@ -447,9 +452,6 @@ pub(crate) async fn list_local_series_hashes(
                 root.display()
             )));
         }
-        if name == PACK_OBJECTS_DIR {
-            continue;
-        }
         let hash = sync_store::pack_keys::parse_series_dir_name(name).map_err(|e| {
             StewardError::Content(format!(
                 "malformed pack-series directory {}/{name}: {e}",
@@ -465,7 +467,7 @@ pub(crate) async fn list_local_series_hashes(
 /// `(series_hash, pack_hash, index)`.
 ///
 /// Fails loudly the moment any advertisement under
-/// `_packs/series=*/pack=*` does not verify (content-address mismatch or
+/// `_packs/v3/series=*/pack=*` does not verify (content-address mismatch or
 /// cross-series index) -- a caller doing GC must never guess that a
 /// corrupt advertisement names no objects, since that could sweep an
 /// object something else still depends on.
@@ -542,7 +544,7 @@ fn layout_marker_path(pond_root: &Path, series_hash: ObjectHash, pack_hash: Obje
 
 /// One pack advertisement's stale-generation sentinel path (see
 /// `sync_store::pack_keys`'s `STALE_MARKER_SUFFIX` doc):
-/// `data/_packs/series=<hex>/pack=<hex>.stale`.
+/// `data/_packs/v3/series=<hex>/pack=<hex>.stale`.
 fn stale_pack_marker_path(
     pond_root: &Path,
     series_hash: ObjectHash,
@@ -553,10 +555,10 @@ fn stale_pack_marker_path(
 }
 
 /// One whole series directory's stale-generation sentinel path, living
-/// directly under `_packs/` beside the `series=<hex>` directory it marks:
-/// `data/_packs/series=<hex>.stale`.
+/// directly under `_packs/v3/` beside the `series=<hex>` directory it marks:
+/// `data/_packs/v3/series=<hex>.stale`.
 fn stale_series_marker_path(pond_root: &Path, series_hash: ObjectHash) -> PathBuf {
-    packs_root(pond_root).join(sync_store::pack_keys::stale_series_marker_file_name(
+    pack_index_root(pond_root).join(sync_store::pack_keys::stale_series_marker_file_name(
         series_hash,
     ))
 }
@@ -762,7 +764,7 @@ pub(crate) struct RetentionStats {
     pub(crate) orphan_markers_removed: usize,
 }
 
-/// Delete every `_packs/series=<hex>` directory whose `<hex>` is not in
+/// Delete every `_packs/v3/series=<hex>` directory whose `<hex>` is not in
 /// `live_series_hashes` -- the other half of pack-backed local maintenance
 /// alongside [`sweep_unreferenced_pack_objects`] -- but only once each has
 /// survived one full maintenance generation as no-longer-live.
@@ -813,7 +815,7 @@ pub(crate) async fn prune_obsolete_series_dirs(
     live_series_hashes: &HashSet<ObjectHash>,
 ) -> Result<RetentionStats, StewardError> {
     let mut stats = RetentionStats::default();
-    let root = packs_root(pond_root);
+    let root = pack_index_root(pond_root);
     for series_hash in list_local_series_hashes(pond_root).await? {
         let stale_path = stale_series_marker_path(pond_root, series_hash);
         if live_series_hashes.contains(&series_hash) {
@@ -870,6 +872,11 @@ pub(crate) struct PackObjectSweepStats {
 /// [`all_local_pack_indexes`]); this function only sweeps what is not in
 /// that set, it never decides what belongs in it.
 ///
+/// If the unversioned v2 advertisement namespace still contains any
+/// `series=<hex>` directory, sweeping is conservatively deferred. Current
+/// code deliberately does not decode v2 indexes, so it cannot prove which
+/// shared `_packs/objects` entries those rollback advertisements still need.
+///
 /// # Errors
 /// Returns an error if the objects directory cannot be listed, or if an
 /// entry's metadata cannot be read or it cannot be deleted.
@@ -877,6 +884,9 @@ pub(crate) async fn sweep_unreferenced_pack_objects(
     pond_root: &Path,
     referenced: &HashSet<ObjectHash>,
 ) -> Result<PackObjectSweepStats, StewardError> {
+    if legacy_pack_advertisements_present(pond_root).await? {
+        return Ok(PackObjectSweepStats::default());
+    }
     let dir = pack_objects_dir(pond_root);
     let mut stats = PackObjectSweepStats::default();
     let mut entries = match tokio::fs::read_dir(&dir).await {
@@ -906,6 +916,26 @@ pub(crate) async fn sweep_unreferenced_pack_objects(
         stats.bytes_freed += len;
     }
     Ok(stats)
+}
+
+async fn legacy_pack_advertisements_present(pond_root: &Path) -> Result<bool, StewardError> {
+    let root = packs_root(pond_root);
+    let mut entries = match tokio::fs::read_dir(&root).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(StewardError::Io(e)),
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if sync_store::pack_keys::parse_series_dir_name(name).is_ok() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -959,6 +989,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sweep_preserves_shared_objects_while_v2_advertisements_remain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (object_hash, _) = write_pack_object(dir.path(), b"rollback payload")
+            .await
+            .expect("write");
+        let legacy_series = packs_root(dir.path()).join(sync_store::pack_keys::series_dir_name(
+            ObjectHash::of_bytes(b"legacy series"),
+        ));
+        tokio::fs::create_dir_all(&legacy_series)
+            .await
+            .expect("create legacy v2 series directory");
+
+        let stats = sweep_unreferenced_pack_objects(dir.path(), &HashSet::new())
+            .await
+            .expect("defer sweep");
+        assert_eq!(stats, PackObjectSweepStats::default());
+        assert!(has_pack_object(dir.path(), object_hash).await.expect("has"));
+    }
+
+    #[tokio::test]
     async fn read_and_verify_pack_index_rejects_content_address_mismatch() {
         let dir = tempfile::tempdir().expect("tempdir");
         let series_hash = ObjectHash::of_bytes(b"series");
@@ -981,19 +1031,22 @@ mod tests {
     /// to exercise directory-level plumbing (publish/list/prune/retain) that
     /// does not care about a pack's actual payload semantics.
     fn trivial_pack_index(series_hash: ObjectHash, object_hash: ObjectHash) -> PackIndex {
-        use sync_store::content::{PackLeafDescriptor, generate_range_proof, merkle_root};
+        use sync_store::content::{
+            PackLeafDescriptor, PackObjectSpan, generate_range_proof, merkle_root,
+        };
         let leaf_hash = ObjectHash::of_bytes(b"one-leaf");
         let root = merkle_root(&[leaf_hash]);
         let proof = generate_range_proof(&[leaf_hash], 0, 1).expect("range proof");
-        let descriptor = PackLeafDescriptor::new(1, None, None, None).expect("descriptor");
-        PackIndex::new(
+        let descriptor = PackLeafDescriptor::new_with_leaf_hash(leaf_hash, 1, None, None, None)
+            .expect("descriptor");
+        PackIndex::new_with_spans(
             series_hash,
             0,
             1,
             1,
             root,
             proof,
-            vec![object_hash],
+            vec![PackObjectSpan::new(object_hash, 0, 1, 0, 1).expect("span")],
             1,
             1,
             vec![descriptor],

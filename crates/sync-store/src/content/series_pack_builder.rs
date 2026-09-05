@@ -74,7 +74,16 @@ use super::series_leaf::{
 };
 use super::series_manifest::{PayloadKind, SeriesManifest};
 use super::series_merkle::{generate_range_proof, merkle_root};
-use super::series_pack::{PackIndex, PackLeafDescriptor, verify_pack_against_manifest};
+use super::series_pack::{
+    PackIndex, PackLeafDescriptor, PackObjectSpan, verify_pack_against_manifest,
+};
+
+struct BuiltPhysicalObject {
+    hash: ObjectHash,
+    bytes: Vec<u8>,
+    logical_start: u64,
+    logical_end: u64,
+}
 
 /// One validated file-payload logical leaf, ready to be packed.
 ///
@@ -128,7 +137,8 @@ impl FileLeafInput {
         // `logical_count` is derived from `bytes.len()` itself, never
         // accepted as a separate caller-supplied argument.
         let logical_count = bytes.len() as u64;
-        let descriptor = PackLeafDescriptor::new(
+        let descriptor = PackLeafDescriptor::new_with_leaf_hash(
+            leaf_hash,
             logical_count,
             min_event_time,
             max_event_time,
@@ -231,7 +241,8 @@ impl TableLeafInput {
                 .checked_add(batch.num_rows() as u64)
                 .ok_or_else(|| "table leaf input row count exceeds u64::MAX".to_string())
         })?;
-        let descriptor = PackLeafDescriptor::new(
+        let descriptor = PackLeafDescriptor::new_with_leaf_hash(
+            leaf_hash,
             logical_count,
             min_event_time,
             max_event_time,
@@ -569,8 +580,7 @@ pub fn build_file_pack(
         .map_err(|_| "max_bytes_per_object does not fit in usize on this platform".to_string())?;
     let physical_objects = build_file_physical_objects(leaves, cap);
     let physical_byte_count = checked_physical_byte_count(&physical_objects)?;
-    let physical_object_hashes: Vec<ObjectHash> =
-        physical_objects.iter().map(|(hash, _)| *hash).collect();
+    let object_spans = pack_object_spans(&physical_objects)?;
 
     let start_usize =
         usize::try_from(leaf_start).map_err(|_| "leaf_start does not fit in usize".to_string())?;
@@ -579,14 +589,14 @@ pub fn build_file_pack(
     let range_proof = generate_range_proof(whole_series_leaf_hashes, start_usize, end_usize)?;
     let range_root = manifest.leaf_merkle_root();
 
-    let index = PackIndex::new(
+    let index = PackIndex::new_with_spans(
         manifest_hash,
         leaf_start,
         leaf_end,
         manifest.leaf_count(),
         range_root,
         range_proof,
-        physical_object_hashes,
+        object_spans,
         logical_count,
         physical_byte_count,
         descriptors,
@@ -596,7 +606,10 @@ pub fn build_file_pack(
 
     Ok(BuiltSeriesPack {
         index,
-        physical_objects,
+        physical_objects: physical_objects
+            .into_iter()
+            .map(|object| (object.hash, object.bytes))
+            .collect(),
     })
 }
 
@@ -668,8 +681,7 @@ pub fn build_table_pack(
 
     let physical_objects = build_table_physical_objects(leaves, layout)?;
     let physical_byte_count = checked_physical_byte_count(&physical_objects)?;
-    let physical_object_hashes: Vec<ObjectHash> =
-        physical_objects.iter().map(|(hash, _)| *hash).collect();
+    let object_spans = pack_object_spans(&physical_objects)?;
 
     let start_usize =
         usize::try_from(leaf_start).map_err(|_| "leaf_start does not fit in usize".to_string())?;
@@ -678,14 +690,14 @@ pub fn build_table_pack(
     let range_proof = generate_range_proof(whole_series_leaf_hashes, start_usize, end_usize)?;
     let range_root = manifest.leaf_merkle_root();
 
-    let index = PackIndex::new(
+    let index = PackIndex::new_with_spans(
         manifest_hash,
         leaf_start,
         leaf_end,
         manifest.leaf_count(),
         range_root,
         range_proof,
-        physical_object_hashes,
+        object_spans,
         logical_count,
         physical_byte_count,
         descriptors,
@@ -695,17 +707,43 @@ pub fn build_table_pack(
 
     Ok(BuiltSeriesPack {
         index,
-        physical_objects,
+        physical_objects: physical_objects
+            .into_iter()
+            .map(|object| (object.hash, object.bytes))
+            .collect(),
     })
 }
 
 /// Sum every physical object's byte length into a checked `u64` total.
-fn checked_physical_byte_count(physical_objects: &[(ObjectHash, Vec<u8>)]) -> Result<u64, String> {
-    physical_objects.iter().try_fold(0u64, |total, (_, bytes)| {
+fn checked_physical_byte_count(physical_objects: &[BuiltPhysicalObject]) -> Result<u64, String> {
+    physical_objects.iter().try_fold(0u64, |total, object| {
         total
-            .checked_add(bytes.len() as u64)
+            .checked_add(object.bytes.len() as u64)
             .ok_or_else(|| "physical_byte_count overflows u64".to_string())
     })
+}
+
+fn pack_object_spans(
+    physical_objects: &[BuiltPhysicalObject],
+) -> Result<Vec<PackObjectSpan>, String> {
+    let mut physical_start = 0u64;
+    physical_objects
+        .iter()
+        .map(|object| {
+            let physical_end = physical_start
+                .checked_add(object.bytes.len() as u64)
+                .ok_or_else(|| "physical object span overflows u64".to_string())?;
+            let span = PackObjectSpan::new(
+                object.hash,
+                object.logical_start,
+                object.logical_end,
+                physical_start,
+                physical_end,
+            )?;
+            physical_start = physical_end;
+            Ok(span)
+        })
+        .collect()
 }
 
 /// Split `leaves`' bytes, in order, into physical objects each capped at
@@ -714,9 +752,11 @@ fn checked_physical_byte_count(physical_objects: &[(ObjectHash, Vec<u8>)]) -> Re
 ///
 /// Holds at most one target object's buffer (bounded by `cap`) plus the one
 /// leaf currently being consumed; never buffers the whole series.
-fn build_file_physical_objects(leaves: &[FileLeafInput], cap: usize) -> Vec<(ObjectHash, Vec<u8>)> {
+fn build_file_physical_objects(leaves: &[FileLeafInput], cap: usize) -> Vec<BuiltPhysicalObject> {
     let mut objects = Vec::new();
     let mut current: Vec<u8> = Vec::new();
+    let mut logical_start = 0u64;
+    let mut logical_cursor = 0u64;
     for leaf in leaves {
         let mut remaining = leaf.bytes();
         while !remaining.is_empty() {
@@ -724,15 +764,27 @@ fn build_file_physical_objects(leaves: &[FileLeafInput], cap: usize) -> Vec<(Obj
             let take = space.min(remaining.len());
             current.extend_from_slice(&remaining[..take]);
             remaining = &remaining[take..];
+            logical_cursor += take as u64;
             if current.len() == cap {
                 let hash = ObjectHash::of_bytes(&current);
-                objects.push((hash, std::mem::take(&mut current)));
+                objects.push(BuiltPhysicalObject {
+                    hash,
+                    bytes: std::mem::take(&mut current),
+                    logical_start,
+                    logical_end: logical_cursor,
+                });
+                logical_start = logical_cursor;
             }
         }
     }
     if !current.is_empty() {
         let hash = ObjectHash::of_bytes(&current);
-        objects.push((hash, current));
+        objects.push(BuiltPhysicalObject {
+            hash,
+            bytes: current,
+            logical_start,
+            logical_end: logical_cursor,
+        });
     }
     objects
 }
@@ -753,22 +805,31 @@ fn build_file_physical_objects(leaves: &[FileLeafInput], cap: usize) -> Vec<(Obj
 fn build_table_physical_objects(
     leaves: &[TableLeafInput],
     layout: &TablePackLayout,
-) -> Result<Vec<(ObjectHash, Vec<u8>)>, String> {
+) -> Result<Vec<BuiltPhysicalObject>, String> {
     let cap = layout.max_rows_per_object();
     let mut objects = Vec::new();
     let mut current_pieces: Vec<RecordBatch> = Vec::new();
     let mut current_rows: u64 = 0;
+    let mut logical_start: u64 = 0;
+    let mut logical_cursor: u64 = 0;
     let mut current_fingerprint: Option<ObjectHash> = None;
     let mut current_schema: Option<Arc<Schema>> = None;
     for leaf in leaves {
         if current_fingerprint != Some(leaf.schema_fingerprint()) {
             if !current_pieces.is_empty() {
-                objects.push(write_table_object(
+                let (hash, bytes) = write_table_object(
                     current_schema
                         .as_ref()
                         .expect("pending table rows always have a schema"),
                     &current_pieces,
-                )?);
+                )?;
+                objects.push(BuiltPhysicalObject {
+                    hash,
+                    bytes,
+                    logical_start,
+                    logical_end: logical_cursor,
+                });
+                logical_start = logical_cursor;
                 current_pieces.clear();
                 current_rows = 0;
             }
@@ -785,15 +846,23 @@ fn build_table_physical_objects(
                 if take > 0 {
                     current_pieces.push(batch.slice(offset, take));
                     current_rows += take as u64;
+                    logical_cursor += take as u64;
                     offset += take;
                 }
                 if current_rows == cap {
-                    objects.push(write_table_object(
+                    let (hash, bytes) = write_table_object(
                         current_schema
                             .as_ref()
                             .expect("pending table rows always have a schema"),
                         &current_pieces,
-                    )?);
+                    )?;
+                    objects.push(BuiltPhysicalObject {
+                        hash,
+                        bytes,
+                        logical_start,
+                        logical_end: logical_cursor,
+                    });
+                    logical_start = logical_cursor;
                     current_pieces.clear();
                     current_rows = 0;
                 }
@@ -801,12 +870,18 @@ fn build_table_physical_objects(
         }
     }
     if !current_pieces.is_empty() {
-        objects.push(write_table_object(
+        let (hash, bytes) = write_table_object(
             current_schema
                 .as_ref()
                 .expect("pending table rows always have a schema"),
             &current_pieces,
-        )?);
+        )?;
+        objects.push(BuiltPhysicalObject {
+            hash,
+            bytes,
+            logical_start,
+            logical_end: logical_cursor,
+        });
     }
     Ok(objects)
 }
@@ -1027,6 +1102,18 @@ mod tests {
         assert_eq!(built.index.leaf_start(), 0);
         assert_eq!(built.index.leaf_end(), 2);
         assert_eq!(built.index.logical_count(), bytes.len() as u64);
+        assert_eq!(
+            built
+                .index
+                .leaf_descriptors()
+                .iter()
+                .map(PackLeafDescriptor::logical_leaf_hash)
+                .collect::<Vec<_>>(),
+            fixture.leaf_hashes
+        );
+        let span = built.index.object_spans()[0];
+        assert_eq!((span.logical_start(), span.logical_end()), (0, 10));
+        assert_eq!((span.physical_start(), span.physical_end()), (0, 10));
         let (_, obj_bytes) = &built.physical_objects[0];
         assert_eq!(obj_bytes.as_slice(), bytes.as_slice());
     }
@@ -1084,6 +1171,13 @@ mod tests {
         // one object matches leaf 0 exactly, but leaf 1 (6 bytes) is split
         // across two objects.
         assert_eq!(built.physical_objects.len(), 3);
+        let logical_spans: Vec<(u64, u64)> = built
+            .index
+            .object_spans()
+            .iter()
+            .map(|span| (span.logical_start(), span.logical_end()))
+            .collect();
+        assert_eq!(logical_spans, vec![(0, 4), (4, 8), (8, 10)]);
         for (_, obj) in &built.physical_objects {
             assert!(!obj.is_empty(), "no physical object may be empty");
         }
@@ -1485,6 +1579,27 @@ mod tests {
         )
         .expect("build table pack");
         assert_eq!(built.physical_objects.len(), 3);
+        assert_eq!(
+            built
+                .index
+                .object_spans()
+                .iter()
+                .map(|span| (span.logical_start(), span.logical_end()))
+                .collect::<Vec<_>>(),
+            vec![(0, 4), (4, 8), (8, 10)]
+        );
+        let mut physical_cursor = 0;
+        for (span, (hash, bytes)) in built
+            .index
+            .object_spans()
+            .iter()
+            .zip(&built.physical_objects)
+        {
+            assert_eq!(span.object_hash(), *hash);
+            assert_eq!(span.physical_start(), physical_cursor);
+            physical_cursor += bytes.len() as u64;
+            assert_eq!(span.physical_end(), physical_cursor);
+        }
 
         let mut all_ids: Vec<i64> = Vec::new();
         for (_, obj_bytes) in &built.physical_objects {

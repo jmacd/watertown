@@ -28,6 +28,7 @@
 //! [`crate::metered_source::MeteredSource`] does.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use provider::factory::rate_limit::LimitUnit;
@@ -38,7 +39,9 @@ use crate::limiter::{LimiterError, LimiterSet};
 
 /// Adapts a shared [`LimiterSet`] to the storage layer's meter.
 struct LimiterMeter {
+    key: RemoteKey,
     limits: Arc<Mutex<LimiterSet>>,
+    closed: AtomicBool,
     /// The refusal that stopped the operation, if one did.
     ///
     /// The storage layer can only return an `object_store` error, so the
@@ -57,21 +60,67 @@ impl std::fmt::Debug for LimiterMeter {
 
 impl StorageMeter for LimiterMeter {
     fn check(&self, ops: u64, bytes: u64) -> Result<(), String> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(format!("storage budget for {} is closed", self.key));
+        }
         let limits = self
             .limits
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.closed.load(Ordering::Acquire) {
+            return Err(format!("storage budget for {} is closed", self.key));
+        }
         for (unit, amount) in [(LimitUnit::Ops, ops), (LimitUnit::Bytes, bytes)] {
             if amount == 0 {
                 continue;
             }
             if let Err(e) = limits.check(unit, amount) {
                 let message = e.to_string();
-                *self
+                let mut refusal = self
                     .refusal
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if refusal.is_none() {
+                    *refusal = Some(e);
+                }
                 return Err(message);
+            }
+        }
+        Ok(())
+    }
+
+    fn check_and_record(&self, ops: u64, bytes: u64) -> Result<(), String> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(format!("storage budget for {} is closed", self.key));
+        }
+        let mut limits = self
+            .limits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.closed.load(Ordering::Acquire) {
+            return Err(format!("storage budget for {} is closed", self.key));
+        }
+
+        let amounts = [(LimitUnit::Ops, ops), (LimitUnit::Bytes, bytes)];
+        for (unit, amount) in amounts {
+            if amount == 0 {
+                continue;
+            }
+            if let Err(e) = limits.check(unit, amount) {
+                let message = e.to_string();
+                let mut refusal = self
+                    .refusal
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if refusal.is_none() {
+                    *refusal = Some(e);
+                }
+                return Err(message);
+            }
+        }
+        for (unit, amount) in amounts {
+            if amount != 0 {
+                limits.record(unit, amount);
             }
         }
         Ok(())
@@ -82,6 +131,11 @@ impl StorageMeter for LimiterMeter {
             .limits
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.closed.load(Ordering::Acquire) {
+            drop(limits);
+            sync_store::record_arrears(&self.key, ops, bytes);
+            return;
+        }
         for (unit, amount) in [(LimitUnit::Ops, ops), (LimitUnit::Bytes, bytes)] {
             if amount != 0 {
                 limits.record(unit, amount);
@@ -117,7 +171,9 @@ impl MeterGuard {
             LimiterSet::unlimited(),
         )));
         let meter = Arc::new(LimiterMeter {
+            key: key.clone(),
             limits: Arc::clone(&shared),
+            closed: AtomicBool::new(false),
             refusal: Mutex::new(None),
         });
         let before = sync_store::observed_under(&key);
@@ -159,6 +215,7 @@ impl MeterGuard {
     /// The spending comes back whether the work succeeded or not, so the
     /// caller can commit the usage either way.
     pub fn finish(mut self, limits: &mut LimiterSet) -> Option<StewardError> {
+        self.meter.closed.store(true, Ordering::Release);
         // Unbind first: traffic after this point belongs to whoever comes
         // next, and must not land in the numbers reported below.
         drop(self.binding.take());
@@ -216,8 +273,8 @@ where
     let outcome = fut.await;
     let refusal = guard.finish(limits);
 
-    match outcome {
-        Err(_) if refusal.is_some() => Err(E::from(refusal.expect("checked as Some in the guard"))),
-        other => other,
+    match refusal {
+        Some(refusal) => Err(E::from(refusal)),
+        None => outcome,
     }
 }

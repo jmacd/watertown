@@ -344,7 +344,7 @@ pub fn verify_range_proof(
 /// [`expected_positions`] exactly, in order, with no extras or omissions.
 /// Shared by [`decode_range_proof`] (strict decode), [`verify_range_proof`]
 /// (defense in depth for a [`RangeProof`] built or mutated without going
-/// through decode), and [`super::series_pack::PackIndex::new`] (so a pack
+/// through decode), and [`super::series_pack::PackIndex::new_with_spans`] (so a pack
 /// index directly constructed, rather than decoded, gets the identical
 /// shape check).
 ///

@@ -11,7 +11,7 @@
 //! is written durably first (`ContentRemote::push_objects`, its own Delta
 //! commit that does not touch the ref), then every v2 series identity pack
 //! this push implies is published (`ContentRemote::publish_pack_with_known_present`,
-//! outside Delta entirely -- object-store keys under `_packs/`), and only
+//! outside Delta entirely -- object-store keys under `_packs/v3/`), and only
 //! then does the tip ref advance (`ContentRemote::advance_ref`, a final,
 //! separate Delta commit).  A crash or failure at any point before the last
 //! step leaves the OLD ref fully intact and fetchable: the new objects (and

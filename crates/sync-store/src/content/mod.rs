@@ -75,8 +75,8 @@ pub use series_leaf::{
 pub use series_manifest::{PayloadKind, SeriesManifest};
 pub use series_merkle::{RangeProof, generate_range_proof, merkle_root, verify_range_proof};
 pub use series_pack::{
-    PackIndex, PackLeafDescriptor, effective_leaf_schema_fingerprint, select_exact_cover,
-    verify_pack_against_manifest,
+    PackIndex, PackLeafDescriptor, PackObjectSpan, effective_leaf_schema_fingerprint,
+    select_exact_cover, verify_pack_against_manifest,
 };
 pub use series_pack_builder::{
     BuiltSeriesPack, FileLeafInput, FilePackLayout, TableLeafInput, TablePackLayout,

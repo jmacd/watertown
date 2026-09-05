@@ -2,12 +2,12 @@
 
 //! Integration tests for [`ContentRemote`]'s pack-advertisement namespace
 //! (`docs/logical-series-identity-design.md` delivery gate 3): the
-//! non-logical `_packs/series=<hex>/pack=<hex>` discovery protocol.
+//! non-logical `_packs/v3/series=<hex>/pack=<hex>` discovery protocol.
 
 use sync_store::ContentRemote;
 use sync_store::content::{
-    ObjectHash, PackIndex, PackLeafDescriptor, PayloadKind, SeriesManifest, generate_range_proof,
-    merkle_root,
+    ObjectHash, PackIndex, PackLeafDescriptor, PackObjectSpan, PayloadKind, SeriesManifest,
+    generate_range_proof, merkle_root,
 };
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -24,10 +24,16 @@ fn h(s: &str) -> ObjectHash {
 /// declaring a logical count of `7` (matching this test module's fixtures,
 /// which always give every leaf the same aggregate-count-per-leaf shape) and
 /// no bounds or attributes.
-fn descriptors(start: usize, end: usize) -> Vec<PackLeafDescriptor> {
+fn descriptors(leaves: &[ObjectHash], start: usize, end: usize) -> Vec<PackLeafDescriptor> {
     (start..end)
-        .map(|_| PackLeafDescriptor::new(7, None, None, None).unwrap())
+        .map(|index| {
+            PackLeafDescriptor::new_with_leaf_hash(leaves[index], 7, None, None, None).unwrap()
+        })
         .collect()
+}
+
+fn blob_bytes(label: &str, len: usize) -> Vec<u8> {
+    label.as_bytes().iter().copied().cycle().take(len).collect()
 }
 
 /// Build a `(series_hash, PackIndex, physical_blobs)` triple: a series
@@ -51,19 +57,20 @@ fn build_series_and_pack(
     .unwrap();
     let series_hash = manifest.hash();
     let proof = generate_range_proof(&leaves, 0, leaves.len()).unwrap();
-    let blob_bytes = format!("physical blob: {blob_label}").into_bytes();
+    let logical_count = leaves.len() as u64 * 7;
+    let blob_bytes = blob_bytes(blob_label, logical_count as usize);
     let blob_hash = ObjectHash::of_bytes(&blob_bytes);
-    let pack = PackIndex::new(
+    let pack = PackIndex::new_with_spans(
         series_hash,
         0,
         leaves.len() as u64,
         leaves.len() as u64,
         root,
         proof,
-        vec![blob_hash],
-        leaves.len() as u64 * 7,
+        vec![PackObjectSpan::new(blob_hash, 0, logical_count, 0, logical_count).unwrap()],
+        logical_count,
         blob_bytes.len() as u64,
-        descriptors(0, leaves.len()),
+        descriptors(&leaves, 0, leaves.len()),
     )
     .unwrap();
     (series_hash, pack, vec![(blob_hash, blob_bytes)])
@@ -90,37 +97,39 @@ fn build_split_layout(
     .unwrap();
     let series_hash = manifest.hash();
 
-    let blob_a_bytes = format!("physical blob: {blob_label_a}").into_bytes();
+    let logical_a = split as u64 * 7;
+    let blob_a_bytes = blob_bytes(blob_label_a, logical_a as usize);
     let blob_a_hash = ObjectHash::of_bytes(&blob_a_bytes);
     let proof_a = generate_range_proof(&leaves, 0, split).unwrap();
-    let pack_a = PackIndex::new(
+    let pack_a = PackIndex::new_with_spans(
         series_hash,
         0,
         split as u64,
         leaves.len() as u64,
         root,
         proof_a,
-        vec![blob_a_hash],
-        split as u64 * 7,
+        vec![PackObjectSpan::new(blob_a_hash, 0, logical_a, 0, logical_a).unwrap()],
+        logical_a,
         blob_a_bytes.len() as u64,
-        descriptors(0, split),
+        descriptors(&leaves, 0, split),
     )
     .unwrap();
 
-    let blob_b_bytes = format!("physical blob: {blob_label_b}").into_bytes();
+    let logical_b = (leaves.len() - split) as u64 * 7;
+    let blob_b_bytes = blob_bytes(blob_label_b, logical_b as usize);
     let blob_b_hash = ObjectHash::of_bytes(&blob_b_bytes);
     let proof_b = generate_range_proof(&leaves, split, leaves.len()).unwrap();
-    let pack_b = PackIndex::new(
+    let pack_b = PackIndex::new_with_spans(
         series_hash,
         split as u64,
         leaves.len() as u64,
         leaves.len() as u64,
         root,
         proof_b,
-        vec![blob_b_hash],
-        (leaves.len() - split) as u64 * 7,
+        vec![PackObjectSpan::new(blob_b_hash, 0, logical_b, 0, logical_b).unwrap()],
+        logical_b,
         blob_b_bytes.len() as u64,
-        descriptors(split, leaves.len()),
+        descriptors(&leaves, split, leaves.len()),
     )
     .unwrap();
 
@@ -415,7 +424,7 @@ async fn list_rejects_malformed_key() {
 
     let series_dir = dir
         .path()
-        .join("_packs")
+        .join(sync_store::pack_keys::PACK_INDEX_ROOT)
         .join(format!("series={}", series_hash.to_hex()));
     std::fs::write(series_dir.join("not-a-pack-key"), b"junk").unwrap();
 
@@ -443,7 +452,7 @@ async fn fetch_rejects_hash_mismatch() {
 
     let series_dir = dir
         .path()
-        .join("_packs")
+        .join(sync_store::pack_keys::PACK_INDEX_ROOT)
         .join(format!("series={}", series_hash.to_hex()));
     std::fs::create_dir_all(&series_dir).unwrap();
     std::fs::write(
@@ -479,7 +488,7 @@ async fn fetch_rejects_cross_series_index() {
     // bypassing `publish_pack` (which would itself refuse this).
     let series_a_dir = dir
         .path()
-        .join("_packs")
+        .join(sync_store::pack_keys::PACK_INDEX_ROOT)
         .join(format!("series={}", series_a.to_hex()));
     std::fs::create_dir_all(&series_a_dir).unwrap();
     std::fs::write(
@@ -517,5 +526,30 @@ async fn no_advertisements_yields_empty_list_not_an_error() {
             .await
             .unwrap(),
         None
+    );
+}
+
+#[tokio::test]
+async fn obsolete_unversioned_pack_namespace_is_ignored() {
+    let dir = TempDir::new().unwrap();
+    let remote = ContentRemote::create_at(dir.path(), pid()).await.unwrap();
+    let (series_hash, pack, _blobs) = build_series_and_pack(&["a", "b"], "obsolete");
+    let old_dir = dir
+        .path()
+        .join("_packs")
+        .join(format!("series={}", series_hash.to_hex()));
+    std::fs::create_dir_all(&old_dir).unwrap();
+    std::fs::write(
+        old_dir.join(format!("pack={}", pack.hash().to_hex())),
+        pack.encode(),
+    )
+    .unwrap();
+
+    assert!(
+        remote
+            .list_pack_hashes(series_hash)
+            .await
+            .unwrap()
+            .is_empty()
     );
 }

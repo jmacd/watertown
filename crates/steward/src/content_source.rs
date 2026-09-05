@@ -81,7 +81,7 @@ pub trait ContentSource: Send + Sync {
         series_hash: ObjectHash,
     ) -> Result<std::collections::HashSet<ObjectHash>, StewardError>;
 
-    /// Fetch one pack advertisement's raw `watertown.series-pack.v2` bytes by the
+    /// Fetch one pack advertisement's raw `watertown.series-pack.v3` bytes by the
     /// series it claims and its own content address, or `None` if absent.
     ///
     /// Implementations validate the returned bytes before handing them back:
@@ -283,7 +283,7 @@ impl LocalPondSource {
         })
     }
 
-    /// The `_packs/series=<hex>` directory for one series, beside
+    /// The `_packs/v3/series=<hex>` directory for one series, beside
     /// `_large_files/` in the pond's physical data directory
     /// (`docs/logical-series-identity-design.md` delivery gate 3).  A
     /// producer that has actually published (via `pond push`) writes real
@@ -294,12 +294,12 @@ impl LocalPondSource {
     /// discoverable.
     fn pack_series_dir(&self, series_hash: ObjectHash) -> PathBuf {
         get_data_path(&self.pond_path)
-            .join(sync_store::pack_keys::PACKS_ROOT)
+            .join(sync_store::pack_keys::PACK_INDEX_ROOT)
             .join(sync_store::pack_keys::series_dir_name(series_hash))
     }
 
     /// Read one persisted pack advertisement from this producer's own
-    /// `_packs/series=<hex>` directory, decoding and validating it exactly
+    /// `_packs/v3/series=<hex>` directory, decoding and validating it exactly
     /// as [`Self::get_pack_index`] does. Returns `None` when no file with
     /// that name exists (never persisted, or synthesized-only).
     ///
@@ -467,7 +467,7 @@ impl ContentSource for LocalPondSource {
         }
         // A maintenance-published physical pack object is not part of the
         // ordinary v1 blob closure captured at `open()` time -- it lives in
-        // this pond's own `_packs/objects/` sidecar, written only by
+        // this pond's own shared `_packs/objects/` sidecar, written only by
         // `pond maintain --collapse-versions` (`crate::pack_store`). Check
         // it too, so a repacked series' physical objects are fetchable
         // through the same `ContentSource` surface as any other blob.
@@ -584,7 +584,7 @@ impl ContentSource for LocalPondSource {
                     )));
                 }
             },
-            // No `_packs/series=<hex>` directory at all means no pack has
+            // No `_packs/v3/series=<hex>` directory at all means no pack has
             // ever been published for this series -- true of every v1
             // series, and of any never-pushed v2 series -- which is not an
             // error: the on-demand synthesis below still answers it.

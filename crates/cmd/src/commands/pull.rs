@@ -288,8 +288,8 @@ async fn pull_one(ship: &mut steward::Steward, name: &str, rebuild_graft: bool) 
     // A budget's refusal outranks the storage error it surfaced as, so an
     // exhausted limit reads as a throttle rather than as an outage.
     let result = match source.finish(&mut limits) {
-        Some(refusal) if result.is_err() => Err(anyhow::Error::new(refusal)),
-        _ => result,
+        Some(refusal) => Err(anyhow::Error::new(refusal)),
+        None => result,
     };
 
     // Persist the windows whether or not the pull succeeded, for the same

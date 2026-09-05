@@ -5,18 +5,27 @@
 //! Integration tests for `steward::fetch_object_graph`: the consumer-side
 //! fetch walk over a content-addressed remote (design Section 8.5).
 
-use steward::{Ship, fetch_object_graph, push_content_to_remote};
+use async_trait::async_trait;
+use steward::{
+    BlobReader, ContentSource, FetchedObject, LocalPondSource, Ship, StewardError,
+    fetch_object_graph, push_content_to_remote,
+};
 use sync_store::ContentRemote;
-use sync_store::content::ObjectHash;
+use sync_store::content::{ObjectHash, PackIndex};
 use tempfile::tempdir;
 use tinyfs::arrow::parquet::ParquetExt;
 use tinyfs::async_helpers::convenience::create_file_path;
 use tlogfs::{PondTxnMetadata, PondUserMetadata};
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use arrow_array::{RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use tokio::io::{AsyncRead, ReadBuf};
 
 fn meta(label: &str) -> PondUserMetadata {
     PondUserMetadata::new(vec!["test".into(), label.into()])
@@ -135,6 +144,29 @@ fn series_batch(ts_micros: i64, label: &str) -> RecordBatch {
     .expect("series batch")
 }
 
+fn series_batch_rows(first_ts_micros: i64, rows: usize, label: &str) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+        Field::new("label", DataType::Utf8, false),
+    ]));
+    let timestamps = (0..rows)
+        .map(|offset| first_ts_micros + offset as i64)
+        .collect::<Vec<_>>();
+    let labels = std::iter::repeat_n(label, rows).collect::<Vec<_>>();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(TimestampMicrosecondArray::from(timestamps)),
+            Arc::new(StringArray::from(labels)),
+        ],
+    )
+    .expect("multi-row series batch")
+}
+
 /// Append `versions` to a `TablePhysicalSeries` at `path`, creating it on the
 /// first version and appending a new version for each subsequent one.
 async fn write_series(ship: &mut Ship, path: &str, versions: &[(i64, &str)]) {
@@ -155,6 +187,19 @@ async fn write_series(ship: &mut Ship, path: &str, versions: &[(i64, &str)]) {
     })
     .await
     .expect("series transaction");
+}
+
+async fn write_series_batch(ship: &mut Ship, path: &str, batch: RecordBatch) {
+    let path = path.to_string();
+    ship.write_transaction(&meta("series-batch"), async move |fs| {
+        let root = fs.root().await?;
+        let _ = root
+            .write_series_from_batch(&path, &batch, Some("timestamp"))
+            .await?;
+        Ok(())
+    })
+    .await
+    .expect("series batch transaction");
 }
 
 /// Append one raw-bytes version to a `FilePhysicalSeries` at `path`, creating
@@ -267,6 +312,139 @@ async fn repush(ship: &Ship, remote: &mut ContentRemote) {
     let _ = push_content_to_remote(ship, remote, "main")
         .await
         .expect("repush");
+}
+
+#[derive(Debug, Default)]
+struct ReadCounts {
+    blob_bytes: AtomicU64,
+    blob_requests: Mutex<Vec<ObjectHash>>,
+    object_bytes: AtomicU64,
+    pack_index_bytes: AtomicU64,
+}
+
+struct CountingReader {
+    inner: BlobReader,
+    counts: Arc<ReadCounts>,
+}
+
+impl AsyncRead for CountingReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(result, Poll::Ready(Ok(()))) {
+            let read = buf.filled().len().saturating_sub(before) as u64;
+            let _ = self.counts.blob_bytes.fetch_add(read, Ordering::Relaxed);
+        }
+        result
+    }
+}
+
+struct CountingSource<'a> {
+    inner: &'a dyn ContentSource,
+    counts: Arc<ReadCounts>,
+}
+
+impl<'a> CountingSource<'a> {
+    fn new(inner: &'a dyn ContentSource) -> Self {
+        Self {
+            inner,
+            counts: Arc::new(ReadCounts::default()),
+        }
+    }
+}
+
+#[async_trait]
+impl ContentSource for CountingSource<'_> {
+    fn pond_id(&self) -> uuid::Uuid {
+        self.inner.pond_id()
+    }
+
+    async fn get_tip(&self, ref_name: &str) -> Result<Option<ObjectHash>, StewardError> {
+        ContentSource::get_tip(self.inner, ref_name).await
+    }
+
+    async fn get_object(&self, hash: ObjectHash) -> Result<Option<Vec<u8>>, StewardError> {
+        let value = ContentSource::get_object(self.inner, hash).await?;
+        if let Some(bytes) = &value {
+            let _ = self
+                .counts
+                .object_bytes
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        }
+        Ok(value)
+    }
+
+    async fn has_blob(&self, hash: ObjectHash) -> Result<bool, StewardError> {
+        ContentSource::has_blob(self.inner, hash).await
+    }
+
+    async fn list_blobs(&self) -> Result<HashSet<ObjectHash>, StewardError> {
+        Err(StewardError::Content(
+            "incremental pulls must not list the complete blob partition".to_string(),
+        ))
+    }
+
+    async fn get_blob_reader(&self, hash: ObjectHash) -> Result<Option<BlobReader>, StewardError> {
+        let reader = ContentSource::get_blob_reader(self.inner, hash).await?;
+        let Some(reader) = reader else {
+            return Ok(None);
+        };
+        self.counts.blob_requests.lock().unwrap().push(hash);
+        Ok(Some(Box::new(CountingReader {
+            inner: reader,
+            counts: Arc::clone(&self.counts),
+        })))
+    }
+
+    async fn list_pack_hashes(
+        &self,
+        series_hash: ObjectHash,
+    ) -> Result<HashSet<ObjectHash>, StewardError> {
+        ContentSource::list_pack_hashes(self.inner, series_hash).await
+    }
+
+    async fn get_pack_index(
+        &self,
+        series_hash: ObjectHash,
+        pack_hash: ObjectHash,
+    ) -> Result<Option<Vec<u8>>, StewardError> {
+        let value = ContentSource::get_pack_index(self.inner, series_hash, pack_hash).await?;
+        if let Some(bytes) = &value {
+            let _ = self
+                .counts
+                .pack_index_bytes
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        }
+        Ok(value)
+    }
+
+    async fn preload_objects(&self) -> Result<(), StewardError> {
+        Err(StewardError::Content(
+            "incremental pulls must not preload the complete object partition".to_string(),
+        ))
+    }
+}
+
+fn only_series_pack(graph: &steward::FetchedGraph) -> &PackIndex {
+    let mut all_series = graph.objects.values().filter_map(|object| match object {
+        FetchedObject::SeriesV2(series) => Some(series.as_ref()),
+        _ => None,
+    });
+    let fetched_series = all_series.next().expect("one fetched series");
+    assert!(
+        all_series.next().is_none(),
+        "fixture must contain one series"
+    );
+    assert_eq!(
+        fetched_series.packs.len(),
+        1,
+        "fixture must select one pack"
+    );
+    &fetched_series.packs[0].1
 }
 
 async fn rename(ship: &mut Ship, old: &str, new: &str) {
@@ -816,6 +994,352 @@ async fn series_repull_appends_only_suffix() {
     assert_eq!(outcome.files, 0);
     assert_eq!(outcome.series, 0);
     assert_eq!(root_hash(&dst).await, root_hash(&src).await);
+}
+
+#[tokio::test]
+async fn incremental_file_series_pull_reads_only_the_bounded_physical_suffix() {
+    const MIB: usize = 1024 * 1024;
+    const HISTORICAL_BYTES: u64 = 6 * MIB as u64;
+
+    let (_t, mut src) = new_pond("bounded-series-src").await;
+    write_file_series_version(&mut src, "/history.series", &vec![0x11; 2 * MIB]).await;
+    write_file_series_version(&mut src, "/history.series", &vec![0x22; 2 * MIB]).await;
+    write_file_series_version(&mut src, "/history.series", &vec![0x33; 2 * MIB]).await;
+    let initial_maintenance = src
+        .collapse_versions(1)
+        .await
+        .expect("build bounded initial pack");
+    assert_eq!(initial_maintenance.series_repacked, 1);
+
+    let (_rt, mut remote) = push(&src).await;
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "bounded-series-dst")
+        .await
+        .expect("create dst");
+
+    {
+        let source = CountingSource::new(&remote);
+        let graph = fetch_object_graph(&source, "main")
+            .await
+            .expect("initial metadata fetch must not preload all objects");
+        assert_eq!(
+            source.counts.blob_bytes.load(Ordering::Relaxed),
+            0,
+            "metadata discovery must not read pack payload bytes"
+        );
+        assert!(
+            source.counts.blob_requests.lock().unwrap().is_empty(),
+            "metadata discovery must not request pack payload objects"
+        );
+        let expected_initial_bytes: u64 = only_series_pack(&graph)
+            .object_spans()
+            .iter()
+            .map(|span| span.physical_len())
+            .sum();
+        let _ = steward::rebuild_pond(&mut dst, &source, &graph)
+            .await
+            .expect("initial materialization");
+        assert_eq!(
+            source.counts.blob_bytes.load(Ordering::Relaxed),
+            expected_initial_bytes,
+            "initial materialization must stream each physical pack object exactly once"
+        );
+    }
+    assert_eq!(root_hash(&dst).await, root_hash(&src).await);
+
+    let appended = vec![0x44; 128 * 1024];
+    write_file_series_version(&mut src, "/history.series", &appended).await;
+    let incremental_maintenance = src
+        .collapse_versions(1)
+        .await
+        .expect("refresh bounded pack after append");
+    assert_eq!(incremental_maintenance.series_repacked, 1);
+    repush(&src, &mut remote).await;
+
+    let source = CountingSource::new(&remote);
+    let graph = fetch_object_graph(&source, "main")
+        .await
+        .expect("incremental metadata fetch must not preload all objects");
+    assert_eq!(
+        source.counts.blob_bytes.load(Ordering::Relaxed),
+        0,
+        "incremental metadata discovery must not read pack payload bytes"
+    );
+    let pack = only_series_pack(&graph);
+    let expected_suffix_bytes: u64 = pack
+        .object_spans()
+        .iter()
+        .filter(|span| span.logical_end() > HISTORICAL_BYTES)
+        .map(|span| span.physical_len())
+        .sum();
+    let historical_objects: HashSet<ObjectHash> = pack
+        .object_spans()
+        .iter()
+        .filter(|span| span.logical_end() <= HISTORICAL_BYTES)
+        .map(|span| span.object_hash())
+        .collect();
+    let suffix_objects: HashSet<ObjectHash> = pack
+        .object_spans()
+        .iter()
+        .filter(|span| span.logical_end() > HISTORICAL_BYTES)
+        .map(|span| span.object_hash())
+        .collect();
+
+    let _ = steward::rebuild_pond(&mut dst, &source, &graph)
+        .await
+        .expect("incremental materialization");
+
+    assert_eq!(root_hash(&dst).await, root_hash(&src).await);
+    assert_eq!(
+        source.counts.blob_bytes.load(Ordering::Relaxed),
+        expected_suffix_bytes,
+        "incremental pull must read only objects intersecting the missing suffix"
+    );
+    assert!(
+        source
+            .counts
+            .blob_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|hash| !historical_objects.contains(hash)),
+        "objects wholly before the durable local frontier must never be requested"
+    );
+    let requests = source.counts.blob_requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        suffix_objects.len(),
+        "each required physical object must be requested exactly once"
+    );
+    assert_eq!(
+        requests.iter().copied().collect::<HashSet<_>>(),
+        suffix_objects,
+        "materialization must request exactly the objects intersecting the suffix"
+    );
+    assert!(
+        expected_suffix_bytes < HISTORICAL_BYTES / 2,
+        "the fixture must distinguish bounded suffix I/O from a historical replay"
+    );
+}
+
+#[tokio::test]
+async fn incremental_table_series_pull_reads_only_the_bounded_physical_suffix() {
+    const ROWS_PER_LEAF: usize = 40_000;
+    const HISTORICAL_ROWS: u64 = (3 * ROWS_PER_LEAF) as u64;
+
+    let (src_dir, mut src) = new_pond("bounded-table-src").await;
+    let src_path = src_dir.path().join("pond");
+    write_series_batch(
+        &mut src,
+        "/history.series",
+        series_batch_rows(1_000_000, ROWS_PER_LEAF, "first"),
+    )
+    .await;
+    write_series_batch(
+        &mut src,
+        "/history.series",
+        series_batch_rows(2_000_000, ROWS_PER_LEAF, "second"),
+    )
+    .await;
+    write_series_batch(
+        &mut src,
+        "/history.series",
+        series_batch_rows(3_000_000, ROWS_PER_LEAF, "third"),
+    )
+    .await;
+    let initial_maintenance = src
+        .collapse_versions(1)
+        .await
+        .expect("build bounded initial table pack");
+    assert_eq!(initial_maintenance.series_repacked, 1);
+
+    let (_rt, remote) = push(&src).await;
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "bounded-table-dst")
+        .await
+        .expect("create dst");
+    let initial = fetch_object_graph(&remote, "main")
+        .await
+        .expect("initial metadata fetch");
+    let _ = steward::rebuild_pond(&mut dst, &remote, &initial)
+        .await
+        .expect("initial table materialization");
+
+    write_series_batch(
+        &mut src,
+        "/history.series",
+        series_batch_rows(4_000_000, 10, "suffix"),
+    )
+    .await;
+    let incremental_maintenance = src
+        .collapse_versions(1)
+        .await
+        .expect("refresh bounded table pack after append");
+    assert_eq!(incremental_maintenance.series_repacked, 1);
+    let expected_root = root_hash(&src).await;
+    drop(src);
+
+    let local = LocalPondSource::open(&src_path)
+        .await
+        .expect("open maintained local source");
+    let source = CountingSource::new(&local);
+    let graph = fetch_object_graph(&source, "main")
+        .await
+        .expect("incremental table metadata fetch");
+    assert_eq!(
+        source.counts.blob_bytes.load(Ordering::Relaxed),
+        0,
+        "table metadata discovery must not read pack payload bytes"
+    );
+    let pack = only_series_pack(&graph);
+    assert!(
+        pack.object_spans().iter().any(|span| {
+            span.logical_start() < HISTORICAL_ROWS && span.logical_end() > HISTORICAL_ROWS
+        }),
+        "the fixture must exercise a bounded object crossing the suffix frontier"
+    );
+    let historical_objects: HashSet<ObjectHash> = pack
+        .object_spans()
+        .iter()
+        .filter(|span| span.logical_end() <= HISTORICAL_ROWS)
+        .map(|span| span.object_hash())
+        .collect();
+    assert!(
+        !historical_objects.is_empty(),
+        "the fixture must contain a wholly historical physical object"
+    );
+    let suffix_objects: HashSet<ObjectHash> = pack
+        .object_spans()
+        .iter()
+        .filter(|span| span.logical_end() > HISTORICAL_ROWS)
+        .map(|span| span.object_hash())
+        .collect();
+    let expected_suffix_bytes: u64 = pack
+        .object_spans()
+        .iter()
+        .filter(|span| span.logical_end() > HISTORICAL_ROWS)
+        .map(|span| span.physical_len())
+        .sum();
+
+    let _ = steward::rebuild_pond(&mut dst, &source, &graph)
+        .await
+        .expect("incremental table materialization");
+
+    assert_eq!(root_hash(&dst).await, expected_root);
+    assert_eq!(
+        source.counts.blob_bytes.load(Ordering::Relaxed),
+        expected_suffix_bytes,
+        "incremental table pull must read only suffix-intersecting objects"
+    );
+    let requests = source.counts.blob_requests.lock().unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|hash| !historical_objects.contains(hash)),
+        "wholly historical table objects must never be requested"
+    );
+    assert_eq!(
+        requests.iter().copied().collect::<HashSet<_>>(),
+        suffix_objects,
+        "table materialization must request exactly the suffix objects"
+    );
+    assert_eq!(
+        requests.len(),
+        suffix_objects.len(),
+        "each required table object must be requested exactly once"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_series_references_fetch_each_physical_object_once() {
+    let (_t, mut src) = new_pond("duplicate-series-src").await;
+    let body = vec![0x5a; 128 * 1024];
+    write_file_series_version(&mut src, "/first.series", &body).await;
+    write_file_series_version(&mut src, "/second.series", &body).await;
+
+    let (_rt, remote) = push(&src).await;
+    let source = CountingSource::new(&remote);
+    let graph = fetch_object_graph(&source, "main")
+        .await
+        .expect("fetch shared series metadata");
+    let pack = only_series_pack(&graph);
+    let expected_objects = pack
+        .object_spans()
+        .iter()
+        .map(|span| span.object_hash())
+        .collect::<HashSet<_>>();
+
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "duplicate-series-dst")
+        .await
+        .expect("create dst");
+    let _ = steward::rebuild_pond(&mut dst, &source, &graph)
+        .await
+        .expect("materialize both references");
+
+    assert_eq!(root_hash(&dst).await, root_hash(&src).await);
+    let requests = source.counts.blob_requests.lock().unwrap();
+    assert_eq!(
+        requests.iter().copied().collect::<HashSet<_>>(),
+        expected_objects
+    );
+    assert_eq!(
+        requests.len(),
+        expected_objects.len(),
+        "transaction-wide caching must prevent duplicate payload reads"
+    );
+}
+
+#[tokio::test]
+async fn divergent_local_series_prefix_fails_before_remote_payload_reads() {
+    let (_t, mut src) = new_pond("divergent-prefix-src").await;
+    write_file_series_version(&mut src, "/history.series", b"shared-prefix").await;
+    let _ = src.collapse_versions(0).await.expect("build initial pack");
+
+    let (_rt, mut remote) = push(&src).await;
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "divergent-prefix-dst")
+        .await
+        .expect("create dst");
+    let initial = fetch_object_graph(&remote, "main")
+        .await
+        .expect("initial fetch");
+    let _ = steward::rebuild_pond(&mut dst, &remote, &initial)
+        .await
+        .expect("initial materialization");
+
+    write_file_series_version(&mut dst, "/history.series", b"local-divergence").await;
+    write_file_series_version(&mut src, "/history.series", b"remote-append").await;
+    let _ = src.collapse_versions(0).await.expect("refresh source pack");
+    repush(&src, &mut remote).await;
+
+    let version_before = dst.data_persistence().table().version();
+    let source = CountingSource::new(&remote);
+    let graph = fetch_object_graph(&source, "main")
+        .await
+        .expect("metadata remains valid");
+    let err = steward::rebuild_pond(&mut dst, &source, &graph)
+        .await
+        .expect_err("a divergent local prefix must be rejected");
+
+    assert!(
+        format!("{err}").contains("diverged"),
+        "failure must identify the prefix divergence: {err}"
+    );
+    assert_eq!(
+        source.counts.blob_bytes.load(Ordering::Relaxed),
+        0,
+        "prefix validation must happen before any pack payload is read"
+    );
+    assert!(
+        source.counts.blob_requests.lock().unwrap().is_empty(),
+        "no physical object may be requested after prefix validation fails"
+    );
+    assert_eq!(
+        dst.data_persistence().table().version(),
+        version_before,
+        "a rejected prefix must not commit any destination changes"
+    );
 }
 
 /// Renaming a node in the source preserves its identity on pull: the consumer
@@ -1573,9 +2097,7 @@ async fn dropped_and_aborted_writes_reuse_their_sequence() {
 
     let _ = ship
         .write_transaction(&meta("abort"), async |_fs| {
-            Err(steward::StewardError::Content(
-                "injected failure".to_string(),
-            ))
+            Err(StewardError::Content("injected failure".to_string()))
         })
         .await
         .expect_err("callback failure must abort");
@@ -1594,9 +2116,7 @@ async fn failed_replay_reuses_its_sequence() {
     let _ = ship
         .replay_transaction(&replay_meta, |_guard, _fs| {
             Box::pin(async {
-                Err::<(), _>(steward::StewardError::Content(
-                    "injected replay failure".to_string(),
-                ))
+                Err::<(), _>(StewardError::Content("injected replay failure".to_string()))
             })
         })
         .await

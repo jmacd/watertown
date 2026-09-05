@@ -7,7 +7,7 @@
 //! against both implementations: [`ContentRemote`] (a `file://` object
 //! store) and [`LocalPondSource`] (a `pond://` producer clone on disk).
 //!
-//! Both must agree on the same `_packs/series=<hex>/pack=<hex>` key layout
+//! Both must agree on the same `_packs/v3/series=<hex>/pack=<hex>` key layout
 //! and the same strict validation (content-address and series-binding
 //! checks), so a selector built against the [`ContentSource`] trait works
 //! unmodified regardless of which backend serves it.
@@ -15,8 +15,8 @@
 use steward::{ContentSource, LocalPondSource, Ship};
 use sync_store::ContentRemote;
 use sync_store::content::{
-    ObjectHash, PackIndex, PackLeafDescriptor, PayloadKind, SeriesManifest, generate_range_proof,
-    merkle_root,
+    ObjectHash, PackIndex, PackLeafDescriptor, PackObjectSpan, PayloadKind, SeriesManifest,
+    generate_range_proof, merkle_root,
 };
 use tempfile::tempdir;
 use tinyfs::arrow::parquet::ParquetExt;
@@ -47,9 +47,10 @@ fn h(s: &str) -> ObjectHash {
 fn build_series_and_pack(leaf_labels: &[&str], blob_label: &str) -> (ObjectHash, PackIndex) {
     let leaves: Vec<ObjectHash> = leaf_labels.iter().map(|s| h(s)).collect();
     let root = merkle_root(&leaves);
+    let logical_count = blob_label.len() as u64;
     let manifest = SeriesManifest::new(
         PayloadKind::File,
-        leaves.len() as u64 * 3,
+        logical_count,
         leaves.len() as u64,
         None,
         None,
@@ -61,19 +62,31 @@ fn build_series_and_pack(leaf_labels: &[&str], blob_label: &str) -> (ObjectHash,
     let proof =
         generate_range_proof(&leaves, 0, leaves.len()).expect("range proof over whole series");
     let blob_hash = ObjectHash::of_bytes(blob_label.as_bytes());
-    let descriptors = (0..leaves.len())
-        .map(|_| PackLeafDescriptor::new(3, None, None, None).expect("valid descriptor"))
+    let descriptors = leaves
+        .iter()
+        .enumerate()
+        .map(|(index, leaf_hash)| {
+            let count = if index + 1 == leaves.len() {
+                logical_count - (leaves.len() as u64 - 1)
+            } else {
+                1
+            };
+            PackLeafDescriptor::new_with_leaf_hash(*leaf_hash, count, None, None, None)
+                .expect("valid descriptor")
+        })
         .collect();
-    let pack = PackIndex::new(
+    let pack = PackIndex::new_with_spans(
         series_hash,
         0,
         leaves.len() as u64,
         leaves.len() as u64,
         root,
         proof,
-        vec![blob_hash],
-        leaves.len() as u64 * 3,
-        blob_label.len() as u64,
+        vec![
+            PackObjectSpan::new(blob_hash, 0, logical_count, 0, logical_count).expect("valid span"),
+        ],
+        logical_count,
+        logical_count,
         descriptors,
     )
     .expect("valid pack index");
@@ -172,8 +185,41 @@ async fn local_pond_source_v1_pond_has_no_pack_advertisements() {
     );
 }
 
+#[tokio::test]
+async fn local_pond_source_ignores_obsolete_v2_advertisements() {
+    let (_tmp, pond_path) = open_producer("v2-sidecar-pond").await;
+    let (series_hash, pack) = build_series_and_pack(&["a", "b"], "legacy-blob");
+    let mut v2_bytes = pack.encode();
+    v2_bytes[..b"watertown.series-pack.v2\n".len()].copy_from_slice(b"watertown.series-pack.v2\n");
+    let pack_hash = ObjectHash::of_bytes(&v2_bytes);
+    let legacy_dir = steward::get_data_path(&pond_path)
+        .join(sync_store::pack_keys::PACKS_ROOT)
+        .join(sync_store::pack_keys::series_dir_name(series_hash));
+    std::fs::create_dir_all(&legacy_dir).expect("create legacy directory");
+    std::fs::write(
+        legacy_dir.join(sync_store::pack_keys::pack_file_name(pack_hash)),
+        v2_bytes,
+    )
+    .expect("write legacy advertisement");
+
+    let source = LocalPondSource::open(&pond_path)
+        .await
+        .expect("open local pond source");
+    assert!(
+        source
+            .list_pack_hashes(series_hash)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        source.get_pack_index(series_hash, pack_hash).await.unwrap(),
+        None
+    );
+}
+
 /// A pack advertisement placed directly under the producer clone's
-/// `_packs/series=<hex>/pack=<hex>` -- the same relative layout
+/// `_packs/v3/series=<hex>/pack=<hex>` -- the same relative layout
 /// [`ContentRemote`] uses -- is discovered and fetched byte-for-byte,
 /// proving `LocalPondSource` reads a real persistent location rather than a
 /// stub.
@@ -186,7 +232,7 @@ async fn local_pond_source_discovers_a_manually_placed_pack_advertisement() {
     let pack_hash = ObjectHash::of_bytes(&pack_bytes);
 
     let series_dir = steward::get_data_path(&pond_path)
-        .join("_packs")
+        .join(sync_store::pack_keys::PACK_INDEX_ROOT)
         .join(format!("series={}", series_hash.to_hex()));
     std::fs::create_dir_all(&series_dir).expect("create series dir");
     std::fs::write(
@@ -220,7 +266,7 @@ async fn local_pond_source_rejects_malformed_pack_key() {
 
     let series_hash = ObjectHash::of_bytes(b"malformed series");
     let series_dir = steward::get_data_path(&pond_path)
-        .join("_packs")
+        .join(sync_store::pack_keys::PACK_INDEX_ROOT)
         .join(format!("series={}", series_hash.to_hex()));
     std::fs::create_dir_all(&series_dir).expect("create series dir");
     std::fs::write(series_dir.join("not-a-pack-key"), b"junk").expect("write stray file");
@@ -254,7 +300,7 @@ async fn local_pond_source_rejects_cross_series_index() {
     let series_a_hash = ObjectHash::of_bytes(b"a completely unrelated series identity");
     assert_ne!(series_a_hash, series_b);
     let series_dir = steward::get_data_path(&pond_path)
-        .join("_packs")
+        .join(sync_store::pack_keys::PACK_INDEX_ROOT)
         .join(format!("series={}", series_a_hash.to_hex()));
     std::fs::create_dir_all(&series_dir).expect("create series dir");
     std::fs::write(
@@ -859,7 +905,7 @@ async fn local_pond_source_fetches_a_maintenance_published_pack_object() {
     // pass merely by exercising `list_pack_hashes`'s on-demand synthesized
     // pack fallback instead of the maintenance-published one.
     let series_dir = steward::get_data_path(&pond_path)
-        .join(sync_store::pack_keys::PACKS_ROOT)
+        .join(sync_store::pack_keys::PACK_INDEX_ROOT)
         .join(sync_store::pack_keys::series_dir_name(series_hash));
     let published: Vec<ObjectHash> = std::fs::read_dir(&series_dir)
         .expect("read published pack advertisement directory")
