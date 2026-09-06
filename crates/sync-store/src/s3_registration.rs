@@ -47,9 +47,10 @@ impl ObjectStoreFactory for S3CompatibleStoreFactory {
         // call sites is the point: a request is counted because it happened,
         // and attributed by the remote it was made to.
         Ok((
-            Arc::new(crate::MeteredStore::new(
+            Arc::new(crate::MeteredStore::new_with_prefix(
                 Arc::new(store),
                 crate::RemoteKey::new(url.as_str()),
+                prefix.clone(),
             )),
             prefix,
         ))

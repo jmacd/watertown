@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use provider::factory::rate_limit::LimitUnit;
-use sync_store::{RemoteKey, StorageMeter};
+use sync_store::{AccessSummary, RemoteKey, StorageMeter};
 
 use crate::StewardError;
 use crate::limiter::{LimiterError, LimiterSet};
@@ -159,6 +159,8 @@ pub struct MeterGuard {
     /// so the guard can report what happened during its own lifetime by
     /// difference.
     observed_at_start: (u64, u64),
+    access_at_start: AccessSummary,
+    inherited_arrears: (u64, u64),
 }
 
 impl MeterGuard {
@@ -177,6 +179,7 @@ impl MeterGuard {
             refusal: Mutex::new(None),
         });
         let before = sync_store::observed_under(&key);
+        let access_at_start = sync_store::access_summary_under(&key);
         let binding = sync_store::bind_meter(&key, Arc::clone(&meter) as Arc<dyn StorageMeter>);
 
         // Arrears were observed before this guard existed but are charged to
@@ -193,6 +196,8 @@ impl MeterGuard {
                 before.0.saturating_sub(owed_ops),
                 before.1.saturating_sub(owed_bytes),
             ),
+            access_at_start,
+            inherited_arrears: (owed_ops, owed_bytes),
         }
     }
 
@@ -216,13 +221,21 @@ impl MeterGuard {
     /// caller can commit the usage either way.
     pub fn finish(mut self, limits: &mut LimiterSet) -> Option<StewardError> {
         self.meter.closed.store(true, Ordering::Release);
-        // Unbind first: traffic after this point belongs to whoever comes
-        // next, and must not land in the numbers reported below.
-        drop(self.binding.take());
-
+        // Snapshot while this binding still owns the remote. A later binding
+        // cannot contribute traffic until this synchronous boundary completes.
         let after = sync_store::observed_under(&self.key);
         let observed_ops = after.0.saturating_sub(self.observed_at_start.0);
         let observed_bytes = after.1.saturating_sub(self.observed_at_start.1);
+        let access =
+            sync_store::access_summary_under(&self.key).saturating_sub(&self.access_at_start);
+        drop(self.binding.take());
+        log::info!(
+            "storage_access_summary remote={} inherited_arrears_ops={} inherited_arrears_bytes={} {}",
+            self.key.diagnostic_label(),
+            self.inherited_arrears.0,
+            self.inherited_arrears.1,
+            access
+        );
 
         let refusal = self
             .meter

@@ -163,6 +163,24 @@ impl RemoteKey {
         &self.0
     }
 
+    /// A non-sensitive label suitable for diagnostics.
+    ///
+    /// Userinfo, query, fragment, and path are excluded so credentials and
+    /// object-like path components can never be written to logs.
+    #[must_use]
+    pub fn diagnostic_label(&self) -> String {
+        let Ok(url) = Url::parse(&self.0) else {
+            return "<redacted-remote>".to_string();
+        };
+        let Some(host) = url.host() else {
+            return format!("{}://<remote>", url.scheme());
+        };
+        match url.port() {
+            Some(port) => format!("{}://{}:{port}", url.scheme(), host),
+            None => format!("{}://{}", url.scheme(), host),
+        }
+    }
+
     /// Whether this key is `other` or lies beneath it.
     ///
     /// A remote is configured as a bucket or container URL while stores get
@@ -207,6 +225,340 @@ static ARREARS: LazyLock<RwLock<HashMap<RemoteKey, (u64, u64)>>> = LazyLock::new
 /// Physical traffic seen per remote, whatever was or was not charged for it.
 static OBSERVED: LazyLock<RwLock<HashMap<RemoteKey, Arc<Observation>>>> =
     LazyLock::new(RwLock::default);
+
+const ACCESS_OPERATIONS: [AccessOperation; 7] = [
+    AccessOperation::Get,
+    AccessOperation::Head,
+    AccessOperation::List,
+    AccessOperation::Put,
+    AccessOperation::Multipart,
+    AccessOperation::Delete,
+    AccessOperation::Copy,
+];
+const ACCESS_CLASSES: [AccessClass; 9] = [
+    AccessClass::DeltaLog,
+    AccessClass::DeltaObjects,
+    AccessClass::DeltaRefs,
+    AccessClass::DeltaMeta,
+    AccessClass::PackIndexes,
+    AccessClass::PackObjects,
+    AccessClass::Blobs,
+    AccessClass::Recovery,
+    AccessClass::Other,
+];
+
+/// One physical object-store operation category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessOperation {
+    /// Object body read.
+    Get,
+    /// Metadata-only object probe.
+    Head,
+    /// Prefix listing, including modeled pages.
+    List,
+    /// Single-request object write.
+    Put,
+    /// Multipart initiation, parts, completion, or cleanup.
+    Multipart,
+    /// Object deletion.
+    Delete,
+    /// Provider-side object copy.
+    Copy,
+}
+
+impl AccessOperation {
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::Head => "head",
+            Self::List => "list",
+            Self::Put => "put",
+            Self::Multipart => "multipart",
+            Self::Delete => "delete",
+            Self::Copy => "copy",
+        }
+    }
+}
+
+/// A non-sensitive class of object-store path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessClass {
+    /// Delta transaction-log objects.
+    DeltaLog,
+    /// Parquet files for the inline content-object partition.
+    DeltaObjects,
+    /// Parquet files for the content-ref partition.
+    DeltaRefs,
+    /// Parquet files for the remote-metadata partition.
+    DeltaMeta,
+    /// Pack-v3 index metadata.
+    PackIndexes,
+    /// Shared physical pack payloads.
+    PackObjects,
+    /// External content-addressed blobs.
+    Blobs,
+    /// Recovery capsule and recipe objects.
+    Recovery,
+    /// Paths outside the recognized storage layout.
+    Other,
+}
+
+impl AccessClass {
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::DeltaLog => "delta_log",
+            Self::DeltaObjects => "delta_objects",
+            Self::DeltaRefs => "delta_refs",
+            Self::DeltaMeta => "delta_meta",
+            Self::PackIndexes => "pack_indexes",
+            Self::PackObjects => "pack_objects",
+            Self::Blobs => "blobs",
+            Self::Recovery => "recovery",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Request and byte totals for one operation or path class.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AccessTotals {
+    /// Modeled provider requests.
+    pub ops: u64,
+    /// Request and response body bytes.
+    pub bytes: u64,
+}
+
+impl AccessTotals {
+    fn add(&mut self, ops: u64, bytes: u64) {
+        self.ops = self.ops.saturating_add(ops);
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.add(other.ops, other.bytes);
+    }
+
+    fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            ops: self.ops.saturating_sub(earlier.ops),
+            bytes: self.bytes.saturating_sub(earlier.bytes),
+        }
+    }
+}
+
+/// Process-local physical access shape for a remote.
+///
+/// Path classes deliberately reveal no object hashes or user content. Logical
+/// query counters distinguish expensive one-key Delta queries from batched
+/// current-closure reads without adding provider traffic.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AccessSummary {
+    total: AccessTotals,
+    operations: [AccessTotals; ACCESS_OPERATIONS.len()],
+    classes: [AccessTotals; ACCESS_CLASSES.len()],
+    /// Single-object Delta queries issued.
+    pub object_point_queries: u64,
+    /// Single-object queries that returned an inline object.
+    pub object_point_hits: u64,
+    /// Batched exact-set Delta queries issued.
+    pub object_batch_queries: u64,
+    /// Distinct hashes requested across batched queries.
+    pub object_batch_keys: u64,
+    /// Requested hashes returned by batched queries.
+    pub object_batch_hits: u64,
+}
+
+impl AccessSummary {
+    /// Total physical requests and transferred bytes.
+    #[must_use]
+    pub fn total(&self) -> AccessTotals {
+        self.total
+    }
+
+    /// Physical totals attributed to `operation`.
+    #[must_use]
+    pub fn operation(&self, operation: AccessOperation) -> AccessTotals {
+        self.operations[operation.index()]
+    }
+
+    /// Physical totals attributed to `class`.
+    #[must_use]
+    pub fn class(&self, class: AccessClass) -> AccessTotals {
+        self.classes[class.index()]
+    }
+
+    fn add_access(&mut self, operation: AccessOperation, class: AccessClass, ops: u64, bytes: u64) {
+        self.total.add(ops, bytes);
+        self.operations[operation.index()].add(ops, bytes);
+        self.classes[class.index()].add(ops, bytes);
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.total.merge(other.total);
+        for operation in ACCESS_OPERATIONS {
+            self.operations[operation.index()].merge(other.operation(operation));
+        }
+        for class in ACCESS_CLASSES {
+            self.classes[class.index()].merge(other.class(class));
+        }
+        self.object_point_queries = self
+            .object_point_queries
+            .saturating_add(other.object_point_queries);
+        self.object_point_hits = self
+            .object_point_hits
+            .saturating_add(other.object_point_hits);
+        self.object_batch_queries = self
+            .object_batch_queries
+            .saturating_add(other.object_batch_queries);
+        self.object_batch_keys = self
+            .object_batch_keys
+            .saturating_add(other.object_batch_keys);
+        self.object_batch_hits = self
+            .object_batch_hits
+            .saturating_add(other.object_batch_hits);
+    }
+
+    /// Difference between two monotonically increasing snapshots.
+    #[must_use]
+    pub fn saturating_sub(&self, earlier: &Self) -> Self {
+        let mut difference = Self {
+            total: self.total.saturating_sub(earlier.total),
+            object_point_queries: self
+                .object_point_queries
+                .saturating_sub(earlier.object_point_queries),
+            object_point_hits: self
+                .object_point_hits
+                .saturating_sub(earlier.object_point_hits),
+            object_batch_queries: self
+                .object_batch_queries
+                .saturating_sub(earlier.object_batch_queries),
+            object_batch_keys: self
+                .object_batch_keys
+                .saturating_sub(earlier.object_batch_keys),
+            object_batch_hits: self
+                .object_batch_hits
+                .saturating_sub(earlier.object_batch_hits),
+            ..Self::default()
+        };
+        for operation in ACCESS_OPERATIONS {
+            difference.operations[operation.index()] = self
+                .operation(operation)
+                .saturating_sub(earlier.operation(operation));
+        }
+        for class in ACCESS_CLASSES {
+            difference.classes[class.index()] =
+                self.class(class).saturating_sub(earlier.class(class));
+        }
+        difference
+    }
+}
+
+impl fmt::Display for AccessSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "total_ops={} total_bytes={}",
+            self.total.ops, self.total.bytes
+        )?;
+        for operation in ACCESS_OPERATIONS {
+            let totals = self.operation(operation);
+            write!(
+                f,
+                " {}_ops={} {}_bytes={}",
+                operation.name(),
+                totals.ops,
+                operation.name(),
+                totals.bytes
+            )?;
+        }
+        for class in ACCESS_CLASSES {
+            let totals = self.class(class);
+            write!(
+                f,
+                " {}_ops={} {}_bytes={}",
+                class.name(),
+                totals.ops,
+                class.name(),
+                totals.bytes
+            )?;
+        }
+        write!(
+            f,
+            " object_point_queries={} object_point_hits={} object_batch_queries={} object_batch_keys={} object_batch_hits={}",
+            self.object_point_queries,
+            self.object_point_hits,
+            self.object_batch_queries,
+            self.object_batch_keys,
+            self.object_batch_hits
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AccessEvent {
+    operation: AccessOperation,
+    class: AccessClass,
+}
+
+impl AccessEvent {
+    fn new(operation: AccessOperation, location: &ObjectPath, prefix: Option<&ObjectPath>) -> Self {
+        Self {
+            operation,
+            class: classify_path(location, prefix),
+        }
+    }
+}
+
+fn classify_path(location: &ObjectPath, prefix: Option<&ObjectPath>) -> AccessClass {
+    let mut path = location.as_ref();
+    if let Some(prefix) = prefix {
+        let prefix = prefix.as_ref().trim_end_matches('/');
+        if path == prefix {
+            path = "";
+        } else if let Some(relative) = path
+            .strip_prefix(prefix)
+            .and_then(|suffix| suffix.strip_prefix('/'))
+        {
+            path = relative;
+        }
+    }
+    if path == "_delta_log" || path.starts_with("_delta_log/") {
+        return AccessClass::DeltaLog;
+    }
+    if path == "_packs/v3" || path.starts_with("_packs/v3/") {
+        return AccessClass::PackIndexes;
+    }
+    if path == "_packs/objects" || path.starts_with("_packs/objects/") {
+        return AccessClass::PackObjects;
+    }
+    if path == "_blobs" || path.starts_with("_blobs/") {
+        return AccessClass::Blobs;
+    }
+    if path == "recovery" || path.starts_with("recovery/") {
+        return AccessClass::Recovery;
+    }
+    for component in path.split('/') {
+        match component {
+            "partition_key=objects" => return AccessClass::DeltaObjects,
+            "partition_key=refs" => return AccessClass::DeltaRefs,
+            "partition_key=meta" => return AccessClass::DeltaMeta,
+            _ => {}
+        }
+    }
+    AccessClass::Other
+}
+
+fn classify_prefix(prefix: Option<&ObjectPath>, root_prefix: Option<&ObjectPath>) -> AccessClass {
+    prefix.map_or(AccessClass::Other, |path| classify_path(path, root_prefix))
+}
 
 /// Bind `meter` to the remote at `key` until the returned value is dropped.
 ///
@@ -391,6 +743,27 @@ pub fn observed_under(key: &RemoteKey) -> (u64, u64) {
         })
 }
 
+/// Detailed physical and logical access shape for `key` and its descendants.
+#[must_use]
+pub fn access_summary_under(key: &RemoteKey) -> AccessSummary {
+    let observed = OBSERVED
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut summary = AccessSummary::default();
+    for (_, observation) in observed.iter().filter(|(k, _)| k.is_under(key)) {
+        summary.merge(&observation.summary());
+    }
+    summary
+}
+
+pub(crate) fn record_object_point_query(key: &RemoteKey, hit: bool) {
+    observation(key).add_object_point_query(hit);
+}
+
+pub(crate) fn record_object_batch_query(key: &RemoteKey, requested: usize, returned: usize) {
+    observation(key).add_object_batch_query(requested, returned);
+}
+
 /// The counters for `key`, created on first use.
 fn observation(key: &RemoteKey) -> Arc<Observation> {
     if let Some(o) = OBSERVED
@@ -414,6 +787,7 @@ fn observation(key: &RemoteKey) -> Arc<Observation> {
 pub struct Observation {
     ops: AtomicU64,
     bytes: AtomicU64,
+    summary: std::sync::Mutex<AccessSummary>,
 }
 
 impl Observation {
@@ -429,9 +803,41 @@ impl Observation {
         self.bytes.load(Ordering::Relaxed)
     }
 
-    fn add(&self, ops: u64, bytes: u64) {
+    fn summary(&self) -> AccessSummary {
+        self.summary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn add(&self, event: AccessEvent, ops: u64, bytes: u64) {
         let _ = self.ops.fetch_add(ops, Ordering::Relaxed);
         let _ = self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.summary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .add_access(event.operation, event.class, ops, bytes);
+    }
+
+    fn add_object_point_query(&self, hit: bool) {
+        let mut summary = self
+            .summary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        summary.object_point_queries = summary.object_point_queries.saturating_add(1);
+        if hit {
+            summary.object_point_hits = summary.object_point_hits.saturating_add(1);
+        }
+    }
+
+    fn add_object_batch_query(&self, requested: usize, returned: usize) {
+        let mut summary = self
+            .summary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        summary.object_batch_queries = summary.object_batch_queries.saturating_add(1);
+        summary.object_batch_keys = summary.object_batch_keys.saturating_add(requested as u64);
+        summary.object_batch_hits = summary.object_batch_hits.saturating_add(returned as u64);
     }
 }
 
@@ -439,6 +845,7 @@ impl Observation {
 fn admit(
     key: &RemoteKey,
     meter: Option<&Arc<dyn StorageMeter>>,
+    event: AccessEvent,
     ops: u64,
     bytes: u64,
 ) -> ObjectStoreResult<()> {
@@ -468,7 +875,7 @@ fn admit(
             record_arrears(key, ops, bytes);
         }
     }
-    observation(key).add(ops, bytes);
+    observation(key).add(event, ops, bytes);
     Ok(())
 }
 
@@ -479,11 +886,17 @@ fn admit(
 /// failing operation retried on a timer is exactly the runaway shape these
 /// budgets exist to stop.  Charging only successes would make the worst case
 /// free.
-fn record(key: &RemoteKey, meter: Option<&Arc<dyn StorageMeter>>, ops: u64, bytes: u64) {
+fn record(
+    key: &RemoteKey,
+    meter: Option<&Arc<dyn StorageMeter>>,
+    event: AccessEvent,
+    ops: u64,
+    bytes: u64,
+) {
     // Observed first and unconditionally: what happened is recorded whether or
     // not anything was watching, and under the key of the store that did it
     // rather than the budget that claimed it.
-    observation(key).add(ops, bytes);
+    observation(key).add(event, ops, bytes);
     match meter {
         Some(meter) => meter.record(ops, bytes),
         // Nothing claimed this traffic, so it is owed rather than forgiven.
@@ -499,13 +912,33 @@ pub struct MeteredStore {
     /// follows from this rather than from what is executing, which is what
     /// makes it survive every task boundary the Delta layer introduces.
     key: RemoteKey,
+    /// Prefix delta-rs applies outside this root object store.
+    prefix: Option<ObjectPath>,
 }
 
 impl MeteredStore {
     /// Wrap `inner` so its traffic is charged to the budget bound to `key`.
     #[must_use]
     pub fn new(inner: Arc<dyn ObjectStore>, key: RemoteKey) -> Self {
-        Self { inner, key }
+        Self {
+            inner,
+            key,
+            prefix: None,
+        }
+    }
+
+    /// Wrap `inner`, classifying requests relative to delta-rs's `prefix`.
+    #[must_use]
+    pub fn new_with_prefix(
+        inner: Arc<dyn ObjectStore>,
+        key: RemoteKey,
+        prefix: ObjectPath,
+    ) -> Self {
+        Self {
+            inner,
+            key,
+            prefix: Some(prefix),
+        }
     }
 
     /// The budget governing this store right now, if any.
@@ -536,7 +969,8 @@ impl ObjectStore for MeteredStore {
     ) -> ObjectStoreResult<PutResult> {
         let meter = self.meter();
         let bytes = payload.content_length() as u64;
-        admit(&self.key, meter.as_ref(), 1, bytes)?;
+        let event = AccessEvent::new(AccessOperation::Put, location, self.prefix.as_ref());
+        admit(&self.key, meter.as_ref(), event, 1, bytes)?;
         self.inner.put_opts(location, payload, opts).await
     }
 
@@ -546,12 +980,14 @@ impl ObjectStore for MeteredStore {
         opts: PutMultipartOptions,
     ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
         let meter = self.meter();
-        admit(&self.key, meter.as_ref(), 1, 0)?;
+        let event = AccessEvent::new(AccessOperation::Multipart, location, self.prefix.as_ref());
+        admit(&self.key, meter.as_ref(), event, 1, 0)?;
         let upload = self.inner.put_multipart_opts(location, opts).await;
         Ok(Box::new(MeteredUpload {
             inner: upload?,
             key: self.key.clone(),
             meter,
+            class: event.class,
         }))
     }
 
@@ -562,7 +998,16 @@ impl ObjectStore for MeteredStore {
     ) -> ObjectStoreResult<GetResult> {
         let meter = self.meter();
         let is_head = options.head;
-        admit(&self.key, meter.as_ref(), 1, 0)?;
+        let event = AccessEvent::new(
+            if is_head {
+                AccessOperation::Head
+            } else {
+                AccessOperation::Get
+            },
+            location,
+            self.prefix.as_ref(),
+        );
+        admit(&self.key, meter.as_ref(), event, 1, 0)?;
         let result = self.inner.get_opts(location, options).await;
         let result = result?;
 
@@ -578,13 +1023,14 @@ impl ObjectStore for MeteredStore {
         // stopping oversized reads before they stream, this makes concurrent
         // GET admission atomic and keeps an outliving stream paid for by the
         // guard under which it was opened.
-        admit(&self.key, meter.as_ref(), 0, response_bytes)?;
+        admit(&self.key, meter.as_ref(), event, 0, response_bytes)?;
         Ok(result)
     }
 
     async fn delete(&self, location: &ObjectPath) -> ObjectStoreResult<()> {
         let meter = self.meter();
-        admit(&self.key, meter.as_ref(), 1, 0)?;
+        let event = AccessEvent::new(AccessOperation::Delete, location, self.prefix.as_ref());
+        admit(&self.key, meter.as_ref(), event, 1, 0)?;
         self.inner.delete(location).await
     }
 
@@ -593,16 +1039,22 @@ impl ObjectStore for MeteredStore {
         prefix: Option<&ObjectPath>,
     ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
         let key = self.key.clone();
+        let event = AccessEvent {
+            operation: AccessOperation::List,
+            class: classify_prefix(prefix, self.prefix.as_ref()),
+        };
         let inner = self.inner.list(prefix);
         futures::stream::try_unfold(
-            (inner, key, 0u64),
-            |(mut inner, key, item_index)| async move {
+            (inner, key, event, 0u64),
+            |(mut inner, key, event, item_index)| async move {
                 if item_index.is_multiple_of(LIST_PAGE_SIZE) {
                     let meter = meter_for(&key);
-                    admit(&key, meter.as_ref(), 1, 0)?;
+                    admit(&key, meter.as_ref(), event, 1, 0)?;
                 }
                 match inner.next().await {
-                    Some(item) => item.map(|item| Some((item, (inner, key, item_index + 1)))),
+                    Some(item) => {
+                        item.map(|item| Some((item, (inner, key, event, item_index + 1))))
+                    }
                     None => Ok(None),
                 }
             },
@@ -615,7 +1067,11 @@ impl ObjectStore for MeteredStore {
         prefix: Option<&ObjectPath>,
     ) -> ObjectStoreResult<ListResult> {
         let meter = self.meter();
-        admit(&self.key, meter.as_ref(), 1, 0)?;
+        let event = AccessEvent {
+            operation: AccessOperation::List,
+            class: classify_prefix(prefix, self.prefix.as_ref()),
+        };
+        admit(&self.key, meter.as_ref(), event, 1, 0)?;
         let result = self.inner.list_with_delimiter(prefix).await;
         let result = result?;
         let entries = result
@@ -628,8 +1084,8 @@ impl ObjectStore for MeteredStore {
             // This API returns all pages at once. A successful admission
             // reserves them; a refusal still records their already-incurred
             // cost before returning the error.
-            if let Err(error) = admit(&self.key, meter.as_ref(), additional_pages, 0) {
-                record(&self.key, meter.as_ref(), additional_pages, 0);
+            if let Err(error) = admit(&self.key, meter.as_ref(), event, additional_pages, 0) {
+                record(&self.key, meter.as_ref(), event, additional_pages, 0);
                 return Err(error);
             }
         }
@@ -638,7 +1094,8 @@ impl ObjectStore for MeteredStore {
 
     async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> ObjectStoreResult<()> {
         let meter = self.meter();
-        admit(&self.key, meter.as_ref(), 1, 0)?;
+        let event = AccessEvent::new(AccessOperation::Copy, to, self.prefix.as_ref());
+        admit(&self.key, meter.as_ref(), event, 1, 0)?;
         self.inner.copy(from, to).await
     }
 
@@ -648,7 +1105,8 @@ impl ObjectStore for MeteredStore {
         to: &ObjectPath,
     ) -> ObjectStoreResult<()> {
         let meter = self.meter();
-        admit(&self.key, meter.as_ref(), 1, 0)?;
+        let event = AccessEvent::new(AccessOperation::Copy, to, self.prefix.as_ref());
+        admit(&self.key, meter.as_ref(), event, 1, 0)?;
         self.inner.copy_if_not_exists(from, to).await
     }
 }
@@ -660,20 +1118,29 @@ struct MeteredUpload {
     inner: Box<dyn MultipartUpload>,
     key: RemoteKey,
     meter: Option<Arc<dyn StorageMeter>>,
+    class: AccessClass,
 }
 
 #[async_trait]
 impl MultipartUpload for MeteredUpload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
         let bytes = data.content_length() as u64;
-        if let Err(error) = admit(&self.key, self.meter.as_ref(), 1, bytes) {
+        let event = AccessEvent {
+            operation: AccessOperation::Multipart,
+            class: self.class,
+        };
+        if let Err(error) = admit(&self.key, self.meter.as_ref(), event, 1, bytes) {
             return Box::pin(async move { Err(error) });
         }
         self.inner.put_part(data)
     }
 
     async fn complete(&mut self) -> ObjectStoreResult<PutResult> {
-        admit(&self.key, self.meter.as_ref(), 1, 0)?;
+        let event = AccessEvent {
+            operation: AccessOperation::Multipart,
+            class: self.class,
+        };
+        admit(&self.key, self.meter.as_ref(), event, 1, 0)?;
         self.inner.complete().await
     }
 
@@ -681,7 +1148,11 @@ impl MultipartUpload for MeteredUpload {
         // Cleanup must remain possible after the request budget is exhausted:
         // refusing an abort can leave staged multipart data accruing storage
         // charges.  Account for the request, but deliberately do not admit it.
-        record(&self.key, self.meter.as_ref(), 1, 0);
+        let event = AccessEvent {
+            operation: AccessOperation::Multipart,
+            class: self.class,
+        };
+        record(&self.key, self.meter.as_ref(), event, 1, 0);
         self.inner.abort().await
     }
 }
@@ -771,6 +1242,142 @@ mod tests {
             MeteredStore::new(Arc::new(InMemory::new()), key.clone()),
             key,
         )
+    }
+
+    #[test]
+    fn access_paths_are_classified_without_exposing_object_names() {
+        assert_eq!(
+            classify_path(&ObjectPath::from("_delta_log/0000000001.json"), None),
+            AccessClass::DeltaLog
+        );
+        assert_eq!(
+            classify_path(
+                &ObjectPath::from("pond_id=p/partition_key=objects/part-secret.parquet"),
+                None
+            ),
+            AccessClass::DeltaObjects
+        );
+        assert_eq!(
+            classify_path(
+                &ObjectPath::from("pond_id=p/partition_key=refs/part-secret.parquet"),
+                None
+            ),
+            AccessClass::DeltaRefs
+        );
+        assert_eq!(
+            classify_path(
+                &ObjectPath::from("_packs/v3/series=secret/pack=secret"),
+                None
+            ),
+            AccessClass::PackIndexes
+        );
+        assert_eq!(
+            classify_path(&ObjectPath::from("_packs/objects/secret"), None),
+            AccessClass::PackObjects
+        );
+        assert_eq!(
+            classify_path(&ObjectPath::from("_blobs/blob=secret"), None),
+            AccessClass::Blobs
+        );
+        assert_eq!(
+            classify_path(&ObjectPath::from("recovery/capsules/secret"), None),
+            AccessClass::Recovery
+        );
+        assert_eq!(
+            classify_path(&ObjectPath::from("unrecognized/secret"), None),
+            AccessClass::Other
+        );
+        let prefix = ObjectPath::from("table/prefix");
+        assert_eq!(
+            classify_path(
+                &ObjectPath::from("table/prefix/_delta_log/0000000001.json"),
+                Some(&prefix)
+            ),
+            AccessClass::DeltaLog
+        );
+        assert_eq!(
+            classify_path(
+                &ObjectPath::from("table/prefix/_packs/objects/secret"),
+                Some(&prefix)
+            ),
+            AccessClass::PackObjects
+        );
+    }
+
+    #[test]
+    fn diagnostic_remote_labels_exclude_credentials_and_paths() {
+        let secret_hash = "a".repeat(64);
+        let key = RemoteKey::new(&format!(
+            "s3://user:password@example.invalid/private/{secret_hash}?token=secret"
+        ));
+        let label = key.diagnostic_label();
+        assert_eq!(label, "s3://example.invalid");
+        assert!(!label.contains("user"));
+        assert!(!label.contains("password"));
+        assert!(!label.contains(&secret_hash));
+        assert!(!label.contains("token"));
+    }
+
+    #[tokio::test]
+    async fn access_summary_breaks_down_operations_and_path_classes() {
+        let (store, key) = store("access-summary-shape");
+        let path = ObjectPath::from("_delta_log/0000000001.json");
+        let before = access_summary_under(&key);
+
+        store
+            .put(&path, PutPayload::from_static(b"abc"))
+            .await
+            .expect("put");
+        let result = store.get(&path).await.expect("get");
+        assert_eq!(&result.bytes().await.expect("body")[..], b"abc");
+        let _ = store.head(&path).await.expect("head");
+        let listed = store
+            .list(Some(&ObjectPath::from("_delta_log")))
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(listed.len(), 1);
+
+        let summary = access_summary_under(&key).saturating_sub(&before);
+        assert_eq!(summary.total(), AccessTotals { ops: 4, bytes: 6 });
+        assert_eq!(
+            summary.operation(AccessOperation::Get),
+            AccessTotals { ops: 1, bytes: 3 }
+        );
+        assert_eq!(
+            summary.operation(AccessOperation::Head),
+            AccessTotals { ops: 1, bytes: 0 }
+        );
+        assert_eq!(
+            summary.operation(AccessOperation::List),
+            AccessTotals { ops: 1, bytes: 0 }
+        );
+        assert_eq!(
+            summary.operation(AccessOperation::Put),
+            AccessTotals { ops: 1, bytes: 3 }
+        );
+        assert_eq!(
+            summary.class(AccessClass::DeltaLog),
+            AccessTotals { ops: 4, bytes: 6 }
+        );
+        assert!(summary.to_string().contains("delta_log_ops=4"));
+    }
+
+    #[test]
+    fn access_summary_records_logical_object_query_shape() {
+        let key = RemoteKey::new("mem://logical-query-summary");
+        let before = access_summary_under(&key);
+
+        record_object_point_query(&key, true);
+        record_object_point_query(&key, false);
+        record_object_batch_query(&key, 12, 10);
+
+        let summary = access_summary_under(&key).saturating_sub(&before);
+        assert_eq!(summary.object_point_queries, 2);
+        assert_eq!(summary.object_point_hits, 1);
+        assert_eq!(summary.object_batch_queries, 1);
+        assert_eq!(summary.object_batch_keys, 12);
+        assert_eq!(summary.object_batch_hits, 10);
+        assert_eq!(summary.total(), AccessTotals::default());
     }
 
     /// The point of the whole module: a read is charged for the bytes that
