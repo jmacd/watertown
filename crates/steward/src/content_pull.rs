@@ -95,8 +95,9 @@ pub struct FetchedSeriesV2 {
 pub struct FetchedGraph {
     /// The tip commit's hash.
     pub tip: Option<ObjectHash>,
-    /// The commit chain from the tip back toward genesis, tip first, limited to
-    /// commits present on the remote.
+    /// The fetched commit ancestry, tip first. [`fetch_object_graph`] reads to
+    /// genesis; [`fetch_object_graph_since`] stops after the requested known
+    /// ancestor, when present.
     pub commits: Vec<(ObjectHash, Commit)>,
     /// Every reachable object keyed by content hash.  Inline entries carry their
     /// bytes (verified to hash to the key); large external blobs are recorded as
@@ -154,6 +155,21 @@ pub async fn fetch_object_graph(
     remote: &dyn ContentSource,
     ref_name: &str,
 ) -> Result<FetchedGraph, StewardError> {
+    fetch_object_graph_since(remote, ref_name, None).await
+}
+
+/// Fetch the verified object closure at `ref_name`, stopping the commit walk
+/// after `known_ancestor` has been fetched.
+///
+/// The boundary commit is included so callers can prove that the fetched tip
+/// descends from their durable prior tip. If the boundary is not in the
+/// ancestry, the walk continues to genesis, allowing the caller to reject the
+/// non-fast-forward update without trusting unverified lineage.
+pub async fn fetch_object_graph_since(
+    remote: &dyn ContentSource,
+    ref_name: &str,
+    known_ancestor: Option<ObjectHash>,
+) -> Result<FetchedGraph, StewardError> {
     let Some(tip) = remote
         .get_tip(ref_name)
         .await
@@ -162,7 +178,7 @@ pub async fn fetch_object_graph(
         return Ok(FetchedGraph::default());
     };
 
-    descend_from_tip(remote, tip).await
+    descend_from_tip(remote, tip, known_ancestor).await
 }
 
 /// Build the fetched graph from `tip`: fetch the exact commits and metadata
@@ -170,6 +186,7 @@ pub async fn fetch_object_graph(
 async fn descend_from_tip(
     remote: &dyn ContentSource,
     tip: ObjectHash,
+    known_ancestor: Option<ObjectHash>,
 ) -> Result<FetchedGraph, StewardError> {
     let mut graph = FetchedGraph {
         tip: Some(tip),
@@ -192,6 +209,9 @@ async fn descend_from_tip(
             .map_err(|e| StewardError::Content(format!("decode commit: {e}")))?;
         next = commit.parent_commit_hash;
         graph.commits.push((commit_hash, commit));
+        if Some(commit_hash) == known_ancestor {
+            break;
+        }
     }
 
     // Descend the tip commit's root tree, fetching the full reachable closure.
@@ -1159,12 +1179,12 @@ async fn import_pond_inner(
     _ = tx.commit().await?;
 
     // Advance only the foreign pond's seq frontier so the local allocator stays
-    // contiguous; the highest source seq is the foreign tip's commit seq.
+    // contiguous. The source tip is the newest commit even when the ancestry
+    // fetch stopped at the destination's prior tip.
     let foreign_seq = graph
         .commits
-        .iter()
+        .first()
         .map(|(_, c)| c.provenance.seq)
-        .max()
         .unwrap_or(0);
     target
         .data_persistence_mut()

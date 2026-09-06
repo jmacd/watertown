@@ -144,7 +144,6 @@ spec:
   config:
     unit: ops/hour
     limit: {ops_per_hour}
-    burst: 1
 ---
 version: v1
 kind: remote
@@ -191,7 +190,6 @@ spec:
   config:
     unit: ops/hour
     limit: {ops_per_hour}
-    burst: 1
 ---
 version: v1
 kind: backup

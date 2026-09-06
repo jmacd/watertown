@@ -118,23 +118,34 @@ async fn pulled_frontier(
     Ok(watermark)
 }
 
-/// Return `true` when the remote's tip commit for ref `main` already equals the
-/// durable graft pin (or mirror watermark), so the graph fetch can be skipped.
-async fn already_at_tip(
+struct PullPosition {
+    previous: Option<sync_store::content::ObjectHash>,
+    already_at_tip: bool,
+}
+
+/// Resolve the durable prior tip once and compare it with the remote's current
+/// tip, so graph fetching and fast-forward validation share the same boundary.
+async fn pull_position(
     ship: &mut steward::Ship,
     remote: &dyn steward::ContentSource,
     url: &str,
     name: &str,
     graft: Option<(&str, uuid::Uuid)>,
-) -> Result<bool> {
+) -> Result<PullPosition> {
     let remote_tip = remote
         .get_tip("main")
         .await
         .map_err(|e| anyhow!("get tip from `{url}`: {e}"))?;
-    let last_pulled = pulled_frontier(ship, url, name, graft).await?;
-    if let (Some(tip), Some(prev)) = (remote_tip, last_pulled.as_deref())
-        && tip.to_hex() == prev
-    {
+    let previous = pulled_frontier(ship, url, name, graft)
+        .await?
+        .map(|tip| {
+            sync_store::content::ObjectHash::from_hex(&tip)
+                .map_err(|e| anyhow!("invalid last_pulled_tip for `{name}`: {e}"))
+        })
+        .transpose()?;
+    let already_at_tip = remote_tip.is_some() && remote_tip == previous;
+    if already_at_tip {
+        let tip = remote_tip.expect("already_at_tip requires a remote tip");
         if graft.is_some() {
             let key = format!("last_pulled_tip:{url}");
             let tip_hex = tip.to_hex();
@@ -150,24 +161,22 @@ async fn already_at_tip(
                     .map_err(|e| anyhow!("repair last_pulled_tip for `{name}`: {e}"))?;
             }
         }
-        log::info!("[OK] pull {name} already up to date (tip={prev})");
-        return Ok(true);
+        log::info!("[OK] pull {name} already up to date (tip={tip})");
     }
-    Ok(false)
+    Ok(PullPosition {
+        previous,
+        already_at_tip,
+    })
 }
 
 async fn require_fast_forward(
-    ship: &mut steward::Ship,
     graph: &steward::FetchedGraph,
-    url: &str,
     name: &str,
-    graft: Option<(&str, uuid::Uuid)>,
+    previous: Option<sync_store::content::ObjectHash>,
 ) -> Result<()> {
-    let Some(previous) = pulled_frontier(ship, url, name, graft).await? else {
+    let Some(previous_hash) = previous else {
         return Ok(());
     };
-    let previous_hash = sync_store::content::ObjectHash::from_hex(&previous)
-        .map_err(|e| anyhow!("invalid last_pulled_tip for `{name}`: {e}"))?;
     if graph
         .commits
         .iter()
@@ -180,7 +189,7 @@ async fn require_fast_forward(
         .map(|tip| tip.to_hex())
         .unwrap_or_else(|| "<empty>".to_string());
     Err(anyhow!(
-        "remote `{name}` tip {remote_tip} does not descend from last pulled tip {previous}; refusing non-fast-forward pull"
+        "remote `{name}` tip {remote_tip} does not descend from last pulled tip {previous_hash}; refusing non-fast-forward pull"
     ))
 }
 
@@ -341,18 +350,18 @@ async fn pull_import(
     // and re-import entirely.  This is the bandwidth-bug guard: without it,
     // every pull re-walks and re-downloads the whole reachable object closure.
     let graft_identity = Some((mount_path, remote.pond_id()));
-    if !rebuild_graft
-        && already_at_tip(ship_ref, remote, &attachment.url, name, graft_identity).await?
-    {
+    let position = pull_position(ship_ref, remote, &attachment.url, name, graft_identity).await?;
+    if !rebuild_graft && position.already_at_tip {
         return Ok(());
     }
 
     // Fetch the foreign object graph and rebuild it under the foreign pond_id
     // partition, then mount it.  The local allocator stays contiguous; only the
     // foreign pond's seq frontier advances inside `import_pond`.
-    let graph = steward::fetch_object_graph(remote, "main")
+    let graph = steward::fetch_object_graph_since(remote, "main", position.previous)
         .await
         .map_err(|e| anyhow!("fetch from `{}`: {}", attachment.url, e))?;
+    require_fast_forward(&graph, name, position.previous).await?;
     if graph.is_empty() {
         log::info!(
             "pull {}: remote ref `main` is empty; nothing to import",
@@ -360,7 +369,6 @@ async fn pull_import(
         );
         return Ok(());
     }
-    require_fast_forward(ship_ref, &graph, &attachment.url, name, graft_identity).await?;
     let foreign_uuid7 = uuid7::Uuid::from(*foreign_pond_id.as_bytes());
     let pinned_tip = graph
         .tip
@@ -407,13 +415,15 @@ async fn pull_mirror(
 
     // Incremental short-circuit (CA3): skip the full graph fetch and rebuild
     // when the mirror already reflects the remote tip.
-    if already_at_tip(ship_ref, remote, &attachment.url, name, None).await? {
+    let position = pull_position(ship_ref, remote, &attachment.url, name, None).await?;
+    if position.already_at_tip {
         return Ok(());
     }
 
-    let graph = steward::fetch_object_graph(remote, "main")
+    let graph = steward::fetch_object_graph_since(remote, "main", position.previous)
         .await
         .map_err(|e| anyhow!("fetch from `{}`: {}", attachment.url, e))?;
+    require_fast_forward(&graph, name, position.previous).await?;
     if graph.is_empty() {
         log::info!(
             "pull {}: remote ref `main` is empty; nothing to rebuild",
@@ -421,7 +431,6 @@ async fn pull_mirror(
         );
         return Ok(());
     }
-    require_fast_forward(ship_ref, &graph, &attachment.url, name, None).await?;
     let outcome = steward::rebuild_pond(ship_ref, remote, &graph)
         .await
         .map_err(|e| anyhow!("rebuild from `{}`: {}", attachment.url, e))?;
