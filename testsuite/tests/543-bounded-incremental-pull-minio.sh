@@ -1,16 +1,18 @@
 #!/bin/bash
 # REQUIRES: compose
-# TEST: Incremental MinIO pull bounds commit ancestry reads
+# TEST: Incremental MinIO pull bounds commit and current-tree metadata reads
 # DESCRIPTION:
 #   Build a producer remote with enough separately-pushed history to make a
 #   full ancestry walk expensive, import it into a consumer, then advance the
 #   producer by one commit. Trace the second pull at MinIO and require both
-#   convergence and a bounded number of physical requests.
+#   convergence and a bounded number of physical requests. The producer's
+#   current tree contains every historical file, so this also catches a
+#   regression to one Delta partition scan per current object.
 #
 #   This exercises the production CLI path that unit tests cannot:
-#     durable graft pin -> pond pull -> bounded ancestry fetch -> MinIO.
-#   Before the bounded-ancestry fix, the second pull fetched every historical
-#   commit through a Delta point query and exceeded the request ceiling below.
+#     durable graft pin -> pond pull -> batched exact-closure fetch -> MinIO.
+#   Before metadata batching, the second pull still performed one Delta point
+#   query per current object and exceeded the request ceiling below.
 set -euo pipefail
 source check.sh
 
@@ -19,7 +21,7 @@ MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-minioadmin}"
 MINIO_ENDPOINT="${MINIO_ENDPOINT:-http://minio:9000}"
 BUCKET_NAME="bounded-pull-543"
 HISTORY_COMMITS=16
-REQUEST_CEILING=600
+REQUEST_CEILING=200
 
 TRACE_PID=
 cleanup() {

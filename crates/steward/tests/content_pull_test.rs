@@ -17,7 +17,7 @@ use tinyfs::arrow::parquet::ParquetExt;
 use tinyfs::async_helpers::convenience::create_file_path;
 use tlogfs::{PondTxnMetadata, PondUserMetadata};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -320,6 +320,7 @@ struct ReadCounts {
     blob_requests: Mutex<Vec<ObjectHash>>,
     object_bytes: AtomicU64,
     object_requests: Mutex<Vec<ObjectHash>>,
+    object_batches: Mutex<Vec<Vec<ObjectHash>>>,
     pack_index_bytes: AtomicU64,
 }
 
@@ -382,6 +383,26 @@ impl ContentSource for CountingSource<'_> {
                 .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         }
         Ok(value)
+    }
+
+    async fn get_objects(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, Vec<u8>>, StewardError> {
+        self.counts
+            .object_batches
+            .lock()
+            .expect("object_batches lock")
+            .push(hashes.to_vec());
+        self.counts
+            .object_requests
+            .lock()
+            .expect("object_requests lock")
+            .extend(hashes.iter().copied());
+        let values = ContentSource::get_objects(self.inner, hashes).await?;
+        let bytes = values.values().map(Vec::len).sum::<usize>() as u64;
+        let _ = self.counts.object_bytes.fetch_add(bytes, Ordering::Relaxed);
+        Ok(values)
     }
 
     async fn has_blob(&self, hash: ObjectHash) -> Result<bool, StewardError> {
@@ -669,6 +690,16 @@ async fn incremental_fetch_bounds_ancestry_at_known_tip() {
             .unwrap()
             .contains(&old_parent),
         "no commit older than the durable prior tip may be requested"
+    );
+    assert_eq!(
+        source
+            .counts
+            .object_batches
+            .lock()
+            .expect("object_batches lock")
+            .len(),
+        3,
+        "one commit batch plus root/manifest and exact current-closure batches"
     );
 }
 
