@@ -108,8 +108,12 @@ pond pull upstream >/tmp/bounded-pull-command.log 2>&1
 REQUESTS=$(stop_trace "${TRACE_LOG}")
 
 GETS=$(grep -c 's3.GetObject' "${TRACE_LOG}" || true)
+ACCESS_SUMMARY=$(grep 'storage_access_summary' /tmp/bounded-pull-command.log | tail -1)
+POINT_QUERIES=$(printf '%s\n' "${ACCESS_SUMMARY}" | sed -n 's/.* object_point_queries=\([0-9][0-9]*\).*/\1/p')
+BATCH_QUERIES=$(printf '%s\n' "${ACCESS_SUMMARY}" | sed -n 's/.* object_batch_queries=\([0-9][0-9]*\).*/\1/p')
 echo "Initial pull MinIO traffic: ${INITIAL_REQUESTS} read request(s)"
 echo "Incremental pull MinIO traffic: ${REQUESTS} read request(s), ${GETS} GET(s)"
+echo "Incremental pull access summary: ${ACCESS_SUMMARY#*storage_access_summary }"
 
 check \
     "test \"$(pond cat /imports/source/data/incremental.txt)\" = 'one bounded append'" \
@@ -123,6 +127,12 @@ check \
 check \
     "test $((REQUESTS * 100)) -le $((INITIAL_REQUESTS * 70))" \
     "incremental pull uses at most 70% of the full-history initial pull"
+check \
+    "test '${POINT_QUERIES}' = 0" \
+    "incremental current-closure discovery uses no object point queries"
+check \
+    "test '${BATCH_QUERIES}' = 3" \
+    "incremental current-closure discovery uses three exact object batches"
 check_not_contains \
     /tmp/bounded-pull-command.log \
     "incremental pull reports no rate-limit or fetch error" \

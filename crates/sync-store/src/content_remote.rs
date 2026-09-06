@@ -617,9 +617,13 @@ impl ContentRemote {
                 return Ok(cache.get(&hash.to_hex()).cloned());
             }
         }
-        self.store
+        let key = crate::RemoteKey::new(&self.store.url());
+        let result = self
+            .store
             .get(self.pond_id, OBJECTS_PARTITION, &hash.to_hex())
-            .await
+            .await;
+        crate::metered_store::record_object_point_query(&key, matches!(&result, Ok(Some(_))));
+        result
     }
 
     /// Read exactly the requested inline objects in one Delta query.
@@ -627,11 +631,23 @@ impl ContentRemote {
     /// Missing hashes are omitted. Unlike [`Self::preload_objects`], this does
     /// not retain state or return unrelated historical inline payloads.
     pub async fn get_objects(&self, hashes: &[ObjectHash]) -> Result<HashMap<ObjectHash, Vec<u8>>> {
-        let keys = hashes.iter().map(ObjectHash::to_hex).collect::<Vec<_>>();
-        let rows = self
+        let mut keys = hashes.iter().map(ObjectHash::to_hex).collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let result = self
             .store
             .get_many(self.pond_id, OBJECTS_PARTITION, &keys)
-            .await?;
+            .await;
+        let returned = result.as_ref().map_or(0, HashMap::len);
+        crate::metered_store::record_object_batch_query(
+            &crate::RemoteKey::new(&self.store.url()),
+            keys.len(),
+            returned,
+        );
+        let rows = result?;
         rows.into_iter()
             .map(|(key, value)| {
                 ObjectHash::from_hex(&key)

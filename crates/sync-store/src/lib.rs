@@ -55,7 +55,8 @@ pub use content::{
 pub use content_remote::{ContentRemote, RecoveryRecipePublishOutcome};
 pub use error::{Result, StoreError};
 pub use metered_store::{
-    MeterBinding, MeteredStore, Observation, RemoteKey, StorageMeter, bind_meter, observed_under,
+    AccessClass, AccessOperation, AccessSummary, AccessTotals, MeterBinding, MeteredStore,
+    Observation, RemoteKey, StorageMeter, access_summary_under, bind_meter, observed_under,
     record_arrears,
 };
 pub use recovery_recipe::{

@@ -49,9 +49,10 @@ impl ObjectStoreFactory for InMemoryGcsFactory {
         let bucket = url.host_str().unwrap_or("bucket");
         let prefix = Path::parse(format!("{bucket}{}", url.path()))?;
         Ok((
-            Arc::new(MeteredStore::new(
+            Arc::new(MeteredStore::new_with_prefix(
                 BACKING.clone(),
                 crate::RemoteKey::new(url.as_str()),
+                prefix.clone(),
             )),
             prefix,
         ))
