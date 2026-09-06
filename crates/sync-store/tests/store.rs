@@ -79,6 +79,49 @@ async fn get_returns_none_for_missing_key() {
 }
 
 #[tokio::test]
+async fn get_many_returns_only_requested_latest_live_values() {
+    init_logger();
+    let dir = TempDir::new().unwrap();
+    let mut store = Store::create(dir.path()).await.unwrap();
+    let _ = store.put(pid_a(), "p1", "a", b"A1".to_vec()).await.unwrap();
+    let _ = store.put(pid_a(), "p1", "b", b"B1".to_vec()).await.unwrap();
+    let _ = store.put(pid_a(), "p1", "a", b"A2".to_vec()).await.unwrap();
+    let _ = store.delete(pid_a(), "p1", "b").await.unwrap();
+    let _ = store
+        .put(pid_a(), "p1", "other", b"X".to_vec())
+        .await
+        .unwrap();
+    let _ = store
+        .put(pid_a(), "p2", "a", b"wrong partition".to_vec())
+        .await
+        .unwrap();
+    let _ = store
+        .put(pid_b(), "p1", "a", b"wrong pond".to_vec())
+        .await
+        .unwrap();
+
+    let values = store
+        .get_many(
+            pid_a(),
+            "p1",
+            &["missing".into(), "b".into(), "a".into(), "a".into()],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(values.len(), 1);
+    assert_eq!(values.get("a"), Some(&b"A2".to_vec()));
+}
+
+#[tokio::test]
+async fn get_many_empty_request_reads_nothing() {
+    init_logger();
+    let dir = TempDir::new().unwrap();
+    let store = Store::create(dir.path()).await.unwrap();
+    assert!(store.get_many(pid_a(), "p1", &[]).await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn put_overwrites_returns_latest() {
     init_logger();
     let dir = TempDir::new().unwrap();

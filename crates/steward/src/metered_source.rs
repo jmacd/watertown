@@ -20,7 +20,7 @@
 //! lifetime to the source's, which is what keeps a [`BlobReader`] metered
 //! while it drains.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -91,6 +91,14 @@ impl ContentSource for MeteredSource {
 
     async fn get_object(&self, hash: ObjectHash) -> Result<Option<Vec<u8>>, StewardError> {
         let outcome = self.inner.get_object(hash).await;
+        self.charged(outcome)
+    }
+
+    async fn get_objects(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, Vec<u8>>, StewardError> {
+        let outcome = self.inner.get_objects(hashes).await;
         self.charged(outcome)
     }
 

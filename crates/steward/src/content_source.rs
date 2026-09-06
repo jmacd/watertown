@@ -16,7 +16,7 @@
 //! `_large_files` blobs -- read directly from the producer clone's on-disk
 //! state, so the consumer rebuilds a byte-identical foreign subtree.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -45,6 +45,27 @@ pub trait ContentSource: Send + Sync {
     /// The bytes of the inline object with `hash`, or `None` if it is not an
     /// inline object (e.g. it is a large external blob).
     async fn get_object(&self, hash: ObjectHash) -> Result<Option<Vec<u8>>, StewardError>;
+
+    /// Read exactly the requested inline objects.
+    ///
+    /// Remote implementations should batch this into one physical query.
+    /// Missing hashes are omitted. The default preserves correct behavior for
+    /// sources whose objects are already local or in memory.
+    async fn get_objects(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, Vec<u8>>, StewardError> {
+        let mut objects = HashMap::with_capacity(hashes.len());
+        for &hash in hashes {
+            if objects.contains_key(&hash) {
+                continue;
+            }
+            if let Some(bytes) = self.get_object(hash).await? {
+                let _ = objects.insert(hash, bytes);
+            }
+        }
+        Ok(objects)
+    }
 
     /// True if the source holds the external blob with `hash`.
     ///
@@ -119,6 +140,15 @@ impl ContentSource for ContentRemote {
 
     async fn get_object(&self, hash: ObjectHash) -> Result<Option<Vec<u8>>, StewardError> {
         ContentRemote::get_object(self, hash)
+            .await
+            .map_err(|e| StewardError::Content(e.to_string()))
+    }
+
+    async fn get_objects(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, Vec<u8>>, StewardError> {
+        ContentRemote::get_objects(self, hashes)
             .await
             .map_err(|e| StewardError::Content(e.to_string()))
     }

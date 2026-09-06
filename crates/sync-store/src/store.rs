@@ -4,6 +4,7 @@
 //!
 //! See `lib.rs` for the public crate documentation.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -531,6 +532,71 @@ impl Store {
             return Ok(Some(value.value(0).to_vec()));
         }
         Ok(None)
+    }
+
+    /// Read the current live values for exactly `keys` in `(pond_id, partition)`.
+    ///
+    /// One query resolves the complete requested set, avoiding a full Delta
+    /// partition scan per key. Missing and tombstoned keys are omitted.
+    pub async fn get_many(
+        &self,
+        pond_id: Uuid,
+        partition: &str,
+        keys: &[String],
+    ) -> Result<HashMap<String, Vec<u8>>> {
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut unique = keys.to_vec();
+        unique.sort();
+        unique.dedup();
+        let requested = unique
+            .iter()
+            .map(|key| format!("'{}'", sql_escape(key)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT {ik}, {value} \
+             FROM ( \
+                SELECT {ik}, {value}, {deleted}, \
+                       ROW_NUMBER() OVER ( \
+                         PARTITION BY {ik} ORDER BY {seq} DESC \
+                       ) AS rn \
+                FROM {table} \
+                WHERE {pid} = '{pid_v}' AND {pk} = '{p}' \
+                  AND {ik} IN ({requested}) \
+             ) \
+             WHERE rn = 1 AND NOT {deleted}",
+            ik = schema::col::ITEM_KEY,
+            value = schema::col::VALUE,
+            deleted = schema::col::DELETED,
+            seq = schema::col::TXN_SEQ,
+            table = TABLE_NAME,
+            pid = schema::col::POND_ID,
+            pid_v = pond_id,
+            pk = schema::col::PARTITION_KEY,
+            p = sql_escape(partition),
+        );
+
+        let batches = self.session_ctx.sql(&sql).await?.collect().await?;
+        let mut out = HashMap::new();
+        for batch in batches {
+            let item_keys = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| StoreError::Invariant("get_many: item_key is not Utf8".into()))?;
+            let values = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| StoreError::Invariant("get_many: value is not Binary".into()))?;
+            for i in 0..batch.num_rows() {
+                let _ = out.insert(item_keys.value(i).to_string(), values.value(i).to_vec());
+            }
+        }
+        Ok(out)
     }
 
     /// Return all live `(item_key, value)` pairs in `(pond_id, partition)`,

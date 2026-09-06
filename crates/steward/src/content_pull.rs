@@ -23,10 +23,11 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
+use async_trait::async_trait;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::reader::ChunkReader;
 
-use crate::content_source::ContentSource;
+use crate::content_source::{BlobReader, ContentSource};
 use sync_store::content::{
     Commit, IncrementalFileLeafHasher, ManifestEntry, ObjectHash, PackIndex, PackLeafDescriptor,
     PackObjectSpan, PayloadKind, SeriesManifest, TreeEntry, VersionMeta, decode_manifest,
@@ -193,15 +194,33 @@ async fn descend_from_tip(
         ..FetchedGraph::default()
     };
 
-    // Walk the commit chain from the tip toward genesis, stopping at the first
-    // commit the remote does not hold.
+    // Fetch the new tip and known boundary together. In the normal one-commit
+    // incremental case this proves the complete ancestry with one Delta scan.
+    let mut commit_seeds = vec![tip];
+    if let Some(known) = known_ancestor
+        && known != tip
+    {
+        commit_seeds.push(known);
+    }
+    let mut commit_objects = remote
+        .get_objects(&commit_seeds)
+        .await
+        .map_err(|e| StewardError::Content(e.to_string()))?;
+
+    // Walk the commit chain from the tip toward genesis, stopping at the known
+    // ancestor. Longer unpublished runs still fetch intermediate commits one
+    // at a time because their hashes are learned from their children.
     let mut next = Some(tip);
     while let Some(commit_hash) = next {
-        let Some(commit_bytes) = remote
-            .get_object(commit_hash)
-            .await
-            .map_err(|e| StewardError::Content(e.to_string()))?
-        else {
+        let commit_bytes = if let Some(bytes) = commit_objects.remove(&commit_hash) {
+            Some(bytes)
+        } else {
+            remote
+                .get_object(commit_hash)
+                .await
+                .map_err(|e| StewardError::Content(e.to_string()))?
+        };
+        let Some(commit_bytes) = commit_bytes else {
             break;
         };
         verify(commit_hash, &commit_bytes)?;
@@ -214,25 +233,108 @@ async fn descend_from_tip(
         }
     }
 
-    // Descend the tip commit's root tree, fetching the full reachable closure.
+    // The authenticated node manifest names every object in the current tree.
+    // Fetch that exact set in two batches: root+manifest, then the manifest's
+    // child hashes. This avoids one full Delta scan per object without
+    // preloading unrelated historical inline payloads.
     if let Some((_, tip_commit)) = graph.commits.first() {
         let root = tip_commit.root_tree_hash;
         let manifest_hash = tip_commit.node_manifest_hash;
-        fetch_tree(remote, root, &mut graph).await?;
-        graph.manifest = fetch_manifest(remote, manifest_hash).await?;
+        let mut current_objects = remote
+            .get_objects(&[root, manifest_hash])
+            .await
+            .map_err(|e| StewardError::Content(e.to_string()))?;
+        let manifest_bytes = current_objects.remove(&manifest_hash).ok_or_else(|| {
+            StewardError::Content(format!(
+                "object {} is absent from the remote",
+                manifest_hash.to_hex()
+            ))
+        })?;
+        verify(manifest_hash, &manifest_bytes)?;
+        graph.manifest = decode_manifest(&manifest_bytes)
+            .map_err(|e| StewardError::Content(format!("decode manifest: {e}")))?;
+
+        let hashes = graph
+            .manifest
+            .iter()
+            .map(|entry| entry.child_hash)
+            .filter(|hash| *hash != root)
+            .collect::<Vec<_>>();
+        current_objects.extend(
+            remote
+                .get_objects(&hashes)
+                .await
+                .map_err(|e| StewardError::Content(e.to_string()))?,
+        );
+
+        let prefetched = PrefetchedObjectSource {
+            inner: remote,
+            objects: current_objects,
+        };
+        fetch_tree(&prefetched, root, &mut graph).await?;
     }
 
     Ok(graph)
 }
 
-/// Fetch and decode the tip commit's node manifest, verifying its bytes hash to
-/// the commit's `node_manifest_hash` (Section 4.5).
-async fn fetch_manifest(
-    remote: &dyn ContentSource,
-    manifest_hash: ObjectHash,
-) -> Result<Vec<ManifestEntry>, StewardError> {
-    let bytes = fetch_verified(remote, manifest_hash).await?;
-    decode_manifest(&bytes).map_err(|e| StewardError::Content(format!("decode manifest: {e}")))
+/// A read-only source view containing exactly the current closure named by an
+/// authenticated node manifest. Object misses stay misses rather than falling
+/// back to point queries, so an inconsistent tree fails closed.
+struct PrefetchedObjectSource<'a> {
+    inner: &'a dyn ContentSource,
+    objects: HashMap<ObjectHash, Vec<u8>>,
+}
+
+#[async_trait]
+impl ContentSource for PrefetchedObjectSource<'_> {
+    fn pond_id(&self) -> uuid::Uuid {
+        self.inner.pond_id()
+    }
+
+    async fn get_tip(&self, ref_name: &str) -> Result<Option<ObjectHash>, StewardError> {
+        self.inner.get_tip(ref_name).await
+    }
+
+    async fn get_object(&self, hash: ObjectHash) -> Result<Option<Vec<u8>>, StewardError> {
+        Ok(self.objects.get(&hash).cloned())
+    }
+
+    async fn get_objects(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, Vec<u8>>, StewardError> {
+        Ok(hashes
+            .iter()
+            .filter_map(|hash| self.objects.get(hash).cloned().map(|bytes| (*hash, bytes)))
+            .collect())
+    }
+
+    async fn has_blob(&self, hash: ObjectHash) -> Result<bool, StewardError> {
+        self.inner.has_blob(hash).await
+    }
+
+    async fn list_blobs(&self) -> Result<HashSet<ObjectHash>, StewardError> {
+        self.inner.list_blobs().await
+    }
+
+    async fn get_blob_reader(&self, hash: ObjectHash) -> Result<Option<BlobReader>, StewardError> {
+        self.inner.get_blob_reader(hash).await
+    }
+
+    async fn list_pack_hashes(
+        &self,
+        series_hash: ObjectHash,
+    ) -> Result<HashSet<ObjectHash>, StewardError> {
+        self.inner.list_pack_hashes(series_hash).await
+    }
+
+    async fn get_pack_index(
+        &self,
+        series_hash: ObjectHash,
+        pack_hash: ObjectHash,
+    ) -> Result<Option<Vec<u8>>, StewardError> {
+        self.inner.get_pack_index(series_hash, pack_hash).await
+    }
 }
 
 /// Recursively fetch a tree object and everything reachable from its entries.
