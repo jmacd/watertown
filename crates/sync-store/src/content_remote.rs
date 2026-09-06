@@ -657,25 +657,6 @@ impl ContentRemote {
             .collect()
     }
 
-    /// Read exactly the requested inline objects in one Delta query.
-    ///
-    /// Missing hashes are omitted. Unlike [`Self::preload_objects`], this does
-    /// not retain state or return unrelated historical inline payloads.
-    pub async fn get_objects(&self, hashes: &[ObjectHash]) -> Result<HashMap<ObjectHash, Vec<u8>>> {
-        let keys = hashes.iter().map(ObjectHash::to_hex).collect::<Vec<_>>();
-        let rows = self
-            .store
-            .get_many(self.pond_id, OBJECTS_PARTITION, &keys)
-            .await?;
-        rows.into_iter()
-            .map(|(key, value)| {
-                ObjectHash::from_hex(&key)
-                    .map(|hash| (hash, value))
-                    .map_err(StoreError::Invariant)
-            })
-            .collect()
-    }
-
     /// Snapshot the entire `objects` partition into memory with one
     /// [`Store::list`] scan, so subsequent [`Self::get_object`] / [`Self::has_object`]
     /// calls resolve from memory instead of one full-table Delta scan per hash.
