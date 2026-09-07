@@ -45,8 +45,25 @@ Remote pulls read that physically isolated partition once, authenticate every
 key/value/commit, and walk exact parent links in memory from the ref tip to the
 known boundary (or genesis when the boundary is unrelated). Current-tree
 metadata then requires exactly two `objects` queries: root plus node manifest,
-followed by the manifest's exact closure. This prevents producer lag of `N`
-commits from becoming `N` full scans of the large inline-object partition.
+followed by the manifest's exact closure. Only after destination series
+prefixes have been validated, a pull with missing series leaves may issue one
+additional exact `objects` batch containing the deduplicated physical hashes
+whose spans intersect those suffixes. Returned inline payloads are
+hash-verified and cached; misses stream from external blob storage. Payload
+materialization never falls back to per-hash `objects` point queries. Before
+that batch, authenticated span lengths bound the possible retained inline
+payload to 64 MiB (objects at or above the 64 KiB externalization threshold
+stream instead). A larger collection of tiny inline objects is rejected before
+remote payload reads rather than risking an allocator OOM; maintenance can
+consolidate such a pathological suffix into bounded external pack objects.
+
+The indexed remote invariant is therefore one commit-index read, two exact
+current-closure object batches, and at most one exact suffix-payload object
+batch. Diagnostics report zero `object_point_queries` and three
+`object_batch_queries` when series payload hashes are required (two when no
+series payload is needed). This prevents either producer lag of `N` commits or
+`N` changed physical payloads from becoming `N` full scans of the large inline
+object partition.
 
 Rollout is deliberately fail closed: until an old remote receives one upgraded
 producer push its commit index is empty, and any indexed remote missing the tip

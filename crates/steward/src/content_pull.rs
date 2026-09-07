@@ -41,6 +41,14 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::{Ship, StewardError};
 
+/// Bound the aggregate inline payload retained by the exact suffix query.
+///
+/// Physical objects at or above `LARGE_FILE_THRESHOLD` are external and
+/// streamed, so they do not contribute. Refusing a pathological collection of
+/// tiny inline objects before querying is safer than risking an allocator OOM,
+/// and aligns the retained payload ceiling with the default remote burst gate.
+const MAX_INLINE_PACK_PREFETCH_BYTES: u64 = 64 * 1024 * 1024;
+
 /// A fetched content object, in the structured form a rebuild needs, alongside
 /// its exact bytes (kept so the rebuild can write file content and re-verify).
 #[derive(Debug, Clone)]
@@ -246,8 +254,10 @@ async fn descend_from_tip(
     // The authenticated node manifest names every object in the current tree.
     // Indexed remotes fetch the exact set in exactly two object batches:
     // root+manifest, then the manifest's child hashes. Commit bytes came from
-    // the isolated index, so there is no tip/known object batch. This avoids
-    // both one full Delta scan per object and one per intermediate commit.
+    // the isolated index, so there is no tip/known object batch. After series
+    // prefix validation, rebuild may issue at most one further exact batch for
+    // the physical objects intersecting missing suffixes. No payload is ever
+    // resolved through an object point query.
     if let Some((_, tip_commit)) = graph.commits.first() {
         let root = tip_commit.root_tree_hash;
         let manifest_hash = tip_commit.node_manifest_hash;
@@ -1070,6 +1080,7 @@ pub async fn rebuild_pond(
         &target_series,
         &target_series_leaves,
     )?;
+    let mut pack_objects = prepare_pack_objects(&ops, graph, remote).await?;
 
     let root_node_id = src_root_id(graph)?.to_string();
     let mut tx = target
@@ -1078,7 +1089,15 @@ pub async fn rebuild_pond(
     tx.expect_content_roots(root, tip_manifest_hash, tip_manifest_root);
     let apply_result = async {
         let root_wd = tx.root().await?;
-        apply_ops(&root_node_id, root_wd, &ops, remote, graph).await
+        apply_ops(
+            &root_node_id,
+            root_wd,
+            &ops,
+            remote,
+            graph,
+            &mut pack_objects,
+        )
+        .await
     }
     .await;
     if let Err(error) = apply_result {
@@ -1221,6 +1240,7 @@ async fn import_pond_inner(
             &target_series_leaves,
         )?
     };
+    let mut pack_objects = prepare_pack_objects(&ops, graph, remote).await?;
 
     let root_node_id = src_root_id(graph)?.to_string();
     let first_import = target_nodes.is_empty();
@@ -1298,7 +1318,15 @@ async fn import_pond_inner(
                 writer.shutdown().await?;
             }
         }
-        apply_ops(&root_node_id, root_wd, &ops, remote, graph).await?;
+        apply_ops(
+            &root_node_id,
+            root_wd,
+            &ops,
+            remote,
+            graph,
+            &mut pack_objects,
+        )
+        .await?;
         let uncommitted = tx.state()?.uncommitted_live_rows().await?;
         let committed_table = tx.data_persistence()?.table().clone();
         crate::content_tree::in_txn_content_state(committed_table, uncommitted, &foreign_id).await
@@ -2122,19 +2150,20 @@ fn plan_series_v2_leaves(
 /// Apply an ordered plan within an open transaction, adopting source node ids.
 /// Small versions write from buffered bytes; large external versions stream
 /// from the remote blob store straight into the writer, never buffered (D7).
-/// A v2 series fetches its required pack payloads on demand and independently
-/// re-verifies each suffix leaf before writing it (see
-/// [`materialize_series_v2`]).
+/// A v2 series consumes its exact, prevalidated suffix-payload plan and
+/// independently re-verifies each suffix leaf before writing it (see
+/// [`materialize_series_v2`]). Inline payloads were fetched in one exact batch
+/// before the transaction opened; cache misses stream only from external blob
+/// storage and never fall back to object point queries.
 async fn apply_ops(
     root_node_id: &str,
     root_wd: WD,
     ops: &[ApplyOp],
     remote: &dyn ContentSource,
     graph: &FetchedGraph,
+    pack_objects: &mut PreparedPackObjects,
 ) -> Result<(), StewardError> {
     let mut dir_wd: HashMap<String, WD> = HashMap::new();
-    let mut pack_object_cache: HashMap<ObjectHash, VerifiedPackObject> = HashMap::new();
-    let mut pack_object_uses = pack_object_use_counts(ops, graph)?;
     let _ = dir_wd.insert(root_node_id.to_string(), root_wd.clone());
 
     for op in ops {
@@ -2261,8 +2290,7 @@ async fn apply_ops(
                     *entry_type,
                     series,
                     remote,
-                    &mut pack_object_cache,
-                    &mut pack_object_uses,
+                    pack_objects,
                     *leaves_from,
                     *replicated_mtime,
                 )
@@ -2270,7 +2298,7 @@ async fn apply_ops(
             }
         }
     }
-    if !pack_object_uses.is_empty() || !pack_object_cache.is_empty() {
+    if !pack_objects.uses.is_empty() || !pack_objects.cache.is_empty() {
         return Err(StewardError::Content(
             "physical pack object cache retained unconsumed planned uses".to_string(),
         ));
@@ -2278,11 +2306,16 @@ async fn apply_ops(
     Ok(())
 }
 
-fn pack_object_use_counts(
-    ops: &[ApplyOp],
-    graph: &FetchedGraph,
-) -> Result<HashMap<ObjectHash, usize>, StewardError> {
+struct PackObjectPlan {
+    uses: HashMap<ObjectHash, usize>,
+    expected_lengths: HashMap<ObjectHash, u64>,
+    inline_bytes: u64,
+}
+
+fn pack_object_plan(ops: &[ApplyOp], graph: &FetchedGraph) -> Result<PackObjectPlan, StewardError> {
     let mut uses = HashMap::new();
+    let mut expected_lengths = HashMap::new();
+    let mut inline_bytes = 0u64;
     for op in ops {
         let ApplyOp::SeriesV2 {
             manifest_hash,
@@ -2303,7 +2336,36 @@ fn pack_object_use_counts(
                 .iter()
                 .filter(|span| span.logical_end() > logical_prefix)
             {
-                let count = uses.entry(span.object_hash()).or_insert(0usize);
+                let hash = span.object_hash();
+                let physical_len = span.physical_len();
+                match expected_lengths.entry(hash) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let _ = entry.insert(physical_len);
+                        if physical_len
+                            < u64::try_from(tlogfs::large_files::LARGE_FILE_THRESHOLD)
+                                .unwrap_or(u64::MAX)
+                        {
+                            inline_bytes =
+                                inline_bytes.checked_add(physical_len).ok_or_else(|| {
+                                    StewardError::Content(
+                                        "inline physical pack object size sum overflows u64"
+                                            .to_string(),
+                                    )
+                                })?;
+                        }
+                    }
+                    std::collections::hash_map::Entry::Occupied(entry)
+                        if *entry.get() != physical_len =>
+                    {
+                        return Err(StewardError::Content(format!(
+                            "physical pack object {hash} has conflicting declared lengths {} and \
+                             {physical_len}",
+                            entry.get()
+                        )));
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {}
+                }
+                let count = uses.entry(hash).or_insert(0usize);
                 *count = count.checked_add(1).ok_or_else(|| {
                     StewardError::Content(
                         "physical pack object use count overflows usize".to_string(),
@@ -2312,7 +2374,91 @@ fn pack_object_use_counts(
             }
         }
     }
-    Ok(uses)
+    Ok(PackObjectPlan {
+        uses,
+        expected_lengths,
+        inline_bytes,
+    })
+}
+
+fn validate_inline_prefetch_size(inline_bytes: u64, limit: u64) -> Result<(), StewardError> {
+    if inline_bytes > limit {
+        return Err(StewardError::Content(format!(
+            "exact suffix payload batch could retain {inline_bytes} inline bytes, exceeding the \
+             {limit}-byte safety limit; refusing before reading remote payloads"
+        )));
+    }
+    Ok(())
+}
+
+/// The exact physical pack-object work remaining after every destination
+/// series prefix has been validated.
+///
+/// `uses` bounds transaction-wide deduplication and releases each object after
+/// its last consumer. `cache` starts with every inline object returned by one
+/// exact [`ContentSource::get_objects`] call. A planned hash absent from that
+/// batch is treated only as a possible external blob; materialization streams
+/// it through [`ContentSource::get_blob_reader`] and fails if it is absent
+/// there too. It never probes [`ContentSource::get_object`].
+struct PreparedPackObjects {
+    uses: HashMap<ObjectHash, usize>,
+    cache: HashMap<ObjectHash, VerifiedPackObject>,
+}
+
+/// Prepare suffix payloads after planning has authenticated destination
+/// prefixes, but before a destination write transaction is opened.
+async fn prepare_pack_objects(
+    ops: &[ApplyOp],
+    graph: &FetchedGraph,
+    remote: &dyn ContentSource,
+) -> Result<PreparedPackObjects, StewardError> {
+    let plan = pack_object_plan(ops, graph)?;
+    validate_inline_prefetch_size(plan.inline_bytes, MAX_INLINE_PACK_PREFETCH_BYTES)?;
+    let hashes = plan
+        .uses
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut cache = HashMap::new();
+    if !hashes.is_empty() {
+        let inline = remote
+            .get_objects(&hashes)
+            .await
+            .map_err(|e| StewardError::Content(format!("prefetch physical pack objects: {e}")))?;
+        let mut actual_inline_bytes = 0u64;
+        for (hash, bytes) in inline {
+            let Some(expected_len) = plan.expected_lengths.get(&hash).copied() else {
+                return Err(StewardError::Content(format!(
+                    "physical pack object prefetch returned unexpected key {hash}"
+                )));
+            };
+            verify(hash, &bytes)?;
+            let actual_len = u64::try_from(bytes.len()).map_err(|_| {
+                StewardError::Content(format!(
+                    "physical pack object {hash} length does not fit in u64"
+                ))
+            })?;
+            if actual_len != expected_len {
+                return Err(StewardError::Content(format!(
+                    "physical object {hash} has {actual_len} byte(s), but its v3 pack span declares \
+                     {expected_len}"
+                )));
+            }
+            actual_inline_bytes = actual_inline_bytes.checked_add(actual_len).ok_or_else(|| {
+                StewardError::Content(
+                    "returned inline physical pack object size sum overflows u64".to_string(),
+                )
+            })?;
+            let _ = cache.insert(hash, VerifiedPackObject::Memory(bytes::Bytes::from(bytes)));
+        }
+        validate_inline_prefetch_size(actual_inline_bytes, MAX_INLINE_PACK_PREFETCH_BYTES)?;
+    }
+    Ok(PreparedPackObjects {
+        uses: plan.uses,
+        cache,
+    })
 }
 
 /// Write one file/series version through `writer`, then finalize it.  An inline
@@ -2443,47 +2589,43 @@ impl VerifiedPackObject {
             Self::File { len, .. } => *len,
         }
     }
+
+    fn validate_len(&self, hash: ObjectHash, expected_len: u64) -> Result<(), StewardError> {
+        if self.len() != expected_len {
+            return Err(StewardError::Content(format!(
+                "physical object {hash} has {} byte(s), but its v3 pack span declares {expected_len}",
+                self.len()
+            )));
+        }
+        Ok(())
+    }
 }
 
 async fn ensure_pack_object<'a>(
     remote: &dyn ContentSource,
     span: &PackObjectSpan,
-    cache: &'a mut HashMap<ObjectHash, VerifiedPackObject>,
+    prepared: &'a mut PreparedPackObjects,
 ) -> Result<&'a VerifiedPackObject, StewardError> {
     let hash = span.object_hash();
     let expected_len = span.physical_len();
-    if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(hash) {
-        let object = if let Some(bytes) = remote
-            .get_object(hash)
-            .await
-            .map_err(|e| StewardError::Content(format!("fetch physical object {hash}: {e}")))?
-        {
-            verify(hash, &bytes)?;
-            VerifiedPackObject::Memory(bytes::Bytes::from(bytes))
-        } else {
-            let (file, len) = spool_external_object(remote, hash).await?;
-            VerifiedPackObject::File { file, len }
-        };
+    if let std::collections::hash_map::Entry::Vacant(entry) = prepared.cache.entry(hash) {
+        let (file, len) = spool_external_object(remote, hash).await?;
+        let object = VerifiedPackObject::File { file, len };
         let _ = entry.insert(object);
     }
-    let object = cache
+    let object = prepared
+        .cache
         .get(&hash)
         .expect("pack object was found or inserted above");
-    if object.len() != expected_len {
-        return Err(StewardError::Content(format!(
-            "physical object {hash} has {} byte(s), but its v3 pack span declares {expected_len}",
-            object.len()
-        )));
-    }
+    object.validate_len(hash, expected_len)?;
     Ok(object)
 }
 
 fn release_pack_object(
     hash: ObjectHash,
-    cache: &mut HashMap<ObjectHash, VerifiedPackObject>,
-    uses: &mut HashMap<ObjectHash, usize>,
+    prepared: &mut PreparedPackObjects,
 ) -> Result<(), StewardError> {
-    let remaining = uses.get_mut(&hash).ok_or_else(|| {
+    let remaining = prepared.uses.get_mut(&hash).ok_or_else(|| {
         StewardError::Content(format!(
             "physical object {hash} was fetched without a planned use"
         ))
@@ -2492,8 +2634,8 @@ fn release_pack_object(
         StewardError::Content(format!("physical object {hash} use count underflow"))
     })?;
     if *remaining == 0 {
-        let _ = uses.remove(&hash);
-        let _ = cache.remove(&hash);
+        let _ = prepared.uses.remove(&hash);
+        let _ = prepared.cache.remove(&hash);
     }
     Ok(())
 }
@@ -2528,8 +2670,9 @@ fn suffix_start_in_pack(pack: &PackIndex, leaves_from: u64) -> Result<(usize, u6
 /// leaf before `leaves_from` (already held by the target) and independently
 /// re-verifying every leaf about to be written against its authenticated v3
 /// descriptor hash *before* handing it to a writer. Physical objects are
-/// fetched here, after prefix validation, and only when their logical span
-/// intersects the missing suffix.
+/// prepared in one exact inline-object batch after prefix validation, and only
+/// when their logical span intersects the missing suffix. Missing inline
+/// values stream from external blob storage without any object point lookup.
 async fn materialize_series_v2(
     pwd: &WD,
     name: &str,
@@ -2538,8 +2681,7 @@ async fn materialize_series_v2(
     entry_type: EntryType,
     series: &FetchedSeriesV2,
     remote: &dyn ContentSource,
-    object_cache: &mut HashMap<ObjectHash, VerifiedPackObject>,
-    object_uses: &mut HashMap<ObjectHash, usize>,
+    pack_objects: &mut PreparedPackObjects,
     leaves_from: u64,
     replicated_mtime: Option<i64>,
 ) -> Result<(), StewardError> {
@@ -2552,8 +2694,7 @@ async fn materialize_series_v2(
                 create,
                 series,
                 remote,
-                object_cache,
-                object_uses,
+                pack_objects,
                 leaves_from,
                 replicated_mtime,
             )
@@ -2567,8 +2708,7 @@ async fn materialize_series_v2(
                 create,
                 series,
                 remote,
-                object_cache,
-                object_uses,
+                pack_objects,
                 leaves_from,
                 replicated_mtime,
             )
@@ -2732,8 +2872,7 @@ async fn materialize_file_series_v2(
     create: bool,
     series: &FetchedSeriesV2,
     remote: &dyn ContentSource,
-    object_cache: &mut HashMap<ObjectHash, VerifiedPackObject>,
-    object_uses: &mut HashMap<ObjectHash, usize>,
+    pack_objects: &mut PreparedPackObjects,
     leaves_from: u64,
     replicated_mtime: Option<i64>,
 ) -> Result<(), StewardError> {
@@ -2760,7 +2899,7 @@ async fn materialize_file_series_v2(
             .filter(|span| span.logical_end() > logical_prefix)
         {
             let skip = logical_prefix.saturating_sub(span.logical_start());
-            let object = ensure_pack_object(remote, span, object_cache).await?;
+            let object = ensure_pack_object(remote, span, pack_objects).await?;
             match object {
                 VerifiedPackObject::Memory(bytes) => {
                     let start = usize::try_from(skip).map_err(|_| {
@@ -2840,7 +2979,7 @@ async fn materialize_file_series_v2(
                     }
                 }
             }
-            release_pack_object(span.object_hash(), object_cache, object_uses)?;
+            release_pack_object(span.object_hash(), pack_objects)?;
         }
         if hasher.is_some() {
             return Err(StewardError::Content(format!(
@@ -2989,8 +3128,7 @@ async fn materialize_table_series_v2(
     create: bool,
     series: &FetchedSeriesV2,
     remote: &dyn ContentSource,
-    object_cache: &mut HashMap<ObjectHash, VerifiedPackObject>,
-    object_uses: &mut HashMap<ObjectHash, usize>,
+    pack_objects: &mut PreparedPackObjects,
     leaves_from: u64,
     replicated_mtime: Option<i64>,
 ) -> Result<(), StewardError> {
@@ -3037,7 +3175,7 @@ async fn materialize_table_series_v2(
                                 .to_string(),
                         )
                     })?;
-            let object = ensure_pack_object(remote, span, object_cache).await?;
+            let object = ensure_pack_object(remote, span, pack_objects).await?;
             let (schema, batches) = match object {
                 VerifiedPackObject::Memory(bytes) => {
                     decode_table_object(bytes.clone(), expected_fingerprint)
@@ -3148,7 +3286,7 @@ async fn materialize_table_series_v2(
                 )
                 .await?;
             }
-            release_pack_object(span.object_hash(), object_cache, object_uses)?;
+            release_pack_object(span.object_hash(), pack_objects)?;
         }
         if current_descriptor.is_some() {
             return Err(StewardError::Content(format!(
@@ -3561,6 +3699,38 @@ mod tests {
         assert!(
             err.contains("crosses a schema-fingerprint transition"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn external_pack_object_size_mismatch_fails_closed() {
+        let hash = ObjectHash::of_bytes(b"external payload");
+        let object = VerifiedPackObject::File {
+            file: tempfile::tempfile().expect("spool file"),
+            len: 8,
+        };
+        let error = object
+            .validate_len(hash, 9)
+            .expect_err("declared span length mismatch must fail");
+        assert!(error.to_string().contains("v3 pack span declares 9"));
+    }
+
+    #[test]
+    fn inline_pack_prefetch_size_limit_is_explicit() {
+        validate_inline_prefetch_size(
+            MAX_INLINE_PACK_PREFETCH_BYTES,
+            MAX_INLINE_PACK_PREFETCH_BYTES,
+        )
+        .expect("the exact limit is accepted");
+        let error = validate_inline_prefetch_size(
+            MAX_INLINE_PACK_PREFETCH_BYTES + 1,
+            MAX_INLINE_PACK_PREFETCH_BYTES,
+        )
+        .expect_err("one byte over the limit must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("refusing before reading remote payloads")
         );
     }
 }
