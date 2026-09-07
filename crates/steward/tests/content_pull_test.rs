@@ -370,6 +370,135 @@ struct CountingSource<'a> {
     counts: Arc<ReadCounts>,
 }
 
+enum BatchFault {
+    Omit(ObjectHash),
+    Corrupt(ObjectHash),
+    Unexpected(ObjectHash, Vec<u8>),
+}
+
+enum BlobFault {
+    Corrupt(ObjectHash),
+}
+
+struct FaultingSource<'a> {
+    inner: &'a dyn ContentSource,
+    batch_fault: Option<BatchFault>,
+    blob_fault: Option<BlobFault>,
+}
+
+struct CorruptingReader {
+    inner: BlobReader,
+    corrupted: bool,
+}
+
+impl AsyncRead for CorruptingReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(result, Poll::Ready(Ok(()))) && !self.corrupted {
+            let after = buf.filled().len();
+            if after > before {
+                buf.filled_mut()[before] ^= 0xff;
+                self.corrupted = true;
+            }
+        }
+        result
+    }
+}
+
+#[async_trait]
+impl ContentSource for FaultingSource<'_> {
+    fn pond_id(&self) -> uuid::Uuid {
+        self.inner.pond_id()
+    }
+
+    async fn get_tip(&self, ref_name: &str) -> Result<Option<ObjectHash>, StewardError> {
+        self.inner.get_tip(ref_name).await
+    }
+
+    async fn get_object(&self, hash: ObjectHash) -> Result<Option<Vec<u8>>, StewardError> {
+        self.inner.get_object(hash).await
+    }
+
+    async fn get_commit_index(&self) -> Result<Option<HashMap<ObjectHash, Commit>>, StewardError> {
+        self.inner.get_commit_index().await
+    }
+
+    async fn get_objects(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, Vec<u8>>, StewardError> {
+        let mut values = self.inner.get_objects(hashes).await?;
+        match &self.batch_fault {
+            Some(BatchFault::Omit(hash)) => {
+                let _ = values.remove(hash);
+            }
+            Some(BatchFault::Corrupt(hash)) => {
+                if let Some(bytes) = values.get_mut(hash) {
+                    if let Some(first) = bytes.first_mut() {
+                        *first ^= 0xff;
+                    } else {
+                        bytes.push(0xff);
+                    }
+                }
+            }
+            Some(BatchFault::Unexpected(hash, bytes)) => {
+                let _ = values.insert(*hash, bytes.clone());
+            }
+            None => {}
+        }
+        Ok(values)
+    }
+
+    async fn has_blob(&self, hash: ObjectHash) -> Result<bool, StewardError> {
+        self.inner.has_blob(hash).await
+    }
+
+    async fn list_blobs(&self) -> Result<HashSet<ObjectHash>, StewardError> {
+        self.inner.list_blobs().await
+    }
+
+    async fn get_blob_reader(&self, hash: ObjectHash) -> Result<Option<BlobReader>, StewardError> {
+        let reader = self.inner.get_blob_reader(hash).await?;
+        match (&self.blob_fault, reader) {
+            (Some(BlobFault::Corrupt(target)), Some(reader)) if *target == hash => {
+                Ok(Some(Box::new(CorruptingReader {
+                    inner: reader,
+                    corrupted: false,
+                })))
+            }
+            (_, reader) => Ok(reader),
+        }
+    }
+
+    async fn list_pack_hashes(
+        &self,
+        series_hash: ObjectHash,
+    ) -> Result<HashSet<ObjectHash>, StewardError> {
+        self.inner.list_pack_hashes(series_hash).await
+    }
+
+    async fn get_pack_index(
+        &self,
+        series_hash: ObjectHash,
+        pack_hash: ObjectHash,
+    ) -> Result<Option<Vec<u8>>, StewardError> {
+        self.inner.get_pack_index(series_hash, pack_hash).await
+    }
+
+    async fn preload_objects(&self) -> Result<(), StewardError> {
+        self.inner.preload_objects().await
+    }
+
+    fn clear_object_cache(&self) {
+        self.inner.clear_object_cache();
+    }
+}
+
 impl<'a> CountingSource<'a> {
     fn new(inner: &'a dyn ContentSource) -> Self {
         Self {
@@ -1226,8 +1355,10 @@ async fn incremental_repull_is_idempotent() {
 
     // Push and pull again with no source changes.
     repush(&src, &mut remote).await;
-    let graph = fetch_object_graph(&remote, "main").await.expect("fetch");
-    let outcome = steward::rebuild_pond(&mut dst, &remote, &graph)
+    let source = CountingSource::new(&remote);
+    let graph = fetch_object_graph(&source, "main").await.expect("fetch");
+    let metadata_batches = source.counts.object_batches.lock().unwrap().len();
+    let outcome = steward::rebuild_pond(&mut dst, &source, &graph)
         .await
         .expect("re-pull");
 
@@ -1235,6 +1366,16 @@ async fn incremental_repull_is_idempotent() {
     assert_eq!(outcome.files, 0);
     assert_eq!(outcome.series, 0);
     assert_eq!(root_hash(&dst).await, root_hash(&src).await);
+    assert_eq!(
+        source.counts.object_batches.lock().unwrap().len(),
+        metadata_batches,
+        "an unchanged series suffix plan must skip the payload batch"
+    );
+    assert_eq!(
+        source.counts.object_point_requests.load(Ordering::Relaxed),
+        0,
+        "an unchanged pull must issue no object point queries"
+    );
 }
 
 /// Appending a version to a source series used to be mirrored as a
@@ -1274,6 +1415,93 @@ async fn series_repull_appends_only_suffix() {
     assert_eq!(outcome.files, 0);
     assert_eq!(outcome.series, 0);
     assert_eq!(root_hash(&dst).await, root_hash(&src).await);
+}
+
+#[tokio::test]
+async fn incremental_inline_series_prefetches_exact_suffix_in_one_batch() {
+    let (_t, mut src) = new_pond("inline-prefetch-src").await;
+    let baseline = [b"baseline-one\n".as_slice(), b"baseline-two\n".as_slice()];
+    for bytes in baseline {
+        write_file_series_version(&mut src, "/history.series", bytes).await;
+    }
+
+    let (_rt, mut remote) = push(&src).await;
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "inline-prefetch-dst")
+        .await
+        .expect("create dst");
+    let initial = fetch_object_graph(&remote, "main")
+        .await
+        .expect("initial fetch");
+    let _ = steward::rebuild_pond(&mut dst, &remote, &initial)
+        .await
+        .expect("initial materialization");
+
+    for bytes in [
+        b"suffix-one\n".as_slice(),
+        b"suffix-two\n".as_slice(),
+        b"suffix-three\n".as_slice(),
+    ] {
+        write_file_series_version(&mut src, "/history.series", bytes).await;
+    }
+    repush(&src, &mut remote).await;
+
+    let source = CountingSource::new(&remote);
+    let graph = fetch_object_graph(&source, "main")
+        .await
+        .expect("incremental metadata fetch");
+    let metadata_batches = source.counts.object_batches.lock().unwrap().len();
+    let baseline_bytes = baseline.iter().map(|bytes| bytes.len() as u64).sum::<u64>();
+    let pack = only_series_pack(&graph);
+    let historical_objects = pack
+        .object_spans()
+        .iter()
+        .filter(|span| span.logical_end() <= baseline_bytes)
+        .map(|span| span.object_hash())
+        .collect::<HashSet<_>>();
+    let suffix_objects = pack
+        .object_spans()
+        .iter()
+        .filter(|span| span.logical_end() > baseline_bytes)
+        .map(|span| span.object_hash())
+        .collect::<HashSet<_>>();
+    assert!(
+        suffix_objects.len() >= 2,
+        "fixture must require multiple distinct inline physical objects"
+    );
+
+    let _ = steward::rebuild_pond(&mut dst, &source, &graph)
+        .await
+        .expect("incremental inline materialization");
+
+    assert_eq!(root_hash(&dst).await, root_hash(&src).await);
+    assert_eq!(
+        source.counts.object_point_requests.load(Ordering::Relaxed),
+        0,
+        "pack payload materialization must never issue object point queries"
+    );
+    assert!(
+        source.counts.blob_requests.lock().unwrap().is_empty(),
+        "small physical objects must be served by the inline exact batch"
+    );
+    let batches = source.counts.object_batches.lock().unwrap();
+    assert_eq!(
+        batches.len(),
+        metadata_batches + 1,
+        "all required inline suffix objects must use one additional exact batch"
+    );
+    let payload_batch = batches.last().expect("payload batch");
+    assert_eq!(
+        payload_batch.iter().copied().collect::<HashSet<_>>(),
+        suffix_objects,
+        "the payload batch must contain exactly the suffix-intersecting physical objects"
+    );
+    assert!(
+        payload_batch
+            .iter()
+            .all(|hash| !historical_objects.contains(hash)),
+        "objects wholly inside the durable prefix must not be requested"
+    );
 }
 
 #[tokio::test]
@@ -1364,6 +1592,7 @@ async fn incremental_file_series_pull_reads_only_the_bounded_physical_suffix() {
         .filter(|span| span.logical_end() > HISTORICAL_BYTES)
         .map(|span| span.object_hash())
         .collect();
+    let batches_before_rebuild = source.counts.object_batches.lock().unwrap().len();
 
     let _ = steward::rebuild_pond(&mut dst, &source, &graph)
         .await
@@ -1395,6 +1624,27 @@ async fn incremental_file_series_pull_reads_only_the_bounded_physical_suffix() {
         requests.iter().copied().collect::<HashSet<_>>(),
         suffix_objects,
         "materialization must request exactly the objects intersecting the suffix"
+    );
+    assert_eq!(
+        source.counts.object_point_requests.load(Ordering::Relaxed),
+        0,
+        "external pack objects must not fall back to inline point queries"
+    );
+    let batches = source.counts.object_batches.lock().unwrap();
+    assert_eq!(
+        batches.len(),
+        batches_before_rebuild + 1,
+        "external candidates still use one exact inline prefetch batch"
+    );
+    assert_eq!(
+        batches
+            .last()
+            .expect("payload batch")
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>(),
+        suffix_objects,
+        "the exact prefetch must name every and only suffix physical object"
     );
     assert!(
         expected_suffix_bytes < HISTORICAL_BYTES / 2,
@@ -1598,6 +1848,7 @@ async fn divergent_local_series_prefix_fails_before_remote_payload_reads() {
     let graph = fetch_object_graph(&source, "main")
         .await
         .expect("metadata remains valid");
+    let batches_before = source.counts.object_batches.lock().unwrap().len();
     let err = steward::rebuild_pond(&mut dst, &source, &graph)
         .await
         .expect_err("a divergent local prefix must be rejected");
@@ -1616,9 +1867,183 @@ async fn divergent_local_series_prefix_fails_before_remote_payload_reads() {
         "no physical object may be requested after prefix validation fails"
     );
     assert_eq!(
+        source.counts.object_batches.lock().unwrap().len(),
+        batches_before,
+        "prefix validation must fail before the exact payload batch"
+    );
+    assert_eq!(
+        source.counts.object_point_requests.load(Ordering::Relaxed),
+        0,
+        "prefix rejection must not issue a point lookup"
+    );
+    assert_eq!(
         dst.data_persistence().table().version(),
         version_before,
         "a rejected prefix must not commit any destination changes"
+    );
+}
+
+#[tokio::test]
+async fn inline_pack_prefetch_corruption_and_missing_data_fail_without_point_lookup() {
+    let (_t, mut src) = new_pond("inline-prefetch-failure-src").await;
+    write_file_series_version(&mut src, "/events.series", b"small inline payload\n").await;
+    let (_rt, remote) = push(&src).await;
+    let source = CountingSource::new(&remote);
+    let graph = fetch_object_graph(&source, "main")
+        .await
+        .expect("fetch inline series metadata");
+    let object_hash = only_series_pack(&graph)
+        .object_spans()
+        .first()
+        .expect("physical object")
+        .object_hash();
+    assert!(
+        ContentSource::get_objects(&remote, &[object_hash])
+            .await
+            .expect("probe inline object")
+            .contains_key(&object_hash),
+        "fixture physical object must be inline"
+    );
+
+    for (label, batch_fault, expected_error) in [
+        (
+            "corrupt",
+            BatchFault::Corrupt(object_hash),
+            "fetched object hashes to",
+        ),
+        (
+            "missing",
+            BatchFault::Omit(object_hash),
+            "vanished from the remote blob store",
+        ),
+    ] {
+        let dst_dir = tempdir().expect("dst dir");
+        let mut dst = Ship::create_pond(
+            dst_dir.path().join("pond"),
+            &format!("inline-prefetch-{label}-dst"),
+        )
+        .await
+        .expect("create dst");
+        let version_before = dst.data_persistence().table().version();
+        let batches_before = source.counts.object_batches.lock().unwrap().len();
+        let faulting = FaultingSource {
+            inner: &source,
+            batch_fault: Some(batch_fault),
+            blob_fault: None,
+        };
+        let error = steward::rebuild_pond(&mut dst, &faulting, &graph)
+            .await
+            .expect_err("faulted inline payload must fail closed");
+        assert!(
+            error.to_string().contains(expected_error),
+            "{label} failure must identify the payload fault: {error}"
+        );
+        assert_eq!(
+            dst.data_persistence().table().version(),
+            version_before,
+            "{label} payload failure must not commit destination changes"
+        );
+        assert_eq!(
+            source.counts.object_batches.lock().unwrap().len(),
+            batches_before + 1,
+            "{label} failure must perform exactly one payload batch"
+        );
+        assert_eq!(
+            source.counts.object_point_requests.load(Ordering::Relaxed),
+            0,
+            "{label} failure must not fall back to get_object"
+        );
+    }
+}
+
+#[tokio::test]
+async fn inline_pack_prefetch_rejects_unexpected_keys() {
+    let (_t, mut src) = new_pond("inline-unexpected-src").await;
+    write_file_series_version(&mut src, "/events.series", b"small inline payload\n").await;
+    let (_rt, remote) = push(&src).await;
+    let source = CountingSource::new(&remote);
+    let graph = fetch_object_graph(&source, "main")
+        .await
+        .expect("fetch inline series metadata");
+    let unexpected_bytes = b"not requested".to_vec();
+    let unexpected_hash = ObjectHash::of_bytes(&unexpected_bytes);
+    let faulting = FaultingSource {
+        inner: &source,
+        batch_fault: Some(BatchFault::Unexpected(unexpected_hash, unexpected_bytes)),
+        blob_fault: None,
+    };
+
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "inline-unexpected-dst")
+        .await
+        .expect("create dst");
+    let version_before = dst.data_persistence().table().version();
+    let error = steward::rebuild_pond(&mut dst, &faulting, &graph)
+        .await
+        .expect_err("unexpected batch key must fail closed");
+
+    assert!(
+        error.to_string().contains("unexpected key"),
+        "failure must identify the unexpected key: {error}"
+    );
+    assert_eq!(dst.data_persistence().table().version(), version_before);
+    assert_eq!(
+        source.counts.object_point_requests.load(Ordering::Relaxed),
+        0,
+        "unexpected batch data must not trigger a point lookup"
+    );
+}
+
+#[tokio::test]
+async fn external_pack_object_corruption_still_streams_and_fails_closed() {
+    let (_t, mut src) = new_pond("external-pack-corrupt-src").await;
+    write_file_series_version(&mut src, "/events.series", &vec![0x5a; 256 * 1024]).await;
+    let (_rt, remote) = push(&src).await;
+    let source = CountingSource::new(&remote);
+    let graph = fetch_object_graph(&source, "main")
+        .await
+        .expect("fetch external series metadata");
+    let object_hash = only_series_pack(&graph)
+        .object_spans()
+        .first()
+        .expect("physical object")
+        .object_hash();
+    assert!(
+        !ContentSource::get_objects(&remote, &[object_hash])
+            .await
+            .expect("probe external object")
+            .contains_key(&object_hash),
+        "fixture physical object must be external"
+    );
+    let faulting = FaultingSource {
+        inner: &source,
+        batch_fault: None,
+        blob_fault: Some(BlobFault::Corrupt(object_hash)),
+    };
+
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "external-pack-corrupt-dst")
+        .await
+        .expect("create dst");
+    let version_before = dst.data_persistence().table().version();
+    let error = steward::rebuild_pond(&mut dst, &faulting, &graph)
+        .await
+        .expect_err("corrupt external payload must fail closed");
+
+    assert!(
+        error.to_string().contains("external object hashes to"),
+        "external hash failure must be explicit: {error}"
+    );
+    assert_eq!(dst.data_persistence().table().version(), version_before);
+    assert_eq!(
+        source.counts.blob_requests.lock().unwrap().as_slice(),
+        &[object_hash],
+        "external physical object must be opened exactly once through the streaming path"
+    );
+    assert_eq!(
+        source.counts.object_point_requests.load(Ordering::Relaxed),
+        0,
+        "external corruption must not fall back to get_object"
     );
 }
 
