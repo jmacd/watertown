@@ -235,9 +235,10 @@ const ACCESS_OPERATIONS: [AccessOperation; 7] = [
     AccessOperation::Delete,
     AccessOperation::Copy,
 ];
-const ACCESS_CLASSES: [AccessClass; 9] = [
+const ACCESS_CLASSES: [AccessClass; 10] = [
     AccessClass::DeltaLog,
     AccessClass::DeltaObjects,
+    AccessClass::DeltaCommits,
     AccessClass::DeltaRefs,
     AccessClass::DeltaMeta,
     AccessClass::PackIndexes,
@@ -291,6 +292,8 @@ pub enum AccessClass {
     DeltaLog,
     /// Parquet files for the inline content-object partition.
     DeltaObjects,
+    /// Parquet files for the derived commit-index partition.
+    DeltaCommits,
     /// Parquet files for the content-ref partition.
     DeltaRefs,
     /// Parquet files for the remote-metadata partition.
@@ -316,6 +319,7 @@ impl AccessClass {
         match self {
             Self::DeltaLog => "delta_log",
             Self::DeltaObjects => "delta_objects",
+            Self::DeltaCommits => "delta_commits",
             Self::DeltaRefs => "delta_refs",
             Self::DeltaMeta => "delta_meta",
             Self::PackIndexes => "pack_indexes",
@@ -548,6 +552,7 @@ fn classify_path(location: &ObjectPath, prefix: Option<&ObjectPath>) -> AccessCl
     for component in path.split('/') {
         match component {
             "partition_key=objects" => return AccessClass::DeltaObjects,
+            "partition_key=commits" => return AccessClass::DeltaCommits,
             "partition_key=refs" => return AccessClass::DeltaRefs,
             "partition_key=meta" => return AccessClass::DeltaMeta,
             _ => {}
@@ -1259,6 +1264,13 @@ mod tests {
         );
         assert_eq!(
             classify_path(
+                &ObjectPath::from("pond_id=p/partition_key=commits/part-secret.parquet"),
+                None
+            ),
+            AccessClass::DeltaCommits
+        );
+        assert_eq!(
+            classify_path(
                 &ObjectPath::from("pond_id=p/partition_key=refs/part-secret.parquet"),
                 None
             ),
@@ -1360,6 +1372,7 @@ mod tests {
             AccessTotals { ops: 4, bytes: 6 }
         );
         assert!(summary.to_string().contains("delta_log_ops=4"));
+        assert!(summary.to_string().contains("delta_commits_ops=0"));
     }
 
     #[test]

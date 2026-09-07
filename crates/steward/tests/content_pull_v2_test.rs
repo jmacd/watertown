@@ -159,11 +159,15 @@ async fn push_root_versioned(
 
     objects.push((root_hash, tree_bytes));
     objects.push((manifest_hash_val, manifest_bytes));
-    objects.push((commit_hash, commit_bytes));
+    objects.push((commit_hash, commit_bytes.clone()));
     let _ = remote
-        .push_commit(&objects, "main", commit_hash)
+        .push_objects_with_commit_index(&objects, &[(commit_hash, commit_bytes)])
         .await
-        .expect("push commit");
+        .expect("push objects and commit index");
+    let _ = remote
+        .advance_ref("main", commit_hash)
+        .await
+        .expect("advance ref");
     commit_hash
 }
 
@@ -290,9 +294,9 @@ async fn publish(remote: &mut ContentRemote, fixture: &FilePackFixture) {
 async fn seed_series_manifest(remote: &mut ContentRemote, manifest: &SeriesManifest) {
     let hash = manifest.hash();
     let _ = remote
-        .push_commit(&[(hash, manifest.encode())], "main", hash)
+        .push_objects(&[(hash, manifest.encode())])
         .await
-        .expect("seed series manifest object");
+        .expect("seed series manifest object without advancing the ref");
 }
 
 fn i64_string_schema() -> Arc<Schema> {

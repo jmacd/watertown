@@ -88,6 +88,55 @@ async fn push_lands_objects_and_decodable_tip() {
     );
 }
 
+#[tokio::test]
+async fn first_upgraded_push_backfills_the_complete_commit_index() {
+    let (_t, mut ship) = new_pond("push-commit-index").await;
+    for index in 0..8 {
+        write_file(
+            &mut ship,
+            &format!("/history-{index}.txt"),
+            format!("history-{index}").as_bytes(),
+        )
+        .await;
+    }
+
+    let pond_id = uuid::Uuid::parse_str(ship.data_persistence().pond_id()).expect("pond id");
+    let remote_dir = tempdir().expect("remote dir");
+    let mut remote = ContentRemote::create_at(remote_dir.path().join("remote"), pond_id)
+        .await
+        .expect("create remote");
+    let outcome = push_content_to_remote(&ship, &mut remote, "main")
+        .await
+        .expect("first upgraded push");
+    let index = remote.list_commit_index().await.expect("read commit index");
+
+    let mut visited = std::collections::HashSet::new();
+    let mut next = Some(outcome.tip);
+    while let Some(hash) = next {
+        assert!(visited.insert(hash), "commit chain must not cycle");
+        let commit = index
+            .get(&hash)
+            .unwrap_or_else(|| panic!("commit index is missing {}", hash.to_hex()));
+        let ordinary = remote
+            .get_object(hash)
+            .await
+            .expect("read ordinary commit object")
+            .expect("commit is also present in objects");
+        assert_eq!(ordinary, commit.encode());
+        next = commit.parent_commit_hash;
+    }
+
+    assert!(
+        visited.len() >= 8,
+        "fixture must contain representative multi-commit history"
+    );
+    assert_eq!(
+        visited.len(),
+        index.len(),
+        "the first upgraded push must index every authoritative commit-log leaf"
+    );
+}
+
 /// Every object on the remote hashes to its key: pushing preserves the
 /// content-addressing invariant a consumer relies on to verify by hash.
 #[tokio::test]

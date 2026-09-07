@@ -46,6 +46,23 @@ pub trait ContentSource: Send + Sync {
     /// inline object (e.g. it is a large external blob).
     async fn get_object(&self, hash: ObjectHash) -> Result<Option<Vec<u8>>, StewardError>;
 
+    /// The authenticated live commit index, or `None` when this source type
+    /// does not support a separate index.
+    ///
+    /// A remote source returns `Some`, including `Some(empty)` for an old
+    /// remote that has not yet received its first upgraded producer push.  Its
+    /// implementation validates every key, content hash, and commit codec
+    /// before returning.  Callers therefore fail closed when the ref tip or a
+    /// parent is missing from a present index; they must not fall back to
+    /// point queries against the large `objects` partition.
+    ///
+    /// Local and in-memory sources return `None` explicitly and retain the
+    /// sequential object lookup path, which is local and does not create the
+    /// remote cost amplification this index prevents.
+    async fn get_commit_index(&self) -> Result<Option<HashMap<ObjectHash, Commit>>, StewardError> {
+        Ok(None)
+    }
+
     /// Read exactly the requested inline objects.
     ///
     /// Remote implementations should batch this into one physical query.
@@ -141,6 +158,13 @@ impl ContentSource for ContentRemote {
     async fn get_object(&self, hash: ObjectHash) -> Result<Option<Vec<u8>>, StewardError> {
         ContentRemote::get_object(self, hash)
             .await
+            .map_err(|e| StewardError::Content(e.to_string()))
+    }
+
+    async fn get_commit_index(&self) -> Result<Option<HashMap<ObjectHash, Commit>>, StewardError> {
+        ContentRemote::list_commit_index(self)
+            .await
+            .map(Some)
             .map_err(|e| StewardError::Content(e.to_string()))
     }
 
@@ -489,6 +513,10 @@ impl ContentSource for LocalPondSource {
 
     async fn get_object(&self, hash: ObjectHash) -> Result<Option<Vec<u8>>, StewardError> {
         Ok(self.objects.get(&hash).cloned())
+    }
+
+    async fn get_commit_index(&self) -> Result<Option<HashMap<ObjectHash, Commit>>, StewardError> {
+        Ok(None)
     }
 
     async fn has_blob(&self, hash: ObjectHash) -> Result<bool, StewardError> {

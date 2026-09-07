@@ -194,49 +194,60 @@ async fn descend_from_tip(
         ..FetchedGraph::default()
     };
 
-    // Fetch the new tip and known boundary together. In the normal one-commit
-    // incremental case this proves the complete ancestry with one Delta scan.
-    let mut commit_seeds = vec![tip];
-    if let Some(known) = known_ancestor
-        && known != tip
-    {
-        commit_seeds.push(known);
-    }
-    let mut commit_objects = remote
-        .get_objects(&commit_seeds)
+    if let Some(commit_index) = remote
+        .get_commit_index()
         .await
-        .map_err(|e| StewardError::Content(e.to_string()))?;
-
-    // Walk the commit chain from the tip toward genesis, stopping at the known
-    // ancestor. Longer unpublished runs still fetch intermediate commits one
-    // at a time because their hashes are learned from their children.
-    let mut next = Some(tip);
-    while let Some(commit_hash) = next {
-        let commit_bytes = if let Some(bytes) = commit_objects.remove(&commit_hash) {
-            Some(bytes)
-        } else {
-            remote
-                .get_object(commit_hash)
-                .await
-                .map_err(|e| StewardError::Content(e.to_string()))?
-        };
-        let Some(commit_bytes) = commit_bytes else {
-            break;
-        };
-        verify(commit_hash, &commit_bytes)?;
-        let commit = Commit::decode(&commit_bytes)
-            .map_err(|e| StewardError::Content(format!("decode commit: {e}")))?;
-        next = commit.parent_commit_hash;
-        graph.commits.push((commit_hash, commit));
-        if Some(commit_hash) == known_ancestor {
-            break;
+        .map_err(|e| StewardError::Content(e.to_string()))?
+    {
+        // Remote ancestry is physically isolated from the large inline-object
+        // partition. Load and authenticate it once, then follow exact parent
+        // links in memory. A present-but-incomplete index is corruption: never
+        // fall back to per-parent object queries, whose cost is one full
+        // `objects` scan for every newly learned hash.
+        graph.commits = walk_indexed_ancestry(&commit_index, tip, known_ancestor)?;
+    } else {
+        // Local/in-memory sources explicitly do not supply the remote commit
+        // index. Their object lookups are cheap, so retain the sequential path:
+        // seed tip+known together, then learn intermediate parents one by one.
+        let mut commit_seeds = vec![tip];
+        if let Some(known) = known_ancestor
+            && known != tip
+        {
+            commit_seeds.push(known);
+        }
+        let mut commit_objects = remote
+            .get_objects(&commit_seeds)
+            .await
+            .map_err(|e| StewardError::Content(e.to_string()))?;
+        let mut next = Some(tip);
+        while let Some(commit_hash) = next {
+            let commit_bytes = if let Some(bytes) = commit_objects.remove(&commit_hash) {
+                Some(bytes)
+            } else {
+                remote
+                    .get_object(commit_hash)
+                    .await
+                    .map_err(|e| StewardError::Content(e.to_string()))?
+            };
+            let Some(commit_bytes) = commit_bytes else {
+                break;
+            };
+            verify(commit_hash, &commit_bytes)?;
+            let commit = Commit::decode(&commit_bytes)
+                .map_err(|e| StewardError::Content(format!("decode commit: {e}")))?;
+            next = commit.parent_commit_hash;
+            graph.commits.push((commit_hash, commit));
+            if Some(commit_hash) == known_ancestor {
+                break;
+            }
         }
     }
 
     // The authenticated node manifest names every object in the current tree.
-    // Fetch that exact set in two batches: root+manifest, then the manifest's
-    // child hashes. This avoids one full Delta scan per object without
-    // preloading unrelated historical inline payloads.
+    // Indexed remotes fetch the exact set in exactly two object batches:
+    // root+manifest, then the manifest's child hashes. Commit bytes came from
+    // the isolated index, so there is no tip/known object batch. This avoids
+    // both one full Delta scan per object and one per intermediate commit.
     if let Some((_, tip_commit)) = graph.commits.first() {
         let root = tip_commit.root_tree_hash;
         let manifest_hash = tip_commit.node_manifest_hash;
@@ -277,6 +288,36 @@ async fn descend_from_tip(
     Ok(graph)
 }
 
+fn walk_indexed_ancestry(
+    commit_index: &HashMap<ObjectHash, Commit>,
+    tip: ObjectHash,
+    known_ancestor: Option<ObjectHash>,
+) -> Result<Vec<(ObjectHash, Commit)>, StewardError> {
+    let mut commits = Vec::new();
+    let mut seen = HashSet::new();
+    let mut next = Some(tip);
+    while let Some(commit_hash) = next {
+        if !seen.insert(commit_hash) {
+            return Err(StewardError::Content(format!(
+                "cycle in remote commit index at {}",
+                commit_hash.to_hex()
+            )));
+        }
+        let commit = commit_index.get(&commit_hash).cloned().ok_or_else(|| {
+            StewardError::Content(format!(
+                "remote commit index is missing required commit {}",
+                commit_hash.to_hex()
+            ))
+        })?;
+        next = commit.parent_commit_hash;
+        commits.push((commit_hash, commit));
+        if Some(commit_hash) == known_ancestor {
+            break;
+        }
+    }
+    Ok(commits)
+}
+
 /// A read-only source view containing exactly the current closure named by an
 /// authenticated node manifest. Object misses stay misses rather than falling
 /// back to point queries, so an inconsistent tree fails closed.
@@ -297,6 +338,10 @@ impl ContentSource for PrefetchedObjectSource<'_> {
 
     async fn get_object(&self, hash: ObjectHash) -> Result<Option<Vec<u8>>, StewardError> {
         Ok(self.objects.get(&hash).cloned())
+    }
+
+    async fn get_commit_index(&self) -> Result<Option<HashMap<ObjectHash, Commit>>, StewardError> {
+        self.inner.get_commit_index().await
     }
 
     async fn get_objects(
@@ -3413,7 +3458,42 @@ fn planned_version(
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field};
-    use sync_store::content::{PackObjectSpan, generate_range_proof, merkle_root};
+    use sync_store::content::{
+        ContentModelVersion, PackObjectSpan, Provenance, generate_range_proof, merkle_root,
+    };
+
+    fn indexed_test_commit(parent: Option<ObjectHash>, seq: i64) -> Commit {
+        Commit::new(
+            ContentModelVersion::LogicalSeriesV2,
+            ObjectHash::of_bytes(b"root"),
+            parent,
+            ObjectHash::of_bytes(b"manifest"),
+            ObjectHash::of_bytes(b"manifest-root"),
+            Provenance {
+                pond_id: "test".to_string(),
+                seq,
+                time_micros: seq,
+                author: "test".to_string(),
+                request: "test".to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn indexed_ancestry_rejects_cycles() {
+        // ContentRemote validates key == hash(bytes), which makes a real
+        // content-addressed cycle computationally infeasible. Exercise the
+        // walk's independent cycle guard with a deliberately contract-
+        // violating map so a future alternate ContentSource cannot loop.
+        let first = ObjectHash::of_bytes(b"first");
+        let second = ObjectHash::of_bytes(b"second");
+        let mut index = HashMap::new();
+        let _ = index.insert(first, indexed_test_commit(Some(second), 2));
+        let _ = index.insert(second, indexed_test_commit(Some(first), 1));
+
+        let error = walk_indexed_ancestry(&index, first, None).expect_err("cycle must fail");
+        assert!(error.to_string().contains("cycle in remote commit index"));
+    }
 
     #[test]
     fn pack_construction_rejects_object_crossing_schema_transition() {

@@ -93,11 +93,15 @@ async fn push_series_root(
 
     objects.push((root_hash, tree_bytes));
     objects.push((manifest_hash_val, manifest_bytes));
-    objects.push((commit_hash, commit_bytes));
+    objects.push((commit_hash, commit_bytes.clone()));
     let _ = remote
-        .push_commit(&objects, "main", commit_hash)
+        .push_objects_with_commit_index(&objects, &[(commit_hash, commit_bytes)])
         .await
-        .expect("push commit");
+        .expect("push objects and commit index");
+    let _ = remote
+        .advance_ref("main", commit_hash)
+        .await
+        .expect("advance ref");
     commit_hash
 }
 
