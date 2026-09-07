@@ -3,8 +3,8 @@
 //! Integration tests for [`ContentRemote`]: the delta-managed
 //! content-addressed remote (design Section 8, Decision D6).
 
-use sync_store::ContentRemote;
-use sync_store::content::ObjectHash;
+use sync_store::content::{Commit, ContentModelVersion, ObjectHash, Provenance};
+use sync_store::{ContentRemote, Store};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -14,6 +14,53 @@ fn pid() -> Uuid {
 
 fn obj(bytes: &[u8]) -> (ObjectHash, Vec<u8>) {
     (ObjectHash::of_bytes(bytes), bytes.to_vec())
+}
+
+fn commit(parent: Option<ObjectHash>, seq: i64) -> (ObjectHash, Vec<u8>) {
+    let commit = Commit::new(
+        ContentModelVersion::LogicalSeriesV2,
+        ObjectHash::of_bytes(b"root"),
+        parent,
+        ObjectHash::of_bytes(b"manifest"),
+        ObjectHash::of_bytes(b"manifest-root"),
+        Provenance {
+            pond_id: pid().to_string(),
+            seq,
+            time_micros: seq,
+            author: "test".to_string(),
+            request: "test".to_string(),
+        },
+    );
+    (commit.hash(), commit.encode())
+}
+
+async fn added_partition_rows(store: &Store, version: i64, partition: &str) -> (usize, usize) {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let (adds, _) = store.actions_at_version(version).await.unwrap();
+    let partition_path = format!("partition_key={partition}/");
+    let matching: Vec<_> = adds
+        .iter()
+        .filter(|add| add.path.contains(&partition_path))
+        .collect();
+    let mut rows = 0;
+    for add in &matching {
+        let bytes = store
+            .object_store()
+            .get(&object_store::path::Path::from(add.path.clone()))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        rows += ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .unwrap()
+            .build()
+            .unwrap()
+            .map(|batch| batch.unwrap().num_rows())
+            .sum::<usize>();
+    }
+    (matching.len(), rows)
 }
 
 /// A pushed object reads back by hash, and the tip ref reads back the tip.
@@ -166,6 +213,208 @@ async fn advance_ref_moves_the_ref_after_objects_are_already_durable() {
     );
     assert_eq!(remote.get_tip("main").await.unwrap(), Some(h_c1));
     assert_eq!(remote.get_object(h_c1).await.unwrap(), Some(c1));
+}
+
+#[tokio::test]
+async fn objects_and_commit_index_are_visible_in_the_same_delta_version() {
+    let dir = TempDir::new().unwrap();
+    let mut remote = ContentRemote::create_at(dir.path(), pid()).await.unwrap();
+    let (commit_hash, commit_bytes) = commit(None, 1);
+    let (blob_hash, blob_bytes) = obj(b"blob");
+    let before = remote.delta_version();
+
+    remote
+        .push_objects_with_commit_index(
+            &[
+                (commit_hash, commit_bytes.clone()),
+                (blob_hash, blob_bytes.clone()),
+            ],
+            &[(commit_hash, commit_bytes.clone())],
+        )
+        .await
+        .unwrap();
+
+    let written_version = remote.delta_version();
+    assert_eq!(
+        written_version,
+        before + 1,
+        "objects and commit index require exactly one Delta commit"
+    );
+    assert_eq!(
+        remote.get_object(blob_hash).await.unwrap(),
+        Some(blob_bytes)
+    );
+    let index = remote.list_commit_index().await.unwrap();
+    assert_eq!(index.len(), 1);
+    assert_eq!(index.get(&commit_hash).unwrap().encode(), commit_bytes);
+
+    let store = Store::open(dir.path()).await.unwrap();
+    let (adds, _) = store.actions_at_version(written_version).await.unwrap();
+    assert!(
+        adds.iter()
+            .any(|add| add.path.contains("partition_key=objects/")),
+        "the transaction must add an objects-partition parquet"
+    );
+    assert!(
+        adds.iter()
+            .any(|add| add.path.contains("partition_key=commits/")),
+        "the same transaction must add a commits-partition parquet"
+    );
+}
+
+#[tokio::test]
+async fn commit_index_requires_the_identical_ordinary_object() {
+    let dir = TempDir::new().unwrap();
+    let mut remote = ContentRemote::create_at(dir.path(), pid()).await.unwrap();
+    let (commit_hash, commit_bytes) = commit(None, 1);
+    let before = remote.delta_version();
+
+    let error = remote
+        .push_objects_with_commit_index(&[], &[(commit_hash, commit_bytes)])
+        .await
+        .expect_err("an index-only commit must be rejected");
+
+    assert!(error.to_string().contains("has no matching object row"));
+    assert_eq!(
+        remote.delta_version(),
+        before,
+        "invalid input must not create a Delta transaction"
+    );
+    assert!(remote.list_commit_index().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn commit_index_physically_appends_only_missing_hashes() {
+    let dir = TempDir::new().unwrap();
+    let mut remote = ContentRemote::create_at(dir.path(), pid()).await.unwrap();
+    let first = commit(None, 1);
+    let second = commit(Some(first.0), 2);
+    let third = commit(Some(second.0), 3);
+    let first_log = vec![first.clone(), second.clone()];
+    let complete_log = vec![first, second, third];
+
+    remote
+        .push_objects_with_commit_index(&first_log, &first_log)
+        .await
+        .unwrap();
+    let first_version = remote.delta_version();
+
+    remote
+        .push_objects_with_commit_index(&complete_log, &complete_log)
+        .await
+        .unwrap();
+    let second_version = remote.delta_version();
+
+    remote
+        .push_objects_with_commit_index(&complete_log, &complete_log)
+        .await
+        .unwrap();
+    let third_version = remote.delta_version();
+
+    let store = Store::open(dir.path()).await.unwrap();
+    assert_eq!(
+        added_partition_rows(&store, first_version, "commits").await,
+        (1, 2),
+        "first upgraded push must physically backfill both commit rows"
+    );
+    assert_eq!(
+        added_partition_rows(&store, second_version, "commits").await,
+        (1, 1),
+        "the next full-log push must physically append only the new commit"
+    );
+    assert_eq!(
+        added_partition_rows(&store, third_version, "commits").await,
+        (0, 0),
+        "an unchanged full-log push must create no commits-partition Add"
+    );
+    assert_eq!(
+        remote.list_commit_index().await.unwrap().len(),
+        3,
+        "the live map alone is insufficient proof, but must remain complete"
+    );
+}
+
+#[tokio::test]
+async fn commit_index_rejects_invalid_keys_hashes_and_codecs() {
+    async fn read_error(dir: &TempDir) -> String {
+        let remote = ContentRemote::open_at(dir.path(), pid()).await.unwrap();
+        remote
+            .list_commit_index()
+            .await
+            .expect_err("corrupt commit index must fail")
+            .to_string()
+    }
+
+    let invalid_key_dir = TempDir::new().unwrap();
+    let _ = ContentRemote::create_at(invalid_key_dir.path(), pid())
+        .await
+        .unwrap();
+    let (_, valid_bytes) = commit(None, 1);
+    let mut store = Store::open(invalid_key_dir.path()).await.unwrap();
+    store
+        .put(pid(), "commits", "not-a-hash", valid_bytes)
+        .await
+        .unwrap();
+    drop(store);
+    assert!(
+        read_error(&invalid_key_dir)
+            .await
+            .contains("commit index key")
+    );
+    let mut remote = ContentRemote::open_at(invalid_key_dir.path(), pid())
+        .await
+        .unwrap();
+    let before = remote.delta_version();
+    let new_commit = commit(None, 2);
+    let error = remote
+        .push_objects_with_commit_index(
+            std::slice::from_ref(&new_commit),
+            std::slice::from_ref(&new_commit),
+        )
+        .await
+        .expect_err("a push must authenticate the existing index before writing");
+    assert!(error.to_string().contains("commit index key"));
+    assert_eq!(
+        remote.delta_version(),
+        before,
+        "corrupt existing index must prevent the whole write batch"
+    );
+
+    let wrong_hash_dir = TempDir::new().unwrap();
+    let _ = ContentRemote::create_at(wrong_hash_dir.path(), pid())
+        .await
+        .unwrap();
+    let (_, valid_bytes) = commit(None, 1);
+    let mut store = Store::open(wrong_hash_dir.path()).await.unwrap();
+    store
+        .put(
+            pid(),
+            "commits",
+            &ObjectHash::of_bytes(b"wrong").to_hex(),
+            valid_bytes,
+        )
+        .await
+        .unwrap();
+    drop(store);
+    assert!(read_error(&wrong_hash_dir).await.contains("has hash"));
+
+    let invalid_codec_dir = TempDir::new().unwrap();
+    let _ = ContentRemote::create_at(invalid_codec_dir.path(), pid())
+        .await
+        .unwrap();
+    let invalid_bytes = b"not a commit".to_vec();
+    let invalid_hash = ObjectHash::of_bytes(&invalid_bytes);
+    let mut store = Store::open(invalid_codec_dir.path()).await.unwrap();
+    store
+        .put(pid(), "commits", &invalid_hash.to_hex(), invalid_bytes)
+        .await
+        .unwrap();
+    drop(store);
+    assert!(
+        read_error(&invalid_codec_dir)
+            .await
+            .contains("decode commit index value")
+    );
 }
 
 /// A large-file blob round-trips through the external blob store by hash: it

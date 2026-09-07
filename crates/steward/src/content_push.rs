@@ -8,8 +8,8 @@
 //! This is the producer side of the single delta-managed content-addressed
 //! remote.  A push is now three ordered steps, not one atomic Delta commit
 //! (Item 2, `docs/logical-series-identity-design.md`): every physical object
-//! is written durably first (`ContentRemote::push_objects`, its own Delta
-//! commit that does not touch the ref), then every v2 series identity pack
+//! is written durably first (`ContentRemote::push_objects_with_commit_index`,
+//! its own Delta commit that does not touch the ref), then every v2 series identity pack
 //! this push implies is published (`ContentRemote::publish_pack_with_known_present`,
 //! outside Delta entirely -- object-store keys under `_packs/v3/`), and only
 //! then does the tip ref advance (`ContentRemote::advance_ref`, a final,
@@ -251,11 +251,19 @@ async fn push_content_inner(
         )));
     }
     objects.push((manifest_hash, manifest_bytes));
+    let mut commit_index = Vec::with_capacity(commit_log.len());
     for bytes in commit_log {
         let commit = sync_store::content::Commit::decode(&bytes)
             .map_err(|e| StewardError::Content(format!("decode commit-log leaf: {e}")))?;
         let hash = commit.hash();
-        objects.push((hash, bytes));
+        if ObjectHash::of_bytes(&bytes) != hash {
+            return Err(StewardError::Content(format!(
+                "commit-log leaf bytes do not hash to decoded commit {}",
+                hash.to_hex()
+            )));
+        }
+        objects.push((hash, bytes.clone()));
+        commit_index.push((hash, bytes));
     }
     if !objects.iter().any(|(hash, _)| *hash == tip) {
         return Err(StewardError::Content(
@@ -266,7 +274,7 @@ async fn push_content_inner(
     // Physical objects durable first: write every inline object (small
     // per-version blobs, the node manifest, and the commit-log objects) in
     // one atomic Delta commit that does NOT yet touch `ref_name` -- see
-    // `ContentRemote::push_objects`. Every external blob above was already
+    // `ContentRemote::push_objects_with_commit_index`. Every external blob above was already
     // streamed (or found already present) before this point too. Only once
     // this call returns are all of `objects` and `materialized.external_blobs`
     // durable; only then are the packs below published, and only after that
@@ -274,8 +282,16 @@ async fn push_content_inner(
     // a crash after this write but before the ref moves leaves the OLD ref
     // fully intact and fetchable, with the new objects simply durable but
     // unreferenced, never a ref naming an incomplete or unfetchable closure.
+    // The complete authoritative local commit log is duplicated into the
+    // physically isolated `commits` partition in this SAME Delta transaction.
+    // A single partition-pruned read can then authenticate any amount of
+    // producer lag without one full `objects` scan per newly learned parent.
+    // Re-sending the full log is deliberate: the first upgraded push atomically
+    // backfills old remotes. Later pushes authenticate the existing index and
+    // filter its hashes before the append-versioned batch is built, so only
+    // newly missing commits create physical `commits` rows.
     let objects_txn_seq = remote
-        .push_objects(&objects)
+        .push_objects_with_commit_index(&objects, &commit_index)
         .await
         .map_err(|e| StewardError::Content(e.to_string()))?;
     let objects_pushed = objects.len();

@@ -8,27 +8,32 @@
 //! per-partition checksum list.
 //!
 //! The remote is one Delta table (a [`Store`]) whose rows are content
-//! objects keyed by their content hash, plus a distinguished ref row holding
-//! the tip commit hash:
+//! objects keyed by their content hash, a derived commit index, plus a
+//! distinguished ref row holding the tip commit hash:
 //!
 //! ```text
 //! partition = "objects", item_key = <hex object hash>, value = object bytes
+//! partition = "commits", item_key = <hex commit hash>, value = commit bytes
 //! partition = "refs",    item_key = <ref name>,        value = 32-byte tip hash
 //! ```
 //!
-//! Because object `value` is the exact object bytes, the store's own
-//! `value_blake3` column equals the object hash -- the storage key and the
-//! integrity digest agree.
+//! The `commits` rows duplicate canonical commit objects already present in
+//! `objects`.  They are derived from the producer's authoritative full local
+//! commit log on every push.  Keeping them in their own physical Delta
+//! partition lets a pull load all ancestry with one history-proportional,
+//! partition-pruned query instead of learning parent hashes one at a time and
+//! scanning the much larger `objects` partition once per commit.
 //!
-//! **Atomicity comes from Delta, not from object ordering.**  A push is one
-//! [`Store::apply_batch`] -- a single Delta commit -- that writes the new
-//! object rows *and* advances the tip ref together.  The tip can therefore
-//! never point at an incomplete object closure, with no "objects-before-ref"
-//! two-phase write and no separate compare-and-swap: delta-rs over
-//! `object_store` provides the commit atomicity the Delta protocol already
-//! requires on S3.
+//! Object rows and their commit-index duplicates are written by the same
+//! [`Store::apply_batch`] transaction, before pack publication and the later
+//! ref advance.  Thus the first push by an upgraded producer atomically
+//! backfills the complete index.  Later serialized pushes authenticate the
+//! live index and append only previously absent commit hashes.  An old remote
+//! has an empty index until that push; readers fail closed if an indexed
+//! ancestry entry is absent rather than falling back to unbounded `objects`
+//! point queries.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::RwLock;
 
@@ -39,8 +44,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::content::{
-    CapsuleManifest, ObjectHash, capsule_manifest_bytes, capsule_root, decode_capsule_manifest,
-    verify_capsule_payload_directory, verify_capsule_payloads,
+    CapsuleManifest, Commit, ObjectHash, capsule_manifest_bytes, capsule_root,
+    decode_capsule_manifest, verify_capsule_payload_directory, verify_capsule_payloads,
     verify_incremental_capsule_payload_directory,
 };
 use crate::error::{Result, StoreError};
@@ -48,6 +53,8 @@ use crate::store::{Op, Store};
 
 /// Partition holding content objects, keyed by hex object hash.
 const OBJECTS_PARTITION: &str = "objects";
+/// Partition holding canonical commit objects, keyed by hex commit hash.
+const COMMITS_PARTITION: &str = "commits";
 /// Partition holding refs, keyed by ref name; value is the 32-byte tip hash.
 const REFS_PARTITION: &str = "refs";
 /// Partition holding remote metadata; the source pond_id is stored here under
@@ -556,6 +563,163 @@ impl ContentRemote {
             .apply_batch(self.pond_id, txn_seq, ts, ops)
             .await?;
         Ok(txn_seq)
+    }
+
+    /// Write ordinary `objects` and canonical commit-log entries in one atomic
+    /// Delta transaction, without touching any ref.
+    ///
+    /// `commits` is explicit rather than inferred from `objects`: raw blobs and
+    /// structured objects share the same content-addressed partition, so a
+    /// writer must identify the authoritative commit-log leaves precisely.
+    /// Every supplied commit is verified to hash to its key and decode
+    /// canonically before any write begins.  The same `(hash, bytes)` is then
+    /// written to both `objects` and the physically isolated `commits`
+    /// partition in one [`Store::apply_batch`] call.
+    ///
+    /// Producers pass their complete local commit log on every push so the
+    /// first upgraded push atomically backfills old remotes.  Before building
+    /// the write batch, this method reads and authenticates the live commit
+    /// index with [`Self::list_commit_index`], then appends only hashes that
+    /// are not already present.  Thus later serialized pushes add one physical
+    /// row per new canonical commit, and add no `commits` parquet file when
+    /// the supplied log contains no new hashes.
+    ///
+    /// This read-before-write filtering assumes the remote's normal
+    /// single-writer push serialization.  It is not a distributed uniqueness
+    /// constraint for concurrent writers that race after reading the same
+    /// index snapshot.
+    ///
+    /// Returns the `txn_seq` allocated for this commit.
+    pub async fn push_objects_with_commit_index(
+        &mut self,
+        objects: &[(ObjectHash, Vec<u8>)],
+        commits: &[(ObjectHash, Vec<u8>)],
+    ) -> Result<i64> {
+        let mut object_values: HashMap<ObjectHash, &[u8]> = HashMap::with_capacity(objects.len());
+        for (hash, bytes) in objects {
+            if let Some(previous) = object_values.insert(*hash, bytes.as_slice())
+                && previous != bytes.as_slice()
+            {
+                return Err(StoreError::Invariant(format!(
+                    "object batch contains conflicting values for {}",
+                    hash.to_hex()
+                )));
+            }
+        }
+
+        let mut ops: Vec<Op> = Vec::with_capacity(objects.len() + commits.len());
+        ops.extend(objects.iter().map(|(hash, bytes)| Op::Put {
+            partition: OBJECTS_PARTITION.to_string(),
+            key: hash.to_hex(),
+            value: bytes.clone(),
+        }));
+        for (hash, bytes) in commits {
+            match object_values.get(hash) {
+                Some(object_bytes) if *object_bytes == bytes.as_slice() => {}
+                Some(_) => {
+                    return Err(StoreError::Invariant(format!(
+                        "commit index value for {} differs from its object row",
+                        hash.to_hex()
+                    )));
+                }
+                None => {
+                    return Err(StoreError::Invariant(format!(
+                        "commit index value for {} has no matching object row",
+                        hash.to_hex()
+                    )));
+                }
+            }
+            let actual = ObjectHash::of_bytes(bytes);
+            if actual != *hash {
+                return Err(StoreError::Invariant(format!(
+                    "commit index value has hash {}, expected {}",
+                    actual.to_hex(),
+                    hash.to_hex()
+                )));
+            }
+            let commit = Commit::decode(bytes).map_err(|error| {
+                StoreError::Invariant(format!(
+                    "decode commit index value {}: {error}",
+                    hash.to_hex()
+                ))
+            })?;
+            if commit.hash() != *hash {
+                return Err(StoreError::Invariant(format!(
+                    "decoded commit index value hashes to {}, expected {}",
+                    commit.hash().to_hex(),
+                    hash.to_hex()
+                )));
+            }
+        }
+
+        let mut indexed_hashes = if commits.is_empty() {
+            HashSet::new()
+        } else {
+            self.list_commit_index().await?.keys().copied().collect()
+        };
+        for (hash, bytes) in commits {
+            if !indexed_hashes.insert(*hash) {
+                continue;
+            }
+            ops.push(Op::Put {
+                partition: COMMITS_PARTITION.to_string(),
+                key: hash.to_hex(),
+                value: bytes.clone(),
+            });
+        }
+        let txn_seq = self.store.last_txn_seq(self.pond_id).await? + 1;
+        let ts = chrono::Utc::now().timestamp_micros();
+        self.store
+            .apply_batch(self.pond_id, txn_seq, ts, ops)
+            .await?;
+        Ok(txn_seq)
+    }
+
+    /// Read and authenticate the complete live commit index with one
+    /// partition-pruned Delta query.
+    ///
+    /// Every row is validated before any index is returned: the item key must
+    /// be an [`ObjectHash`], the value bytes must hash to that key, and the
+    /// bytes must decode as a canonical [`Commit`].  An old remote that has not
+    /// yet received an upgraded producer push returns an empty map; callers
+    /// must treat a missing tip or parent entry as corruption and must not fall
+    /// back to point reads from the `objects` partition.
+    pub async fn list_commit_index(&self) -> Result<HashMap<ObjectHash, Commit>> {
+        let rows = self.store.list(self.pond_id, COMMITS_PARTITION).await?;
+        let mut commits = HashMap::with_capacity(rows.len());
+        for (key, bytes) in rows {
+            let hash = ObjectHash::from_hex(&key).map_err(|error| {
+                StoreError::Invariant(format!("commit index key `{key}` is invalid: {error}"))
+            })?;
+            let actual = ObjectHash::of_bytes(&bytes);
+            if actual != hash {
+                return Err(StoreError::Invariant(format!(
+                    "commit index value for {} has hash {}",
+                    hash.to_hex(),
+                    actual.to_hex()
+                )));
+            }
+            let commit = Commit::decode(&bytes).map_err(|error| {
+                StoreError::Invariant(format!(
+                    "decode commit index value {}: {error}",
+                    hash.to_hex()
+                ))
+            })?;
+            if commit.hash() != hash {
+                return Err(StoreError::Invariant(format!(
+                    "decoded commit index value hashes to {}, expected {}",
+                    commit.hash().to_hex(),
+                    hash.to_hex()
+                )));
+            }
+            if commits.insert(hash, commit).is_some() {
+                return Err(StoreError::Invariant(format!(
+                    "duplicate live commit index key {}",
+                    hash.to_hex()
+                )));
+            }
+        }
+        Ok(commits)
     }
 
     /// Advance `ref_name` to `tip` in its own atomic Delta commit, touching

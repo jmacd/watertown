@@ -11,7 +11,7 @@ use steward::{
     fetch_object_graph, push_content_to_remote,
 };
 use sync_store::ContentRemote;
-use sync_store::content::{ObjectHash, PackIndex};
+use sync_store::content::{Commit, ContentModelVersion, ObjectHash, PackIndex, Provenance};
 use tempfile::tempdir;
 use tinyfs::arrow::parquet::ParquetExt;
 use tinyfs::async_helpers::convenience::create_file_path;
@@ -29,6 +29,24 @@ use tokio::io::{AsyncRead, ReadBuf};
 
 fn meta(label: &str) -> PondUserMetadata {
     PondUserMetadata::new(vec!["test".into(), label.into()])
+}
+
+fn synthetic_commit(parent: Option<ObjectHash>, seq: i64) -> (ObjectHash, Vec<u8>) {
+    let commit = Commit::new(
+        ContentModelVersion::LogicalSeriesV2,
+        ObjectHash::of_bytes(b"synthetic-root"),
+        parent,
+        ObjectHash::of_bytes(b"synthetic-manifest"),
+        ObjectHash::of_bytes(b"synthetic-manifest-root"),
+        Provenance {
+            pond_id: "synthetic".to_string(),
+            seq,
+            time_micros: seq,
+            author: "test".to_string(),
+            request: "test".to_string(),
+        },
+    );
+    (commit.hash(), commit.encode())
 }
 
 async fn write_file(ship: &mut Ship, path: &str, bytes: &[u8]) {
@@ -320,7 +338,9 @@ struct ReadCounts {
     blob_requests: Mutex<Vec<ObjectHash>>,
     object_bytes: AtomicU64,
     object_requests: Mutex<Vec<ObjectHash>>,
+    object_point_requests: AtomicU64,
     object_batches: Mutex<Vec<Vec<ObjectHash>>>,
+    commit_index_requests: AtomicU64,
     pack_index_bytes: AtomicU64,
 }
 
@@ -370,6 +390,10 @@ impl ContentSource for CountingSource<'_> {
     }
 
     async fn get_object(&self, hash: ObjectHash) -> Result<Option<Vec<u8>>, StewardError> {
+        let _ = self
+            .counts
+            .object_point_requests
+            .fetch_add(1, Ordering::Relaxed);
         self.counts
             .object_requests
             .lock()
@@ -383,6 +407,14 @@ impl ContentSource for CountingSource<'_> {
                 .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         }
         Ok(value)
+    }
+
+    async fn get_commit_index(&self) -> Result<Option<HashMap<ObjectHash, Commit>>, StewardError> {
+        let _ = self
+            .counts
+            .commit_index_requests
+            .fetch_add(1, Ordering::Relaxed);
+        ContentSource::get_commit_index(self.inner).await
     }
 
     async fn get_objects(
@@ -420,7 +452,11 @@ impl ContentSource for CountingSource<'_> {
         let Some(reader) = reader else {
             return Ok(None);
         };
-        self.counts.blob_requests.lock().unwrap().push(hash);
+        self.counts
+            .blob_requests
+            .lock()
+            .expect("blob_requests lock")
+            .push(hash);
         Ok(Some(Box::new(CountingReader {
             inner: reader,
             counts: Arc::clone(&self.counts),
@@ -645,6 +681,8 @@ async fn push_includes_ancestry_across_multiple_local_commits() {
 
 #[tokio::test]
 async fn incremental_fetch_bounds_ancestry_at_known_tip() {
+    const LAG_COMMITS: usize = 8;
+
     let (_t, mut src) = new_pond("bounded-ancestry-src").await;
     write_file(&mut src, "/initial.txt", b"initial").await;
     write_file(&mut src, "/baseline.txt", b"baseline").await;
@@ -659,12 +697,19 @@ async fn incremental_fetch_bounds_ancestry_at_known_tip() {
         .await
         .expect("read old commit")
         .expect("old commit");
-    let old_parent = sync_store::content::Commit::decode(&old_commit_bytes)
+    let old_parent = Commit::decode(&old_commit_bytes)
         .expect("decode old commit")
         .parent_commit_hash
         .expect("old parent");
 
-    write_file(&mut src, "/next.txt", b"next").await;
+    for index in 0..LAG_COMMITS {
+        write_file(
+            &mut src,
+            &format!("/next-{index}.txt"),
+            format!("next-{index}").as_bytes(),
+        )
+        .await;
+    }
     repush(&src, &mut remote).await;
 
     let source = CountingSource::new(&remote);
@@ -674,8 +719,8 @@ async fn incremental_fetch_bounds_ancestry_at_known_tip() {
 
     assert_eq!(
         graph.commits.len(),
-        2,
-        "one new commit plus the known boundary must be fetched"
+        LAG_COMMITS + 1,
+        "every lagging commit plus the known boundary must be fetched"
     );
     assert_eq!(
         graph.commits.last().map(|(hash, _)| *hash),
@@ -692,14 +737,24 @@ async fn incremental_fetch_bounds_ancestry_at_known_tip() {
         "no commit older than the durable prior tip may be requested"
     );
     assert_eq!(
+        source.counts.object_point_requests.load(Ordering::Relaxed),
+        0,
+        "indexed ancestry must issue no object point queries"
+    );
+    assert_eq!(
+        source.counts.commit_index_requests.load(Ordering::Relaxed),
+        1,
+        "indexed ancestry must use one commit-partition query"
+    );
+    assert_eq!(
         source
             .counts
             .object_batches
             .lock()
             .expect("object_batches lock")
             .len(),
-        3,
-        "one commit batch plus root/manifest and exact current-closure batches"
+        2,
+        "indexed pulls use only root/manifest and exact current-closure object batches"
     );
 }
 
@@ -729,6 +784,115 @@ async fn incremental_fetch_walks_to_genesis_when_ancestry_boundary_is_absent() {
             .map(|(_, commit)| commit.parent_commit_hash),
         Some(None),
         "a missing boundary must force the authenticated walk to genesis"
+    );
+}
+
+#[tokio::test]
+async fn indexed_remote_without_backfill_fails_closed() {
+    let remote_dir = tempdir().expect("remote dir");
+    let pond_id = uuid::Uuid::new_v4();
+    let mut remote = ContentRemote::create_at(remote_dir.path().join("remote"), pond_id)
+        .await
+        .expect("create remote");
+    let (tip, tip_bytes) = synthetic_commit(None, 1);
+    let _ = remote
+        .push_commit(&[(tip, tip_bytes)], "main", tip)
+        .await
+        .expect("write legacy-style remote without commit index");
+
+    let error = steward::fetch_object_graph_since(&remote, "main", None)
+        .await
+        .expect_err("an empty live commit index must not fall back to objects");
+    assert!(
+        error
+            .to_string()
+            .contains("remote commit index is missing required commit"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn indexed_remote_missing_parent_entry_fails_closed() {
+    let remote_dir = tempdir().expect("remote dir");
+    let pond_id = uuid::Uuid::new_v4();
+    let mut remote = ContentRemote::create_at(remote_dir.path().join("remote"), pond_id)
+        .await
+        .expect("create remote");
+    let (parent, parent_bytes) = synthetic_commit(None, 1);
+    let (tip, tip_bytes) = synthetic_commit(Some(parent), 2);
+    let _ = remote
+        .push_objects_with_commit_index(
+            &[(parent, parent_bytes), (tip, tip_bytes.clone())],
+            &[(tip, tip_bytes)],
+        )
+        .await
+        .expect("write intentionally incomplete commit index");
+    let _ = remote
+        .advance_ref("main", tip)
+        .await
+        .expect("advance ref to indexed tip");
+
+    let source = CountingSource::new(&remote);
+    let error = steward::fetch_object_graph_since(&source, "main", None)
+        .await
+        .expect_err("missing indexed parent must fail");
+    assert!(
+        error.to_string().contains(&parent.to_hex()),
+        "error must name the missing parent: {error}"
+    );
+    assert_eq!(
+        source.counts.object_point_requests.load(Ordering::Relaxed),
+        0,
+        "an incomplete index must not trigger object point-query fallback"
+    );
+}
+
+#[tokio::test]
+async fn local_source_retains_sequential_commit_walk() {
+    let (src_dir, mut src) = new_pond("local-sequential-ancestry").await;
+    let src_path = src_dir.path().join("pond");
+    write_file(&mut src, "/initial.txt", b"initial").await;
+    let old_seq = src
+        .control_table()
+        .latest_spine_seq()
+        .await
+        .expect("read old spine")
+        .expect("old spine");
+    let old_tip = ObjectHash::from_hex(
+        &src.control_table()
+            .commit_hash_at(old_seq)
+            .await
+            .expect("read old hash")
+            .expect("old hash"),
+    )
+    .expect("decode old hash");
+    for index in 0..3 {
+        write_file(
+            &mut src,
+            &format!("/local-{index}.txt"),
+            format!("local-{index}").as_bytes(),
+        )
+        .await;
+    }
+    drop(src);
+
+    let local = LocalPondSource::open(&src_path)
+        .await
+        .expect("open local source");
+    let source = CountingSource::new(&local);
+    let graph = steward::fetch_object_graph_since(&source, "main", Some(old_tip))
+        .await
+        .expect("local sequential ancestry");
+
+    assert_eq!(graph.commits.len(), 4, "three new commits plus boundary");
+    assert_eq!(
+        source.counts.commit_index_requests.load(Ordering::Relaxed),
+        1,
+        "the local source explicitly reports index unsupported"
+    );
+    assert!(
+        source.counts.object_point_requests.load(Ordering::Relaxed) > 0,
+        "intermediate local parents retain the sequential get_object path"
     );
 }
 

@@ -30,7 +30,7 @@ use crate::StewardError;
 use crate::content_source::{BlobReader, ContentSource};
 use crate::limiter::LimiterSet;
 use crate::storage_meter::MeterGuard;
-use sync_store::content::ObjectHash;
+use sync_store::content::{Commit, ObjectHash};
 
 /// Wraps a source so every request it makes to a remote store is charged.
 pub struct MeteredSource {
@@ -91,6 +91,11 @@ impl ContentSource for MeteredSource {
 
     async fn get_object(&self, hash: ObjectHash) -> Result<Option<Vec<u8>>, StewardError> {
         let outcome = self.inner.get_object(hash).await;
+        self.charged(outcome)
+    }
+
+    async fn get_commit_index(&self) -> Result<Option<HashMap<ObjectHash, Commit>>, StewardError> {
+        let outcome = self.inner.get_commit_index().await;
         self.charged(outcome)
     }
 

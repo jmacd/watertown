@@ -26,6 +26,35 @@ Phases track the plan in Section 8; each is independently reviewable.
 | 5b | Checksum subsumption (per-directory `tree_hash` replaces `row_leaf_digest`) | **Done** |
 | 6 | Validation (equivalence + rebuild-from-pond; keep tlog/pull/719 green; presubmit) | **Done** |
 
+### Remote pull ancestry cost invariant
+
+The content remote duplicates every canonical commit-log leaf into a dedicated
+Delta `partition_key=commits` partition in the same transaction that publishes
+the ordinary `objects` rows. A producer always supplies its full authoritative
+local commit log, so the first push by an upgraded producer atomically backfills
+an old remote; no separate migration or partial-index state is published.
+Before constructing later write batches, the producer-side remote reads and
+authenticates the live commit index with one partition-pruned query, then
+filters already-present hashes from the append. Under the normal serialized
+single-writer push model, each canonical commit therefore contributes exactly
+one physical `commits` row; a push with no missing commits creates no Add file
+for that partition. The ordinary objects and newly missing index rows remain in
+the same Delta transaction, preserving atomic visibility.
+
+Remote pulls read that physically isolated partition once, authenticate every
+key/value/commit, and walk exact parent links in memory from the ref tip to the
+known boundary (or genesis when the boundary is unrelated). Current-tree
+metadata then requires exactly two `objects` queries: root plus node manifest,
+followed by the manifest's exact closure. This prevents producer lag of `N`
+commits from becoming `N` full scans of the large inline-object partition.
+
+Rollout is deliberately fail closed: until an old remote receives one upgraded
+producer push its commit index is empty, and any indexed remote missing the tip
+or an intermediate ancestry row is rejected. Readers never hide an incomplete
+index by falling back to unbounded object-partition point queries. Local
+`pond://` sources explicitly report the index as unsupported and retain their
+cheap sequential in-memory/on-disk walk.
+
 **Tier 0 (done).** Landed on branch `jmacd/65`. The two full-table `SELECT *`
 post-commit scans (content-tree fold + partition checksums) are now one shared
 **narrow** scan that never reads inline file `content`/`bao_outboard` bytes; the
