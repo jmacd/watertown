@@ -5,12 +5,11 @@
 //! Content-graph fetch: the consumer side of the content-addressed remote
 //! (design Section 8.5, Fork 2).
 //!
-//! This module implements the *fetch walk*: given a [`ContentSource`] and its
-//! tip commit, descend the object graph by `child_hash` and collect the
-//! reachable, verified object closure.  It does no tlogfs rebuild yet; it
-//! produces the in-memory [`FetchedGraph`] a rebuild consumes, and it is the
-//! point at which content addressing is checked: every fetched object's bytes
-//! are re-hashed and must equal the key they were fetched under.
+//! This module implements native-v2 fetch. An initial clone traverses the
+//! requested persistent manifest map and snapshot. A consumer with a known
+//! publication head walks only newer immutable publication records and their
+//! changed manifest/object set. Every fetched object's bytes are re-hashed
+//! against its raw object-store key before a rebuild can consume it.
 //!
 //! Descent is driven by [`EntryType`], exactly mirroring the producer's fold
 //! (Section 9): physical directories are tree objects whose entries are
@@ -23,17 +22,18 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
-use async_trait::async_trait;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::reader::ChunkReader;
 
-use crate::content_source::{BlobReader, ContentSource};
+use crate::content_source::ContentSource;
+use sync_store::PublicationState;
 use sync_store::content::{
-    Commit, IncrementalFileLeafHasher, ManifestEntry, ObjectHash, PackIndex, PackLeafDescriptor,
-    PackObjectSpan, PayloadKind, SeriesManifest, TreeEntry, VersionMeta, decode_manifest,
-    decode_recipe, decode_tree, effective_leaf_schema_fingerprint, encode_table_leaf_parquet,
-    schema_fingerprint, select_exact_cover, table_leaf_hash_canonical,
-    verify_pack_against_manifest,
+    Commit, IncrementalFileLeafHasher, ManifestChange, ManifestEntry, ManifestMapEditor,
+    ManifestMapNode, ManifestRecord, ManifestRecordChild, ObjectHash, PackDescriptor, PackIndex,
+    PackLeafDescriptor, PackObjectSpan, PayloadKind, PublicationRecord, SeriesManifest, TreeEntry,
+    VersionMeta, decode_manifest_root, decode_recipe, decode_tree,
+    effective_leaf_schema_fingerprint, encode_table_leaf_parquet, schema_fingerprint,
+    table_leaf_hash_canonical, verify_complete_pack_against_manifest, verify_pack_against_manifest,
 };
 use tinyfs::{EntryType, NodeID, WD};
 use tlogfs::PondUserMetadata;
@@ -62,38 +62,46 @@ pub enum FetchedObject {
     /// the remote straight into the local writer at rebuild time, keyed by this
     /// object's hash; only its presence is recorded here.
     External,
-    /// A verified `watertown.series.v2` logical series
+    /// A verified `watertown.series.v3` logical series
     /// (`docs/logical-series-identity-design.md` delivery gate 4).
     ///
     /// By the time this variant exists in [`FetchedGraph::objects`], the
-    /// series manifest and selected v3 pack metadata have been fetched and
+    /// series manifest and selected v4 pack metadata have been fetched and
     /// authenticated. Physical objects remain unfetched until materialization
     /// knows the destination's durable logical prefix.
     SeriesV2(Box<FetchedSeriesV2>),
+    /// One decoded persistent manifest-map node.
+    ManifestNode(ManifestMapNode),
 }
 
-/// The immutable, verified state of one fetched `watertown.series.v2` logical series.
+/// The immutable, verified state of one fetched `watertown.series.v3` logical series.
 ///
 /// `leaf_hashes` come from v3 descriptors whose range proofs were verified
 /// against `manifest`. Physical pack objects are intentionally not fetched
 /// until materialization, after the destination prefix has been validated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchedSeriesV2 {
-    /// The `watertown.series.v2` object's own content address -- the hash the owning
+    /// The `watertown.series.v3` object's own content address -- the hash the owning
     /// tree entry's `child_hash` named.
     pub manifest_hash: ObjectHash,
     /// The decoded series manifest.
     pub manifest: SeriesManifest,
-    /// The selected exact-cover packs, `(pack_hash, decoded PackIndex)`, in
-    /// increasing leaf-range order (as returned by
-    /// [`select_exact_cover`]) -- together they exactly tile
-    /// `[0, manifest.leaf_count())` with no gap and no overlap.
+    /// The fetched linked segment packs, `(pack_hash, decoded PackIndex)`, in
+    /// increasing leaf-range order. A fresh clone receives a complete linked
+    /// chain covering `[0, manifest.leaf_count())`; an incremental fetch may
+    /// retain only the publication-window suffix.
     pub packs: Vec<(ObjectHash, PackIndex)>,
-    /// Every logical leaf's identity hash, in leaf order across the whole
-    /// series (`0..manifest.leaf_count()`), authenticated by each selected
-    /// pack's range proof against the manifest root.
+    /// First whole-series leaf index represented in [`Self::leaf_hashes`].
+    pub leaf_start: u64,
+    /// Logical leaf hashes represented by the fetched segment suffix, in
+    /// whole-series order starting at [`Self::leaf_start`].
     pub leaf_hashes: Vec<ObjectHash>,
-    /// Every physical object hash the selected packs name, in first-seen
+    /// Immutable prefix series state immediately before [`Self::leaf_start`],
+    /// present only for a bounded incremental fetch.
+    pub base_series_hash: Option<ObjectHash>,
+    /// Decoded manifest for [`Self::base_series_hash`].
+    pub base_manifest: Option<SeriesManifest>,
+    /// Every physical object hash the fetched segment packs name, in first-seen
     /// order across `packs`, deduplicated. These are metadata references only;
     /// the corresponding payloads are fetched on demand during materialization.
     pub physical_object_hashes: Vec<ObjectHash>,
@@ -104,20 +112,29 @@ pub struct FetchedSeriesV2 {
 pub struct FetchedGraph {
     /// The tip commit's hash.
     pub tip: Option<ObjectHash>,
+    /// Fixed-size active publication row that named this graph.
+    pub publication_state: Option<PublicationState>,
     /// The fetched commit ancestry, tip first. [`fetch_object_graph`] reads to
     /// genesis; [`fetch_object_graph_since`] stops after the requested known
     /// ancestor, when present.
     pub commits: Vec<(ObjectHash, Commit)>,
-    /// Every reachable object keyed by content hash.  Inline entries carry their
-    /// bytes (verified to hash to the key); large external blobs are recorded as
-    /// [`FetchedObject::External`] with no bytes.
+    /// Compatibility view containing one validated interpretation per payload.
+    ///
+    /// Because one hash may serve multiple semantic roles, production
+    /// materialization uses `trees`, `series`, `blob_hashes`, and `bytes`
+    /// instead of assuming this enum is exhaustive.
     pub objects: BTreeMap<ObjectHash, FetchedObject>,
+    /// Independently validated tree interpretations keyed by payload hash.
+    pub trees: BTreeMap<ObjectHash, Vec<TreeEntry>>,
+    /// Independently validated series interpretations keyed by payload hash.
+    pub series: BTreeMap<ObjectHash, Box<FetchedSeriesV2>>,
+    /// Payload hashes authenticated for use as leaf blobs.
+    pub blob_hashes: BTreeSet<ObjectHash>,
     /// Raw bytes of every fetched *inline* object, keyed by content hash.  Large
     /// external blobs are absent here by design -- they are never buffered.
     pub bytes: BTreeMap<ObjectHash, Vec<u8>>,
     /// Hashes of large leaf blobs that live in the remote blob store and are
-    /// streamed rather than buffered (Decision D7).  Every hash here also has a
-    /// [`FetchedObject::External`] entry in `objects`.
+    /// streamed rather than buffered (Decision D7).
     pub external_blobs: BTreeSet<ObjectHash>,
     /// The tip commit's node manifest: one entry per node, recording the
     /// source's `node_id` alongside its parent, name, type, and content
@@ -125,6 +142,21 @@ pub struct FetchedGraph {
     /// `objects`/`bytes` because the manifest is pond-specific identity, not
     /// part of the dedup-shareable pure-content closure.
     pub manifest: Vec<ManifestEntry>,
+    /// Net changed records when `manifest_complete` is false.
+    pub manifest_changes: Vec<ManifestChange>,
+    /// Whether `manifest` is the complete current snapshot rather than only
+    /// changed upserts.
+    pub manifest_complete: bool,
+    /// Immutable packs learned from publication records, grouped by series.
+    pub publication_packs: BTreeMap<ObjectHash, Vec<PackDescriptor>>,
+    /// Publication records newer than the requested durable boundary, newest
+    /// first. This is the authenticated publication window used for
+    /// apply-before-ack recovery.
+    pub publication_records: Vec<(ObjectHash, PublicationRecord)>,
+    /// Exact publication record at the requested durable boundary, excluded
+    /// from [`Self::publication_records`] so its object inventory is not
+    /// fetched again.
+    pub publication_boundary: Option<(ObjectHash, PublicationRecord)>,
 }
 
 impl FetchedGraph {
@@ -179,217 +211,538 @@ pub async fn fetch_object_graph_since(
     ref_name: &str,
     known_ancestor: Option<ObjectHash>,
 ) -> Result<FetchedGraph, StewardError> {
-    let Some(tip) = remote
-        .get_tip(ref_name)
+    let Some(state) = remote
+        .get_publication_state(ref_name)
         .await
         .map_err(|e| StewardError::Content(e.to_string()))?
     else {
         return Ok(FetchedGraph::default());
     };
-
-    descend_from_tip(remote, tip, known_ancestor).await
+    fetch_object_graph_at_publication(remote, state, known_ancestor).await
 }
 
-/// Build the fetched graph from `tip`: fetch the exact commits and metadata
-/// objects named by the tip, then descend its root tree.
-async fn descend_from_tip(
+/// Fetch one exact immutable publication state, optionally stopping at a
+/// snapshot boundary.
+///
+/// Unlike [`fetch_object_graph_since`], this does not reread the mutable active
+/// publication row. Callers that already selected a state therefore fetch and
+/// apply exactly that state even if the remote advances concurrently.
+pub async fn fetch_object_graph_at_publication(
     remote: &dyn ContentSource,
-    tip: ObjectHash,
+    state: PublicationState,
     known_ancestor: Option<ObjectHash>,
 ) -> Result<FetchedGraph, StewardError> {
+    let boundary = known_ancestor
+        .map(PublicationBoundary::Snapshot)
+        .unwrap_or(PublicationBoundary::None);
+    descend_from_publication(remote, state, boundary).await
+}
+
+/// Fetch one exact immutable publication state back to an exact structured
+/// acknowledgement.
+///
+/// The acknowledgement generation bounds publication-record reads before any
+/// history is traversed, and its immutable record hash is required at the
+/// exact generation boundary.
+pub async fn fetch_object_graph_from_acknowledgement(
+    remote: &dyn ContentSource,
+    state: PublicationState,
+    acknowledged: &PublicationState,
+) -> Result<FetchedGraph, StewardError> {
+    descend_from_publication(
+        remote,
+        state,
+        PublicationBoundary::Acknowledged(acknowledged.clone()),
+    )
+    .await
+}
+
+/// Authenticate one active publication row against its immutable record and
+/// snapshot commit using only fixed-key point reads.
+pub async fn authenticate_publication_head(
+    remote: &dyn ContentSource,
+    state: &PublicationState,
+) -> Result<(), StewardError> {
+    let _ = authenticated_publication_head_commit(remote, state).await?;
+    Ok(())
+}
+
+/// Authenticate one active row and return its verified tip commit.
+pub async fn authenticated_publication_head_commit(
+    remote: &dyn ContentSource,
+    state: &PublicationState,
+) -> Result<Commit, StewardError> {
+    if remote.pond_id() != state.pond_id {
+        return Err(StewardError::Content(format!(
+            "publication row pond {} does not match source pond {}",
+            state.pond_id,
+            remote.pond_id()
+        )));
+    }
+    let record = remote
+        .get_publication_record(state.publication_record)
+        .await?
+        .ok_or_else(|| {
+            StewardError::Content(format!(
+                "publication record {} is absent",
+                state.publication_record
+            ))
+        })?;
+    if record.hash() != state.publication_record
+        || record.pond_id != state.pond_id
+        || record.ref_name != state.ref_name
+        || record.format != state.format
+        || record.snapshot_tip != state.snapshot_tip
+        || record.manifest_root != state.manifest_root
+    {
+        return Err(StewardError::Content(
+            "publication head record disagrees with active row identity".to_string(),
+        ));
+    }
+    let bytes = fetch_verified(remote, state.snapshot_tip).await?;
+    let commit = Commit::decode(&bytes).map_err(|error| {
+        StewardError::Content(format!(
+            "decode publication tip commit {}: {error}",
+            state.snapshot_tip
+        ))
+    })?;
+    if commit.hash() != state.snapshot_tip || commit.manifest_root != state.manifest_root {
+        return Err(StewardError::Content(format!(
+            "publication tip {} does not match its commit and manifest root",
+            state.snapshot_tip
+        )));
+    }
+    Ok(commit)
+}
+
+async fn descend_from_publication(
+    remote: &dyn ContentSource,
+    state: PublicationState,
+    boundary: PublicationBoundary,
+) -> Result<FetchedGraph, StewardError> {
+    let known_ancestor = boundary.snapshot_tip();
     let mut graph = FetchedGraph {
-        tip: Some(tip),
+        tip: Some(state.snapshot_tip),
+        publication_state: Some(state.clone()),
         ..FetchedGraph::default()
     };
+    let window = fetch_publication_chain(remote, &state, &boundary).await?;
+    let records = &window.records;
+    graph.publication_records = window.records.clone();
+    graph.publication_boundary = window.boundary;
+    let mut descriptors = BTreeSet::new();
+    let mut pack_descriptors = BTreeSet::new();
+    for (_, record) in records {
+        descriptors.extend(record.introduced_objects.iter().copied());
+        pack_descriptors.extend(record.introduced_packs.iter().copied());
+    }
+    for descriptor in &pack_descriptors {
+        graph
+            .publication_packs
+            .entry(descriptor.series_hash)
+            .or_default()
+            .push(*descriptor);
+    }
+    for packs in graph.publication_packs.values_mut() {
+        packs.sort_unstable();
+        packs.dedup();
+    }
 
-    if let Some(commit_index) = remote
-        .get_commit_index()
-        .await
-        .map_err(|e| StewardError::Content(e.to_string()))?
+    let mut commit_bytes = HashMap::new();
+    for descriptor in descriptors
+        .iter()
+        .filter(|descriptor| descriptor.kind == sync_store::content::ContentObjectKind::Commit)
     {
-        // Remote ancestry is physically isolated from the large inline-object
-        // partition. Load and authenticate it once, then follow exact parent
-        // links in memory. A present-but-incomplete index is corruption: never
-        // fall back to per-parent object queries, whose cost is one full
-        // `objects` scan for every newly learned hash.
-        graph.commits = walk_indexed_ancestry(&commit_index, tip, known_ancestor)?;
+        let bytes = remote.get_object(descriptor.hash).await?.ok_or_else(|| {
+            StewardError::Content(format!(
+                "publication names missing commit {}",
+                descriptor.hash
+            ))
+        })?;
+        verify(descriptor.hash, &bytes)?;
+        let _ = commit_bytes.insert(descriptor.hash, bytes);
+    }
+    if let std::collections::hash_map::Entry::Vacant(entry) = commit_bytes.entry(state.snapshot_tip)
+    {
+        let bytes = remote
+            .get_object(state.snapshot_tip)
+            .await?
+            .ok_or_else(|| {
+                StewardError::Content(format!(
+                    "publication tip commit {} is absent",
+                    state.snapshot_tip
+                ))
+            })?;
+        verify(state.snapshot_tip, &bytes)?;
+        let _ = entry.insert(bytes);
+    }
+    graph.commits =
+        walk_bounded_commit_delta(remote, state.snapshot_tip, known_ancestor, commit_bytes).await?;
+    let tip_commit = graph
+        .commits
+        .first()
+        .map(|(_, commit)| commit)
+        .ok_or_else(|| StewardError::Content("publication has no tip commit".to_string()))?;
+    if tip_commit.manifest_root != state.manifest_root {
+        return Err(StewardError::Content(format!(
+            "publication row manifest {} disagrees with tip commit {}",
+            state.manifest_root, tip_commit.manifest_root
+        )));
+    }
+
+    let tip_root_tree = tip_commit.root_tree_hash;
+    if known_ancestor.is_none() {
+        graph.manifest_complete = true;
+        let records = fetch_complete_manifest(remote, state.manifest_root, &mut graph).await?;
+        graph.manifest = records.iter().map(|record| record.entry.clone()).collect();
+        fetch_tree(remote, tip_root_tree, &mut graph, true).await?;
     } else {
-        // Local/in-memory sources explicitly do not supply the remote commit
-        // index. Their object lookups are cheap, so retain the sequential path:
-        // seed tip+known together, then learn intermediate parents one by one.
-        let mut commit_seeds = vec![tip];
-        if let Some(known) = known_ancestor
-            && known != tip
-        {
-            commit_seeds.push(known);
-        }
-        let mut commit_objects = remote
-            .get_objects(&commit_seeds)
-            .await
-            .map_err(|e| StewardError::Content(e.to_string()))?;
-        let mut next = Some(tip);
-        while let Some(commit_hash) = next {
-            let commit_bytes = if let Some(bytes) = commit_objects.remove(&commit_hash) {
-                Some(bytes)
-            } else {
-                remote
-                    .get_object(commit_hash)
-                    .await
-                    .map_err(|e| StewardError::Content(e.to_string()))?
-            };
-            let Some(commit_bytes) = commit_bytes else {
-                break;
-            };
-            verify(commit_hash, &commit_bytes)?;
-            let commit = Commit::decode(&commit_bytes)
-                .map_err(|e| StewardError::Content(format!("decode commit: {e}")))?;
-            next = commit.parent_commit_hash;
-            graph.commits.push((commit_hash, commit));
-            if Some(commit_hash) == known_ancestor {
-                break;
+        let changes = squash_publication_changes(records)?;
+        graph.manifest = changes
+            .iter()
+            .filter_map(|change| change.after.as_ref().map(|record| record.entry.clone()))
+            .collect();
+        graph.manifest_changes = changes;
+        let changed_entries = graph.manifest.clone();
+        for entry in changed_entries {
+            match entry.entry_type {
+                EntryType::DirectoryPhysical => {
+                    let bytes = fetch_verified(remote, entry.child_hash).await?;
+                    let tree = decode_tree(&bytes)
+                        .map_err(|error| StewardError::Content(format!("decode tree: {error}")))?;
+                    let _ = graph
+                        .objects
+                        .entry(entry.child_hash)
+                        .or_insert_with(|| FetchedObject::Tree(tree.clone()));
+                    let _ = graph.trees.insert(entry.child_hash, tree);
+                    let _ = graph.bytes.insert(entry.child_hash, bytes);
+                }
+                EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries => {
+                    fetch_series(
+                        remote,
+                        entry.child_hash,
+                        entry.entry_type,
+                        &mut graph,
+                        false,
+                    )
+                    .await?;
+                }
+                EntryType::FilePhysicalVersion | EntryType::TablePhysicalVersion => {
+                    fetch_blob(remote, entry.child_hash, &mut graph, false).await?;
+                }
+                EntryType::Symlink
+                | EntryType::DirectoryDynamic
+                | EntryType::FileDynamic
+                | EntryType::TableDynamic => {
+                    fetch_blob(remote, entry.child_hash, &mut graph, true).await?;
+                }
             }
         }
     }
-
-    // The authenticated node manifest names every object in the current tree.
-    // Indexed remotes fetch the exact set in exactly two object batches:
-    // root+manifest, then the manifest's child hashes. Commit bytes came from
-    // the isolated index, so there is no tip/known object batch. After series
-    // prefix validation, rebuild may issue at most one further exact batch for
-    // the physical objects intersecting missing suffixes. No payload is ever
-    // resolved through an object point query.
-    if let Some((_, tip_commit)) = graph.commits.first() {
-        let root = tip_commit.root_tree_hash;
-        let manifest_hash = tip_commit.node_manifest_hash;
-        let mut current_objects = remote
-            .get_objects(&[root, manifest_hash])
-            .await
-            .map_err(|e| StewardError::Content(e.to_string()))?;
-        let manifest_bytes = current_objects.remove(&manifest_hash).ok_or_else(|| {
-            StewardError::Content(format!(
-                "object {} is absent from the remote",
-                manifest_hash.to_hex()
-            ))
-        })?;
-        verify(manifest_hash, &manifest_bytes)?;
-        graph.manifest = decode_manifest(&manifest_bytes)
-            .map_err(|e| StewardError::Content(format!("decode manifest: {e}")))?;
-
-        let hashes = graph
-            .manifest
-            .iter()
-            .map(|entry| entry.child_hash)
-            .filter(|hash| *hash != root)
-            .collect::<Vec<_>>();
-        current_objects.extend(
-            remote
-                .get_objects(&hashes)
-                .await
-                .map_err(|e| StewardError::Content(e.to_string()))?,
-        );
-
-        let prefetched = PrefetchedObjectSource {
-            inner: remote,
-            objects: current_objects,
-        };
-        fetch_tree(&prefetched, root, &mut graph).await?;
-    }
-
     Ok(graph)
 }
 
-fn walk_indexed_ancestry(
-    commit_index: &HashMap<ObjectHash, Commit>,
-    tip: ObjectHash,
-    known_ancestor: Option<ObjectHash>,
-) -> Result<Vec<(ObjectHash, Commit)>, StewardError> {
-    let mut commits = Vec::new();
-    let mut seen = HashSet::new();
-    let mut next = Some(tip);
-    while let Some(commit_hash) = next {
-        if !seen.insert(commit_hash) {
+struct PublicationWindow {
+    records: Vec<(ObjectHash, PublicationRecord)>,
+    boundary: Option<(ObjectHash, PublicationRecord)>,
+}
+
+enum PublicationBoundary {
+    None,
+    Snapshot(ObjectHash),
+    Acknowledged(PublicationState),
+}
+
+impl PublicationBoundary {
+    fn snapshot_tip(&self) -> Option<ObjectHash> {
+        match self {
+            Self::None => None,
+            Self::Snapshot(snapshot_tip) => Some(*snapshot_tip),
+            Self::Acknowledged(state) => Some(state.snapshot_tip),
+        }
+    }
+}
+
+async fn fetch_publication_chain(
+    remote: &dyn ContentSource,
+    state: &PublicationState,
+    boundary: &PublicationBoundary,
+) -> Result<PublicationWindow, StewardError> {
+    if state.generation <= 0 {
+        return Err(StewardError::Content(format!(
+            "publication generation must be positive, got {}",
+            state.generation
+        )));
+    }
+    if let PublicationBoundary::Acknowledged(acknowledged) = boundary {
+        if state.pond_id != acknowledged.pond_id
+            || state.ref_name != acknowledged.ref_name
+            || state.format != acknowledged.format
+        {
+            return Err(StewardError::Content(
+                "publication state does not match acknowledgement identity".to_string(),
+            ));
+        }
+        if acknowledged.generation <= 0 || state.generation <= acknowledged.generation {
             return Err(StewardError::Content(format!(
-                "cycle in remote commit index at {}",
-                commit_hash.to_hex()
+                "publication generation {} does not advance acknowledged generation {}",
+                state.generation, acknowledged.generation
             )));
         }
-        let commit = commit_index.get(&commit_hash).cloned().ok_or_else(|| {
+    }
+
+    let max_reads = match boundary {
+        PublicationBoundary::None => 1,
+        PublicationBoundary::Snapshot(_) => usize::try_from(state.generation).map_err(|_| {
             StewardError::Content(format!(
-                "remote commit index is missing required commit {}",
-                commit_hash.to_hex()
+                "publication generation {} does not fit this platform",
+                state.generation
             ))
+        })?,
+        PublicationBoundary::Acknowledged(acknowledged) => {
+            let newer = state
+                .generation
+                .checked_sub(acknowledged.generation)
+                .ok_or_else(|| {
+                    StewardError::Content("publication generation delta overflow".to_string())
+                })?;
+            usize::try_from(newer)
+                .map_err(|_| {
+                    StewardError::Content(format!(
+                        "publication generation delta {newer} does not fit this platform"
+                    ))
+                })?
+                .checked_add(1)
+                .ok_or_else(|| {
+                    StewardError::Content("publication record read bound overflow".to_string())
+                })?
+        }
+    };
+
+    let mut records = Vec::new();
+    let mut next = Some(state.publication_record);
+    let mut seen = HashSet::new();
+    for read_index in 0..max_reads {
+        let hash = next.ok_or_else(|| {
+            StewardError::Content(match boundary {
+                PublicationBoundary::Acknowledged(acknowledged) => format!(
+                    "publication history ended before acknowledged record {} at generation {}",
+                    acknowledged.publication_record, acknowledged.generation
+                ),
+                PublicationBoundary::Snapshot(known) => {
+                    format!("publication history does not contain known snapshot {known}")
+                }
+                PublicationBoundary::None => {
+                    "publication head record is unexpectedly absent".to_string()
+                }
+            })
         })?;
+        if !seen.insert(hash) {
+            return Err(StewardError::Content(format!(
+                "cycle in publication records at {hash}"
+            )));
+        }
+        let record = remote
+            .get_publication_record(hash)
+            .await?
+            .ok_or_else(|| StewardError::Content(format!("publication record {hash} is absent")))?;
+        if record.hash() != hash
+            || record.pond_id != state.pond_id
+            || record.ref_name != state.ref_name
+            || record.format != state.format
+        {
+            return Err(StewardError::Content(format!(
+                "publication record {hash} has mismatched identity"
+            )));
+        }
+        if records.is_empty()
+            && (record.snapshot_tip != state.snapshot_tip
+                || record.manifest_root != state.manifest_root)
+        {
+            return Err(StewardError::Content(
+                "publication head disagrees with active row".to_string(),
+            ));
+        }
+
+        match boundary {
+            PublicationBoundary::None => {
+                records.push((hash, record));
+                return Ok(PublicationWindow {
+                    records,
+                    boundary: None,
+                });
+            }
+            PublicationBoundary::Snapshot(known) if record.snapshot_tip == *known => {
+                return Ok(PublicationWindow {
+                    records,
+                    boundary: Some((hash, record)),
+                });
+            }
+            PublicationBoundary::Acknowledged(acknowledged) if read_index + 1 == max_reads => {
+                if hash != acknowledged.publication_record
+                    || record.snapshot_tip != acknowledged.snapshot_tip
+                    || record.manifest_root != acknowledged.manifest_root
+                {
+                    return Err(StewardError::Content(format!(
+                        "publication record at acknowledged generation {} does not match the \
+                         exact acknowledgement boundary",
+                        acknowledged.generation
+                    )));
+                }
+                return Ok(PublicationWindow {
+                    records,
+                    boundary: Some((hash, record)),
+                });
+            }
+            PublicationBoundary::Acknowledged(acknowledged)
+                if hash == acknowledged.publication_record
+                    || record.snapshot_tip == acknowledged.snapshot_tip =>
+            {
+                return Err(StewardError::Content(format!(
+                    "publication reached acknowledgement generation {} before the advertised \
+                     generation boundary",
+                    acknowledged.generation
+                )));
+            }
+            PublicationBoundary::Snapshot(_) | PublicationBoundary::Acknowledged(_) => {}
+        }
+        next = record.parent_publication_record;
+        records.push((hash, record));
+    }
+    Err(StewardError::Content(match boundary {
+        PublicationBoundary::Snapshot(known) => format!(
+            "publication history does not contain known snapshot {known} within advertised \
+             generation {}",
+            state.generation
+        ),
+        PublicationBoundary::Acknowledged(acknowledged) => format!(
+            "publication history did not reach acknowledged record {} at generation {}",
+            acknowledged.publication_record, acknowledged.generation
+        ),
+        PublicationBoundary::None => "publication head record was not returned".to_string(),
+    }))
+}
+
+async fn walk_bounded_commit_delta(
+    remote: &dyn ContentSource,
+    tip: ObjectHash,
+    known_ancestor: Option<ObjectHash>,
+    mut objects: HashMap<ObjectHash, Vec<u8>>,
+) -> Result<Vec<(ObjectHash, Commit)>, StewardError> {
+    let mut commits = Vec::new();
+    let mut next = Some(tip);
+    let mut seen = HashSet::new();
+    while let Some(hash) = next {
+        if !seen.insert(hash) {
+            return Err(StewardError::Content(format!(
+                "cycle in published commit delta at {hash}"
+            )));
+        }
+        let bytes = match objects.remove(&hash) {
+            Some(bytes) => bytes,
+            None if Some(hash) == known_ancestor => {
+                remote.get_object(hash).await?.ok_or_else(|| {
+                    StewardError::Content(format!("known boundary commit {hash} is absent"))
+                })?
+            }
+            None if known_ancestor.is_none() && commits.is_empty() => remote
+                .get_object(hash)
+                .await?
+                .ok_or_else(|| StewardError::Content(format!("tip commit {hash} is absent")))?,
+            None => {
+                return Err(StewardError::Content(match known_ancestor {
+                    Some(known) => format!(
+                        "remote tip {tip} does not descend from known snapshot {known}: \
+                         publication delta is missing commit {hash}"
+                    ),
+                    None => format!("publication delta is missing commit {hash}"),
+                }));
+            }
+        };
+        verify(hash, &bytes)?;
+        let commit = Commit::decode(&bytes)
+            .map_err(|error| StewardError::Content(format!("decode commit {hash}: {error}")))?;
         next = commit.parent_commit_hash;
-        commits.push((commit_hash, commit));
-        if Some(commit_hash) == known_ancestor {
+        commits.push((hash, commit));
+        if Some(hash) == known_ancestor || known_ancestor.is_none() {
             break;
         }
     }
     Ok(commits)
 }
 
-/// A read-only source view containing exactly the current closure named by an
-/// authenticated node manifest. Object misses stay misses rather than falling
-/// back to point queries, so an inconsistent tree fails closed.
-struct PrefetchedObjectSource<'a> {
-    inner: &'a dyn ContentSource,
-    objects: HashMap<ObjectHash, Vec<u8>>,
+async fn fetch_complete_manifest(
+    remote: &dyn ContentSource,
+    root: ObjectHash,
+    graph: &mut FetchedGraph,
+) -> Result<Vec<ManifestRecord>, StewardError> {
+    let mut records = Vec::new();
+    let mut stack = vec![root];
+    let mut seen = HashSet::new();
+    while let Some(hash) = stack.pop() {
+        if !seen.insert(hash) {
+            continue;
+        }
+
+        let bytes = fetch_verified(remote, hash).await?;
+        let node = ManifestMapNode::decode(&bytes).map_err(|error| {
+            StewardError::Content(format!("decode manifest node {hash}: {error}"))
+        })?;
+        let _ = graph.bytes.insert(hash, bytes);
+        let _ = graph
+            .objects
+            .entry(hash)
+            .or_insert_with(|| FetchedObject::ManifestNode(node.clone()));
+        match node {
+            ManifestMapNode::Leaf { record, .. } => records.push(record),
+            ManifestMapNode::Branch { left, right, .. } => {
+                stack.push(right);
+                stack.push(left);
+            }
+        }
+    }
+    records.sort_by(|left, right| left.node_id().as_bytes().cmp(right.node_id().as_bytes()));
+    Ok(records)
 }
 
-#[async_trait]
-impl ContentSource for PrefetchedObjectSource<'_> {
-    fn pond_id(&self) -> uuid::Uuid {
-        self.inner.pond_id()
-    }
+/// Fetch and authenticate a complete persistent manifest map.
+///
+/// Initial clone, capsule tooling, and explicit diagnostics use this. Ordinary
+/// incremental consumers apply publication-record changes instead.
+pub async fn fetch_manifest_records(
+    remote: &dyn ContentSource,
+    root: ObjectHash,
+) -> Result<Vec<ManifestRecord>, StewardError> {
+    let mut graph = FetchedGraph::default();
+    fetch_complete_manifest(remote, root, &mut graph).await
+}
 
-    async fn get_tip(&self, ref_name: &str) -> Result<Option<ObjectHash>, StewardError> {
-        self.inner.get_tip(ref_name).await
+fn squash_publication_changes(
+    records_newest_first: &[(ObjectHash, PublicationRecord)],
+) -> Result<Vec<ManifestChange>, StewardError> {
+    let mut changes = BTreeMap::<String, ManifestChange>::new();
+    for (_, record) in records_newest_first.iter().rev() {
+        for change in &record.manifest_changes {
+            let node_id = change.node_id().to_string();
+            match changes.get_mut(&node_id) {
+                Some(existing) => {
+                    if existing.after != change.before {
+                        return Err(StewardError::Content(format!(
+                            "publication manifest deltas are discontinuous at node {node_id}"
+                        )));
+                    }
+                    existing.after = change.after.clone();
+                }
+                None => {
+                    let _ = changes.insert(node_id, change.clone());
+                }
+            }
+        }
     }
-
-    async fn get_object(&self, hash: ObjectHash) -> Result<Option<Vec<u8>>, StewardError> {
-        Ok(self.objects.get(&hash).cloned())
-    }
-
-    async fn get_commit_index(&self) -> Result<Option<HashMap<ObjectHash, Commit>>, StewardError> {
-        self.inner.get_commit_index().await
-    }
-
-    async fn get_objects(
-        &self,
-        hashes: &[ObjectHash],
-    ) -> Result<HashMap<ObjectHash, Vec<u8>>, StewardError> {
-        Ok(hashes
-            .iter()
-            .filter_map(|hash| self.objects.get(hash).cloned().map(|bytes| (*hash, bytes)))
-            .collect())
-    }
-
-    async fn has_blob(&self, hash: ObjectHash) -> Result<bool, StewardError> {
-        self.inner.has_blob(hash).await
-    }
-
-    async fn list_blobs(&self) -> Result<HashSet<ObjectHash>, StewardError> {
-        self.inner.list_blobs().await
-    }
-
-    async fn get_blob_reader(&self, hash: ObjectHash) -> Result<Option<BlobReader>, StewardError> {
-        self.inner.get_blob_reader(hash).await
-    }
-
-    async fn list_pack_hashes(
-        &self,
-        series_hash: ObjectHash,
-    ) -> Result<HashSet<ObjectHash>, StewardError> {
-        self.inner.list_pack_hashes(series_hash).await
-    }
-
-    async fn get_pack_index(
-        &self,
-        series_hash: ObjectHash,
-        pack_hash: ObjectHash,
-    ) -> Result<Option<Vec<u8>>, StewardError> {
-        self.inner.get_pack_index(series_hash, pack_hash).await
-    }
+    Ok(changes
+        .into_values()
+        .filter(|change| change.before != change.after)
+        .collect())
 }
 
 /// Recursively fetch a tree object and everything reachable from its entries.
@@ -397,11 +750,12 @@ async fn fetch_tree(
     remote: &dyn ContentSource,
     tree_hash: ObjectHash,
     graph: &mut FetchedGraph,
+    complete_series_chain: bool,
 ) -> Result<(), StewardError> {
     // Iterative worklist to avoid async recursion on the directory tree.
     let mut stack = vec![tree_hash];
     while let Some(hash) = stack.pop() {
-        if graph.objects.contains_key(&hash) {
+        if graph.trees.contains_key(&hash) {
             continue;
         }
         let bytes = fetch_verified(remote, hash).await?;
@@ -409,22 +763,32 @@ async fn fetch_tree(
             decode_tree(&bytes).map_err(|e| StewardError::Content(format!("decode tree: {e}")))?;
         let _ = graph
             .objects
-            .insert(hash, FetchedObject::Tree(entries.clone()));
+            .entry(hash)
+            .or_insert_with(|| FetchedObject::Tree(entries.clone()));
+        let _ = graph.trees.insert(hash, entries.clone());
         let _ = graph.bytes.insert(hash, bytes);
 
         for entry in entries {
             match entry.entry_type {
                 EntryType::DirectoryPhysical => stack.push(entry.child_hash),
                 EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries => {
-                    fetch_series(remote, entry.child_hash, entry.entry_type, graph).await?;
+                    fetch_series(
+                        remote,
+                        entry.child_hash,
+                        entry.entry_type,
+                        graph,
+                        complete_series_chain,
+                    )
+                    .await?;
                 }
-                EntryType::FilePhysicalVersion
-                | EntryType::TablePhysicalVersion
-                | EntryType::Symlink
+                EntryType::FilePhysicalVersion | EntryType::TablePhysicalVersion => {
+                    fetch_blob(remote, entry.child_hash, graph, false).await?;
+                }
+                EntryType::Symlink
                 | EntryType::DirectoryDynamic
                 | EntryType::FileDynamic
                 | EntryType::TableDynamic => {
-                    fetch_blob(remote, entry.child_hash, graph).await?;
+                    fetch_blob(remote, entry.child_hash, graph, true).await?;
                 }
             }
         }
@@ -432,46 +796,49 @@ async fn fetch_tree(
     Ok(())
 }
 
-/// Fetch a `watertown.series.v2` object and everything it names.
+/// Fetch a `watertown.series.v3` object and everything it names.
 ///
 /// `entry_type` is the owning tree entry's declared kind
 /// (`FilePhysicalSeries` or `TablePhysicalSeries`); it must
 /// agree with the manifest's own [`PayloadKind`] (`docs/logical-series-
 /// identity-design.md` delivery gate 4), since nothing else ties a
-/// `watertown.series.v2` object's payload kind to the directory position naming it.
+/// `watertown.series.v3` object's payload kind to the directory position naming it.
 async fn fetch_series(
     remote: &dyn ContentSource,
     series_hash: ObjectHash,
     entry_type: EntryType,
     graph: &mut FetchedGraph,
+    complete_chain: bool,
 ) -> Result<(), StewardError> {
-    if let Some(existing) = graph.objects.get(&series_hash) {
-        return match existing {
-            FetchedObject::SeriesV2(series) => {
-                let expected_kind = expected_payload_kind(entry_type);
-                if series.manifest.payload_kind() != expected_kind {
-                    Err(StewardError::Content(format!(
-                        "series {series_hash} manifest declares payload kind {:?} but another tree \
-                         entry is {entry_type:?} (expects {expected_kind:?})",
-                        series.manifest.payload_kind()
-                    )))
-                } else {
-                    Ok(())
-                }
-            }
-            _ => Err(StewardError::Content(format!(
-                "object {series_hash} was already fetched as a non-series object"
-            ))),
+    if let Some(series) = graph.series.get(&series_hash) {
+        let expected_kind = expected_payload_kind(entry_type);
+        return if series.manifest.payload_kind() != expected_kind {
+            Err(StewardError::Content(format!(
+                "series {series_hash} manifest declares payload kind {:?} but another tree entry \
+                 is {entry_type:?} (expects {expected_kind:?})",
+                series.manifest.payload_kind()
+            )))
+        } else {
+            Ok(())
         };
     }
     let bytes = fetch_verified(remote, series_hash).await?;
     let manifest = SeriesManifest::decode(&bytes)
         .map_err(|e| StewardError::Content(format!("decode series: {e}")))?;
-    fetch_series_v2(remote, series_hash, entry_type, manifest, bytes, graph).await
+    fetch_series_v2(
+        remote,
+        series_hash,
+        entry_type,
+        manifest,
+        bytes,
+        graph,
+        complete_chain,
+    )
+    .await
 }
 
 /// Map a series-carrying tree entry type to the [`PayloadKind`] its
-/// `watertown.series.v2` manifest must declare.
+/// `watertown.series.v3` manifest must declare.
 ///
 /// Only ever called with a series entry type (the two callers -- [`fetch_tree`]'s
 /// match arm and [`fetch_series`] -- both guarantee that), so any other value
@@ -484,23 +851,22 @@ fn expected_payload_kind(entry_type: EntryType) -> PayloadKind {
     }
 }
 
-/// Fetch, discover, and authenticate a `watertown.series.v2` logical series
+/// Fetch, discover, and authenticate a `watertown.series.v3` logical series
 /// (`docs/logical-series-identity-design.md` delivery gate 4).
 ///
-/// This is the heart of the dual reader's v2 side. It:
+/// This is the series-chain reader. It:
 ///
 /// 1. checks `manifest.payload_kind()` against the owning tree entry's
 ///    declared type;
-/// 2. lists every pack hash [`ContentSource::list_pack_hashes`] advertises
-///    for this series, fetches and decodes each one (rejecting a malformed
-///    or vanished candidate outright rather than silently skipping it);
-/// 3. chooses a deterministic exact cover with [`select_exact_cover`];
-/// 4. authenticates each pack's descriptor hashes and range proof against the
-///    independently fetched manifest, without fetching physical payloads;
-/// 5. records the authenticated descriptor hashes as the series leaf sequence;
-/// 6. checks that the selected packs' logical counts sum to
-///    `manifest.logical_count()` and that their descriptors' aggregate
-///    event-time bounds agree with the manifest's own aggregate bounds.
+/// 2. point-reads the current series locator, never a pack-prefix listing;
+/// 3. verifies each linked suffix pack against that segment state's
+///    independently fetched manifest;
+/// 4. stops an incremental walk at the first parent outside the bounded
+///    publication window, or walks to a root/consolidated pack for a fresh
+///    clone;
+/// 5. proves every child state is an exact Merkle append of its parent; and
+/// 6. for a complete clone, recomputes the current complete leaf Merkle root
+///    from every collected descriptor.
 ///
 /// Payload bytes are fetched later by [`materialize_series_v2`], after
 /// [`plan_series_v2_leaves`] has verified the destination's durable prefix.
@@ -511,6 +877,7 @@ async fn fetch_series_v2(
     manifest: SeriesManifest,
     manifest_bytes: Vec<u8>,
     graph: &mut FetchedGraph,
+    complete_chain: bool,
 ) -> Result<(), StewardError> {
     let expected_kind = expected_payload_kind(entry_type);
     if manifest.payload_kind() != expected_kind {
@@ -520,159 +887,459 @@ async fn fetch_series_v2(
         )));
     }
 
-    // Discover every advertised pack candidate. A candidate that vanishes
-    // between listing and fetch, or that fails to decode, is a hard error:
-    // discovery must never silently proceed with a partial candidate set,
-    // since that could make an otherwise-uncoverable series appear to have
-    // no valid cover, or could paper over a corrupt advertisement.
-    let candidate_hashes = remote
-        .list_pack_hashes(series_hash)
-        .await
-        .map_err(|e| StewardError::Content(format!("list packs for series {series_hash}: {e}")))?;
-    let mut candidates: Vec<(ObjectHash, PackIndex)> = Vec::with_capacity(candidate_hashes.len());
-    for pack_hash in candidate_hashes {
-        let bytes = remote
-            .get_pack_index(series_hash, pack_hash)
-            .await
-            .map_err(|e| {
-                StewardError::Content(format!("fetch pack {pack_hash} for series {series_hash}: {e}"))
-            })?
-            .ok_or_else(|| {
-                StewardError::Content(format!(
-                    "pack {pack_hash} was advertised for series {series_hash} but vanished before it could be fetched"
-                ))
-            })?;
-        let computed = ObjectHash::of_bytes(&bytes);
-        if computed != pack_hash {
+    if manifest.leaf_count() == 0 {
+        let series_v2 = FetchedSeriesV2 {
+            manifest_hash: series_hash,
+            manifest,
+            packs: Vec::new(),
+            leaf_start: 0,
+            leaf_hashes: Vec::new(),
+            base_series_hash: None,
+            base_manifest: None,
+            physical_object_hashes: Vec::new(),
+        };
+        let _ = graph
+            .objects
+            .entry(series_hash)
+            .or_insert_with(|| FetchedObject::SeriesV2(Box::new(series_v2.clone())));
+        let _ = graph.series.insert(series_hash, Box::new(series_v2));
+        let _ = graph.bytes.insert(series_hash, manifest_bytes);
+        return Ok(());
+    }
+
+    let mut current_hash = series_hash;
+    let mut current_manifest = manifest.clone();
+    let mut newest_first = Vec::<(ObjectHash, PackIndex)>::new();
+    let mut base = None;
+    let mut seen_series = HashSet::new();
+    loop {
+        if !seen_series.insert(current_hash) {
             return Err(StewardError::Content(format!(
-                "pack advertisement for series {series_hash} hashes to {computed} but was fetched as {pack_hash}"
+                "cycle in linked series segments at {current_hash}"
             )));
         }
-        let pack = PackIndex::decode(&bytes).map_err(|e| {
-            StewardError::Content(format!(
-                "decode pack {pack_hash} for series {series_hash}: {e}"
-            ))
-        })?;
-        for (descriptor_index, descriptor) in pack.leaf_descriptors().iter().enumerate() {
-            let _ = effective_leaf_schema_fingerprint(&manifest, &pack, descriptor).map_err(|e| {
-                StewardError::Content(format!(
-                    "pack {pack_hash} descriptor {descriptor_index} is incompatible with series \
-                     {series_hash}: {e}"
-                ))
-            })?;
+        let descriptor = if complete_chain {
+            match remote.get_consolidated_series_pack(current_hash).await? {
+                Some(descriptor) => Some(descriptor),
+                None => remote.get_series_pack(current_hash).await?,
+            }
+        } else {
+            remote.get_series_pack(current_hash).await?
         }
-        candidates.push((pack_hash, pack));
-    }
-
-    let selected_hashes = select_exact_cover(series_hash, manifest.leaf_count(), &candidates)
-        .map_err(|e| {
-            StewardError::Content(format!("select pack cover for series {series_hash}: {e}"))
-        })?;
-    let candidates_by_hash: HashMap<ObjectHash, PackIndex> = candidates.into_iter().collect();
-    let mut selected_packs: Vec<(ObjectHash, PackIndex)> =
-        Vec::with_capacity(selected_hashes.len());
-    for pack_hash in selected_hashes {
-        let pack = candidates_by_hash.get(&pack_hash).cloned().ok_or_else(|| {
+        .ok_or_else(|| {
             StewardError::Content(format!(
-                "select_exact_cover chose pack {pack_hash} that was not among the fetched candidates \
-                 (internal inconsistency)"
+                "series {current_hash} has no canonical pack-segment locator"
             ))
         })?;
-        selected_packs.push((pack_hash, pack));
-    }
-
-    // Authenticate every selected pack from metadata alone. Pack decoding
-    // already validates the descriptor hashes against its range proof and
-    // declared range root; this additional check binds that root to the
-    // independently fetched manifest.
-    let mut all_leaf_hashes: Vec<ObjectHash> = Vec::with_capacity(manifest.leaf_count() as usize);
-    let mut physical_object_hashes: Vec<ObjectHash> = Vec::new();
-    let mut seen_physical: HashSet<ObjectHash> = HashSet::new();
-    let mut total_logical: u64 = 0;
-
-    for (pack_hash, pack) in &selected_packs {
-        let leaf_hashes: Vec<ObjectHash> = pack
+        let pack = fetch_pack(remote, descriptor).await?;
+        let range_leaf_hashes = pack
             .leaf_descriptors()
             .iter()
             .map(PackLeafDescriptor::logical_leaf_hash)
-            .collect();
-        verify_pack_against_manifest(series_hash, &manifest, pack, &leaf_hashes).map_err(|e| {
+            .collect::<Vec<_>>();
+        verify_series_segment(current_hash, &current_manifest, &pack, &range_leaf_hashes)?;
+        let parent_hash = pack.parent_series_hash();
+        newest_first.push((descriptor.pack_hash, pack));
+
+        let Some(parent_hash) = parent_hash else {
+            break;
+        };
+        let parent_bytes = fetch_verified(remote, parent_hash).await?;
+        let parent_manifest = SeriesManifest::decode(&parent_bytes).map_err(|error| {
             StewardError::Content(format!(
-                "pack {pack_hash} failed verification against series {series_hash}: {e}"
+                "decode parent series manifest {parent_hash}: {error}"
             ))
         })?;
-        all_leaf_hashes.extend(leaf_hashes);
-        total_logical = total_logical.checked_add(pack.logical_count()).ok_or_else(|| {
-            StewardError::Content(format!(
-                "aggregate logical_count across selected packs for series {series_hash} overflows u64"
-            ))
-        })?;
+        verify_series_extension(
+            parent_hash,
+            &parent_manifest,
+            current_hash,
+            &current_manifest,
+            &newest_first.last().expect("just pushed").1,
+            &range_leaf_hashes,
+        )?;
+        let continue_chain = complete_chain || graph.publication_packs.contains_key(&parent_hash);
+        if !continue_chain {
+            base = Some((parent_hash, parent_manifest));
+            break;
+        }
+        current_hash = parent_hash;
+        current_manifest = parent_manifest;
+    }
+
+    newest_first.reverse();
+    let leaf_start = newest_first
+        .first()
+        .map_or(manifest.leaf_count(), |(_, pack)| pack.leaf_start());
+    let mut all_leaf_hashes = Vec::new();
+    let mut physical_object_hashes = Vec::new();
+    let mut seen_physical = HashSet::new();
+    for (_, pack) in &newest_first {
+        all_leaf_hashes.extend(
+            pack.leaf_descriptors()
+                .iter()
+                .map(PackLeafDescriptor::logical_leaf_hash),
+        );
         for &object_hash in pack.physical_object_hashes() {
             if seen_physical.insert(object_hash) {
                 physical_object_hashes.push(object_hash);
             }
         }
     }
-
-    if total_logical != manifest.logical_count() {
-        return Err(StewardError::Content(format!(
-            "series {series_hash}: selected packs cover {total_logical} logical unit(s) but the manifest declares logical_count {}",
-            manifest.logical_count()
-        )));
+    if let Some((_, base_manifest)) = &base {
+        let extended = base_manifest
+            .merkle_frontier()
+            .extended(&all_leaf_hashes)
+            .map_err(StewardError::Content)?;
+        if extended != *manifest.merkle_frontier() {
+            return Err(StewardError::Content(format!(
+                "linked series suffix for {series_hash} does not extend its base to the current \
+                 Merkle frontier"
+            )));
+        }
+    } else {
+        if leaf_start != 0
+            || u64::try_from(all_leaf_hashes.len()).ok() != Some(manifest.leaf_count())
+            || sync_store::content::merkle_root(&all_leaf_hashes) != manifest.leaf_merkle_root()
+        {
+            return Err(StewardError::Content(format!(
+                "complete linked segment chain for {series_hash} does not reconstruct the current \
+                 complete leaf Merkle root"
+            )));
+        }
     }
-    verify_aggregate_bounds(series_hash, &manifest, &selected_packs)?;
 
     let series_v2 = FetchedSeriesV2 {
         manifest_hash: series_hash,
         manifest,
-        packs: selected_packs,
+        packs: newest_first,
+        leaf_start,
         leaf_hashes: all_leaf_hashes,
+        base_series_hash: base.as_ref().map(|(hash, _)| *hash),
+        base_manifest: base.map(|(_, manifest)| manifest),
         physical_object_hashes,
     };
     let _ = graph
         .objects
-        .insert(series_hash, FetchedObject::SeriesV2(Box::new(series_v2)));
+        .entry(series_hash)
+        .or_insert_with(|| FetchedObject::SeriesV2(Box::new(series_v2.clone())));
+    let _ = graph.series.insert(series_hash, Box::new(series_v2));
     let _ = graph.bytes.insert(series_hash, manifest_bytes);
     Ok(())
 }
 
-/// Check that the aggregate event-time bounds derivable from every selected
-/// pack's leaf descriptors agree with `manifest`'s own aggregate bounds
-/// (`docs/logical-series-identity-design.md`: a manifest's bounds are the
-/// aggregate minimum/maximum over every leaf that carried one). Because the
-/// selected packs together exactly cover `[0, manifest.leaf_count())`, their
-/// descriptors collectively describe every leaf in the series -- so this is
-/// a real cross-check, not a subset comparison.
-fn verify_aggregate_bounds(
-    series_hash: ObjectHash,
-    manifest: &SeriesManifest,
-    selected_packs: &[(ObjectHash, PackIndex)],
+async fn ensure_series_coverage(
+    remote: &dyn ContentSource,
+    series: &mut FetchedSeriesV2,
+    desired_leaf_start: u64,
+    prefer_consolidated: bool,
 ) -> Result<(), StewardError> {
-    let mut min: Option<i64> = None;
-    let mut max: Option<i64> = None;
-    for (_, pack) in selected_packs {
-        for descriptor in pack.leaf_descriptors() {
-            if let Some(v) = descriptor.min_event_time() {
-                min = Some(min.map_or(v, |cur| cur.min(v)));
+    if desired_leaf_start > series.manifest.leaf_count() {
+        return Err(StewardError::Content(format!(
+            "requested series frontier {desired_leaf_start} exceeds current leaf count {}",
+            series.manifest.leaf_count()
+        )));
+    }
+    while series.leaf_start > desired_leaf_start {
+        let current_hash = series.base_series_hash.ok_or_else(|| {
+            StewardError::Content(format!(
+                "series {} linked chain ends at leaf {}, before required frontier {}",
+                series.manifest_hash, series.leaf_start, desired_leaf_start
+            ))
+        })?;
+        let current_manifest = series.base_manifest.clone().ok_or_else(|| {
+            StewardError::Content(format!(
+                "series {} has a base hash without its authenticated manifest",
+                series.manifest_hash
+            ))
+        })?;
+        let descriptor = if prefer_consolidated {
+            match remote.get_consolidated_series_pack(current_hash).await? {
+                Some(descriptor) => Some(descriptor),
+                None => remote.get_series_pack(current_hash).await?,
             }
-            if let Some(v) = descriptor.max_event_time() {
-                max = Some(max.map_or(v, |cur| cur.max(v)));
+        } else {
+            remote.get_series_pack(current_hash).await?
+        }
+        .ok_or_else(|| {
+            StewardError::Content(format!(
+                "series {current_hash} has no canonical pack-segment locator"
+            ))
+        })?;
+        let pack = fetch_pack(remote, descriptor).await?;
+        let leaf_hashes = pack
+            .leaf_descriptors()
+            .iter()
+            .map(PackLeafDescriptor::logical_leaf_hash)
+            .collect::<Vec<_>>();
+        verify_series_segment(current_hash, &current_manifest, &pack, &leaf_hashes)?;
+        if pack.leaf_end() != series.leaf_start {
+            return Err(StewardError::Content(format!(
+                "series {} predecessor pack ends at leaf {}, expected {}",
+                series.manifest_hash,
+                pack.leaf_end(),
+                series.leaf_start
+            )));
+        }
+
+        let parent = match pack.parent_series_hash() {
+            Some(parent_hash) => {
+                let bytes = fetch_verified(remote, parent_hash).await?;
+                let parent_manifest = SeriesManifest::decode(&bytes).map_err(|error| {
+                    StewardError::Content(format!(
+                        "decode parent series manifest {parent_hash}: {error}"
+                    ))
+                })?;
+                verify_series_extension(
+                    parent_hash,
+                    &parent_manifest,
+                    current_hash,
+                    &current_manifest,
+                    &pack,
+                    &leaf_hashes,
+                )?;
+                Some((parent_hash, parent_manifest))
+            }
+            None => None,
+        };
+
+        series.packs.insert(0, (descriptor.pack_hash, pack));
+        _ = series.leaf_hashes.splice(0..0, leaf_hashes);
+        series.leaf_start = series
+            .packs
+            .first()
+            .expect("predecessor pack was inserted")
+            .1
+            .leaf_start();
+        series.base_series_hash = parent.as_ref().map(|(hash, _)| *hash);
+        series.base_manifest = parent.map(|(_, manifest)| manifest);
+    }
+
+    let mut physical_object_hashes = Vec::new();
+    let mut seen = HashSet::new();
+    for (_, pack) in &series.packs {
+        for &hash in pack.physical_object_hashes() {
+            if seen.insert(hash) {
+                physical_object_hashes.push(hash);
             }
         }
     }
-    if min != manifest.min_event_time() {
+    series.physical_object_hashes = physical_object_hashes;
+    Ok(())
+}
+
+async fn align_series_fetches_to_target(
+    remote: &dyn ContentSource,
+    graph: &mut FetchedGraph,
+    target: &TargetPlanningState,
+) -> Result<(), StewardError> {
+    if graph.manifest_complete {
+        return Ok(());
+    }
+    let mut desired = HashMap::<ObjectHash, (u64, bool)>::new();
+    for change in &graph.manifest_changes {
+        let Some(after) = &change.after else {
+            continue;
+        };
+        if !matches!(
+            after.entry.entry_type,
+            EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries
+        ) {
+            continue;
+        }
+        let (leaf_start, fresh) = match target.nodes.get(after.entry.node_id.as_str()) {
+            None => (0, true),
+            Some(existing) if existing.child_hash == after.entry.child_hash => continue,
+            Some(_) => {
+                let prior = target
+                    .series_manifests
+                    .get(after.entry.node_id.as_str())
+                    .ok_or_else(|| {
+                        StewardError::Content(format!(
+                            "changed series node {} has no authenticated prior manifest",
+                            after.entry.node_id
+                        ))
+                    })?;
+                (prior.leaf_count(), false)
+            }
+        };
+        let _ = desired
+            .entry(after.entry.child_hash)
+            .and_modify(|(current, any_fresh)| {
+                *current = (*current).min(leaf_start);
+                *any_fresh |= fresh;
+            })
+            .or_insert((leaf_start, fresh));
+    }
+    for (series_hash, (leaf_start, fresh)) in desired {
+        let series = graph.series.get_mut(&series_hash).ok_or_else(|| {
+            StewardError::Content(format!(
+                "series object {series_hash} is missing from the fetched graph"
+            ))
+        })?;
+        ensure_series_coverage(remote, series, leaf_start, fresh).await?;
+        if let Some(FetchedObject::SeriesV2(compatibility)) = graph.objects.get_mut(&series_hash) {
+            *compatibility = series.clone();
+        }
+    }
+    Ok(())
+}
+
+async fn fetch_pack(
+    remote: &dyn ContentSource,
+    descriptor: PackDescriptor,
+) -> Result<PackIndex, StewardError> {
+    let pack_hash = descriptor.pack_hash;
+    let series_hash = descriptor.series_hash;
+    let bytes = remote
+        .get_publication_pack(descriptor)
+        .await
+        .map_err(|error| {
+            StewardError::Content(format!(
+                "fetch pack {pack_hash} for series {series_hash}: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            StewardError::Content(format!(
+                "canonical pack segment {pack_hash} for series {series_hash} is absent"
+            ))
+        })?;
+    let computed = ObjectHash::of_bytes(&bytes);
+    if computed != pack_hash {
         return Err(StewardError::Content(format!(
-            "series {series_hash}: selected packs' aggregate min_event_time {min:?} does not match manifest's {:?}",
-            manifest.min_event_time()
+            "pack segment for series {series_hash} hashes to {computed} but was fetched as \
+             {pack_hash}"
         )));
     }
-    if max != manifest.max_event_time() {
+    let pack = PackIndex::decode(&bytes).map_err(|error| {
+        StewardError::Content(format!(
+            "decode pack {pack_hash} for series {series_hash}: {error}"
+        ))
+    })?;
+    if pack.series_hash() != series_hash {
         return Err(StewardError::Content(format!(
-            "series {series_hash}: selected packs' aggregate max_event_time {max:?} does not match manifest's {:?}",
-            manifest.max_event_time()
+            "pack {pack_hash} declares series {}, expected {series_hash}",
+            pack.series_hash()
+        )));
+    }
+    pack.validate_series_segment()
+        .map_err(|error| StewardError::Content(format!("pack {pack_hash}: {error}")))?;
+    Ok(pack)
+}
+
+fn verify_series_segment(
+    series_hash: ObjectHash,
+    manifest: &SeriesManifest,
+    pack: &PackIndex,
+    range_leaf_hashes: &[ObjectHash],
+) -> Result<(), StewardError> {
+    if pack.parent_series_hash().is_none() {
+        verify_complete_pack_against_manifest(series_hash, manifest, pack).map_err(|error| {
+            StewardError::Content(format!(
+                "pack {} failed verification against series {series_hash}: {error}",
+                pack.hash()
+            ))
+        })?;
+    } else {
+        verify_pack_against_manifest(series_hash, manifest, pack, range_leaf_hashes).map_err(
+            |error| {
+                StewardError::Content(format!(
+                    "pack {} failed verification against series {series_hash}: {error}",
+                    pack.hash()
+                ))
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn verify_series_extension(
+    parent_hash: ObjectHash,
+    parent: &SeriesManifest,
+    series_hash: ObjectHash,
+    manifest: &SeriesManifest,
+    pack: &PackIndex,
+    range_leaf_hashes: &[ObjectHash],
+) -> Result<(), StewardError> {
+    if pack.parent_series_hash() != Some(parent_hash) {
+        return Err(StewardError::Content(format!(
+            "pack {} links to {:?}, expected parent series {parent_hash}",
+            pack.hash(),
+            pack.parent_series_hash()
+        )));
+    }
+    if parent.payload_kind() != manifest.payload_kind() {
+        return Err(StewardError::Content(format!(
+            "series {series_hash} changes payload kind from parent {parent_hash}"
+        )));
+    }
+    if pack.leaf_start() != parent.leaf_count() {
+        return Err(StewardError::Content(format!(
+            "pack {} starts at leaf {}, parent series {parent_hash} has {} leaves",
+            pack.hash(),
+            pack.leaf_start(),
+            parent.leaf_count()
+        )));
+    }
+    let expected_logical = parent
+        .logical_count()
+        .checked_add(pack.logical_count())
+        .ok_or_else(|| StewardError::Content("linked series logical count overflow".to_string()))?;
+    if expected_logical != manifest.logical_count() {
+        return Err(StewardError::Content(format!(
+            "series {series_hash} logical count {} is not parent {} plus suffix {}",
+            manifest.logical_count(),
+            parent.logical_count(),
+            pack.logical_count()
+        )));
+    }
+    let (suffix_min, suffix_max) = descriptor_bounds(pack.leaf_descriptors());
+    let expected_min = match (parent.min_event_time(), suffix_min) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (left, right) => left.or(right),
+    };
+    let expected_max = match (parent.max_event_time(), suffix_max) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (left, right) => left.or(right),
+    };
+    if expected_min != manifest.min_event_time() || expected_max != manifest.max_event_time() {
+        return Err(StewardError::Content(format!(
+            "series {series_hash} aggregate bounds do not equal parent {parent_hash} plus suffix"
+        )));
+    }
+    let suffix_attributes = pack
+        .leaf_descriptors()
+        .last()
+        .and_then(PackLeafDescriptor::logical_attributes);
+    if suffix_attributes != manifest.logical_attributes() {
+        return Err(StewardError::Content(format!(
+            "series {series_hash} latest logical attributes do not match its appended suffix"
+        )));
+    }
+    let extended = parent
+        .merkle_frontier()
+        .extended(range_leaf_hashes)
+        .map_err(StewardError::Content)?;
+    if extended != *manifest.merkle_frontier() {
+        return Err(StewardError::Content(format!(
+            "series {series_hash} is not an exact Merkle append of parent {parent_hash}"
         )));
     }
     Ok(())
+}
+
+fn descriptor_bounds(descriptors: &[PackLeafDescriptor]) -> (Option<i64>, Option<i64>) {
+    let mut min: Option<i64> = None;
+    let mut max: Option<i64> = None;
+    for descriptor in descriptors {
+        if let Some(value) = descriptor.min_event_time() {
+            min = Some(min.map_or(value, |current| current.min(value)));
+        }
+        if let Some(value) = descriptor.max_event_time() {
+            max = Some(max.map_or(value, |current| current.max(value)));
+        }
+    }
+    (min, max)
 }
 
 /// Decode one Parquet physical object, checking its canonical schema
@@ -808,8 +1475,20 @@ async fn fetch_blob(
     remote: &dyn ContentSource,
     hash: ObjectHash,
     graph: &mut FetchedGraph,
+    require_buffered: bool,
 ) -> Result<(), StewardError> {
-    if graph.objects.contains_key(&hash) {
+    if graph.blob_hashes.contains(&hash) && (!require_buffered || graph.bytes.contains_key(&hash)) {
+        return Ok(());
+    }
+    if !require_buffered
+        && remote
+            .object_size(hash)
+            .await?
+            .is_some_and(|size| size >= tlogfs::large_files::LARGE_FILE_THRESHOLD as u64)
+    {
+        let _ = graph.objects.entry(hash).or_insert(FetchedObject::External);
+        let _ = graph.blob_hashes.insert(hash);
+        let _ = graph.external_blobs.insert(hash);
         return Ok(());
     }
     if let Some(bytes) = remote
@@ -820,7 +1499,9 @@ async fn fetch_blob(
         verify(hash, &bytes)?;
         let _ = graph
             .objects
-            .insert(hash, FetchedObject::Blob(bytes.clone()));
+            .entry(hash)
+            .or_insert_with(|| FetchedObject::Blob(bytes.clone()));
+        let _ = graph.blob_hashes.insert(hash);
         let _ = graph.bytes.insert(hash, bytes);
         return Ok(());
     }
@@ -836,7 +1517,13 @@ async fn fetch_blob(
             hash.to_hex()
         )));
     }
-    let _ = graph.objects.insert(hash, FetchedObject::External);
+    if require_buffered {
+        return Err(StewardError::Content(format!(
+            "structured leaf object {hash} is unavailable as buffered immutable content"
+        )));
+    }
+    let _ = graph.objects.entry(hash).or_insert(FetchedObject::External);
+    let _ = graph.blob_hashes.insert(hash);
     let _ = graph.external_blobs.insert(hash);
     Ok(())
 }
@@ -890,6 +1577,316 @@ pub struct RebuildOutcome {
     pub series: usize,
     /// Number of dynamic nodes created.
     pub dynamic: usize,
+    /// Local planning work used to decide this rebuild.
+    pub local_cost: LocalPullCost,
+}
+
+/// Observable local work performed while planning one pull.
+///
+/// Ordinary incremental native-v2 pulls use the persistent manifest map and
+/// prior series manifest, so `full_target_scan` is false and
+/// `retained_leaf_hashes_scanned` is zero. Full clone/rebuild and explicit
+/// diagnostics may still report a complete scan.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LocalPullCost {
+    /// Whether planning folded the complete destination pond.
+    pub full_target_scan: bool,
+    /// Fixed local manifest-root cursor files read.
+    pub manifest_root_cursor_files_read: usize,
+    /// Latest reserved-index rows returned by bounded recovery queries.
+    pub manifest_root_rows_read: usize,
+    /// Immutable Patricia-map node files read by point lookup.
+    pub manifest_nodes_read: usize,
+    /// Distinct destination manifest records loaded, including parent paths.
+    pub manifest_records_loaded: usize,
+    /// Prior `watertown.series.v3` manifest files read.
+    pub series_manifests_read: usize,
+    /// Retained per-leaf hashes enumerated by planning.
+    pub retained_leaf_hashes_scanned: usize,
+}
+
+#[derive(Default)]
+struct TargetPlanningState {
+    nodes: HashMap<String, ManifestEntry>,
+    directory_children: HashMap<String, Vec<ManifestRecordChild>>,
+    series_leaves: HashMap<String, Vec<ObjectHash>>,
+    series_manifests: HashMap<String, SeriesManifest>,
+    index_bytes: Option<Vec<u8>>,
+    local_cost: LocalPullCost,
+}
+
+async fn read_target_index_bytes(
+    target: &Ship,
+    pond_id: &str,
+    expected_root: Option<ObjectHash>,
+) -> Result<(Option<Vec<u8>>, usize, usize), StewardError> {
+    let store = crate::local_content::LocalContentStore::new(target.pond_path());
+    let cursor = if expected_root.is_some() {
+        store.read_manifest_root_cursor(pond_id)?
+    } else {
+        None
+    };
+    let cursor_reads = usize::from(cursor.is_some());
+    if let (Some(expected_root), Some(bytes)) = (expected_root, cursor)
+        && decode_manifest_root(&bytes).is_ok_and(|root| root == expected_root)
+    {
+        return Ok((Some(bytes), cursor_reads, 0));
+    }
+
+    let bytes = crate::content_tree::index_root_pointer_bytes(
+        target.data_persistence().table().clone(),
+        pond_id,
+    )
+    .await?;
+    if let Some(bytes) = &bytes {
+        store.write_manifest_root_cursor(pond_id, bytes)?;
+        if let Some(expected_root) = expected_root {
+            let actual = decode_manifest_root(bytes).map_err(StewardError::Content)?;
+            if actual != expected_root {
+                return Err(StewardError::Content(format!(
+                    "destination manifest root {actual} does not match the authenticated pull \
+                     boundary {expected_root}; refusing an O(history) fallback"
+                )));
+            }
+        }
+    }
+    let row_reads = usize::from(bytes.is_some());
+    Ok((bytes, cursor_reads, row_reads))
+}
+
+fn directory_children_from_entries(
+    nodes: &HashMap<String, ManifestEntry>,
+) -> HashMap<String, Vec<ManifestRecordChild>> {
+    let mut children: HashMap<String, Vec<ManifestRecordChild>> = HashMap::new();
+    for entry in nodes.values() {
+        if entry.parent_node_id.is_empty() {
+            continue;
+        }
+        children
+            .entry(entry.parent_node_id.clone())
+            .or_default()
+            .push(ManifestRecordChild::new(
+                entry.node_id.clone(),
+                entry.name.clone(),
+                entry.entry_type,
+            ));
+    }
+    for entries in children.values_mut() {
+        entries.sort_by(|left, right| left.node_id.as_bytes().cmp(right.node_id.as_bytes()));
+    }
+    children
+}
+
+async fn full_target_planning_state(
+    target: &mut Ship,
+    pond_id: &str,
+    foreign_pond_id: Option<uuid7::Uuid>,
+) -> Result<TargetPlanningState, StewardError> {
+    let (nodes, series_leaves) = if foreign_pond_id.is_some() {
+        crate::content_tree::build_target_state_for_pond(target, pond_id).await?
+    } else {
+        crate::content_tree::build_target_state(target).await?
+    };
+    let (index_bytes, cursor_reads, row_reads) = if nodes.is_empty() {
+        (None, 0, 0)
+    } else {
+        read_target_index_bytes(target, pond_id, None).await?
+    };
+    let retained_leaf_hashes_scanned = series_leaves.values().map(Vec::len).sum();
+    Ok(TargetPlanningState {
+        directory_children: directory_children_from_entries(&nodes),
+        nodes,
+        series_leaves,
+        series_manifests: HashMap::new(),
+        index_bytes,
+        local_cost: LocalPullCost {
+            full_target_scan: true,
+            manifest_root_cursor_files_read: cursor_reads,
+            manifest_root_rows_read: row_reads,
+            retained_leaf_hashes_scanned,
+            ..LocalPullCost::default()
+        },
+    })
+}
+
+fn incremental_boundary_manifest_root(graph: &FetchedGraph) -> Result<ObjectHash, StewardError> {
+    if graph.manifest_complete {
+        return Err(StewardError::Content(
+            "complete graph has no incremental manifest boundary".to_string(),
+        ));
+    }
+    let (boundary_hash, boundary) = graph.commits.last().ok_or_else(|| {
+        StewardError::Content("incremental graph has no boundary commit".to_string())
+    })?;
+    if Some(*boundary_hash) == graph.tip {
+        return Err(StewardError::Content(
+            "incremental graph contains no prior boundary commit".to_string(),
+        ));
+    }
+    Ok(boundary.manifest_root)
+}
+
+fn load_target_record<F>(
+    editor: &mut ManifestMapEditor<F>,
+    cache: &mut HashMap<String, Option<ManifestRecord>>,
+    node_id: &str,
+) -> Result<Option<ManifestRecord>, StewardError>
+where
+    F: FnMut(ObjectHash) -> Result<Vec<u8>, String>,
+{
+    if let Some(record) = cache.get(node_id) {
+        return Ok(record.clone());
+    }
+    let record = editor.lookup(node_id).map_err(StewardError::Content)?;
+    let _ = cache.insert(node_id.to_string(), record.clone());
+    Ok(record)
+}
+
+fn decode_local_series_manifest(
+    store: &crate::local_content::LocalContentStore,
+    node_id: &str,
+    hash: ObjectHash,
+) -> Result<SeriesManifest, StewardError> {
+    let bytes = store.read(hash).map_err(|error| {
+        StewardError::Content(format!(
+            "incremental pull cannot read prior series manifest {hash} for node {node_id}: \
+             {error}; native-v2 does not fall back to rescanning retained series rows"
+        ))
+    })?;
+    let manifest = SeriesManifest::decode(&bytes).map_err(|error| {
+        StewardError::Content(format!(
+            "decode prior series manifest {hash} for node {node_id}: {error}"
+        ))
+    })?;
+    if manifest.hash() != hash {
+        return Err(StewardError::Content(format!(
+            "prior series manifest for node {node_id} hashes to {}, expected {hash}",
+            manifest.hash()
+        )));
+    }
+    Ok(manifest)
+}
+
+async fn sparse_target_planning_state(
+    target: &Ship,
+    graph: &FetchedGraph,
+    pond_id: &str,
+) -> Result<TargetPlanningState, StewardError> {
+    let expected_root = incremental_boundary_manifest_root(graph)?;
+    let (index_bytes, cursor_reads, row_reads) =
+        read_target_index_bytes(target, pond_id, Some(expected_root)).await?;
+    let index_bytes = index_bytes.ok_or_else(|| {
+        StewardError::Content(
+            "incremental pull has no destination .pond-node-index baseline; run an explicit \
+                 full rebuild (or rebuild the graft) instead of rescanning local history"
+                .to_string(),
+        )
+    })?;
+    let prior_root = decode_manifest_root(&index_bytes).map_err(StewardError::Content)?;
+    debug_assert_eq!(prior_root, expected_root);
+
+    let local_store = crate::local_content::LocalContentStore::new(target.pond_path());
+    let mut manifest_nodes_read = 0usize;
+    let mut editor = ManifestMapEditor::new(Some(prior_root), |hash| {
+        manifest_nodes_read += 1;
+        local_store.read_string_error(hash).map_err(|error| {
+            format!(
+                "incremental pull cannot read local manifest-map node {hash}: {error}; \
+                 run an explicit full rebuild instead of rescanning the Delta table"
+            )
+        })
+    });
+    let mut cache = HashMap::<String, Option<ManifestRecord>>::new();
+    let mut records = HashMap::<String, ManifestRecord>::new();
+    let mut directory_children = HashMap::<String, Vec<ManifestRecordChild>>::new();
+    let mut series_manifests = HashMap::<String, SeriesManifest>::new();
+    let changes = graph
+        .manifest_changes
+        .iter()
+        .map(|change| (change.node_id().to_string(), change))
+        .collect::<HashMap<_, _>>();
+    let mut parents = VecDeque::new();
+
+    for change in &graph.manifest_changes {
+        let node_id = change.node_id();
+        let current = load_target_record(&mut editor, &mut cache, node_id)?;
+        if current != change.before {
+            return Err(StewardError::Content(format!(
+                "incremental publication baseline for node {node_id} does not match the \
+                 destination manifest map"
+            )));
+        }
+        if let Some(record) = current {
+            if record.entry.entry_type == EntryType::DirectoryPhysical {
+                let _ = directory_children.insert(node_id.to_string(), record.children.clone());
+            }
+            if matches!(
+                record.entry.entry_type,
+                EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries
+            ) && change
+                .after
+                .as_ref()
+                .is_some_and(|after| after.entry.child_hash != record.entry.child_hash)
+            {
+                let manifest =
+                    decode_local_series_manifest(&local_store, node_id, record.entry.child_hash)?;
+                let _ = series_manifests.insert(node_id.to_string(), manifest);
+            }
+            if !record.entry.parent_node_id.is_empty() {
+                parents.push_back(record.entry.parent_node_id.clone());
+            }
+            let _ = records.insert(node_id.to_string(), record);
+        }
+        if let Some(after) = &change.after
+            && !after.entry.parent_node_id.is_empty()
+        {
+            parents.push_back(after.entry.parent_node_id.clone());
+        }
+    }
+    parents.push_back(tinyfs::ROOT_UUID.to_string());
+
+    while let Some(node_id) = parents.pop_front() {
+        if records.contains_key(&node_id) {
+            continue;
+        }
+        let current = load_target_record(&mut editor, &mut cache, &node_id)?;
+        if let Some(record) = current {
+            if record.entry.entry_type == EntryType::DirectoryPhysical {
+                let _ = directory_children.insert(node_id.clone(), record.children.clone());
+            }
+            if !record.entry.parent_node_id.is_empty() {
+                parents.push_back(record.entry.parent_node_id.clone());
+            }
+            let _ = records.insert(node_id, record);
+        } else if let Some(after) = changes
+            .get(&node_id)
+            .and_then(|change| change.after.as_ref())
+            && !after.entry.parent_node_id.is_empty()
+        {
+            parents.push_back(after.entry.parent_node_id.clone());
+        }
+    }
+    drop(editor);
+
+    let nodes = records
+        .into_iter()
+        .map(|(node_id, record)| (node_id, record.entry))
+        .collect::<HashMap<_, _>>();
+    Ok(TargetPlanningState {
+        local_cost: LocalPullCost {
+            manifest_root_cursor_files_read: cursor_reads,
+            manifest_root_rows_read: row_reads,
+            manifest_nodes_read,
+            manifest_records_loaded: nodes.len(),
+            series_manifests_read: series_manifests.len(),
+            ..LocalPullCost::default()
+        },
+        nodes,
+        directory_children,
+        series_leaves: HashMap::new(),
+        series_manifests,
+        index_bytes: Some(index_bytes),
+    })
 }
 
 /// The source of one file/series version's bytes in an apply plan.  Small blobs
@@ -957,11 +1954,6 @@ enum ApplyOp {
         create: bool,
         entry_type: EntryType,
         versions: Vec<PlannedVersion>,
-        /// When set, the first written version replaces (collapses) every
-        /// version the target already held -- replicating a source-side series
-        /// compaction. `versions` then holds the full post-collapse list, not an
-        /// appended suffix.
-        collapse_first: bool,
     },
     /// Create (adopting `node_id`) or rewrite a symlink.  A rewrite re-adopts
     /// the same `node_id` after unlinking, so identity is preserved.
@@ -987,7 +1979,7 @@ enum ApplyOp {
     },
     /// Unlink a target node that is absent from the source.
     Delete { parent_path: String, name: String },
-    /// Create (adopting `node_id`) or append to a native `watertown.series.v2` v2
+    /// Create (adopting `node_id`) or append to a native `watertown.series.v3`
     /// logical series (`docs/logical-series-identity-design.md`, release
     /// blocker item 1). Unlike [`ApplyOp::File`], a v2 series carries no
     /// buffered version list here: apply resolves `manifest_hash` back into
@@ -999,20 +1991,19 @@ enum ApplyOp {
         node_id: String,
         create: bool,
         entry_type: EntryType,
-        /// The `watertown.series.v2` manifest object's hash -- this node's
+        /// The `watertown.series.v3` manifest object's hash -- this node's
         /// `child_hash` -- naming the verified [`FetchedSeriesV2`] in
-        /// `graph.objects` to materialize from.
+        /// the graph's validated series-role map to materialize from.
         manifest_hash: ObjectHash,
         /// The first (0-based, whole-series) logical leaf index this
-        /// operation must write; every earlier leaf is walked, to stay
-        /// correctly positioned in the reconstructed physical stream, but
-        /// never buffered or written, since the target already holds it.
+        /// operation must write. Packs and object spans wholly before this
+        /// boundary are not read.
         leaves_from: u64,
         /// The source's aggregate mtime for this series
         /// ([`replicated_mtime`]), adopted verbatim on the *last* leaf this
         /// operation writes so the destination's own subsequent fold
         /// recomputes the identical aggregate `VersionMeta` (mtime is not
-        /// part of the `watertown.series.v2` manifest hash, but is part of the
+        /// part of the `watertown.series.v3` manifest hash, but is part of the
         /// destination's own `build_series_manifest` aggregation, which
         /// takes it from the latest leaf-bearing version).
         replicated_mtime: Option<i64>,
@@ -1036,11 +2027,9 @@ enum ApplyOp {
 /// Returns an error if the graph is empty or carries no manifest, if the graph
 /// references an object it does not contain, if a node's `entry_type` changed
 /// or it was reparented (both unsupported), if a symlink target is not valid
-/// UTF-8, if a recipe fails to decode, or if a write fails.  A source-side series
-/// compaction (the incoming versions replace rather than extend the held ones) is
-/// replicated, not rejected.  After applying, the read-side fold of `target` must
-/// equal the tip's root tree hash and the rebuilt node manifest hash must equal
-/// the tip commit's `node_manifest_hash`; a mismatch is an error.
+/// UTF-8, if a recipe fails to decode, if a series is not an exact append, or
+/// if a write fails. After applying, the destination's incremental native-v2
+/// fold must equal the tip's root tree hash and persistent manifest-map root.
 pub async fn rebuild_pond(
     target: &mut Ship,
     remote: &dyn ContentSource,
@@ -1049,44 +2038,60 @@ pub async fn rebuild_pond(
     let root = graph
         .root_tree_hash()
         .ok_or_else(|| StewardError::Content("cannot rebuild from an empty graph".to_string()))?;
-    if graph.manifest.is_empty() {
+    if authenticated_zero_change_transition(graph)? {
+        let pond_id = target.data_persistence().pond_id().to_string();
+        if destination_matches_publication_for_pond(target, graph, &pond_id).await? {
+            return Ok(RebuildOutcome::default());
+        }
+        return Err(StewardError::Content(
+            "authenticated zero-change publication does not match the destination content roots"
+                .to_string(),
+        ));
+    }
+    if graph.manifest.is_empty() && graph.manifest_changes.is_empty() {
         return Err(StewardError::Content(
             "fetched graph has no node manifest".to_string(),
         ));
     }
-    let tip_manifest_hash = graph
-        .commits
-        .first()
-        .map(|(_, c)| c.node_manifest_hash)
-        .ok_or_else(|| StewardError::Content("fetched graph has no tip commit".to_string()))?;
     let tip_manifest_root = graph
         .commits
         .first()
-        .map(|(_, c)| c.node_manifest_root)
+        .map(|(_, c)| c.manifest_root)
         .ok_or_else(|| StewardError::Content("fetched graph has no tip commit".to_string()))?;
 
-    let (target_nodes, target_series, target_series_leaves) =
-        crate::content_tree::build_target_state(target).await?;
+    let local_pond_id = target.data_persistence().pond_id().to_string();
+    let target_state = if graph.manifest_complete {
+        full_target_planning_state(target, &local_pond_id, None).await?
+    } else {
+        sparse_target_planning_state(target, graph, &local_pond_id).await?
+    };
+    let mut prepared_graph = graph.clone();
+    align_series_fetches_to_target(remote, &mut prepared_graph, &target_state).await?;
+    let effective_graph = graph_with_effective_manifest(&prepared_graph, &target_state.nodes)?;
 
     // Reject a manifest that is inconsistent with the fetched tree closure
     // before any mutation, so a hostile/corrupt remote cannot commit an
     // inconsistent tree that the post-apply fold would only catch after commit.
-    verify_manifest_matches_tree(graph)?;
+    if graph.manifest_complete {
+        verify_manifest_matches_tree(&effective_graph)?;
+    }
 
-    let (ops, outcome) = plan_node_diff(
-        graph,
+    let (ops, mut outcome) = plan_node_diff(
+        &effective_graph,
         root,
-        &target_nodes,
-        &target_series,
-        &target_series_leaves,
+        &target_state.nodes,
+        &target_state.directory_children,
+        &target_state.series_leaves,
+        &target_state.series_manifests,
     )?;
-    let mut pack_objects = prepare_pack_objects(&ops, graph, remote).await?;
+    outcome.local_cost = target_state.local_cost;
+    let mut pack_objects = prepare_pack_objects(&ops, &effective_graph, remote).await?;
 
-    let root_node_id = src_root_id(graph)?.to_string();
+    let root_node_id = src_root_id(&effective_graph)?.to_string();
     let mut tx = target
         .begin_write(&PondUserMetadata::new(vec!["pull".to_string()]))
         .await?;
-    tx.expect_content_roots(root, tip_manifest_hash, tip_manifest_root);
+    tx.expect_content_roots(root, tip_manifest_root);
     let apply_result = async {
         let root_wd = tx.root().await?;
         apply_ops(
@@ -1094,7 +2099,7 @@ pub async fn rebuild_pond(
             root_wd,
             &ops,
             remote,
-            graph,
+            &effective_graph,
             &mut pack_objects,
         )
         .await
@@ -1119,8 +2124,8 @@ pub async fn rebuild_pond(
 /// # Errors
 ///
 /// Same conditions as [`rebuild_pond`], computed over `foreign_pond_id`: the
-/// graph must carry a manifest, references must resolve, and the rebuilt tree
-/// must fold to the tip root tree hash with a matching node manifest.
+/// graph must carry a manifest, references must resolve, and the bounded
+/// native-v2 update must produce the tip root tree hash and manifest root.
 pub async fn import_pond(
     target: &mut Ship,
     remote: &dyn ContentSource,
@@ -1194,6 +2199,651 @@ struct PreparedGraft {
     pin_yaml: String,
 }
 
+async fn apply_graft_metadata(
+    tx: &crate::guard::StewardTransactionGuard<'_>,
+    graft: &PreparedGraft,
+    foreign_id: &str,
+    replace: bool,
+) -> Result<(), StewardError> {
+    use tinyfs::EntryType;
+
+    let root = tx.root().await?;
+    let _ = root.create_dir_all(&graft.parent).await?;
+    let parent_wd = root.open_dir_path(&graft.parent).await?;
+    let foreign_pond_id = uuid7::Uuid::from(
+        *uuid::Uuid::parse_str(foreign_id)
+            .map_err(|error| StewardError::Content(format!("parse foreign pond id: {error}")))?
+            .as_bytes(),
+    );
+    let foreign_node = tx.foreign_root_node(foreign_pond_id).await?;
+    if let Some(existing) = parent_wd.entry(&graft.leaf).await? {
+        let existing_pond = existing.pond_id.as_deref().ok_or_else(|| {
+            StewardError::Aborted(format!(
+                "mount path `{}/{}` contains local content; refusing scoped graft replacement",
+                graft.parent, graft.leaf
+            ))
+        })?;
+        if existing_pond != foreign_id {
+            return Err(StewardError::Aborted(format!(
+                "mount path `{}/{}` belongs to pond {}; refusing to replace graft {}",
+                graft.parent, graft.leaf, existing_pond, foreign_id
+            )));
+        }
+        if replace {
+            parent_wd.remove_entry(&graft.leaf).await?;
+            let _ = parent_wd.insert_node(&graft.leaf, foreign_node).await?;
+        } else if existing.child_node_id != foreign_node.id().node_id() {
+            return Err(StewardError::Aborted(format!(
+                "mount path `{}/{}` points to foreign node {} instead of root {}",
+                graft.parent,
+                graft.leaf,
+                existing.child_node_id,
+                foreign_node.id().node_id()
+            )));
+        }
+    } else {
+        let _ = parent_wd.insert_node(&graft.leaf, foreign_node).await?;
+    }
+
+    let _ = root.create_dir_all(crate::SYS_DIR).await?;
+    let _ = root.create_dir_all(crate::SYS_GRAFTS_DIR).await?;
+    let pin_is_current = if root.exists(&graft.pin_path).await {
+        root.read_file_path_to_vec(&graft.pin_path).await? == graft.pin_yaml.as_bytes()
+    } else {
+        false
+    };
+    if !pin_is_current && root.exists(&graft.pin_path).await {
+        let grafts_dir = root.open_dir_path(crate::SYS_GRAFTS_DIR).await?;
+        grafts_dir.remove_entry(&graft.pin_name).await?;
+    }
+    if !pin_is_current {
+        let mut writer = root
+            .async_writer_path_with_type(&graft.pin_path, EntryType::FilePhysicalVersion)
+            .await?;
+        writer.write_all(graft.pin_yaml.as_bytes()).await?;
+        writer.shutdown().await?;
+    }
+    Ok(())
+}
+
+fn authenticated_zero_change_transition(graph: &FetchedGraph) -> Result<bool, StewardError> {
+    if graph.manifest_complete
+        || !graph.manifest.is_empty()
+        || !graph.manifest_changes.is_empty()
+        || graph.commits.len() < 2
+    {
+        return Ok(false);
+    }
+    let (_, tip) = &graph.commits[0];
+    let (_, boundary) = graph.commits.last().expect("checked at least two commits");
+    if tip.root_tree_hash != boundary.root_tree_hash || tip.manifest_root != boundary.manifest_root
+    {
+        return Err(StewardError::Content(
+            "publication has no manifest changes but its authenticated content roots changed"
+                .to_string(),
+        ));
+    }
+    Ok(true)
+}
+
+async fn destination_matches_publication_for_pond(
+    target: &Ship,
+    graph: &FetchedGraph,
+    pond_id: &str,
+) -> Result<bool, StewardError> {
+    let tip = graph
+        .commits
+        .first()
+        .map(|(_, commit)| commit)
+        .ok_or_else(|| StewardError::Content("fetched graph has no tip commit".to_string()))?;
+    destination_matches_commit_for_pond(target, tip, pond_id).await
+}
+
+async fn destination_matches_commit_for_pond(
+    target: &Ship,
+    commit: &Commit,
+    pond_id: &str,
+) -> Result<bool, StewardError> {
+    let Some(index_bytes) = crate::content_tree::index_root_pointer_bytes(
+        target.data_persistence().table().clone(),
+        pond_id,
+    )
+    .await?
+    else {
+        return Ok(false);
+    };
+    let local_manifest_root = decode_manifest_root(&index_bytes).map_err(StewardError::Content)?;
+    if local_manifest_root != commit.manifest_root {
+        return Ok(false);
+    }
+
+    let store = crate::local_content::LocalContentStore::new(target.pond_path());
+    let mut editor = ManifestMapEditor::new(Some(local_manifest_root), |hash| {
+        store.read_string_error(hash)
+    });
+    let root = editor
+        .lookup(tinyfs::ROOT_UUID)
+        .map_err(StewardError::Content)?;
+    let Some(root) = root else {
+        return Err(StewardError::Content(
+            "destination manifest map has no root record".to_string(),
+        ));
+    };
+    Ok(root.entry.parent_node_id.is_empty()
+        && root.entry.name.is_empty()
+        && root.entry.entry_type == EntryType::DirectoryPhysical
+        && root.entry.child_hash == commit.root_tree_hash)
+}
+
+/// Authenticate an exact-identity no-op against the destination's
+/// authoritative reserved-index row and root manifest record.
+pub async fn authenticate_destination_publication_head(
+    target: &Ship,
+    state: &PublicationState,
+    commit: &Commit,
+    pond_id: &str,
+) -> Result<(), StewardError> {
+    if state.snapshot_tip != commit.hash() || state.manifest_root != commit.manifest_root {
+        return Err(StewardError::Content(
+            "authenticated publication state disagrees with its tip commit".to_string(),
+        ));
+    }
+    let index_bytes = crate::content_tree::index_root_pointer_bytes(
+        target.data_persistence().table().clone(),
+        pond_id,
+    )
+    .await?
+    .ok_or_else(|| {
+        StewardError::Content(format!(
+            "destination pond {pond_id} has no authoritative manifest-root index"
+        ))
+    })?;
+    let local_manifest_root = decode_manifest_root(&index_bytes).map_err(StewardError::Content)?;
+    if local_manifest_root != commit.manifest_root {
+        return Err(StewardError::Content(format!(
+            "destination pond {pond_id} manifest root {local_manifest_root} does not match \
+             authenticated publication root {}",
+            commit.manifest_root
+        )));
+    }
+    let store = crate::local_content::LocalContentStore::new(target.pond_path());
+    let mut editor = ManifestMapEditor::new(Some(local_manifest_root), |hash| {
+        store.read_string_error(hash)
+    });
+    let root = editor
+        .lookup(tinyfs::ROOT_UUID)
+        .map_err(StewardError::Content)?
+        .ok_or_else(|| {
+            StewardError::Content(format!(
+                "destination pond {pond_id} manifest map has no root record"
+            ))
+        })?;
+    if !root.entry.parent_node_id.is_empty()
+        || !root.entry.name.is_empty()
+        || root.entry.entry_type != EntryType::DirectoryPhysical
+        || root.entry.child_hash != commit.root_tree_hash
+    {
+        return Err(StewardError::Content(format!(
+            "destination pond {pond_id} roots do not match authenticated publication {}",
+            state.snapshot_tip
+        )));
+    }
+    Ok(())
+}
+
+/// Authenticate a graft no-op, including foreign roots, mount identity, and
+/// the durable content pin.
+pub async fn authenticate_graft_publication_head(
+    target: &mut Ship,
+    state: &PublicationState,
+    commit: &Commit,
+    name: &str,
+    mount_path: &str,
+) -> Result<(), StewardError> {
+    let foreign_id = state.pond_id.to_string();
+    authenticate_destination_publication_head(target, state, commit, &foreign_id).await?;
+    let (parent, leaf) = crate::split_mount_path(mount_path).map_err(StewardError::Content)?;
+    let expected_pin = crate::GraftPin {
+        foreign_pond_id: foreign_id.clone(),
+        mount_path: mount_path.to_string(),
+        pinned_tip: state.snapshot_tip.to_hex(),
+    };
+    let pin_path = crate::GraftPin::pin_path(name);
+    let tx = target
+        .begin_read(&PondUserMetadata::new(vec![
+            "pull".to_string(),
+            "authenticate-graft-noop".to_string(),
+            name.to_string(),
+        ]))
+        .await?;
+    let validation = async {
+        let root = tx.root().await?;
+        let parent = root.open_dir_path(parent).await.map_err(|error| {
+            StewardError::Content(format!(
+                "graft mount parent for {mount_path:?} is absent: {error}"
+            ))
+        })?;
+        let mount = parent.entry(leaf).await?.ok_or_else(|| {
+            StewardError::Content(format!("graft mount {mount_path:?} is absent"))
+        })?;
+        if mount.pond_id.as_deref() != Some(foreign_id.as_str())
+            || mount.child_node_id.to_string() != tinyfs::ROOT_UUID
+            || mount.entry_type != EntryType::DirectoryPhysical
+        {
+            return Err(StewardError::Content(format!(
+                "graft mount {mount_path:?} does not reference foreign pond {foreign_id}'s root"
+            )));
+        }
+        let pin_bytes = root
+            .read_file_path_to_vec(&pin_path)
+            .await
+            .map_err(|error| {
+                StewardError::Content(format!("read graft pin {pin_path:?}: {error}"))
+            })?;
+        let pin = crate::GraftPin::from_yaml_bytes(&pin_bytes).map_err(|error| {
+            StewardError::Content(format!("parse graft pin {pin_path:?}: {error}"))
+        })?;
+        if pin != expected_pin {
+            return Err(StewardError::Content(format!(
+                "graft pin {pin_path:?} does not match authenticated publication {}",
+                state.snapshot_tip
+            )));
+        }
+        Ok(())
+    }
+    .await;
+    let close = tx.commit().await;
+    validation?;
+    let _ = close?;
+    Ok(())
+}
+
+/// Authenticate that the destination's durable manifest-map transaction
+/// already represents the fetched publication tip.
+///
+/// Used only to recover the mirror apply/ack crash window. The comparison is
+/// against the verified remote commit's two content roots and the authoritative
+/// reserved index row, not a mutable control-table acknowledgement or cache.
+pub async fn destination_matches_publication(
+    target: &Ship,
+    graph: &FetchedGraph,
+) -> Result<bool, StewardError> {
+    let pond_id = target.data_persistence().pond_id().to_string();
+    destination_matches_publication_for_pond(target, graph, &pond_id).await
+}
+
+/// Authenticate that a fetched incremental publication window continues the
+/// exact durable consumer acknowledgement, including producer/ref identity,
+/// publication-record lineage, generations, commit ancestry, and both content
+/// roots at every published snapshot.
+pub fn authenticate_publication_window(
+    graph: &FetchedGraph,
+    acknowledged: &PublicationState,
+) -> Result<(), StewardError> {
+    let current = graph.publication_state.as_ref().ok_or_else(|| {
+        StewardError::Content("fetched graph has no publication state".to_string())
+    })?;
+    if current.pond_id != acknowledged.pond_id
+        || current.ref_name != acknowledged.ref_name
+        || current.format != acknowledged.format
+        || current.generation <= acknowledged.generation
+    {
+        return Err(StewardError::Content(
+            "fetched publication window does not continue the consumer acknowledgement".to_string(),
+        ));
+    }
+    let (boundary_hash, boundary) = graph.publication_boundary.as_ref().ok_or_else(|| {
+        StewardError::Content(
+            "fetched publication window has no authenticated acknowledgement boundary".to_string(),
+        )
+    })?;
+    if *boundary_hash != acknowledged.publication_record
+        || boundary.snapshot_tip != acknowledged.snapshot_tip
+        || boundary.manifest_root != acknowledged.manifest_root
+        || boundary.pond_id != acknowledged.pond_id
+        || boundary.ref_name != acknowledged.ref_name
+    {
+        return Err(StewardError::Content(
+            "fetched publication boundary does not match the exact consumer acknowledgement"
+                .to_string(),
+        ));
+    }
+    let generation_delta =
+        usize::try_from(current.generation - acknowledged.generation).map_err(|_| {
+            StewardError::Content("publication generation delta is invalid".to_string())
+        })?;
+    if graph.publication_records.len() != generation_delta {
+        return Err(StewardError::Content(format!(
+            "publication lineage contains {} record(s), but generations {} to {} require \
+             {generation_delta}",
+            graph.publication_records.len(),
+            acknowledged.generation,
+            current.generation
+        )));
+    }
+
+    let mut commit_indexes = Vec::new();
+    let mut prior_commit_index = 0usize;
+    for record in graph
+        .publication_records
+        .iter()
+        .map(|(_, record)| record)
+        .chain(std::iter::once(boundary))
+    {
+        let relative = graph.commits[prior_commit_index..]
+            .iter()
+            .position(|(hash, commit)| {
+                *hash == record.snapshot_tip && commit.manifest_root == record.manifest_root
+            })
+            .ok_or_else(|| {
+                StewardError::Content(format!(
+                    "publication record for snapshot {} is not bound to the fetched commit \
+                     ancestry and manifest root",
+                    record.snapshot_tip
+                ))
+            })?;
+        prior_commit_index += relative;
+        commit_indexes.push(prior_commit_index);
+        prior_commit_index = prior_commit_index.checked_add(1).ok_or_else(|| {
+            StewardError::Content("publication commit index overflow".to_string())
+        })?;
+    }
+    if commit_indexes.first().copied() != Some(0) {
+        return Err(StewardError::Content(
+            "publication head record is not bound to the fetched tip commit".to_string(),
+        ));
+    }
+    for (record_index, (_, record)) in graph.publication_records.iter().enumerate() {
+        let start = commit_indexes[record_index];
+        let parent = commit_indexes[record_index + 1];
+        if parent <= start {
+            return Err(StewardError::Content(
+                "publication records do not advance through distinct commit snapshots".to_string(),
+            ));
+        }
+        let expected = publication_delta_from_commits(
+            graph.commits[start..parent]
+                .iter()
+                .rev()
+                .map(|(_, commit)| commit),
+        )?;
+        require_record_matches_commit_delta(record, &expected)?;
+    }
+    Ok(())
+}
+
+/// Reconstruct and authenticate the structured publication boundary named
+/// only by a durable snapshot pin.
+///
+/// This is used for graft recovery after the structured acknowledgement was
+/// explicitly cleared. The active row's generation bounds the preceding fetch;
+/// this function then binds the located immutable publication record, commit,
+/// and manifest root before the pin may be used as an incremental boundary.
+pub fn authenticate_pinned_publication_boundary(
+    graph: &FetchedGraph,
+    pinned_tip: ObjectHash,
+) -> Result<PublicationState, StewardError> {
+    let current = graph.publication_state.as_ref().ok_or_else(|| {
+        StewardError::Content("fetched graph has no publication state".to_string())
+    })?;
+    let (record_hash, record) = graph.publication_boundary.as_ref().ok_or_else(|| {
+        StewardError::Content(format!(
+            "fetched publication window has no immutable record for pinned snapshot {pinned_tip}"
+        ))
+    })?;
+    if record.snapshot_tip != pinned_tip {
+        return Err(StewardError::Content(format!(
+            "fetched publication boundary {} does not match pinned snapshot {pinned_tip}",
+            record.snapshot_tip
+        )));
+    }
+    let newer = i64::try_from(graph.publication_records.len()).map_err(|_| {
+        StewardError::Content("publication window length does not fit i64".to_string())
+    })?;
+    let generation = current.generation.checked_sub(newer).ok_or_else(|| {
+        StewardError::Content("pinned publication generation underflow".to_string())
+    })?;
+    let boundary = PublicationState::new(
+        current.pond_id,
+        &current.ref_name,
+        record.snapshot_tip,
+        record.manifest_root,
+        *record_hash,
+        generation,
+        0,
+    )
+    .map_err(|error| StewardError::Content(error.to_string()))?;
+    authenticate_publication_window(graph, &boundary)?;
+    Ok(boundary)
+}
+
+/// Narrow an already authenticated publication window to the suffix after an
+/// applied snapshot pin.
+///
+/// The pin must name a newer immutable publication record inside the exact
+/// acknowledged window. Older, unrelated, or head pins are rejected.
+pub fn narrow_authenticated_publication_window(
+    graph: &FetchedGraph,
+    acknowledged: &PublicationState,
+    applied_tip: ObjectHash,
+) -> Result<(PublicationState, FetchedGraph), StewardError> {
+    authenticate_publication_window(graph, acknowledged)?;
+    if applied_tip == acknowledged.snapshot_tip {
+        return Ok((acknowledged.clone(), graph.clone()));
+    }
+    let record_index = graph
+        .publication_records
+        .iter()
+        .position(|(_, record)| record.snapshot_tip == applied_tip)
+        .ok_or_else(|| {
+            StewardError::Content(format!(
+                "graft pin {applied_tip} is not inside the authenticated publication window"
+            ))
+        })?;
+    if record_index == 0 {
+        return Err(StewardError::Content(format!(
+            "graft pin {applied_tip} already names the current publication"
+        )));
+    }
+    narrow_publication_window_at(graph, record_index)
+}
+
+#[derive(Default)]
+struct AuthenticatedPublicationDelta {
+    objects: BTreeSet<sync_store::content::ObjectDescriptor>,
+    packs: BTreeSet<PackDescriptor>,
+    changes: BTreeMap<String, ManifestChange>,
+}
+
+fn publication_delta_from_commits<'a>(
+    commits: impl IntoIterator<Item = &'a Commit>,
+) -> Result<AuthenticatedPublicationDelta, StewardError> {
+    let mut delta = AuthenticatedPublicationDelta::default();
+    for commit in commits {
+        let _ = delta
+            .objects
+            .insert(sync_store::content::ObjectDescriptor::new(
+                commit.hash(),
+                sync_store::content::ContentObjectKind::Commit,
+            ));
+        delta
+            .objects
+            .extend(commit.introduced_objects.iter().copied());
+        delta.packs.extend(commit.introduced_packs.iter().copied());
+        for change in &commit.manifest_changes {
+            let node_id = change.node_id().to_string();
+            match delta.changes.get_mut(&node_id) {
+                Some(existing) => {
+                    if existing.after != change.before {
+                        return Err(StewardError::Content(format!(
+                            "published commit deltas are discontinuous at node {node_id}"
+                        )));
+                    }
+                    existing.after = change.after.clone();
+                    if existing.before == existing.after {
+                        let _ = delta.changes.remove(&node_id);
+                    }
+                }
+                None => {
+                    let _ = delta.changes.insert(node_id, change.clone());
+                }
+            }
+        }
+    }
+    Ok(delta)
+}
+
+fn require_record_matches_commit_delta(
+    record: &PublicationRecord,
+    expected: &AuthenticatedPublicationDelta,
+) -> Result<(), StewardError> {
+    let objects = record
+        .introduced_objects
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if objects != expected.objects {
+        return Err(StewardError::Content(format!(
+            "publication record {} object inventory does not match its exact commit interval",
+            record.hash()
+        )));
+    }
+    let packs = record
+        .introduced_packs
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if packs != expected.packs {
+        return Err(StewardError::Content(format!(
+            "publication record {} pack inventory does not match its exact commit interval",
+            record.hash()
+        )));
+    }
+    let changes = record
+        .manifest_changes
+        .iter()
+        .cloned()
+        .map(|change| (change.node_id().to_string(), change))
+        .collect::<BTreeMap<_, _>>();
+    if changes != expected.changes {
+        return Err(StewardError::Content(format!(
+            "publication record {} manifest changes do not match its exact commit interval",
+            record.hash()
+        )));
+    }
+    Ok(())
+}
+
+/// When the destination already represents an intermediate publication in an
+/// authenticated fetched window, return that repaired frontier plus a graph
+/// narrowed to only the still-unapplied suffix.
+pub async fn recover_applied_publication(
+    target: &Ship,
+    graph: &FetchedGraph,
+    acknowledged: &PublicationState,
+) -> Result<Option<(PublicationState, FetchedGraph)>, StewardError> {
+    authenticate_publication_window(graph, acknowledged)?;
+    let current = graph.publication_state.as_ref().ok_or_else(|| {
+        StewardError::Content("fetched graph has no publication state".to_string())
+    })?;
+    if target.control_table().pond_id_uuid() != current.pond_id {
+        return Err(StewardError::Content(format!(
+            "destination pond {} does not match publication source pond {}",
+            target.control_table().pond_id_uuid(),
+            current.pond_id
+        )));
+    }
+
+    let pond_id = target.data_persistence().pond_id().to_string();
+    for (record_index, (_record_hash, record)) in
+        graph.publication_records.iter().enumerate().skip(1)
+    {
+        let Some(commit_index) = graph.commits.iter().position(|(hash, commit)| {
+            *hash == record.snapshot_tip && commit.manifest_root == record.manifest_root
+        }) else {
+            return Err(StewardError::Content(format!(
+                "intermediate publication {} is absent from the fetched commit ancestry",
+                record.snapshot_tip
+            )));
+        };
+        if !destination_matches_commit_for_pond(target, &graph.commits[commit_index].1, &pond_id)
+            .await?
+        {
+            continue;
+        }
+        return narrow_publication_window_at(graph, record_index).map(Some);
+    }
+    Ok(None)
+}
+
+fn narrow_publication_window_at(
+    graph: &FetchedGraph,
+    record_index: usize,
+) -> Result<(PublicationState, FetchedGraph), StewardError> {
+    let current = graph.publication_state.as_ref().ok_or_else(|| {
+        StewardError::Content("fetched graph has no publication state".to_string())
+    })?;
+    let (record_hash, record) = graph.publication_records.get(record_index).ok_or_else(|| {
+        StewardError::Content(format!(
+            "publication window has no record at index {record_index}"
+        ))
+    })?;
+    let commit_index = graph
+        .commits
+        .iter()
+        .position(|(hash, commit)| {
+            *hash == record.snapshot_tip && commit.manifest_root == record.manifest_root
+        })
+        .ok_or_else(|| {
+            StewardError::Content(format!(
+                "publication {} is absent from the fetched commit ancestry",
+                record.snapshot_tip
+            ))
+        })?;
+    let generation = current
+        .generation
+        .checked_sub(i64::try_from(record_index).map_err(|_| {
+            StewardError::Content("publication window index does not fit i64".to_string())
+        })?)
+        .ok_or_else(|| StewardError::Content("publication generation underflow".to_string()))?;
+    let boundary = PublicationState::new(
+        current.pond_id,
+        &current.ref_name,
+        record.snapshot_tip,
+        record.manifest_root,
+        *record_hash,
+        generation,
+        0,
+    )
+    .map_err(|error| StewardError::Content(error.to_string()))?;
+
+    let mut remaining = graph.clone();
+    remaining.commits.truncate(commit_index + 1);
+    remaining.publication_records.truncate(record_index);
+    remaining.publication_boundary = Some((*record_hash, record.clone()));
+    remaining.manifest_changes = squash_publication_changes(&remaining.publication_records)?;
+    remaining.manifest = remaining
+        .manifest_changes
+        .iter()
+        .filter_map(|change| change.after.as_ref().map(|after| after.entry.clone()))
+        .collect();
+    remaining.publication_packs.clear();
+    for (_, newer) in &remaining.publication_records {
+        for descriptor in &newer.introduced_packs {
+            remaining
+                .publication_packs
+                .entry(descriptor.series_hash)
+                .or_default()
+                .push(*descriptor);
+        }
+    }
+    for packs in remaining.publication_packs.values_mut() {
+        packs.sort_unstable();
+        packs.dedup();
+    }
+    Ok((boundary, remaining))
+}
+
 async fn import_pond_inner(
     target: &mut Ship,
     remote: &dyn ContentSource,
@@ -1205,45 +2855,87 @@ async fn import_pond_inner(
     let root = graph
         .root_tree_hash()
         .ok_or_else(|| StewardError::Content("cannot import an empty graph".to_string()))?;
-    if graph.manifest.is_empty() {
+    let tip_manifest_root = graph
+        .commits
+        .first()
+        .map(|(_, c)| c.manifest_root)
+        .ok_or_else(|| StewardError::Content("fetched graph has no tip commit".to_string()))?;
+    let foreign_id = foreign_pond_id.to_string();
+    if authenticated_zero_change_transition(graph)? {
+        if !destination_matches_publication_for_pond(target, graph, &foreign_id).await? {
+            return Err(StewardError::Content(
+                "authenticated zero-change publication does not match the imported foreign roots"
+                    .to_string(),
+            ));
+        }
+        if let Some(graft) = &graft {
+            let tx = target
+                .begin_write(&PondUserMetadata::new(vec![
+                    "pull".to_string(),
+                    "advance-graft-pin".to_string(),
+                ]))
+                .await?;
+            if let Err(error) = apply_graft_metadata(&tx, graft, &foreign_id, false).await {
+                return Err(tx.abort_preserving(error).await);
+            }
+            _ = tx.commit().await?;
+        }
+        let foreign_seq = graph
+            .commits
+            .first()
+            .map(|(_, commit)| commit.provenance.seq)
+            .unwrap_or(0);
+        target
+            .data_persistence_mut()
+            .sync_last_txn_seq(&foreign_id, foreign_seq);
+        return Ok(RebuildOutcome::default());
+    }
+    if graph.manifest.is_empty() && graph.manifest_changes.is_empty() {
         return Err(StewardError::Content(
             "fetched graph has no node manifest".to_string(),
         ));
     }
-    let tip_manifest_hash = graph
-        .commits
-        .first()
-        .map(|(_, c)| c.node_manifest_hash)
-        .ok_or_else(|| StewardError::Content("fetched graph has no tip commit".to_string()))?;
-    let tip_manifest_root = graph
-        .commits
-        .first()
-        .map(|(_, c)| c.node_manifest_root)
-        .ok_or_else(|| StewardError::Content("fetched graph has no tip commit".to_string()))?;
-
-    let foreign_id = foreign_pond_id.to_string();
-    let (target_nodes, target_series, target_series_leaves) =
-        crate::content_tree::build_target_state_for_pond(target, &foreign_id).await?;
+    if replace && !graph.manifest_complete {
+        return Err(StewardError::Content(
+            "scoped graft replacement requires a complete source graph".to_string(),
+        ));
+    }
+    let target_state = if graph.manifest_complete {
+        full_target_planning_state(target, &foreign_id, Some(foreign_pond_id)).await?
+    } else {
+        sparse_target_planning_state(target, graph, &foreign_id).await?
+    };
+    let mut prepared_graph = graph.clone();
+    align_series_fetches_to_target(remote, &mut prepared_graph, &target_state).await?;
+    let effective_graph = graph_with_effective_manifest(&prepared_graph, &target_state.nodes)?;
 
     // Reject a manifest that is inconsistent with the fetched tree closure
     // before any mutation (see verify_manifest_matches_tree).
-    verify_manifest_matches_tree(graph)?;
+    if graph.manifest_complete {
+        verify_manifest_matches_tree(&effective_graph)?;
+    }
 
-    let (ops, outcome) = if replace {
-        plan_full_replacement(graph, root, &target_nodes)?
+    let (ops, mut outcome) = if replace {
+        plan_full_replacement(&effective_graph, root, &target_state.nodes)?
     } else {
         plan_node_diff(
-            graph,
+            &effective_graph,
             root,
-            &target_nodes,
-            &target_series,
-            &target_series_leaves,
+            &target_state.nodes,
+            &target_state.directory_children,
+            &target_state.series_leaves,
+            &target_state.series_manifests,
         )?
     };
-    let mut pack_objects = prepare_pack_objects(&ops, graph, remote).await?;
+    outcome.local_cost = target_state.local_cost;
+    let mut pack_objects = prepare_pack_objects(&ops, &effective_graph, remote).await?;
 
-    let root_node_id = src_root_id(graph)?.to_string();
-    let first_import = target_nodes.is_empty();
+    let root_node_id = src_root_id(&effective_graph)?.to_string();
+    let first_import = target_state.nodes.is_empty();
+    let prior_index_bytes = (!replace)
+        .then_some(target_state.index_bytes.clone())
+        .flatten();
+    let pond_path = target.pond_path().to_path_buf();
     let tx = target
         .begin_write(&PondUserMetadata::new(vec![
             "pull".to_string(),
@@ -1261,97 +2953,42 @@ async fn import_pond_inner(
         };
         let root_wd = tx.wd(&foreign_np, foreign_np.clone()).await?;
         if let Some(graft) = &graft {
-            use tinyfs::EntryType;
-
-            let root = tx.root().await?;
-            let _ = root.create_dir_all(&graft.parent).await?;
-            let parent_wd = root.open_dir_path(&graft.parent).await?;
-            let foreign_node = tx.foreign_root_node(foreign_pond_id).await?;
-            if let Some(existing) = parent_wd.entry(&graft.leaf).await? {
-                let existing_pond = existing.pond_id.as_deref().ok_or_else(|| {
-                    StewardError::Aborted(format!(
-                        "mount path `{}/{}` contains local content; refusing scoped graft replacement",
-                        graft.parent, graft.leaf
-                    ))
-                })?;
-                if existing_pond != foreign_id {
-                    return Err(StewardError::Aborted(format!(
-                        "mount path `{}/{}` belongs to pond {}; refusing to replace graft {}",
-                        graft.parent, graft.leaf, existing_pond, foreign_id
-                    )));
-                }
-                if replace {
-                    parent_wd.remove_entry(&graft.leaf).await?;
-                    let _ = parent_wd.insert_node(&graft.leaf, foreign_node).await?;
-                } else if existing.child_node_id != foreign_node.id().node_id() {
-                    return Err(StewardError::Aborted(format!(
-                        "mount path `{}/{}` points to foreign node {} instead of root {}",
-                        graft.parent,
-                        graft.leaf,
-                        existing.child_node_id,
-                        foreign_node.id().node_id()
-                    )));
-                }
-            } else {
-                let _ = parent_wd.insert_node(&graft.leaf, foreign_node).await?;
-            }
-
-            let _ = root.create_dir_all(crate::SYS_DIR).await?;
-            let _ = root.create_dir_all(crate::SYS_GRAFTS_DIR).await?;
-            let pin_is_current = if root.exists(&graft.pin_path).await {
-                root.read_file_path_to_vec(&graft.pin_path).await? == graft.pin_yaml.as_bytes()
-            } else {
-                false
-            };
-            if !pin_is_current && root.exists(&graft.pin_path).await {
-                let grafts_dir = root.open_dir_path(crate::SYS_GRAFTS_DIR).await?;
-                grafts_dir.remove_entry(&graft.pin_name).await?;
-            }
-            if !pin_is_current {
-                let mut writer = root
-                    .async_writer_path_with_type(
-                        &graft.pin_path,
-                        EntryType::FilePhysicalVersion,
-                    )
-                    .await?;
-                writer.write_all(graft.pin_yaml.as_bytes()).await?;
-                writer.shutdown().await?;
-            }
+            apply_graft_metadata(&tx, graft, &foreign_id, replace).await?;
         }
         apply_ops(
             &root_node_id,
-            root_wd,
+            root_wd.clone(),
             &ops,
             remote,
-            graph,
+            &effective_graph,
             &mut pack_objects,
         )
         .await?;
-        let uncommitted = tx.state()?.uncommitted_live_rows().await?;
-        let committed_table = tx.data_persistence()?.table().clone();
-        crate::content_tree::in_txn_content_state(committed_table, uncommitted, &foreign_id).await
+        validate_and_stage_foreign_manifest(
+            &tx,
+            &root_wd,
+            &foreign_id,
+            &pond_path,
+            prior_index_bytes,
+            root,
+            tip_manifest_root,
+        )
+        .await
     }
     .await;
-    let preview = match apply_result {
-        Ok(preview) => preview,
-        Err(error) => return Err(tx.abort_preserving(error).await),
-    };
-    let validation = preview_validation_error(
-        graph,
-        &preview,
-        root,
-        tip_manifest_hash,
-        tip_manifest_root,
-        "imported foreign tree",
-    );
-    let validation = match validation {
-        Ok(validation) => validation,
-        Err(error) => return Err(tx.abort_preserving(error).await),
-    };
-    if let Some(error) = validation {
-        return Err(tx.abort(error).await);
+    if let Err(error) = apply_result {
+        return Err(tx.abort_preserving(error).await);
     }
     _ = tx.commit().await?;
+    let foreign_index_bytes = sync_store::content::encode_manifest_root(tip_manifest_root);
+    if let Err(error) = crate::local_content::LocalContentStore::new(&pond_path)
+        .write_manifest_root_cursor(&foreign_id, &foreign_index_bytes)
+    {
+        log::warn!(
+            "committed foreign manifest-root cursor could not be refreshed; the next pull will \
+             recover it from the reserved index: {error}"
+        );
+    }
 
     // Advance only the foreign pond's seq frontier so the local allocator stays
     // contiguous. The source tip is the newest commit even when the ancestry
@@ -1367,6 +3004,100 @@ async fn import_pond_inner(
 
     Ok(outcome)
 }
+
+async fn validate_and_stage_foreign_manifest(
+    tx: &crate::guard::StewardTransactionGuard<'_>,
+    foreign_root: &WD,
+    foreign_pond_id: &str,
+    pond_path: &std::path::Path,
+    prior_index_bytes: Option<Vec<u8>>,
+    expected_root_tree: ObjectHash,
+    expected_manifest_root: ObjectHash,
+) -> Result<(), StewardError> {
+    let uncommitted = tx.state()?.uncommitted_live_rows().await?;
+    let committed_table = tx.data_persistence()?.table().clone();
+    let inputs = crate::content_tree::incremental_spine_inputs_v2(
+        committed_table,
+        prior_index_bytes.clone(),
+        uncommitted,
+        foreign_pond_id,
+        pond_path,
+    )
+    .await?;
+    if inputs.root_tree_hash != expected_root_tree || inputs.manifest_root != expected_manifest_root
+    {
+        return Err(StewardError::Content(format!(
+            "imported foreign tree would produce root {} manifest {}, expected root {} manifest {}",
+            inputs.root_tree_hash, inputs.manifest_root, expected_root_tree, expected_manifest_root
+        )));
+    }
+
+    let local_store = crate::local_content::LocalContentStore::new(pond_path);
+    local_store.put_batch(&inputs.object_bytes)?;
+    local_store.put_batch(&inputs.pack_bytes)?;
+
+    if prior_index_bytes.as_deref() == Some(inputs.index_bytes.as_slice()) {
+        return Ok(());
+    }
+    let mut writer = if foreign_root.exists(tinyfs::INDEX_NODE_NAME).await {
+        foreign_root.async_writer_reserved_index().await?
+    } else {
+        let node_id = NodeID::from_hex_string(tinyfs::INDEX_NODE_UUID)
+            .map_err(|error| StewardError::Content(format!("reserved index node id: {error}")))?;
+        foreign_root
+            .create_file_with_id(tinyfs::INDEX_NODE_NAME, node_id)
+            .await?
+    };
+    writer.write_all(&inputs.index_bytes).await?;
+    writer.shutdown().await?;
+    Ok(())
+}
+
+fn graph_with_effective_manifest(
+    graph: &FetchedGraph,
+    target_nodes: &HashMap<String, ManifestEntry>,
+) -> Result<FetchedGraph, StewardError> {
+    if graph.manifest_complete {
+        return Ok(graph.clone());
+    }
+    let mut nodes = target_nodes.clone();
+    for change in &graph.manifest_changes {
+        let node_id = change.node_id();
+        if let Some(before) = &change.before {
+            let current = nodes.get(node_id).ok_or_else(|| {
+                StewardError::Content(format!(
+                    "incremental publication expects existing node {node_id}"
+                ))
+            })?;
+            if current != &before.entry {
+                return Err(StewardError::Content(format!(
+                    "incremental publication baseline for node {node_id} does not match the \
+                     consumer"
+                )));
+            }
+        } else if nodes.contains_key(node_id) {
+            return Err(StewardError::Content(format!(
+                "incremental publication creates already-present node {node_id}"
+            )));
+        }
+        match &change.after {
+            Some(after) => {
+                let _ = nodes.insert(node_id.to_string(), after.entry.clone());
+            }
+            None => {
+                let _ = nodes.remove(node_id);
+            }
+        }
+    }
+    let mut effective = graph.clone();
+    effective.manifest = nodes.into_values().collect();
+    effective
+        .manifest
+        .sort_by(|left, right| left.node_id.as_bytes().cmp(right.node_id.as_bytes()));
+    effective.manifest_complete = true;
+    Ok(effective)
+}
+
 fn src_root_id(graph: &FetchedGraph) -> Result<&str, StewardError> {
     graph
         .manifest
@@ -1374,210 +3105,6 @@ fn src_root_id(graph: &FetchedGraph) -> Result<&str, StewardError> {
         .find(|e| e.parent_node_id.is_empty() && e.name.is_empty())
         .map(|e| e.node_id.as_str())
         .ok_or_else(|| StewardError::Content("manifest has no root entry".to_string()))
-}
-
-fn first_replica_divergence(
-    graph: &FetchedGraph,
-    actual_nodes: &HashMap<String, ManifestEntry>,
-    actual_series: &HashMap<String, Vec<ObjectHash>>,
-) -> Result<Option<String>, StewardError> {
-    let mut expected_nodes: BTreeMap<&str, &ManifestEntry> = BTreeMap::new();
-    for entry in &graph.manifest {
-        if expected_nodes
-            .insert(entry.node_id.as_str(), entry)
-            .is_some()
-        {
-            return Ok(Some(format!(
-                "source manifest contains duplicate node {}",
-                entry.node_id
-            )));
-        }
-    }
-    let actual_nodes_sorted: BTreeMap<&str, &ManifestEntry> = actual_nodes
-        .values()
-        .map(|entry| (entry.node_id.as_str(), entry))
-        .collect();
-
-    for node_id in expected_nodes
-        .keys()
-        .chain(actual_nodes_sorted.keys())
-        .copied()
-        .collect::<BTreeSet<_>>()
-    {
-        let Some(expected) = expected_nodes.get(node_id) else {
-            let actual = actual_nodes_sorted[node_id];
-            return Ok(Some(format!(
-                "unexpected node {node_id} ({:?} {:?})",
-                actual.entry_type, actual.name
-            )));
-        };
-        let Some(actual) = actual_nodes_sorted.get(node_id) else {
-            return Ok(Some(format!(
-                "missing node {node_id} ({:?} {:?})",
-                expected.entry_type, expected.name
-            )));
-        };
-        if expected.parent_node_id != actual.parent_node_id {
-            return Ok(Some(format!(
-                "node {node_id} parent differs: expected {:?}, actual {:?}",
-                expected.parent_node_id, actual.parent_node_id
-            )));
-        }
-        if expected.name != actual.name {
-            return Ok(Some(format!(
-                "node {node_id} name differs: expected {:?}, actual {:?}",
-                expected.name, actual.name
-            )));
-        }
-        if expected.entry_type != actual.entry_type {
-            return Ok(Some(format!(
-                "node {node_id} type differs: expected {:?}, actual {:?}",
-                expected.entry_type, actual.entry_type
-            )));
-        }
-    }
-
-    for (node_id, expected) in &expected_nodes {
-        let actual = actual_nodes_sorted[node_id];
-        if matches!(
-            expected.entry_type,
-            EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries
-        ) {
-            let expected_versions = &series_v2(graph, expected.child_hash)?.leaf_hashes;
-            let actual_versions = actual_series
-                .get(*node_id)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            let compared = expected_versions.len().min(actual_versions.len());
-            for index in 0..compared {
-                if expected_versions[index] != actual_versions[index] {
-                    return Ok(Some(format!(
-                        "series node {node_id} ({:?}) leaf {index} differs: expected {}, actual {}",
-                        expected.name,
-                        expected_versions[index].to_hex(),
-                        actual_versions[index].to_hex()
-                    )));
-                }
-            }
-            if expected_versions.len() != actual_versions.len() {
-                return Ok(Some(format!(
-                    "series node {node_id} ({:?}) leaf count differs: expected {}, actual {}",
-                    expected.name,
-                    expected_versions.len(),
-                    actual_versions.len()
-                )));
-            }
-        } else if expected.entry_type != EntryType::DirectoryPhysical
-            && expected.child_hash != actual.child_hash
-        {
-            return Ok(Some(format!(
-                "node {node_id} ({:?}) content hash differs: expected {}, actual {}",
-                expected.name,
-                expected.child_hash.to_hex(),
-                actual.child_hash.to_hex()
-            )));
-        }
-
-        let compared = expected.versions.len().min(actual.versions.len());
-        for index in 0..compared {
-            let expected_meta = &expected.versions[index];
-            let actual_meta = &actual.versions[index];
-            if expected_meta.timestamp != actual_meta.timestamp {
-                return Ok(Some(format!(
-                    "node {node_id} ({:?}) version {index} timestamp differs: expected {:?}, actual {:?}",
-                    expected.name, expected_meta.timestamp, actual_meta.timestamp
-                )));
-            }
-            if expected_meta.min_event_time != actual_meta.min_event_time {
-                return Ok(Some(format!(
-                    "node {node_id} ({:?}) version {index} min_event_time differs: expected {:?}, actual {:?}",
-                    expected.name, expected_meta.min_event_time, actual_meta.min_event_time
-                )));
-            }
-            if expected_meta.max_event_time != actual_meta.max_event_time {
-                return Ok(Some(format!(
-                    "node {node_id} ({:?}) version {index} max_event_time differs: expected {:?}, actual {:?}",
-                    expected.name, expected_meta.max_event_time, actual_meta.max_event_time
-                )));
-            }
-            if expected_meta.extended_attributes != actual_meta.extended_attributes {
-                return Ok(Some(format!(
-                    "node {node_id} ({:?}) version {index} extended_attributes differ: expected {:?}, actual {:?}",
-                    expected.name,
-                    expected_meta.extended_attributes,
-                    actual_meta.extended_attributes
-                )));
-            }
-        }
-        if expected.versions.len() != actual.versions.len() {
-            return Ok(Some(format!(
-                "node {node_id} ({:?}) metadata count differs: expected {}, actual {}",
-                expected.name,
-                expected.versions.len(),
-                actual.versions.len()
-            )));
-        }
-    }
-
-    for (node_id, expected) in expected_nodes {
-        let actual = actual_nodes_sorted[node_id];
-        if expected.child_hash != actual.child_hash {
-            return Ok(Some(format!(
-                "directory node {node_id} ({:?}) derived hash differs: expected {}, actual {}",
-                expected.name,
-                expected.child_hash.to_hex(),
-                actual.child_hash.to_hex()
-            )));
-        }
-    }
-
-    Ok(None)
-}
-
-fn preview_validation_error(
-    graph: &FetchedGraph,
-    preview: &crate::content_tree::FoldedContentState,
-    expected_root: ObjectHash,
-    expected_manifest_hash: ObjectHash,
-    expected_manifest_root: ObjectHash,
-    label: &str,
-) -> Result<Option<String>, StewardError> {
-    let mismatch = if preview.root_tree_hash != expected_root {
-        Some(format!(
-            "{label} would fold to {} but the tip root tree is {}",
-            preview.root_tree_hash.to_hex(),
-            expected_root.to_hex()
-        ))
-    } else if preview.node_manifest_hash != expected_manifest_hash {
-        Some(format!(
-            "{label} node manifest would hash to {} but the tip commit's manifest is {}",
-            preview.node_manifest_hash.to_hex(),
-            expected_manifest_hash.to_hex()
-        ))
-    } else if preview.node_manifest_root != expected_manifest_root {
-        Some(format!(
-            "{label} node manifest Merkle root would be {} but the tip commit's root is {}",
-            preview.node_manifest_root.to_hex(),
-            expected_manifest_root.to_hex()
-        ))
-    } else {
-        None
-    };
-    let Some(mut mismatch) = mismatch else {
-        return Ok(None);
-    };
-
-    let actual_nodes: HashMap<String, ManifestEntry> = preview
-        .manifest
-        .iter()
-        .cloned()
-        .map(|entry| (entry.node_id.clone(), entry))
-        .collect();
-    match first_replica_divergence(graph, &actual_nodes, &preview.series_leaf_hashes)? {
-        Some(detail) => mismatch.push_str(&format!("; first divergence: {detail}")),
-        None => mismatch.push_str("; manifests match field-by-field"),
-    }
-    Ok(Some(mismatch))
 }
 
 /// Verify the fetched node manifest is structurally consistent with the fetched
@@ -1639,16 +3166,13 @@ fn verify_manifest_matches_tree(graph: &FetchedGraph) -> Result<(), StewardError
         .iter()
         .filter(|e| e.entry_type == EntryType::DirectoryPhysical)
     {
-        let tree_entries = match graph.objects.get(&dir.child_hash) {
-            Some(FetchedObject::Tree(entries)) => entries,
-            _ => {
-                return Err(StewardError::Content(format!(
-                    "directory node {} references {} which is not a tree object in the closure",
-                    dir.node_id,
-                    dir.child_hash.to_hex()
-                )));
-            }
-        };
+        let tree_entries = graph.trees.get(&dir.child_hash).ok_or_else(|| {
+            StewardError::Content(format!(
+                "directory node {} references {} which is not a tree object in the closure",
+                dir.node_id,
+                dir.child_hash.to_hex()
+            ))
+        })?;
         let mut expected: Vec<(&str, EntryType, ObjectHash)> = tree_entries
             .iter()
             .map(|t| (t.name.as_str(), t.entry_type, t.child_hash))
@@ -1801,6 +3325,7 @@ fn plan_full_replacement(
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &HashMap::new(),
     )?;
     deletes.append(&mut creates);
     Ok((deletes, outcome))
@@ -1810,8 +3335,9 @@ fn plan_node_diff(
     graph: &FetchedGraph,
     root: ObjectHash,
     target_nodes: &HashMap<String, ManifestEntry>,
-    target_series: &HashMap<String, Vec<ObjectHash>>,
+    target_directory_children: &HashMap<String, Vec<ManifestRecordChild>>,
     target_series_leaves: &HashMap<String, Vec<ObjectHash>>,
+    target_series_manifests: &HashMap<String, SeriesManifest>,
 ) -> Result<(Vec<ApplyOp>, RebuildOutcome), StewardError> {
     let root_id = src_root_id(graph)?.to_string();
 
@@ -1886,9 +3412,10 @@ fn plan_node_diff(
             .iter()
             .map(|entry| entry.name.clone())
             .chain(
-                target_nodes
-                    .values()
-                    .filter(|entry| entry.parent_node_id == parent_id)
+                target_directory_children
+                    .get(parent_id)
+                    .into_iter()
+                    .flatten()
                     .map(|entry| entry.name.clone()),
             )
             .collect();
@@ -1899,8 +3426,8 @@ fn plan_node_diff(
                 entry,
                 graph,
                 target_nodes,
-                target_series,
                 target_series_leaves,
+                target_series_manifests,
                 &mut ops,
                 &mut outcome,
             )?;
@@ -1918,8 +3445,8 @@ fn plan_one(
     entry: &ManifestEntry,
     graph: &FetchedGraph,
     target_nodes: &HashMap<String, ManifestEntry>,
-    _target_series: &HashMap<String, Vec<ObjectHash>>,
     target_series_leaves: &HashMap<String, Vec<ObjectHash>>,
+    target_series_manifests: &HashMap<String, SeriesManifest>,
     ops: &mut Vec<ApplyOp>,
     outcome: &mut RebuildOutcome,
 ) -> Result<(), StewardError> {
@@ -1989,34 +3516,36 @@ fn plan_one(
                 create,
                 entry_type: entry.entry_type,
                 versions,
-                collapse_first: false,
             });
         }
         EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries => {
             if create {
                 outcome.series += 1;
             }
-            let series = series_v2(graph, entry.child_hash)?;
-            let leaves_from = plan_series_v2_leaves(
-                entry,
-                series,
-                target_series_leaves,
-                existing.map(|t| t.child_hash),
-            )?;
-            // Always emit the op on create (adopting the node even
-            // if, defensively, it turned out to need no leaves), and
-            // otherwise only when there is a real suffix to append.
-            if create || leaves_from < series.leaf_hashes.len() as u64 {
-                ops.push(ApplyOp::SeriesV2 {
-                    parent: entry.parent_node_id.clone(),
-                    name: entry.name.clone(),
-                    node_id: entry.node_id.clone(),
-                    create,
-                    entry_type: entry.entry_type,
-                    manifest_hash: entry.child_hash,
-                    leaves_from,
-                    replicated_mtime: replicated_mtime(entry),
-                });
+            if needs_write {
+                let series = series_v2(graph, entry.child_hash)?;
+                let leaves_from = plan_series_v2_leaves(
+                    entry,
+                    series,
+                    target_series_leaves,
+                    target_series_manifests,
+                    existing.map(|t| t.child_hash),
+                )?;
+                // Always emit the op on create (adopting the node even
+                // if, defensively, it turned out to need no leaves), and
+                // otherwise only when there is a real suffix to append.
+                if create || leaves_from < series.manifest.leaf_count() {
+                    ops.push(ApplyOp::SeriesV2 {
+                        parent: entry.parent_node_id.clone(),
+                        name: entry.name.clone(),
+                        node_id: entry.node_id.clone(),
+                        create,
+                        entry_type: entry.entry_type,
+                        manifest_hash: entry.child_hash,
+                        leaves_from,
+                        replicated_mtime: replicated_mtime(entry),
+                    });
+                }
             }
         }
         EntryType::Symlink => {
@@ -2071,7 +3600,7 @@ fn replicated_mtime(entry: &ManifestEntry) -> Option<i64> {
     entry.versions.last().and_then(|meta| meta.timestamp)
 }
 
-/// Resolve a `watertown.series.v2` object to its verified [`FetchedSeriesV2`] state.
+/// Resolve a `watertown.series.v3` object to its verified [`FetchedSeriesV2`] state.
 ///
 /// # Errors
 ///
@@ -2080,23 +3609,22 @@ fn series_v2(
     graph: &FetchedGraph,
     series_hash: ObjectHash,
 ) -> Result<&FetchedSeriesV2, StewardError> {
-    match graph.objects.get(&series_hash) {
-        Some(FetchedObject::SeriesV2(series)) => Ok(series),
-        Some(_) => Err(StewardError::Content(format!(
-            "expected a watertown.series.v2 series at {} but found a different object shape",
-            series_hash.to_hex()
-        ))),
-        None => Err(StewardError::Content(format!(
-            "series object {} missing from graph",
-            series_hash.to_hex()
-        ))),
-    }
+    graph
+        .series
+        .get(&series_hash)
+        .map(Box::as_ref)
+        .ok_or_else(|| {
+            StewardError::Content(format!(
+                "series object {} missing from graph",
+                series_hash.to_hex()
+            ))
+        })
 }
 
 /// Decide the suffix of a v2 logical series' leaves the target still needs
 /// (release blocker item 1, `docs/logical-series-identity-design.md`).
 ///
-/// A `watertown.series.v2` series' `child_hash` is its manifest hash, which is a pure
+/// A `watertown.series.v3` series' `child_hash` is its manifest hash, which is a pure
 /// function of its whole logical content (leaf hashes, aggregate bounds,
 /// schema, attributes -- everything except mtime); an unchanged `child_hash`
 /// therefore means an unchanged logical state, full stop.
@@ -2109,38 +3637,146 @@ fn series_v2(
 ///
 /// # Errors
 ///
-/// Returns an error if the target's currently-held v2 leaf hashes are
-/// unknown for a node whose `child_hash` changed, or if they are not a
-/// prefix of the source's verified leaf hashes.
+/// Returns an error if the destination's persisted prior manifest does not
+/// equal the fetched suffix's authenticated base. Complete rebuilds may still
+/// compare full retained leaf lists; ordinary incremental pulls never do.
 fn plan_series_v2_leaves(
     entry: &ManifestEntry,
     series: &FetchedSeriesV2,
     target_series_leaves: &HashMap<String, Vec<ObjectHash>>,
+    target_series_manifests: &HashMap<String, SeriesManifest>,
     existing_child_hash: Option<ObjectHash>,
 ) -> Result<u64, StewardError> {
-    let incoming = &series.leaf_hashes;
     if let Some(child_hash) = existing_child_hash
         && child_hash == entry.child_hash
     {
-        return Ok(incoming.len() as u64);
+        return Ok(series.manifest.leaf_count());
     }
-    let held: &[ObjectHash] = match existing_child_hash {
-        None => &[],
-        Some(_) => target_series_leaves
-            .get(&entry.node_id)
-            .map(Vec::as_slice)
-            .ok_or_else(|| {
-                StewardError::Content(format!(
-                    "v2 series node {} changed but its current logical leaves are unknown",
-                    entry.node_id
-                ))
-            })?,
-    };
-    if incoming.len() < held.len() || incoming[..held.len()] != *held {
+
+    if existing_child_hash.is_none() {
+        if series.base_series_hash.is_some() || series.leaf_start != 0 {
+            return Err(StewardError::Content(format!(
+                "new v2 series node {} was fetched as only a suffix; a fresh node requires the \
+                 complete linked segment chain",
+                entry.node_id
+            )));
+        }
+        return Ok(0);
+    }
+
+    if let Some(held_manifest) = target_series_manifests.get(&entry.node_id) {
+        let held_hash = existing_child_hash.expect("checked Some above");
+        if held_manifest.hash() != held_hash {
+            return Err(StewardError::Content(format!(
+                "v2 series node {} prior manifest hashes to {}, expected {}",
+                entry.node_id,
+                held_manifest.hash(),
+                held_hash
+            )));
+        }
+        let held_count = held_manifest.leaf_count();
+        if held_count < series.leaf_start || held_count > series.manifest.leaf_count() {
+            return Err(StewardError::Content(format!(
+                "v2 series node {} holds {} leaves, but fetched authenticated coverage begins at \
+                 {} and ends at {}",
+                entry.node_id,
+                held_count,
+                series.leaf_start,
+                series.manifest.leaf_count()
+            )));
+        }
+        let prefix_len = usize::try_from(held_count - series.leaf_start).map_err(|_| {
+            StewardError::Content("series prefix length does not fit usize".to_string())
+        })?;
+        let base_frontier = match &series.base_manifest {
+            Some(base) if base.leaf_count() == series.leaf_start => base.merkle_frontier().clone(),
+            None if series.leaf_start == 0 => sync_store::content::MerkleFrontier::empty(),
+            _ => {
+                return Err(StewardError::Content(format!(
+                    "v2 series node {} has no authenticated frontier at fetched leaf {}",
+                    entry.node_id, series.leaf_start
+                )));
+            }
+        };
+        let reconstructed = base_frontier
+            .extended(&series.leaf_hashes[..prefix_len])
+            .map_err(StewardError::Content)?;
+        if reconstructed != *held_manifest.merkle_frontier() {
+            return Err(StewardError::Content(format!(
+                "v2 series node {} retained frontier does not match the fetched series prefix",
+                entry.node_id
+            )));
+        }
+        if held_manifest.payload_kind() != series.manifest.payload_kind() {
+            return Err(StewardError::Content(format!(
+                "v2 series node {} retained payload kind differs from the fetched series",
+                entry.node_id
+            )));
+        }
+        let mut logical_count = series
+            .base_manifest
+            .as_ref()
+            .map_or(0, SeriesManifest::logical_count);
+        let mut min_event_time = series
+            .base_manifest
+            .as_ref()
+            .and_then(SeriesManifest::min_event_time);
+        let mut max_event_time = series
+            .base_manifest
+            .as_ref()
+            .and_then(SeriesManifest::max_event_time);
+        let mut logical_attributes = series
+            .base_manifest
+            .as_ref()
+            .and_then(SeriesManifest::logical_attributes)
+            .map(<[u8]>::to_vec);
+        for descriptor in series
+            .packs
+            .iter()
+            .flat_map(|(_, pack)| pack.leaf_descriptors())
+            .take(prefix_len)
+        {
+            logical_count = logical_count
+                .checked_add(descriptor.logical_count())
+                .ok_or_else(|| {
+                    StewardError::Content(
+                        "series retained-prefix logical count overflows u64".to_string(),
+                    )
+                })?;
+            if let Some(value) = descriptor.min_event_time() {
+                min_event_time = Some(min_event_time.map_or(value, |current| current.min(value)));
+            }
+            if let Some(value) = descriptor.max_event_time() {
+                max_event_time = Some(max_event_time.map_or(value, |current| current.max(value)));
+            }
+            logical_attributes = descriptor.logical_attributes().map(<[u8]>::to_vec);
+        }
+        if held_manifest.logical_count() != logical_count
+            || held_manifest.min_event_time() != min_event_time
+            || held_manifest.max_event_time() != max_event_time
+            || held_manifest.logical_attributes() != logical_attributes.as_deref()
+        {
+            return Err(StewardError::Content(format!(
+                "v2 series node {} retained manifest metadata does not match the authenticated \
+                 fetched prefix",
+                entry.node_id
+            )));
+        }
+        return Ok(held_count);
+    }
+
+    let held = target_series_leaves.get(&entry.node_id).ok_or_else(|| {
+        StewardError::Content(format!(
+            "v2 series node {} changed without an authenticated prior manifest",
+            entry.node_id
+        ))
+    })?;
+    if series.leaf_start != 0
+        || series.leaf_hashes.len() < held.len()
+        || series.leaf_hashes[..held.len()] != *held
+    {
         return Err(StewardError::Content(format!(
-            "v2 series node {} diverged from its previously materialized logical leaves: a \
-             verified v2 series never rewrites or collapses leaf history, so this can only mean \
-             corruption or an unsupported non-append change",
+            "v2 series node {} diverged from its previously materialized logical leaves",
             entry.node_id
         )));
     }
@@ -2201,13 +3837,9 @@ async fn apply_ops(
                 create,
                 entry_type,
                 versions,
-                collapse_first,
             } => {
                 let pwd = parent_wd(&dir_wd, parent)?;
                 let mut remaining = versions.iter();
-                // A collapsing rewrite always targets an existing node, so its
-                // first version goes through the collapsing writer below, never
-                // the create path.
                 if *create {
                     // The first version is written through the writer returned
                     // at creation: a pending file has no row to re-resolve by
@@ -2219,14 +3851,6 @@ async fn apply_ops(
                             .await?;
                         write_version(pwd, name, writer, first, *entry_type, remote).await?;
                     }
-                } else if *collapse_first && let Some(first) = remaining.next() {
-                    // Replicate a source-side compaction: the first version
-                    // starts a fresh baseline and supersedes every version the
-                    // target already held, so its fold matches the source.
-                    let writer = pwd
-                        .async_writer_path_collapsing_with_type(name, *entry_type)
-                        .await?;
-                    write_version(pwd, name, writer, first, *entry_type, remote).await?;
                 }
                 for version in remaining {
                     let writer = pwd.async_writer_path_with_type(name, *entry_type).await?;
@@ -2402,6 +4026,7 @@ fn validate_inline_prefetch_size(inline_bytes: u64, limit: u64) -> Result<(), St
 /// there too. It never probes [`ContentSource::get_object`].
 struct PreparedPackObjects {
     uses: HashMap<ObjectHash, usize>,
+    inline_expected: HashSet<ObjectHash>,
     cache: HashMap<ObjectHash, VerifiedPackObject>,
 }
 
@@ -2414,13 +4039,23 @@ async fn prepare_pack_objects(
 ) -> Result<PreparedPackObjects, StewardError> {
     let plan = pack_object_plan(ops, graph)?;
     validate_inline_prefetch_size(plan.inline_bytes, MAX_INLINE_PACK_PREFETCH_BYTES)?;
-    let hashes = plan
-        .uses
-        .keys()
-        .copied()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
+    let mut hashes = Vec::new();
+    let threshold = u64::try_from(tlogfs::large_files::LARGE_FILE_THRESHOLD).unwrap_or(u64::MAX);
+    for hash in plan.uses.keys().copied().collect::<BTreeSet<_>>() {
+        let expected = plan.expected_lengths[&hash];
+        if let Some(actual) = remote.object_size(hash).await? {
+            if actual != expected {
+                return Err(StewardError::Content(format!(
+                    "physical object {hash} has receipt length {actual}, but its pack span \
+                     declares {expected}"
+                )));
+            }
+            if actual < threshold {
+                hashes.push(hash);
+            }
+        }
+    }
+    let inline_expected = hashes.iter().copied().collect::<HashSet<_>>();
     let mut cache = HashMap::new();
     if !hashes.is_empty() {
         let inline = remote
@@ -2442,7 +4077,7 @@ async fn prepare_pack_objects(
             })?;
             if actual_len != expected_len {
                 return Err(StewardError::Content(format!(
-                    "physical object {hash} has {actual_len} byte(s), but its v3 pack span declares \
+                    "physical object {hash} has {actual_len} byte(s), but its v4 pack span declares \
                      {expected_len}"
                 )));
             }
@@ -2457,6 +4092,7 @@ async fn prepare_pack_objects(
     }
     Ok(PreparedPackObjects {
         uses: plan.uses,
+        inline_expected,
         cache,
     })
 }
@@ -2593,7 +4229,7 @@ impl VerifiedPackObject {
     fn validate_len(&self, hash: ObjectHash, expected_len: u64) -> Result<(), StewardError> {
         if self.len() != expected_len {
             return Err(StewardError::Content(format!(
-                "physical object {hash} has {} byte(s), but its v3 pack span declares {expected_len}",
+                "physical object {hash} has {} byte(s), but its v4 pack span declares {expected_len}",
                 self.len()
             )));
         }
@@ -2609,6 +4245,11 @@ async fn ensure_pack_object<'a>(
     let hash = span.object_hash();
     let expected_len = span.physical_len();
     if let std::collections::hash_map::Entry::Vacant(entry) = prepared.cache.entry(hash) {
+        if prepared.inline_expected.contains(&hash) {
+            return Err(StewardError::Content(format!(
+                "inline physical object {hash} was omitted from the exact payload fetch"
+            )));
+        }
         let (file, len) = spool_external_object(remote, hash).await?;
         let object = VerifiedPackObject::File { file, len };
         let _ = entry.insert(object);
@@ -2661,7 +4302,7 @@ fn suffix_start_in_pack(pack: &PackIndex, leaves_from: u64) -> Result<(usize, u6
     Ok((skipped, logical_prefix))
 }
 
-/// Materialize a verified `watertown.series.v2` logical series into the destination
+/// Materialize a verified `watertown.series.v3` logical series into the destination
 /// as native tlogfs rows (release blocker item 1,
 /// `docs/logical-series-identity-design.md`).
 ///
@@ -2808,7 +4449,7 @@ fn descriptor_timestamp_column(descriptor: &PackLeafDescriptor) -> Result<String
     }
 }
 
-/// Materialize a `watertown.series.v2` `FilePhysicalSeries` whose manifest declares
+/// Materialize a `watertown.series.v3` `FilePhysicalSeries` whose manifest declares
 /// `leaf_count() == 0` (release blocker item 1,
 /// `docs/logical-series-identity-design.md`): a legitimately empty,
 /// metadata-only series that has never carried a logical leaf (for example a
@@ -2922,6 +4563,7 @@ async fn materialize_file_series_v2(
                         &mut node_created,
                         &mut leaf_index,
                         leaves_from,
+                        series.leaf_start,
                         &series.leaf_hashes,
                         &mut hasher,
                         &mut buffer,
@@ -2968,6 +4610,7 @@ async fn materialize_file_series_v2(
                             &mut node_created,
                             &mut leaf_index,
                             leaves_from,
+                            series.leaf_start,
                             &series.leaf_hashes,
                             &mut hasher,
                             &mut buffer,
@@ -3017,6 +4660,7 @@ async fn feed_file_chunk<'d>(
     node_created: &mut bool,
     leaf_index: &mut u64,
     leaves_from: u64,
+    leaf_hash_start: u64,
     leaf_hashes: &[ObjectHash],
     hasher: &mut Option<IncrementalFileLeafHasher>,
     buffer: &mut Option<Vec<u8>>,
@@ -3068,12 +4712,23 @@ async fn feed_file_chunk<'d>(
             let finished_hasher = hasher.take().expect("present, just written to");
             let d = current_descriptor.take().expect("present, just written to");
             let computed = finished_hasher.finish().map_err(StewardError::Content)?;
-            let idx = *leaf_index as usize;
+            let relative = leaf_index.checked_sub(leaf_hash_start).ok_or_else(|| {
+                StewardError::Content(format!(
+                    "file series leaf {} precedes fetched hash range starting at {leaf_hash_start}",
+                    *leaf_index
+                ))
+            })?;
+            let idx = usize::try_from(relative).map_err(|_| {
+                StewardError::Content(
+                    "file series relative leaf index does not fit in usize".to_string(),
+                )
+            })?;
             let expected = leaf_hashes.get(idx).copied().ok_or_else(|| {
                 StewardError::Content(format!(
-                    "file series leaf index {idx} has no expected hash (internal inconsistency: \
-                     {} leaf hash(es))",
-                    leaf_hashes.len()
+                    "file series leaf {} has no expected hash in fetched range \
+                     [{leaf_hash_start}, {})",
+                    *leaf_index,
+                    leaf_hash_start.saturating_add(leaf_hashes.len() as u64)
                 ))
             })?;
             if computed != expected {
@@ -3223,7 +4878,7 @@ async fn materialize_table_series_v2(
             let expected_rows = span.logical_end() - span.logical_start();
             if decoded_rows != expected_rows {
                 return Err(StewardError::Content(format!(
-                    "physical object {} decoded {decoded_rows} row(s), but its v3 pack span declares {}",
+                    "physical object {} decoded {decoded_rows} row(s), but its v4 pack span declares {}",
                     span.object_hash(),
                     expected_rows
                 )));
@@ -3276,6 +4931,7 @@ async fn materialize_table_series_v2(
                     &mut node_created,
                     &mut leaf_index,
                     leaves_from,
+                    series.leaf_start,
                     &series.leaf_hashes,
                     &mut current_descriptor,
                     &mut current_batches,
@@ -3327,6 +4983,7 @@ async fn feed_table_batch(
     node_created: &mut bool,
     leaf_index: &mut u64,
     leaves_from: u64,
+    leaf_hash_start: u64,
     leaf_hashes: &[ObjectHash],
     current_descriptor: &mut Option<usize>,
     current_batches: &mut Vec<RecordBatch>,
@@ -3393,12 +5050,24 @@ async fn feed_table_batch(
                 d.logical_attributes(),
             )
             .map_err(StewardError::Content)?;
-            let idx = *leaf_index as usize;
+            let relative = leaf_index.checked_sub(leaf_hash_start).ok_or_else(|| {
+                StewardError::Content(format!(
+                    "table series leaf {} precedes fetched hash range starting at \
+                     {leaf_hash_start}",
+                    *leaf_index
+                ))
+            })?;
+            let idx = usize::try_from(relative).map_err(|_| {
+                StewardError::Content(
+                    "table series relative leaf index does not fit in usize".to_string(),
+                )
+            })?;
             let expected = leaf_hashes.get(idx).copied().ok_or_else(|| {
                 StewardError::Content(format!(
-                    "table series leaf index {idx} has no expected hash (internal \
-                     inconsistency: {} leaf hash(es))",
-                    leaf_hashes.len()
+                    "table series leaf {} has no expected hash in fetched range \
+                     [{leaf_hash_start}, {})",
+                    *leaf_index,
+                    leaf_hash_start.saturating_add(leaf_hashes.len() as u64)
                 ))
             })?;
             if hash != expected {
@@ -3545,14 +5214,16 @@ fn target_path(node_id: &str, target_nodes: &HashMap<String, ManifestEntry>) -> 
 /// blobs (symlink targets, recipes); a large external blob has no buffered
 /// bytes and must be streamed instead (see [`version_source`]).
 fn blob_bytes(graph: &FetchedGraph, hash: ObjectHash) -> Result<Vec<u8>, StewardError> {
-    match graph.objects.get(&hash) {
-        Some(FetchedObject::Blob(bytes)) => Ok(bytes.clone()),
-        Some(FetchedObject::External) => Err(StewardError::Content(format!(
-            "object {} is a large external blob and cannot be buffered here",
+    if !graph.blob_hashes.contains(&hash) {
+        return Err(StewardError::Content(format!(
+            "blob object {} missing from graph",
             hash.to_hex()
-        ))),
-        Some(_) => Err(StewardError::Content(format!(
-            "expected a blob at {} but found a structured object",
+        )));
+    }
+    match graph.bytes.get(&hash) {
+        Some(bytes) => Ok(bytes.clone()),
+        None if graph.external_blobs.contains(&hash) => Err(StewardError::Content(format!(
+            "object {} is a large external blob and cannot be buffered here",
             hash.to_hex()
         ))),
         None => Err(StewardError::Content(format!(
@@ -3565,15 +5236,17 @@ fn blob_bytes(graph: &FetchedGraph, hash: ObjectHash) -> Result<Vec<u8>, Steward
 /// Resolve a file/series version blob to its apply-time source: buffered bytes
 /// for an inline small blob, or the hash for a large external blob to stream.
 fn version_source(graph: &FetchedGraph, hash: ObjectHash) -> Result<VersionSource, StewardError> {
-    match graph.objects.get(&hash) {
-        Some(FetchedObject::Blob(bytes)) => Ok(VersionSource::Inline(bytes.clone())),
-        Some(FetchedObject::External) => Ok(VersionSource::External(hash)),
-        Some(_) => Err(StewardError::Content(format!(
-            "expected a blob at {} but found a structured object",
-            hash.to_hex()
-        ))),
-        None => Err(StewardError::Content(format!(
+    if !graph.blob_hashes.contains(&hash) {
+        return Err(StewardError::Content(format!(
             "blob object {} missing from graph",
+            hash.to_hex()
+        )));
+    }
+    match graph.bytes.get(&hash) {
+        Some(bytes) => Ok(VersionSource::Inline(bytes.clone())),
+        None if graph.external_blobs.contains(&hash) => Ok(VersionSource::External(hash)),
+        None => Err(StewardError::Content(format!(
+            "blob object {} has no buffered or external payload",
             hash.to_hex()
         ))),
     }
@@ -3596,41 +5269,210 @@ fn planned_version(
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field};
-    use sync_store::content::{
-        ContentModelVersion, PackObjectSpan, Provenance, generate_range_proof, merkle_root,
-    };
+    use sync_store::ContentRemote;
+    use sync_store::content::{MerkleFrontier, PackObjectSpan, generate_range_proof};
+    use sync_store::testing::in_memory_remote_url;
+    use tempfile::tempdir;
+    use tokio::io::AsyncWriteExt;
+    use uuid::Uuid;
 
-    fn indexed_test_commit(parent: Option<ObjectHash>, seq: i64) -> Commit {
-        Commit::new(
-            ContentModelVersion::LogicalSeriesV2,
-            ObjectHash::of_bytes(b"root"),
-            parent,
-            ObjectHash::of_bytes(b"manifest"),
-            ObjectHash::of_bytes(b"manifest-root"),
-            Provenance {
-                pond_id: "test".to_string(),
-                seq,
-                time_micros: seq,
-                author: "test".to_string(),
-                request: "test".to_string(),
-            },
+    #[test]
+    fn publication_window_requires_strictly_advancing_snapshot_bindings() {
+        let pond = Uuid::new_v4();
+        let make_commit = |parent, seq| {
+            Commit::new(
+                sync_store::content::ContentModelVersion::PublicationV2,
+                ObjectHash::of_bytes(format!("tree-{seq}").as_bytes()),
+                parent,
+                ObjectHash::of_bytes(format!("manifest-{seq}").as_bytes()),
+                sync_store::content::Provenance {
+                    pond_id: pond.to_string(),
+                    seq,
+                    time_micros: seq,
+                    author: "test".to_string(),
+                    request: "test".to_string(),
+                },
+            )
+        };
+        let a = make_commit(None, 1);
+        let a_hash = a.hash();
+        let b = make_commit(Some(a_hash), 2);
+        let b_hash = b.hash();
+        let c = make_commit(Some(b_hash), 3);
+        let c_hash = c.hash();
+        let boundary = PublicationRecord::new(
+            pond,
+            "main",
+            a_hash,
+            a.manifest_root,
+            None,
+            vec![sync_store::content::ObjectDescriptor::new(
+                a_hash,
+                sync_store::content::ContentObjectKind::Commit,
+            )],
+            vec![],
+            vec![],
         )
+        .unwrap();
+        let duplicate = PublicationRecord::new(
+            pond,
+            "main",
+            c_hash,
+            c.manifest_root,
+            Some(boundary.hash()),
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let head = PublicationRecord::new(
+            pond,
+            "main",
+            c_hash,
+            c.manifest_root,
+            Some(duplicate.hash()),
+            vec![sync_store::content::ObjectDescriptor::new(
+                c_hash,
+                sync_store::content::ContentObjectKind::Commit,
+            )],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let acknowledged =
+            PublicationState::new(pond, "main", a_hash, a.manifest_root, boundary.hash(), 1, 1)
+                .unwrap();
+        let current =
+            PublicationState::new(pond, "main", c_hash, c.manifest_root, head.hash(), 3, 3)
+                .unwrap();
+        let graph = FetchedGraph {
+            tip: Some(c_hash),
+            publication_state: Some(current),
+            commits: vec![(c_hash, c), (b_hash, b), (a_hash, a)],
+            publication_records: vec![(head.hash(), head), (duplicate.hash(), duplicate)],
+            publication_boundary: Some((boundary.hash(), boundary)),
+            ..FetchedGraph::default()
+        };
+        let error = authenticate_publication_window(&graph, &acknowledged)
+            .expect_err("two generations must not bind the same commit");
+        assert!(
+            error
+                .to_string()
+                .contains("not bound to the fetched commit ancestry")
+                || error.to_string().contains("distinct commit snapshots"),
+            "{error}"
+        );
     }
 
     #[test]
-    fn indexed_ancestry_rejects_cycles() {
-        // ContentRemote validates key == hash(bytes), which makes a real
-        // content-addressed cycle computationally infeasible. Exercise the
-        // walk's independent cycle guard with a deliberately contract-
-        // violating map so a future alternate ContentSource cannot loop.
-        let first = ObjectHash::of_bytes(b"first");
-        let second = ObjectHash::of_bytes(b"second");
-        let mut index = HashMap::new();
-        let _ = index.insert(first, indexed_test_commit(Some(second), 2));
-        let _ = index.insert(second, indexed_test_commit(Some(first), 1));
-
-        let error = walk_indexed_ancestry(&index, first, None).expect_err("cycle must fail");
-        assert!(error.to_string().contains("cycle in remote commit index"));
+    fn publication_window_rejects_inventory_shifted_between_records() {
+        let pond = Uuid::new_v4();
+        let root = ObjectHash::of_bytes(b"tree");
+        let manifest = ObjectHash::of_bytes(b"manifest");
+        let make_commit = |parent, seq, object| {
+            Commit::new_with_delta(
+                sync_store::content::ContentModelVersion::PublicationV2,
+                root,
+                parent,
+                manifest,
+                vec![],
+                vec![sync_store::content::ObjectDescriptor::new(
+                    object,
+                    sync_store::content::ContentObjectKind::RawBlob,
+                )],
+                vec![],
+                sync_store::content::Provenance {
+                    pond_id: pond.to_string(),
+                    seq,
+                    time_micros: seq,
+                    author: "test".to_string(),
+                    request: "test".to_string(),
+                },
+            )
+            .unwrap()
+        };
+        let object_a = ObjectHash::of_bytes(b"a");
+        let object_b = ObjectHash::of_bytes(b"b");
+        let object_c = ObjectHash::of_bytes(b"c");
+        let a = make_commit(None, 1, object_a);
+        let a_hash = a.hash();
+        let b = make_commit(Some(a_hash), 2, object_b);
+        let b_hash = b.hash();
+        let c = make_commit(Some(b_hash), 3, object_c);
+        let c_hash = c.hash();
+        let boundary = PublicationRecord::new(
+            pond,
+            "main",
+            a_hash,
+            manifest,
+            None,
+            vec![
+                sync_store::content::ObjectDescriptor::new(
+                    a_hash,
+                    sync_store::content::ContentObjectKind::Commit,
+                ),
+                sync_store::content::ObjectDescriptor::new(
+                    object_a,
+                    sync_store::content::ContentObjectKind::RawBlob,
+                ),
+            ],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let b_record = PublicationRecord::new(
+            pond,
+            "main",
+            b_hash,
+            manifest,
+            Some(boundary.hash()),
+            vec![sync_store::content::ObjectDescriptor::new(
+                b_hash,
+                sync_store::content::ContentObjectKind::Commit,
+            )],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let c_record = PublicationRecord::new(
+            pond,
+            "main",
+            c_hash,
+            manifest,
+            Some(b_record.hash()),
+            vec![
+                sync_store::content::ObjectDescriptor::new(
+                    c_hash,
+                    sync_store::content::ContentObjectKind::Commit,
+                ),
+                sync_store::content::ObjectDescriptor::new(
+                    object_b,
+                    sync_store::content::ContentObjectKind::RawBlob,
+                ),
+                sync_store::content::ObjectDescriptor::new(
+                    object_c,
+                    sync_store::content::ContentObjectKind::RawBlob,
+                ),
+            ],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let acknowledged =
+            PublicationState::new(pond, "main", a_hash, manifest, boundary.hash(), 1, 1).unwrap();
+        let current =
+            PublicationState::new(pond, "main", c_hash, manifest, c_record.hash(), 3, 3).unwrap();
+        let graph = FetchedGraph {
+            tip: Some(c_hash),
+            publication_state: Some(current),
+            commits: vec![(c_hash, c), (b_hash, b), (a_hash, a)],
+            publication_records: vec![(c_record.hash(), c_record), (b_record.hash(), b_record)],
+            publication_boundary: Some((boundary.hash(), boundary)),
+            ..FetchedGraph::default()
+        };
+        let error = authenticate_publication_window(&graph, &acknowledged)
+            .expect_err("aggregate-equivalent shifted inventory must fail");
+        assert!(error.to_string().contains("object inventory"), "{error}");
     }
 
     #[test]
@@ -3657,7 +5499,7 @@ mod tests {
             None,
             None,
             None,
-            merkle_root(&leaves),
+            MerkleFrontier::from_leaves(&leaves),
         )
         .expect("manifest");
         let descriptors = vec![
@@ -3712,7 +5554,7 @@ mod tests {
         let error = object
             .validate_len(hash, 9)
             .expect_err("declared span length mismatch must fail");
-        assert!(error.to_string().contains("v3 pack span declares 9"));
+        assert!(error.to_string().contains("v4 pack span declares 9"));
     }
 
     #[test]
@@ -3732,5 +5574,260 @@ mod tests {
                 .to_string()
                 .contains("refusing before reading remote payloads")
         );
+    }
+
+    fn cost_series_node_id() -> NodeID {
+        NodeID::from_hex_string("00000000-0000-7700-8000-000000000777")
+            .expect("cost series node id")
+    }
+
+    async fn seed_cost_series(ship: &mut Ship, leaf_count: usize) {
+        assert!(leaf_count > 0);
+        let tx = ship
+            .begin_write(&PondUserMetadata::new(vec!["seed-cost-series".to_string()]))
+            .await
+            .expect("begin seed transaction");
+        let root = tx.root().await.expect("seed root");
+        let first = vec![b'a'];
+        let mut writer = root
+            .create_file_with_id("observations.series", cost_series_node_id())
+            .await
+            .expect("create seeded series");
+        writer.set_mtime(0);
+        writer.write_all(&first).await.expect("write first leaf");
+        writer.shutdown().await.expect("close first leaf");
+
+        let file_id = root
+            .get_node_path("/observations.series")
+            .await
+            .expect("seeded series path")
+            .id();
+        let mut cumulative = first.clone();
+        let mut hash_state = tlogfs::bao_outboard::IncrementalHashState::new();
+        hash_state.ingest(&first);
+        let mut outboard =
+            tlogfs::bao_outboard::SeriesOutboard::from_first_version_state(&hash_state, 1);
+        for index in 1..leaf_count {
+            let byte = vec![b'a' + u8::try_from(index % 26).expect("modulo fits")];
+            let pending_start = cumulative.len() / tlogfs::bao_outboard::BLOCK_SIZE
+                * tlogfs::bao_outboard::BLOCK_SIZE;
+            outboard = tlogfs::bao_outboard::SeriesOutboard::append_version(
+                &outboard,
+                &cumulative[pending_start..],
+                &byte,
+            );
+            cumulative.extend_from_slice(&byte);
+            tx.state()
+                .expect("seed state")
+                .store_file_content_ref(
+                    file_id,
+                    tlogfs::file_writer::ContentRef::Small(byte),
+                    tlogfs::file_writer::FileMetadata::Data,
+                    Some(i64::try_from(index + 1).expect("version fits")),
+                    Some(outboard.to_bytes()),
+                    None,
+                    Some(i64::try_from(index).expect("mtime fits")),
+                    None,
+                )
+                .await
+                .expect("store seeded leaf");
+        }
+        _ = tx.commit().await.expect("commit seeded series");
+    }
+
+    async fn append_cost_series(ship: &mut Ship, byte: u8) {
+        ship.write_transaction(
+            &PondUserMetadata::new(vec!["append-cost-series".to_string()]),
+            async move |transaction| {
+                let root = transaction.root().await?;
+                let mut writer = root
+                    .async_writer_path_with_type(
+                        "/observations.series",
+                        EntryType::FilePhysicalSeries,
+                    )
+                    .await?;
+                writer.write_all(&[byte]).await?;
+                writer.shutdown().await?;
+                Ok(())
+            },
+        )
+        .await
+        .expect("append cost series");
+    }
+
+    async fn write_cost_file(ship: &mut Ship) {
+        ship.write_transaction(
+            &PondUserMetadata::new(vec!["write-cost-file".to_string()]),
+            async move |transaction| {
+                let root = transaction.root().await?;
+                let mut writer = root
+                    .async_writer_path_with_type("/changed.txt", EntryType::FilePhysicalVersion)
+                    .await?;
+                writer.write_all(b"changed").await?;
+                writer.shutdown().await?;
+                Ok(())
+            },
+        )
+        .await
+        .expect("write cost file");
+    }
+
+    async fn cost_fixture(
+        label: &str,
+        leaf_count: usize,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Ship,
+        Ship,
+        ContentRemote,
+    ) {
+        let producer_dir = tempdir().expect("producer tempdir");
+        let consumer_dir = tempdir().expect("consumer tempdir");
+        let mut producer = Ship::create_pond(producer_dir.path().join("producer"), label)
+            .await
+            .expect("create producer");
+        let mut consumer = Ship::create_pond(consumer_dir.path().join("consumer"), label)
+            .await
+            .expect("create consumer");
+        seed_cost_series(&mut producer, leaf_count).await;
+        seed_cost_series(&mut consumer, leaf_count).await;
+        assert_eq!(
+            crate::compute_content_tree(&producer)
+                .await
+                .expect("producer root")
+                .root_tree_hash,
+            crate::compute_content_tree(&consumer)
+                .await
+                .expect("consumer root")
+                .root_tree_hash
+        );
+        let url = in_memory_remote_url(&format!("{label}-{}", Uuid::new_v4()));
+        let mut remote = ContentRemote::create_at_url(
+            &url,
+            producer.control_table().pond_id_uuid(),
+            HashMap::new(),
+        )
+        .await
+        .expect("create remote");
+        let _ = crate::push_content_to_remote(&producer, &mut remote, "main")
+            .await
+            .expect("publish baseline");
+        (producer_dir, consumer_dir, producer, consumer, remote)
+    }
+
+    #[tokio::test]
+    async fn unrelated_file_apply_does_not_scan_thousand_leaf_series() {
+        let (_producer_dir, _consumer_dir, mut producer, mut consumer, mut remote) =
+            cost_fixture("local-cost-unrelated", 1_000).await;
+        let baseline = remote
+            .current_publication("main")
+            .await
+            .expect("read baseline")
+            .expect("baseline state");
+        write_cost_file(&mut producer).await;
+        let _ = crate::push_content_to_remote(&producer, &mut remote, "main")
+            .await
+            .expect("publish file change");
+        let graph = fetch_object_graph_since(&remote, "main", Some(baseline.snapshot_tip))
+            .await
+            .expect("fetch file delta");
+        assert!(
+            graph
+                .objects
+                .values()
+                .all(|object| !matches!(object, FetchedObject::SeriesV2(_)))
+        );
+        let outcome = rebuild_pond(&mut consumer, &remote, &graph)
+            .await
+            .expect("apply file delta");
+        assert!(!outcome.local_cost.full_target_scan);
+        assert_eq!(outcome.local_cost.manifest_root_cursor_files_read, 1);
+        assert_eq!(outcome.local_cost.manifest_root_rows_read, 0);
+        assert_eq!(outcome.local_cost.series_manifests_read, 0);
+        assert_eq!(outcome.local_cost.retained_leaf_hashes_scanned, 0);
+        assert!(outcome.local_cost.manifest_records_loaded <= 3);
+        assert!(outcome.local_cost.manifest_nodes_read <= 8);
+    }
+
+    async fn one_leaf_append_cost(prior_leaves: usize) -> LocalPullCost {
+        let label = format!("local-cost-series-{prior_leaves}");
+        let (_producer_dir, _consumer_dir, mut producer, mut consumer, mut remote) =
+            cost_fixture(&label, prior_leaves).await;
+        let baseline = remote
+            .current_publication("main")
+            .await
+            .expect("read baseline")
+            .expect("baseline state");
+        append_cost_series(&mut producer, b'z').await;
+        let _ = crate::push_content_to_remote(&producer, &mut remote, "main")
+            .await
+            .expect("publish suffix");
+        let graph = fetch_object_graph_since(&remote, "main", Some(baseline.snapshot_tip))
+            .await
+            .expect("fetch suffix");
+        let series = graph
+            .objects
+            .values()
+            .find_map(|object| match object {
+                FetchedObject::SeriesV2(series) => Some(series),
+                _ => None,
+            })
+            .expect("fetched series");
+        assert_eq!(series.leaf_start, prior_leaves as u64);
+        assert_eq!(series.leaf_hashes.len(), 1);
+        rebuild_pond(&mut consumer, &remote, &graph)
+            .await
+            .expect("apply suffix")
+            .local_cost
+    }
+
+    #[tokio::test]
+    async fn missing_manifest_cursor_recovers_with_one_latest_index_row() {
+        let (_producer_dir, _consumer_dir, mut producer, mut consumer, mut remote) =
+            cost_fixture("local-cost-cursor-recovery", 100).await;
+        let baseline = remote
+            .current_publication("main")
+            .await
+            .expect("read baseline")
+            .expect("baseline state");
+        let cursor = crate::get_data_path(consumer.pond_path())
+            .join("_content/v2/state/manifest-root")
+            .join(format!("pond={}", consumer.control_table().pond_id_uuid()));
+        std::fs::remove_file(cursor).expect("remove local manifest cursor");
+
+        append_cost_series(&mut producer, b'z').await;
+        let _ = crate::push_content_to_remote(&producer, &mut remote, "main")
+            .await
+            .expect("publish suffix");
+        let graph = fetch_object_graph_since(&remote, "main", Some(baseline.snapshot_tip))
+            .await
+            .expect("fetch suffix");
+        let cost = rebuild_pond(&mut consumer, &remote, &graph)
+            .await
+            .expect("apply suffix")
+            .local_cost;
+        assert!(!cost.full_target_scan);
+        assert_eq!(cost.manifest_root_cursor_files_read, 0);
+        assert_eq!(cost.manifest_root_rows_read, 1);
+        assert_eq!(cost.retained_leaf_hashes_scanned, 0);
+    }
+
+    #[tokio::test]
+    async fn one_leaf_append_local_cost_is_fixed_after_1_100_1000_leaves() {
+        let one = one_leaf_append_cost(1).await;
+        let hundred = one_leaf_append_cost(100).await;
+        let thousand = one_leaf_append_cost(1_000).await;
+        for cost in [one, hundred, thousand] {
+            assert!(!cost.full_target_scan, "{cost:?}");
+            assert_eq!(cost.manifest_root_cursor_files_read, 1, "{cost:?}");
+            assert_eq!(cost.manifest_root_rows_read, 0, "{cost:?}");
+            assert_eq!(cost.series_manifests_read, 1, "{cost:?}");
+            assert_eq!(cost.retained_leaf_hashes_scanned, 0, "{cost:?}");
+            assert!(cost.manifest_records_loaded <= 3, "{cost:?}");
+            assert!(cost.manifest_nodes_read <= 8, "{cost:?}");
+        }
+        assert_eq!(one, hundred);
+        assert_eq!(one, thousand);
     }
 }

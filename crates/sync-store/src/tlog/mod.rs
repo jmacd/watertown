@@ -61,10 +61,9 @@ mod tests {
 
     fn commit(seq: i64, root_byte: u8) -> Commit {
         Commit::new(
-            ContentModelVersion::LogicalSeriesV2,
+            ContentModelVersion::PublicationV2,
             ObjectHash::of_bytes(&[root_byte]),
             None,
-            ObjectHash::of_bytes(b"manifest"),
             ObjectHash::of_bytes(b"manifest-root"),
             Provenance {
                 pond_id: "pond".to_string(),

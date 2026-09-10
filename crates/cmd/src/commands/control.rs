@@ -801,12 +801,23 @@ async fn set_pond_config(
     key: &str,
     value: &str,
 ) -> Result<()> {
+    validate_config_write(key)?;
     control_table
         .set_setting(key, value)
         .await
         .map_err(|e| anyhow!("Failed to set setting: {}", e))?;
 
     println!("[OK] Set '{}' = '{}'", key, value);
+    Ok(())
+}
+
+fn validate_config_write(key: &str) -> Result<()> {
+    if key == "post_commit_dispatch" {
+        return Err(anyhow!(
+            "`post_commit_dispatch` is safety-gated and cannot be set through raw config; use \
+             `pond capsule activate` to enable a restored pond after preflight"
+        ));
+    }
     Ok(())
 }
 
@@ -1030,5 +1041,12 @@ mod tests {
         let truncated = truncate_error(&long);
         assert!(truncated.ends_with("..."));
         assert!(truncated.len() <= 103); // 100 + "..."
+    }
+
+    #[test]
+    fn post_commit_dispatch_is_not_raw_configurable() {
+        let error = validate_config_write("post_commit_dispatch").expect_err("safety gate");
+        assert!(error.to_string().contains("pond capsule activate"));
+        validate_config_write("hostmount_path").expect("ordinary setting");
     }
 }

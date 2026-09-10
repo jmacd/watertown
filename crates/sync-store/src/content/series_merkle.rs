@@ -4,17 +4,14 @@
 //! hashes, and contiguous range membership proofs over it.
 //!
 //! `docs/logical-series-identity-design.md` delivery gate 2. This module
-//! knows nothing about `watertown.series.v2` root objects, `watertown.series-pack.v2` pack
+//! knows nothing about `watertown.series.v3` root objects, `watertown.series-pack.v4` pack
 //! indexes, Parquet, or Bao; it is pure, order-sensitive Merkle math over an
 //! already-computed ordered list of leaf hashes (each produced by
 //! [`super::series_leaf::table_leaf_hash`] or
-//! [`super::series_leaf::file_leaf_hash`]). It is deliberately **not** the
-//! same construction as [`super::node_merkle`]: that module is a *sparse*,
-//! key-addressed tree over the unordered node manifest, sized for point
-//! updates; this one is a *dense*, position-addressed tree over an ordered
-//! append-only sequence, sized for contiguous range proofs. The two must
-//! never be confused, so this module mints its own domain tags rather than
-//! reusing [`super::node_merkle`]'s.
+//! [`super::series_leaf::file_leaf_hash`]). It is deliberately distinct from
+//! the persistent node-identity Patricia map: this is a dense,
+//! position-addressed tree over an ordered append-only sequence, sized for
+//! contiguous range proofs. The constructions use separate domain tags.
 //!
 //! # Construction
 //!
@@ -76,10 +73,8 @@
 
 use super::{Cursor, ObjectHash};
 
-/// Domain prefix for every hash this module computes. Distinct from
-/// [`super::series_leaf`]'s and [`super::node_merkle`]'s own tags so no two
-/// modules' preimages can ever collide even if, by coincidence, they were fed
-/// identical bytes.
+/// Domain prefix for every hash this module computes. Distinct from the
+/// series-leaf and manifest-map tags so no modules' preimages can collide.
 const MERKLE_DOMAIN: &[u8] = b"watertown.series-merkle.v1\n";
 
 /// Domain tag for the empty tree (`n = 0`).
@@ -124,6 +119,152 @@ fn interior_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrontierPeak {
+    count: u64,
+    hash: ObjectHash,
+}
+
+/// Compact append frontier for an ordered logical-series Merkle tree.
+///
+/// The peaks are the left-to-right perfect subtrees selected by the set bits
+/// of [`Self::leaf_count`], largest first. Their count is therefore bounded by
+/// 64, regardless of series age. Appending one logical leaf merges only the
+/// trailing equal-sized peaks, and the complete RFC-6962 root is recovered by
+/// folding the peaks right-to-left.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MerkleFrontier {
+    leaf_count: u64,
+    peaks: Vec<FrontierPeak>,
+}
+
+impl MerkleFrontier {
+    /// Empty-series frontier.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Build a compact frontier from an ordered complete leaf sequence.
+    ///
+    /// Explicit full materialization and verification use this path. Ordinary
+    /// append commits instead decode the prior manifest's frontier and append
+    /// only the new suffix.
+    #[must_use]
+    pub fn from_leaves(leaves: &[ObjectHash]) -> Self {
+        let mut frontier = Self::empty();
+        for &leaf in leaves {
+            frontier
+                .append(leaf)
+                .expect("a slice length always fits in u64 on supported platforms");
+        }
+        frontier
+    }
+
+    /// Reconstruct and validate a frontier from its canonical peak hashes.
+    ///
+    /// `peak_hashes` must contain exactly one hash for every set bit in
+    /// `leaf_count`, ordered by descending subtree size.
+    pub fn from_peak_hashes(leaf_count: u64, peak_hashes: Vec<ObjectHash>) -> Result<Self, String> {
+        let counts = frontier_peak_counts(leaf_count);
+        if counts.len() != peak_hashes.len() {
+            return Err(format!(
+                "series Merkle frontier for {leaf_count} leaves needs {} peak(s), got {}",
+                counts.len(),
+                peak_hashes.len()
+            ));
+        }
+        Ok(Self {
+            leaf_count,
+            peaks: counts
+                .into_iter()
+                .zip(peak_hashes)
+                .map(|(count, hash)| FrontierPeak { count, hash })
+                .collect(),
+        })
+    }
+
+    /// Number of logical leaves represented by this frontier.
+    #[must_use]
+    pub fn leaf_count(&self) -> u64 {
+        self.leaf_count
+    }
+
+    /// Canonical left-to-right peak hashes, largest subtree first.
+    #[must_use]
+    pub fn peak_hashes(&self) -> Vec<ObjectHash> {
+        self.peaks.iter().map(|peak| peak.hash).collect()
+    }
+
+    /// Append one logical leaf hash.
+    pub fn append(&mut self, leaf: ObjectHash) -> Result<(), String> {
+        let next_count = self
+            .leaf_count
+            .checked_add(1)
+            .ok_or_else(|| "series Merkle frontier leaf count overflow".to_string())?;
+        let mut carry = FrontierPeak {
+            count: 1,
+            hash: ObjectHash::from_bytes(leaf_node_hash(leaf.as_bytes())),
+        };
+        while self
+            .peaks
+            .last()
+            .is_some_and(|peak| peak.count == carry.count)
+        {
+            let left = self.peaks.pop().expect("checked above");
+            carry = FrontierPeak {
+                count: carry
+                    .count
+                    .checked_mul(2)
+                    .ok_or_else(|| "series Merkle frontier peak size overflow".to_string())?,
+                hash: ObjectHash::from_bytes(interior_hash(
+                    left.hash.as_bytes(),
+                    carry.hash.as_bytes(),
+                )),
+            };
+        }
+        self.peaks.push(carry);
+        self.leaf_count = next_count;
+        debug_assert_eq!(
+            self.peaks.iter().map(|peak| peak.count).collect::<Vec<_>>(),
+            frontier_peak_counts(self.leaf_count)
+        );
+        Ok(())
+    }
+
+    /// Return a frontier extended by `leaves`, leaving `self` unchanged.
+    pub fn extended(&self, leaves: &[ObjectHash]) -> Result<Self, String> {
+        let mut next = self.clone();
+        for &leaf in leaves {
+            next.append(leaf)?;
+        }
+        Ok(next)
+    }
+
+    /// Complete RFC-6962-shaped root represented by this frontier.
+    #[must_use]
+    pub fn root(&self) -> ObjectHash {
+        let Some(last) = self.peaks.last() else {
+            return ObjectHash::from_bytes(empty_root());
+        };
+        let mut root = last.hash;
+        for peak in self.peaks[..self.peaks.len() - 1].iter().rev() {
+            root = ObjectHash::from_bytes(interior_hash(peak.hash.as_bytes(), root.as_bytes()));
+        }
+        root
+    }
+}
+
+fn frontier_peak_counts(mut leaf_count: u64) -> Vec<u64> {
+    let mut counts = Vec::with_capacity(leaf_count.count_ones() as usize);
+    while leaf_count != 0 {
+        let count = 1u64 << (63 - leaf_count.leading_zeros());
+        counts.push(count);
+        leaf_count -= count;
+    }
+    counts
+}
+
 /// The RFC 6962 split point for a node covering `n > 1` leaves: the largest
 /// power of two strictly less than `n`.
 fn split_point(n: u64) -> u64 {
@@ -154,7 +295,7 @@ fn subtree_hash(leaves: &[ObjectHash]) -> [u8; 32] {
 /// interior preimage.
 #[must_use]
 pub fn merkle_root(leaves: &[ObjectHash]) -> ObjectHash {
-    ObjectHash::from_bytes(subtree_hash(leaves))
+    MerkleFrontier::from_leaves(leaves).root()
 }
 
 /// One sibling subtree entry in a [`RangeProof`]: the canonical tree node
@@ -236,6 +377,7 @@ pub fn generate_range_proof(
     if start >= end {
         return Err(format!("range must be nonempty: start={start} end={end}"));
     }
+
     if end > total {
         return Err(format!("range end {end} exceeds total leaf count {total}"));
     }
@@ -249,6 +391,51 @@ pub fn generate_range_proof(
         &mut nodes,
     );
     Ok(RangeProof { nodes })
+}
+
+/// Generate the canonical range proof for appending a nonempty suffix to a
+/// compact prior frontier.
+///
+/// The proven range is
+/// `[prefix.leaf_count(), prefix.leaf_count() + suffix_leaf_count)`. Because
+/// it reaches the new series tip, every proof node lies in the old prefix and
+/// is already one of `prefix`'s bounded peaks. No historical leaf list is
+/// scanned or rebuilt.
+///
+/// # Errors
+///
+/// Returns an error for an empty suffix or a leaf-count overflow.
+pub fn generate_append_range_proof(
+    prefix: &MerkleFrontier,
+    suffix_leaf_count: usize,
+) -> Result<RangeProof, String> {
+    if suffix_leaf_count == 0 {
+        return Err("append range must contain at least one leaf".to_string());
+    }
+    let suffix_leaf_count = u64::try_from(suffix_leaf_count)
+        .map_err(|_| "append suffix leaf count exceeds u64::MAX".to_string())?;
+    let total = prefix
+        .leaf_count
+        .checked_add(suffix_leaf_count)
+        .ok_or_else(|| "append range total leaf count overflow".to_string())?;
+    let mut start = 0u64;
+    let nodes = prefix
+        .peaks
+        .iter()
+        .map(|peak| {
+            let node = ProofNode {
+                start,
+                count: peak.count,
+                hash: peak.hash,
+            };
+            start += peak.count;
+            node
+        })
+        .collect::<Vec<_>>();
+    debug_assert_eq!(start, prefix.leaf_count);
+    let proof = RangeProof { nodes };
+    validate_range_proof_shape(&proof, total, prefix.leaf_count, total)?;
+    Ok(proof)
 }
 
 /// Mirrors [`collect_positions`]'s recursion, but also computes and emits
@@ -569,6 +756,52 @@ mod tests {
         let before = merkle_root(&leaves(&["a", "b", "c"]));
         let after = merkle_root(&leaves(&["a", "b", "c", "d"]));
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn compact_frontier_matches_direct_tree_and_round_trips_peaks() {
+        let leaves = (0..1_000)
+            .map(|index| h(&format!("leaf-{index}")))
+            .collect::<Vec<_>>();
+        for count in [0usize, 1, 2, 3, 7, 8, 31, 100, 999, 1_000] {
+            let frontier = MerkleFrontier::from_leaves(&leaves[..count]);
+            assert_eq!(
+                frontier.root(),
+                ObjectHash::from_bytes(subtree_hash(&leaves[..count]))
+            );
+            assert_eq!(
+                MerkleFrontier::from_peak_hashes(frontier.leaf_count(), frontier.peak_hashes())
+                    .unwrap(),
+                frontier
+            );
+        }
+    }
+
+    #[test]
+    fn append_proof_uses_only_prior_frontier_peaks() {
+        let leaves = (0..128)
+            .map(|index| h(&format!("leaf-{index}")))
+            .collect::<Vec<_>>();
+        for prefix_count in 0..120 {
+            for suffix_count in 1..=8 {
+                let end = prefix_count + suffix_count;
+                let prefix = MerkleFrontier::from_leaves(&leaves[..prefix_count]);
+                let compact = generate_append_range_proof(&prefix, suffix_count).unwrap();
+                let full = generate_range_proof(&leaves[..end], prefix_count, end).unwrap();
+                assert_eq!(compact, full);
+                assert_eq!(
+                    verify_range_proof(
+                        end,
+                        prefix_count,
+                        end,
+                        &leaves[prefix_count..end],
+                        &compact,
+                    )
+                    .unwrap(),
+                    merkle_root(&leaves[..end])
+                );
+            }
+        }
     }
 
     #[test]

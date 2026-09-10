@@ -147,8 +147,9 @@ impl OpLogFile {
     ///
     /// When `collapse_prior` is set the writer starts a fresh content/bao
     /// baseline (no resume from the previous version) and, at shutdown, stamps a
-    /// `collapsed_through` sentinel so every earlier version is superseded --
-    /// used to replicate a source-side series compaction during content pull.
+    /// `collapsed_through` sentinel so every earlier version is superseded.
+    /// Native-v2 reaches this only through TinyFS's validated reserved-index
+    /// writer; public user-series path writes are rejected.
     async fn build_writer(
         &self,
         collapse_prior: bool,
@@ -596,8 +597,8 @@ impl AsyncWrite for OpLogFileWriter {
                                 // Get bao_outboard from metadata instead of separate method
                                 state.metadata(file_id).await.ok().and_then(|meta| meta.bao_outboard)
                             } else {
-                                // First version, or a collapsing write that starts a
-                                // fresh baseline replacing all prior versions.
+                                // First version, or the reserved index's bounded
+                                // rewrite that replaces its prior pointer.
                                 None
                             };
 
@@ -722,8 +723,7 @@ impl AsyncWrite for OpLogFileWriter {
                         _ => crate::file_writer::FileMetadata::Data,
                     };
 
-                    // A pull replicating a source-side collapse marks the merged
-                    // version as superseding every earlier one it wrote.
+                    // The reserved index rewrite supersedes every prior pointer.
                     let collapsed_through = collapse_prior.then(|| allocated_version - 1);
 
                     state.store_file_content_ref(file_id, content_ref, metadata, Some(allocated_version), bao_outboard, collapsed_through, precomputed_mtime, precomputed_exact_attributes).await

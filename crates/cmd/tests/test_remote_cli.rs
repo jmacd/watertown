@@ -7,12 +7,13 @@
 //! library entry points (no spawned subprocesses).
 
 use cmd::commands::{
-    add_backup_command, add_remote_command, init_command, list_remotes_command, pull_command,
-    push_command, remote::remote_config_path, status_command, verify_command,
+    add_backup_command, add_remote_command, capsule_publish_command, init_command,
+    list_remotes_command, publish_consolidated_packs_command, pull_command, push_command,
+    remote::remote_config_path, status_command, verify_command,
 };
 use cmd::common::ShipContext;
 use std::sync::Once;
-use steward::{PondUserMetadata, REMOTE_MODE_PREFIX, REMOTE_MOUNT_PATH_PREFIX};
+use steward::{PondUserMetadata, REMOTE_MODE_PREFIX, REMOTE_MOUNT_PATH_PREFIX, read_pull_ack};
 use tempfile::TempDir;
 use tinyfs::EntryType;
 use tokio::io::AsyncWriteExt;
@@ -63,6 +64,44 @@ async fn write_small_file(
     Ok(())
 }
 
+async fn append_small_series(ctx: &ShipContext, path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    let mut ship = ctx.open_pond().await?;
+    let bytes = bytes.to_vec();
+    ship.write_transaction(
+        &PondUserMetadata::new(vec!["append-series".into()]),
+        async move |fs| {
+            let root = fs.root().await?;
+            let mut writer = root
+                .async_writer_path_with_type(path, EntryType::FilePhysicalSeries)
+                .await?;
+            writer.write_all(&bytes).await?;
+            writer.shutdown().await?;
+            Ok(())
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn create_then_delete_before_publication(
+    ctx: &ShipContext,
+    path: &str,
+) -> anyhow::Result<()> {
+    write_small_file(ctx, path, b"transient", vec!["zero-net", "create"]).await?;
+    let mut ship = ctx.open_pond().await?;
+    let path = path.to_string();
+    ship.write_transaction(
+        &PondUserMetadata::new(vec!["zero-net".into(), "delete".into()]),
+        async move |fs| {
+            let root = fs.root().await?;
+            root.remove_entry(path.trim_start_matches('/')).await?;
+            Ok(())
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 /// Read a file from `ctx` as Vec<u8>.
 async fn read_small_file(ctx: &ShipContext, path: &str) -> anyhow::Result<Vec<u8>> {
     let mut ship = ctx.open_pond().await?;
@@ -79,6 +118,112 @@ async fn read_small_file(ctx: &ShipContext, path: &str) -> anyhow::Result<Vec<u8
     };
     let _ = tx.commit().await?;
     Ok(bytes)
+}
+
+#[tokio::test]
+async fn consolidated_pack_publication_rejects_pull_only_remote() {
+    init_log();
+    let scratch = TempDir::new().expect("tempdir");
+    let pond_path = scratch.path().join("pond");
+    let remote_path = scratch.path().join("remote");
+    let remote_url = format!("file://{}", remote_path.display());
+    let _ = sync_store::ContentRemote::create_at_url(
+        &remote_url,
+        uuid::Uuid::new_v4(),
+        Default::default(),
+    )
+    .await
+    .expect("create foreign remote");
+    let context = ctx_for(&pond_path, vec!["pond", "init"]);
+    init_command(&context, "test-host").await.expect("init");
+    add_remote_command(
+        &context,
+        "upstream",
+        &remote_url,
+        "/imports/upstream",
+        None,
+        None,
+        None,
+        None,
+        false,
+        false,
+    )
+    .await
+    .expect("attach pull remote");
+    let error = publish_consolidated_packs_command(&context, "upstream")
+        .await
+        .expect_err("pull-only remote must be rejected");
+    assert!(error.to_string().contains("pull-only"));
+}
+
+#[tokio::test]
+async fn consolidated_pack_command_publishes_maintained_pack() {
+    init_log();
+    let scratch = TempDir::new().expect("tempdir");
+    let pond_path = scratch.path().join("pond");
+    let remote_path = scratch.path().join("remote");
+    let remote_url = format!("file://{}", remote_path.display());
+    let context = ctx_for(&pond_path, vec!["pond", "init"]);
+    init_command(&context, "test-host").await.expect("init");
+
+    append_small_series(&context, "/events.series", b"one\n")
+        .await
+        .expect("first append");
+    add_backup_command(
+        &context,
+        "origin",
+        &remote_url,
+        false,
+        None,
+        None,
+        None,
+        None,
+        false,
+        false,
+    )
+    .await
+    .expect("attach backup");
+    push_command(&context, Some("origin".to_string()))
+        .await
+        .expect("publish first append");
+    for bytes in [b"two\n".as_slice(), b"three\n".as_slice()] {
+        append_small_series(&context, "/events.series", bytes)
+            .await
+            .expect("append series");
+        push_command(&context, Some("origin".to_string()))
+            .await
+            .expect("publish append");
+    }
+
+    {
+        let mut ship = context.open_pond().await.expect("open for maintenance");
+        let report = ship
+            .as_pond_mut()
+            .expect("pond steward")
+            .collapse_versions(1)
+            .await
+            .expect("local pack maintenance");
+        assert_eq!(report.series_repacked, 1);
+    }
+    publish_consolidated_packs_command(&context, "origin")
+        .await
+        .expect("publish maintained pack");
+
+    let remote = sync_store::ContentRemote::open_at_url(&remote_url, Default::default())
+        .await
+        .expect("open remote");
+    let graph = steward::fetch_object_graph(&remote, "main")
+        .await
+        .expect("fresh graph");
+    let series = graph
+        .objects
+        .values()
+        .find_map(|object| match object {
+            steward::FetchedObject::SeriesV2(series) => Some(series),
+            _ => None,
+        })
+        .expect("fetched series");
+    assert_eq!(series.packs.len(), 1);
 }
 
 /// End-to-end: `pond init` -> write a file -> `pond remote add` -> `pond push`
@@ -158,6 +303,363 @@ async fn pond_remote_push_pull_roundtrip() {
     list_remotes_command(&src_ctx, None)
         .await
         .expect("list src");
+}
+
+#[tokio::test]
+async fn mirror_retry_recovers_intermediate_apply_before_ack_frontier() {
+    init_log();
+    let scratch = TempDir::new().expect("tempdir");
+    let src_pond = scratch.path().join("src");
+    let dst_pond = scratch.path().join("dst");
+    let remote_path = scratch.path().join("remote");
+    let remote_url = format!("file://{}", remote_path.display());
+    let src_ctx = ctx_for(&src_pond, vec!["pond", "init"]);
+    init_command(&src_ctx, "source").await.unwrap();
+    add_backup_command(
+        &src_ctx,
+        "origin",
+        &remote_url,
+        false,
+        None,
+        None,
+        None,
+        None,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    write_small_file(&src_ctx, "/one.txt", b"one", vec!["write"])
+        .await
+        .unwrap();
+    let source = src_ctx.open_pond().await.unwrap();
+    let pond_id = source.control_table().pond_id_uuid();
+    let mut remote = sync_store::ContentRemote::open_at_url(&remote_url, Default::default())
+        .await
+        .unwrap();
+    let first = remote.current_publication("main").await.unwrap().unwrap();
+
+    let _ = steward::Ship::create_replica(&dst_pond, pond_id)
+        .await
+        .unwrap();
+    let dst_ctx = ctx_for(&dst_pond, vec!["pond", "pull"]);
+    add_remote_command(
+        &dst_ctx,
+        "origin",
+        &remote_url,
+        "/",
+        None,
+        None,
+        None,
+        None,
+        false,
+        true,
+    )
+    .await
+    .unwrap();
+    pull_command(&dst_ctx, Some("origin".to_string()))
+        .await
+        .unwrap();
+
+    write_small_file(&src_ctx, "/two.txt", b"two", vec!["write"])
+        .await
+        .unwrap();
+    remote = sync_store::ContentRemote::open_at_url(&remote_url, Default::default())
+        .await
+        .unwrap();
+    let second = remote.current_publication("main").await.unwrap().unwrap();
+
+    // Construct the exact crash state: T2 data committed in the mirror while
+    // the consumer acknowledgement still names T1.
+    {
+        let mut destination = dst_ctx.open_pond().await.unwrap();
+        let graph = steward::fetch_object_graph_since(&remote, "main", Some(first.snapshot_tip))
+            .await
+            .unwrap();
+        let _ = steward::rebuild_pond(
+            destination.as_pond_mut().expect("destination pond"),
+            &remote,
+            &graph,
+        )
+        .await
+        .unwrap();
+        let ack = read_pull_ack(destination.control_table(), &remote_url, pond_id, "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ack.state(&remote_url, pond_id, "main")
+                .unwrap()
+                .snapshot_tip,
+            first.snapshot_tip
+        );
+    }
+
+    write_small_file(&src_ctx, "/three.txt", b"three", vec!["write"])
+        .await
+        .unwrap();
+    remote = sync_store::ContentRemote::open_at_url(&remote_url, Default::default())
+        .await
+        .unwrap();
+    let third = remote.current_publication("main").await.unwrap().unwrap();
+    assert_eq!(
+        read_small_file(&dst_ctx, "/two.txt").await.unwrap(),
+        b"two",
+        "constructed mirror must durably contain B"
+    );
+    assert!(
+        read_small_file(&dst_ctx, "/three.txt").await.is_err(),
+        "constructed mirror must not yet contain C"
+    );
+
+    pull_command(&dst_ctx, Some("origin".to_string()))
+        .await
+        .expect("ordinary retry authenticates B, repairs its ack, and applies only B to C");
+    let destination = dst_ctx.open_pond().await.unwrap();
+    let ack = read_pull_ack(destination.control_table(), &remote_url, pond_id, "main")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ack.state(&remote_url, pond_id, "main")
+            .unwrap()
+            .snapshot_tip,
+        third.snapshot_tip
+    );
+    assert_eq!(
+        read_small_file(&dst_ctx, "/three.txt").await.unwrap(),
+        b"three"
+    );
+    assert_ne!(second.snapshot_tip, third.snapshot_tip);
+}
+
+#[tokio::test]
+async fn zero_net_publication_advances_mirror_ack_without_data_write() {
+    init_log();
+    let scratch = TempDir::new().expect("tempdir");
+    let src_pond = scratch.path().join("src");
+    let dst_pond = scratch.path().join("dst");
+    let remote_path = scratch.path().join("remote");
+    let remote_url = format!("file://{}", remote_path.display());
+    let src_ctx = ctx_for(&src_pond, vec!["pond", "init"]);
+    init_command(&src_ctx, "source").await.unwrap();
+    let pond_id = src_ctx
+        .open_pond()
+        .await
+        .unwrap()
+        .control_table()
+        .pond_id_uuid();
+    let mut remote =
+        sync_store::ContentRemote::create_at_url(&remote_url, pond_id, Default::default())
+            .await
+            .unwrap();
+    add_remote_command(
+        &src_ctx,
+        "origin",
+        &remote_url,
+        "/",
+        None,
+        None,
+        None,
+        None,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    write_small_file(&src_ctx, "/stable.txt", b"stable", vec!["write"])
+        .await
+        .unwrap();
+    let source = src_ctx.open_pond().await.unwrap();
+    let _ = steward::push_content_to_remote(
+        source.as_pond().expect("source pond"),
+        &mut remote,
+        "main",
+    )
+    .await
+    .unwrap();
+    let _ = steward::Ship::create_replica(&dst_pond, pond_id)
+        .await
+        .unwrap();
+    let dst_ctx = ctx_for(&dst_pond, vec!["pond", "pull"]);
+    add_remote_command(
+        &dst_ctx,
+        "origin",
+        &remote_url,
+        "/",
+        None,
+        None,
+        None,
+        None,
+        false,
+        true,
+    )
+    .await
+    .unwrap();
+    pull_command(&dst_ctx, Some("origin".to_string()))
+        .await
+        .unwrap();
+    let before_seq = dst_ctx
+        .open_pond()
+        .await
+        .unwrap()
+        .control_table()
+        .get_last_write_sequence()
+        .await
+        .unwrap();
+
+    create_then_delete_before_publication(&src_ctx, "/transient.txt")
+        .await
+        .unwrap();
+    let source = src_ctx.open_pond().await.unwrap();
+    let next = steward::push_content_to_remote(
+        source.as_pond().expect("source pond"),
+        &mut remote,
+        "main",
+    )
+    .await
+    .unwrap();
+    pull_command(&dst_ctx, Some("origin".to_string()))
+        .await
+        .expect("zero-net publication pull");
+
+    let destination = dst_ctx.open_pond().await.unwrap();
+    assert_eq!(
+        destination
+            .control_table()
+            .get_last_write_sequence()
+            .await
+            .unwrap(),
+        before_seq,
+        "mirror data must not be rewritten for an authenticated zero-net transition"
+    );
+    let ack = read_pull_ack(destination.control_table(), &remote_url, pond_id, "main")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ack.state(&remote_url, pond_id, "main")
+            .unwrap()
+            .snapshot_tip,
+        next.tip
+    );
+}
+
+#[tokio::test]
+async fn zero_net_publication_advances_graft_pin() {
+    init_log();
+    let scratch = TempDir::new().expect("tempdir");
+    let src_pond = scratch.path().join("src");
+    let dst_pond = scratch.path().join("dst");
+    let remote_path = scratch.path().join("remote");
+    let remote_url = format!("file://{}", remote_path.display());
+    let src_ctx = ctx_for(&src_pond, vec!["pond", "init"]);
+    init_command(&src_ctx, "source").await.unwrap();
+    write_small_file(&src_ctx, "/stable.txt", b"stable", vec!["write"])
+        .await
+        .unwrap();
+    let mut source = src_ctx.open_pond().await.unwrap();
+    let source_id = source.control_table().pond_id_uuid();
+    let mut remote =
+        sync_store::ContentRemote::create_at_url(&remote_url, source_id, Default::default())
+            .await
+            .unwrap();
+    let _ = steward::push_content_to_remote(
+        source.as_pond().expect("source pond"),
+        &mut remote,
+        "main",
+    )
+    .await
+    .unwrap();
+
+    let dst_ctx = ctx_for(&dst_pond, vec!["pond", "init"]);
+    init_command(&dst_ctx, "destination").await.unwrap();
+    add_remote_command(
+        &dst_ctx,
+        "upstream",
+        &remote_url,
+        "/imports/upstream",
+        None,
+        None,
+        None,
+        None,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    pull_command(&dst_ctx, Some("upstream".to_string()))
+        .await
+        .unwrap();
+
+    create_then_delete_before_publication(&src_ctx, "/transient.txt")
+        .await
+        .unwrap();
+    source = src_ctx.open_pond().await.unwrap();
+    let next = steward::push_content_to_remote(
+        source.as_pond().expect("source pond"),
+        &mut remote,
+        "main",
+    )
+    .await
+    .unwrap();
+    pull_command(&dst_ctx, Some("upstream".to_string()))
+        .await
+        .expect("zero-net graft pull");
+
+    assert_eq!(
+        read_small_file(&dst_ctx, "/imports/upstream/stable.txt")
+            .await
+            .unwrap(),
+        b"stable"
+    );
+    let pin = steward::GraftPin::from_yaml_bytes(
+        &read_small_file(&dst_ctx, "/sys/grafts/upstream")
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(pin.pinned_tip, next.tip.to_hex());
+}
+
+#[tokio::test]
+async fn pond_capsule_publish_writes_a_verified_v4_generation() {
+    init_log();
+    let scratch = TempDir::new().expect("tempdir");
+    let pond_path = scratch.path().join("pond");
+    let remote_path = scratch.path().join("remote");
+    let remote_url = format!("file://{}", remote_path.display());
+    let context = ctx_for(&pond_path, vec!["pond", "init"]);
+    init_command(&context, "test-host").await.expect("init");
+    write_small_file(&context, "/capsule.txt", b"capsule payload", vec!["copy"])
+        .await
+        .expect("write content");
+    add_backup_command(
+        &context,
+        "origin",
+        &remote_url,
+        false,
+        None,
+        None,
+        None,
+        None,
+        false,
+        false,
+    )
+    .await
+    .expect("backup add");
+    capsule_publish_command(&context, "origin")
+        .await
+        .expect("publish capsule");
+    let remote = sync_store::ContentRemote::open_at_url(&remote_url, Default::default())
+        .await
+        .expect("open remote");
+    let (root, manifest) = remote
+        .latest_capsule()
+        .await
+        .expect("read capsule ref")
+        .expect("capsule published");
+    assert_eq!(sync_store::content::capsule_root(&manifest).unwrap(), root);
 }
 
 #[tokio::test]
@@ -265,20 +767,19 @@ async fn pond_remote_push_pull_large_file_roundtrip() {
         .await
         .expect("push");
 
-    // D7 streaming: the large blob must transfer out-of-row -- present in the
-    // remote's sibling `_blobs/` store, absent from the Delta row table -- so a
-    // multi-gigabyte value never bloats the remote's parquet rows.
+    // Native-v2 streaming: the large blob is one canonical raw object outside
+    // Delta rows, so a multi-gigabyte value never bloats Parquet metadata.
     {
-        let blobs_dir = remote_path.join("_blobs");
+        let blobs_dir = remote_path.join("_content/v2/objects");
         assert!(
             blobs_dir.exists(),
-            "remote should hold the large blob under _blobs/: {:?}",
+            "remote should hold the large blob under _content/v2/objects/: {:?}",
             blobs_dir
         );
         let n_blobs = std::fs::read_dir(&blobs_dir)
-            .expect("read _blobs")
+            .expect("read v2 objects")
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("blob="))
+            .filter(|e| e.file_name().to_string_lossy().starts_with("blake3="))
             .count();
         assert!(
             n_blobs >= 1,
@@ -482,13 +983,45 @@ async fn pond_verify_reports_remote_behind_after_local_write() {
         sync_store::ContentRemote::create_at_url(&remote_url, store_id, Default::default())
             .await
             .expect("create remote");
-    // Publish the earlier commit object and point "main" at it.  verify only
-    // reads the tip ref and that one commit object, so this faithfully models a
-    // remote that is behind by one commit.
-    let _published_seq = remote
-        .push_commit(&[(earlier_tip, earlier_obj)], "main", earlier_tip)
+    let earlier_commit =
+        sync_store::content::Commit::decode(&earlier_obj).expect("decode earlier commit");
+    let descriptor = sync_store::content::ObjectDescriptor::new(
+        earlier_tip,
+        sync_store::content::ContentObjectKind::Commit,
+    );
+    let _ = remote
+        .put_immutable_object(descriptor, &earlier_obj)
         .await
         .expect("publish earlier tip");
+    let record = sync_store::content::PublicationRecord::new(
+        store_id,
+        "main",
+        earlier_tip,
+        earlier_commit.manifest_root,
+        None,
+        vec![descriptor],
+        vec![],
+        earlier_commit.manifest_changes.clone(),
+    )
+    .expect("publication record");
+    let _ = remote
+        .put_publication_record(&record)
+        .await
+        .expect("publish record");
+    let state = sync_store::PublicationState::new(
+        store_id,
+        "main",
+        earlier_tip,
+        earlier_commit.manifest_root,
+        record.hash(),
+        1,
+        1,
+    )
+    .expect("publication state");
+    let _ = remote
+        .compare_and_swap_publication(sync_store::PublicationExpectation::Missing, state)
+        .await
+        .expect("publish earlier state");
 
     let report =
         steward::verify_content_against_remote(ship.as_pond().expect("pond"), &remote, "main")
@@ -559,8 +1092,31 @@ async fn pond_verify_rejects_tampered_remote_tip() {
         sync_store::ContentRemote::create_at_url(&remote_url, store_id, Default::default())
             .await
             .expect("create remote");
+    let raw = sync_store::raw_object_store_at_url(&remote_url, Default::default())
+        .await
+        .expect("raw store");
+    let _ = raw
+        .put(
+            &object_store::path::Path::from(format!(
+                "_content/v2/objects/blake3={}",
+                tip_key.to_hex()
+            )),
+            tampered_bytes.into(),
+        )
+        .await
+        .expect("publish tampered bytes");
+    let state = sync_store::PublicationState::new(
+        store_id,
+        "main",
+        tip_key,
+        sync_store::content::ObjectHash::of_bytes(b"tampered manifest root"),
+        sync_store::content::ObjectHash::of_bytes(b"tampered publication record"),
+        1,
+        1,
+    )
+    .expect("tampered state");
     let _ = remote
-        .push_commit(&[(tip_key, tampered_bytes)], "main", tip_key)
+        .compare_and_swap_publication(sync_store::PublicationExpectation::Missing, state)
         .await
         .expect("publish tampered tip");
 
@@ -569,7 +1125,7 @@ async fn pond_verify_rejects_tampered_remote_tip() {
             .await
             .expect_err("tampered remote tip must be rejected");
     assert!(
-        format!("{err}").contains("remote tip commit hashes to"),
+        format!("{err}").contains("hashes to"),
         "unexpected error: {err}"
     );
 }

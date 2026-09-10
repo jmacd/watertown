@@ -80,12 +80,7 @@ async fn pulled_frontier(
     name: &str,
     graft: Option<(&str, uuid::Uuid)>,
 ) -> Result<Option<String>> {
-    let watermark = ship
-        .control_table()
-        .raw_config_get(&format!("last_pulled_tip:{url}"))
-        .await
-        .map_err(|e| anyhow!("read last_pulled_tip for `{name}`: {e}"))?
-        .filter(|tip| !tip.is_empty());
+    let _ = url;
     if let Some((mount_path, foreign_pond_id)) = graft {
         let pin_path = steward::GraftPin::pin_path(name);
         let tx = ship
@@ -105,7 +100,7 @@ async fn pulled_frontier(
         };
         let _ = tx.commit().await?;
         let Some(bytes) = pin_bytes else {
-            return Ok(watermark);
+            return Ok(None);
         };
         let pin = steward::GraftPin::from_yaml_bytes(&bytes)
             .map_err(|e| anyhow!("parse graft pin `{pin_path}`: {e}"))?;
@@ -115,11 +110,15 @@ async fn pulled_frontier(
         }
         return Ok(None);
     }
-    Ok(watermark)
+    Ok(None)
 }
 
 struct PullPosition {
     previous: Option<sync_store::content::ObjectHash>,
+    pinned: Option<sync_store::content::ObjectHash>,
+    acknowledged: Option<sync_store::PublicationState>,
+    remote_state: Option<sync_store::PublicationState>,
+    exact_ack: bool,
     already_at_tip: bool,
 }
 
@@ -132,41 +131,119 @@ async fn pull_position(
     name: &str,
     graft: Option<(&str, uuid::Uuid)>,
 ) -> Result<PullPosition> {
-    let remote_tip = remote
-        .get_tip("main")
+    let remote_state = remote
+        .get_publication_state("main")
         .await
-        .map_err(|e| anyhow!("get tip from `{url}`: {e}"))?;
-    let previous = pulled_frontier(ship, url, name, graft)
+        .map_err(|e| anyhow!("get publication state from `{url}`: {e}"))?;
+    let acknowledged = steward::read_pull_ack(ship.control_table(), url, remote.pond_id(), "main")
+        .await
+        .map_err(|e| anyhow!("read consumer acknowledgement for `{name}`: {e}"))?
+        .map(|ack| ack.state(url, remote.pond_id(), "main"))
+        .transpose()
+        .map_err(|e| anyhow!("validate consumer acknowledgement for `{name}`: {e}"))?;
+    let pinned = pulled_frontier(ship, url, name, graft)
         .await?
         .map(|tip| {
             sync_store::content::ObjectHash::from_hex(&tip)
-                .map_err(|e| anyhow!("invalid last_pulled_tip for `{name}`: {e}"))
+                .map_err(|e| anyhow!("invalid graft pinned tip for `{name}`: {e}"))
         })
         .transpose()?;
-    let already_at_tip = remote_tip.is_some() && remote_tip == previous;
-    if already_at_tip {
-        let tip = remote_tip.expect("already_at_tip requires a remote tip");
-        if graft.is_some() {
-            let key = format!("last_pulled_tip:{url}");
-            let tip_hex = tip.to_hex();
-            let watermark = ship
-                .control_table()
-                .raw_config_get(&key)
-                .await
-                .map_err(|e| anyhow!("read last_pulled_tip for `{name}`: {e}"))?;
-            if watermark.as_deref() != Some(tip_hex.as_str()) {
-                ship.control_table_mut()
-                    .raw_config_set(&key, &tip_hex)
-                    .await
-                    .map_err(|e| anyhow!("repair last_pulled_tip for `{name}`: {e}"))?;
-            }
-        }
-        log::info!("[OK] pull {name} already up to date (tip={tip})");
+    let previous = if graft.is_some() {
+        pinned
+    } else {
+        acknowledged.as_ref().map(|state| state.snapshot_tip)
+    };
+    if let (Some(state), Some(acknowledged)) = (&remote_state, &acknowledged)
+        && state.snapshot_tip == acknowledged.snapshot_tip
+        && !steward::same_publication_identity(state, acknowledged)
+    {
+        return Err(anyhow!(
+            "remote `{name}` publication identity changed at acknowledged tip {}; refusing to \
+             overwrite the structured acknowledgement",
+            state.snapshot_tip
+        ));
     }
+
+    let exact_ack = remote_state
+        .as_ref()
+        .zip(acknowledged.as_ref())
+        .is_some_and(|(state, acknowledged)| {
+            steward::same_publication_identity(state, acknowledged)
+        });
+    let pinned_at_head = graft.is_some()
+        && remote_state
+            .as_ref()
+            .is_some_and(|state| Some(state.snapshot_tip) == pinned);
+    let already_at_tip = if graft.is_some() {
+        pinned_at_head
+    } else {
+        exact_ack
+    };
     Ok(PullPosition {
         previous,
+        pinned,
+        acknowledged,
+        remote_state,
+        exact_ack,
         already_at_tip,
     })
+}
+
+async fn authenticate_exact_identity_noop(
+    ship: &mut steward::Ship,
+    remote: &dyn steward::ContentSource,
+    url: &str,
+    name: &str,
+    mount_path: Option<&str>,
+    position: &PullPosition,
+) -> Result<()> {
+    let state = position
+        .remote_state
+        .as_ref()
+        .ok_or_else(|| anyhow!("remote `{name}` lost its publication row"))?;
+    let commit = if let Some(acknowledged) = position
+        .acknowledged
+        .as_ref()
+        .filter(|_| !position.exact_ack)
+    {
+        let graph =
+            steward::fetch_object_graph_from_acknowledgement(remote, state.clone(), acknowledged)
+                .await
+                .map_err(|e| anyhow!("fetch acknowledgement lineage for `{name}`: {e}"))?;
+        steward::authenticate_publication_window(&graph, acknowledged)
+            .map_err(|e| anyhow!("authenticate acknowledgement lineage for `{name}`: {e}"))?;
+        graph
+            .commits
+            .first()
+            .map(|(_, commit)| commit.clone())
+            .ok_or_else(|| anyhow!("authenticated publication for `{name}` has no tip commit"))?
+    } else {
+        steward::authenticated_publication_head_commit(remote, state)
+            .await
+            .map_err(|e| anyhow!("authenticate immutable publication head for `{name}`: {e}"))?
+    };
+
+    if let Some(mount_path) = mount_path {
+        steward::authenticate_graft_publication_head(ship, state, &commit, name, mount_path)
+            .await
+            .map_err(|e| anyhow!("authenticate graft destination for `{name}`: {e}"))?;
+    } else {
+        let pond_id = ship.data_persistence().pond_id().to_string();
+        steward::authenticate_destination_publication_head(ship, state, &commit, &pond_id)
+            .await
+            .map_err(|e| anyhow!("authenticate mirror destination for `{name}`: {e}"))?;
+    }
+
+    if !position.exact_ack {
+        steward::write_pull_ack(ship.control_table_mut(), url, state)
+            .await
+            .map_err(|e| anyhow!("restore consumer acknowledgement for `{name}`: {e}"))?;
+    }
+    log::info!(
+        "[OK] pull {name} already up to date (tip={})",
+        state.snapshot_tip
+    );
+    Ok(())
 }
 
 async fn require_fast_forward(
@@ -352,17 +429,103 @@ async fn pull_import(
     let graft_identity = Some((mount_path, remote.pond_id()));
     let position = pull_position(ship_ref, remote, &attachment.url, name, graft_identity).await?;
     if !rebuild_graft && position.already_at_tip {
-        return Ok(());
+        return authenticate_exact_identity_noop(
+            ship_ref,
+            remote,
+            &attachment.url,
+            name,
+            Some(mount_path),
+            &position,
+        )
+        .await;
     }
-
     // Fetch the foreign object graph and rebuild it under the foreign pond_id
     // partition, then mount it.  The local allocator stays contiguous; only the
     // foreign pond's seq frontier advances inside `import_pond`.
-    let graph = steward::fetch_object_graph_since(remote, "main", position.previous)
-        .await
-        .map_err(|e| anyhow!("fetch from `{}`: {}", attachment.url, e))?;
-    require_fast_forward(&graph, name, position.previous).await?;
-    if graph.is_empty() {
+    let mut authenticated_boundary = None;
+    let graph = match position.remote_state.clone() {
+        None => steward::FetchedGraph::default(),
+        Some(state) if rebuild_graft => {
+            steward::fetch_object_graph_at_publication(remote, state, None)
+                .await
+                .map_err(|e| anyhow!("fetch from `{}`: {}", attachment.url, e))?
+        }
+        Some(state) => match (position.acknowledged.as_ref(), position.pinned) {
+            (Some(acknowledged), pinned)
+                if !steward::same_publication_identity(&state, acknowledged) =>
+            {
+                let authenticated =
+                    steward::fetch_object_graph_from_acknowledgement(remote, state, acknowledged)
+                        .await
+                        .map_err(|e| anyhow!("fetch from `{}`: {}", attachment.url, e))?;
+                steward::authenticate_publication_window(&authenticated, acknowledged)
+                    .map_err(|e| anyhow!("authenticate graft lineage for `{name}`: {e}"))?;
+                if let Some(pinned) = pinned {
+                    let (boundary, remaining) = steward::narrow_authenticated_publication_window(
+                        &authenticated,
+                        acknowledged,
+                        pinned,
+                    )
+                    .map_err(|e| anyhow!("authenticate graft pin for `{name}`: {e}"))?;
+                    authenticated_boundary = Some(boundary);
+                    remaining
+                } else {
+                    authenticated
+                }
+            }
+            (None, Some(pinned)) => {
+                let authenticated =
+                    steward::fetch_object_graph_at_publication(remote, state, Some(pinned))
+                        .await
+                        .map_err(|e| anyhow!("fetch from `{}`: {}", attachment.url, e))?;
+                let boundary =
+                    steward::authenticate_pinned_publication_boundary(&authenticated, pinned)
+                        .map_err(|e| {
+                            anyhow!("authenticate pinned graft lineage for `{name}`: {e}")
+                        })?;
+                authenticated_boundary = Some(boundary);
+                authenticated
+            }
+            _ => steward::fetch_object_graph_at_publication(remote, state, None)
+                .await
+                .map_err(|e| anyhow!("fetch from `{}`: {}", attachment.url, e))?,
+        },
+    };
+    if !rebuild_graft {
+        if let Some(boundary) = authenticated_boundary.as_ref() {
+            let boundary_commit = graph
+                .commits
+                .iter()
+                .find(|(hash, commit)| {
+                    *hash == boundary.snapshot_tip && commit.manifest_root == boundary.manifest_root
+                })
+                .map(|(_, commit)| commit)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "authenticated graft boundary {} has no matching commit",
+                        boundary.snapshot_tip
+                    )
+                })?;
+            steward::authenticate_graft_publication_head(
+                ship_ref,
+                boundary,
+                boundary_commit,
+                name,
+                mount_path,
+            )
+            .await
+            .map_err(|e| anyhow!("authenticate graft boundary for `{name}`: {e}"))?;
+        }
+        require_fast_forward(
+            &graph,
+            name,
+            authenticated_boundary
+                .as_ref()
+                .map(|state| state.snapshot_tip),
+        )
+        .await?;
+    }
+    if graph.tip.is_none() {
         log::info!(
             "pull {}: remote ref `main` is empty; nothing to import",
             name
@@ -388,14 +551,14 @@ async fn pull_import(
     // Record the per-ref frontier we last pulled: the foreign tip commit hash
     // now atomically imported, mounted, and pinned. If this control-table write
     // fails, a retry safely repeats the idempotent graft transaction.
-    ship_ref
-        .control_table_mut()
-        .raw_config_set(
-            &format!("last_pulled_tip:{}", attachment.url),
-            &pinned_tip.to_hex(),
-        )
+    let state = graph
+        .publication_state
+        .as_ref()
+        .ok_or_else(|| anyhow!("imported graph from `{}` has no publication state", name))?;
+    debug_assert_eq!(state.snapshot_tip, pinned_tip);
+    steward::write_pull_ack(ship_ref.control_table_mut(), &attachment.url, state)
         .await
-        .map_err(|e| anyhow!("record last_pulled_tip for `{}`: {}", name, e))?;
+        .map_err(|e| anyhow!("record consumer acknowledgement for `{}`: {}", name, e))?;
 
     Ok(())
 }
@@ -417,19 +580,82 @@ async fn pull_mirror(
     // when the mirror already reflects the remote tip.
     let position = pull_position(ship_ref, remote, &attachment.url, name, None).await?;
     if position.already_at_tip {
-        return Ok(());
+        return authenticate_exact_identity_noop(
+            ship_ref,
+            remote,
+            &attachment.url,
+            name,
+            None,
+            &position,
+        )
+        .await;
     }
 
-    let graph = steward::fetch_object_graph_since(remote, "main", position.previous)
-        .await
-        .map_err(|e| anyhow!("fetch from `{}`: {}", attachment.url, e))?;
+    let mut graph = match position.remote_state.clone() {
+        None => steward::FetchedGraph::default(),
+        Some(state) => {
+            if let Some(acknowledged) = position.acknowledged.as_ref() {
+                let graph =
+                    steward::fetch_object_graph_from_acknowledgement(remote, state, acknowledged)
+                        .await
+                        .map_err(|e| anyhow!("fetch from `{}`: {}", attachment.url, e))?;
+                steward::authenticate_publication_window(&graph, acknowledged).map_err(|e| {
+                    anyhow!(
+                        "authenticate publication lineage from consumer acknowledgement for \
+                         `{name}`: {e}"
+                    )
+                })?;
+                graph
+            } else {
+                steward::fetch_object_graph_at_publication(remote, state, None)
+                    .await
+                    .map_err(|e| anyhow!("fetch from `{}`: {}", attachment.url, e))?
+            }
+        }
+    };
     require_fast_forward(&graph, name, position.previous).await?;
-    if graph.is_empty() {
+    if graph.tip.is_none() {
         log::info!(
             "pull {}: remote ref `main` is empty; nothing to rebuild",
             name
         );
         return Ok(());
+    }
+    if steward::destination_matches_publication(ship_ref, &graph)
+        .await
+        .map_err(|e| anyhow!("authenticate existing mirror state for `{}`: {}", name, e))?
+    {
+        let state = graph
+            .publication_state
+            .as_ref()
+            .ok_or_else(|| anyhow!("fetched graph from `{}` has no publication state", name))?;
+        steward::write_pull_ack(ship_ref.control_table_mut(), &attachment.url, state)
+            .await
+            .map_err(|e| anyhow!("repair consumer acknowledgement for `{}`: {}", name, e))?;
+        log::info!(
+            "[OK] pull {} recovered already-applied publication (tip={})",
+            name,
+            state.snapshot_tip
+        );
+        return Ok(());
+    }
+    if let Some(acknowledged) = position.acknowledged.as_ref()
+        && let Some((recovered, remaining)) =
+            steward::recover_applied_publication(ship_ref, &graph, acknowledged)
+                .await
+                .map_err(|e| anyhow!("recover applied mirror frontier for `{name}`: {e}"))?
+    {
+        steward::write_pull_ack(ship_ref.control_table_mut(), &attachment.url, &recovered)
+            .await
+            .map_err(|e| {
+                anyhow!("repair intermediate consumer acknowledgement for `{name}`: {e}")
+            })?;
+        log::info!(
+            "[OK] pull {} recovered intermediate applied publication (tip={})",
+            name,
+            recovered.snapshot_tip
+        );
+        graph = remaining;
     }
     let outcome = steward::rebuild_pond(ship_ref, remote, &graph)
         .await
@@ -442,16 +668,13 @@ async fn pull_mirror(
 
     // Record the per-ref frontier we last pulled: the tip commit hash the
     // mirror now reflects (CA3 replacement for the retired seq watermark).
-    if let Some(tip) = graph.tip {
-        ship_ref
-            .control_table_mut()
-            .raw_config_set(
-                &format!("last_pulled_tip:{}", attachment.url),
-                &tip.to_hex(),
-            )
-            .await
-            .map_err(|e| anyhow!("record last_pulled_tip for `{}`: {}", name, e))?;
-    }
+    let state = graph
+        .publication_state
+        .as_ref()
+        .ok_or_else(|| anyhow!("rebuilt graph from `{}` has no publication state", name))?;
+    steward::write_pull_ack(ship_ref.control_table_mut(), &attachment.url, state)
+        .await
+        .map_err(|e| anyhow!("record consumer acknowledgement for `{}`: {}", name, e))?;
     Ok(())
 }
 

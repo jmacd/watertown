@@ -14,6 +14,7 @@ use thiserror::Error;
 
 mod capsule;
 mod capsule_import;
+mod consolidated_pack;
 mod content_diff;
 mod content_objects;
 mod content_pull;
@@ -30,10 +31,12 @@ mod host;
 mod inner_control;
 pub mod limiter;
 pub mod limiter_usage;
+mod local_content;
 pub mod maintenance;
 pub mod metered_source;
 mod pack_maintenance;
 mod pack_store;
+mod publication_ack;
 mod rebuild;
 pub mod reclaim;
 mod remote_config;
@@ -46,21 +49,34 @@ pub use capsule::{
     CapsuleBuild, build_recovery_capsule, build_recovery_capsule_incremental,
     open_and_inspect_recovery_recipe_limited, open_and_publish_recovery_recipe_limited,
 };
-pub use capsule_import::{CapsuleImportProvenance, CapsuleImportReport, import_capsule};
+pub use capsule_import::{
+    CapsuleActivationReport, CapsuleImportLimits, CapsuleImportProvenance, CapsuleImportReport,
+    activate_capsule_import, import_capsule, import_capsule_with_limits,
+};
+pub use consolidated_pack::{
+    ConsolidatedPackPublishOutcome, ConsolidatedPackSelection,
+    open_and_publish_local_consolidated_packs_limited, publish_local_consolidated_packs,
+};
 pub use content_diff::{ContentComparison, ContentDiff, DiffKind, compare_content_trees};
 pub use content_objects::{ObjectInventory, ObjectKind, inventory_content_objects};
 pub use content_pull::{
-    FetchedGraph, FetchedObject, FetchedSeriesV2, RebuildOutcome, fetch_object_graph,
-    fetch_object_graph_since, import_graft, import_pond, rebuild_pond, replace_graft,
+    FetchedGraph, FetchedObject, FetchedSeriesV2, LocalPullCost, RebuildOutcome,
+    authenticate_destination_publication_head, authenticate_graft_publication_head,
+    authenticate_pinned_publication_boundary, authenticate_publication_head,
+    authenticate_publication_window, authenticated_publication_head_commit,
+    destination_matches_publication, fetch_manifest_records, fetch_object_graph,
+    fetch_object_graph_at_publication, fetch_object_graph_from_acknowledgement,
+    fetch_object_graph_since, import_graft, import_pond, narrow_authenticated_publication_window,
+    rebuild_pond, recover_applied_publication, replace_graft,
 };
 pub use content_push::{
     ContentPushOutcome, open_and_push_to_remote_limited, push_content_to_remote,
-    push_content_to_remote_limited,
+    push_content_to_remote_limited, remote_ref_is_acknowledged, remote_tip_is_acknowledged,
 };
 pub use content_source::{BlobReader, ContentSource, LocalPondSource};
 pub use content_tree::{
-    ContentTreeReport, MaterializedObjects, compute_content_tree, compute_content_tree_for_table,
-    materialize_content_objects,
+    ContentTreeReport, MaterializedInlineObject, MaterializedObjects, compute_content_tree,
+    compute_content_tree_for_table, materialize_content_objects,
 };
 pub use content_verify::{ContentVerifyReport, ContentVerifyState, verify_content_against_remote};
 pub use control_table::{CommitSpine, ControlTable, TransactionType};
@@ -76,6 +92,10 @@ pub use limiter_usage::{
     LIMITER_USAGE_PENDING_KEY, LIMITER_USAGE_SERIES, LimiterUsageRow, UsageSample,
 };
 pub use pack_maintenance::{PackCandidateOutcome, PackMaintenanceCandidate};
+pub use publication_ack::{
+    PublicationAcknowledgement, clear_acknowledgements, read_pull_ack, read_pull_ack_for_remote,
+    read_push_ack, same_publication_identity, write_pull_ack, write_push_ack,
+};
 pub use rebuild::{RebuildReport, rebuild_control_table};
 pub use remote_config::{RemoteAttachment, RemoteConfigError, RemoteMode};
 pub use ship::{CollapseReport, CompactOutcome, Ship};
@@ -254,10 +274,10 @@ pub fn unfreeze_pond_writes<P: AsRef<Path>>(
 // The directory `/sys/` is reserved for system metadata; D4 only writes
 // `/sys/remotes/*` but future D-phases may add more siblings (e.g. `/sys/keys/`).
 //
-// Per-remote runtime state — `last_pushed_seq:<url>`, `last_pulled_seq:<url>`,
-// `remote_mode:<name>` — is stored in the control table's settings map via
-// `ControlTable::raw_config_{get,set}`, NOT in the YAML config (so that
-// pushing the config to a backup never accidentally ships local watermarks).
+// Per-remote runtime state — mode/mount and structured publication
+// acknowledgements keyed by remote URL, pond id, and ref — is stored in the
+// control table via `ControlTable::raw_config_{get,set}`, NOT in the YAML
+// config (so backup content never ships replica-local frontiers).
 
 /// Filesystem directory holding `/sys/` metadata files (D4+).
 pub const SYS_DIR: &str = "/sys";

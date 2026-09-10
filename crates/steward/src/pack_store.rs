@@ -7,10 +7,10 @@
 //! --collapse-versions` writes into (`docs/logical-series-identity-design.md`,
 //! pack-only physical maintenance).
 //!
-//! This is distinct from [`sync_store::ContentRemote`]'s pack advertisement
-//! (an `object_store` remote, written only by `pond push`): this module is
-//! the read/write side for the pond's OWN root directory, exactly the
-//! `_packs/v3/series=<hex>/pack=<hex>` layout
+//! This is distinct from [`sync_store::ContentRemote`]'s content-addressed
+//! pack objects and fixed-key linked/consolidated locators. This module is the
+//! read/write side for the pond's OWN root directory, exactly the
+//! `_packs/v4/series=<hex>/pack=<hex>` layout
 //! [`crate::content_source::LocalPondSource`] already reads from
 //! (`sync_store::pack_keys`). Physical pack objects (the bounded, repacked
 //! byte ranges / Parquet objects a pack index names) live in a second,
@@ -46,7 +46,7 @@ pub(crate) fn packs_root(pond_root: &Path) -> PathBuf {
     get_data_path(pond_root).join(sync_store::pack_keys::PACKS_ROOT)
 }
 
-/// The versioned v3 pack-index root under a pond's data directory.
+/// The versioned v4 pack-index root under a pond's data directory.
 #[must_use]
 pub(crate) fn pack_index_root(pond_root: &Path) -> PathBuf {
     get_data_path(pond_root).join(sync_store::pack_keys::PACK_INDEX_ROOT)
@@ -58,7 +58,7 @@ pub(crate) fn pack_objects_dir(pond_root: &Path) -> PathBuf {
     packs_root(pond_root).join(PACK_OBJECTS_DIR)
 }
 
-/// One series' pack advertisement directory: `data/_packs/v3/series=<hex>`.
+/// One series' pack advertisement directory: `data/_packs/v4/series=<hex>`.
 #[must_use]
 pub(crate) fn pack_series_dir(pond_root: &Path, series_hash: ObjectHash) -> PathBuf {
     pack_index_root(pond_root).join(sync_store::pack_keys::series_dir_name(series_hash))
@@ -70,7 +70,7 @@ fn pack_object_path(pond_root: &Path, object_hash: ObjectHash) -> PathBuf {
     pack_objects_dir(pond_root).join(object_hash.to_hex())
 }
 
-/// One pack advertisement's on-disk path: `data/_packs/v3/series=<hex>/pack=<hex>`.
+/// One pack advertisement's on-disk path: `data/_packs/v4/series=<hex>/pack=<hex>`.
 #[must_use]
 fn pack_index_path(pond_root: &Path, series_hash: ObjectHash, pack_hash: ObjectHash) -> PathBuf {
     pack_series_dir(pond_root, series_hash).join(sync_store::pack_keys::pack_file_name(pack_hash))
@@ -106,7 +106,7 @@ async fn write_atomic(final_path: &Path, bytes: &[u8]) -> Result<(), StewardErro
     })?;
     tokio::fs::create_dir_all(parent).await?;
     // `create_dir_all` may have just created `parent` itself (a brand new
-    // `series=<hex>` directory entry under `_packs/v3/`, or `_packs/objects`
+    // `series=<hex>` directory entry under `_packs/v4/`, or `_packs/objects`
     // itself on a fresh pond): fsync it and its own parent unconditionally
     // (idempotent and cheap even when both already existed) so that new
     // directory's existence can never be lost to a crash independent of
@@ -189,6 +189,48 @@ pub(crate) async fn has_pack_object(
     Ok(tokio::fs::try_exists(&path).await?)
 }
 
+/// Stream and verify one local physical pack object against its
+/// content-addressed filename, returning its byte length.
+pub(crate) async fn verify_pack_object(
+    pond_root: &Path,
+    object_hash: ObjectHash,
+) -> Result<u64, StewardError> {
+    use tokio::io::AsyncReadExt;
+
+    let path = pack_object_path(pond_root, object_hash);
+    let mut file = open_pack_object_reader(pond_root, object_hash)
+        .await?
+        .ok_or_else(|| {
+            StewardError::Content(format!(
+                "local consolidated pack names missing physical object {}",
+                path.display()
+            ))
+        })?;
+    let mut hasher = blake3::Hasher::new();
+    let mut length = 0u64;
+    let mut buffer = vec![0u8; 256 * 1024];
+    loop {
+        let count = file.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        let _ = hasher.update(&buffer[..count]);
+        length = length.checked_add(count as u64).ok_or_else(|| {
+            StewardError::Content(format!("pack object {} length overflow", path.display()))
+        })?;
+    }
+    let actual = ObjectHash::from_bytes(*hasher.finalize().as_bytes());
+    if actual != object_hash {
+        return Err(StewardError::Content(format!(
+            "local pack object {} hashes to {}, expected {}",
+            path.display(),
+            actual,
+            object_hash
+        )));
+    }
+    Ok(length)
+}
+
 /// Every physical pack object hash currently durable under
 /// `data/_packs/objects/` -- parsed from each entry's own hex filename,
 /// exactly the content-addressed key [`write_pack_object`] wrote it under.
@@ -230,7 +272,7 @@ pub(crate) async fn list_pack_object_hashes(
 }
 
 /// Publish one pack advertisement at its own content-addressed key
-/// (`data/_packs/v3/series=<hex>/pack=<hex>`), unless it already exists (the
+/// (`data/_packs/v4/series=<hex>/pack=<hex>`), unless it already exists (the
 /// key is content-addressed, so an existing file is necessarily
 /// byte-identical). Returns the pack's own hash.
 ///
@@ -399,11 +441,11 @@ pub(crate) async fn list_local_pack_hashes(
     Ok(out)
 }
 
-/// Every series hash with at least one advertisement under `_packs/v3/`, parsed
+/// Every series hash with at least one advertisement under `_packs/v4/`, parsed
 /// from `series=<hex>` directory names.
 ///
 /// # Errors
-/// Returns an error if the `_packs/v3` root cannot be listed, or if it holds
+/// Returns an error if the `_packs/v4` root cannot be listed, or if it holds
 /// an entry (other than common, harmless OS filesystem metadata such as `.DS_Store` -- see
 /// [`sync_store::pack_keys::is_ignorable_directory_entry`]) whose name does
 /// not parse as `series=<hex>`.
@@ -467,7 +509,7 @@ pub(crate) async fn list_local_series_hashes(
 /// `(series_hash, pack_hash, index)`.
 ///
 /// Fails loudly the moment any advertisement under
-/// `_packs/v3/series=*/pack=*` does not verify (content-address mismatch or
+/// `_packs/v4/series=*/pack=*` does not verify (content-address mismatch or
 /// cross-series index) -- a caller doing GC must never guess that a
 /// corrupt advertisement names no objects, since that could sweep an
 /// object something else still depends on.
@@ -544,7 +586,7 @@ fn layout_marker_path(pond_root: &Path, series_hash: ObjectHash, pack_hash: Obje
 
 /// One pack advertisement's stale-generation sentinel path (see
 /// `sync_store::pack_keys`'s `STALE_MARKER_SUFFIX` doc):
-/// `data/_packs/v3/series=<hex>/pack=<hex>.stale`.
+/// `data/_packs/v4/series=<hex>/pack=<hex>.stale`.
 fn stale_pack_marker_path(
     pond_root: &Path,
     series_hash: ObjectHash,
@@ -555,8 +597,8 @@ fn stale_pack_marker_path(
 }
 
 /// One whole series directory's stale-generation sentinel path, living
-/// directly under `_packs/v3/` beside the `series=<hex>` directory it marks:
-/// `data/_packs/v3/series=<hex>.stale`.
+/// directly under `_packs/v4/` beside the `series=<hex>` directory it marks:
+/// `data/_packs/v4/series=<hex>.stale`.
 fn stale_series_marker_path(pond_root: &Path, series_hash: ObjectHash) -> PathBuf {
     pack_index_root(pond_root).join(sync_store::pack_keys::stale_series_marker_file_name(
         series_hash,
@@ -764,12 +806,12 @@ pub(crate) struct RetentionStats {
     pub(crate) orphan_markers_removed: usize,
 }
 
-/// Delete every `_packs/v3/series=<hex>` directory whose `<hex>` is not in
+/// Delete every `_packs/v4/series=<hex>` directory whose `<hex>` is not in
 /// `live_series_hashes` -- the other half of pack-backed local maintenance
 /// alongside [`sweep_unreferenced_pack_objects`] -- but only once each has
 /// survived one full maintenance generation as no-longer-live.
 ///
-/// A `watertown.series.v2` series hash is the fold of *all* of a series' current
+/// A `watertown.series.v3` series hash is the fold of *all* of a series' current
 /// live leaf hashes, so any append at all mints a brand new series hash;
 /// without this, every append-then-repack cycle would leave the previous
 /// cycle's now-superseded `series=<oldhash>` directory (and its

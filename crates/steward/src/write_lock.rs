@@ -76,6 +76,15 @@ pub(crate) struct WriteLockGuard {
 }
 
 impl WriteLockGuard {
+    /// Acquire a separate process-level lock file under `control_dir`.
+    pub(crate) fn try_acquire_named(
+        control_dir: &Path,
+        file_name: &str,
+        txn_meta: &PondTxnMetadata,
+    ) -> Result<Self, StewardError> {
+        Self::try_acquire_path(control_dir.join(file_name), txn_meta)
+    }
+
     /// Acquire the write lock and reject a persisted write freeze.
     pub(crate) fn try_acquire_for_write(
         control_dir: &Path,
@@ -109,8 +118,10 @@ impl WriteLockGuard {
         control_dir: &Path,
         txn_meta: &PondTxnMetadata,
     ) -> Result<Self, StewardError> {
-        let path = control_dir.join("write.lock");
+        Self::try_acquire_path(control_dir.join("write.lock"), txn_meta)
+    }
 
+    fn try_acquire_path(path: PathBuf, txn_meta: &PondTxnMetadata) -> Result<Self, StewardError> {
         // Open without O_TRUNC: if another process holds the lock we
         // must not stomp their body before we discover the conflict.
         let mut file = OpenOptions::new()

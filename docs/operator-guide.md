@@ -25,8 +25,9 @@ Lake.  Every write is one atomic transaction recorded in the Delta
 commit log.
 
 A **remote** is an S3-compatible bucket or a local directory that holds
-replicated copies of a pond's transactions as **bundles**.  Two kinds of
-attachment exist, distinguished only by direction:
+immutable native-v2 objects, packs, publication records, and one bounded
+current-publication row per ref. Two kinds of attachment exist, distinguished
+only by direction:
 
 | Attachment | Command | Direction | Use |
 |-----------|---------|-----------|-----|
@@ -48,7 +49,7 @@ A pull remote attaches at a **mount path**:
 | Kind | Examples | Where it lives | Replicated? |
 |------|----------|----------------|-------------|
 | **Universal** | User data, factory configs, `/sys/remotes/<name>` attachment YAML | Data Delta table | Yes (push/pull) |
-| **Per-replica** | Pond identity cache, remote modes, push/pull watermarks | Control table | No |
+| **Per-replica** | Pond identity cache, remote modes, structured push/pull acknowledgements | Control table | No |
 
 The **data table** is canonical and replicable.  The **control table**
 is a per-instance cache and audit log; it is disposable and can be
@@ -184,13 +185,11 @@ $ POND=~/preview-mysite pond restore origin s3://my-bucket/mysite \
     --secret-access-key '${env:S3_SECRET_KEY}'
 ```
 
-`restore` fetches the **entire object graph** reachable from the remote
-tip (every reachable blob, tree, and commit) and verifies it folds to the
-remote's root hash, so the first run transfers the pond's full live
-content.  The graph fetch loads the remote's object index once rather than
-per object, so a clone runs at roughly stream-once speed over the link
-(e.g. a multi-GB staging pond over LAN MinIO clones in a few minutes, not
-hours).
+`restore` reads the fixed current `_publication/` row, verifies its immutable
+publication record and `watertown.commit.v2` tip, traverses the requested
+persistent manifest map, and fetches the live snapshot objects. The first run
+therefore transfers the full live content. It does not scan a cumulative
+object or commit index.
 
 A restored clone is a normal, fully queryable pond -- `pond list`,
 `pond cat <path> --sql "..."`, and factory runs all work against it with
@@ -239,8 +238,9 @@ many data sources the site needs:
    ```
 
    The cross-pond `pull` steps fetch only the objects the local pond is
-   missing, using the same one-shot object-index load as `restore`, so a
-   first full import of a large staging pond completes in minutes.
+   missing. An initial import traverses the current persistent manifest map;
+   later pulls read changed publication records, changed manifest paths, and
+   changed series suffixes only.
 
 The sitegen node path (`/system/etc/90-sitegen`) and the set of import
 remotes are defined by the deployment's site config, not by the platform.
@@ -318,7 +318,7 @@ local and needs no commit.
 $ pond push                # all push/both remotes
 $ pond push origin         # one named remote
 
-# Pull new bundles from pull/both remotes
+# Pull new native-v2 publications from pull/both remotes
 $ pond pull                # all pull/both remotes
 $ pond pull upstream       # one named remote
 ```
@@ -336,16 +336,33 @@ small parquet files into fewer large ones.
 ```
 $ pond maintain
 $ pond maintain --compact
+$ pond maintain --dry-run --collapse-versions 100
+$ pond maintain --collapse-versions 100
 ```
 
-`--compact` records the data-table merge as a **Compact transaction**, so
-the next `pond push` emits a Compact bundle that backups can use as a
-restart baseline (see [§6](#6-recovery)).  Push before (or right after)
-compacting so the baseline reaches your backup.
+`--compact` records the data-table merge as a **Compact transaction**. Push
+afterward when the compacted state changed the current native snapshot.
 
-> `pond maintain` operates on the local pond only; it does not push to or
-> prune remotes.  Remote-side bundle retention is not currently exposed as
-> a `pond` CLI command.
+`--collapse-versions N` is native-v2 **pack-only** maintenance despite its
+historical flag name. It creates verified whole-range physical packs under
+local `data/_packs` for series whose fanout exceeds `N`. It never rewrites or
+reclaims user logical-series rows or their `_large_files` payloads; only
+obsolete rows of the reserved `.pond-node-index` may be deleted.
+
+Local pack creation never opens a backup. After the exact local snapshot has
+already been pushed, publish the maintained packs explicitly:
+
+```
+$ pond backup publish-consolidated origin
+```
+
+That command accepts one named `push`/`both` backup, validates its pond
+identity and current `main` publication, re-verifies every selected local pack
+and object, and performs objects -> pack -> immutable consolidated locator
+under the attachment's limiter. It reports selected series, packs, objects,
+and bytes. It is never run by collection, automatic post-commit push, or an
+unchanged command. A failed attempt leaves the ordinary linked series chain
+valid and can be retried idempotently.
 
 ---
 
@@ -461,16 +478,17 @@ $ pond pull upstream
 ```
 
 A mirror re-fetch rebuilds the local content closure from the remote's
-published tip; a cross-pond pull refreshes only the foreign pond's
-footprint.
+published tip; a cross-pond pull refreshes only the foreign pond's footprint.
+When a structured consumer acknowledgement is present, ordinary pull walks
+only newer immutable publication records and changed manifest entries.
 
 ### Capsule recovery
 
 Use a portable capsule when a native backup must be recovered into a fresh
-pond. The current
-`watertown.commit.v1` recovery recipe produces `pondcapsule.4`. V4 preserves
-the schema identity of every table leaf and persisted dynamic-node timestamps.
-No historical capsule or native object format is accepted.
+pond. Native-v2 ponds publish `pondcapsule.4` explicitly with
+`pond capsule publish`; V4 preserves the schema identity of every table leaf
+and persisted dynamic-node timestamps. No historical capsule format is
+accepted.
 
 This is not the routine `pond pull` path. A capsule is a deliberate,
 authenticated recovery boundary:
@@ -486,31 +504,26 @@ authenticated recovery boundary:
    Stopping the service, timer, supervisor, and operator sessions is still
    required.
 
-2. Publish and inspect the current recipe, then push and verify
-   the selected exact native snapshot:
+2. Push and verify the selected exact native snapshot, then explicitly publish
+   its portable capsule:
 
    ```bash
-   POND="$SOURCE_POND" pond capsule recipe publish backup
-   POND="$SOURCE_POND" pond capsule recipe inspect backup
    POND="$SOURCE_POND" pond push backup
    POND="$SOURCE_POND" pond verify --exact backup
+   POND="$SOURCE_POND" pond capsule publish backup
    ```
 
-   Record the exact source tip and the recipe hash printed by `inspect`.
-   Retrieve the hash-addressed bootstrap at
-   `recovery/recipes/watertown.commit.v1/<recipe-hash>/README.sh`. The
-   discoverable `recovery/README.sh` may be older; authenticate its exact bytes
-   against the immutable object at the path named by its own recipe hash.
-   Missing or mismatched immutable copies are errors.
-   Authenticate the bootstrap with the documented `pondcapsule.recipe.1`
-   domain hash before executing it.
+   Record the exact source tip and capsule root. Download the immutable
+   `recovery/` tree from the backup and verify it with the downloaded
+   `capsule.py` or the current `pond capsule verify`.
 
-3. Using the authenticated kit, download a complete read-only copy of the
-   native backup, extract by the recorded commit hash, and verify the capsule:
+   `pond capsule recipe publish/inspect` is only for extracting an explicitly
+   retained legacy `watertown.commit.v1` rollback remote. It is not part of
+   native-v2 publication or cutover.
+
+3. Verify the downloaded capsule and optionally materialize it independently:
 
    ```bash
-   python extract.py "$BACKUP" "$CAPSULE" \
-     --commit "$SOURCE_TIP" --birthplace "$SOURCE_BIRTHPLACE"
    python "$CAPSULE/capsule.py" verify "$CAPSULE"
    python "$CAPSULE/capsule.py" materialize "$CAPSULE" "$MATERIALIZED"
    ```
@@ -518,21 +531,24 @@ authenticated recovery boundary:
    `CAPSULE` and `MATERIALIZED` must not exist before creation. Keep the
    backup, capsule, and materialized output read-only after verification.
 
-4. Import only into a new target. Import keeps post-commit dispatch and
-   automatic pushes suppressed until the operator deliberately promotes it:
+4. Import only into a new target. Import uses bounded journaled batches and
+   keeps post-commit dispatch and automatic pushes suppressed through
+   promotion:
 
    ```bash
    POND="$TARGET_POND" pond capsule import "$CAPSULE" \
-     --birthplace "$TARGET_BIRTHPLACE" --experimental
+     --birthplace "$TARGET_BIRTHPLACE"
    POND="$TARGET_POND" pond fsck --quick
    POND="$TARGET_POND" pond remote list
    ```
 
    Review `CAPSULE_IMPORT_PROVENANCE.json`, validate critical data, schemas,
    timestamps, and remotes, and ensure the target does not resolve to source
-   storage. Attach or retain only an isolated target backup. Enable
-   `post_commit_dispatch` and start exactly one writer only after those
-   checks, including a separate current-format backup/recovery drill, succeed.
+   storage. Attach or retain only an isolated target backup. After those
+   checks, including a separate current-format backup/recovery drill, run
+   `POND="$TARGET_POND" pond capsule activate`; it preflights restored remotes
+   and `/system/run/*` configs before enabling dispatch. Start exactly one
+   writer only after activation succeeds.
 
 Follow [capsule-recovery-runbook.md](capsule-recovery-runbook.md) for the
 complete watershop rehearsal and Azure production procedure. It specifies the
@@ -660,8 +676,10 @@ SETUP
 
 ROUTINE
   pond push [name]                            Push pending writes (retry)
-  pond pull [name]                            Pull new bundles
+  pond pull [name]                            Pull new native-v2 publications
   pond maintain [--compact]                   Local checkpoint/vacuum/compact
+  pond maintain --collapse-versions N         Build verified local whole-range packs
+  pond backup publish-consolidated <name>     Explicitly upload/install those packs
 
 MONITORING
   pond status                                 Identity + watermarks + recovery
@@ -672,11 +690,13 @@ MONITORING
 RECOVERY
   pond recover                                Resolve incomplete transactions
   pond rebuild-control [--force]              Rebuild control table from data
-  pond capsule recipe publish <backup>        Publish current V4 recovery kit
-  pond capsule recipe inspect <backup>        Inspect current V4 recovery kit
-  pond capsule verify <capsule-dir>           Verify a downloaded V1-V4 capsule
-  pond capsule import <capsule-dir> --birthplace <label> --experimental
+  pond capsule publish <backup>               Publish current V4 capsule
+  pond capsule recipe publish <backup>        Publish legacy-v1 extraction kit
+  pond capsule recipe inspect <backup>        Inspect legacy-v1 extraction kit
+  pond capsule verify <capsule-dir>           Verify a downloaded V4 capsule
+  pond capsule import <capsule-dir> --birthplace <label>
                                               Import only into a new inert pond
+  pond capsule activate                       Preflight and activate an import
   pond freeze enable|status|disable            Guard a migration source
   pond emergency ...                          Destructive recovery
 ```

@@ -18,12 +18,6 @@ use std::sync::Arc;
 use tinyfs::FS;
 use tlogfs::transaction_guard::TransactionGuard;
 
-/// Reserved directory-entry name of the pond's node-manifest index node under
-/// the root.  Paired with the reserved [`tinyfs::INDEX_NODE_UUID`]; excluded
-/// from the content-tree fold and node manifest (design
-/// `docs/incremental-content-tree-design.md` Section 3).
-const INDEX_NODE_NAME: &str = ".pond-node-index";
-
 /// Reserved directory-entry name of the pond's authoritative commit-log node
 /// under the root.  Paired with the reserved [`tinyfs::LOG_NODE_UUID`]; each
 /// version is one transparency-log leaf (one encoded commit object).  Excluded
@@ -42,13 +36,13 @@ struct PostCommitFactoryConfig {
 
 struct ExpectedContentRoots {
     root_tree_hash: String,
-    node_manifest_hash: String,
-    node_manifest_root: String,
+    manifest_root: String,
 }
 
 struct PreparedCommit {
     spine: CommitSpine,
     content_roots: ExpectedContentRoots,
+    index_bytes: Vec<u8>,
 }
 
 /// Steward transaction guard wraps TLogFS transaction with control table lifecycle tracking
@@ -75,11 +69,12 @@ pub struct StewardTransactionGuard<'a> {
     /// `None` for read transactions (no exclusion needed).
     #[allow(dead_code)]
     write_lock: Option<WriteLockGuard>,
-    /// Number of queued limiter-usage samples written into the pond at the
-    /// start of this transaction (Decision L12).  They are dropped from the
-    /// control queue only once this transaction commits, so an aborted write
-    /// re-emits rather than losing them.
-    emitted_usage: std::sync::atomic::AtomicUsize,
+    /// Limiter usage queued by earlier remote activity. It is emitted only
+    /// after this transaction has another real data change, so telemetry can
+    /// never turn a factory no-op into a commit.
+    pending_usage: Vec<crate::limiter_usage::UsageSample>,
+    /// Number of pending samples successfully added to this transaction.
+    emitted_usage: usize,
     expected_content_roots: Option<ExpectedContentRoots>,
     /// When set, [`Self::commit`] skips [`Self::run_post_commit_factories`] and
     /// [`Self::run_post_commit_remotes`] for this transaction.
@@ -105,6 +100,7 @@ impl<'a> StewardTransactionGuard<'a> {
         last_write_seq: &'a mut i64,
         path: P,
         write_lock: Option<WriteLockGuard>,
+        pending_usage: Vec<crate::limiter_usage::UsageSample>,
     ) -> Self {
         Self {
             data_tx: Some(data_tx),
@@ -116,7 +112,8 @@ impl<'a> StewardTransactionGuard<'a> {
             pond_path: path.as_ref().to_path_buf(),
             committed: false,
             write_lock,
-            emitted_usage: std::sync::atomic::AtomicUsize::new(0),
+            pending_usage,
+            emitted_usage: 0,
             expected_content_roots: None,
             suppress_post_commit: false,
         }
@@ -344,23 +341,14 @@ impl<'a> StewardTransactionGuard<'a> {
     /// Returns the data-FS Delta version number on a successful write
     /// commit (`Ok(Some(v))`); returns `Ok(None)` for a read transaction
     /// or a write that produced no changes.
-    /// Record that `count` queued usage samples were written into the pond by
-    /// this transaction.
-    pub fn note_emitted_usage(&self, count: usize) {
-        self.emitted_usage
-            .store(count, std::sync::atomic::Ordering::Relaxed);
-    }
-
     pub(crate) fn expect_content_roots(
         &mut self,
         root_tree_hash: sync_store::content::ObjectHash,
-        node_manifest_hash: sync_store::content::ObjectHash,
-        node_manifest_root: sync_store::content::ObjectHash,
+        manifest_root: sync_store::content::ObjectHash,
     ) {
         self.expected_content_roots = Some(ExpectedContentRoots {
             root_tree_hash: root_tree_hash.to_hex(),
-            node_manifest_hash: node_manifest_hash.to_hex(),
-            node_manifest_root: node_manifest_root.to_hex(),
+            manifest_root: manifest_root.to_hex(),
         });
     }
 
@@ -372,7 +360,8 @@ impl<'a> StewardTransactionGuard<'a> {
                     "Transaction already consumed".to_string(),
                 )))
             })?;
-            let (pending_records, modified_dirs) = data_tx.state()?.pending_operation_counts();
+            let (pending_records, modified_dirs) =
+                data_tx.state()?.pending_operation_counts_exact().await;
             if pending_records > 0 || modified_dirs > 0 {
                 prepared_commit = self
                     .write_reserved_nodes(
@@ -388,8 +377,7 @@ impl<'a> StewardTransactionGuard<'a> {
             let actual = if let Some(prepared) = &prepared_commit {
                 (
                     prepared.content_roots.root_tree_hash.clone(),
-                    prepared.content_roots.node_manifest_hash.clone(),
-                    prepared.content_roots.node_manifest_root.clone(),
+                    prepared.content_roots.manifest_root.clone(),
                 )
             } else {
                 let data_tx = self.data_tx.as_ref().ok_or_else(|| {
@@ -404,26 +392,20 @@ impl<'a> StewardTransactionGuard<'a> {
                     &pond_id,
                 )
                 .await?;
-                (
-                    current.root_tree_hash.to_hex(),
-                    current.node_manifest_hash.to_hex(),
-                    current.node_manifest_root.to_hex(),
-                )
+                let (manifest_root, _) =
+                    sync_store::content::build_manifest_map(&current.manifest_records)
+                        .map_err(StewardError::Content)?;
+                (current.root_tree_hash.to_hex(), manifest_root.to_hex())
             };
             let mismatch = if actual.0 != expected.root_tree_hash {
                 Some(format!(
                     "precommit root tree is {} but expected {}",
                     actual.0, expected.root_tree_hash
                 ))
-            } else if actual.1 != expected.node_manifest_hash {
+            } else if actual.1 != expected.manifest_root {
                 Some(format!(
-                    "precommit node manifest hash is {} but expected {}",
-                    actual.1, expected.node_manifest_hash
-                ))
-            } else if actual.2 != expected.node_manifest_root {
-                Some(format!(
-                    "precommit node manifest Merkle root is {} but expected {}",
-                    actual.2, expected.node_manifest_root
+                    "precommit manifest root is {} but expected {}",
+                    actual.1, expected.manifest_root
                 ))
             } else {
                 None
@@ -434,6 +416,36 @@ impl<'a> StewardTransactionGuard<'a> {
         }
 
         Ok(prepared_commit)
+    }
+
+    async fn emit_pending_usage_after_real_change(&mut self) -> Result<(), StewardError> {
+        if self.transaction_type != TransactionType::Write
+            || self.pending_usage.is_empty()
+            || self.expected_content_roots.is_some()
+        {
+            return Ok(());
+        }
+        let data_tx = self.data_tx.as_ref().ok_or_else(|| {
+            StewardError::DataInit(tlogfs::TLogFSError::TinyFS(tinyfs::Error::Other(
+                "Transaction already consumed".to_string(),
+            )))
+        })?;
+        let (pending_records, modified_dirs) =
+            data_tx.state()?.pending_operation_counts_exact().await;
+        if pending_records == 0 && modified_dirs == 0 {
+            return Ok(());
+        }
+
+        match crate::limiter_usage::emit(data_tx, &self.pending_usage).await {
+            Ok(()) => self.emitted_usage = self.pending_usage.len(),
+            Err(error) => {
+                log::error!(
+                    "limiter usage: failed to emit queued samples; preserving them for retry: \
+                     {error}"
+                );
+            }
+        }
+        Ok(())
     }
 
     pub async fn commit(mut self) -> Result<Option<i64>, StewardError> {
@@ -456,6 +468,9 @@ impl<'a> StewardTransactionGuard<'a> {
         // transaction, before it is finalized.  Only write transactions that
         // actually changed something get an index-node version; a read
         // transaction (or a no-op write) leaves it untouched.
+        if let Err(error) = self.emit_pending_usage_after_real_change().await {
+            return Err(self.abort_preserving(error).await);
+        }
         let prepared_commit = match self.prepare_commit().await {
             Ok(prepared) => prepared,
             Err(error) => return Err(self.abort_preserving(error).await),
@@ -499,12 +514,26 @@ impl<'a> StewardTransactionGuard<'a> {
                 // same Delta transaction as the data, by `write_reserved_nodes`.
                 // The control-table copy recorded below is a disposable,
                 // rebuildable cache -- not the source of truth.
-                let commit_spine = prepared_commit.map(|prepared| prepared.spine);
+                let (commit_spine, index_bytes) = prepared_commit
+                    .map_or((None, None), |prepared| {
+                        (Some(prepared.spine), Some(prepared.index_bytes))
+                    });
 
                 // The leaf appended to the transparency log is the commit
                 // object of this commit; a spine is present exactly when the
                 // reserved commit-log node got a new leaf this transaction.
                 let has_leaf = commit_spine.is_some();
+
+                if let Some(index_bytes) = index_bytes
+                    && let Err(error) =
+                        crate::local_content::LocalContentStore::new(&self.pond_path)
+                            .write_manifest_root_cursor(&pond_id.to_string(), &index_bytes)
+                {
+                    log::warn!(
+                        "committed manifest-root cursor could not be refreshed; the next \
+                         operation will recover it from the reserved index: {error}"
+                    );
+                }
 
                 self.control_table
                     .record_data_committed(
@@ -544,9 +573,7 @@ impl<'a> StewardTransactionGuard<'a> {
                 // post-commit push below, which will queue fresh samples of
                 // its own -- and `drop_emitted` removes a prefix rather than
                 // clearing, so those survive.
-                let emitted = self
-                    .emitted_usage
-                    .load(std::sync::atomic::Ordering::Relaxed);
+                let emitted = self.emitted_usage;
                 if emitted > 0 {
                     crate::limiter_usage::drop_emitted(self.control_table, emitted).await;
                 }
@@ -679,32 +706,73 @@ impl<'a> StewardTransactionGuard<'a> {
         let committed_table = data_tx.persistence().table().clone();
 
         let root = data_tx.root().await?;
+        let local_store = crate::local_content::LocalContentStore::new(&self.pond_path);
+        let parent_commit_hash =
+            crate::content_tree::log_tip_commit_hash(committed_table.clone(), &pond_id_str).await?;
 
-        // The prior committed manifest is the incremental fold's baseline; it is
-        // absent only at genesis, before the first content-changing commit wrote
-        // the index node.  Reading it through the working directory transparently
-        // reassembles an externalized (large) manifest.
-        let prior_manifest_bytes = if root.exists(INDEX_NODE_NAME).await {
-            Some(root.read_file_path_to_vec(INDEX_NODE_NAME).await?)
-        } else {
-            None
+        // The fixed local cursor is the normal baseline. Recover it from one
+        // bounded latest-index query after a crash/cache loss, validating it
+        // against the authoritative parent commit before use.
+        let prior_manifest_bytes = match parent_commit_hash {
+            None => None,
+            Some(parent_hash) => {
+                let parent_bytes = local_store.read(parent_hash)?;
+                let parent =
+                    sync_store::content::Commit::decode(&parent_bytes).map_err(|error| {
+                        StewardError::Content(format!(
+                            "decode local parent commit {parent_hash}: {error}"
+                        ))
+                    })?;
+                let expected_root = parent.manifest_root;
+                let cursor = local_store
+                    .read_manifest_root_cursor(&pond_id_str)?
+                    .filter(|bytes| {
+                        sync_store::content::decode_manifest_root(bytes)
+                            .is_ok_and(|root| root == expected_root)
+                    });
+                match cursor {
+                    Some(bytes) => Some(bytes),
+                    None => {
+                        let bytes = crate::content_tree::index_root_pointer_bytes(
+                            committed_table.clone(),
+                            &pond_id_str,
+                        )
+                        .await?
+                        .ok_or_else(|| {
+                            StewardError::Content(format!(
+                                "parent commit {parent_hash} names manifest {expected_root}, but \
+                                 the reserved index pointer is absent"
+                            ))
+                        })?;
+                        let actual = sync_store::content::decode_manifest_root(&bytes)
+                            .map_err(StewardError::Content)?;
+                        if actual != expected_root {
+                            return Err(StewardError::Content(format!(
+                                "reserved index points to {actual}, parent commit {parent_hash} \
+                                 names {expected_root}"
+                            )));
+                        }
+                        local_store.write_manifest_root_cursor(&pond_id_str, &bytes)?;
+                        Some(bytes)
+                    }
+                }
+            }
         };
 
-        let inputs = crate::content_tree::incremental_spine_inputs(
+        let inputs = crate::content_tree::incremental_spine_inputs_v2(
             committed_table.clone(),
             prior_manifest_bytes,
             uncommitted.clone(),
             &pond_id_str,
+            &self.pond_path,
         )
         .await?;
 
-        // Design step 4b oracle: the incremental roots must match a full fold of
-        // the same live state.  Always on in debug builds; in release builds it
-        // is opt-in via POND_VERIFY_FOLD (see `fold_verification_enabled`) so a
-        // high-value pond can validate every commit while other deployments pay
-        // just the O(change) incremental fold.
+        // Design step 4b oracle: when the explicit POND_VERIFY_FOLD diagnostic
+        // is enabled, the incremental roots must match a full fold of the same
+        // live state. Ordinary runs in every build pay only O(change).
         if crate::content_tree::fold_verification_enabled() {
-            let oracle = crate::content_tree::in_txn_spine_inputs(
+            let oracle = crate::content_tree::in_txn_content_state(
                 committed_table.clone(),
                 uncommitted,
                 &pond_id_str,
@@ -714,53 +782,51 @@ impl<'a> StewardTransactionGuard<'a> {
                 inputs.root_tree_hash, oracle.root_tree_hash,
                 "incremental root_tree_hash diverged from full fold"
             );
+            let (oracle_manifest_root, _) =
+                sync_store::content::build_manifest_map(&oracle.manifest_records)
+                    .map_err(StewardError::Content)?;
             assert_eq!(
-                inputs.node_manifest_hash, oracle.node_manifest_hash,
-                "incremental node_manifest_hash diverged from full fold"
-            );
-            assert_eq!(
-                inputs.node_manifest_root, oracle.node_manifest_root,
-                "incremental node_manifest_root diverged from full fold"
-            );
-            assert_eq!(
-                inputs.manifest_bytes, oracle.manifest_bytes,
-                "incremental manifest bytes diverged from full fold"
+                inputs.manifest_root, oracle_manifest_root,
+                "incremental manifest root diverged from full fold"
             );
         }
 
-        // Index node: one full manifest per version, collapsing so it stays at a
-        // single live version (Phase 2).
-        let mut index_writer = if root.exists(INDEX_NODE_NAME).await {
-            root.async_writer_path_collapsing_with_type(
-                INDEX_NODE_NAME,
-                tinyfs::EntryType::FilePhysicalSeries,
-            )
-            .await?
+        local_store.put_batch(&inputs.object_bytes)?;
+        local_store.put_batch(&inputs.pack_bytes)?;
+
+        // Index node: one fixed-size manifest-root pointer per version,
+        // collapsing so routine local lookup remains bounded.
+        let mut index_writer = if root.exists(tinyfs::INDEX_NODE_NAME).await {
+            root.async_writer_reserved_index().await?
         } else {
             let node_id = tinyfs::NodeID::from_hex_string(tinyfs::INDEX_NODE_UUID)
                 .map_err(|e| StewardError::Content(format!("reserved index node id: {e}")))?;
-            root.create_file_with_id(INDEX_NODE_NAME, node_id).await?
+            root.create_file_with_id(tinyfs::INDEX_NODE_NAME, node_id)
+                .await?
         };
-        index_writer.write_all(&inputs.manifest_bytes).await?;
+        index_writer.write_all(&inputs.index_bytes).await?;
         index_writer.shutdown().await?;
 
         // Commit-log node: the parent is the current log tip read from the
         // committed table (this transaction's leaf is not written yet), so the
         // new leaf chains onto the previous commit.  Each version is a distinct,
         // permanent leaf, so this is a plain (non-collapsing) append.
-        let parent_commit_hash =
-            crate::content_tree::log_tip_commit_hash(committed_table, &pond_id_str).await?;
         let spine = crate::content_tree::build_commit_spine(
             parent_commit_hash,
             inputs.root_tree_hash,
-            inputs.node_manifest_hash,
-            inputs.node_manifest_root,
+            inputs.manifest_root,
+            inputs.manifest_changes,
+            inputs.introduced_objects,
+            inputs.introduced_packs,
             &pond_id_str,
             txn_seq,
             commit_args,
-        );
+        )?;
         let commit_object = hex::decode(&spine.commit_object)
             .map_err(|e| StewardError::Content(format!("encode commit-log leaf: {e}")))?;
+        let commit_hash = sync_store::content::ObjectHash::from_hex(&spine.commit_hash)
+            .map_err(StewardError::Content)?;
+        let _ = local_store.put(commit_hash, &commit_object)?;
         let mut log_writer = if root.exists(LOG_NODE_NAME).await {
             root.async_writer_path_with_type(LOG_NODE_NAME, tinyfs::EntryType::FilePhysicalSeries)
                 .await?
@@ -774,10 +840,10 @@ impl<'a> StewardTransactionGuard<'a> {
 
         Ok(Some(PreparedCommit {
             spine,
+            index_bytes: inputs.index_bytes,
             content_roots: ExpectedContentRoots {
                 root_tree_hash: inputs.root_tree_hash.to_hex(),
-                node_manifest_hash: inputs.node_manifest_hash.to_hex(),
-                node_manifest_root: inputs.node_manifest_root.to_hex(),
+                manifest_root: inputs.manifest_root.to_hex(),
             },
         }))
     }
@@ -1434,6 +1500,25 @@ impl<'a> StewardTransactionGuard<'a> {
         };
 
         for (name, attachment) in to_push {
+            match crate::remote_ref_is_acknowledged(ship, &attachment.url, "main").await {
+                Ok(true) => {
+                    info!(
+                        "post-commit auto-push: {} skipped; remote already acknowledged the \
+                         current content tip",
+                        name
+                    );
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    log::error!(
+                        "post-commit auto-push: {} cannot validate local publication \
+                         acknowledgement; reconciling against the remote: {}",
+                        name,
+                        error
+                    );
+                }
+            }
             info!("post-commit auto-push: {} -> {}", name, attachment.url);
             // One dispatch (Decision A8).  Boxed for the same reason the
             // limiter bind below is: reading a profile opens a read
@@ -1504,15 +1589,15 @@ impl<'a> StewardTransactionGuard<'a> {
                         "post-commit auto-push: {} done (objects_pushed={}, tip={})",
                         name, outcome.objects_pushed, tip_hex
                     );
-                    // Record the per-ref frontier we last pushed (CA3 tip hash,
-                    // replacing the retired per-pond seq watermark).
-                    if let Err(e) = ship
-                        .control_table_mut()
-                        .raw_config_set(&format!("last_pushed_tip:{}", attachment.url), &tip_hex)
-                        .await
+                    if let Err(e) = crate::write_push_ack(
+                        ship.control_table_mut(),
+                        &attachment.url,
+                        &outcome.state,
+                    )
+                    .await
                     {
                         log::warn!(
-                            "post-commit auto-push: {} pushed but failed to record last_pushed_tip: {}",
+                            "post-commit auto-push: {} pushed but failed to record acknowledgement: {}",
                             name,
                             e
                         );

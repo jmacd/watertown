@@ -30,7 +30,8 @@ use crate::StewardError;
 use crate::content_source::{BlobReader, ContentSource};
 use crate::limiter::LimiterSet;
 use crate::storage_meter::MeterGuard;
-use sync_store::content::{Commit, ObjectHash};
+use sync_store::PublicationState;
+use sync_store::content::{ObjectHash, PackDescriptor, PublicationRecord};
 
 /// Wraps a source so every request it makes to a remote store is charged.
 pub struct MeteredSource {
@@ -89,13 +90,37 @@ impl ContentSource for MeteredSource {
         self.charged(outcome)
     }
 
+    async fn get_publication_state(
+        &self,
+        ref_name: &str,
+    ) -> Result<Option<PublicationState>, StewardError> {
+        let outcome = self.inner.get_publication_state(ref_name).await;
+        self.charged(outcome)
+    }
+
+    async fn get_publication_record(
+        &self,
+        hash: ObjectHash,
+    ) -> Result<Option<PublicationRecord>, StewardError> {
+        let outcome = self.inner.get_publication_record(hash).await;
+        self.charged(outcome)
+    }
+
+    async fn get_publication_pack(
+        &self,
+        descriptor: PackDescriptor,
+    ) -> Result<Option<Vec<u8>>, StewardError> {
+        let outcome = self.inner.get_publication_pack(descriptor).await;
+        self.charged(outcome)
+    }
+
     async fn get_object(&self, hash: ObjectHash) -> Result<Option<Vec<u8>>, StewardError> {
         let outcome = self.inner.get_object(hash).await;
         self.charged(outcome)
     }
 
-    async fn get_commit_index(&self) -> Result<Option<HashMap<ObjectHash, Commit>>, StewardError> {
-        let outcome = self.inner.get_commit_index().await;
+    async fn object_size(&self, hash: ObjectHash) -> Result<Option<u64>, StewardError> {
+        let outcome = self.inner.object_size(hash).await;
         self.charged(outcome)
     }
 
@@ -122,6 +147,22 @@ impl ContentSource for MeteredSource {
         self.charged(outcome)
     }
 
+    async fn get_series_pack(
+        &self,
+        series_hash: ObjectHash,
+    ) -> Result<Option<PackDescriptor>, StewardError> {
+        let outcome = self.inner.get_series_pack(series_hash).await;
+        self.charged(outcome)
+    }
+
+    async fn get_consolidated_series_pack(
+        &self,
+        series_hash: ObjectHash,
+    ) -> Result<Option<PackDescriptor>, StewardError> {
+        let outcome = self.inner.get_consolidated_series_pack(series_hash).await;
+        self.charged(outcome)
+    }
+
     async fn list_pack_hashes(
         &self,
         series_hash: ObjectHash,
@@ -137,14 +178,5 @@ impl ContentSource for MeteredSource {
     ) -> Result<Option<Vec<u8>>, StewardError> {
         let outcome = self.inner.get_pack_index(series_hash, pack_hash).await;
         self.charged(outcome)
-    }
-
-    async fn preload_objects(&self) -> Result<(), StewardError> {
-        let outcome = self.inner.preload_objects().await;
-        self.charged(outcome)
-    }
-
-    fn clear_object_cache(&self) {
-        self.inner.clear_object_cache();
     }
 }

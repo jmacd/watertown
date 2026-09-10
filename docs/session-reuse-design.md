@@ -10,8 +10,11 @@ factory. That model is a good user interface, but the current CLI gives every
 `pond run` invocation a completely separate process, pond open, transaction,
 provider state, commit, and post-commit sequence.
 
-That cost is acceptable for the ordinary water, septic, and noyo collectors,
-where one `run` executes the whole collection factory. It is a poor fit for
+Water and septic currently execute one collection factory per tick. Noyo
+executes two Git refreshes and one HydroVu collection as three separate
+commands. Each command, including its backup activity, must already satisfy the
+low-cost invariants in `low-cost-correctness-review.md`; session reuse is not a
+correctness prerequisite. It is a distinct opportunity for workloads such as
 `watershop-selfmon`, whose shell tick composes many small factories. A steady
 selfmon tick currently launches about 51 `pond` processes. Twenty-seven of them
 open the selfmon pond; eleven separate invocations each open the same pond and

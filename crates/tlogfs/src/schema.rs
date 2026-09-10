@@ -1143,11 +1143,10 @@ mod tests {
     ///
     /// This tiered shape -- an earlier merge run's range NOT fully covered by
     /// a later run's range, so both stay live -- is only reachable in this
-    /// synthetic form today: production's only reachable collapse-row source
-    /// (`WD::async_writer_path_collapsing_with_type`, used by content-pull
-    /// replication to mirror a source pond's collapse) always supersedes
-    /// every version back to the start (`collapsed_from` is always `None`,
-    /// i.e. lo=0), while the arbitrary-window `collapsed_from` a partial merge
+    /// synthetic form today: native-v2 production's only reachable collapsed
+    /// row is the reserved manifest index, which always supersedes every
+    /// version back to the start (`collapsed_from` is always `None`, i.e.
+    /// lo=0), while the arbitrary-window `collapsed_from` a partial merge
     /// would need is unsupported for logical-series-v2
     /// (`TLogFSError::CollapseUnsupported`, BLOCKER 3). The distinguishing
     /// logic must still be correct for any row shape this schema can express

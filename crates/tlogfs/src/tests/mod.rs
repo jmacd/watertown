@@ -3593,10 +3593,9 @@ fn test_supersession_uses_ranges_not_max_watermark() {
 /// single run, or with no loose tail, version order and byte order still
 /// agree. Row-rewriting collapse is no longer a production capability for
 /// logical-series-v2 (`State::collapse_file_series` unconditionally returns
-/// `TLogFSError::CollapseUnsupported`), but the merged-row shape it used to
-/// produce remains reachable in production via content-pull replication of a
-/// source-side collapse (`collapse_prior` in `crate::file`), so the read
-/// path's range-ordering logic below still needs this fixture.
+/// `TLogFSError::CollapseUnsupported`). The merged user-series shape below is
+/// synthetic decoder coverage only; native-v2 production can collapse only
+/// the reserved manifest index.
 async fn build_two_run_series(persistence: &mut OpLogPersistence, file_path: &str) -> Vec<u8> {
     let mut cumulative: Vec<u8> = Vec::new();
     for i in 0..25u32 {

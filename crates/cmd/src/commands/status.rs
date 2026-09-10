@@ -10,10 +10,9 @@
 //! table and `/sys/remotes/*` attachments.  It never opens a remote or
 //! touches the network, so it is safe to run frequently and on a pond
 //! whose remotes are unreachable.  Push "lag" is computed purely from
-//! whose remotes are unreachable.  Push/pull state is reported as the
-//! per-ref tip commit hash last pushed/pulled (`last_pushed_tip:<url>` /
-//! `last_pulled_tip:<url>`); to cross-check against what a remote actually
-//! recorded, use `pond verify`.
+//! whose remotes are unreachable. Push/pull state is reported from structured
+//! local publication acknowledgements; to cross-check against what a remote
+//! actually recorded, use `pond verify`.
 #![allow(clippy::print_stdout)]
 
 use crate::commands::remote::{list_remote_names, load_remote_attachment};
@@ -111,8 +110,19 @@ pub async fn status_command(ship_context: &ShipContext) -> Result<()> {
             .unwrap_or_default()
             .filter(|s| !s.is_empty());
 
-        let last_pushed_tip = read_tip(&ship, &format!("last_pushed_tip:{}", attachment.url)).await;
-        let last_pulled_tip = read_tip(&ship, &format!("last_pulled_tip:{}", attachment.url)).await;
+        let pond_id = ship.control_table().pond_id_uuid();
+        let last_pushed =
+            steward::read_push_ack(ship.control_table(), &attachment.url, pond_id, "main")
+                .await
+                .map_err(|error| {
+                    anyhow!("read pushed acknowledgement for remote `{name}`: {error}")
+                })?;
+        let last_pulled =
+            steward::read_pull_ack_for_remote(ship.control_table(), &attachment.url, "main")
+                .await
+                .map_err(|error| {
+                    anyhow!("read pulled acknowledgement for remote `{name}`: {error}")
+                })?;
 
         println!("  {}  [{}]", name, mode_str);
         println!("    url:          {}", attachment.url);
@@ -124,15 +134,21 @@ pub async fn status_command(ship_context: &ShipContext) -> Result<()> {
         report_storage(&mut ship, &attachment).await;
 
         if mode.pushes() {
-            match last_pushed_tip {
-                Some(tip) => println!("    last pushed:  {}", tip),
+            match last_pushed {
+                Some(ack) => println!(
+                    "    last pushed:  {} (generation {}, record {})",
+                    ack.snapshot_tip, ack.generation, ack.publication_record
+                ),
                 None => println!("    last pushed:  - (never pushed)"),
             }
         }
 
         if mode.pulls() {
-            match last_pulled_tip {
-                Some(tip) => println!("    last pulled:  {}", tip),
+            match last_pulled {
+                Some(ack) => println!(
+                    "    last pulled:  {} (generation {}, record {})",
+                    ack.snapshot_tip, ack.generation, ack.publication_record
+                ),
                 None => println!("    last pulled:  - (never pulled)"),
             }
         }
@@ -282,17 +298,6 @@ fn format_duration(d: Duration) -> String {
     } else {
         format!("{secs}s")
     }
-}
-
-/// Read a per-ref tip commit hash setting.  Returns `None` if the key is unset
-/// or empty (the ref has never been pushed/pulled).
-async fn read_tip(ship: &steward::Steward, key: &str) -> Option<String> {
-    ship.control_table()
-        .raw_config_get(key)
-        .await
-        .ok()
-        .flatten()
-        .filter(|v| !v.is_empty())
 }
 
 /// Format a microsecond timestamp as a human-readable UTC string.

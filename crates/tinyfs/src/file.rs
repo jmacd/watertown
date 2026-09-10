@@ -187,15 +187,16 @@ pub trait File: Metadata + Send + Sync {
     /// Returns a writer that can optionally accept metadata via FileMetadataWriter trait
     async fn async_writer(&self) -> error::Result<Pin<Box<dyn FileMetadataWriter>>>;
 
-    /// Create a writer for a series version that *replaces* all earlier versions
-    /// of this node -- replicating a source-side compaction during content pull.
+    /// Backend primitive for replacing earlier versions of the reserved
+    /// manifest-index node.
     ///
     /// Unlike [`File::async_writer`], the returned writer starts a fresh
     /// content/bao baseline (it does not resume the previous version's frontier)
     /// and stamps the persisted row with a `collapsed_through` sentinel so the
     /// read path and content fold both drop the superseded predecessors. The
-    /// default delegates to [`File::async_writer`] for backends that have no
-    /// version sentinels.
+    /// User path APIs reject this operation for logical series. The default
+    /// delegates to [`File::async_writer`] for backends that have no version
+    /// sentinels.
     async fn async_writer_collapsing(&self) -> error::Result<Pin<Box<dyn FileMetadataWriter>>> {
         self.async_writer().await
     }
@@ -269,8 +270,8 @@ impl Handle {
         file.async_writer().await
     }
 
-    /// Get an async writer that replaces all earlier versions of a series node
-    /// with a fresh baseline (see [`File::async_writer_collapsing`]).
+    /// Internal backend writer for the reserved manifest index (see
+    /// [`File::async_writer_collapsing`]).
     pub async fn async_writer_collapsing(&self) -> error::Result<Pin<Box<dyn FileMetadataWriter>>> {
         let file = self.0.lock().await;
         file.async_writer_collapsing().await

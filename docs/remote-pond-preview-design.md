@@ -234,8 +234,8 @@ tip — the tree already *is* the recursive manifest.
 
 What is **not** replicated is per-replica **control** state (`raw_config`, the
 disposable control table): `remote.mode.<name>` (push / pull / both),
-`remote.mount_path.<name>`, and `last_pulled_tip:` / `last_pushed_tip:`
-watermarks. Critically, `pull_command` **dispatches mirror-vs-import on the
+`remote.mount_path.<name>`, and structured publication acknowledgements keyed
+by remote URL, pond id, and ref. Critically, `pull_command` **dispatches mirror-vs-import on the
 control `mount_path`** — so even after a clone has the replicated remotes + graft
 pins, a plain `pond pull <name>` won't know to treat `<name>` as an import until
 the control table is **rehydrated** from the pins. A correct recursive clone must

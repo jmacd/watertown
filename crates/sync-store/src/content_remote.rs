@@ -1,66 +1,48 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! [`ContentRemote`]: the delta-managed content-addressed remote.
+//! [`ContentRemote`]: native-v2 immutable payloads plus bounded transactional
+//! publication state.
 //!
-//! This is the single replication backend described in the design doc
-//! Section 8 (Decision D6).  It replaces the bundle/frontier remote: there
-//! is no `(pond_id, seq)` frontier, no per-bundle manifest, and no
-//! per-partition checksum list.
-//!
-//! The remote is one Delta table (a [`Store`]) whose rows are content
-//! objects keyed by their content hash, a derived commit index, plus a
-//! distinguished ref row holding the tip commit hash:
-//!
-//! ```text
-//! partition = "objects", item_key = <hex object hash>, value = object bytes
-//! partition = "commits", item_key = <hex commit hash>, value = commit bytes
-//! partition = "refs",    item_key = <ref name>,        value = 32-byte tip hash
-//! ```
-//!
-//! The `commits` rows duplicate canonical commit objects already present in
-//! `objects`.  They are derived from the producer's authoritative full local
-//! commit log on every push.  Keeping them in their own physical Delta
-//! partition lets a pull load all ancestry with one history-proportional,
-//! partition-pruned query instead of learning parent hashes one at a time and
-//! scanning the much larger `objects` partition once per commit.
-//!
-//! Object rows and their commit-index duplicates are written by the same
-//! [`Store::apply_batch`] transaction, before pack publication and the later
-//! ref advance.  Thus the first push by an upgraded producer atomically
-//! backfills the complete index.  Later serialized pushes authenticate the
-//! live index and append only previously absent commit hashes.  An old remote
-//! has an empty index until that push; readers fail closed if an indexed
-//! ancestry entry is absent rather than falling back to unbounded `objects`
-//! point queries.
+//! Canonical content lives at raw object-store keys beneath `_content/v2/`.
+//! Every payload uses conditional create and an authenticated immutable
+//! receipt. Per-push publication records name only that push's additions.
+//! Series packs are content-addressed linked suffix segments reached through
+//! fixed-key per-series locators; explicit consolidated locators may select a
+//! whole-range pack without rewriting old segments or listing the pack prefix.
+//! `_publication/` is a separate Delta table containing one active row per
+//! `(pond_id, ref_name)`; its generation/record-head CAS is the final
+//! visibility operation. The generic [`Store`] retained at the remote root is
+//! metadata/capsule infrastructure only and is not an ordinary payload, commit,
+//! or ref representation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::RwLock;
 
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use object_store::{PutMode, PutOptions};
+use object_store::{ObjectMeta, PutMode, PutOptions, PutResult};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::content::{
-    CapsuleManifest, Commit, ObjectHash, capsule_manifest_bytes, capsule_root,
-    decode_capsule_manifest, verify_capsule_payload_directory, verify_capsule_payloads,
+    CapsuleManifest, ObjectDescriptor, ObjectHash, ObjectReceipt, PackDescriptor,
+    PublicationRecord, capsule_manifest_bytes, capsule_root, decode_capsule_manifest,
+    verify_capsule_payload_directory, verify_capsule_payloads,
     verify_incremental_capsule_payload_directory,
 };
 use crate::error::{Result, StoreError};
-use crate::store::{Op, Store};
+use crate::publication::{PublicationExpectation, PublicationState, PublicationTable};
+use crate::store::Store;
 
-/// Partition holding content objects, keyed by hex object hash.
-const OBJECTS_PARTITION: &str = "objects";
-/// Partition holding canonical commit objects, keyed by hex commit hash.
-const COMMITS_PARTITION: &str = "commits";
-/// Partition holding refs, keyed by ref name; value is the 32-byte tip hash.
-const REFS_PARTITION: &str = "refs";
 /// Partition holding remote metadata; the source pond_id is stored here under
 /// the nil pond partition so a consumer can discover it without knowing it.
 const META_PARTITION: &str = "meta";
 const POND_ID_KEY: &str = "pond_id";
+const V2_OBJECT_PREFIX: &str = "_content/v2/objects";
+const V2_RECEIPT_PREFIX: &str = "_content/v2/receipts";
+const V2_PUBLICATION_PREFIX: &str = "_content/v2/publications";
+const V2_PACK_PREFIX: &str = "_content/v2/packs";
+const V2_UPLOAD_PREFIX: &str = "_content/v2/fallback/uploads";
 const CAPSULE_PREFIX: &str = "recovery";
 const CAPSULE_HISTORY_LIMIT: usize = 3;
 const RECIPE_NATIVE_FORMAT: &str = "watertown.commit.v1";
@@ -93,6 +75,56 @@ pub struct RecoveryRecipePublishOutcome {
     pub versioned_created: bool,
     /// Whether this call created the discoverable top-level bootstrap.
     pub discoverable_created: bool,
+}
+
+/// Physical effect of one immutable native-v2 create attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImmutableWriteOutcome {
+    /// Whether this call established the canonical payload key.
+    pub payload_created: bool,
+    /// Whether this call established the canonical receipt.
+    pub receipt_created: bool,
+    /// Payload bytes physically created by this call.
+    pub payload_bytes_created: u64,
+}
+
+/// Physical effect of explicitly publishing one consolidated series pack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsolidatedPackWriteOutcome {
+    /// Content address of the immutable pack index.
+    pub pack_hash: ObjectHash,
+    /// Whether this call created the immutable pack bytes.
+    pub pack_created: bool,
+    /// Whether this call installed the fixed-key consolidated locator.
+    pub locator_created: bool,
+}
+
+/// Physical effect of one explicit stale-upload cleanup.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UploadCleanupOutcome {
+    /// Staging objects deleted.
+    pub objects_deleted: usize,
+    /// Staging bytes deleted.
+    pub bytes_deleted: u64,
+}
+
+/// Deterministic one-shot publication failure used by retry/atomicity tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicationFailurePoint {
+    /// Before the first payload create.
+    BeforeObjects,
+    /// After this many payload objects have been processed.
+    AfterObject(usize),
+    /// After every payload object, before packs.
+    AfterObjects,
+    /// After packs, before the immutable publication record.
+    AfterPacks,
+    /// After the publication record, before the active-row CAS.
+    AfterRecord,
+    /// Immediately after the active-row CAS became visible.
+    AfterRef,
+    /// After a consolidated pack is durable, before its locator is installed.
+    BeforeConsolidatedLocator,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -210,19 +242,9 @@ pub fn capsule_gc_plan_hash(plan: &CapsuleGcPlan) -> std::result::Result<ObjectH
 /// blobs.
 pub struct ContentRemote {
     store: Store,
+    publication: PublicationTable,
     pond_id: Uuid,
-    /// Optional in-memory snapshot of the entire `objects` partition, keyed by
-    /// hex object hash.  [`Self::preload_objects`] fills it with a single
-    /// [`Store::list`] scan so a bulk read (e.g. cloning the object graph)
-    /// resolves each object from memory instead of a full-table Delta scan per
-    /// hash -- the difference between O(objects x table-size) and one scan.
-    ///
-    /// It is a *per-operation* snapshot, not a durable cache: a caller preloads
-    /// at the start of a bulk read and [`Self::clear_object_cache`]s at the end,
-    /// so a later read (or a re-pull after new commits) never sees stale bytes.
-    /// `None` means "not preloaded"; [`Self::get_object`] then falls back to a
-    /// per-hash store lookup, preserving prior behavior.
-    object_cache: RwLock<Option<HashMap<String, Vec<u8>>>>,
+    failure_point: Option<PublicationFailurePoint>,
 }
 
 impl ContentRemote {
@@ -237,11 +259,14 @@ impl ContentRemote {
     /// Create a fresh remote at `path`.  Errors if a Delta table already
     /// exists there.
     pub async fn create_at(path: impl AsRef<Path>, pond_id: Uuid) -> Result<Self> {
-        let store = Store::create(path).await?;
+        let path = path.as_ref().to_path_buf();
+        let store = Store::create(&path).await?;
+        let publication = PublicationTable::create(&path).await?;
         let mut me = Self {
             store,
+            publication,
             pond_id,
-            object_cache: RwLock::new(None),
+            failure_point: None,
         };
         me.write_pond_id().await?;
         Ok(me)
@@ -249,11 +274,14 @@ impl ContentRemote {
 
     /// Open an existing remote at `path`.
     pub async fn open_at(path: impl AsRef<Path>, pond_id: Uuid) -> Result<Self> {
-        let store = Store::open(path).await?;
+        let path = path.as_ref().to_path_buf();
+        let store = Store::open(&path).await?;
+        let publication = PublicationTable::open(&path).await?;
         Ok(Self {
             store,
+            publication,
             pond_id,
-            object_cache: RwLock::new(None),
+            failure_point: None,
         })
     }
 
@@ -264,11 +292,13 @@ impl ContentRemote {
         pond_id: Uuid,
         storage_options: std::collections::HashMap<String, String>,
     ) -> Result<Self> {
-        let store = Store::create_at_url(url, storage_options).await?;
+        let store = Store::create_at_url(url, storage_options.clone()).await?;
+        let publication = PublicationTable::create_at_url(url, storage_options).await?;
         let mut me = Self {
             store,
+            publication,
             pond_id,
-            object_cache: RwLock::new(None),
+            failure_point: None,
         };
         me.write_pond_id().await?;
         Ok(me)
@@ -280,7 +310,8 @@ impl ContentRemote {
         url: &str,
         storage_options: std::collections::HashMap<String, String>,
     ) -> Result<Self> {
-        let store = Store::open_at_url(url, storage_options).await?;
+        let store = Store::open_at_url(url, storage_options.clone()).await?;
+        let publication = PublicationTable::open_at_url(url, storage_options).await?;
         let bytes = store
             .get(Uuid::nil(), META_PARTITION, POND_ID_KEY)
             .await?
@@ -291,8 +322,9 @@ impl ContentRemote {
             Uuid::parse_str(&s).map_err(|e| StoreError::Invariant(format!("bad pond_id: {e}")))?;
         Ok(Self {
             store,
+            publication,
             pond_id,
-            object_cache: RwLock::new(None),
+            failure_point: None,
         })
     }
 
@@ -318,6 +350,982 @@ impl ContentRemote {
     /// The pond whose objects this remote holds.
     pub fn pond_id(&self) -> Uuid {
         self.pond_id
+    }
+
+    /// Install a one-shot deterministic failure for publication tests.
+    pub fn inject_publication_failure(&mut self, point: PublicationFailurePoint) {
+        self.failure_point = Some(point);
+    }
+
+    /// Trigger and clear a matching one-shot publication failure.
+    pub fn publication_stage(&mut self, point: PublicationFailurePoint) -> Result<()> {
+        if self.failure_point == Some(point) {
+            self.failure_point = None;
+            return Err(StoreError::Invariant(format!(
+                "injected publication failure at {point:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn v2_object_path(hash: ObjectHash) -> object_store::path::Path {
+        object_store::path::Path::from(format!("{V2_OBJECT_PREFIX}/blake3={}", hash.to_hex()))
+    }
+
+    fn v2_receipt_path(hash: ObjectHash) -> object_store::path::Path {
+        object_store::path::Path::from(format!("{V2_RECEIPT_PREFIX}/blake3={}", hash.to_hex()))
+    }
+
+    fn v2_publication_path(hash: ObjectHash) -> object_store::path::Path {
+        object_store::path::Path::from(format!("{V2_PUBLICATION_PREFIX}/blake3={}", hash.to_hex()))
+    }
+
+    fn v2_pack_path(hash: ObjectHash) -> object_store::path::Path {
+        object_store::path::Path::from(format!("{V2_PACK_PREFIX}/blake3={}", hash.to_hex()))
+    }
+
+    fn v2_series_pack_path(series_hash: ObjectHash) -> object_store::path::Path {
+        object_store::path::Path::from(format!(
+            "{V2_PACK_PREFIX}/by-series/blake3={}",
+            series_hash.to_hex()
+        ))
+    }
+
+    fn v2_consolidated_series_pack_path(series_hash: ObjectHash) -> object_store::path::Path {
+        object_store::path::Path::from(format!(
+            "{V2_PACK_PREFIX}/consolidated/by-series/blake3={}",
+            series_hash.to_hex()
+        ))
+    }
+
+    /// Read the fixed-size current publication row for one ref.
+    pub async fn current_publication(&self, ref_name: &str) -> Result<Option<PublicationState>> {
+        self.publication.get(self.pond_id, ref_name).await
+    }
+
+    /// Atomically replace exactly one active publication row.
+    pub async fn compare_and_swap_publication(
+        &mut self,
+        expectation: PublicationExpectation,
+        next: PublicationState,
+    ) -> Result<PublicationState> {
+        if next.pond_id != self.pond_id {
+            return Err(StoreError::Invariant(format!(
+                "publication pond {} does not match remote pond {}",
+                next.pond_id, self.pond_id
+            )));
+        }
+        self.publication.compare_and_swap(expectation, next).await
+    }
+
+    /// Current dedicated publication-table version.
+    #[must_use]
+    pub fn publication_version(&self) -> i64 {
+        self.publication.version()
+    }
+
+    /// Active Parquet files in the dedicated publication table.
+    pub fn publication_active_file_count(&self) -> Result<usize> {
+        self.publication.active_file_count()
+    }
+
+    /// Write one canonical immutable payload and receipt.
+    ///
+    /// The payload bytes are verified against `descriptor.hash` before any
+    /// request. `PutMode::Create` establishes the sole canonical key. A retry
+    /// with a valid receipt reads only that small receipt plus payload metadata.
+    /// If a prior create was interrupted before its receipt, the payload is
+    /// downloaded and hashed once before the receipt is established.
+    pub async fn put_immutable_object(
+        &self,
+        descriptor: ObjectDescriptor,
+        bytes: &[u8],
+    ) -> Result<ImmutableWriteOutcome> {
+        let actual = ObjectHash::of_bytes(bytes);
+        if actual != descriptor.hash {
+            return Err(StoreError::Invariant(format!(
+                "refusing {} object {} whose bytes hash to {}",
+                descriptor.kind.as_str(),
+                descriptor.hash,
+                actual
+            )));
+        }
+        if let Some(receipt) = self.read_receipt(descriptor.hash).await? {
+            self.verify_receipt_identity(descriptor, bytes.len() as u64, &receipt)
+                .await?;
+            return Ok(ImmutableWriteOutcome {
+                payload_created: false,
+                receipt_created: false,
+                payload_bytes_created: 0,
+            });
+        }
+        let path = Self::v2_object_path(descriptor.hash);
+        match self
+            .store
+            .object_store()
+            .put_opts(
+                &path,
+                bytes.to_vec().into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..PutOptions::default()
+                },
+            )
+            .await
+        {
+            Ok(result) => {
+                crate::metered_store::record_physical_create(
+                    &crate::RemoteKey::new(&self.store.url()),
+                    crate::AccessClass::ContentObjects,
+                    bytes.len() as u64,
+                );
+                let receipt = receipt_from_put(descriptor, bytes.len() as u64, &result)?;
+                let receipt_created = self.create_receipt(&receipt).await?;
+                Ok(ImmutableWriteOutcome {
+                    payload_created: true,
+                    receipt_created,
+                    payload_bytes_created: bytes.len() as u64,
+                })
+            }
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let receipt = self.read_receipt(descriptor.hash).await?;
+                let receipt_created = match receipt {
+                    Some(receipt) => {
+                        self.verify_receipt_identity(descriptor, bytes.len() as u64, &receipt)
+                            .await?;
+                        false
+                    }
+                    None => {
+                        let result =
+                            self.store
+                                .object_store()
+                                .get(&path)
+                                .await
+                                .map_err(|error| {
+                                    StoreError::Invariant(format!(
+                                        "read receipt-less object {}: {error}",
+                                        descriptor.hash
+                                    ))
+                                })?;
+                        let metadata = result.meta.clone();
+                        let existing = result.bytes().await.map_err(|error| {
+                            StoreError::Invariant(format!(
+                                "collect receipt-less object {}: {error}",
+                                descriptor.hash
+                            ))
+                        })?;
+                        let existing_hash = ObjectHash::of_bytes(&existing);
+                        if existing_hash != descriptor.hash
+                            || existing.len() != bytes.len()
+                            || existing.as_ref() != bytes
+                        {
+                            return Err(StoreError::Invariant(format!(
+                                "receipt-less object {} has conflicting bytes",
+                                descriptor.hash
+                            )));
+                        }
+                        let receipt =
+                            receipt_from_meta(descriptor, existing.len() as u64, &metadata)?;
+                        self.create_receipt(&receipt).await?
+                    }
+                };
+                Ok(ImmutableWriteOutcome {
+                    payload_created: false,
+                    receipt_created,
+                    payload_bytes_created: 0,
+                })
+            }
+            Err(error) => Err(StoreError::Invariant(format!(
+                "create immutable {} object {}: {error}",
+                descriptor.kind.as_str(),
+                descriptor.hash
+            ))),
+        }
+    }
+
+    /// Stream a potentially large canonical payload without buffering it.
+    ///
+    /// A valid receipt short-circuits before the reader is consumed. For a new
+    /// payload, bytes are hash-verified in a unique staging object and promoted
+    /// with atomic `copy_if_not_exists`; the staging key is deleted before the
+    /// method returns. The canonical key therefore still has create-once
+    /// semantics even on backends whose multipart API has no `PutMode`.
+    pub async fn put_immutable_object_stream<R>(
+        &self,
+        descriptor: ObjectDescriptor,
+        reader: R,
+    ) -> Result<ImmutableWriteOutcome>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        if let Some(receipt) = self.read_receipt(descriptor.hash).await? {
+            self.verify_receipt_identity(descriptor, receipt.byte_length, &receipt)
+                .await?;
+            return Ok(ImmutableWriteOutcome {
+                payload_created: false,
+                receipt_created: false,
+                payload_bytes_created: 0,
+            });
+        }
+
+        let canonical = Self::v2_object_path(descriptor.hash);
+        match self.store.object_store().head(&canonical).await {
+            Ok(_) => {
+                let receipt = self
+                    .verify_receiptless_object(descriptor, &canonical)
+                    .await?;
+                let created = self.create_receipt(&receipt).await?;
+                return Ok(ImmutableWriteOutcome {
+                    payload_created: false,
+                    receipt_created: created,
+                    payload_bytes_created: 0,
+                });
+            }
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(error) => {
+                return Err(StoreError::Invariant(format!(
+                    "head immutable object {}: {error}",
+                    descriptor.hash
+                )));
+            }
+        }
+
+        let staging =
+            object_store::path::Path::from(format!("{V2_UPLOAD_PREFIX}/{}", uuid::Uuid::new_v4()));
+        self.put_hashed_object(staging.clone(), descriptor.hash, None, reader)
+            .await?;
+        let staged_meta = match self.store.object_store().head(&staging).await {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let cleanup = self.store.object_store().delete(&staging).await;
+                return Err(StoreError::Invariant(match cleanup {
+                    Ok(()) => format!("head staged immutable object {}: {error}", descriptor.hash),
+                    Err(cleanup_error) => format!(
+                        "head staged immutable object {}: {error}; staging cleanup failed: \
+                         {cleanup_error}",
+                        descriptor.hash
+                    ),
+                }));
+            }
+        };
+
+        let copied = match self
+            .store
+            .object_store()
+            .copy_if_not_exists(&staging, &canonical)
+            .await
+        {
+            Ok(()) => true,
+            Err(object_store::Error::AlreadyExists { .. }) => false,
+            Err(error) => {
+                let cleanup = self.store.object_store().delete(&staging).await;
+                return Err(StoreError::Invariant(match cleanup {
+                    Ok(()) => format!(
+                        "promote immutable object {} with copy-if-absent: {error}",
+                        descriptor.hash
+                    ),
+                    Err(cleanup_error) => format!(
+                        "promote immutable object {}: {error}; staging cleanup failed: \
+                         {cleanup_error}",
+                        descriptor.hash
+                    ),
+                }));
+            }
+        };
+        self.store
+            .object_store()
+            .delete(&staging)
+            .await
+            .map_err(|error| {
+                StoreError::Invariant(format!(
+                    "delete staged immutable object {}: {error}",
+                    descriptor.hash
+                ))
+            })?;
+
+        let receipt = if copied {
+            crate::metered_store::record_physical_create(
+                &crate::RemoteKey::new(&self.store.url()),
+                crate::AccessClass::ContentObjects,
+                staged_meta.size as u64,
+            );
+            let metadata = self
+                .store
+                .object_store()
+                .head(&canonical)
+                .await
+                .map_err(|error| {
+                    StoreError::Invariant(format!(
+                        "head promoted immutable object {}: {error}",
+                        descriptor.hash
+                    ))
+                })?;
+            receipt_from_meta(descriptor, metadata.size as u64, &metadata)?
+        } else {
+            self.verify_receiptless_object(descriptor, &canonical)
+                .await?
+        };
+        let receipt_created = self.create_receipt(&receipt).await?;
+        Ok(ImmutableWriteOutcome {
+            payload_created: copied,
+            receipt_created,
+            payload_bytes_created: if copied { receipt.byte_length } else { 0 },
+        })
+    }
+
+    /// Delete upload-staging objects older than `older_than`.
+    ///
+    /// These keys are never publication roots. They can survive only when a
+    /// process exits after multipart upload and before normal cleanup. The
+    /// age boundary protects uploads that may still be in flight.
+    pub async fn cleanup_stale_uploads(
+        &self,
+        older_than: chrono::DateTime<chrono::Utc>,
+    ) -> Result<UploadCleanupOutcome> {
+        let prefix = object_store::path::Path::from(V2_UPLOAD_PREFIX);
+        let mut listed = self.store.object_store().list(Some(&prefix));
+        let mut stale = Vec::new();
+        while let Some(metadata) = listed.next().await {
+            let metadata = metadata.map_err(|error| {
+                StoreError::Invariant(format!("list immutable upload staging: {error}"))
+            })?;
+            if metadata.last_modified <= older_than {
+                stale.push(metadata);
+            }
+        }
+
+        let mut outcome = UploadCleanupOutcome::default();
+        for metadata in stale {
+            self.store
+                .object_store()
+                .delete(&metadata.location)
+                .await
+                .map_err(|error| {
+                    StoreError::Invariant(format!(
+                        "delete stale immutable upload staging {}: {error}",
+                        metadata.location
+                    ))
+                })?;
+            outcome.objects_deleted += 1;
+            outcome.bytes_deleted = outcome.bytes_deleted.saturating_add(metadata.size);
+        }
+        Ok(outcome)
+    }
+
+    /// Read and hash-verify one native-v2 immutable payload.
+    pub async fn get_immutable_object(&self, hash: ObjectHash) -> Result<Option<Vec<u8>>> {
+        let result = match self
+            .store
+            .object_store()
+            .get(&Self::v2_object_path(hash))
+            .await
+        {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => {
+                return Err(StoreError::Invariant(format!(
+                    "get immutable object {hash}: {error}"
+                )));
+            }
+        };
+        let bytes = result.bytes().await.map_err(|error| {
+            StoreError::Invariant(format!("collect immutable object {hash}: {error}"))
+        })?;
+        let actual = ObjectHash::of_bytes(&bytes);
+        if actual != hash {
+            return Err(StoreError::Invariant(format!(
+                "immutable object {hash} hashes to {actual}"
+            )));
+        }
+        Ok(Some(bytes.to_vec()))
+    }
+
+    /// Receipt-authenticated payload length, or `None` if neither payload nor
+    /// receipt exists.
+    pub async fn immutable_object_size(&self, hash: ObjectHash) -> Result<Option<u64>> {
+        match self.read_receipt(hash).await? {
+            Some(receipt) => {
+                let metadata = self
+                    .store
+                    .object_store()
+                    .head(&Self::v2_object_path(hash))
+                    .await
+                    .map_err(|error| {
+                        StoreError::Invariant(format!("head receipt-backed object {hash}: {error}"))
+                    })?;
+                verify_receipt_metadata(&receipt, &metadata)?;
+                Ok(Some(receipt.byte_length))
+            }
+            None => match self
+                .store
+                .object_store()
+                .head(&Self::v2_object_path(hash))
+                .await
+            {
+                Ok(_) => Err(StoreError::Invariant(format!(
+                    "immutable object {hash} is visible without a receipt"
+                ))),
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(error) => Err(StoreError::Invariant(format!(
+                    "head immutable object {hash}: {error}"
+                ))),
+            },
+        }
+    }
+
+    /// Open a streaming reader over one native-v2 immutable payload.
+    pub async fn get_immutable_object_reader(
+        &self,
+        hash: ObjectHash,
+    ) -> Result<Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>> {
+        let result = match self
+            .store
+            .object_store()
+            .get(&Self::v2_object_path(hash))
+            .await
+        {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => {
+                return Err(StoreError::Invariant(format!(
+                    "get immutable object stream {hash}: {error}"
+                )));
+            }
+        };
+        let stream = futures::TryStreamExt::map_err(result.into_stream(), std::io::Error::other);
+        Ok(Some(Box::new(tokio_util::io::StreamReader::new(stream))))
+    }
+
+    /// Publish a canonical immutable pack index.
+    pub async fn put_immutable_pack(
+        &self,
+        descriptor: PackDescriptor,
+        bytes: &[u8],
+    ) -> Result<bool> {
+        let (created, pack) = self.store_immutable_pack(descriptor, bytes).await?;
+        if pack.validate_series_segment().is_ok() {
+            self.ensure_series_pack_locator(descriptor).await?;
+        }
+        Ok(created)
+    }
+
+    async fn store_immutable_pack(
+        &self,
+        descriptor: PackDescriptor,
+        bytes: &[u8],
+    ) -> Result<(bool, crate::content::PackIndex)> {
+        let actual = ObjectHash::of_bytes(bytes);
+        if actual != descriptor.pack_hash {
+            return Err(StoreError::Invariant(format!(
+                "pack bytes hash to {actual}, expected {}",
+                descriptor.pack_hash
+            )));
+        }
+        let pack = crate::content::PackIndex::decode(bytes)
+            .map_err(|error| StoreError::Invariant(format!("decode pack: {error}")))?;
+        if pack.series_hash() != descriptor.series_hash {
+            return Err(StoreError::Invariant(format!(
+                "pack {} names series {}, expected {}",
+                descriptor.pack_hash,
+                pack.series_hash(),
+                descriptor.series_hash
+            )));
+        }
+        let created = self
+            .create_content_addressed_small(
+                &Self::v2_pack_path(descriptor.pack_hash),
+                descriptor.pack_hash,
+                bytes,
+                crate::AccessClass::ContentPacks,
+                "pack",
+            )
+            .await?;
+        Ok((created, pack))
+    }
+
+    /// Read the immutable ordinary append-segment locator for one series.
+    ///
+    /// This fixed-size point read intentionally ignores an optional
+    /// consolidated locator so an incremental consumer can continue to fetch
+    /// only its publication-window suffix.
+    pub async fn canonical_pack_for_series(
+        &self,
+        series_hash: ObjectHash,
+    ) -> Result<Option<PackDescriptor>> {
+        self.read_series_pack_locator(
+            series_hash,
+            &Self::v2_series_pack_path(series_hash),
+            "canonical",
+        )
+        .await
+    }
+
+    /// Read the optional full-range consolidated locator for one series.
+    ///
+    /// Fresh clones prefer this fixed-size point lookup when present. An
+    /// incremental consumer deliberately uses [`Self::canonical_pack_for_series`]
+    /// instead so maintenance cannot turn a suffix fetch back into a
+    /// whole-series metadata read.
+    pub async fn consolidated_pack_for_series(
+        &self,
+        series_hash: ObjectHash,
+    ) -> Result<Option<PackDescriptor>> {
+        self.read_series_pack_locator(
+            series_hash,
+            &Self::v2_consolidated_series_pack_path(series_hash),
+            "consolidated",
+        )
+        .await
+    }
+
+    async fn read_series_pack_locator(
+        &self,
+        series_hash: ObjectHash,
+        path: &object_store::path::Path,
+        kind: &str,
+    ) -> Result<Option<PackDescriptor>> {
+        let bytes = match self.store.object_store().get(path).await {
+            Ok(result) => result
+                .bytes()
+                .await
+                .map_err(|error| {
+                    StoreError::Invariant(format!(
+                        "read {kind} pack locator for series {series_hash}: {error}"
+                    ))
+                })?
+                .to_vec(),
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => {
+                return Err(StoreError::Invariant(format!(
+                    "get {kind} pack locator for series {series_hash}: {error}"
+                )));
+            }
+        };
+        let raw: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
+            StoreError::Invariant(format!(
+                "{kind} pack locator for series {series_hash} is {} bytes, expected 32",
+                bytes.len()
+            ))
+        })?;
+        Ok(Some(PackDescriptor::new(
+            series_hash,
+            ObjectHash::from_bytes(raw),
+        )))
+    }
+
+    async fn ensure_series_pack_locator(&self, descriptor: PackDescriptor) -> Result<()> {
+        let path = Self::v2_series_pack_path(descriptor.series_hash);
+        match self
+            .store
+            .object_store()
+            .put_opts(
+                &path,
+                descriptor.pack_hash.as_bytes().to_vec().into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..PutOptions::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let existing = self
+                    .canonical_pack_for_series(descriptor.series_hash)
+                    .await?
+                    .ok_or_else(|| {
+                        StoreError::Invariant(format!(
+                            "canonical pack locator for series {} disappeared",
+                            descriptor.series_hash
+                        ))
+                    })?;
+                if self.get_immutable_pack(existing).await?.is_none() {
+                    return Err(StoreError::Invariant(format!(
+                        "canonical pack locator for series {} names missing pack {}",
+                        descriptor.series_hash, existing.pack_hash
+                    )));
+                }
+                if existing.pack_hash != descriptor.pack_hash {
+                    log::debug!(
+                        "series {} already has verified canonical pack {}; retaining it instead of \
+                         alternative segmentation {}",
+                        descriptor.series_hash,
+                        existing.pack_hash,
+                        descriptor.pack_hash
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => Err(StoreError::Invariant(format!(
+                "create canonical pack locator for series {}: {error}",
+                descriptor.series_hash
+            ))),
+        }
+    }
+
+    async fn ensure_consolidated_series_pack_locator(
+        &self,
+        descriptor: PackDescriptor,
+    ) -> Result<bool> {
+        let path = Self::v2_consolidated_series_pack_path(descriptor.series_hash);
+        match self
+            .store
+            .object_store()
+            .put_opts(
+                &path,
+                descriptor.pack_hash.as_bytes().to_vec().into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..PutOptions::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let existing = self
+                    .read_series_pack_locator(descriptor.series_hash, &path, "consolidated")
+                    .await?
+                    .ok_or_else(|| {
+                        StoreError::Invariant(format!(
+                            "consolidated pack locator for series {} disappeared",
+                            descriptor.series_hash
+                        ))
+                    })?;
+                if self.get_immutable_pack(existing).await?.is_none() {
+                    return Err(StoreError::Invariant(format!(
+                        "consolidated pack locator for series {} names missing pack {}",
+                        descriptor.series_hash, existing.pack_hash
+                    )));
+                }
+                if existing.pack_hash != descriptor.pack_hash {
+                    return Err(StoreError::Invariant(format!(
+                        "series {} already has consolidated pack {}, refusing conflicting pack {}",
+                        descriptor.series_hash, existing.pack_hash, descriptor.pack_hash
+                    )));
+                }
+                Ok(false)
+            }
+            Err(error) => Err(StoreError::Invariant(format!(
+                "create consolidated pack locator for series {}: {error}",
+                descriptor.series_hash
+            ))),
+        }
+    }
+
+    /// Fetch and verify one native-v2 immutable pack index.
+    pub async fn get_immutable_pack(&self, descriptor: PackDescriptor) -> Result<Option<Vec<u8>>> {
+        let bytes = self
+            .read_content_addressed_small(
+                &Self::v2_pack_path(descriptor.pack_hash),
+                descriptor.pack_hash,
+                "pack",
+            )
+            .await?;
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        let pack = crate::content::PackIndex::decode(&bytes)
+            .map_err(|error| StoreError::Invariant(format!("decode pack: {error}")))?;
+        if pack.series_hash() != descriptor.series_hash {
+            return Err(StoreError::Invariant(format!(
+                "pack {} names series {}, expected {}",
+                descriptor.pack_hash,
+                pack.series_hash(),
+                descriptor.series_hash
+            )));
+        }
+        Ok(Some(bytes))
+    }
+
+    /// Publish one canonical immutable per-push record.
+    pub async fn put_publication_record(&self, record: &PublicationRecord) -> Result<bool> {
+        if record.pond_id != self.pond_id {
+            return Err(StoreError::Invariant(format!(
+                "publication record pond {} does not match remote pond {}",
+                record.pond_id, self.pond_id
+            )));
+        }
+        let bytes = record.encode();
+        let hash = record.hash();
+        self.create_content_addressed_small(
+            &Self::v2_publication_path(hash),
+            hash,
+            &bytes,
+            crate::AccessClass::PublicationRecords,
+            "publication record",
+        )
+        .await
+    }
+
+    /// Fetch and strictly decode one immutable publication record.
+    pub async fn get_publication_record(
+        &self,
+        hash: ObjectHash,
+    ) -> Result<Option<PublicationRecord>> {
+        let bytes = self
+            .read_content_addressed_small(
+                &Self::v2_publication_path(hash),
+                hash,
+                "publication record",
+            )
+            .await?;
+        bytes
+            .map(|bytes| {
+                PublicationRecord::decode(&bytes).map_err(|error| {
+                    StoreError::Invariant(format!("decode publication record {hash}: {error}"))
+                })
+            })
+            .transpose()
+    }
+
+    /// Count canonical native-v2 payload keys without including receipts,
+    /// records, packs, or Delta files.
+    pub async fn immutable_object_count(&self) -> Result<u64> {
+        let mut stream = self
+            .store
+            .object_store()
+            .list(Some(&object_store::path::Path::from(V2_OBJECT_PREFIX)));
+        let mut count = 0u64;
+        while let Some(item) = stream.next().await {
+            let metadata = item.map_err(|error| {
+                StoreError::Invariant(format!("list immutable objects: {error}"))
+            })?;
+            if metadata
+                .location
+                .filename()
+                .is_some_and(|name| name.starts_with("blake3="))
+            {
+                count = count.saturating_add(1);
+            }
+        }
+        Ok(count)
+    }
+
+    async fn create_content_addressed_small(
+        &self,
+        path: &object_store::path::Path,
+        hash: ObjectHash,
+        bytes: &[u8],
+        class: crate::AccessClass,
+        label: &str,
+    ) -> Result<bool> {
+        if ObjectHash::of_bytes(bytes) != hash {
+            return Err(StoreError::Invariant(format!(
+                "{label} bytes do not hash to {hash}"
+            )));
+        }
+        match self
+            .store
+            .object_store()
+            .put_opts(
+                path,
+                bytes.to_vec().into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..PutOptions::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => {
+                crate::metered_store::record_physical_create(
+                    &crate::RemoteKey::new(&self.store.url()),
+                    class,
+                    bytes.len() as u64,
+                );
+                Ok(true)
+            }
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let existing = self
+                    .read_content_addressed_small(path, hash, label)
+                    .await?
+                    .ok_or_else(|| {
+                        StoreError::Invariant(format!(
+                            "{label} {hash} disappeared after AlreadyExists"
+                        ))
+                    })?;
+                if existing != bytes {
+                    return Err(StoreError::Invariant(format!(
+                        "existing {label} {hash} has conflicting bytes"
+                    )));
+                }
+                Ok(false)
+            }
+            Err(error) => Err(StoreError::Invariant(format!(
+                "create {label} {hash}: {error}"
+            ))),
+        }
+    }
+
+    async fn read_content_addressed_small(
+        &self,
+        path: &object_store::path::Path,
+        hash: ObjectHash,
+        label: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let result = match self.store.object_store().get(path).await {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => {
+                return Err(StoreError::Invariant(format!(
+                    "read {label} {hash}: {error}"
+                )));
+            }
+        };
+        let bytes = result
+            .bytes()
+            .await
+            .map_err(|error| StoreError::Invariant(format!("collect {label} {hash}: {error}")))?;
+        let actual = ObjectHash::of_bytes(&bytes);
+        if actual != hash {
+            return Err(StoreError::Invariant(format!(
+                "{label} {hash} hashes to {actual}"
+            )));
+        }
+        Ok(Some(bytes.to_vec()))
+    }
+
+    async fn verify_receiptless_object(
+        &self,
+        descriptor: ObjectDescriptor,
+        path: &object_store::path::Path,
+    ) -> Result<ObjectReceipt> {
+        use futures::TryStreamExt;
+
+        let result = self.store.object_store().get(path).await.map_err(|error| {
+            StoreError::Invariant(format!(
+                "read receipt-less object {}: {error}",
+                descriptor.hash
+            ))
+        })?;
+        let metadata = result.meta.clone();
+        let mut stream = result.into_stream();
+        let mut hasher = blake3::Hasher::new();
+        let mut length = 0u64;
+        while let Some(chunk) = stream.try_next().await.map_err(|error| {
+            StoreError::Invariant(format!(
+                "stream receipt-less object {}: {error}",
+                descriptor.hash
+            ))
+        })? {
+            let _ = hasher.update(&chunk);
+            length = length.checked_add(chunk.len() as u64).ok_or_else(|| {
+                StoreError::Invariant(format!(
+                    "receipt-less object {} exceeds u64::MAX",
+                    descriptor.hash
+                ))
+            })?;
+        }
+        let actual = ObjectHash::from_bytes(*hasher.finalize().as_bytes());
+        if actual != descriptor.hash || length != metadata.size as u64 {
+            return Err(StoreError::Invariant(format!(
+                "receipt-less object {} has hash {} length {}, metadata length {}",
+                descriptor.hash, actual, length, metadata.size
+            )));
+        }
+        receipt_from_meta(descriptor, length, &metadata)
+    }
+
+    async fn read_receipt(&self, hash: ObjectHash) -> Result<Option<ObjectReceipt>> {
+        let path = Self::v2_receipt_path(hash);
+        let result = match self.store.object_store().get(&path).await {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => {
+                return Err(StoreError::Invariant(format!(
+                    "read receipt for {hash}: {error}"
+                )));
+            }
+        };
+        let bytes = result.bytes().await.map_err(|error| {
+            StoreError::Invariant(format!("collect receipt for {hash}: {error}"))
+        })?;
+        let receipt = ObjectReceipt::decode(&bytes).map_err(|error| {
+            StoreError::Invariant(format!("malformed receipt for {hash}: {error}"))
+        })?;
+        if receipt.payload_hash != hash {
+            return Err(StoreError::Invariant(format!(
+                "receipt path for {hash} names payload {}",
+                receipt.payload_hash
+            )));
+        }
+        Ok(Some(receipt))
+    }
+
+    async fn create_receipt(&self, receipt: &ObjectReceipt) -> Result<bool> {
+        let path = Self::v2_receipt_path(receipt.payload_hash);
+        let bytes = receipt.encode();
+        match self
+            .store
+            .object_store()
+            .put_opts(
+                &path,
+                bytes.clone().into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..PutOptions::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => {
+                crate::metered_store::record_physical_create(
+                    &crate::RemoteKey::new(&self.store.url()),
+                    crate::AccessClass::ContentReceipts,
+                    bytes.len() as u64,
+                );
+                Ok(true)
+            }
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let existing = self
+                    .read_receipt(receipt.payload_hash)
+                    .await?
+                    .ok_or_else(|| {
+                        StoreError::Invariant(format!(
+                            "receipt {} disappeared after AlreadyExists",
+                            receipt.payload_hash
+                        ))
+                    })?;
+                if existing != *receipt {
+                    return Err(StoreError::Invariant(format!(
+                        "receipt {} conflicts with established identity",
+                        receipt.payload_hash
+                    )));
+                }
+                Ok(false)
+            }
+            Err(error) => Err(StoreError::Invariant(format!(
+                "create receipt {}: {error}",
+                receipt.payload_hash
+            ))),
+        }
+    }
+
+    async fn verify_receipt_identity(
+        &self,
+        descriptor: ObjectDescriptor,
+        expected_length: u64,
+        receipt: &ObjectReceipt,
+    ) -> Result<()> {
+        if receipt.payload_hash != descriptor.hash || receipt.byte_length != expected_length {
+            return Err(StoreError::Invariant(format!(
+                "receipt for {} does not match requested hash/length",
+                descriptor.hash
+            )));
+        }
+        let metadata = self
+            .store
+            .object_store()
+            .head(&Self::v2_object_path(descriptor.hash))
+            .await
+            .map_err(|error| {
+                StoreError::Invariant(format!(
+                    "head receipt-backed object {}: {error}",
+                    descriptor.hash
+                ))
+            })?;
+        verify_receipt_metadata(receipt, &metadata)
     }
 
     fn recovery_recipe_versioned_path(hash: ObjectHash) -> object_store::path::Path {
@@ -498,356 +1506,32 @@ impl ContentRemote {
         Ok(hash)
     }
 
-    /// Push a commit: write `objects` and advance `ref_name` to `tip` in a
-    /// single atomic Delta commit.  `objects` should be the closure the
-    /// remote lacks (typically the producer's `missing_from` set); already
-    /// present objects may be included harmlessly, since a re-put of an
-    /// identical hash is idempotent.
-    ///
-    /// Returns the `txn_seq` allocated for the commit.
-    pub async fn push_commit(
-        &mut self,
-        objects: &[(ObjectHash, Vec<u8>)],
-        ref_name: &str,
-        tip: ObjectHash,
-    ) -> Result<i64> {
-        let mut ops: Vec<Op> = Vec::with_capacity(objects.len() + 1);
-        for (hash, bytes) in objects {
-            ops.push(Op::Put {
-                partition: OBJECTS_PARTITION.to_string(),
-                key: hash.to_hex(),
-                value: bytes.clone(),
-            });
-        }
-        ops.push(Op::Put {
-            partition: REFS_PARTITION.to_string(),
-            key: ref_name.to_string(),
-            value: tip.as_bytes().to_vec(),
-        });
-
-        let txn_seq = self.store.last_txn_seq(self.pond_id).await? + 1;
-        let ts = chrono::Utc::now().timestamp_micros();
-        self.store
-            .apply_batch(self.pond_id, txn_seq, ts, ops)
-            .await?;
-        Ok(txn_seq)
-    }
-
-    /// Write `objects` to the remote's `objects` partition in one atomic
-    /// Delta commit, **without** touching any ref.
-    ///
-    /// This is [`Self::push_commit`] split in two (see [`Self::advance_ref`]
-    /// for the other half), so a caller that also has pack advertisements to
-    /// publish can durably land physical objects first, publish the packs
-    /// that name them, and only then advance the tip -- the ordering the
-    /// design doc's "Physical pack index" section and delivery gate 3
-    /// require. A crash between this call and [`Self::advance_ref`] leaves
-    /// the old ref intact (still resolvable, still fetchable): the new
-    /// objects are durable but simply unreferenced garbage until a retried
-    /// push finishes advancing the ref, never a ref pointing at an
-    /// incomplete or unfetchable closure.
-    ///
-    /// Returns the `txn_seq` allocated for this commit.
-    pub async fn push_objects(&mut self, objects: &[(ObjectHash, Vec<u8>)]) -> Result<i64> {
-        let ops: Vec<Op> = objects
-            .iter()
-            .map(|(hash, bytes)| Op::Put {
-                partition: OBJECTS_PARTITION.to_string(),
-                key: hash.to_hex(),
-                value: bytes.clone(),
-            })
-            .collect();
-        let txn_seq = self.store.last_txn_seq(self.pond_id).await? + 1;
-        let ts = chrono::Utc::now().timestamp_micros();
-        self.store
-            .apply_batch(self.pond_id, txn_seq, ts, ops)
-            .await?;
-        Ok(txn_seq)
-    }
-
-    /// Write ordinary `objects` and canonical commit-log entries in one atomic
-    /// Delta transaction, without touching any ref.
-    ///
-    /// `commits` is explicit rather than inferred from `objects`: raw blobs and
-    /// structured objects share the same content-addressed partition, so a
-    /// writer must identify the authoritative commit-log leaves precisely.
-    /// Every supplied commit is verified to hash to its key and decode
-    /// canonically before any write begins.  The same `(hash, bytes)` is then
-    /// written to both `objects` and the physically isolated `commits`
-    /// partition in one [`Store::apply_batch`] call.
-    ///
-    /// Producers pass their complete local commit log on every push so the
-    /// first upgraded push atomically backfills old remotes.  Before building
-    /// the write batch, this method reads and authenticates the live commit
-    /// index with [`Self::list_commit_index`], then appends only hashes that
-    /// are not already present.  Thus later serialized pushes add one physical
-    /// row per new canonical commit, and add no `commits` parquet file when
-    /// the supplied log contains no new hashes.
-    ///
-    /// This read-before-write filtering assumes the remote's normal
-    /// single-writer push serialization.  It is not a distributed uniqueness
-    /// constraint for concurrent writers that race after reading the same
-    /// index snapshot.
-    ///
-    /// Returns the `txn_seq` allocated for this commit.
-    pub async fn push_objects_with_commit_index(
-        &mut self,
-        objects: &[(ObjectHash, Vec<u8>)],
-        commits: &[(ObjectHash, Vec<u8>)],
-    ) -> Result<i64> {
-        let mut object_values: HashMap<ObjectHash, &[u8]> = HashMap::with_capacity(objects.len());
-        for (hash, bytes) in objects {
-            if let Some(previous) = object_values.insert(*hash, bytes.as_slice())
-                && previous != bytes.as_slice()
-            {
-                return Err(StoreError::Invariant(format!(
-                    "object batch contains conflicting values for {}",
-                    hash.to_hex()
-                )));
-            }
-        }
-
-        let mut ops: Vec<Op> = Vec::with_capacity(objects.len() + commits.len());
-        ops.extend(objects.iter().map(|(hash, bytes)| Op::Put {
-            partition: OBJECTS_PARTITION.to_string(),
-            key: hash.to_hex(),
-            value: bytes.clone(),
-        }));
-        for (hash, bytes) in commits {
-            match object_values.get(hash) {
-                Some(object_bytes) if *object_bytes == bytes.as_slice() => {}
-                Some(_) => {
-                    return Err(StoreError::Invariant(format!(
-                        "commit index value for {} differs from its object row",
-                        hash.to_hex()
-                    )));
-                }
-                None => {
-                    return Err(StoreError::Invariant(format!(
-                        "commit index value for {} has no matching object row",
-                        hash.to_hex()
-                    )));
-                }
-            }
-            let actual = ObjectHash::of_bytes(bytes);
-            if actual != *hash {
-                return Err(StoreError::Invariant(format!(
-                    "commit index value has hash {}, expected {}",
-                    actual.to_hex(),
-                    hash.to_hex()
-                )));
-            }
-            let commit = Commit::decode(bytes).map_err(|error| {
-                StoreError::Invariant(format!(
-                    "decode commit index value {}: {error}",
-                    hash.to_hex()
-                ))
-            })?;
-            if commit.hash() != *hash {
-                return Err(StoreError::Invariant(format!(
-                    "decoded commit index value hashes to {}, expected {}",
-                    commit.hash().to_hex(),
-                    hash.to_hex()
-                )));
-            }
-        }
-
-        let mut indexed_hashes = if commits.is_empty() {
-            HashSet::new()
-        } else {
-            self.list_commit_index().await?.keys().copied().collect()
-        };
-        for (hash, bytes) in commits {
-            if !indexed_hashes.insert(*hash) {
-                continue;
-            }
-            ops.push(Op::Put {
-                partition: COMMITS_PARTITION.to_string(),
-                key: hash.to_hex(),
-                value: bytes.clone(),
-            });
-        }
-        let txn_seq = self.store.last_txn_seq(self.pond_id).await? + 1;
-        let ts = chrono::Utc::now().timestamp_micros();
-        self.store
-            .apply_batch(self.pond_id, txn_seq, ts, ops)
-            .await?;
-        Ok(txn_seq)
-    }
-
-    /// Read and authenticate the complete live commit index with one
-    /// partition-pruned Delta query.
-    ///
-    /// Every row is validated before any index is returned: the item key must
-    /// be an [`ObjectHash`], the value bytes must hash to that key, and the
-    /// bytes must decode as a canonical [`Commit`].  An old remote that has not
-    /// yet received an upgraded producer push returns an empty map; callers
-    /// must treat a missing tip or parent entry as corruption and must not fall
-    /// back to point reads from the `objects` partition.
-    pub async fn list_commit_index(&self) -> Result<HashMap<ObjectHash, Commit>> {
-        let rows = self.store.list(self.pond_id, COMMITS_PARTITION).await?;
-        let mut commits = HashMap::with_capacity(rows.len());
-        for (key, bytes) in rows {
-            let hash = ObjectHash::from_hex(&key).map_err(|error| {
-                StoreError::Invariant(format!("commit index key `{key}` is invalid: {error}"))
-            })?;
-            let actual = ObjectHash::of_bytes(&bytes);
-            if actual != hash {
-                return Err(StoreError::Invariant(format!(
-                    "commit index value for {} has hash {}",
-                    hash.to_hex(),
-                    actual.to_hex()
-                )));
-            }
-            let commit = Commit::decode(&bytes).map_err(|error| {
-                StoreError::Invariant(format!(
-                    "decode commit index value {}: {error}",
-                    hash.to_hex()
-                ))
-            })?;
-            if commit.hash() != hash {
-                return Err(StoreError::Invariant(format!(
-                    "decoded commit index value hashes to {}, expected {}",
-                    commit.hash().to_hex(),
-                    hash.to_hex()
-                )));
-            }
-            if commits.insert(hash, commit).is_some() {
-                return Err(StoreError::Invariant(format!(
-                    "duplicate live commit index key {}",
-                    hash.to_hex()
-                )));
-            }
-        }
-        Ok(commits)
-    }
-
-    /// Advance `ref_name` to `tip` in its own atomic Delta commit, touching
-    /// no object rows.
-    ///
-    /// Call this only once every physical object `tip`'s closure reaches
-    /// (directly or transitively via a series pack) is already durable --
-    /// see [`Self::push_objects`] and [`Self::publish_pack`] -- so the ref
-    /// never becomes visible pointing at an incomplete or unfetchable
-    /// closure.
-    ///
-    /// Returns the `txn_seq` allocated for this commit.
-    pub async fn advance_ref(&mut self, ref_name: &str, tip: ObjectHash) -> Result<i64> {
-        let ops = vec![Op::Put {
-            partition: REFS_PARTITION.to_string(),
-            key: ref_name.to_string(),
-            value: tip.as_bytes().to_vec(),
-        }];
-        let txn_seq = self.store.last_txn_seq(self.pond_id).await? + 1;
-        let ts = chrono::Utc::now().timestamp_micros();
-        self.store
-            .apply_batch(self.pond_id, txn_seq, ts, ops)
-            .await?;
-        Ok(txn_seq)
-    }
-
     /// Read the tip commit hash for `ref_name`, or `None` if the ref does not
     /// exist.
     pub async fn get_tip(&self, ref_name: &str) -> Result<Option<ObjectHash>> {
-        let Some(bytes) = self
-            .store
-            .get(self.pond_id, REFS_PARTITION, ref_name)
+        Ok(self
+            .current_publication(ref_name)
             .await?
-        else {
-            return Ok(None);
-        };
-        let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-            StoreError::Invariant(format!(
-                "ref '{}' value is {} bytes, expected 32",
-                ref_name,
-                bytes.len()
-            ))
-        })?;
-        Ok(Some(ObjectHash::from_bytes(arr)))
+            .map(|state| state.snapshot_tip))
     }
 
     /// Read the bytes of the object with the given hash, or `None` if absent.
     pub async fn get_object(&self, hash: ObjectHash) -> Result<Option<Vec<u8>>> {
-        // When preloaded, the snapshot is authoritative for the whole `objects`
-        // partition: a hit returns the bytes, and a miss definitively means the
-        // hash is not an inline object (e.g. it is a large external blob).
-        // Either way we skip the per-hash Delta scan entirely.
-        {
-            let guard = self
-                .object_cache
-                .read()
-                .map_err(|_| StoreError::Invariant("object_cache lock poisoned".into()))?;
-            if let Some(cache) = guard.as_ref() {
-                return Ok(cache.get(&hash.to_hex()).cloned());
+        self.get_immutable_object(hash).await
+    }
+
+    /// Read exactly the requested native-v2 objects.
+    pub async fn get_objects(&self, hashes: &[ObjectHash]) -> Result<HashMap<ObjectHash, Vec<u8>>> {
+        let mut objects = HashMap::new();
+        let mut unique = hashes.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        for hash in unique {
+            if let Some(bytes) = self.get_immutable_object(hash).await? {
+                let _ = objects.insert(hash, bytes);
             }
         }
-        let key = crate::RemoteKey::new(&self.store.url());
-        let result = self
-            .store
-            .get(self.pond_id, OBJECTS_PARTITION, &hash.to_hex())
-            .await;
-        crate::metered_store::record_object_point_query(&key, matches!(&result, Ok(Some(_))));
-        result
-    }
-
-    /// Read exactly the requested inline objects in one Delta query.
-    ///
-    /// Missing hashes are omitted. Unlike [`Self::preload_objects`], this does
-    /// not retain state or return unrelated historical inline payloads.
-    pub async fn get_objects(&self, hashes: &[ObjectHash]) -> Result<HashMap<ObjectHash, Vec<u8>>> {
-        let mut keys = hashes.iter().map(ObjectHash::to_hex).collect::<Vec<_>>();
-        keys.sort();
-        keys.dedup();
-        if keys.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let result = self
-            .store
-            .get_many(self.pond_id, OBJECTS_PARTITION, &keys)
-            .await;
-        let returned = result.as_ref().map_or(0, HashMap::len);
-        crate::metered_store::record_object_batch_query(
-            &crate::RemoteKey::new(&self.store.url()),
-            keys.len(),
-            returned,
-        );
-        let rows = result?;
-        rows.into_iter()
-            .map(|(key, value)| {
-                ObjectHash::from_hex(&key)
-                    .map(|hash| (hash, value))
-                    .map_err(StoreError::Invariant)
-            })
-            .collect()
-    }
-
-    /// Snapshot the entire `objects` partition into memory with one
-    /// [`Store::list`] scan, so subsequent [`Self::get_object`] / [`Self::has_object`]
-    /// calls resolve from memory instead of one full-table Delta scan per hash.
-    ///
-    /// This is the fast path for bulk reads such as cloning the object graph.
-    /// The snapshot is *per-operation*: each call re-scans and replaces any
-    /// prior snapshot, and callers must [`Self::clear_object_cache`] when the
-    /// bulk read finishes so no later read sees stale bytes.  Only inline
-    /// objects live in the `objects` partition (large blobs are external,
-    /// Decision D7), so the snapshot is bounded and does not buffer bulk content.
-    pub async fn preload_objects(&self) -> Result<()> {
-        let rows = self.store.list(self.pond_id, OBJECTS_PARTITION).await?;
-        let map: HashMap<String, Vec<u8>> = rows.into_iter().collect();
-        let mut guard = self
-            .object_cache
-            .write()
-            .map_err(|_| StoreError::Invariant("object_cache lock poisoned".into()))?;
-        *guard = Some(map);
-        Ok(())
-    }
-
-    /// Drop any snapshot taken by [`Self::preload_objects`], restoring per-hash
-    /// store lookups.  Call this when a bulk read finishes.
-    pub fn clear_object_cache(&self) {
-        if let Ok(mut guard) = self.object_cache.write() {
-            *guard = None;
-        }
+        Ok(objects)
     }
 
     /// True if the object with the given hash is present on the remote.
@@ -855,50 +1539,8 @@ impl ContentRemote {
         Ok(self.get_object(hash).await?.is_some())
     }
 
-    /// Object-store key for an external blob, sibling to the Delta log.  Large
-    /// blobs (>64KB) live here rather than as inline `objects` rows so a
-    /// multi-gigabyte value never lands in the Delta table (Decision D7).
     fn blob_path(hash: ObjectHash) -> object_store::path::Path {
-        object_store::path::Path::from(format!("_blobs/blob={}", hash.to_hex()))
-    }
-
-    /// Every external blob the remote holds, as one listing of the `_blobs/`
-    /// prefix.
-    ///
-    /// This exists because presence is asked about in bulk.  A push must know,
-    /// for each blob its content closure references, whether the remote already
-    /// holds it -- and [`Self::has_blob`] answers that with one `HEAD` per
-    /// blob.  That cost is proportional to the pond's accumulated history
-    /// rather than to the work being done: a pond holding 180 blobs pays 180
-    /// billed requests on every push, including a push that transfers nothing.
-    /// Measured on a staging pond, hourly pushes came to ~4300 requests a day
-    /// purely to re-confirm blobs that had not changed.
-    ///
-    /// One listing answers the same question. `object_store` paginates
-    /// internally at 1000 keys per request, so this is a single request for any
-    /// realistic blob count, and it reads live remote state exactly as the
-    /// per-blob `HEAD`s did -- it is not a cache.
-    pub async fn list_blobs(&self) -> Result<std::collections::HashSet<ObjectHash>> {
-        use futures::StreamExt;
-
-        let prefix = object_store::path::Path::from("_blobs");
-        let mut stream = self.store.object_store().list(Some(&prefix));
-        let mut out = std::collections::HashSet::new();
-        while let Some(meta) = stream.next().await {
-            let meta = meta.map_err(|e| StoreError::Invariant(format!("list blobs: {e}")))?;
-            // Keys are `_blobs/blob=<hex>`; anything else under the prefix is
-            // not ours and is skipped rather than guessed at.
-            let Some(name) = meta.location.filename() else {
-                continue;
-            };
-            let Some(hex) = name.strip_prefix("blob=") else {
-                continue;
-            };
-            if let Ok(hash) = ObjectHash::from_hex(hex) {
-                let _ = out.insert(hash);
-            }
-        }
-        Ok(out)
+        Self::v2_object_path(hash)
     }
 
     /// True if the external blob `hash` is already present in the remote blob
@@ -920,147 +1562,65 @@ impl ContentRemote {
         self.store.delta_version()
     }
 
-    /// Object-store key prefix for one series' pack advertisements: the
-    /// `_packs/v3/series=<hex>` directory under which every pack index naming
-    /// that series lives.  See `docs/logical-series-identity-design.md`
-    /// delivery gate 3 and [`crate::pack_keys`].
-    fn pack_series_prefix(series_hash: ObjectHash) -> object_store::path::Path {
-        object_store::path::Path::from(crate::pack_keys::PACK_INDEX_ROOT)
-            .child(crate::pack_keys::series_dir_name(series_hash))
-    }
-
-    /// Object-store key for one pack advertisement:
-    /// `_packs/v3/series=<series_hex>/pack=<pack_hex>`.
-    fn pack_index_path(series_hash: ObjectHash, pack_hash: ObjectHash) -> object_store::path::Path {
-        Self::pack_series_prefix(series_hash).child(crate::pack_keys::pack_file_name(pack_hash))
-    }
-
-    /// Every pack hash advertised for `series_hash`, as one listing of its
-    /// `_packs/v3/series=<hex>/` prefix.
-    ///
-    /// Pack indexes are derived storage metadata excluded from the logical
-    /// content tree (the design doc's "Physical pack index" section), so
-    /// they cannot be discovered by walking the commit/tree object closure
-    /// the way inline objects and `_blobs` are. This is the one prefix
-    /// listing that answers "what packs exist for this series", matching
-    /// [`Self::list_blobs`]'s single-listing shape rather than a `HEAD` per
-    /// candidate.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any entry under the prefix is not a well-formed
-    /// `pack=<64-hex>` key, or if the same pack hash is listed more than
-    /// once -- either would mean the object store's own listing is not
-    /// trustworthy, and this must not silently proceed on unverified data.
-    pub async fn list_pack_hashes(
+    /// Explicit diagnostic scan of all immutable v2 pack indexes for one
+    /// logical series. Ordinary publication and pull never call this.
+    pub async fn diagnostic_list_pack_hashes(
         &self,
         series_hash: ObjectHash,
     ) -> Result<std::collections::HashSet<ObjectHash>> {
         use futures::StreamExt;
 
-        let prefix = Self::pack_series_prefix(series_hash);
+        let prefix = object_store::path::Path::from(V2_PACK_PREFIX);
         let mut stream = self.store.object_store().list(Some(&prefix));
         let mut out = std::collections::HashSet::new();
         while let Some(meta) = stream.next().await {
             let meta = meta.map_err(|e| StoreError::Invariant(format!("list packs: {e}")))?;
+            if meta
+                .location
+                .as_ref()
+                .starts_with(&format!("{V2_PACK_PREFIX}/by-series/"))
+                || meta
+                    .location
+                    .as_ref()
+                    .starts_with(&format!("{V2_PACK_PREFIX}/consolidated/"))
+            {
+                continue;
+            }
             let Some(name) = meta.location.filename() else {
-                return Err(StoreError::Invariant(format!(
-                    "pack advertisement key has no filename: {}",
-                    meta.location
-                )));
+                continue;
             };
-            let hash = crate::pack_keys::parse_pack_file_name(name).map_err(|e| {
-                StoreError::Invariant(format!(
-                    "malformed pack advertisement key {}: {e}",
-                    meta.location
-                ))
+            let Some(hex) = name.strip_prefix("blake3=") else {
+                continue;
+            };
+            let hash = ObjectHash::from_hex(hex).map_err(StoreError::Invariant)?;
+            let Some(bytes) = self
+                .read_content_addressed_small(&meta.location, hash, "pack")
+                .await?
+            else {
+                continue;
+            };
+            let pack = crate::content::PackIndex::decode(&bytes).map_err(|error| {
+                StoreError::Invariant(format!("decode diagnostic pack {hash}: {error}"))
             })?;
-            if !out.insert(hash) {
-                return Err(StoreError::Invariant(format!(
-                    "duplicate pack advertisement listing entry: {hash}"
-                )));
+            if pack.series_hash() == series_hash {
+                let _ = out.insert(hash);
             }
         }
         Ok(out)
     }
 
-    /// Fetch one pack advertisement's raw `watertown.series-pack.v3` bytes by the
-    /// series it claims and its own content address, or `None` if absent.
-    ///
-    /// This fetches at the exact series-scoped key
-    /// (`_packs/v3/series=<series_hex>/pack=<pack_hex>`) rather than a bare
-    /// `pack=<hex>` lookup, so resolving one pack never requires scanning
-    /// every series' advertisements -- the ambiguous global lookup the
-    /// design doc's key layout is deliberately shaped to avoid.
-    ///
-    /// The returned bytes are validated before being handed back: they must
-    /// hash to `pack_hash` (the object store's own key naming this entry is
-    /// not itself proof of content, only of address) and must decode to a
-    /// [`crate::content::PackIndex`] whose own `series_hash` field agrees
-    /// with `series_hash` (rejecting a pack index published, by mistake or
-    /// by attack, under the wrong series' directory).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the stored bytes do not hash to `pack_hash`, do
-    /// not decode as a `watertown.series-pack.v3` object, or decode to a pack index
-    /// naming a different series than `series_hash`.
+    /// Fetch one immutable native-v2 pack index.
     pub async fn get_pack_index_bytes(
         &self,
         series_hash: ObjectHash,
         pack_hash: ObjectHash,
     ) -> Result<Option<Vec<u8>>> {
-        let path = Self::pack_index_path(series_hash, pack_hash);
-        let bytes = match self.store.object_store().get(&path).await {
-            Ok(res) => res
-                .bytes()
-                .await
-                .map_err(|e| StoreError::Invariant(format!("pack index get: {e}")))?
-                .to_vec(),
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(e) => return Err(StoreError::Invariant(format!("pack index get: {e}"))),
-        };
-        let computed = ObjectHash::of_bytes(&bytes);
-        if computed != pack_hash {
-            return Err(StoreError::Invariant(format!(
-                "pack advertisement at series={} pack={} hashes to {} (content-address mismatch)",
-                series_hash.to_hex(),
-                pack_hash.to_hex(),
-                computed.to_hex()
-            )));
-        }
-        let decoded = crate::content::PackIndex::decode(&bytes).map_err(|e| {
-            StoreError::Invariant(format!(
-                "decode pack advertisement {}: {e}",
-                pack_hash.to_hex()
-            ))
-        })?;
-        if decoded.series_hash() != series_hash {
-            return Err(StoreError::Invariant(format!(
-                "pack advertisement {} listed under series={} declares series_hash {} (cross-series index)",
-                pack_hash.to_hex(),
-                series_hash.to_hex(),
-                decoded.series_hash().to_hex()
-            )));
-        }
-        Ok(Some(bytes))
+        self.get_immutable_pack(PackDescriptor::new(series_hash, pack_hash))
+            .await
     }
 
-    /// True if the physical object `hash` is already durable on the remote,
-    /// checked with exactly one bounded exact-key lookup rather than a full
-    /// bucket listing: a pack's declared physical objects may be either
-    /// external blobs (`_blobs/blob=<hex>`, [`Self::has_blob`]) or inline
-    /// objects already published by the ordinary content push (the Delta
-    /// `objects` partition, [`Self::get_object`]). An initial pack over a
-    /// freshly folded series advertises exactly those already-pushed
-    /// per-version objects, so both locations must be checked; a repacked
-    /// maintenance pack's fresh physical objects are always external blobs
-    /// and satisfy the first check.
     async fn has_physical_object(&self, hash: ObjectHash) -> Result<bool> {
-        if self.has_blob(hash).await? {
-            return Ok(true);
-        }
-        Ok(self.get_object(hash).await?.is_some())
+        Ok(self.immutable_object_size(hash).await?.is_some())
     }
 
     /// [`Self::publish_pack_with_known_present`] with an empty known-present
@@ -1087,29 +1647,18 @@ impl ContentRemote {
     /// declared physical blobs that `physical_blobs` supplies and that the
     /// remote does not already hold.
     ///
-    /// `known_present` names physical object hashes the *caller* already
-    /// knows are durable on the remote -- typically because it just wrote
-    /// them itself in this same push, via [`Self::push_objects`] or
-    /// [`Self::put_blob`] -- and for which [`Self::has_physical_object`]'s
-    /// exact-key check (a `HEAD` plus, on a miss, a Delta lookup that can run
-    /// a full query over the objects partition) is therefore redundant
-    /// proof-of-presence. Every hash in `pack_index.physical_object_hashes()`
-    /// that is *not* in `known_present` is still checked exactly: this
-    /// parameter narrows re-probing to the objects a caller cannot already
-    /// vouch for, it never widens what is trusted unconditionally. A caller
-    /// with no such proof should use [`Self::publish_pack`] (an empty
-    /// known-present set), which preserves the original exact-validation
-    /// behavior for every declared object.
+    /// `known_present` names physical object hashes the caller already proved
+    /// durable in this operation. Every other declared hash is checked through
+    /// its receipt-backed native-v2 key before the pack is created.
     ///
     /// Publication order is otherwise unchanged from [`Self::publish_pack`]:
     /// physical objects first (the design doc's "Physical pack index"
     /// section), pack index last, so a pack index never becomes visible
     /// while any physical object it names is missing.
     ///
-    /// This never touches Delta refs or the txn sequence: it operates
-    /// entirely through the same raw object-store surface as
-    /// [`Self::put_blob`]/[`Self::has_blob`], sibling to (not inside) the
-    /// Delta-managed `objects`/`refs` partitions.
+    /// This never installs a fixed-key locator and never touches Delta
+    /// publication state. Whole-range locator installation is reserved for
+    /// [`Self::publish_consolidated_pack_with_known_present`].
     ///
     /// The write is idempotent and cheap to retry: if an advertisement
     /// already exists at `pack_index`'s own content-addressed key, this
@@ -1145,20 +1694,6 @@ impl ContentRemote {
             "PackIndex::hash must equal blake3(encode())"
         );
 
-        // Skip entirely when this exact advertisement already exists: the
-        // destination key is content-addressed, so an existing entry is
-        // necessarily byte-identical and every physical dependency it named
-        // was already confirmed present the first time it was published.
-        let path = Self::pack_index_path(series_hash, pack_hash);
-        if self.store.object_store().head(&path).await.is_ok() {
-            return Ok(pack_hash);
-        }
-
-        // Physical blobs first: upload only the caller-supplied bytes not
-        // already durable, one bounded exact-key check per distinct hash --
-        // unless the caller already knows (via `known_present`) that this
-        // exact hash is durable, in which case neither the check nor the
-        // upload is needed.
         let mut uploaded: std::collections::HashSet<ObjectHash> = std::collections::HashSet::new();
         for (hash, blob_bytes) in physical_blobs {
             if uploaded.contains(hash)
@@ -1171,14 +1706,6 @@ impl ContentRemote {
             let _ = uploaded.insert(*hash);
         }
 
-        // Never trust the caller's `physical_blobs` alone: require every
-        // declared physical object to be present (as either an external blob
-        // or an already-pushed inline object) before the index becomes
-        // visible -- except a hash the caller has already proven present via
-        // `known_present`, which is skipped entirely rather than re-probed.
-        // One bounded lookup per distinct hash not already known, not a
-        // bucket scan and not history-proportional re-verification of
-        // objects this same push just durably wrote.
         let mut checked: std::collections::HashSet<ObjectHash> = std::collections::HashSet::new();
         for hash in pack_index.physical_object_hashes() {
             if known_present.contains(hash) || !checked.insert(*hash) {
@@ -1192,14 +1719,63 @@ impl ContentRemote {
             }
         }
 
-        // Index last: only reachable once every physical dependency above is
-        // confirmed durable.
-        self.store
-            .object_store()
-            .put(&path, bytes.into())
-            .await
-            .map_err(|e| StoreError::Invariant(format!("publish pack index: {e}")))?;
+        let descriptor = PackDescriptor::new(series_hash, pack_hash);
+        let _ = self.store_immutable_pack(descriptor, &bytes).await?;
         Ok(pack_hash)
+    }
+
+    /// Publish an already-verified whole-range pack and then install its
+    /// immutable consolidated locator.
+    ///
+    /// `manifest` must hash to `series_hash`, and the pack must verify as its
+    /// complete parentless range. The caller first makes every hash in
+    /// `known_present` durable through this remote. Any remaining referenced
+    /// object is checked here. Pack bytes are created before the one-shot
+    /// failure boundary and locator, so failure leaves the previous locator
+    /// state valid and retry is physically idempotent.
+    pub async fn publish_consolidated_pack_with_known_present(
+        &mut self,
+        series_hash: ObjectHash,
+        manifest: &crate::content::SeriesManifest,
+        pack_index: &crate::content::PackIndex,
+        known_present: &std::collections::HashSet<ObjectHash>,
+    ) -> Result<ConsolidatedPackWriteOutcome> {
+        if manifest.hash() != series_hash {
+            return Err(StoreError::Invariant(format!(
+                "consolidated series manifest hashes to {}, expected {series_hash}",
+                manifest.hash()
+            )));
+        }
+        if pack_index.series_hash() != series_hash {
+            return Err(StoreError::Invariant(format!(
+                "refusing to publish consolidated pack under series={} for a pack declaring {}",
+                series_hash,
+                pack_index.series_hash()
+            )));
+        }
+        crate::content::verify_complete_pack_against_manifest(series_hash, manifest, pack_index)
+            .map_err(StoreError::Invariant)?;
+        for hash in pack_index.physical_object_hashes() {
+            if !known_present.contains(hash) && !self.has_physical_object(*hash).await? {
+                return Err(StoreError::Invariant(format!(
+                    "cannot publish consolidated pack: physical object {hash} is absent"
+                )));
+            }
+        }
+
+        let bytes = pack_index.encode();
+        let pack_hash = ObjectHash::of_bytes(&bytes);
+        let descriptor = PackDescriptor::new(series_hash, pack_hash);
+        let (pack_created, _) = self.store_immutable_pack(descriptor, &bytes).await?;
+        self.publication_stage(PublicationFailurePoint::BeforeConsolidatedLocator)?;
+        let locator_created = self
+            .ensure_consolidated_series_pack_locator(descriptor)
+            .await?;
+        Ok(ConsolidatedPackWriteOutcome {
+            pack_hash,
+            pack_created,
+            locator_created,
+        })
     }
 
     /// Stream a large blob's raw bytes from `reader` into the remote blob store,
@@ -1215,8 +1791,13 @@ impl ContentRemote {
     where
         R: tokio::io::AsyncRead + Unpin,
     {
-        self.put_hashed_object(Self::blob_path(hash), hash, None, &mut reader)
-            .await
+        let _ = self
+            .put_immutable_object_stream(
+                ObjectDescriptor::new(hash, crate::content::ContentObjectKind::RawBlob),
+                &mut reader,
+            )
+            .await?;
+        Ok(())
     }
 
     async fn put_hashed_object<R>(
@@ -1373,15 +1954,7 @@ impl ContentRemote {
         &self,
         hash: ObjectHash,
     ) -> Result<Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>> {
-        let path = Self::blob_path(hash);
-        let res = match self.store.object_store().get(&path).await {
-            Ok(r) => r,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(e) => return Err(StoreError::Invariant(format!("blob get: {e}"))),
-        };
-        let stream = futures::TryStreamExt::map_err(res.into_stream(), std::io::Error::other);
-        let reader = tokio_util::io::StreamReader::new(stream);
-        Ok(Some(Box::new(reader)))
+        self.get_immutable_object_reader(hash).await
     }
 
     /// Publish a complete portable recovery-capsule generation.
@@ -2477,6 +3050,64 @@ fn capsule_mc_script(root: ObjectHash) -> String {
     )
 }
 
+fn receipt_from_put(
+    descriptor: ObjectDescriptor,
+    byte_length: u64,
+    result: &PutResult,
+) -> Result<ObjectReceipt> {
+    ObjectReceipt::new(
+        descriptor.hash,
+        byte_length,
+        result.e_tag.clone(),
+        result.version.clone(),
+    )
+    .map_err(StoreError::Invariant)
+}
+
+fn receipt_from_meta(
+    descriptor: ObjectDescriptor,
+    byte_length: u64,
+    metadata: &ObjectMeta,
+) -> Result<ObjectReceipt> {
+    ObjectReceipt::new(
+        descriptor.hash,
+        byte_length,
+        metadata.e_tag.clone(),
+        metadata.version.clone(),
+    )
+    .map_err(StoreError::Invariant)
+}
+
+fn verify_receipt_metadata(receipt: &ObjectReceipt, metadata: &ObjectMeta) -> Result<()> {
+    if metadata.size != receipt.byte_length {
+        return Err(StoreError::Invariant(format!(
+            "receipt-backed object {} has size {}, expected {}",
+            receipt.payload_hash, metadata.size, receipt.byte_length
+        )));
+    }
+    if receipt
+        .e_tag
+        .as_ref()
+        .is_some_and(|expected| metadata.e_tag.as_ref() != Some(expected))
+    {
+        return Err(StoreError::Invariant(format!(
+            "receipt-backed object {} ETag changed",
+            receipt.payload_hash
+        )));
+    }
+    if receipt
+        .version
+        .as_ref()
+        .is_some_and(|expected| metadata.version.as_ref() != Some(expected))
+    {
+        return Err(StoreError::Invariant(format!(
+            "receipt-backed object {} version changed",
+            receipt.payload_hash
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -2488,6 +3119,179 @@ mod tests {
     };
     use tempfile::tempdir;
     use tinyfs::EntryType;
+
+    #[tokio::test]
+    async fn immutable_payload_retry_is_physically_unique() {
+        let dir = tempdir().unwrap();
+        let remote = ContentRemote::create_at(dir.path().join("remote"), Uuid::new_v4())
+            .await
+            .unwrap();
+        let bytes = b"immutable payload".to_vec();
+        let descriptor = ObjectDescriptor::new(
+            ObjectHash::of_bytes(&bytes),
+            crate::content::ContentObjectKind::RawBlob,
+        );
+        let first = remote
+            .put_immutable_object(descriptor, &bytes)
+            .await
+            .unwrap();
+        assert!(first.payload_created);
+        assert!(first.receipt_created);
+        let retry = remote
+            .put_immutable_object(descriptor, &bytes)
+            .await
+            .unwrap();
+        assert!(!retry.payload_created);
+        assert!(!retry.receipt_created);
+        assert_eq!(remote.immutable_object_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_immutable_create_converges_to_one_payload() {
+        let dir = tempdir().unwrap();
+        let remote = ContentRemote::create_at(dir.path().join("remote"), Uuid::new_v4())
+            .await
+            .unwrap();
+        let bytes = b"concurrent payload".to_vec();
+        let descriptor = ObjectDescriptor::new(
+            ObjectHash::of_bytes(&bytes),
+            crate::content::ContentObjectKind::RawBlob,
+        );
+        let (left, right) = tokio::join!(
+            remote.put_immutable_object(descriptor, &bytes),
+            remote.put_immutable_object(descriptor, &bytes)
+        );
+        let left = left.unwrap();
+        let right = right.unwrap();
+        assert_eq!(
+            usize::from(left.payload_created) + usize::from(right.payload_created),
+            1
+        );
+        assert_eq!(remote.immutable_object_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_publishers_fail_on_a_conflicting_canonical_key() {
+        let dir = tempdir().unwrap();
+        let remote = ContentRemote::create_at(dir.path().join("remote"), Uuid::new_v4())
+            .await
+            .unwrap();
+        let expected = b"expected payload".to_vec();
+        let descriptor = ObjectDescriptor::new(
+            ObjectHash::of_bytes(&expected),
+            crate::content::ContentObjectKind::RawBlob,
+        );
+        remote
+            .store
+            .object_store()
+            .put(
+                &ContentRemote::v2_object_path(descriptor.hash),
+                b"conflicting publisher bytes".to_vec().into(),
+            )
+            .await
+            .unwrap();
+        let (left, right) = tokio::join!(
+            remote.put_immutable_object(descriptor, &expected),
+            remote.put_immutable_object(descriptor, &expected)
+        );
+        assert!(left.unwrap_err().to_string().contains("conflicting bytes"));
+        assert!(right.unwrap_err().to_string().contains("conflicting bytes"));
+    }
+
+    #[tokio::test]
+    async fn receiptless_payload_is_verified_once_and_receipted() {
+        let dir = tempdir().unwrap();
+        let remote = ContentRemote::create_at(dir.path().join("remote"), Uuid::new_v4())
+            .await
+            .unwrap();
+        let bytes = b"interrupted create".to_vec();
+        let descriptor = ObjectDescriptor::new(
+            ObjectHash::of_bytes(&bytes),
+            crate::content::ContentObjectKind::RawBlob,
+        );
+        remote
+            .store
+            .object_store()
+            .put_opts(
+                &ContentRemote::v2_object_path(descriptor.hash),
+                bytes.clone().into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..PutOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        let outcome = remote
+            .put_immutable_object(descriptor, &bytes)
+            .await
+            .unwrap();
+        assert!(!outcome.payload_created);
+        assert!(outcome.receipt_created);
+        assert!(
+            remote
+                .read_receipt(descriptor.hash)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_receipt_and_conflicting_existing_payload_fail_closed() {
+        let dir = tempdir().unwrap();
+        let remote = ContentRemote::create_at(dir.path().join("remote"), Uuid::new_v4())
+            .await
+            .unwrap();
+        let bytes = b"valid payload".to_vec();
+        let descriptor = ObjectDescriptor::new(
+            ObjectHash::of_bytes(&bytes),
+            crate::content::ContentObjectKind::RawBlob,
+        );
+        remote
+            .store
+            .object_store()
+            .put(
+                &ContentRemote::v2_object_path(descriptor.hash),
+                bytes.clone().into(),
+            )
+            .await
+            .unwrap();
+        remote
+            .store
+            .object_store()
+            .put(
+                &ContentRemote::v2_receipt_path(descriptor.hash),
+                b"malformed".to_vec().into(),
+            )
+            .await
+            .unwrap();
+        let error = remote
+            .put_immutable_object(descriptor, &bytes)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("malformed receipt"));
+
+        let other = b"expected bytes".to_vec();
+        let other_descriptor = ObjectDescriptor::new(
+            ObjectHash::of_bytes(&other),
+            crate::content::ContentObjectKind::RawBlob,
+        );
+        remote
+            .store
+            .object_store()
+            .put(
+                &ContentRemote::v2_object_path(other_descriptor.hash),
+                b"conflicting bytes".to_vec().into(),
+            )
+            .await
+            .unwrap();
+        let error = remote
+            .put_immutable_object(other_descriptor, &other)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("conflicting bytes"));
+    }
 
     #[tokio::test]
     async fn url_remote_persists_and_discovers_pond_id() {

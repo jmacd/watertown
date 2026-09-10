@@ -8,10 +8,11 @@
 use async_trait::async_trait;
 use steward::{
     BlobReader, ContentSource, FetchedObject, LocalPondSource, Ship, StewardError,
-    fetch_object_graph, push_content_to_remote,
+    fetch_object_graph, fetch_object_graph_since, materialize_content_objects,
+    push_content_to_remote,
 };
 use sync_store::ContentRemote;
-use sync_store::content::{Commit, ContentModelVersion, ObjectHash, PackIndex, Provenance};
+use sync_store::content::{Commit, ObjectHash, PackIndex};
 use tempfile::tempdir;
 use tinyfs::arrow::parquet::ParquetExt;
 use tinyfs::async_helpers::convenience::create_file_path;
@@ -31,22 +32,26 @@ fn meta(label: &str) -> PondUserMetadata {
     PondUserMetadata::new(vec!["test".into(), label.into()])
 }
 
-fn synthetic_commit(parent: Option<ObjectHash>, seq: i64) -> (ObjectHash, Vec<u8>) {
-    let commit = Commit::new(
-        ContentModelVersion::LogicalSeriesV2,
-        ObjectHash::of_bytes(b"synthetic-root"),
-        parent,
-        ObjectHash::of_bytes(b"synthetic-manifest"),
-        ObjectHash::of_bytes(b"synthetic-manifest-root"),
-        Provenance {
-            pond_id: "synthetic".to_string(),
-            seq,
-            time_micros: seq,
-            author: "test".to_string(),
-            request: "test".to_string(),
-        },
-    );
-    (commit.hash(), commit.encode())
+async fn write_file_series_versions(ship: &mut Ship, path: &str, values: &[&[u8]]) {
+    let path = path.to_string();
+    let values = values
+        .iter()
+        .map(|value| value.to_vec())
+        .collect::<Vec<_>>();
+    ship.write_transaction(&meta("file-series-batch"), async move |fs| {
+        use tokio::io::AsyncWriteExt;
+        let root = fs.root().await?;
+        for bytes in values {
+            let mut writer = root
+                .async_writer_path_with_type(&path, tinyfs::EntryType::FilePhysicalSeries)
+                .await?;
+            writer.write_all(&bytes).await?;
+            writer.shutdown().await?;
+        }
+        Ok(())
+    })
+    .await
+    .expect("file-series batch transaction");
 }
 
 async fn write_file(ship: &mut Ship, path: &str, bytes: &[u8]) {
@@ -58,6 +63,192 @@ async fn write_file(ship: &mut Ship, path: &str, bytes: &[u8]) {
     })
     .await
     .expect("write transaction");
+}
+
+#[tokio::test]
+async fn incremental_materialization_follows_destination_series_frontiers_across_segmentation() {
+    let (_source_dir, mut source) = new_pond("segmented-source").await;
+    write_file_series_version(&mut source, "/a.series", b"x").await;
+    let remote_dir = tempdir().expect("remote tempdir");
+    let pond_id = source.control_table().pond_id_uuid();
+    let mut remote = ContentRemote::create_at(remote_dir.path().join("remote"), pond_id)
+        .await
+        .expect("create remote");
+    let first = push_content_to_remote(&source, &mut remote, "main")
+        .await
+        .expect("publish x");
+
+    let target_dir = tempdir().expect("target tempdir");
+    let mut target = Ship::create_replica(target_dir.path().join("pond"), pond_id)
+        .await
+        .expect("create replica");
+    let initial = fetch_object_graph(&remote, "main")
+        .await
+        .expect("fetch initial graph");
+    let _ = steward::rebuild_pond(&mut target, &remote, &initial)
+        .await
+        .expect("materialize initial graph");
+
+    write_file_series_version(&mut source, "/a.series", b"y").await;
+    let second = push_content_to_remote(&source, &mut remote, "main")
+        .await
+        .expect("publish linked xy");
+    let xy = fetch_object_graph_since(&remote, "main", Some(first.tip))
+        .await
+        .expect("fetch xy suffix");
+    let _ = steward::rebuild_pond(&mut target, &remote, &xy)
+        .await
+        .expect("materialize xy suffix");
+
+    // The canonical locator for logical [x,y] is A's suffix [y] -> [x].
+    // B publishes the same logical series as one root segment. A new B node
+    // must follow the retained canonical chain through the older [x] state.
+    write_file_series_versions(&mut source, "/b.series", &[b"x", b"y"]).await;
+    let third = push_content_to_remote(&source, &mut remote, "main")
+        .await
+        .expect("publish alternate xy segmentation");
+    let new_node = fetch_object_graph_since(&remote, "main", Some(second.tip))
+        .await
+        .expect("fetch new B");
+    let _ = steward::rebuild_pond(&mut target, &remote, &new_node)
+        .await
+        .expect("new B must materialize through canonical linked suffix");
+
+    // Install a root [x,y,z] canonical locator through C, then append z to A.
+    // A retains the authenticated [x,y] frontier even though the canonical
+    // current pack starts at leaf zero rather than at A's retained boundary.
+    write_file_series_versions(&mut source, "/c.series", &[b"x", b"y", b"z"]).await;
+    let fourth = push_content_to_remote(&source, &mut remote, "main")
+        .await
+        .expect("publish root xyz segmentation");
+    let c_graph = fetch_object_graph_since(&remote, "main", Some(third.tip))
+        .await
+        .expect("fetch C");
+    let _ = steward::rebuild_pond(&mut target, &remote, &c_graph)
+        .await
+        .expect("materialize C");
+
+    write_file_series_version(&mut source, "/a.series", b"z").await;
+    let _fifth = push_content_to_remote(&source, &mut remote, "main")
+        .await
+        .expect("publish A xyz alternate suffix");
+    let retained_prefix = fetch_object_graph_since(&remote, "main", Some(fourth.tip))
+        .await
+        .expect("fetch A append");
+    let _ = steward::rebuild_pond(&mut target, &remote, &retained_prefix)
+        .await
+        .expect("A retained xy frontier must authenticate within root xyz pack");
+
+    let tx = target
+        .begin_read(&meta("verify-segmentation"))
+        .await
+        .unwrap();
+    let root = tx.root().await.unwrap();
+    assert_eq!(
+        root.read_file_path_to_vec("/a.series").await.unwrap(),
+        b"xyz"
+    );
+    assert_eq!(
+        root.read_file_path_to_vec("/b.series").await.unwrap(),
+        b"xy"
+    );
+    assert_eq!(
+        root.read_file_path_to_vec("/c.series").await.unwrap(),
+        b"xyz"
+    );
+    let _ = tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn pull_preserves_payloads_with_structured_and_raw_roles() {
+    let (_source_dir, mut source) = new_pond("shared-tree-payload-source").await;
+    mkdir_and_file(&mut source, "/sub", "/sub/value.txt", b"value").await;
+    let materialized = materialize_content_objects(&source)
+        .await
+        .expect("materialize source tree");
+    let tree_hash = materialized
+        .manifest_records
+        .iter()
+        .find(|record| record.entry.name == "sub")
+        .expect("subdirectory manifest record")
+        .entry
+        .child_hash;
+    let tree_bytes = materialized
+        .inline
+        .get(&tree_hash)
+        .expect("subdirectory tree object")
+        .bytes
+        .clone();
+    write_file(&mut source, "/tree-as-file.bin", &tree_bytes).await;
+
+    let remote_dir = tempdir().expect("remote tempdir");
+    let pond_id = source.control_table().pond_id_uuid();
+    let mut remote = ContentRemote::create_at(remote_dir.path().join("remote"), pond_id)
+        .await
+        .expect("create remote");
+    let _ = push_content_to_remote(&source, &mut remote, "main")
+        .await
+        .expect("publish shared tree/raw payload");
+    let graph = fetch_object_graph(&remote, "main")
+        .await
+        .expect("fetch shared tree/raw payload");
+    assert!(graph.trees.contains_key(&tree_hash));
+    assert!(graph.blob_hashes.contains(&tree_hash));
+
+    let target_dir = tempdir().expect("target tempdir");
+    let mut target = Ship::create_replica(target_dir.path().join("pond"), pond_id)
+        .await
+        .expect("create replica");
+    let _ = steward::rebuild_pond(&mut target, &remote, &graph)
+        .await
+        .expect("materialize shared tree/raw payload");
+    let tx = target
+        .begin_read(&meta("verify-shared-payload"))
+        .await
+        .unwrap();
+    assert_eq!(
+        tx.root()
+            .await
+            .unwrap()
+            .read_file_path_to_vec("/tree-as-file.bin")
+            .await
+            .unwrap(),
+        tree_bytes
+    );
+    let _ = tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn pull_buffers_large_dynamic_recipes() {
+    let (_source_dir, mut source) = new_pond("large-recipe-source").await;
+    let config = vec![b'x'; tlogfs::large_files::LARGE_FILE_THRESHOLD + 1];
+    write_dynamic(
+        &mut source,
+        "/large.dynamic",
+        tinyfs::EntryType::FileDynamic,
+        "large-recipe-factory",
+        &config,
+    )
+    .await;
+
+    let remote_dir = tempdir().expect("remote tempdir");
+    let pond_id = source.control_table().pond_id_uuid();
+    let mut remote = ContentRemote::create_at(remote_dir.path().join("remote"), pond_id)
+        .await
+        .expect("create remote");
+    let _ = push_content_to_remote(&source, &mut remote, "main")
+        .await
+        .expect("publish large recipe");
+    let graph = fetch_object_graph(&remote, "main")
+        .await
+        .expect("fetch large recipe");
+    let target_dir = tempdir().expect("target tempdir");
+    let mut target = Ship::create_replica(target_dir.path().join("pond"), pond_id)
+        .await
+        .expect("create replica");
+    let _ = steward::rebuild_pond(&mut target, &remote, &graph)
+        .await
+        .expect("materialize large recipe");
 }
 
 async fn write_foreign_file(ship: &mut Ship, pond_id: uuid7::Uuid, path: &str, bytes: &[u8]) {
@@ -341,6 +532,7 @@ struct ReadCounts {
     object_point_requests: AtomicU64,
     object_batches: Mutex<Vec<Vec<ObjectHash>>>,
     commit_index_requests: AtomicU64,
+    publication_record_requests: AtomicU64,
     pack_index_bytes: AtomicU64,
 }
 
@@ -368,6 +560,12 @@ impl AsyncRead for CountingReader {
 struct CountingSource<'a> {
     inner: &'a dyn ContentSource,
     counts: Arc<ReadCounts>,
+}
+
+struct AdvancingStateSource<'a> {
+    inner: &'a dyn ContentSource,
+    first: sync_store::PublicationState,
+    calls: AtomicU64,
 }
 
 enum BatchFault {
@@ -424,8 +622,8 @@ impl ContentSource for FaultingSource<'_> {
         self.inner.get_object(hash).await
     }
 
-    async fn get_commit_index(&self) -> Result<Option<HashMap<ObjectHash, Commit>>, StewardError> {
-        self.inner.get_commit_index().await
+    async fn object_size(&self, hash: ObjectHash) -> Result<Option<u64>, StewardError> {
+        self.inner.object_size(hash).await
     }
 
     async fn get_objects(
@@ -475,6 +673,20 @@ impl ContentSource for FaultingSource<'_> {
         }
     }
 
+    async fn get_series_pack(
+        &self,
+        series_hash: ObjectHash,
+    ) -> Result<Option<sync_store::content::PackDescriptor>, StewardError> {
+        self.inner.get_series_pack(series_hash).await
+    }
+
+    async fn get_consolidated_series_pack(
+        &self,
+        series_hash: ObjectHash,
+    ) -> Result<Option<sync_store::content::PackDescriptor>, StewardError> {
+        self.inner.get_consolidated_series_pack(series_hash).await
+    }
+
     async fn list_pack_hashes(
         &self,
         series_hash: ObjectHash,
@@ -489,14 +701,6 @@ impl ContentSource for FaultingSource<'_> {
     ) -> Result<Option<Vec<u8>>, StewardError> {
         self.inner.get_pack_index(series_hash, pack_hash).await
     }
-
-    async fn preload_objects(&self) -> Result<(), StewardError> {
-        self.inner.preload_objects().await
-    }
-
-    fn clear_object_cache(&self) {
-        self.inner.clear_object_cache();
-    }
 }
 
 impl<'a> CountingSource<'a> {
@@ -505,6 +709,101 @@ impl<'a> CountingSource<'a> {
             inner,
             counts: Arc::new(ReadCounts::default()),
         }
+    }
+}
+
+#[async_trait]
+impl ContentSource for AdvancingStateSource<'_> {
+    fn pond_id(&self) -> uuid::Uuid {
+        self.inner.pond_id()
+    }
+
+    async fn get_tip(&self, ref_name: &str) -> Result<Option<ObjectHash>, StewardError> {
+        Ok(self
+            .get_publication_state(ref_name)
+            .await?
+            .map(|state| state.snapshot_tip))
+    }
+
+    async fn get_publication_state(
+        &self,
+        ref_name: &str,
+    ) -> Result<Option<sync_store::PublicationState>, StewardError> {
+        if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+            Ok(Some(self.first.clone()))
+        } else {
+            self.inner.get_publication_state(ref_name).await
+        }
+    }
+
+    async fn get_publication_record(
+        &self,
+        hash: ObjectHash,
+    ) -> Result<Option<sync_store::content::PublicationRecord>, StewardError> {
+        self.inner.get_publication_record(hash).await
+    }
+
+    async fn get_publication_pack(
+        &self,
+        descriptor: sync_store::content::PackDescriptor,
+    ) -> Result<Option<Vec<u8>>, StewardError> {
+        self.inner.get_publication_pack(descriptor).await
+    }
+
+    async fn get_object(&self, hash: ObjectHash) -> Result<Option<Vec<u8>>, StewardError> {
+        self.inner.get_object(hash).await
+    }
+
+    async fn object_size(&self, hash: ObjectHash) -> Result<Option<u64>, StewardError> {
+        self.inner.object_size(hash).await
+    }
+
+    async fn get_objects(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, Vec<u8>>, StewardError> {
+        self.inner.get_objects(hashes).await
+    }
+
+    async fn has_blob(&self, hash: ObjectHash) -> Result<bool, StewardError> {
+        self.inner.has_blob(hash).await
+    }
+
+    async fn list_blobs(&self) -> Result<HashSet<ObjectHash>, StewardError> {
+        self.inner.list_blobs().await
+    }
+
+    async fn get_blob_reader(&self, hash: ObjectHash) -> Result<Option<BlobReader>, StewardError> {
+        self.inner.get_blob_reader(hash).await
+    }
+
+    async fn get_series_pack(
+        &self,
+        series_hash: ObjectHash,
+    ) -> Result<Option<sync_store::content::PackDescriptor>, StewardError> {
+        self.inner.get_series_pack(series_hash).await
+    }
+
+    async fn get_consolidated_series_pack(
+        &self,
+        series_hash: ObjectHash,
+    ) -> Result<Option<sync_store::content::PackDescriptor>, StewardError> {
+        self.inner.get_consolidated_series_pack(series_hash).await
+    }
+
+    async fn list_pack_hashes(
+        &self,
+        series_hash: ObjectHash,
+    ) -> Result<HashSet<ObjectHash>, StewardError> {
+        self.inner.list_pack_hashes(series_hash).await
+    }
+
+    async fn get_pack_index(
+        &self,
+        series_hash: ObjectHash,
+        pack_hash: ObjectHash,
+    ) -> Result<Option<Vec<u8>>, StewardError> {
+        self.inner.get_pack_index(series_hash, pack_hash).await
     }
 }
 
@@ -518,11 +817,45 @@ impl ContentSource for CountingSource<'_> {
         ContentSource::get_tip(self.inner, ref_name).await
     }
 
-    async fn get_object(&self, hash: ObjectHash) -> Result<Option<Vec<u8>>, StewardError> {
+    async fn get_publication_state(
+        &self,
+        ref_name: &str,
+    ) -> Result<Option<sync_store::PublicationState>, StewardError> {
+        ContentSource::get_publication_state(self.inner, ref_name).await
+    }
+
+    async fn get_publication_record(
+        &self,
+        hash: ObjectHash,
+    ) -> Result<Option<sync_store::content::PublicationRecord>, StewardError> {
         let _ = self
             .counts
-            .object_point_requests
+            .publication_record_requests
             .fetch_add(1, Ordering::Relaxed);
+        let _ = self.counts.commit_index_requests.compare_exchange(
+            0,
+            1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        ContentSource::get_publication_record(self.inner, hash).await
+    }
+
+    async fn get_publication_pack(
+        &self,
+        descriptor: sync_store::content::PackDescriptor,
+    ) -> Result<Option<Vec<u8>>, StewardError> {
+        let value = ContentSource::get_publication_pack(self.inner, descriptor).await?;
+        if let Some(bytes) = &value {
+            let _ = self
+                .counts
+                .pack_index_bytes
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        }
+        Ok(value)
+    }
+
+    async fn get_object(&self, hash: ObjectHash) -> Result<Option<Vec<u8>>, StewardError> {
         self.counts
             .object_requests
             .lock()
@@ -538,12 +871,8 @@ impl ContentSource for CountingSource<'_> {
         Ok(value)
     }
 
-    async fn get_commit_index(&self) -> Result<Option<HashMap<ObjectHash, Commit>>, StewardError> {
-        let _ = self
-            .counts
-            .commit_index_requests
-            .fetch_add(1, Ordering::Relaxed);
-        ContentSource::get_commit_index(self.inner).await
+    async fn object_size(&self, hash: ObjectHash) -> Result<Option<u64>, StewardError> {
+        self.inner.object_size(hash).await
     }
 
     async fn get_objects(
@@ -592,6 +921,20 @@ impl ContentSource for CountingSource<'_> {
         })))
     }
 
+    async fn get_series_pack(
+        &self,
+        series_hash: ObjectHash,
+    ) -> Result<Option<sync_store::content::PackDescriptor>, StewardError> {
+        ContentSource::get_series_pack(self.inner, series_hash).await
+    }
+
+    async fn get_consolidated_series_pack(
+        &self,
+        series_hash: ObjectHash,
+    ) -> Result<Option<sync_store::content::PackDescriptor>, StewardError> {
+        ContentSource::get_consolidated_series_pack(self.inner, series_hash).await
+    }
+
     async fn list_pack_hashes(
         &self,
         series_hash: ObjectHash,
@@ -613,15 +956,9 @@ impl ContentSource for CountingSource<'_> {
         }
         Ok(value)
     }
-
-    async fn preload_objects(&self) -> Result<(), StewardError> {
-        Err(StewardError::Content(
-            "incremental pulls must not preload the complete object partition".to_string(),
-        ))
-    }
 }
 
-fn only_series_pack(graph: &steward::FetchedGraph) -> &PackIndex {
+fn only_fetched_series(graph: &steward::FetchedGraph) -> &steward::FetchedSeriesV2 {
     let mut all_series = graph.objects.values().filter_map(|object| match object {
         FetchedObject::SeriesV2(series) => Some(series.as_ref()),
         _ => None,
@@ -631,6 +968,11 @@ fn only_series_pack(graph: &steward::FetchedGraph) -> &PackIndex {
         all_series.next().is_none(),
         "fixture must contain one series"
     );
+    fetched_series
+}
+
+fn only_series_pack(graph: &steward::FetchedGraph) -> &PackIndex {
+    let fetched_series = only_fetched_series(graph);
     assert_eq!(
         fetched_series.packs.len(),
         1,
@@ -752,7 +1094,7 @@ async fn fetched_closure_matches_pushed_objects() {
     write_file(&mut ship, "/a.txt", b"alpha").await;
     mkdir_and_file(&mut ship, "/sub", "/sub/b.txt", b"beta").await;
 
-    let mat = steward::materialize_content_objects(&ship)
+    let mat = materialize_content_objects(&ship)
         .await
         .expect("materialize");
     let (_rt, remote) = push(&ship).await;
@@ -780,7 +1122,7 @@ async fn fetched_closure_matches_pushed_objects() {
 }
 
 #[tokio::test]
-async fn push_includes_ancestry_across_multiple_local_commits() {
+async fn initial_fetch_does_not_scan_complete_commit_history() {
     let (_t, mut src) = new_pond("push-ancestry-src").await;
     write_file(&mut src, "/v1.txt", b"one").await;
     let (_rt, mut remote) = push(&src).await;
@@ -795,17 +1137,12 @@ async fn push_includes_ancestry_across_multiple_local_commits() {
     repush(&src, &mut remote).await;
 
     let graph = fetch_object_graph(&remote, "main").await.expect("fetch");
-    assert!(
-        graph
-            .commits
-            .iter()
-            .any(|(commit_hash, _)| *commit_hash == old_tip),
-        "a later push must include enough commit ancestry to prove a fast-forward"
+    assert_eq!(
+        graph.commits.len(),
+        1,
+        "initial clone needs only the current tip"
     );
-    assert!(
-        graph.commits.len() >= 3,
-        "two unpushed local commits must not break the remote commit chain"
-    );
+    assert_ne!(graph.commits[0].0, old_tip);
 }
 
 #[tokio::test]
@@ -842,7 +1179,7 @@ async fn incremental_fetch_bounds_ancestry_at_known_tip() {
     repush(&src, &mut remote).await;
 
     let source = CountingSource::new(&remote);
-    let graph = steward::fetch_object_graph_since(&source, "main", Some(old_tip))
+    let graph = fetch_object_graph_since(&source, "main", Some(old_tip))
         .await
         .expect("fetch bounded ancestry");
 
@@ -873,7 +1210,7 @@ async fn incremental_fetch_bounds_ancestry_at_known_tip() {
     assert_eq!(
         source.counts.commit_index_requests.load(Ordering::Relaxed),
         1,
-        "indexed ancestry must use one commit-partition query"
+        "bounded ancestry must use the publication-record channel"
     );
     assert_eq!(
         source
@@ -882,102 +1219,161 @@ async fn incremental_fetch_bounds_ancestry_at_known_tip() {
             .lock()
             .expect("object_batches lock")
             .len(),
-        2,
-        "indexed pulls use only root/manifest and exact current-closure object batches"
+        0,
+        "native-v2 pulls do not query a Delta object partition"
     );
 }
 
 #[tokio::test]
-async fn incremental_fetch_walks_to_genesis_when_ancestry_boundary_is_absent() {
+async fn exact_publication_fetch_does_not_reread_an_advancing_head() {
+    let (_t, mut source_pond) = new_pond("advancing-head-source").await;
+    write_file(&mut source_pond, "/a.txt", b"a").await;
+    let (_remote_dir, mut remote) = push(&source_pond).await;
+    let first = remote
+        .get_publication_state("main")
+        .await
+        .expect("read first state")
+        .expect("first publication");
+    write_file(&mut source_pond, "/b.txt", b"b").await;
+    repush(&source_pond, &mut remote).await;
+    let second = remote
+        .get_publication_state("main")
+        .await
+        .expect("read second state")
+        .expect("second publication");
+    assert_ne!(first.snapshot_tip, second.snapshot_tip);
+
+    let source = AdvancingStateSource {
+        inner: &remote,
+        first: first.clone(),
+        calls: AtomicU64::new(0),
+    };
+    let selected = source
+        .get_publication_state("main")
+        .await
+        .expect("select publication")
+        .expect("selected publication");
+    let graph = steward::fetch_object_graph_at_publication(&source, selected.clone(), None)
+        .await
+        .expect("fetch exact selected publication");
+    assert_eq!(
+        source.calls.load(Ordering::Relaxed),
+        1,
+        "fetching the selected graph must not reread a mutable active head"
+    );
+    assert_eq!(graph.publication_state, Some(selected));
+    assert_eq!(graph.tip, Some(first.snapshot_tip));
+}
+
+#[tokio::test]
+async fn incremental_fetch_rejects_unknown_ancestry_boundary() {
     let (_t, mut src) = new_pond("missing-ancestry-boundary-src").await;
     write_file(&mut src, "/initial.txt", b"initial").await;
     write_file(&mut src, "/next.txt", b"next").await;
     let (_rt, remote) = push(&src).await;
     let unrelated = ObjectHash::of_bytes(b"not a commit in this source");
 
-    let graph = steward::fetch_object_graph_since(&remote, "main", Some(unrelated))
+    let error = fetch_object_graph_since(&remote, "main", Some(unrelated))
         .await
-        .expect("fetch complete ancestry");
-
-    assert!(
-        graph
-            .commits
-            .iter()
-            .all(|(commit_hash, _)| *commit_hash != unrelated),
-        "an unrelated boundary must not be accepted as ancestry"
-    );
-    assert_eq!(
-        graph
-            .commits
-            .last()
-            .map(|(_, commit)| commit.parent_commit_hash),
-        Some(None),
-        "a missing boundary must force the authenticated walk to genesis"
-    );
-}
-
-#[tokio::test]
-async fn indexed_remote_without_backfill_fails_closed() {
-    let remote_dir = tempdir().expect("remote dir");
-    let pond_id = uuid::Uuid::new_v4();
-    let mut remote = ContentRemote::create_at(remote_dir.path().join("remote"), pond_id)
-        .await
-        .expect("create remote");
-    let (tip, tip_bytes) = synthetic_commit(None, 1);
-    let _ = remote
-        .push_commit(&[(tip, tip_bytes)], "main", tip)
-        .await
-        .expect("write legacy-style remote without commit index");
-
-    let error = steward::fetch_object_graph_since(&remote, "main", None)
-        .await
-        .expect_err("an empty live commit index must not fall back to objects");
+        .expect_err("unknown publication baseline must fail");
     assert!(
         error
             .to_string()
-            .contains("remote commit index is missing required commit"),
-        "{error}"
+            .contains("does not contain known snapshot")
     );
 }
 
 #[tokio::test]
-async fn indexed_remote_missing_parent_entry_fails_closed() {
+async fn malformed_publication_chain_cannot_exceed_advertised_generation_reads() {
     let remote_dir = tempdir().expect("remote dir");
     let pond_id = uuid::Uuid::new_v4();
     let mut remote = ContentRemote::create_at(remote_dir.path().join("remote"), pond_id)
         .await
         .expect("create remote");
-    let (parent, parent_bytes) = synthetic_commit(None, 1);
-    let (tip, tip_bytes) = synthetic_commit(Some(parent), 2);
+    let mut parent = None;
+    let mut first = None;
+    let mut head = None;
+    for index in 0..10 {
+        let snapshot = ObjectHash::of_bytes(format!("malformed-snapshot-{index}").as_bytes());
+        let root = ObjectHash::of_bytes(format!("malformed-root-{index}").as_bytes());
+        let record = sync_store::content::PublicationRecord::new(
+            pond_id,
+            "main",
+            snapshot,
+            root,
+            parent,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("publication record");
+        let record_hash = record.hash();
+        let _ = remote
+            .put_publication_record(&record)
+            .await
+            .expect("store publication record");
+        parent = Some(record_hash);
+        let _ = first.get_or_insert((snapshot, root, record_hash));
+        head = Some((snapshot, root, record_hash));
+    }
+    let (first_snapshot, first_root, first_record) = first.expect("first");
+    let first_state = sync_store::PublicationState::new(
+        pond_id,
+        "main",
+        first_snapshot,
+        first_root,
+        first_record,
+        1,
+        0,
+    )
+    .expect("first state");
     let _ = remote
-        .push_objects_with_commit_index(
-            &[(parent, parent_bytes), (tip, tip_bytes.clone())],
-            &[(tip, tip_bytes)],
+        .compare_and_swap_publication(sync_store::PublicationExpectation::Missing, first_state)
+        .await
+        .expect("publish initial state");
+    let (snapshot, root, publication_record) = head.expect("head");
+    let state = sync_store::PublicationState::new(
+        pond_id,
+        "main",
+        snapshot,
+        root,
+        publication_record,
+        2,
+        1,
+    )
+    .expect("state");
+    let _ = remote
+        .compare_and_swap_publication(
+            sync_store::PublicationExpectation::Existing {
+                generation: 1,
+                publication_record: first_record,
+            },
+            state,
         )
         .await
-        .expect("write intentionally incomplete commit index");
-    let _ = remote
-        .advance_ref("main", tip)
-        .await
-        .expect("advance ref to indexed tip");
+        .expect("publish malformed head");
 
     let source = CountingSource::new(&remote);
-    let error = steward::fetch_object_graph_since(&source, "main", None)
+    let missing = ObjectHash::of_bytes(b"missing advertised-generation boundary");
+    let error = fetch_object_graph_since(&source, "main", Some(missing))
         .await
-        .expect_err("missing indexed parent must fail");
+        .expect_err("malformed overlong history must fail at its advertised bound");
     assert!(
-        error.to_string().contains(&parent.to_hex()),
-        "error must name the missing parent: {error}"
+        error.to_string().contains("within advertised generation 2"),
+        "{error}"
     );
     assert_eq!(
-        source.counts.object_point_requests.load(Ordering::Relaxed),
-        0,
-        "an incomplete index must not trigger object point-query fallback"
+        source
+            .counts
+            .publication_record_requests
+            .load(Ordering::Relaxed),
+        2,
+        "a generation-2 active row permits at most two publication-record reads"
     );
 }
 
 #[tokio::test]
-async fn local_source_retains_sequential_commit_walk() {
+async fn local_source_synthesizes_bounded_publication_history() {
     let (src_dir, mut src) = new_pond("local-sequential-ancestry").await;
     let src_path = src_dir.path().join("pond");
     write_file(&mut src, "/initial.txt", b"initial").await;
@@ -1009,7 +1405,7 @@ async fn local_source_retains_sequential_commit_walk() {
         .await
         .expect("open local source");
     let source = CountingSource::new(&local);
-    let graph = steward::fetch_object_graph_since(&source, "main", Some(old_tip))
+    let graph = fetch_object_graph_since(&source, "main", Some(old_tip))
         .await
         .expect("local sequential ancestry");
 
@@ -1017,11 +1413,12 @@ async fn local_source_retains_sequential_commit_walk() {
     assert_eq!(
         source.counts.commit_index_requests.load(Ordering::Relaxed),
         1,
-        "the local source explicitly reports index unsupported"
+        "the local source exposes publication records"
     );
-    assert!(
-        source.counts.object_point_requests.load(Ordering::Relaxed) > 0,
-        "intermediate local parents retain the sequential get_object path"
+    assert_eq!(
+        source.counts.object_point_requests.load(Ordering::Relaxed),
+        0,
+        "the local source needs no legacy commit-index fallback"
     );
 }
 
@@ -1135,7 +1532,7 @@ async fn rebuild_reproduces_source_content() {
     );
 }
 
-/// A multi-version (multi-leaf) native `watertown.series.v2` table series survives
+/// A multi-version (multi-leaf) native `watertown.series.v3` table series survives
 /// the full round trip: the rebuilt pond is content-equal to the source,
 /// materializing every logical leaf in order so the read-side fold's root
 /// tree hash matches (design Section 8.5.3, release blocker item 1 --
@@ -1180,7 +1577,9 @@ async fn rebuild_streams_large_external_blob() {
     let (_t, mut src) = new_pond("large-src").await;
     // 256 KiB, comfortably above the 64 KiB large-file threshold, with varied
     // bytes so it does not compress to something tiny.
-    let big: Vec<u8> = (0..256 * 1024).map(|i| (i * 31 + 7) as u8).collect();
+    let big: Vec<u8> = (0..256 * 1024_usize)
+        .map(|i| ((i * 31 + 7) & 0xff) as u8)
+        .collect();
     write_file(&mut src, "/big.bin", &big).await;
     write_file(&mut src, "/small.txt", b"tiny").await;
 
@@ -1235,8 +1634,7 @@ async fn external_blob_validation_failure_leaves_target_unchanged() {
     let valid = fetch_object_graph(&remote, "main").await.expect("fetch");
     assert_eq!(valid.external_blobs.len(), 1);
     let mut invalid = valid.clone();
-    invalid.commits[0].1.node_manifest_root =
-        ObjectHash::of_bytes(b"wrong external-blob manifest root");
+    invalid.commits[0].1.manifest_root = ObjectHash::of_bytes(b"wrong external-blob manifest root");
 
     let dst_dir = tempdir().expect("dst dir");
     let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "large-abort-dst")
@@ -1418,6 +1816,169 @@ async fn series_repull_appends_only_suffix() {
 }
 
 #[tokio::test]
+async fn renamed_series_reuses_its_canonical_pack() {
+    let (_t, mut src) = new_pond("renamed-series-src").await;
+    write_series(
+        &mut src,
+        "/before.series",
+        &[(1_000, "first"), (2_000, "second")],
+    )
+    .await;
+
+    let (_rt, mut remote) = push(&src).await;
+    let first_state = remote
+        .current_publication("main")
+        .await
+        .expect("publication state")
+        .expect("initial publication");
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "renamed-series-dst")
+        .await
+        .expect("create dst");
+    let initial = fetch_object_graph(&remote, "main")
+        .await
+        .expect("initial fetch");
+    let _ = steward::rebuild_pond(&mut dst, &remote, &initial)
+        .await
+        .expect("initial rebuild");
+
+    rename(&mut src, "/before.series", "/after.series").await;
+    repush(&src, &mut remote).await;
+    let incremental = fetch_object_graph_since(&remote, "main", Some(first_state.snapshot_tip))
+        .await
+        .expect("renamed series fetch");
+    let _ = steward::rebuild_pond(&mut dst, &remote, &incremental)
+        .await
+        .expect("renamed series rebuild");
+
+    assert_eq!(root_hash(&dst).await, root_hash(&src).await);
+}
+
+#[tokio::test]
+async fn unchanged_series_under_a_moved_directory_remains_fetchable() {
+    let (_t, mut src) = new_pond("moved-series-src").await;
+    src.write_transaction(&meta("mkdir-series-parent"), async move |transaction| {
+        let root = transaction.root().await?;
+        let _ = root.create_dir_all("/before").await?;
+        Ok(())
+    })
+    .await
+    .expect("create series parent");
+    write_series(
+        &mut src,
+        "/before/observations.series",
+        &[(1_000, "first"), (2_000, "second")],
+    )
+    .await;
+
+    let (_rt, mut remote) = push(&src).await;
+    let first_state = remote
+        .current_publication("main")
+        .await
+        .expect("publication state")
+        .expect("initial publication");
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "moved-series-dst")
+        .await
+        .expect("create dst");
+    let initial = fetch_object_graph(&remote, "main")
+        .await
+        .expect("initial fetch");
+    let _ = steward::rebuild_pond(&mut dst, &remote, &initial)
+        .await
+        .expect("initial rebuild");
+
+    rename(&mut src, "/before", "/after").await;
+    repush(&src, &mut remote).await;
+    let incremental = fetch_object_graph_since(&remote, "main", Some(first_state.snapshot_tip))
+        .await
+        .expect("moved series fetch");
+    let _ = steward::rebuild_pond(&mut dst, &remote, &incremental)
+        .await
+        .expect("moved series rebuild");
+
+    assert_eq!(root_hash(&dst).await, root_hash(&src).await);
+}
+
+#[tokio::test]
+async fn unrelated_incremental_change_keeps_unchanged_series() {
+    let (_t, mut src) = new_pond("unchanged-series-src").await;
+    write_series(&mut src, "/observations.series", &[(1_000, "first")]).await;
+    let (_rt, mut remote) = push(&src).await;
+    let first_state = remote
+        .current_publication("main")
+        .await
+        .expect("publication state")
+        .expect("initial publication");
+
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "unchanged-series-dst")
+        .await
+        .expect("create dst");
+    let initial = fetch_object_graph(&remote, "main")
+        .await
+        .expect("initial fetch");
+    let _ = steward::rebuild_pond(&mut dst, &remote, &initial)
+        .await
+        .expect("initial rebuild");
+
+    write_file(&mut src, "/unrelated.txt", b"new").await;
+    repush(&src, &mut remote).await;
+    let incremental = fetch_object_graph_since(&remote, "main", Some(first_state.snapshot_tip))
+        .await
+        .expect("incremental fetch");
+    let _ = steward::rebuild_pond(&mut dst, &remote, &incremental)
+        .await
+        .expect("apply unrelated change beside unchanged series");
+
+    assert_eq!(root_hash(&dst).await, root_hash(&src).await);
+}
+
+#[tokio::test]
+async fn pinned_mirror_change_does_not_emit_local_limiter_usage() {
+    let (_t, mut src) = new_pond("pinned-usage-src").await;
+    write_file(&mut src, "/value.txt", b"first").await;
+    let (_rt, mut remote) = push(&src).await;
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "pinned-usage-dst")
+        .await
+        .expect("create dst");
+    let initial = fetch_object_graph(&remote, "main")
+        .await
+        .expect("initial fetch");
+    let _ = steward::rebuild_pond(&mut dst, &remote, &initial)
+        .await
+        .expect("initial rebuild");
+
+    let sample = steward::UsageSample {
+        at_us: 1,
+        limiter: "/sys/limits/pull-bytes".to_string(),
+        unit: "bytes".to_string(),
+        amount: 1,
+        observed: 1,
+        used: 1,
+        limit: 1024,
+        window_us: 60_000_000,
+    };
+    steward::limiter_usage::queue(dst.control_table_mut(), std::slice::from_ref(&sample)).await;
+
+    write_file(&mut src, "/other.txt", b"second").await;
+    repush(&src, &mut remote).await;
+    let changed = fetch_object_graph(&remote, "main")
+        .await
+        .expect("changed fetch");
+    let _ = steward::rebuild_pond(&mut dst, &remote, &changed)
+        .await
+        .expect("pinned rebuild must ignore local telemetry");
+    assert_eq!(root_hash(&dst).await, root_hash(&src).await);
+    assert_eq!(
+        steward::limiter_usage::read_pending(dst.control_table()).await,
+        vec![sample],
+        "pinned replication must leave local telemetry queued"
+    );
+}
+
+#[tokio::test]
 async fn incremental_inline_series_prefetches_exact_suffix_in_one_batch() {
     let (_t, mut src) = new_pond("inline-prefetch-src").await;
     let baseline = [b"baseline-one\n".as_slice(), b"baseline-two\n".as_slice()];
@@ -1426,6 +1987,11 @@ async fn incremental_inline_series_prefetches_exact_suffix_in_one_batch() {
     }
 
     let (_rt, mut remote) = push(&src).await;
+    let baseline_state = remote
+        .current_publication("main")
+        .await
+        .expect("baseline publication")
+        .expect("baseline state");
     let dst_dir = tempdir().expect("dst dir");
     let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "inline-prefetch-dst")
         .await
@@ -1433,6 +1999,11 @@ async fn incremental_inline_series_prefetches_exact_suffix_in_one_batch() {
     let initial = fetch_object_graph(&remote, "main")
         .await
         .expect("initial fetch");
+    let historical_objects = only_fetched_series(&initial)
+        .physical_object_hashes
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
     let _ = steward::rebuild_pond(&mut dst, &remote, &initial)
         .await
         .expect("initial materialization");
@@ -1447,22 +2018,17 @@ async fn incremental_inline_series_prefetches_exact_suffix_in_one_batch() {
     repush(&src, &mut remote).await;
 
     let source = CountingSource::new(&remote);
-    let graph = fetch_object_graph(&source, "main")
+    let graph = fetch_object_graph_since(&source, "main", Some(baseline_state.snapshot_tip))
         .await
         .expect("incremental metadata fetch");
     let metadata_batches = source.counts.object_batches.lock().unwrap().len();
-    let baseline_bytes = baseline.iter().map(|bytes| bytes.len() as u64).sum::<u64>();
-    let pack = only_series_pack(&graph);
-    let historical_objects = pack
-        .object_spans()
+    let fetched = only_fetched_series(&graph);
+    assert_eq!(fetched.leaf_start, baseline.len() as u64);
+    assert_eq!(fetched.leaf_hashes.len(), 3);
+    let suffix_objects = fetched
+        .packs
         .iter()
-        .filter(|span| span.logical_end() <= baseline_bytes)
-        .map(|span| span.object_hash())
-        .collect::<HashSet<_>>();
-    let suffix_objects = pack
-        .object_spans()
-        .iter()
-        .filter(|span| span.logical_end() > baseline_bytes)
+        .flat_map(|(_, pack)| pack.object_spans())
         .map(|span| span.object_hash())
         .collect::<HashSet<_>>();
     assert!(
@@ -1520,12 +2086,17 @@ async fn incremental_file_series_pull_reads_only_the_bounded_physical_suffix() {
     assert_eq!(initial_maintenance.series_repacked, 1);
 
     let (_rt, mut remote) = push(&src).await;
+    let baseline_state = remote
+        .current_publication("main")
+        .await
+        .expect("baseline publication")
+        .expect("baseline state");
     let dst_dir = tempdir().expect("dst dir");
     let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "bounded-series-dst")
         .await
         .expect("create dst");
 
-    {
+    let historical_objects = {
         let source = CountingSource::new(&remote);
         let graph = fetch_object_graph(&source, "main")
             .await
@@ -1544,6 +2115,11 @@ async fn incremental_file_series_pull_reads_only_the_bounded_physical_suffix() {
             .iter()
             .map(|span| span.physical_len())
             .sum();
+        let historical_objects = only_series_pack(&graph)
+            .physical_object_hashes()
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
         let _ = steward::rebuild_pond(&mut dst, &source, &graph)
             .await
             .expect("initial materialization");
@@ -1552,7 +2128,8 @@ async fn incremental_file_series_pull_reads_only_the_bounded_physical_suffix() {
             expected_initial_bytes,
             "initial materialization must stream each physical pack object exactly once"
         );
-    }
+        historical_objects
+    };
     assert_eq!(root_hash(&dst).await, root_hash(&src).await);
 
     let appended = vec![0x44; 128 * 1024];
@@ -1565,7 +2142,7 @@ async fn incremental_file_series_pull_reads_only_the_bounded_physical_suffix() {
     repush(&src, &mut remote).await;
 
     let source = CountingSource::new(&remote);
-    let graph = fetch_object_graph(&source, "main")
+    let graph = fetch_object_graph_since(&source, "main", Some(baseline_state.snapshot_tip))
         .await
         .expect("incremental metadata fetch must not preload all objects");
     assert_eq!(
@@ -1574,22 +2151,15 @@ async fn incremental_file_series_pull_reads_only_the_bounded_physical_suffix() {
         "incremental metadata discovery must not read pack payload bytes"
     );
     let pack = only_series_pack(&graph);
+    assert_eq!(pack.leaf_start(), 3);
     let expected_suffix_bytes: u64 = pack
         .object_spans()
         .iter()
-        .filter(|span| span.logical_end() > HISTORICAL_BYTES)
         .map(|span| span.physical_len())
         .sum();
-    let historical_objects: HashSet<ObjectHash> = pack
-        .object_spans()
-        .iter()
-        .filter(|span| span.logical_end() <= HISTORICAL_BYTES)
-        .map(|span| span.object_hash())
-        .collect();
     let suffix_objects: HashSet<ObjectHash> = pack
         .object_spans()
         .iter()
-        .filter(|span| span.logical_end() > HISTORICAL_BYTES)
         .map(|span| span.object_hash())
         .collect();
     let batches_before_rebuild = source.counts.object_batches.lock().unwrap().len();
@@ -1633,18 +2203,8 @@ async fn incremental_file_series_pull_reads_only_the_bounded_physical_suffix() {
     let batches = source.counts.object_batches.lock().unwrap();
     assert_eq!(
         batches.len(),
-        batches_before_rebuild + 1,
-        "external candidates still use one exact inline prefetch batch"
-    );
-    assert_eq!(
-        batches
-            .last()
-            .expect("payload batch")
-            .iter()
-            .copied()
-            .collect::<HashSet<_>>(),
-        suffix_objects,
-        "the exact prefetch must name every and only suffix physical object"
+        batches_before_rebuild,
+        "external candidates bypass the inline payload batch"
     );
     assert!(
         expected_suffix_bytes < HISTORICAL_BYTES / 2,
@@ -1914,7 +2474,7 @@ async fn inline_pack_prefetch_corruption_and_missing_data_fail_without_point_loo
         (
             "missing",
             BatchFault::Omit(object_hash),
-            "vanished from the remote blob store",
+            "was omitted from the exact payload fetch",
         ),
     ] {
         let dst_dir = tempdir().expect("dst dir");
@@ -2009,11 +2569,11 @@ async fn external_pack_object_corruption_still_streams_and_fails_closed() {
         .expect("physical object")
         .object_hash();
     assert!(
-        !ContentSource::get_objects(&remote, &[object_hash])
+        ContentSource::object_size(&remote, object_hash)
             .await
-            .expect("probe external object")
-            .contains_key(&object_hash),
-        "fixture physical object must be external"
+            .expect("probe object size")
+            .is_some_and(|size| size >= tlogfs::large_files::LARGE_FILE_THRESHOLD as u64),
+        "fixture physical object must exercise the streaming path"
     );
     let faulting = FaultingSource {
         inner: &source,
@@ -2504,7 +3064,7 @@ async fn precommit_manifest_root_mismatch_leaves_target_unchanged() {
     let (_rt, remote) = push(&src).await;
     let valid = fetch_object_graph(&remote, "main").await.expect("fetch");
     let mut invalid = valid.clone();
-    invalid.commits[0].1.node_manifest_root = ObjectHash::of_bytes(b"wrong manifest root");
+    invalid.commits[0].1.manifest_root = ObjectHash::of_bytes(b"wrong manifest root");
 
     let dst_dir = tempdir().expect("dst dir");
     let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "precommit-dst")
@@ -2517,12 +3077,12 @@ async fn precommit_manifest_root_mismatch_leaves_target_unchanged() {
         .expect_err("advertised manifest-root mismatch must abort");
     let message = err.to_string();
     assert!(
-        message.contains("node manifest Merkle root would be"),
+        message.contains("would produce root"),
         "unexpected error: {message}"
     );
     assert!(
-        message.contains("manifests match field-by-field"),
-        "unexpected diagnosis: {message}"
+        message.contains("expected root"),
+        "unexpected bounded validation diagnosis: {message}"
     );
     assert_eq!(
         dst.data_persistence().table().version(),
@@ -2560,7 +3120,7 @@ async fn graft_import_is_atomic_with_mount_and_pin() {
     let (_rt, remote) = push(&src).await;
     let valid = fetch_object_graph(&remote, "main").await.expect("fetch");
     let mut invalid = valid.clone();
-    invalid.commits[0].1.node_manifest_root = ObjectHash::of_bytes(b"wrong manifest root");
+    invalid.commits[0].1.manifest_root = ObjectHash::of_bytes(b"wrong manifest root");
 
     let dst_dir = tempdir().expect("dst dir");
     let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "atomic-graft-dst")
@@ -2631,6 +3191,178 @@ async fn graft_import_is_atomic_with_mount_and_pin() {
     );
 }
 
+#[tokio::test]
+async fn exact_identity_noop_authenticates_remote_head_and_mirror_roots() {
+    let (_source_dir, mut source) = new_pond("noop-auth-source").await;
+    write_file(&mut source, "/a.txt", b"alpha").await;
+    let (_remote_dir, remote) = push(&source).await;
+    let graph = fetch_object_graph(&remote, "main").await.expect("fetch");
+    let state = graph.publication_state.clone().expect("publication state");
+
+    let destination_dir = tempdir().expect("destination");
+    let mut destination = Ship::create_pond(destination_dir.path().join("pond"), "noop-auth-dst")
+        .await
+        .expect("create destination");
+    let _ = steward::rebuild_pond(&mut destination, &remote, &graph)
+        .await
+        .expect("initial mirror");
+    let commit = steward::authenticated_publication_head_commit(&remote, &state)
+        .await
+        .expect("authenticate head");
+    let local_pond_id = destination.data_persistence().pond_id().to_string();
+    steward::authenticate_destination_publication_head(
+        &destination,
+        &state,
+        &commit,
+        &local_pond_id,
+    )
+    .await
+    .expect("matching destination roots");
+
+    let stale_cursor = sync_store::content::encode_manifest_root(state.manifest_root);
+    write_file(&mut destination, "/tampered.txt", b"tampered").await;
+    let cursor = steward::get_data_path(destination.pond_path())
+        .join("_content/v2/state/manifest-root")
+        .join(format!("pond={local_pond_id}"));
+    std::fs::write(&cursor, stale_cursor).expect("restore stale matching cursor");
+    let error = steward::authenticate_destination_publication_head(
+        &destination,
+        &state,
+        &commit,
+        &local_pond_id,
+    )
+    .await
+    .expect_err("stale acknowledgement must not hide destination divergence");
+    assert!(error.to_string().contains("manifest root"));
+}
+
+#[tokio::test]
+async fn exact_identity_graft_noop_authenticates_foreign_roots_mount_and_pin() {
+    let (_source_dir, mut source) = new_pond("graft-noop-auth-source").await;
+    write_file(&mut source, "/a.txt", b"alpha").await;
+    let source_id = source
+        .data_persistence()
+        .pond_id()
+        .parse::<uuid7::Uuid>()
+        .expect("source id");
+    let (_remote_dir, remote) = push(&source).await;
+    let graph = fetch_object_graph(&remote, "main").await.expect("fetch");
+    let state = graph.publication_state.clone().expect("publication state");
+
+    let destination_dir = tempdir().expect("destination");
+    let mut destination =
+        Ship::create_pond(destination_dir.path().join("pond"), "graft-noop-auth-dst")
+            .await
+            .expect("create destination");
+    let _ = steward::import_graft(
+        &mut destination,
+        &remote,
+        &graph,
+        source_id,
+        "upstream",
+        "/imports/upstream",
+    )
+    .await
+    .expect("import graft");
+    let commit = steward::authenticated_publication_head_commit(&remote, &state)
+        .await
+        .expect("authenticate head");
+    steward::authenticate_graft_publication_head(
+        &mut destination,
+        &state,
+        &commit,
+        "upstream",
+        "/imports/upstream",
+    )
+    .await
+    .expect("matching graft identity");
+
+    destination
+        .write_transaction(&meta("remove-pin"), async move |transaction| {
+            let root = transaction.root().await?;
+            let grafts = root.open_dir_path(steward::SYS_GRAFTS_DIR).await?;
+            grafts.remove_entry("upstream").await?;
+            Ok(())
+        })
+        .await
+        .expect("remove pin");
+    let error = steward::authenticate_graft_publication_head(
+        &mut destination,
+        &state,
+        &commit,
+        "upstream",
+        "/imports/upstream",
+    )
+    .await
+    .expect_err("missing pin must prevent the no-op");
+    assert!(error.to_string().contains("graft pin"));
+}
+
+#[tokio::test]
+async fn graft_noop_rejects_advanced_foreign_index_behind_stale_cursor() {
+    let (_source_dir, mut source) = new_pond("graft-stale-cursor-source").await;
+    write_file(&mut source, "/a.txt", b"alpha").await;
+    let source_id = source
+        .data_persistence()
+        .pond_id()
+        .parse::<uuid7::Uuid>()
+        .expect("source id");
+    let (_remote_dir, mut remote) = push(&source).await;
+    let first_graph = fetch_object_graph(&remote, "main")
+        .await
+        .expect("first graph");
+    let first_state = first_graph.publication_state.clone().expect("first state");
+    let first_commit = steward::authenticated_publication_head_commit(&remote, &first_state)
+        .await
+        .expect("first commit");
+
+    let destination_dir = tempdir().expect("destination");
+    let mut destination = Ship::create_pond(
+        destination_dir.path().join("pond"),
+        "graft-stale-cursor-dst",
+    )
+    .await
+    .expect("create destination");
+    let _ = steward::import_graft(
+        &mut destination,
+        &remote,
+        &first_graph,
+        source_id,
+        "upstream",
+        "/imports/upstream",
+    )
+    .await
+    .expect("import first graft");
+
+    write_file(&mut source, "/b.txt", b"beta").await;
+    repush(&source, &mut remote).await;
+    let second_graph = fetch_object_graph_since(&remote, "main", Some(first_state.snapshot_tip))
+        .await
+        .expect("second graph");
+    let _ = steward::import_pond(&mut destination, &remote, &second_graph, source_id)
+        .await
+        .expect("advance foreign partition without advancing graft metadata");
+
+    let cursor = steward::get_data_path(destination.pond_path())
+        .join("_content/v2/state/manifest-root")
+        .join(format!("pond={}", first_state.pond_id));
+    std::fs::write(
+        cursor,
+        sync_store::content::encode_manifest_root(first_state.manifest_root),
+    )
+    .expect("stage stale matching foreign cursor");
+    let error = steward::authenticate_graft_publication_head(
+        &mut destination,
+        &first_state,
+        &first_commit,
+        "upstream",
+        "/imports/upstream",
+    )
+    .await
+    .expect_err("authoritative foreign index must expose the advanced content");
+    assert!(error.to_string().contains("manifest root"), "{error}");
+}
+
 /// Scoped replacement rebuilds exactly one foreign partition and validates the
 /// replacement before commit, leaving unrelated grafts intact.
 #[tokio::test]
@@ -2671,7 +3403,7 @@ async fn replace_graft_is_scoped_and_atomic() {
     point_mount_at_foreign_child(&mut dst, src1_id, "/imports", "one", "one.txt").await;
 
     let mut invalid1 = valid1.clone();
-    invalid1.commits[0].1.node_manifest_root = ObjectHash::of_bytes(b"wrong replacement root");
+    invalid1.commits[0].1.manifest_root = ObjectHash::of_bytes(b"wrong replacement root");
     let version_before = dst.data_persistence().table().version();
     let _ = steward::replace_graft(
         &mut dst,
@@ -2753,7 +3485,7 @@ async fn rebuild_manifest_root_mismatch_leaves_target_unchanged() {
     let (_rt, remote) = push(&src).await;
     let valid = fetch_object_graph(&remote, "main").await.expect("fetch");
     let mut invalid = valid.clone();
-    invalid.commits[0].1.node_manifest_root = ObjectHash::of_bytes(b"wrong manifest root");
+    invalid.commits[0].1.manifest_root = ObjectHash::of_bytes(b"wrong manifest root");
 
     let dst_dir = tempdir().expect("dst dir");
     let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "rebuild-precommit-dst")
@@ -2766,8 +3498,7 @@ async fn rebuild_manifest_root_mismatch_leaves_target_unchanged() {
         .await
         .expect_err("advertised manifest-root mismatch must abort");
     assert!(
-        err.to_string()
-            .contains("precommit node manifest Merkle root"),
+        err.to_string().contains("precommit manifest root"),
         "unexpected error: {err}"
     );
     assert_eq!(

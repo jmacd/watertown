@@ -1,221 +1,246 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Commit objects: the spine, and the only place lineage lives.
-//!
-//! A commit wraps one transaction.  It names the `root_tree_hash` (the top of
-//! the SPACE tree), the `parent_commit_hash` (making the single-writer chain a
-//! hash chain), and the provenance.  Blobs and trees are pure content; *all*
-//! provenance is isolated here so subtree hashes stay comparable across ponds.
-//! See `docs/content-addressed-pond-design.md` Sections 4.3 and 5.3.
+//! Native-v2 commit objects: snapshot root, lineage, and bounded change delta.
 
-use super::{Cursor, ObjectHash, push_len_prefixed};
+use super::manifest_map::{ManifestChange, decode_manifest_change, encode_manifest_change};
+use super::{
+    ContentObjectKind, Cursor, ObjectDescriptor, ObjectHash, PackDescriptor, push_len_prefixed,
+};
 
-/// Magic header distinguishing a serialized commit from a raw blob (D2).
-///
-/// The commit carries an explicit [`ContentModelVersion`] tag alongside the
-/// magic so a decoder never has to infer which content model built its
-/// `root_tree_hash`. Only the current logical-series-v2 model is accepted.
-const COMMIT_MAGIC: &[u8] = b"watertown.commit.v1\n";
+const COMMIT_MAGIC: &[u8] = b"watertown.commit.v2\n";
 
-/// Which content-addressing model a commit's `root_tree_hash` (and the rest
-/// of its tree) was built under.
-///
-/// A typed, validated wire byte (not an unchecked integer): [`Self::decode`]
-/// rejects any byte it does not recognize, so a corrupt or forward-
-/// incompatible tag is a loud decode error rather than silently
-/// misinterpreted content.
-///
-/// There is currently exactly one variant because the reset decision
-/// (`docs/logical-series-identity-design.md`) means there is no v1-writing
-/// path to keep distinguishing: every production commit encodes the v2
-/// logical-series model. The type still exists (rather than a bare `watertown.commit.v1`
-/// bump) so a future content-model change has an explicit, checked tag to
-/// bump instead of silently repurposing the magic string again.
+/// Content-addressing model named by a commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentModelVersion {
-    /// The v2 logical-series identity model: series nodes commit to a
-    /// `watertown.series.v2` manifest over persisted logical leaf hashes (BLAKE3 over
-    /// canonical logical bytes), not to a physical-blob Merkle tree.
-    LogicalSeriesV2,
+    /// Persistent node-identity Merkle map plus immutable publication objects.
+    PublicationV2,
 }
 
 impl ContentModelVersion {
     fn to_wire(self) -> u8 {
         match self {
-            ContentModelVersion::LogicalSeriesV2 => 1,
+            Self::PublicationV2 => 1,
         }
     }
 
-    fn from_wire(byte: u8) -> Result<Self, String> {
-        match byte {
-            1 => Ok(ContentModelVersion::LogicalSeriesV2),
+    fn from_wire(value: u8) -> Result<Self, String> {
+        match value {
+            1 => Ok(Self::PublicationV2),
             other => Err(format!("unknown content model version byte: {other}")),
         }
     }
 }
 
-/// The lineage and audit metadata recorded on a commit.
-///
-/// This is the only content in the object model that depends on `pond_id`,
-/// sequence, or wall-clock time.  Keeping it isolated in the commit is the
-/// inversion the whole design rests on.
+/// Lineage and audit metadata isolated from shareable content objects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Provenance {
-    /// The UUID of the pond that produced this commit.
+    /// Pond that produced this commit.
     pub pond_id: String,
-    /// The pond-local transaction sequence number.
+    /// Pond-local transaction sequence.
     pub seq: i64,
     /// Commit time in microseconds since the Unix epoch.
     pub time_micros: i64,
-    /// A human-meaningful author identifier.
+    /// Human-meaningful author identifier.
     pub author: String,
-    /// The original request that produced the transaction (for example, the
-    /// CLI invocation), recorded verbatim for audit.
+    /// Original request that produced the transaction.
     pub request: String,
 }
 
-/// One commit: a transaction's content root plus its lineage.
+/// One native-v2 snapshot commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
-    /// Which content model `root_tree_hash` was built under; see
-    /// [`ContentModelVersion`].
+    /// Content model used by this commit.
     pub content_model_version: ContentModelVersion,
-    /// The hash of this commit's root directory tree (top of SPACE).
+    /// Hash of the root directory tree.
     pub root_tree_hash: ObjectHash,
-    /// The previous commit on this pond's linear chain, or `None` for the
-    /// genesis commit.
+    /// Prior commit in the local linear chain.
     pub parent_commit_hash: Option<ObjectHash>,
-    /// The content hash of this commit's node manifest object -- `blake3` of the
-    /// encoded manifest -- and therefore the address a consumer fetches the
-    /// manifest by.  A consumer adopts these ids to mirror the source
-    /// row-for-row (Section 4.5, Decision D8).
-    pub node_manifest_hash: ObjectHash,
-    /// The root of the node-keyed Merkle over the same manifest (Section 4.2).
-    /// A commitment that recomputes along touched paths only, so it can be
-    /// verified incrementally and, in a later phase, drive incremental manifest
-    /// transfer.  Distinct from `node_manifest_hash`, which is the monolithic
-    /// manifest object's byte address.
-    pub node_manifest_root: ObjectHash,
+    /// Root of the persistent node-identity Merkle map.
+    pub manifest_root: ObjectHash,
+    /// Net identity-map changes made by this transaction.
+    pub manifest_changes: Vec<ManifestChange>,
+    /// Immutable payload/metadata objects created or reintroduced by this
+    /// transaction. The commit object itself is added by publication.
+    pub introduced_objects: Vec<ObjectDescriptor>,
+    /// Pack advertisements derived for series changed by this transaction.
+    pub introduced_packs: Vec<PackDescriptor>,
     /// Lineage and audit metadata.
     pub provenance: Provenance,
 }
 
 impl Commit {
-    /// Construct a commit.
+    /// Construct a commit without a delta (primarily for codec/unit callers).
     #[must_use]
     pub fn new(
         content_model_version: ContentModelVersion,
         root_tree_hash: ObjectHash,
         parent_commit_hash: Option<ObjectHash>,
-        node_manifest_hash: ObjectHash,
-        node_manifest_root: ObjectHash,
+        manifest_root: ObjectHash,
         provenance: Provenance,
     ) -> Self {
         Self {
             content_model_version,
             root_tree_hash,
             parent_commit_hash,
-            node_manifest_hash,
-            node_manifest_root,
+            manifest_root,
+            manifest_changes: Vec::new(),
+            introduced_objects: Vec::new(),
+            introduced_packs: Vec::new(),
             provenance,
         }
     }
 
-    /// Serialize the commit into its canonical wire format.
-    ///
-    /// The layout is:
-    ///
-    /// ```text
-    /// COMMIT_MAGIC
-    /// u8      content_model_version
-    /// 32      root_tree_hash
-    /// u8      parent present flag (0 or 1)
-    /// 32      parent_commit_hash    (only if the flag is 1)
-    /// 32      node_manifest_hash
-    /// 32      node_manifest_root
-    /// u32 LE + bytes   pond_id
-    /// i64 LE  seq
-    /// i64 LE  time_micros
-    /// u32 LE + bytes   author
-    /// u32 LE + bytes   request
-    /// ```
-    ///
-    /// The returned bytes *are* the commit object; its [`Commit::hash`] is
-    /// `blake3` of these bytes.
-    #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(COMMIT_MAGIC.len() + 161);
-        buf.extend_from_slice(COMMIT_MAGIC);
-        buf.push(self.content_model_version.to_wire());
-        buf.extend_from_slice(self.root_tree_hash.as_bytes());
-        match &self.parent_commit_hash {
-            Some(parent) => {
-                buf.push(1);
-                buf.extend_from_slice(parent.as_bytes());
-            }
-            None => buf.push(0),
-        }
-        buf.extend_from_slice(self.node_manifest_hash.as_bytes());
-        buf.extend_from_slice(self.node_manifest_root.as_bytes());
-        push_len_prefixed(&mut buf, self.provenance.pond_id.as_bytes());
-        buf.extend_from_slice(&self.provenance.seq.to_le_bytes());
-        buf.extend_from_slice(&self.provenance.time_micros.to_le_bytes());
-        push_len_prefixed(&mut buf, self.provenance.author.as_bytes());
-        push_len_prefixed(&mut buf, self.provenance.request.as_bytes());
-        buf
+    /// Construct and canonicalize a commit carrying its bounded transaction
+    /// delta.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_delta(
+        content_model_version: ContentModelVersion,
+        root_tree_hash: ObjectHash,
+        parent_commit_hash: Option<ObjectHash>,
+        manifest_root: ObjectHash,
+        manifest_changes: Vec<ManifestChange>,
+        mut introduced_objects: Vec<ObjectDescriptor>,
+        mut introduced_packs: Vec<PackDescriptor>,
+        provenance: Provenance,
+    ) -> Result<Self, String> {
+        let manifest_changes = ManifestChange::canonicalize(manifest_changes)?;
+        introduced_objects.sort_unstable();
+        introduced_objects.dedup();
+        introduced_packs.sort_unstable();
+        introduced_packs.dedup();
+        Ok(Self {
+            content_model_version,
+            root_tree_hash,
+            parent_commit_hash,
+            manifest_root,
+            manifest_changes,
+            introduced_objects,
+            introduced_packs,
+            provenance,
+        })
     }
 
-    /// The content address of this commit (`blake3` of [`Commit::encode`]).
-    ///
-    /// This hash is both the head of the SPACE tree (via `root_tree_hash`) and
-    /// the leaf payload of the TIME transparency log.
+    /// Canonical wire bytes.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(COMMIT_MAGIC);
+        bytes.push(self.content_model_version.to_wire());
+        bytes.extend_from_slice(self.root_tree_hash.as_bytes());
+        match self.parent_commit_hash {
+            Some(parent) => {
+                bytes.push(1);
+                bytes.extend_from_slice(parent.as_bytes());
+            }
+            None => bytes.push(0),
+        }
+        bytes.extend_from_slice(self.manifest_root.as_bytes());
+
+        let change_count =
+            u32::try_from(self.manifest_changes.len()).expect("change count exceeds u32::MAX");
+        bytes.extend_from_slice(&change_count.to_le_bytes());
+        for change in &self.manifest_changes {
+            push_len_prefixed(&mut bytes, &encode_manifest_change(change));
+        }
+
+        let object_count =
+            u32::try_from(self.introduced_objects.len()).expect("object count exceeds u32::MAX");
+        bytes.extend_from_slice(&object_count.to_le_bytes());
+        for object in &self.introduced_objects {
+            bytes.extend_from_slice(object.hash.as_bytes());
+            bytes.push(object.kind.to_wire());
+        }
+
+        let pack_count =
+            u32::try_from(self.introduced_packs.len()).expect("pack count exceeds u32::MAX");
+        bytes.extend_from_slice(&pack_count.to_le_bytes());
+        for pack in &self.introduced_packs {
+            bytes.extend_from_slice(pack.series_hash.as_bytes());
+            bytes.extend_from_slice(pack.pack_hash.as_bytes());
+        }
+
+        push_len_prefixed(&mut bytes, self.provenance.pond_id.as_bytes());
+        bytes.extend_from_slice(&self.provenance.seq.to_le_bytes());
+        bytes.extend_from_slice(&self.provenance.time_micros.to_le_bytes());
+        push_len_prefixed(&mut bytes, self.provenance.author.as_bytes());
+        push_len_prefixed(&mut bytes, self.provenance.request.as_bytes());
+        bytes
+    }
+
+    /// BLAKE3 address of [`Self::encode`].
     #[must_use]
     pub fn hash(&self) -> ObjectHash {
         ObjectHash::of_bytes(&self.encode())
     }
 
-    /// Decode a commit from its canonical wire format (the inverse of
-    /// [`Commit::encode`]).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the magic header is wrong, `content_model_version`
-    /// is not a recognized byte (see [`ContentModelVersion::from_wire`]), or
-    /// the buffer is truncated or otherwise malformed.
+    /// Strictly decode one native-v2 commit.
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
-        let mut cur = Cursor::new(bytes);
-        cur.expect_tag(COMMIT_MAGIC)?;
-        let content_model_version = ContentModelVersion::from_wire(cur.take_u8()?)?;
-        let root_tree_hash = cur.take_hash()?;
-        let parent_commit_hash = match cur.take_u8()? {
+        let mut cursor = Cursor::new(bytes);
+        cursor.expect_tag(COMMIT_MAGIC)?;
+        let content_model_version = ContentModelVersion::from_wire(cursor.take_u8()?)?;
+        let root_tree_hash = cursor.take_hash()?;
+        let parent_commit_hash = match cursor.take_u8()? {
             0 => None,
-            1 => Some(cur.take_hash()?),
+            1 => Some(cursor.take_hash()?),
             other => return Err(format!("invalid parent flag {other}")),
         };
-        let node_manifest_hash = cur.take_hash()?;
-        let node_manifest_root = cur.take_hash()?;
-        let pond_id = cur.take_len_prefixed_string()?;
-        let seq = cur.take_i64()?;
-        let time_micros = cur.take_i64()?;
-        let author = cur.take_len_prefixed_string()?;
-        let request = cur.take_len_prefixed_string()?;
-        if !cur.is_empty() {
-            return Err(format!("{} trailing byte(s) after commit", cur.remaining()));
+        let manifest_root = cursor.take_hash()?;
+
+        let change_count = cursor.take_u32()? as usize;
+        let mut manifest_changes = Vec::with_capacity(cursor.bounded_capacity(change_count, 8));
+        for _ in 0..change_count {
+            manifest_changes.push(decode_manifest_change(cursor.take_len_prefixed()?)?);
         }
-        Ok(Self {
+
+        let object_count = cursor.take_u32()? as usize;
+        let mut introduced_objects = Vec::with_capacity(cursor.bounded_capacity(object_count, 33));
+        for _ in 0..object_count {
+            introduced_objects.push(ObjectDescriptor {
+                hash: cursor.take_hash()?,
+                kind: ContentObjectKind::from_wire(cursor.take_u8()?)?,
+            });
+        }
+
+        let pack_count = cursor.take_u32()? as usize;
+        let mut introduced_packs = Vec::with_capacity(cursor.bounded_capacity(pack_count, 64));
+        for _ in 0..pack_count {
+            introduced_packs.push(PackDescriptor {
+                series_hash: cursor.take_hash()?,
+                pack_hash: cursor.take_hash()?,
+            });
+        }
+
+        let pond_id = cursor.take_len_prefixed_string()?;
+        let seq = cursor.take_i64()?;
+        let time_micros = cursor.take_i64()?;
+        let author = cursor.take_len_prefixed_string()?;
+        let request = cursor.take_len_prefixed_string()?;
+        if !cursor.is_empty() {
+            return Err(format!(
+                "{} trailing byte(s) after commit",
+                cursor.remaining()
+            ));
+        }
+        let decoded = Self::new_with_delta(
             content_model_version,
             root_tree_hash,
             parent_commit_hash,
-            node_manifest_hash,
-            node_manifest_root,
-            provenance: Provenance {
+            manifest_root,
+            manifest_changes,
+            introduced_objects,
+            introduced_packs,
+            Provenance {
                 pond_id,
                 seq,
                 time_micros,
                 author,
                 request,
             },
-        })
+        )?;
+        if decoded.encode() != bytes {
+            return Err("commit is not canonically encoded".to_string());
+        }
+        Ok(decoded)
     }
 }
 
@@ -223,218 +248,63 @@ impl Commit {
 mod tests {
     use super::*;
 
-    fn prov() -> Provenance {
+    fn hash(value: &str) -> ObjectHash {
+        ObjectHash::of_bytes(value.as_bytes())
+    }
+
+    fn provenance() -> Provenance {
         Provenance {
-            pond_id: "pond-uuid".to_string(),
+            pond_id: "pond".to_string(),
             seq: 7,
-            time_micros: 1_700_000_000_000_000,
-            author: "jmacd".to_string(),
-            request: "pond copy host:///x /y".to_string(),
+            time_micros: 9,
+            author: "author".to_string(),
+            request: "request".to_string(),
         }
     }
 
-    fn model() -> ContentModelVersion {
-        ContentModelVersion::LogicalSeriesV2
-    }
-
-    fn root() -> ObjectHash {
-        ObjectHash::of_bytes(b"root-tree")
-    }
-
-    fn manifest() -> ObjectHash {
-        ObjectHash::of_bytes(b"node-manifest")
-    }
-
-    fn mroot() -> ObjectHash {
-        ObjectHash::of_bytes(b"node-manifest-merkle-root")
+    fn commit(parent: Option<ObjectHash>) -> Commit {
+        Commit::new(
+            ContentModelVersion::PublicationV2,
+            hash("root"),
+            parent,
+            hash("manifest"),
+            provenance(),
+        )
     }
 
     #[test]
-    fn commit_hash_is_deterministic() {
-        let c1 = Commit::new(model(), root(), None, manifest(), mroot(), prov());
-        let c2 = Commit::new(model(), root(), None, manifest(), mroot(), prov());
-        assert_eq!(c1.hash(), c2.hash());
-    }
-
-    #[test]
-    fn parent_changes_hash() {
-        let no_parent = Commit::new(model(), root(), None, manifest(), mroot(), prov());
-        let parent = ObjectHash::of_bytes(b"parent-commit");
-        let with_parent = Commit::new(model(), root(), Some(parent), manifest(), mroot(), prov());
-        assert_ne!(no_parent.hash(), with_parent.hash());
-    }
-
-    #[test]
-    fn provenance_changes_hash() {
-        let base = Commit::new(model(), root(), None, manifest(), mroot(), prov());
-        let mut other = prov();
-        other.seq = 8;
-        let changed = Commit::new(model(), root(), None, manifest(), mroot(), other);
-        assert_ne!(base.hash(), changed.hash());
-    }
-
-    #[test]
-    fn root_tree_changes_hash() {
-        let base = Commit::new(model(), root(), None, manifest(), mroot(), prov());
-        let changed = Commit::new(
-            model(),
-            ObjectHash::of_bytes(b"other-root"),
-            None,
-            manifest(),
-            mroot(),
-            prov(),
-        );
-        assert_ne!(base.hash(), changed.hash());
-    }
-
-    #[test]
-    fn manifest_changes_hash() {
-        // The node manifest is part of lineage, so changing it (even with the
-        // same content tree) must change the commit hash.
-        let base = Commit::new(model(), root(), None, manifest(), mroot(), prov());
-        let changed = Commit::new(
-            model(),
-            root(),
-            None,
-            ObjectHash::of_bytes(b"other-manifest"),
-            mroot(),
-            prov(),
-        );
-        assert_ne!(base.hash(), changed.hash());
-    }
-
-    #[test]
-    fn manifest_root_changes_hash() {
-        // The node-keyed Merkle root is a distinct commitment; changing it (with
-        // the same manifest object hash) must change the commit hash.
-        let base = Commit::new(model(), root(), None, manifest(), mroot(), prov());
-        let changed = Commit::new(
-            model(),
-            root(),
-            None,
-            manifest(),
-            ObjectHash::of_bytes(b"other-manifest-root"),
-            prov(),
-        );
-        assert_ne!(base.hash(), changed.hash());
-    }
-
-    #[test]
-    fn length_prefix_prevents_field_ambiguity() {
-        // Moving a character across the author/request boundary must change
-        // the hash, proving the framing is unambiguous.
-        let mut a = prov();
-        a.author = "ab".to_string();
-        a.request = "c".to_string();
-        let mut b = prov();
-        b.author = "a".to_string();
-        b.request = "bc".to_string();
-        let ca = Commit::new(model(), root(), None, manifest(), mroot(), a);
-        let cb = Commit::new(model(), root(), None, manifest(), mroot(), b);
-        assert_ne!(ca.hash(), cb.hash());
-    }
-
-    #[test]
-    fn commit_hash_differs_from_root_blob() {
-        let c = Commit::new(model(), root(), None, manifest(), mroot(), prov());
-        assert_ne!(c.hash(), root());
-    }
-
-    #[test]
-    fn decode_round_trips_encode() {
-        let parent = ObjectHash::of_bytes(b"parent-commit");
-        for c in [
-            Commit::new(model(), root(), None, manifest(), mroot(), prov()),
-            Commit::new(model(), root(), Some(parent), manifest(), mroot(), prov()),
-        ] {
-            let bytes = c.encode();
-            let decoded = Commit::decode(&bytes).expect("decode");
-            assert_eq!(decoded, c);
-            assert_eq!(decoded.hash(), c.hash());
+    fn codec_round_trips_and_hashes_exact_bytes() {
+        for commit in [commit(None), commit(Some(hash("parent")))] {
+            let bytes = commit.encode();
+            assert_eq!(Commit::decode(&bytes).unwrap(), commit);
+            assert_eq!(commit.hash(), ObjectHash::of_bytes(&bytes));
         }
     }
 
     #[test]
-    fn decode_rejects_bad_magic() {
-        let mut bytes = Commit::new(model(), root(), None, manifest(), mroot(), prov()).encode();
-        bytes[0] ^= 0xff;
-        assert!(Commit::decode(&bytes).is_err());
+    fn roots_parent_and_provenance_change_identity() {
+        let base = commit(None);
+        assert_ne!(base.hash(), commit(Some(hash("parent"))).hash());
+        let mut changed = base.clone();
+        changed.root_tree_hash = hash("other-root");
+        assert_ne!(base.hash(), changed.hash());
+        let mut changed = base.clone();
+        changed.manifest_root = hash("other-manifest");
+        assert_ne!(base.hash(), changed.hash());
+        let mut changed = base.clone();
+        changed.provenance.seq += 1;
+        assert_ne!(base.hash(), changed.hash());
     }
 
     #[test]
-    fn decode_rejects_trailing_bytes() {
-        let mut bytes = Commit::new(model(), root(), None, manifest(), mroot(), prov()).encode();
-        bytes.push(0);
-        assert!(Commit::decode(&bytes).is_err());
-    }
-
-    #[test]
-    fn decode_rejects_truncation() {
-        let bytes = Commit::new(model(), root(), None, manifest(), mroot(), prov()).encode();
-        assert!(Commit::decode(&bytes[..bytes.len() - 4]).is_err());
-    }
-
-    #[test]
-    fn decode_rejects_unknown_content_model_version() {
-        // The byte immediately after COMMIT_MAGIC is the content model
-        // version; a decoder must reject an unrecognized value rather than
-        // silently defaulting or misinterpreting the rest of the buffer as a
-        // different model's fields.
-        let mut bytes = Commit::new(model(), root(), None, manifest(), mroot(), prov()).encode();
-        let version_byte = COMMIT_MAGIC.len();
-        bytes[version_byte] = 0xaa;
-        let err = Commit::decode(&bytes).expect_err("unknown content model version must error");
-        assert!(
-            err.contains("content model version"),
-            "error should name the field: {err}"
-        );
-    }
-
-    #[test]
-    fn decode_rejects_old_dp_commit_3_magic() {
-        let mut bytes = Commit::new(model(), root(), None, manifest(), mroot(), prov()).encode();
-        bytes[..b"dp.commit.3\n".len()].copy_from_slice(b"dp.commit.3\n");
-        let err = Commit::decode(&bytes).expect_err("obsolete commit magic must not decode");
-        assert!(err.contains("bad magic header"));
-    }
-
-    #[test]
-    fn content_model_version_changes_hash() {
-        // The content model tag is part of the commit's own bytes, so two
-        // commits that differ only in it must not collide -- checked by
-        // comparing the actual `ObjectHash`es (what `Commit::hash` returns,
-        // and what a transparency log / object store would key on), not
-        // merely the raw byte buffers (which trivially differ by
-        // construction and would prove nothing about hashing).
-        //
-        // There is only one variant today, so this test exercises the wire
-        // byte directly rather than constructing a second `ContentModelVersion`.
-        let commit = Commit::new(model(), root(), None, manifest(), mroot(), prov());
-        let base_bytes = commit.encode();
-        let base_hash = commit.hash();
-        assert_eq!(
-            base_hash,
-            ObjectHash::of_bytes(&base_bytes),
-            "Commit::hash must equal ObjectHash::of_bytes(encode()) -- sanity-checking the \
-             comparison mechanism itself"
-        );
-
-        let mut other_model_byte = base_bytes.clone();
-        // There is only one valid wire byte (1) today; flipping it to an
-        // adjacent still-plausible-looking value proves the tag is hashed,
-        // even though that buffer would itself fail to decode.
-        let version_byte = COMMIT_MAGIC.len();
-        other_model_byte[version_byte] = 2;
-        assert_ne!(
-            base_bytes, other_model_byte,
-            "sanity: the byte flip took effect"
-        );
-
-        let other_hash = ObjectHash::of_bytes(&other_model_byte);
-        assert_ne!(
-            base_hash, other_hash,
-            "flipping only the content-model-version wire byte must change the commit's object \
-             hash, or two commits differing solely in content model could collide"
-        );
+    fn decoder_rejects_bad_magic_truncation_and_trailing_bytes() {
+        let bytes = commit(None).encode();
+        let mut bad = bytes.clone();
+        bad[0] ^= 1;
+        assert!(Commit::decode(&bad).is_err());
+        assert!(Commit::decode(&bytes[..bytes.len() - 1]).is_err());
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(Commit::decode(&trailing).is_err());
     }
 }

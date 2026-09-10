@@ -33,6 +33,9 @@ pub fn root_uuid() -> Uuid {
 /// content-tree fold and node manifest, so it never attests to itself.
 pub const INDEX_NODE_UUID: &str = "00000000-0000-7700-8000-000000000000";
 
+/// Reserved root-directory name paired with [`INDEX_NODE_UUID`].
+pub const INDEX_NODE_NAME: &str = ".pond-node-index";
+
 #[must_use]
 pub fn index_node_uuid() -> Uuid {
     INDEX_NODE_UUID

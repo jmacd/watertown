@@ -70,6 +70,23 @@ async fn write_small_file(ctx: &ShipContext, path: &str, bytes: &[u8]) -> anyhow
     Ok(())
 }
 
+async fn read_small_file(ctx: &ShipContext, path: &str) -> anyhow::Result<Vec<u8>> {
+    let mut ship = ctx.open_pond().await?;
+    let pond = ship
+        .as_pond_mut()
+        .ok_or_else(|| anyhow::anyhow!("expected pond steward"))?;
+    let tx = pond
+        .begin_read(&PondUserMetadata::new(vec![
+            "test".to_string(),
+            "read".to_string(),
+            path.to_string(),
+        ]))
+        .await?;
+    let bytes = tx.root().await?.read_file_path_to_vec(path).await?;
+    let _ = tx.commit().await?;
+    Ok(bytes)
+}
+
 /// One document creating a generous byte budget, one creating an ops budget,
 /// and one attaching a backup governed by both.
 /// Build a real upstream pond in `tmp` and push it to a `file://` content
@@ -845,19 +862,25 @@ async fn a_governed_pull_within_budget_still_succeeds() {
         .expect("a pull inside its budget must succeed");
 
     let ship = ctx.open_pond().await.expect("open");
-    let tip = ship
-        .control_table()
-        .raw_config_get(&format!("last_pulled_tip:{url}"))
-        .await
-        .expect("read watermark");
+    let tip = steward::read_pull_ack(
+        ship.control_table(),
+        &url,
+        sync_store::ContentRemote::open_at_url(&url, HashMap::new())
+            .await
+            .expect("open remote")
+            .pond_id(),
+        "main",
+    )
+    .await
+    .expect("read acknowledgement");
     assert!(
-        tip.is_some_and(|t| !t.is_empty()),
-        "a successful governed pull must record the tip it pulled"
+        tip.is_some(),
+        "a successful governed pull must record its acknowledgement"
     );
 }
 
 #[tokio::test]
-async fn missing_watermark_retries_graft_without_another_data_commit() {
+async fn missing_watermark_retries_graft_after_authenticating_remote_head() {
     init_log();
     let tmp = TempDir::new().expect("tmp");
     let url = publish_upstream(&tmp, "watermark-retry").await;
@@ -872,50 +895,30 @@ async fn missing_watermark_retries_graft_without_another_data_commit() {
         .expect("initial pull");
 
     let mut ship = ctx.open_pond().await.expect("open consumer");
-    let key = format!("last_pulled_tip:{url}");
-    let pulled_tip = ship
-        .control_table()
-        .raw_config_get(&key)
+    let remote = sync_store::ContentRemote::open_at_url(&url, HashMap::new())
         .await
-        .expect("read watermark")
-        .expect("watermark");
+        .expect("open remote");
+    let remote_pond_id = remote.pond_id();
+    let remote_state = remote
+        .current_publication("main")
+        .await
+        .expect("read remote state")
+        .expect("remote publication");
+    let pulled = steward::read_pull_ack(ship.control_table(), &url, remote_pond_id, "main")
+        .await
+        .expect("read acknowledgement")
+        .expect("acknowledgement");
+    let pulled_tip = pulled.snapshot_tip.clone();
     let version = ship
         .as_pond()
         .expect("pond steward")
         .data_persistence()
         .table()
         .version();
-    ship.control_table_mut()
-        .raw_config_set(&key, "")
+    steward::clear_acknowledgements(ship.control_table_mut(), &url, remote_pond_id, "main")
         .await
-        .expect("simulate lost trailing watermark");
+        .expect("simulate lost acknowledgement");
     drop(ship);
-
-    // Remove the commit object while retaining the ref. A full graph fetch
-    // would now fail; success proves the graft pin short-circuits the retry.
-    let remote = sync_store::ContentRemote::open_at_url(&url, HashMap::new())
-        .await
-        .expect("open remote");
-    let mut store = sync_store::Store::open_at_url(&url, HashMap::new())
-        .await
-        .expect("open backing store");
-    let txn_seq = store
-        .last_txn_seq(remote.pond_id())
-        .await
-        .expect("last remote sequence")
-        + 1;
-    store
-        .apply_batch(
-            remote.pond_id(),
-            txn_seq,
-            chrono::Utc::now().timestamp_micros(),
-            vec![sync_store::Op::Delete {
-                partition: "objects".to_string(),
-                key: pulled_tip.clone(),
-            }],
-        )
-        .await
-        .expect("remove tip object while retaining ref");
 
     pull_command(&ctx, Some("upstream".to_string()))
         .await
@@ -930,13 +933,227 @@ async fn missing_watermark_retries_graft_without_another_data_commit() {
         version,
         "idempotent retry must not add a data commit"
     );
-    assert_eq!(
-        ship.control_table()
-            .raw_config_get(&key)
+    let restored = steward::read_pull_ack(ship.control_table(), &url, remote_pond_id, "main")
+        .await
+        .expect("read restored acknowledgement")
+        .expect("restored acknowledgement");
+    let restored_state = restored
+        .state(&url, remote_pond_id, "main")
+        .expect("decode restored acknowledgement");
+    assert!(steward::same_publication_identity(
+        &restored_state,
+        &remote_state
+    ));
+    assert_eq!(restored.snapshot_tip, pulled_tip);
+}
+
+#[tokio::test]
+async fn cleared_ack_graft_authenticates_pinned_boundary_before_advanced_pull() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let url = publish_upstream(&tmp, "cleared-ack-advanced").await;
+    let pond = tmp.path().join("consumer-cleared-ack-advanced");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&url, false, false))
+        .await
+        .expect("attach pull remote");
+    pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect("initial pull");
+
+    let mut ship = ctx.open_pond().await.expect("open consumer");
+    let remote_pond_id = sync_store::ContentRemote::open_at_url(&url, HashMap::new())
+        .await
+        .expect("open remote")
+        .pond_id();
+    steward::clear_acknowledgements(ship.control_table_mut(), &url, remote_pond_id, "main")
+        .await
+        .expect("clear acknowledgement while retaining graft pin");
+    drop(ship);
+
+    let producer = tmp.path().join("producer-cleared-ack-advanced");
+    let producer_ctx = ctx_for(&producer, vec!["pond", "push"]);
+    write_small_file(&producer_ctx, "/advanced.txt", b"advanced after clear")
+        .await
+        .expect("advance producer");
+    push_command(&producer_ctx, Some("origin".to_string()))
+        .await
+        .expect("publish advanced generation");
+    let advanced = sync_store::ContentRemote::open_at_url(&url, HashMap::new())
+        .await
+        .expect("open advanced remote")
+        .current_publication("main")
+        .await
+        .expect("read advanced state")
+        .expect("advanced publication");
+
+    pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect("authenticate retained pin boundary and apply advanced suffix");
+    let ship = ctx.open_pond().await.expect("reopen consumer");
+    let acknowledgement =
+        steward::read_pull_ack(ship.control_table(), &url, remote_pond_id, "main")
             .await
-            .expect("read restored watermark"),
-        Some(pulled_tip)
+            .expect("read restored acknowledgement")
+            .expect("restored acknowledgement")
+            .state(&url, remote_pond_id, "main")
+            .expect("decode restored acknowledgement");
+    assert!(steward::same_publication_identity(
+        &acknowledgement,
+        &advanced
+    ));
+    assert_eq!(
+        read_small_file(&ctx, "/sources/upstream/advanced.txt")
+            .await
+            .expect("read advanced graft content"),
+        b"advanced after clear"
     );
+}
+
+#[tokio::test]
+async fn missing_watermark_graft_rejects_unauthenticated_remote_head() {
+    init_log();
+    let tmp = TempDir::new().expect("tmp");
+    let url = publish_upstream(&tmp, "watermark-authentication").await;
+    let pond = tmp.path().join("consumer-watermark-authentication");
+    let ctx = ctx_for(&pond, vec!["pond", "init"]);
+    init_command(&ctx, "consumer-host").await.expect("init");
+    apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&url, false, false))
+        .await
+        .expect("attach pull remote");
+    pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect("initial pull");
+
+    let mut ship = ctx.open_pond().await.expect("open consumer");
+    let remote_pond_id = sync_store::ContentRemote::open_at_url(&url, HashMap::new())
+        .await
+        .expect("open remote")
+        .pond_id();
+    let pulled = steward::read_pull_ack(ship.control_table(), &url, remote_pond_id, "main")
+        .await
+        .expect("read acknowledgement")
+        .expect("acknowledgement");
+    let pulled_tip = pulled.snapshot_tip.clone();
+    steward::clear_acknowledgements(ship.control_table_mut(), &url, remote_pond_id, "main")
+        .await
+        .expect("simulate lost acknowledgement");
+    drop(ship);
+
+    let raw = sync_store::raw_object_store_at_url(&url, HashMap::new())
+        .await
+        .expect("open raw remote");
+    raw.delete(&object_store::path::Path::from(format!(
+        "_content/v2/objects/blake3={pulled_tip}"
+    )))
+    .await
+    .expect("remove tip object while retaining ref");
+
+    let error = pull_command(&ctx, Some("upstream".to_string()))
+        .await
+        .expect_err("graft pin must not trust an unauthenticated remote row");
+    assert!(
+        format!("{error:#}").contains("authenticate immutable publication head"),
+        "unexpected error: {error:#}"
+    );
+    let ship = ctx.open_pond().await.expect("reopen consumer");
+    assert!(
+        steward::read_pull_ack(ship.control_table(), &url, remote_pond_id, "main")
+            .await
+            .expect("read acknowledgement after failure")
+            .is_none(),
+        "failed authentication must not restore the acknowledgement"
+    );
+}
+
+#[tokio::test]
+async fn matching_tip_with_changed_publication_identity_is_rejected() {
+    init_log();
+    for mutation in ["record", "root", "generation"] {
+        let tmp = TempDir::new().expect("tmp");
+        let url = publish_upstream(&tmp, &format!("same-tip-changed-{mutation}")).await;
+        let pond = tmp
+            .path()
+            .join(format!("consumer-same-tip-changed-{mutation}"));
+        let ctx = ctx_for(&pond, vec!["pond", "init"]);
+        init_command(&ctx, "consumer-host").await.expect("init");
+        apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&url, false, false))
+            .await
+            .expect("attach pull remote");
+        pull_command(&ctx, Some("upstream".to_string()))
+            .await
+            .expect("initial pull");
+
+        let mut remote = sync_store::ContentRemote::open_at_url(&url, HashMap::new())
+            .await
+            .expect("open remote");
+        let original = remote
+            .current_publication("main")
+            .await
+            .expect("read original state")
+            .expect("original publication");
+        let mut changed_root = original.manifest_root;
+        let mut changed_record_hash = original.publication_record;
+        if mutation != "generation" {
+            if mutation == "root" {
+                changed_root = sync_store::content::ObjectHash::of_bytes(b"changed manifest root");
+            }
+            let changed_record = sync_store::content::PublicationRecord::new(
+                original.pond_id,
+                "main",
+                original.snapshot_tip,
+                changed_root,
+                Some(original.publication_record),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("changed publication record");
+            changed_record_hash = changed_record.hash();
+            let _ = remote
+                .put_publication_record(&changed_record)
+                .await
+                .expect("store changed publication record");
+        }
+        let changed = sync_store::PublicationState::new(
+            original.pond_id,
+            "main",
+            original.snapshot_tip,
+            changed_root,
+            changed_record_hash,
+            original.generation + 1,
+            original.updated_at + 1,
+        )
+        .expect("changed publication state");
+        let _ = remote
+            .compare_and_swap_publication(
+                sync_store::PublicationExpectation::Existing {
+                    generation: original.generation,
+                    publication_record: original.publication_record,
+                },
+                changed,
+            )
+            .await
+            .expect("advance changed publication identity");
+
+        let error = pull_command(&ctx, Some("upstream".to_string()))
+            .await
+            .expect_err("same tip with changed publication identity must be rejected");
+        assert!(
+            format!("{error:#}").contains("publication identity changed at acknowledged tip"),
+            "unexpected {mutation} error: {error:#}"
+        );
+        let ship = ctx.open_pond().await.expect("reopen consumer");
+        let preserved =
+            steward::read_pull_ack(ship.control_table(), &url, original.pond_id, "main")
+                .await
+                .expect("read preserved acknowledgement")
+                .expect("preserved acknowledgement")
+                .state(&url, original.pond_id, "main")
+                .expect("decode preserved acknowledgement");
+        assert!(steward::same_publication_identity(&preserved, &original));
+    }
 }
 
 #[tokio::test]
@@ -1047,12 +1264,31 @@ async fn rebuild_graft_command_runs_end_to_end() {
         .data_persistence()
         .table()
         .version();
-    let watermark_before = ship
-        .control_table()
-        .raw_config_get(&format!("last_pulled_tip:{url}"))
+    let source_pond_id = sync_store::ContentRemote::open_at_url(&url, HashMap::new())
         .await
-        .expect("read watermark");
+        .expect("open remote")
+        .pond_id();
+    let watermark_before =
+        steward::read_pull_ack(ship.control_table(), &url, source_pond_id, "main")
+            .await
+            .expect("read acknowledgement");
     drop(ship);
+
+    let producer = tmp.path().join("producer-rebuild-graft-command");
+    let producer_ctx = ctx_for(&producer, vec!["pond", "push"]);
+    write_small_file(&producer_ctx, "/advanced.txt", b"new upstream generation")
+        .await
+        .expect("advance producer");
+    push_command(&producer_ctx, Some("origin".to_string()))
+        .await
+        .expect("publish advanced upstream");
+    let advanced_state = sync_store::ContentRemote::open_at_url(&url, HashMap::new())
+        .await
+        .expect("open advanced remote")
+        .current_publication("main")
+        .await
+        .expect("read advanced publication")
+        .expect("advanced publication exists");
 
     pull_command_with_rebuild(&ctx, Some("upstream".to_string()), true)
         .await
@@ -1067,12 +1303,15 @@ async fn rebuild_graft_command_runs_end_to_end() {
         version_before.map(|version| version + 1),
         "scoped replacement must land as one data commit"
     );
-    assert_eq!(
-        ship.control_table()
-            .raw_config_get(&format!("last_pulled_tip:{url}"))
+    let watermark_after =
+        steward::read_pull_ack(ship.control_table(), &url, source_pond_id, "main")
             .await
-            .expect("read watermark"),
-        watermark_before
+            .expect("read acknowledgement")
+            .expect("advanced acknowledgement");
+    assert_ne!(Some(watermark_after.clone()), watermark_before);
+    assert_eq!(
+        watermark_after.snapshot_tip,
+        advanced_state.snapshot_tip.to_hex()
     );
 
     let err = pull_command_with_rebuild(&ctx, None, true)
@@ -1107,11 +1346,12 @@ async fn out_of_order_remote_tip_cannot_roll_back_a_graft() {
     let remote = sync_store::ContentRemote::open_at_url(&url, HashMap::new())
         .await
         .expect("open remote");
-    let old_tip = remote
-        .get_tip("main")
+    let old_state = remote
+        .current_publication("main")
         .await
-        .expect("read old tip")
-        .expect("old tip");
+        .expect("read old publication")
+        .expect("old publication");
+    let old_tip = old_state.snapshot_tip;
 
     let pond = tmp.path().join("consumer-tip-regression");
     let ctx = ctx_for(&pond, vec!["pond", "init"]);
@@ -1133,38 +1373,74 @@ async fn out_of_order_remote_tip_cannot_roll_back_a_graft() {
         .await
         .expect("pull newer tip");
 
-    let mut ship = ctx.open_pond().await.expect("open advanced consumer");
-    let key = format!("last_pulled_tip:{url}");
-    let new_tip = ship
-        .control_table()
-        .raw_config_get(&key)
+    let ship = ctx.open_pond().await.expect("open advanced consumer");
+    let new_ack = steward::read_pull_ack(ship.control_table(), &url, old_state.pond_id, "main")
         .await
-        .expect("read newer watermark")
-        .expect("newer watermark");
-    assert_ne!(new_tip, old_tip.to_hex());
+        .expect("read newer acknowledgement")
+        .expect("newer acknowledgement");
+    assert_ne!(new_ack.snapshot_tip, old_tip.to_hex());
     let version = ship
         .as_pond()
         .expect("pond steward")
         .data_persistence()
         .table()
         .version();
-    ship.control_table_mut()
-        .raw_config_set(&key, &old_tip.to_hex())
-        .await
-        .expect("simulate stale trailing watermark");
     drop(ship);
 
     let mut remote = sync_store::ContentRemote::open_at_url(&url, HashMap::new())
         .await
         .expect("reopen current remote");
+    let current = remote
+        .current_publication("main")
+        .await
+        .expect("current publication")
+        .expect("current state");
+    let old_commit_bytes = remote
+        .get_immutable_object(old_tip)
+        .await
+        .expect("read old commit")
+        .expect("old commit retained");
+    let old_commit =
+        sync_store::content::Commit::decode(&old_commit_bytes).expect("decode old commit");
+    let record = sync_store::content::PublicationRecord::new(
+        current.pond_id,
+        "main",
+        old_tip,
+        old_commit.manifest_root,
+        Some(current.publication_record),
+        vec![],
+        vec![],
+        vec![],
+    )
+    .expect("stale publication record");
     let _ = remote
-        .push_commit(&[], "main", old_tip)
+        .put_publication_record(&record)
+        .await
+        .expect("publish stale record");
+    let stale = sync_store::PublicationState::new(
+        current.pond_id,
+        "main",
+        old_tip,
+        old_commit.manifest_root,
+        record.hash(),
+        current.generation + 1,
+        current.updated_at + 1,
+    )
+    .expect("stale state");
+    let _ = remote
+        .compare_and_swap_publication(
+            sync_store::PublicationExpectation::Existing {
+                generation: current.generation,
+                publication_record: current.publication_record,
+            },
+            stale,
+        )
         .await
         .expect("publish stale ref view");
     let err = pull_command(&ctx, Some("upstream".to_string()))
         .await
         .expect_err("older remote tip must be rejected");
-    assert!(format!("{err:#}").contains("refusing non-fast-forward pull"));
+    assert!(format!("{err:#}").contains("does not descend"));
 
     let ship = ctx.open_pond().await.expect("reopen consumer");
     assert_eq!(
@@ -1175,13 +1451,11 @@ async fn out_of_order_remote_tip_cannot_roll_back_a_graft() {
             .version(),
         version
     );
-    assert_eq!(
-        ship.control_table()
-            .raw_config_get(&key)
-            .await
-            .expect("read preserved watermark"),
-        Some(old_tip.to_hex())
-    );
+    let preserved = steward::read_pull_ack(ship.control_table(), &url, old_state.pond_id, "main")
+        .await
+        .expect("read preserved acknowledgement")
+        .expect("preserved acknowledgement");
+    assert_eq!(preserved.snapshot_tip, new_ack.snapshot_tip);
 }
 
 #[tokio::test]
@@ -1200,15 +1474,16 @@ async fn overwrite_can_migrate_a_verified_pull_watermark_between_equivalent_remo
         .await
         .expect("pull first remote");
 
-    let old_tip = ctx
-        .open_pond()
+    let first_pond_id = sync_store::ContentRemote::open_at_url(&first, HashMap::new())
         .await
-        .expect("open")
-        .control_table()
-        .raw_config_get(&format!("last_pulled_tip:{first}"))
+        .expect("open first remote")
+        .pond_id();
+    let old_ship = ctx.open_pond().await.expect("open");
+    let old_ack = steward::read_pull_ack(old_ship.control_table(), &first, first_pond_id, "main")
         .await
-        .expect("read old watermark")
-        .expect("old watermark");
+        .expect("read old acknowledgement")
+        .expect("old acknowledgement");
+    drop(old_ship);
 
     apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&second, true, true))
         .await
@@ -1222,19 +1497,17 @@ async fn overwrite_can_migrate_a_verified_pull_watermark_between_equivalent_remo
             .url,
         second
     );
-    assert_eq!(
-        ship.control_table()
-            .raw_config_get(&format!("last_pulled_tip:{second}"))
+    let migrated = steward::read_pull_ack(ship.control_table(), &second, first_pond_id, "main")
+        .await
+        .expect("read migrated acknowledgement")
+        .expect("migrated acknowledgement");
+    assert_eq!(migrated.snapshot_tip, old_ack.snapshot_tip);
+    assert_eq!(migrated.manifest_root, old_ack.manifest_root);
+    assert!(
+        steward::read_pull_ack(ship.control_table(), &first, first_pond_id, "main")
             .await
-            .expect("read migrated watermark"),
-        Some(old_tip.clone())
-    );
-    assert_eq!(
-        ship.control_table()
-            .raw_config_get(&format!("last_pulled_tip:{first}"))
-            .await
-            .expect("read retained old watermark"),
-        Some(old_tip)
+            .expect("read retained old acknowledgement")
+            .is_some()
     );
     drop(ship);
 
@@ -1281,12 +1554,15 @@ async fn watermark_migration_refuses_an_advanced_destination_without_replacing_t
             .url,
         first
     );
-    assert_eq!(
-        ship.control_table()
-            .raw_config_get(&format!("last_pulled_tip:{second}"))
+    let pond_id = sync_store::ContentRemote::open_at_url(&second, HashMap::new())
+        .await
+        .expect("open replacement")
+        .pond_id();
+    assert!(
+        steward::read_pull_ack(ship.control_table(), &second, pond_id, "main")
             .await
-            .expect("read replacement watermark"),
-        None
+            .expect("read replacement acknowledgement")
+            .is_none()
     );
 }
 
@@ -1389,10 +1665,25 @@ async fn watermark_migration_refuses_a_watermark_that_disagrees_with_the_graft_p
         .expect("pull first remote");
 
     let mut ship = ctx.open_pond().await.expect("open consumer");
-    ship.control_table_mut()
-        .raw_config_set(&format!("last_pulled_tip:{first}"), &"0".repeat(64))
+    let pond_id = sync_store::ContentRemote::open_at_url(&first, HashMap::new())
         .await
-        .expect("corrupt old watermark");
+        .expect("open first remote")
+        .pond_id();
+    let acknowledgement = steward::read_pull_ack(ship.control_table(), &first, pond_id, "main")
+        .await
+        .expect("read acknowledgement")
+        .expect("acknowledgement");
+    let mut state = acknowledgement
+        .state(&first, pond_id, "main")
+        .expect("decode acknowledgement");
+    state.snapshot_tip =
+        sync_store::content::ObjectHash::from_hex(&"0".repeat(64)).expect("zero hash");
+    steward::clear_acknowledgements(ship.control_table_mut(), &first, pond_id, "main")
+        .await
+        .expect("explicitly clear acknowledgement before corruption fixture");
+    steward::write_pull_ack(ship.control_table_mut(), &first, &state)
+        .await
+        .expect("corrupt old acknowledgement");
     drop(ship);
 
     let err = apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&second, true, true))
@@ -1424,28 +1715,19 @@ async fn watermark_migration_refuses_a_destination_missing_the_pinned_commit() {
     let remote = sync_store::ContentRemote::open_at_url(&second, HashMap::new())
         .await
         .expect("open equivalent remote");
-    let pond_id = remote.pond_id();
     let tip = remote
         .get_tip("main")
         .await
         .expect("read remote tip")
         .expect("remote tip");
-    let mut store = sync_store::Store::open_at_url(&second, HashMap::new())
+    let raw = sync_store::raw_object_store_at_url(&second, HashMap::new())
         .await
-        .expect("open backing store");
-    let txn_seq = store.last_txn_seq(pond_id).await.expect("last sequence") + 1;
-    store
-        .apply_batch(
-            pond_id,
-            txn_seq,
-            chrono::Utc::now().timestamp_micros(),
-            vec![sync_store::Op::Delete {
-                partition: "objects".to_string(),
-                key: tip.to_string(),
-            }],
-        )
-        .await
-        .expect("remove pinned commit while retaining the ref");
+        .expect("open raw store");
+    raw.delete(&object_store::path::Path::from(format!(
+        "_content/v2/objects/blake3={tip}"
+    )))
+    .await
+    .expect("remove pinned commit while retaining the ref");
 
     let err = apply_yaml(&ctx, tmp.path(), &pull_remote_yaml(&second, true, true))
         .await
@@ -1487,12 +1769,15 @@ async fn ordinary_overwrite_without_a_prior_pull_does_not_require_migration_stat
             .url,
         second
     );
-    assert_eq!(
-        ship.control_table()
-            .raw_config_get(&format!("last_pulled_tip:{second}"))
+    let pond_id = sync_store::ContentRemote::open_at_url(&second, HashMap::new())
+        .await
+        .expect("open replacement")
+        .pond_id();
+    assert!(
+        steward::read_pull_ack(ship.control_table(), &second, pond_id, "main")
             .await
-            .expect("read absent watermark"),
-        None
+            .expect("read absent acknowledgement")
+            .is_none()
     );
 }
 

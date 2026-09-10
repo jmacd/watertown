@@ -95,14 +95,11 @@ against *different* remotes from *different* network positions; a shared,
 replicated consumption counter would be actively wrong. And a limiter window
 is worthless after a few hours, so nothing is lost by making it disposable.
 
-There is direct precedent: the push watermark is already a raw control-table
-key written right after a successful push.
+There is direct precedent: the structured publication acknowledgement is raw
+per-replica control state written right after a successful active-row CAS.
 
 ```rust
-// crates/steward/src/guard.rs:1296-1302
-ship.control_table_mut()
-    .raw_config_set(&format!("last_pushed_tip:{}", attachment.url), &tip_hex)
-    .await
+write_push_ack(control, remote_url, publication_state).await
 ```
 
 The API is small and already public:
@@ -620,8 +617,9 @@ the byte count with no remote round-trip. This matters: the reverted
 remote-read spike had to add `ContentRemote::object_size()` precisely because
 it lacked local knowledge; the push side does not have that problem.
 
-The batched `push_commit` is charged as one op plus the summed length of the
-inline object bytes, checked before the call and recorded after. Finally:
+Conditional payload/receipt creates, immutable pack and publication-record
+writes, and the dedicated Delta publication CAS are charged at the physical
+object-store layer. Finally:
 
 ```rust
 for l in [bytes.as_mut(), ops.as_mut()].into_iter().flatten() {
@@ -629,8 +627,8 @@ for l in [bytes.as_mut(), ops.as_mut()].into_iter().flatten() {
 }
 ```
 
-one control write per bound limiter, at the end, alongside the existing
-`last_pushed_tip:` write at `guard.rs:1296-1302`.
+one control write per bound limiter, at the end, alongside the structured
+publication acknowledgement write.
 
 ### 4.4 Behavior when the budget is exhausted
 
@@ -1076,7 +1074,8 @@ Two things worth keeping:
 | L9 | Limiter state is reported by `pond status`; a silent throttle is not acceptable. |
 | L10 | Callers declare the unit they spend at `Limiter::open`; a mismatch with the node's configured unit is a bind-time error. |
 | L11 | Limiter bindings are authored in YAML via new `pond apply` `kind: backup` / `kind: remote` resources routed through the existing attach validation -- not via CLI flags. |
-| L12 | Spending is *also* emitted into the pond as a durable metric series at `/sys/limits/usage`, flushed at the start of the next write transaction. |
+| L12 | Spending is *also* emitted into the pond as `/sys/limits/usage`, but only after a transaction already has another real data change; telemetry alone never creates a commit. |
 | L13 | `POND_IGNORE_LIMITS` suspends enforcement (not binding) for a seeding import; it logs loudly and discards rather than records what it spent, so an exceptional transfer cannot exhaust the window that governs ordinary traffic. |
 | L14 | Pulls are governed by decorating `ContentSource` (`GovernedSource`), so every ingress path is charged at the remote boundary; a pull refuses to *begin* a transfer on a spent budget rather than checking an unknowable size in advance. |
 | L15 | Remote blob presence is answered by one listing of the `_blobs/` prefix, not a probe per blob: probing costs a billed request for every blob in the pond's history on every push or pull, including ones that transfer nothing. |
+| L16 | `pond backup publish-consolidated NAME` binds the named attachment's normal ops/bytes limiters before remote open, meters identity/state checks plus object/pack/locator publication, and commits limiter usage on success or failure. |

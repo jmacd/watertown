@@ -15,8 +15,8 @@
 //! target series how far it has already been materialized, selects only the
 //! source rows beyond that watermark, and appends them as ONE new version.
 //! The result is an append-only physical series with one version per tick --
-//! the same shape `hydrovu` produces, and therefore the same shape the
-//! collapse/reclaim path operates on.
+//! the same shape `hydrovu` produces and the local pack-maintenance path can
+//! repack without rewriting or reclaiming its Oplog rows.
 //!
 //! It is deliberately incremental rather than a snapshot-and-replace: a
 //! rewrite-everything materializer would reintroduce exactly the `O(N^2)` write

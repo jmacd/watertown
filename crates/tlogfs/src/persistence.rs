@@ -1254,11 +1254,10 @@ impl State {
     ///
     /// This does NOT reinstate collapse as a production capability: it exists
     /// solely so the read path's `collapsed_from`/`collapsed_through`
-    /// range-ordering logic keeps test coverage, because that shape is still a
-    /// real, reachable state in production -- a content pull that replicates a
-    /// source-side collapse stamps exactly this sentinel via
-    /// `tinyfs::wd::WD::async_writer_collapsing` (see `collapse_prior` in
-    /// `crate::file`). Never call this outside a test.
+    /// range-ordering logic keeps synthetic coverage for the generic row
+    /// decoder. Native-v2 production user series cannot create this shape;
+    /// only the reserved manifest index uses the full-history sentinel. Never
+    /// call this outside a test.
     #[cfg(test)]
     pub(crate) async fn collapse_file_series_for_test(
         &self,
@@ -1794,6 +1793,15 @@ impl State {
             }
             Err(_) => (0, 0), // Can't get counts if lock is held
         }
+    }
+
+    /// Get the exact count of pending operations while an async caller can
+    /// wait for the transaction-state lock.
+    pub async fn pending_operation_counts_exact(&self) -> (usize, usize) {
+        let guard = self.inner.lock().await;
+        let record_count = guard.records.len();
+        let modified_dirs = guard.directories.values().filter(|d| d.modified).count();
+        (record_count, modified_dirs)
     }
 
     /// Synthesize the uncommitted live rows of the current transaction: every
@@ -3183,7 +3191,7 @@ impl InnerState {
     /// `TablePhysicalSeries` row must go through -- `self.records.push`
     /// must never be called directly with such an entry, or a future write
     /// path could silently commit a series row with no logical leaf, which
-    /// `watertown.series.v2` (steward's content fold) cannot detect after the fact.
+    /// `watertown.series.v3` (steward's content fold) cannot detect after the fact.
     ///
     /// Also enforces item 5: a `TablePhysicalSeries` append's schema
     /// fingerprint must match every existing committed-or-pending logical
@@ -3254,7 +3262,7 @@ impl InnerState {
                 // rejects a nonempty-but-zero-row one) -- a genuinely empty
                 // first version would durably commit a node steward's own
                 // source-side fold can never later represent as a valid
-                // `watertown.series.v2` manifest. Reject here, before the row is
+                // `watertown.series.v3` manifest. Reject here, before the row is
                 // ever durable, rather than let that surface as an opaque
                 // fold failure at the next commit.
                 if !physically_nonempty {
@@ -3330,6 +3338,15 @@ impl InnerState {
         exact_logical_attributes: Option<Vec<u8>>,
     ) -> Result<(), TLogFSError> {
         debug!("store_file_content_ref_transactional called for node_id={id}");
+        if collapsed_through.is_some() && !id.node_id().is_index() {
+            return Err(TLogFSError::CollapseUnsupported {
+                reason: format!(
+                    "collapsed rows are reserved for .pond-node-index; user node {} is \
+                     append-only and replacement requires a verified pondcapsule.4 reset",
+                    id.node_id()
+                ),
+            });
+        }
 
         // Create OplogEntry from content reference.  Replication supplies the
         // source's mtime so a mirrored version keeps the timestamp it was
@@ -3343,10 +3360,11 @@ impl InnerState {
         } else {
             // Legacy path: calculate version now (for backward compatibility)
             // Check if there's already an entry for this node in this transaction
-            let existing_entry = self
-                .records
-                .iter()
-                .find(|e| e.node_id == id.node_id() && e.part_id == id.part_id());
+            let existing_entry = self.records.iter().find(|e| {
+                e.node_id == id.node_id()
+                    && e.part_id == id.part_id()
+                    && e.pond_id == id.pond_id().to_string()
+            });
 
             if existing_entry.is_some() {
                 // There's already a version in this transaction.
@@ -3530,8 +3548,8 @@ impl InnerState {
         if let Some(outboard) = bao_outboard {
             entry.set_bao_outboard(outboard);
         }
-        // A pull replicating a source-side collapse stamps the merged version so
-        // the read path and content fold both drop the superseded predecessors.
+        // The validated reserved-index writer stamps the replacement pointer so
+        // the read path drops its superseded predecessors.
         if let Some(sentinel) = collapsed_through {
             entry.collapsed_through = Some(sentinel);
         }
@@ -3898,15 +3916,15 @@ impl InnerState {
         let pond_id_str = id.pond_id().to_string();
 
         // Step 1: Check pending records in memory FIRST
-        // Pending records have empty pond_id (stamped at commit), so match
-        // only by part_id+node_id. This is safe because pending records
-        // are always from the local pond's current transaction.
+        // A transaction may import more than one foreign pond, whose reserved
+        // root/index ids intentionally collide. Pending rows are stamped from
+        // their FileID at construction, so pond identity is part of the key.
         let pending_record = self
             .records
             .iter()
             .filter(|r| {
                 // @@@ Linear!
-                r.part_id == id.part_id() && r.node_id == id.node_id()
+                r.part_id == id.part_id() && r.node_id == id.node_id() && r.pond_id == pond_id_str
             })
             .max_by_key(|r| r.version)
             .cloned();
@@ -3976,7 +3994,9 @@ impl InnerState {
         let pending_record = self
             .records
             .iter()
-            .filter(|r| r.part_id == id.part_id() && r.node_id == id.node_id())
+            .filter(|r| {
+                r.part_id == id.part_id() && r.node_id == id.node_id() && r.pond_id == pond_id_str
+            })
             .max_by_key(|r| r.version)
             .cloned();
 
@@ -4089,7 +4109,11 @@ impl InnerState {
         let records = {
             self.records
                 .iter()
-                .filter(|record| record.part_id == id.part_id() && record.node_id == id.node_id())
+                .filter(|record| {
+                    record.part_id == id.part_id()
+                        && record.node_id == id.node_id()
+                        && record.pond_id == pond_id_str
+                })
                 .cloned()
                 .collect::<Vec<_>>()
         };
@@ -5560,7 +5584,7 @@ mod stamping_choke_point_tests {
     /// The genuinely-empty-first-version case too: a brand-new
     /// `TablePhysicalSeries` node's very first append must be rejected if
     /// it carries zero bytes, since (unlike a file series) it could never
-    /// be folded into a valid `watertown.series.v2` manifest afterward.
+    /// be folded into a valid `watertown.series.v3` manifest afterward.
     #[tokio::test]
     async fn table_series_leafless_first_version_is_rejected() {
         use crate::TLogFSError;

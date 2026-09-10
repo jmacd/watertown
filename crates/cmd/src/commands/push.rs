@@ -61,6 +61,16 @@ pub async fn push_command(ship_context: &ShipContext, name: Option<String>) -> R
 /// remote under the `main` ref via the content-addressed pipeline.
 async fn push_one(ship: &mut steward::Steward, name: &str) -> Result<()> {
     let attachment = load_remote_attachment(ship, name).await?;
+    let ship_ref = ship
+        .as_pond()
+        .ok_or_else(|| anyhow!("push requires a pond steward (not a host steward)"))?;
+    if steward::remote_ref_is_acknowledged(ship_ref, &attachment.url, "main").await? {
+        log::info!(
+            "[OK] push {} skipped: remote already acknowledged the current content tip",
+            name
+        );
+        return Ok(());
+    }
 
     // One dispatch, from the profile when there is one and from the URL only
     // when there is not (Decision A8).
@@ -120,11 +130,181 @@ async fn push_one(ship: &mut steward::Steward, name: &str) -> Result<()> {
         tip_hex
     );
 
-    // Record the per-ref frontier: the single commit hash we last pushed to
-    // this remote (the CA3 replacement for the retired per-pond seq watermark).
-    ship.control_table_mut()
-        .raw_config_set(&format!("last_pushed_tip:{}", attachment.url), &tip_hex)
+    steward::write_push_ack(ship.control_table_mut(), &attachment.url, &outcome.state)
         .await
-        .map_err(|e| anyhow!("record last_pushed_tip for `{}`: {}", name, e))?;
+        .map_err(|e| anyhow!("record publication acknowledgement for `{}`: {}", name, e))?;
+    Ok(())
+}
+
+/// Delete abandoned immutable-payload upload staging objects older than the
+/// requested grace period.
+pub async fn cleanup_backup_uploads_command(
+    ship_context: &ShipContext,
+    name: &str,
+    older_than_seconds: i64,
+) -> Result<()> {
+    if older_than_seconds < 0 {
+        return Err(anyhow!("older-than-seconds must not be negative"));
+    }
+    let mut ship = ship_context.open_pond().await?;
+    match remote_mode_for(&ship, name).await? {
+        RemoteMode::Push | RemoteMode::Both => {}
+        RemoteMode::Pull => {
+            return Err(anyhow!(
+                "remote `{name}` is pull-only; upload cleanup applies to backups"
+            ));
+        }
+    }
+    let attachment = load_remote_attachment(&mut ship, name).await?;
+    let storage_options = {
+        let pond = ship
+            .as_pond_mut()
+            .ok_or_else(|| anyhow!("upload cleanup requires a pond steward"))?;
+        steward::storage_profile::prepare_storage(pond, &attachment).await?
+    };
+    let limit_spec = attachment.resolved_limits()?;
+    let mut limits = {
+        let pond = ship
+            .as_pond_mut()
+            .ok_or_else(|| anyhow!("upload cleanup requires a pond steward"))?;
+        steward::LimiterSet::open(pond, &limit_spec)
+            .await
+            .map_err(|error| anyhow!("bind limiters for backup `{name}`: {error}"))?
+    };
+    let url = attachment.url.clone();
+    let cleanup_url = url.clone();
+    let age = chrono::Duration::try_seconds(older_than_seconds)
+        .ok_or_else(|| anyhow!("older-than-seconds is out of range"))?;
+    let cutoff = chrono::Utc::now()
+        .checked_sub_signed(age)
+        .ok_or_else(|| anyhow!("older-than-seconds is out of range"))?;
+    let cleanup = steward::storage_meter::metered_op(
+        &url,
+        &mut limits,
+        Box::pin(async move {
+            let remote = sync_store::ContentRemote::open_at_url(&cleanup_url, storage_options)
+                .await
+                .map_err(anyhow::Error::from)?;
+            remote
+                .cleanup_stale_uploads(cutoff)
+                .await
+                .map_err(anyhow::Error::from)
+        }),
+    )
+    .await;
+
+    let pond = ship
+        .as_pond_mut()
+        .ok_or_else(|| anyhow!("upload cleanup requires a pond steward"))?;
+    limits
+        .commit(pond.control_table_mut())
+        .await
+        .map_err(|error| anyhow!("record upload-cleanup limiter usage: {error}"))?;
+    let outcome = cleanup.map_err(|error| anyhow!("clean backup `{name}` uploads: {error}"))?;
+    log::info!(
+        "[OK] backup {} upload cleanup complete (objects_deleted={}, bytes_deleted={})",
+        name,
+        outcome.objects_deleted,
+        outcome.bytes_deleted
+    );
+    Ok(())
+}
+
+/// Publish locally maintained whole-range series packs to one named backup.
+pub async fn publish_consolidated_packs_command(
+    ship_context: &ShipContext,
+    name: &str,
+) -> Result<()> {
+    let mut ship = ship_context.open_pond().await?;
+    match remote_mode_for(&ship, name).await? {
+        RemoteMode::Push | RemoteMode::Both => {}
+        RemoteMode::Pull => {
+            return Err(anyhow!(
+                "remote `{name}` is pull-only; consolidated packs may be published only to a \
+                 push/both backup"
+            ));
+        }
+    }
+    let attachment = load_remote_attachment(&mut ship, name).await?;
+    let storage_options = {
+        let pond = ship
+            .as_pond_mut()
+            .ok_or_else(|| anyhow!("consolidated-pack publication requires a pond steward"))?;
+        steward::storage_profile::prepare_storage(pond, &attachment).await?
+    };
+    let limit_spec = attachment.resolved_limits()?;
+    let mut limits = {
+        let pond = ship
+            .as_pond_mut()
+            .ok_or_else(|| anyhow!("consolidated-pack publication requires a pond steward"))?;
+        steward::LimiterSet::open(pond, &limit_spec)
+            .await
+            .map_err(|error| anyhow!("bind limiters for backup `{name}`: {error}"))?
+    };
+    let published = {
+        let pond = ship
+            .as_pond()
+            .ok_or_else(|| anyhow!("consolidated-pack publication requires a pond steward"))?;
+        steward::open_and_publish_local_consolidated_packs_limited(
+            pond,
+            &attachment.url,
+            storage_options,
+            "main",
+            &mut limits,
+        )
+        .await
+    };
+
+    let usage_error = {
+        let pond = ship
+            .as_pond_mut()
+            .ok_or_else(|| anyhow!("consolidated-pack publication requires a pond steward"))?;
+        limits.commit(pond.control_table_mut()).await.err()
+    };
+    let outcome = match (published, usage_error) {
+        (Ok(outcome), None) => outcome,
+        (Ok(_), Some(error)) => {
+            return Err(anyhow!(
+                "published consolidated packs to `{name}`, but failed to record limiter usage: \
+                 {error}"
+            ));
+        }
+        (Err(error), None) => {
+            return Err(anyhow!(
+                "publish consolidated packs to `{name}` ({}): {error}",
+                attachment.url
+            ));
+        }
+        (Err(error), Some(usage_error)) => {
+            return Err(anyhow!(
+                "publish consolidated packs to `{name}` ({}): {error}; additionally failed to \
+                 record limiter usage: {usage_error}",
+                attachment.url
+            ));
+        }
+    };
+
+    for selection in &outcome.selections {
+        log::info!(
+            "[PACK] series={} pack={} objects={} bytes={}",
+            selection.series_hash,
+            selection.pack_hash,
+            selection.objects,
+            selection.bytes
+        );
+    }
+    log::info!(
+        "[OK] backup {} consolidated packs published (series={}, packs={}, objects={}, bytes={}, \
+         objects_created={}, bytes_created={}, packs_created={}, locators_created={})",
+        name,
+        outcome.selections.len(),
+        outcome.selections.len(),
+        outcome.objects_selected,
+        outcome.bytes_selected,
+        outcome.objects_created,
+        outcome.bytes_created,
+        outcome.packs_created,
+        outcome.locators_created
+    );
     Ok(())
 }

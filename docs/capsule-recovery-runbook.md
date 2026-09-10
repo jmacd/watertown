@@ -1,13 +1,13 @@
 # Watertown Capsule Recovery Runbook
 
 This runbook covers recovery of the current native
-`watertown.commit.v1` format through the current portable
+`watertown.commit.v2` format through the current portable
 `pondcapsule.4` format. There is no historical-format migration path.
 
 ## Safety model
 
 - Recover from an authenticated, read-only copy of the native backup.
-- Record the exact source commit and recovery-recipe hash before extraction.
+- Record the exact source commit and capsule root before cutover.
 - Never overwrite the source backup or an existing destination.
 - Keep restored dynamic recipes inert until the target is reviewed.
 - Treat every unsupported object or capsule magic as an abort condition.
@@ -24,58 +24,38 @@ POND="$SOURCE_POND" pond freeze status
 
 Record the source pond identity and exact content tip.
 
-## 2. Publish and authenticate the recovery recipe
+## 2. Publish and authenticate the capsule
 
 ```bash
-POND="$SOURCE_POND" pond capsule recipe publish backup
-POND="$SOURCE_POND" pond capsule recipe inspect backup
 POND="$SOURCE_POND" pond push backup
 POND="$SOURCE_POND" pond verify --exact backup
+POND="$SOURCE_POND" pond capsule publish backup
 ```
 
-Record the printed recipe hash. Retrieve both:
+Record the printed capsule root and retrieve the complete immutable tree:
 
 ```text
-recovery/recipes/watertown.commit.v1/<recipe-hash>/README.sh
-recovery/README.sh
+recovery/refs/latest
+recovery/manifests/<capsule-root>.json
+recovery/objects/blake3=<payload-hash>
+CAPSULE-README.md
+CAPSULE-FORMAT.md
+capsule.py
+parquet_schema.py
+capsule-requirements.lock
+recover.sh
 ```
 
-The current hash-addressed object must match the reviewed current recipe.
-`recovery/README.sh` may be an older recipe, but its exact bytes must already
-exist at
-`recovery/recipes/watertown.commit.v1/<hash-of-discoverable-bytes>/README.sh`.
-Missing or mismatched immutable copies are rejected and never backfilled.
+`pond capsule recipe publish/inspect` is only for an explicitly retained
+legacy `watertown.commit.v1` rollback remote. It is not part of native-v2
+publication or cutover.
 
-## 3. Download a complete native backup
+## 3. Download the complete portable capsule
 
-Use the reviewed download helper for the storage backend. Preserve object
-names and bytes exactly, including:
+Use the reviewed storage-backend download helper and preserve the `recovery/`
+tree's names and bytes exactly. Do not continue from a partial listing.
 
-```text
-Delta table data and _delta_log/
-_blobs/
-_packs/
-recovery/
-```
-
-Do not extract from a partial listing.
-
-## 4. Extract the recorded commit
-
-Run the authenticated kit into a nonexistent destination:
-
-```bash
-python extract.py ./native-backup ./capsule \
-  --commit "$SOURCE_COMMIT" \
-  --birthplace recovery-rehearsal
-```
-
-The extractor accepts only `watertown.commit.v1`, `watertown.tree.v1`,
-`watertown.manifest.v1`, `watertown.series.v2`,
-`watertown.series-pack.v2`, and `watertown.recipe.v1`. Any other native
-object is a hard failure.
-
-## 5. Verify the capsule without Pond
+## 4. Verify the capsule without Pond
 
 ```bash
 python ./capsule/capsule.py verify ./capsule
@@ -88,7 +68,7 @@ The verifier checks canonical JSON, the `pondcapsule.root.4` root, the exact
 object closure, payload BLAKE3 and sizes, Parquet schemas, logical leaves,
 series roots, dynamic metadata, and `watertown.recipe.v1` framing.
 
-## 6. Rehearse safe materialization
+## 5. Rehearse safe materialization
 
 ```bash
 python ./capsule/capsule.py materialize ./capsule ./materialized
@@ -98,22 +78,39 @@ Review `inventory.json`, regular file versions, Parquet table versions,
 symlink target descriptions, and inert dynamic recipe files. No recipe is
 executed and no live symlink is created.
 
-## 7. Import into a fresh pond
+## 6. Import into a fresh pond
 
 The target path must not exist:
 
 ```bash
 POND="$TARGET_POND" pond capsule import ./capsule \
-  --birthplace recovered-production \
-  --experimental
+  --birthplace recovered-production
 ```
 
-The importer creates a private sibling staging pond, suppresses post-commit
-dispatch and automatic pushes, rebuilds a `pondcapsule.4` from the staged
-pond, compares the logical projection, syncs it, and atomically renames it
-onto the target.
+The importer first creates the pond in a same-parent, capsule-addressed unique
+initialization directory. It writes persistent dispatch suppression,
+provenance, and the first durable journal, syncs them, and atomically publishes
+that directory under the deterministic resumable staging name. It then commits
+bounded entry/leaf batches, rebuilds a `pondcapsule.4` from the staged pond,
+compares the logical projection, syncs it, and atomically renames it onto the
+target.
 
-## 8. Validate and cut over
+A retry can finish a pristine initialization interrupted before suppression,
+provenance, the first journal, or staging-name publication. It validates the
+target/capsule-addressed directory, birthplace, provenance when present, and
+initial transaction sequence. Modified, conflicting, or corrupt state fails
+loudly and remains in place for inspection.
+
+Each numbered checkpoint is published by a synced same-directory staging file
+and atomic no-replace rename. A crash may leave an unpublished staging file;
+resume removes it and continues from the highest final checkpoint. A corrupt
+final checkpoint is an error and must be investigated, not skipped.
+
+File and table series imports build linear offset indexes once per invocation;
+each leaf reads only overlapping physical objects. Resuming may rebuild those
+indexes, but does not rescan all preceding leaves or objects.
+
+## 7. Validate and cut over
 
 While the target remains inert:
 
@@ -124,7 +121,16 @@ POND="$TARGET_POND" pond capsule recipe inspect backup
 ```
 
 Review remotes and every restored dynamic recipe. Enable exactly one writer
-only after the target has passed application-specific checks.
+only after the target has passed application-specific checks. Repair unsafe
+attachments/configs with the ordinary remote and mknod/apply commands, then:
+
+```bash
+POND="$TARGET_POND" pond capsule activate
+```
+
+Activation reads and validates every `/sys/remotes/*` attachment and
+`/system/run/*` config without executing factories. Any failure leaves the
+pond inert.
 
 ## Rollback and retention
 

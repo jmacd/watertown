@@ -370,8 +370,7 @@ async fn an_unlimited_set_never_refuses() {
 }
 
 /// Decision L12: spending is queued in control, then flushed into the pond by
-/// the next write transaction -- because the push that spends it cannot write
-/// the pond without recursing.
+/// the next transaction that already has a real write.
 #[tokio::test]
 async fn usage_reaches_the_pond_on_the_next_write() {
     let (_t, mut ship) = new_pond("limiter-usage").await;
@@ -404,6 +403,43 @@ async fn usage_reaches_the_pond_on_the_next_write() {
         "limit travels with the row"
     );
     assert_eq!(rows[0].window_secs, 86_400);
+}
+
+#[tokio::test]
+async fn pending_usage_does_not_turn_a_write_noop_into_a_commit() {
+    let (_t, mut ship) = new_pond("limiter-usage-noop").await;
+    write_limiter(&mut ship, "/quota", "MiB/day", 10.0, None).await;
+
+    let mut limiter = Limiter::open(&mut ship, "/quota", LimitUnit::Bytes)
+        .await
+        .expect("open");
+    limiter.record(1024);
+    limiter
+        .commit(ship.control_table_mut())
+        .await
+        .expect("queue usage");
+
+    let version_before = ship.data_persistence().table().version();
+    let transaction = ship.begin_write(&meta("noop")).await.expect("begin no-op");
+    assert_eq!(
+        transaction.commit().await.expect("commit no-op"),
+        None,
+        "pending telemetry must not create a data commit"
+    );
+    assert_eq!(
+        ship.data_persistence().table().version(),
+        version_before,
+        "the data Delta version must not advance"
+    );
+    assert!(
+        read_usage_rows(&mut ship).await.is_empty(),
+        "the no-op must leave telemetry queued rather than emitting it"
+    );
+
+    write_file(&mut ship, "/real.txt", b"real").await;
+    let rows = read_usage_rows(&mut ship).await;
+    assert_eq!(rows.len(), 1, "the next real write must emit the sample");
+    assert_eq!(rows[0].amount, 1024);
 }
 
 /// The queue is drained by the write that emitted it, so a second write does
