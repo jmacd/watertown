@@ -39,10 +39,11 @@ use std::sync::Arc;
 use datafusion::execution::context::SessionContext;
 
 use sync_store::content::{
-    Commit, ContentModelVersion, ManifestEntry, ObjectHash, PayloadKind, Provenance,
-    SeriesManifest, TreeEntry, VersionMeta, decode_manifest, encode_canonical_attributes,
-    encode_manifest, encode_recipe, encode_tree, manifest_hash, merkle_root,
-    node_merkle_rebuild_root, recipe_hash,
+    Commit, ContentModelVersion, ContentObjectKind, ManifestChange, ManifestEntry,
+    ManifestMapEditor, ManifestRecord, ManifestRecordChild, MerkleFrontier, ObjectDescriptor,
+    ObjectHash, PackDescriptor, PayloadKind, Provenance, SeriesManifest, TreeEntry, VersionMeta,
+    build_manifest_map, decode_manifest_root, encode_canonical_attributes, encode_manifest_root,
+    encode_recipe, encode_tree, generate_append_range_proof, recipe_hash,
 };
 use tinyfs::{EntryType, ROOT_UUID};
 use tlogfs::schema::{CollapseRange, OplogEntry, decode_directory_entries, live_series_versions};
@@ -139,7 +140,7 @@ pub struct MaterializedObjects {
     /// pure content (trees, series, symlinks, recipes, small blobs) and so
     /// dedup across ponds; identity-bearing objects are kept out (see
     /// `manifest`).
-    pub inline: BTreeMap<ObjectHash, Vec<u8>>,
+    pub inline: BTreeMap<ObjectHash, MaterializedInlineObject>,
     /// Large-blob hashes whose bytes transfer via the external path.
     pub external_blobs: BTreeSet<ObjectHash>,
     /// The node manifest object: its hash and bytes (Section 4.5).  Kept
@@ -148,9 +149,14 @@ pub struct MaterializedObjects {
     /// ponds with identical content still have different manifests.  `None`
     /// only on a default-constructed value; a real fold always produces one.
     pub manifest: Option<(ObjectHash, Vec<u8>)>,
-    /// Everything [`publish_initial_series_packs`] needs to mint one
-    /// whole-range "initial" identity pack per `watertown.series.v2` series folded
-    /// in this materialization, without re-walking the pond. Not itself a
+    /// Persistent identity-map root for this snapshot.
+    pub manifest_root: Option<ObjectHash>,
+    /// Complete identity records, populated only by explicit full
+    /// materialization (initial publication, capsule build, or diagnostics).
+    pub manifest_records: Vec<ManifestRecord>,
+    /// Everything an explicit full materialization needs to mint one
+    /// whole-range root pack per `watertown.series.v3` series, without
+    /// re-walking the pond. Not itself a
     /// pushed object (a `PackIndex` is derived storage metadata excluded
     /// from the content tree), so it is not counted by [`Self::len`]/
     /// [`Self::is_empty`].
@@ -162,14 +168,12 @@ pub struct MaterializedObjects {
 /// pack (`docs/logical-series-identity-design.md`) from the exact same
 /// content the fold already read, without a second pass over the pond.
 ///
-/// See [`publish_initial_series_packs`] for how this is consumed and why:
-/// the dual reader (`crate::content_pull::fetch_series_v2`) requires an
-/// exact pack cover before it will trust any `watertown.series.v2` content, so a
-/// freshly-folded v2 series is otherwise unfetchable the moment it is
-/// pushed.
+/// Initial publication uses this to make the current complete series
+/// independently fetchable. Ordinary append commits do not construct this
+/// full material; they emit a linked suffix segment from only the new rows.
 #[derive(Debug, Clone)]
 pub(crate) struct SeriesPackMaterial {
-    /// The series' own content address -- the `watertown.series.v2` manifest hash,
+    /// The series' own content address -- the `watertown.series.v3` manifest hash,
     /// and the key packs are published under.
     pub(crate) series_hash: ObjectHash,
     /// `FilePhysicalSeries` or `TablePhysicalSeries`; nothing else is ever
@@ -183,10 +187,49 @@ pub(crate) struct SeriesPackMaterial {
     pub(crate) versions: Vec<SeriesVersionData>,
 }
 
+/// One inline content object with its kind carried from the typed fold site.
+///
+/// Payload bytes are never inspected to infer this value: arbitrary raw files
+/// may legitimately begin with any Watertown wire-format magic prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializedInlineObject {
+    pub kinds: BTreeSet<ContentObjectKind>,
+    pub bytes: Vec<u8>,
+}
+
+impl std::ops::Deref for MaterializedInlineObject {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.bytes
+    }
+}
+
 impl MaterializedObjects {
     /// Record an inline object (idempotent: re-recording a hash is a no-op).
-    fn put_inline(&mut self, hash: ObjectHash, bytes: Vec<u8>) {
-        let _ = self.inline.entry(hash).or_insert(bytes);
+    fn put_inline(
+        &mut self,
+        kind: ContentObjectKind,
+        hash: ObjectHash,
+        bytes: Vec<u8>,
+    ) -> Result<(), StewardError> {
+        match self.inline.entry(hash) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let _ = entry.insert(MaterializedInlineObject {
+                    kinds: BTreeSet::from([kind]),
+                    bytes,
+                });
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().bytes != bytes {
+                    return Err(StewardError::Content(format!(
+                        "content hash {hash} was materialized with conflicting bytes"
+                    )));
+                }
+                let _ = entry.get_mut().kinds.insert(kind);
+            }
+        }
+        Ok(())
     }
 
     /// Record a large blob to transfer externally by hash.
@@ -197,13 +240,13 @@ impl MaterializedObjects {
     /// Total number of distinct objects (inline, external, and the manifest).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inline.len() + self.external_blobs.len() + usize::from(self.manifest.is_some())
+        self.inline.len() + self.external_blobs.len() + usize::from(self.manifest_root.is_some())
     }
 
     /// True when no objects were materialized.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.inline.is_empty() && self.external_blobs.is_empty() && self.manifest.is_none()
+        self.inline.is_empty() && self.external_blobs.is_empty() && self.manifest_root.is_none()
     }
 }
 
@@ -242,22 +285,18 @@ pub(crate) struct ContentTreeIndex {
     pub root_key: NodeKey,
     /// Per physical-directory child lists, in name order.
     pub dirs: HashMap<NodeKey, Vec<ChildRef>>,
-    /// Per series node, its ordered version blob hashes (ascending version).
-    /// Lets an incremental rebuild compute the suffix it must append to a
-    /// series it already holds (design Section 8.5.3).
+    /// Per series node, ordered physical blob hashes retained for full-fold
+    /// diagnostics and synthetic collapse-ordering tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub series_versions: HashMap<NodeKey, Vec<ObjectHash>>,
     /// Per series node, its ordered *logical leaf* hashes (ascending
     /// version, skipping leafless metadata-only rows) --
     /// `docs/logical-series-identity-design.md` v2 identity, distinct from
-    /// `series_versions`' physical blob identity above. A v2 materializer
-    /// (`steward::content_pull`'s `rebuild_pond`/`import_pond`) diffs a
-    /// fetched, verified [`sync_store::content::SeriesManifest`]'s ordered
-    /// leaf hashes against this per-node list to find the suffix of leaves
-    /// it must still write, exactly as `series_versions` lets a v1
-    /// incremental rebuild find its own suffix -- but at logical-leaf
-    /// granularity, which is stable across a re-encode (physical blob
-    /// identity is not: re-encoding a table leaf's Parquet bytes changes
-    /// `blob_hash` even when the decoded rows are unchanged).
+    /// `series_versions`' physical blob identity above. Full clone/rebuild and
+    /// explicit diagnostics may compare this complete list. Ordinary
+    /// incremental pulls instead compare the prior persisted
+    /// [`sync_store::content::SeriesManifest`] frontier/count with the fetched
+    /// suffix base and never build this retained-leaf list.
     pub series_leaf_hashes: HashMap<NodeKey, Vec<ObjectHash>>,
     /// Number of distinct nodes folded into the root.
     pub nodes_hashed: usize,
@@ -291,8 +330,8 @@ struct NodeFacts {
 /// when present, its persisted v2 logical-leaf identity
 /// (`docs/logical-series-identity-design.md`). Shared by the full fold
 /// ([`fold_rows`]/[`hash_child`]) and the incremental fold
-/// ([`incremental_spine_inputs`]/[`read_series_committed`]) so both compute
-/// the [`SeriesManifest`] identically -- see [`build_series_manifest`].
+/// ([`incremental_spine_inputs_v2`]) so both compute the [`SeriesManifest`]
+/// identically -- see [`build_series_manifest`].
 #[derive(Debug, Clone)]
 pub(crate) struct SeriesVersionData {
     /// This row's Delta table `version` number. Needed (only by
@@ -307,8 +346,7 @@ pub(crate) struct SeriesVersionData {
     /// version's blob (initial pack publication/fetch keeps physical blobs
     /// available even once the series' own identity is the manifest hash)
     /// and for the physical-byte replica-divergence bookkeeping in
-    /// [`ContentTreeIndex::series_versions`], which is unaffected by this
-    /// module's v1-to-v2 change.
+    /// full-fold physical diagnostics.
     pub(crate) blob_hash: ObjectHash,
     /// Inline bytes when small; `None` when externalized (large file) --
     /// only read by the full fold's materialization sink.
@@ -319,7 +357,7 @@ pub(crate) struct SeriesVersionData {
     /// requirement below).
     pub(crate) meta: VersionMeta,
     /// This version's raw (un-canonicalized) `extended_attributes` JSON as
-    /// persisted on the row. Needed to compute `watertown.series.v2`'s
+    /// persisted on the row. Needed to compute `watertown.series.v3`'s
     /// `logical_attributes` via
     /// [`sync_store::content::encode_canonical_attributes`], whose
     /// canonical-JSON convention is distinct from this module's own
@@ -441,6 +479,40 @@ pub(crate) fn node_manifest_entries(index: &ContentTreeIndex) -> Vec<ManifestEnt
     entries
 }
 
+/// Build the persistent manifest-map records for an already-folded snapshot.
+pub(crate) fn node_manifest_records(
+    index: &ContentTreeIndex,
+) -> Result<Vec<ManifestRecord>, StewardError> {
+    let mut entries = node_manifest_entries(index)
+        .into_iter()
+        .map(|entry| (entry.node_id.clone(), entry))
+        .collect::<HashMap<_, _>>();
+    let mut records = Vec::with_capacity(entries.len());
+    let local_pond = &index.root_key.0;
+    for (node_id, entry) in entries.drain() {
+        let children = if entry.entry_type == EntryType::DirectoryPhysical {
+            index
+                .dirs
+                .get(&(local_pond.clone(), node_id.clone()))
+                .into_iter()
+                .flatten()
+                .map(|child| {
+                    ManifestRecordChild::new(
+                        child.child_node_id.clone(),
+                        child.name.clone(),
+                        child.entry_type,
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        records.push(ManifestRecord::new(entry, children).map_err(StewardError::Content)?);
+    }
+    records.sort_by(|left, right| left.node_id().as_bytes().cmp(right.node_id().as_bytes()));
+    Ok(records)
+}
+
 /// Build the full node-manifest bytes for the current in-transaction live state
 /// (design `docs/incremental-content-tree-design.md` Section 4, Approach A /
 /// Phase 2).
@@ -461,8 +533,8 @@ pub(crate) fn node_manifest_entries(index: &ContentTreeIndex) -> Vec<ManifestEnt
 ///
 /// The reserved-node write's inputs, all folded from the same in-transaction
 /// live snapshot in a single scan: the encoded node manifest (index-node
-/// content) plus the content roots (`root_tree_hash`, `node_manifest_hash`,
-/// `node_manifest_root`) that the commit object needs.
+/// content) plus the content roots (`root_tree_hash`, persistent
+/// `manifest_root`) and bounded publication delta that the commit needs.
 ///
 /// Folding once here lets the guard write the index node and the authoritative
 /// commit-log leaf atomically in the same transaction without re-scanning the
@@ -470,20 +542,21 @@ pub(crate) fn node_manifest_entries(index: &ContentTreeIndex) -> Vec<ManifestEnt
 /// step 4a).  The two reserved nodes are excluded from the fold, so writing
 /// them never perturbs these roots.
 pub(crate) struct SpineInputs {
-    pub manifest_bytes: Vec<u8>,
+    pub index_bytes: Vec<u8>,
     pub root_tree_hash: ObjectHash,
-    pub node_manifest_hash: ObjectHash,
-    pub node_manifest_root: ObjectHash,
+    pub manifest_root: ObjectHash,
+    pub manifest_changes: Vec<ManifestChange>,
+    pub introduced_objects: Vec<ObjectDescriptor>,
+    pub introduced_packs: Vec<PackDescriptor>,
+    pub object_bytes: BTreeMap<ObjectHash, Vec<u8>>,
+    pub pack_bytes: BTreeMap<ObjectHash, Vec<u8>>,
 }
 
-/// Canonical full-fold view of one pond partition, including the state needed
-/// to explain a root mismatch at node and series-version granularity.
+/// Canonical full-fold view of one pond partition for explicit diagnostics and
+/// optional incremental-fold cross-checking.
 pub(crate) struct FoldedContentState {
-    pub manifest: Vec<ManifestEntry>,
-    pub series_leaf_hashes: HashMap<String, Vec<ObjectHash>>,
+    pub manifest_records: Vec<ManifestRecord>,
     pub root_tree_hash: ObjectHash,
-    pub node_manifest_hash: ObjectHash,
-    pub node_manifest_root: ObjectHash,
 }
 
 pub(crate) async fn in_txn_content_state(
@@ -500,21 +573,10 @@ pub(crate) async fn in_txn_content_state(
             .then_with(|| a.version.cmp(&b.version))
     });
     let index = fold_rows(rows, pond_id, None)?;
-    let manifest = node_manifest_entries(&index);
-    let node_manifest_hash = manifest_hash(&manifest).map_err(StewardError::Content)?;
-    let node_manifest_root = node_merkle_rebuild_root(&manifest).map_err(StewardError::Content)?;
-    let series_leaf_hashes = index
-        .series_leaf_hashes
-        .iter()
-        .filter(|((row_pond_id, _), _)| row_pond_id == pond_id)
-        .map(|((_, node_id), hashes)| (node_id.clone(), hashes.clone()))
-        .collect();
+    let manifest_records = node_manifest_records(&index)?;
     Ok(FoldedContentState {
-        manifest,
-        series_leaf_hashes,
+        manifest_records,
         root_tree_hash: index.root_tree_hash,
-        node_manifest_hash,
-        node_manifest_root,
     })
 }
 
@@ -523,13 +585,73 @@ pub(crate) async fn in_txn_spine_inputs(
     uncommitted: Vec<OplogEntry>,
     local_pond_id: &str,
 ) -> Result<SpineInputs, StewardError> {
-    let state = in_txn_content_state(committed_table, uncommitted, local_pond_id).await?;
-    let manifest_bytes = encode_manifest(&state.manifest).map_err(StewardError::Content)?;
+    let mut rows = scan_live_rows(committed_table, true).await?;
+    rows.extend(uncommitted);
+    rows.sort_by(|a, b| {
+        a.pond_id
+            .cmp(&b.pond_id)
+            .then_with(|| a.node_id.to_string().cmp(&b.node_id.to_string()))
+            .then_with(|| a.version.cmp(&b.version))
+    });
+    let mut materialized = MaterializedObjects::default();
+    let index = fold_rows(rows, local_pond_id, Some(&mut materialized))?;
+    let records = node_manifest_records(&index)?;
+    let (manifest_root, manifest_objects) =
+        build_manifest_map(&records).map_err(StewardError::Content)?;
+    let manifest_changes = records
+        .into_iter()
+        .map(|record| ManifestChange::new(None, Some(record)).map_err(StewardError::Content))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut introduced_objects = materialized
+        .inline
+        .iter()
+        .flat_map(|(hash, object)| {
+            object
+                .kinds
+                .iter()
+                .copied()
+                .map(|kind| ObjectDescriptor::new(*hash, kind))
+        })
+        .collect::<Vec<_>>();
+    let mut object_bytes = materialized
+        .inline
+        .into_iter()
+        .map(|(hash, object)| (hash, object.bytes))
+        .collect::<BTreeMap<_, _>>();
+    introduced_objects.extend(
+        materialized
+            .external_blobs
+            .iter()
+            .copied()
+            .map(|hash| ObjectDescriptor::new(hash, ContentObjectKind::RawBlob)),
+    );
+    for (hash, bytes) in manifest_objects {
+        let _ = object_bytes.insert(hash, bytes);
+        introduced_objects.push(ObjectDescriptor::new(hash, ContentObjectKind::ManifestNode));
+    }
+    let mut pack_bytes = BTreeMap::new();
+    let mut introduced_packs = Vec::new();
+    for material in &materialized.series_material {
+        if let Some(pack) = build_initial_pack_index(material)? {
+            let bytes = pack.encode();
+            let pack_hash = ObjectHash::of_bytes(&bytes);
+            let _ = pack_bytes.insert(pack_hash, bytes);
+            introduced_packs.push(PackDescriptor::new(material.series_hash, pack_hash));
+        }
+    }
+    introduced_objects.sort_unstable();
+    introduced_objects.dedup();
+    introduced_packs.sort_unstable();
+    introduced_packs.dedup();
     Ok(SpineInputs {
-        manifest_bytes,
-        root_tree_hash: state.root_tree_hash,
-        node_manifest_hash: state.node_manifest_hash,
-        node_manifest_root: state.node_manifest_root,
+        index_bytes: encode_manifest_root(manifest_root),
+        root_tree_hash: index.root_tree_hash,
+        manifest_root,
+        manifest_changes,
+        introduced_objects,
+        introduced_packs,
+        object_bytes,
+        pack_bytes,
     })
 }
 
@@ -537,6 +659,8 @@ pub(crate) async fn in_txn_spine_inputs(
 /// `tree_hash` is `encode_tree` over `(name, entry_type, child_hash)` for its
 /// content children, so those three fields are all the incremental fold needs.
 #[derive(Clone)]
+#[cfg(any())]
+#[allow(dead_code)]
 struct ChildLite {
     node_id: String,
     name: String,
@@ -548,15 +672,12 @@ struct ChildLite {
 ///
 /// The oracle recomputes both commit roots with a full `O(n)`
 /// [`in_txn_spine_inputs`] fold and asserts they match the `O(change)`
-/// [`incremental_spine_inputs`] result (step 4b).  It is always on in debug
-/// builds.  In release builds it is opt-in via the `POND_VERIFY_FOLD`
-/// environment variable -- set to any value other than empty, `0`, or `false`
-/// -- so a high-value pond can validate every commit without a debug rebuild.
+/// [`incremental_spine_inputs`] result (step 4b). It is an explicit diagnostic,
+/// enabled in any build only by `POND_VERIFY_FOLD` (any value other than empty,
+/// `0`, or `false`). Ordinary debug/test execution must retain production's
+/// bounded local-cost shape rather than hiding a full fold behind build mode.
 /// The environment is read once and cached for the process lifetime.
 pub(crate) fn fold_verification_enabled() -> bool {
-    if cfg!(debug_assertions) {
-        return true;
-    }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         let enabled = std::env::var("POND_VERIFY_FOLD")
@@ -577,6 +698,673 @@ pub(crate) fn fold_verification_enabled() -> bool {
     })
 }
 
+/// Compute a native-v2 commit delta from the prior persistent manifest root
+/// and this transaction's touched rows.
+///
+/// Point lookups load only identities on changed/ancestor paths. Unchanged
+/// Patricia subtrees and content objects remain addressed by their prior
+/// hashes and are never enumerated.
+pub(crate) async fn incremental_spine_inputs_v2(
+    committed_table: deltalake::DeltaTable,
+    prior_index_bytes: Option<Vec<u8>>,
+    uncommitted: Vec<OplogEntry>,
+    local_pond_id: &str,
+    pond_path: &std::path::Path,
+) -> Result<SpineInputs, StewardError> {
+    let Some(prior_index_bytes) = prior_index_bytes else {
+        return in_txn_spine_inputs(committed_table, uncommitted, local_pond_id).await;
+    };
+    let prior_root = decode_manifest_root(&prior_index_bytes).map_err(StewardError::Content)?;
+    let local_store = crate::local_content::LocalContentStore::new(pond_path);
+    let loader_store = local_store.clone();
+    let mut editor = ManifestMapEditor::new(Some(prior_root), move |hash| {
+        loader_store.read_string_error(hash)
+    });
+    let mut prior_cache: HashMap<String, Option<ManifestRecord>> = HashMap::new();
+    let mut mutations: HashMap<String, Option<ManifestRecord>> = HashMap::new();
+    let mut object_bytes = BTreeMap::new();
+    let mut introduced_objects = Vec::new();
+    let mut pack_bytes = BTreeMap::new();
+    let mut introduced_packs = Vec::new();
+
+    let mut dir_rows: HashMap<String, (i64, Vec<u8>)> = HashMap::new();
+    let mut leaf_latest: HashMap<String, OplogEntry> = HashMap::new();
+    let mut series_new: HashMap<String, BTreeMap<i64, SeriesVersionData>> = HashMap::new();
+    for row in uncommitted {
+        if row.pond_id != local_pond_id {
+            continue;
+        }
+        let node = row.node_id.to_string();
+        match row.file_type {
+            EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries => {
+                let range = CollapseRange::of(&row);
+                if range.merged {
+                    return Err(StewardError::DeltaLake(format!(
+                        "native series commit for node {node} contains a collapsed range \
+                         [{}, {}]; logical series updates must be append-only",
+                        range.lo, range.hi
+                    )));
+                }
+                let data = series_version_data(
+                    row.version,
+                    row.timestamp,
+                    &row.blake3,
+                    row.content.clone(),
+                    row.min_event_time,
+                    row.max_event_time,
+                    row.extended_attributes.as_ref(),
+                    &row.logical_leaf_hash,
+                    row.logical_count,
+                    &row.series_schema_fingerprint,
+                    row.size,
+                    &node,
+                )?;
+                let _ = series_new
+                    .entry(node.clone())
+                    .or_default()
+                    .insert(row.version, data);
+            }
+            EntryType::DirectoryPhysical => {
+                let content = row.content.clone().unwrap_or_default();
+                let slot = dir_rows
+                    .entry(node)
+                    .or_insert((row.version, content.clone()));
+                if row.version >= slot.0 {
+                    *slot = (row.version, content);
+                }
+            }
+            _ => {
+                if leaf_latest
+                    .get(&node)
+                    .is_none_or(|prior| row.version >= prior.version)
+                {
+                    let _ = leaf_latest.insert(node, row);
+                }
+            }
+        }
+    }
+
+    for (node_id, row) in &leaf_latest {
+        let prior = lookup_prior(&mut editor, &mut prior_cache, node_id)?;
+        let (child_hash, versions, object) = match row.file_type {
+            EntryType::FilePhysicalVersion | EntryType::TablePhysicalVersion => {
+                let hash = row_blob_hash(&row.blake3, row.content.as_deref());
+                (
+                    hash,
+                    vec![version_meta(
+                        row.timestamp,
+                        row.min_event_time,
+                        row.max_event_time,
+                        row.extended_attributes.as_ref(),
+                    )],
+                    row.content
+                        .clone()
+                        .map(|bytes| (ContentObjectKind::RawBlob, bytes)),
+                )
+            }
+            EntryType::Symlink => {
+                let bytes = row.content.clone().unwrap_or_default();
+                (
+                    ObjectHash::of_bytes(&bytes),
+                    vec![version_meta(
+                        row.timestamp,
+                        row.min_event_time,
+                        row.max_event_time,
+                        row.extended_attributes.as_ref(),
+                    )],
+                    Some((ContentObjectKind::RawBlob, bytes)),
+                )
+            }
+            EntryType::DirectoryDynamic | EntryType::FileDynamic | EntryType::TableDynamic => {
+                let factory = row.factory.as_deref().ok_or_else(|| {
+                    StewardError::DeltaLake(format!(
+                        "dynamic node {node_id} is missing its factory type"
+                    ))
+                })?;
+                let bytes = encode_recipe(factory, row.content.as_deref().unwrap_or(&[]));
+                (
+                    ObjectHash::of_bytes(&bytes),
+                    vec![version_meta(
+                        row.timestamp,
+                        row.min_event_time,
+                        row.max_event_time,
+                        row.extended_attributes.as_ref(),
+                    )],
+                    Some((ContentObjectKind::Recipe, bytes)),
+                )
+            }
+            other => {
+                return Err(StewardError::DeltaLake(format!(
+                    "unexpected changed leaf type {other:?} for node {node_id}"
+                )));
+            }
+        };
+        if let Some((kind, bytes)) = object {
+            insert_local_object(
+                &mut object_bytes,
+                &mut introduced_objects,
+                kind,
+                child_hash,
+                bytes,
+            )?;
+        } else {
+            introduced_objects.push(ObjectDescriptor::new(
+                child_hash,
+                ContentObjectKind::RawBlob,
+            ));
+        }
+        let mut entry = prior.as_ref().map_or_else(
+            || {
+                ManifestEntry::new(
+                    node_id.clone(),
+                    String::new(),
+                    String::new(),
+                    row.file_type,
+                    child_hash,
+                    versions.clone(),
+                )
+            },
+            |record| record.entry.clone(),
+        );
+        entry.entry_type = row.file_type;
+        entry.child_hash = child_hash;
+        entry.versions = versions;
+        let record = ManifestRecord::new(entry, Vec::new()).map_err(StewardError::Content)?;
+        let _ = mutations.insert(node_id.clone(), Some(record));
+    }
+
+    for (node_id, appended) in &series_new {
+        let prior = lookup_prior(&mut editor, &mut prior_cache, node_id)?;
+        let entry_type = prior
+            .as_ref()
+            .map(|record| record.entry.entry_type)
+            .or_else(|| {
+                appended.values().next().map(|_| {
+                    if appended
+                        .values()
+                        .any(|version| version.schema_fingerprint.is_some())
+                    {
+                        EntryType::TablePhysicalSeries
+                    } else {
+                        EntryType::FilePhysicalSeries
+                    }
+                })
+            })
+            .ok_or_else(|| {
+                StewardError::DeltaLake(format!("changed series node {node_id} has no entry type"))
+            })?;
+        let prior_manifest = prior
+            .as_ref()
+            .map(|record| {
+                let hash = record.entry.child_hash;
+                let bytes = local_store.read(hash)?;
+                let manifest = SeriesManifest::decode(&bytes).map_err(|error| {
+                    StewardError::Content(format!(
+                        "decode prior series manifest {hash} for node {node_id}: {error}"
+                    ))
+                })?;
+                if manifest.hash() != hash {
+                    return Err(StewardError::Content(format!(
+                        "prior series manifest for node {node_id} hashes to {}, expected {hash}",
+                        manifest.hash()
+                    )));
+                }
+                Ok(manifest)
+            })
+            .transpose()?;
+        let appended_versions = appended.values().cloned().collect::<Vec<_>>();
+        let (manifest, meta) = append_series_manifest(
+            entry_type,
+            prior_manifest.as_ref(),
+            prior
+                .as_ref()
+                .and_then(|record| record.entry.versions.first()),
+            &appended_versions,
+        )?;
+        let series_hash = manifest.hash();
+        insert_local_object(
+            &mut object_bytes,
+            &mut introduced_objects,
+            ContentObjectKind::SeriesManifest,
+            series_hash,
+            manifest.encode(),
+        )?;
+        for version in appended.values() {
+            if version.blob_size == 0 {
+                continue;
+            }
+            match &version.content {
+                Some(bytes) => insert_local_object(
+                    &mut object_bytes,
+                    &mut introduced_objects,
+                    ContentObjectKind::RawBlob,
+                    version.blob_hash,
+                    bytes.clone(),
+                )?,
+                None => introduced_objects.push(ObjectDescriptor::new(
+                    version.blob_hash,
+                    ContentObjectKind::RawBlob,
+                )),
+            }
+        }
+        let prior_leaf_count = prior_manifest
+            .as_ref()
+            .map_or(0, SeriesManifest::leaf_count);
+        let appended_leaf_count = appended_versions
+            .iter()
+            .filter(|version| version.logical_leaf_hash.is_some())
+            .count();
+        if appended_leaf_count > 0 {
+            let parent_series_hash = prior_manifest
+                .as_ref()
+                .filter(|manifest| manifest.leaf_count() > 0)
+                .map(|_| {
+                    prior
+                        .as_ref()
+                        .expect("a prior manifest implies a prior record")
+                        .entry
+                        .child_hash
+                });
+            let prefix = prior_manifest
+                .as_ref()
+                .map_or_else(MerkleFrontier::empty, |manifest| {
+                    manifest.merkle_frontier().clone()
+                });
+            let pack = build_series_segment_pack(
+                series_hash,
+                entry_type,
+                &manifest,
+                parent_series_hash,
+                prior_leaf_count,
+                &prefix,
+                &appended_versions,
+            )?;
+            let bytes = pack.encode();
+            let pack_hash = ObjectHash::of_bytes(&bytes);
+            let _ = pack_bytes.insert(pack_hash, bytes);
+            introduced_packs.push(PackDescriptor::new(series_hash, pack_hash));
+        }
+        let mut entry = prior.as_ref().map_or_else(
+            || {
+                ManifestEntry::new(
+                    node_id.clone(),
+                    String::new(),
+                    String::new(),
+                    entry_type,
+                    series_hash,
+                    vec![meta.clone()],
+                )
+            },
+            |record| record.entry.clone(),
+        );
+        entry.entry_type = entry_type;
+        entry.child_hash = series_hash;
+        entry.versions = vec![meta];
+        let record = ManifestRecord::new(entry, Vec::new()).map_err(StewardError::Content)?;
+        let _ = mutations.insert(node_id.clone(), Some(record));
+    }
+
+    let mut new_parent: HashMap<String, (String, String, EntryType)> = HashMap::new();
+    let mut decoded_directories: HashMap<String, Vec<ManifestRecordChild>> = HashMap::new();
+    for (directory_id, (_, content)) in &dir_rows {
+        let mut children = Vec::new();
+        for child in decode_directory_entries(content)
+            .map_err(|error| StewardError::DeltaLake(error.to_string()))?
+        {
+            let child_pond = child
+                .pond_id
+                .clone()
+                .unwrap_or_else(|| local_pond_id.to_string());
+            if child_pond != local_pond_id {
+                continue;
+            }
+            let child_id = child.child_node_id.to_string();
+            if child_id == tinyfs::INDEX_NODE_UUID || child_id == tinyfs::LOG_NODE_UUID {
+                continue;
+            }
+            if new_parent
+                .insert(
+                    child_id.clone(),
+                    (directory_id.clone(), child.name.clone(), child.entry_type),
+                )
+                .is_some()
+            {
+                return Err(StewardError::DeltaLake(format!(
+                    "node {child_id} appears in more than one modified directory"
+                )));
+            }
+            children.push(ManifestRecordChild::new(
+                child_id,
+                child.name,
+                child.entry_type,
+            ));
+        }
+        let _ = decoded_directories.insert(directory_id.clone(), children);
+    }
+
+    for (directory_id, children) in &decoded_directories {
+        let current = current_record(&mut editor, &mut prior_cache, &mutations, directory_id)?;
+        let mut entry = current.as_ref().map_or_else(
+            || {
+                ManifestEntry::bare(
+                    directory_id.clone(),
+                    String::new(),
+                    String::new(),
+                    EntryType::DirectoryPhysical,
+                    ObjectHash::of_bytes(&[]),
+                )
+            },
+            |record| record.entry.clone(),
+        );
+        entry.entry_type = EntryType::DirectoryPhysical;
+        let record = ManifestRecord::new(entry, children.clone()).map_err(StewardError::Content)?;
+        let _ = mutations.insert(directory_id.clone(), Some(record));
+
+        for child in children {
+            let current =
+                current_record(&mut editor, &mut prior_cache, &mutations, &child.node_id)?;
+            let current = match current {
+                Some(current) => current,
+                None if child.entry_type == EntryType::DirectoryPhysical => {
+                    let bytes = encode_tree(&[]).map_err(StewardError::Content)?;
+                    let hash = ObjectHash::of_bytes(&bytes);
+                    insert_local_object(
+                        &mut object_bytes,
+                        &mut introduced_objects,
+                        ContentObjectKind::Tree,
+                        hash,
+                        bytes,
+                    )?;
+                    ManifestRecord::new(
+                        ManifestEntry::bare(
+                            child.node_id.clone(),
+                            directory_id.clone(),
+                            child.name.clone(),
+                            child.entry_type,
+                            hash,
+                        ),
+                        Vec::new(),
+                    )
+                    .map_err(StewardError::Content)?
+                }
+                None => {
+                    return Err(StewardError::DeltaLake(format!(
+                        "modified directory {directory_id} references unknown child {}",
+                        child.node_id
+                    )));
+                }
+            };
+            let mut updated = current;
+            updated.entry.parent_node_id = directory_id.clone();
+            updated.entry.name = child.name.clone();
+            updated.entry.entry_type = child.entry_type;
+            let _ = mutations.insert(child.node_id.clone(), Some(updated));
+        }
+    }
+
+    for (directory_id, children) in &decoded_directories {
+        let prior = lookup_prior(&mut editor, &mut prior_cache, directory_id)?;
+        let new_ids = children
+            .iter()
+            .map(|child| child.node_id.as_str())
+            .collect::<HashSet<_>>();
+        for prior_child in prior.into_iter().flat_map(|record| record.children) {
+            if !new_ids.contains(prior_child.node_id.as_str())
+                && !new_parent.contains_key(&prior_child.node_id)
+            {
+                mark_deleted_subtree(
+                    &prior_child.node_id,
+                    &mut editor,
+                    &mut prior_cache,
+                    &mut mutations,
+                )?;
+            }
+        }
+    }
+
+    let mutation_ids = mutations.keys().cloned().collect::<Vec<_>>();
+    let mut dirty_directories = BTreeSet::new();
+    for node_id in mutation_ids {
+        let before = lookup_prior(&mut editor, &mut prior_cache, &node_id)?;
+        let after = mutations.get(&node_id).cloned().flatten();
+        for record in before.iter().chain(after.iter()) {
+            if record.entry.entry_type == EntryType::DirectoryPhysical {
+                let _ = dirty_directories.insert(record.entry.node_id.clone());
+            }
+            let mut parent = record.entry.parent_node_id.clone();
+            let mut seen = HashSet::new();
+            while !parent.is_empty() && seen.insert(parent.clone()) {
+                let _ = dirty_directories.insert(parent.clone());
+                parent = current_record(&mut editor, &mut prior_cache, &mutations, &parent)?
+                    .or_else(|| prior_cache.get(&parent).cloned().flatten())
+                    .map(|record| record.entry.parent_node_id)
+                    .unwrap_or_default();
+            }
+        }
+    }
+    let _ = dirty_directories.insert(ROOT_UUID.to_string());
+
+    let mut depth_cache = HashMap::new();
+    let mut dirty_order = dirty_directories.into_iter().collect::<Vec<_>>();
+    dirty_order.sort_by_key(|node_id| {
+        std::cmp::Reverse(manifest_record_depth(
+            node_id,
+            &mut editor,
+            &mut prior_cache,
+            &mutations,
+            &mut depth_cache,
+        ))
+    });
+    for directory_id in dirty_order {
+        let Some(mut directory) =
+            current_record(&mut editor, &mut prior_cache, &mutations, &directory_id)?
+        else {
+            continue;
+        };
+        if directory.entry.entry_type != EntryType::DirectoryPhysical {
+            continue;
+        }
+        let mut tree_entries = Vec::with_capacity(directory.children.len());
+        for child in &directory.children {
+            let child_record =
+                current_record(&mut editor, &mut prior_cache, &mutations, &child.node_id)?
+                    .ok_or_else(|| {
+                        StewardError::DeltaLake(format!(
+                            "directory {directory_id} references deleted child {}",
+                            child.node_id
+                        ))
+                    })?;
+            if child_record.entry.parent_node_id != directory_id
+                || child_record.entry.name != child.name
+                || child_record.entry.entry_type != child.entry_type
+            {
+                return Err(StewardError::DeltaLake(format!(
+                    "directory {directory_id} child identity {} disagrees with its manifest record",
+                    child.node_id
+                )));
+            }
+            tree_entries.push(TreeEntry::new(
+                child.name.clone(),
+                child.entry_type,
+                child_record.entry.child_hash,
+                child_record.entry.versions.clone(),
+            ));
+        }
+        let bytes = encode_tree(&tree_entries).map_err(StewardError::Content)?;
+        let tree_hash = ObjectHash::of_bytes(&bytes);
+        insert_local_object(
+            &mut object_bytes,
+            &mut introduced_objects,
+            ContentObjectKind::Tree,
+            tree_hash,
+            bytes,
+        )?;
+        directory.entry.child_hash = tree_hash;
+        directory.entry.versions.clear();
+        let _ = mutations.insert(directory_id, Some(directory));
+    }
+
+    let root_tree_hash = current_record(&mut editor, &mut prior_cache, &mutations, ROOT_UUID)?
+        .ok_or_else(|| StewardError::DeltaLake("manifest update deleted the root".to_string()))?
+        .entry
+        .child_hash;
+
+    let mut manifest_changes = Vec::new();
+    let mut ordered_mutations = mutations.into_iter().collect::<Vec<_>>();
+    ordered_mutations.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    for (node_id, after) in ordered_mutations {
+        let before = lookup_prior(&mut editor, &mut prior_cache, &node_id)?;
+        if before == after {
+            continue;
+        }
+        manifest_changes
+            .push(ManifestChange::new(before, after.clone()).map_err(StewardError::Content)?);
+        match after {
+            Some(record) => editor.upsert(record).map_err(StewardError::Content)?,
+            None => {
+                let removed = editor.remove(&node_id).map_err(StewardError::Content)?;
+                if !removed {
+                    return Err(StewardError::DeltaLake(format!(
+                        "manifest change deletes absent node {node_id}"
+                    )));
+                }
+            }
+        }
+    }
+    let (manifest_root, manifest_objects) = editor.finish().map_err(StewardError::Content)?;
+    for (hash, bytes) in manifest_objects {
+        insert_local_object(
+            &mut object_bytes,
+            &mut introduced_objects,
+            ContentObjectKind::ManifestNode,
+            hash,
+            bytes,
+        )?;
+    }
+    introduced_objects.sort_unstable();
+    introduced_objects.dedup();
+    introduced_packs.sort_unstable();
+    introduced_packs.dedup();
+
+    Ok(SpineInputs {
+        index_bytes: encode_manifest_root(manifest_root),
+        root_tree_hash,
+        manifest_root,
+        manifest_changes,
+        introduced_objects,
+        introduced_packs,
+        object_bytes,
+        pack_bytes,
+    })
+}
+
+fn lookup_prior<F>(
+    editor: &mut ManifestMapEditor<F>,
+    cache: &mut HashMap<String, Option<ManifestRecord>>,
+    node_id: &str,
+) -> Result<Option<ManifestRecord>, StewardError>
+where
+    F: FnMut(ObjectHash) -> Result<Vec<u8>, String>,
+{
+    if let Some(record) = cache.get(node_id) {
+        return Ok(record.clone());
+    }
+    let record = editor.lookup(node_id).map_err(StewardError::Content)?;
+    let _ = cache.insert(node_id.to_string(), record.clone());
+    Ok(record)
+}
+
+fn current_record<F>(
+    editor: &mut ManifestMapEditor<F>,
+    cache: &mut HashMap<String, Option<ManifestRecord>>,
+    mutations: &HashMap<String, Option<ManifestRecord>>,
+    node_id: &str,
+) -> Result<Option<ManifestRecord>, StewardError>
+where
+    F: FnMut(ObjectHash) -> Result<Vec<u8>, String>,
+{
+    match mutations.get(node_id) {
+        Some(record) => Ok(record.clone()),
+        None => lookup_prior(editor, cache, node_id),
+    }
+}
+
+fn mark_deleted_subtree<F>(
+    node_id: &str,
+    editor: &mut ManifestMapEditor<F>,
+    cache: &mut HashMap<String, Option<ManifestRecord>>,
+    mutations: &mut HashMap<String, Option<ManifestRecord>>,
+) -> Result<(), StewardError>
+where
+    F: FnMut(ObjectHash) -> Result<Vec<u8>, String>,
+{
+    let Some(record) = current_record(editor, cache, mutations, node_id)? else {
+        return Ok(());
+    };
+    for child in record.children.clone() {
+        mark_deleted_subtree(&child.node_id, editor, cache, mutations)?;
+    }
+    let _ = mutations.insert(node_id.to_string(), None);
+    Ok(())
+}
+
+fn manifest_record_depth<F>(
+    node_id: &str,
+    editor: &mut ManifestMapEditor<F>,
+    cache: &mut HashMap<String, Option<ManifestRecord>>,
+    mutations: &HashMap<String, Option<ManifestRecord>>,
+    depth_cache: &mut HashMap<String, usize>,
+) -> usize
+where
+    F: FnMut(ObjectHash) -> Result<Vec<u8>, String>,
+{
+    if node_id == ROOT_UUID {
+        return 0;
+    }
+    if let Some(depth) = depth_cache.get(node_id) {
+        return *depth;
+    }
+    let depth = current_record(editor, cache, mutations, node_id)
+        .ok()
+        .flatten()
+        .and_then(|record| {
+            (!record.entry.parent_node_id.is_empty()).then_some(record.entry.parent_node_id)
+        })
+        .map_or(usize::MAX / 2, |parent| {
+            manifest_record_depth(&parent, editor, cache, mutations, depth_cache).saturating_add(1)
+        });
+    let _ = depth_cache.insert(node_id.to_string(), depth);
+    depth
+}
+
+fn insert_local_object(
+    object_bytes: &mut BTreeMap<ObjectHash, Vec<u8>>,
+    descriptors: &mut Vec<ObjectDescriptor>,
+    kind: ContentObjectKind,
+    hash: ObjectHash,
+    bytes: Vec<u8>,
+) -> Result<(), StewardError> {
+    let actual = ObjectHash::of_bytes(&bytes);
+    if actual != hash {
+        return Err(StewardError::Content(format!(
+            "local {} object hashes to {}, expected {}",
+            kind.as_str(),
+            actual,
+            hash
+        )));
+    }
+    if let Some(existing) = object_bytes.insert(hash, bytes.clone())
+        && existing != bytes
+    {
+        return Err(StewardError::Content(format!(
+            "two local objects claim hash {} with different bytes",
+            hash
+        )));
+    }
+    descriptors.push(ObjectDescriptor::new(hash, kind));
+    Ok(())
+}
+
 /// Compute the two commit roots incrementally along the touched path only,
 /// using the pond's previously committed node manifest as the child-hash
 /// baseline (design `docs/incremental-content-tree-design.md` Section 10,
@@ -589,8 +1377,7 @@ pub(crate) fn fold_verification_enabled() -> bool {
 /// path then has its `tree_hash` recomputed bottom-up, while untouched subtrees
 /// keep their cached `child_hash`.  The result is byte-identical to a full
 /// [`fold_rows`] of the post-commit live state, which the guard verifies against
-/// this on every commit when [`fold_verification_enabled`] is true (always in
-/// debug builds; opt-in via `POND_VERIFY_FOLD` in release builds).
+/// this on every commit when the explicit `POND_VERIFY_FOLD` diagnostic is set.
 ///
 /// `prior_manifest_bytes` is `None` only at genesis (no index node yet), when
 /// there is no baseline to build on and the full fold in [`in_txn_spine_inputs`]
@@ -601,6 +1388,8 @@ pub(crate) fn fold_verification_enabled() -> bool {
 /// Returns an error if the prior manifest cannot be decoded, a touched series'
 /// committed versions cannot be read, a referenced child has no known hash, or
 /// a tree/manifest cannot be encoded.
+#[cfg(any())]
+#[allow(dead_code)]
 pub(crate) async fn incremental_spine_inputs(
     committed_table: deltalake::DeltaTable,
     prior_manifest_bytes: Option<Vec<u8>>,
@@ -741,7 +1530,7 @@ pub(crate) async fn incremental_spine_inputs(
     // New content hash of every touched series: its committed version blobs
     // followed by this transaction's appended versions, pruned by range
     // containment and ordered oldest content first, exactly as [`fold_rows`]
-    // does, then folded into one watertown.series.v2 manifest.
+    // does, then folded into one watertown.series.v3 manifest.
     for (node, appended) in &series_new {
         let (mut versions, mut ranges) =
             read_series_committed(committed_table.clone(), local_pond_id, node).await?;
@@ -885,20 +1674,48 @@ pub(crate) async fn incremental_spine_inputs(
         }
     }
 
-    let node_manifest_hash = manifest_hash(&manifest).map_err(StewardError::Content)?;
-    let node_manifest_root = node_merkle_rebuild_root(&manifest).map_err(StewardError::Content)?;
-    let manifest_bytes = encode_manifest(&manifest).map_err(StewardError::Content)?;
+    let records = manifest
+        .iter()
+        .cloned()
+        .map(|entry| {
+            let children = dir_children
+                .get(&entry.node_id)
+                .into_iter()
+                .flatten()
+                .map(|child| {
+                    ManifestRecordChild::new(
+                        child.node_id.clone(),
+                        child.name.clone(),
+                        child.entry_type,
+                    )
+                })
+                .collect();
+            ManifestRecord::new(entry, children).map_err(StewardError::Content)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (manifest_root, manifest_objects) =
+        build_manifest_map(&records).map_err(StewardError::Content)?;
     Ok(SpineInputs {
-        manifest_bytes,
+        index_bytes: encode_manifest_root(manifest_root),
         root_tree_hash,
-        node_manifest_hash,
-        node_manifest_root,
+        manifest_root,
+        manifest_changes: Vec::new(),
+        introduced_objects: manifest_objects
+            .keys()
+            .copied()
+            .map(|hash| ObjectDescriptor::new(hash, ContentObjectKind::ManifestNode))
+            .collect(),
+        introduced_packs: Vec::new(),
+        object_bytes: manifest_objects,
+        pack_bytes: BTreeMap::new(),
     })
 }
 
 /// Depth of a node below the root (root = 0), memoized across a fold.  A node
 /// whose parent chain does not reach the root (a detached fragment) is treated
 /// as maximally deep so it is recomputed before any real ancestor.
+#[cfg(any())]
+#[allow(dead_code)]
 fn node_depth(
     node: &str,
     parent_of: &HashMap<String, String>,
@@ -918,81 +1735,9 @@ fn node_depth(
     depth
 }
 
-/// Read a series node's committed version blob hashes from `table`, keyed by
-/// version, together with the [`CollapseRange`] of every committed row.  Unlike
-/// [`fold_rows`], the pruning is left to the caller so this transaction's
-/// appended rows can be folded in first.
-///
-/// Used by the incremental fold to rebuild a touched series' hash from its
-/// committed history plus this transaction's appended versions.
-///
-/// # Errors
-///
-/// Returns an error if the series rows cannot be read or deserialized.
-async fn read_series_committed(
-    table: deltalake::DeltaTable,
-    pond_id: &str,
-    node_id: &str,
-) -> Result<(BTreeMap<i64, SeriesVersionData>, Vec<(i64, CollapseRange)>), StewardError> {
-    let ctx = SessionContext::new();
-    let _previous = ctx
-        .register_table("series_live", Arc::new(table))
-        .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
-    let sql = format!(
-        "SELECT version, timestamp, blake3, content, collapsed_from, collapsed_through, \
-         min_event_time, max_event_time, extended_attributes, logical_leaf_hash, \
-         logical_count, series_schema_fingerprint, size FROM series_live \
-         WHERE pond_id = '{pond_id}' AND node_id = '{node_id}' ORDER BY version",
-    );
-    let batches = ctx
-        .sql(&sql)
-        .await
-        .map_err(|e| StewardError::DeltaLake(e.to_string()))?
-        .collect()
-        .await
-        .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
-    let mut rows: Vec<SeriesVersionRow> = Vec::new();
-    for batch in &batches {
-        let parsed: Vec<SeriesVersionRow> = serde_arrow::from_record_batch(batch)
-            .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
-        rows.extend(parsed);
-    }
-    let ranges: Vec<(i64, CollapseRange)> = rows
-        .iter()
-        .map(|r| {
-            (
-                r.version,
-                CollapseRange::new(r.version, r.collapsed_from, r.collapsed_through),
-            )
-        })
-        .collect();
-    let node_desc = format!("{pond_id}/{node_id}");
-    let mut versions: BTreeMap<i64, SeriesVersionData> = BTreeMap::new();
-    for row in rows {
-        let version = row.version;
-        let data = series_version_data(
-            version,
-            row.timestamp,
-            &row.blake3,
-            row.content,
-            row.min_event_time,
-            row.max_event_time,
-            row.extended_attributes.as_ref(),
-            &row.logical_leaf_hash,
-            row.logical_count,
-            &row.series_schema_fingerprint,
-            row.size,
-            &node_desc,
-        )?;
-        let _ = versions.insert(version, data);
-    }
-    Ok((versions, ranges))
-}
-
 /// Fetch **one** already-known-live series version's inline content, by
 /// `(pond_id, node_id, version)`, straight from that one Oplog row --
-/// never the whole series' `content` column read into memory in one batch
-/// the way [`read_series_committed`] does.
+/// never the whole series' `content` column read into memory in one batch.
 ///
 /// Returns `None` when that version's row carries no inline `content` --
 /// it was externalized to `_large_files`, so its bytes must instead be
@@ -1063,7 +1808,6 @@ pub(crate) async fn read_series_version_inline_content(
 /// persisted `size`) *without* selecting or deserializing the row's
 /// (potentially large) inline `content` column at all.
 ///
-/// This is the metadata-only counterpart to [`read_series_committed`]:
 /// `crate::pack_maintenance`'s discovery (shared by dry-run and a real run)
 /// uses this so surveying every over-threshold series in a pond never reads,
 /// decodes, or buffers a single byte of any series' actual payload -- a real
@@ -1142,35 +1886,13 @@ pub(crate) async fn read_series_live_metadata_ordered(
         .collect())
 }
 
-/// One committed series version row's identity/bookkeeping metadata, exactly
-/// [`SeriesVersionRow`] minus the inline `content` column -- see
-/// [`read_series_live_metadata_ordered`].
+/// One committed series version row's identity/bookkeeping metadata, excluding
+/// the inline `content` column -- see [`read_series_live_metadata_ordered`].
 #[derive(serde::Deserialize)]
 struct SeriesVersionMetaRow {
     version: i64,
     timestamp: i64,
     blake3: Option<String>,
-    collapsed_from: Option<i64>,
-    collapsed_through: Option<i64>,
-    min_event_time: Option<i64>,
-    max_event_time: Option<i64>,
-    extended_attributes: Option<String>,
-    logical_leaf_hash: Option<String>,
-    logical_count: Option<i64>,
-    series_schema_fingerprint: Option<String>,
-    size: Option<i64>,
-}
-
-/// One committed series version row: its version and the fields
-/// [`row_blob_hash`] needs, plus the collapse range columns, the node
-/// metadata a replica cannot recompute, and the v2 logical-series identity
-/// columns [`series_version_data`] parses.
-#[derive(serde::Deserialize)]
-struct SeriesVersionRow {
-    version: i64,
-    timestamp: i64,
-    blake3: Option<String>,
-    content: Option<Vec<u8>>,
     collapsed_from: Option<i64>,
     collapsed_through: Option<i64>,
     min_event_time: Option<i64>,
@@ -1236,6 +1958,52 @@ struct LogLeaf {
     content: Option<Vec<u8>>,
 }
 
+/// Read exactly the latest committed reserved manifest-index pointer for one
+/// pond partition.
+///
+/// This avoids opening the index as a `FilePhysicalSeries`, whose generic read
+/// path would load every retained collapsed row before selecting the live one.
+pub(crate) async fn index_root_pointer_bytes(
+    table: deltalake::DeltaTable,
+    pond_id: &str,
+) -> Result<Option<Vec<u8>>, StewardError> {
+    let ctx = SessionContext::new();
+    let _ = ctx
+        .register_table("index_tip", Arc::new(table))
+        .map_err(|error| StewardError::DeltaLake(error.to_string()))?;
+    let sql = format!(
+        "SELECT version, content FROM index_tip WHERE pond_id = '{pond_id}' \
+         AND node_id = '{index}' ORDER BY version DESC LIMIT 1",
+        index = tinyfs::INDEX_NODE_UUID,
+    );
+    let batches = ctx
+        .sql(&sql)
+        .await
+        .map_err(|error| StewardError::DeltaLake(error.to_string()))?
+        .collect()
+        .await
+        .map_err(|error| StewardError::DeltaLake(error.to_string()))?;
+    let mut rows = Vec::new();
+    for batch in &batches {
+        rows.extend(
+            serde_arrow::from_record_batch::<Vec<LogLeaf>>(batch)
+                .map_err(|error| StewardError::DeltaLake(error.to_string()))?,
+        );
+    }
+    match rows.as_slice() {
+        [] => Ok(None),
+        [row] => row.content.clone().map(Some).ok_or_else(|| {
+            StewardError::Content(format!(
+                "manifest-index pointer at version {} has no content",
+                row.version
+            ))
+        }),
+        _ => Err(StewardError::Content(
+            "bounded manifest-index query returned multiple rows".to_string(),
+        )),
+    }
+}
+
 /// The current tip of the commit-log node -- the hash of its last leaf's commit
 /// object -- to use as the `parent_commit_hash` of the next commit.  `None`
 /// when the log node is empty (genesis).
@@ -1243,11 +2011,44 @@ pub(crate) async fn log_tip_commit_hash(
     table: deltalake::DeltaTable,
     pond_id: &str,
 ) -> Result<Option<ObjectHash>, StewardError> {
-    let leaves = read_log_leaves(table, pond_id).await?;
-    let Some(last) = leaves.last() else {
-        return Ok(None);
-    };
-    log_tip_hash(last)
+    let ctx = SessionContext::new();
+    let _ = ctx
+        .register_table("log_tip", Arc::new(table))
+        .map_err(|error| StewardError::DeltaLake(error.to_string()))?;
+    let sql = format!(
+        "SELECT version, content FROM log_tip WHERE pond_id = '{pond_id}' AND node_id = '{log}' \
+         ORDER BY version DESC LIMIT 1",
+        log = tinyfs::LOG_NODE_UUID,
+    );
+    let batches = ctx
+        .sql(&sql)
+        .await
+        .map_err(|error| StewardError::DeltaLake(error.to_string()))?
+        .collect()
+        .await
+        .map_err(|error| StewardError::DeltaLake(error.to_string()))?;
+    let mut rows = Vec::new();
+    for batch in &batches {
+        rows.extend(
+            serde_arrow::from_record_batch::<Vec<LogLeaf>>(batch)
+                .map_err(|error| StewardError::DeltaLake(error.to_string()))?,
+        );
+    }
+    match rows.as_slice() {
+        [] => Ok(None),
+        [row] => {
+            let bytes = row.content.as_deref().ok_or_else(|| {
+                StewardError::Content(format!(
+                    "commit-log tip at version {} has no content",
+                    row.version
+                ))
+            })?;
+            log_tip_hash(bytes)
+        }
+        _ => Err(StewardError::Content(
+            "bounded commit-log tip query returned multiple rows".to_string(),
+        )),
+    }
 }
 
 fn log_tip_hash(bytes: &[u8]) -> Result<Option<ObjectHash>, StewardError> {
@@ -1295,12 +2096,14 @@ pub(crate) async fn read_log_spines(
 pub(crate) fn build_commit_spine(
     parent_commit_hash: Option<ObjectHash>,
     root_tree_hash: ObjectHash,
-    node_manifest_hash: ObjectHash,
-    node_manifest_root: ObjectHash,
+    manifest_root: ObjectHash,
+    manifest_changes: Vec<ManifestChange>,
+    introduced_objects: Vec<ObjectDescriptor>,
+    introduced_packs: Vec<PackDescriptor>,
     pond_id_str: &str,
     txn_seq: i64,
     request: String,
-) -> CommitSpine {
+) -> Result<CommitSpine, StewardError> {
     let provenance = Provenance {
         pond_id: pond_id_str.to_string(),
         seq: txn_seq,
@@ -1308,29 +2111,32 @@ pub(crate) fn build_commit_spine(
         author: String::new(),
         request,
     };
-    let commit = Commit::new(
-        ContentModelVersion::LogicalSeriesV2,
+    let commit = Commit::new_with_delta(
+        ContentModelVersion::PublicationV2,
         root_tree_hash,
         parent_commit_hash,
-        node_manifest_hash,
-        node_manifest_root,
+        manifest_root,
+        manifest_changes,
+        introduced_objects,
+        introduced_packs,
         provenance,
-    );
-    CommitSpine {
+    )
+    .map_err(StewardError::Content)?;
+    Ok(CommitSpine {
         root_tree_hash: root_tree_hash.to_hex(),
         parent_commit_hash: parent_commit_hash.map(|h| h.to_hex()),
         commit_hash: commit.hash().to_hex(),
         commit_object: hex::encode(commit.encode()),
-    }
+    })
 }
 
-/// Build a target pond's current node state for an incremental rebuild: a map
-/// from `node_id` to its [`ManifestEntry`]; a map from each series `node_id`
-/// to its ordered version blob hashes (v1 physical-blob identity); and a map
-/// from each series `node_id` to its ordered v2 logical leaf hashes (`docs/
-/// logical-series-identity-design.md`), used by native v2 materialization to
-/// find the suffix of leaves a source's fetched manifest still needs to
-/// write.
+/// Build a target pond's complete current node state for a full clone/rebuild
+/// or explicit diagnostic: a map from `node_id` to its [`ManifestEntry`] and a
+/// map from each series `node_id` to every ordered v2 logical leaf hash.
+///
+/// Ordinary incremental native-v2 pulls must not call this O(history) helper;
+/// they point-load changed records and prior series manifests from the
+/// persistent local manifest map.
 ///
 /// The maps are keyed by `node_id` alone (not the full `NodeKey`) because an
 /// incremental pull operates within a single mirror pond; the diff against the
@@ -1345,7 +2151,6 @@ pub(crate) async fn build_target_state(
     (
         HashMap<String, ManifestEntry>,
         HashMap<String, Vec<ObjectHash>>,
-        HashMap<String, Vec<ObjectHash>>,
     ),
     StewardError,
 > {
@@ -1353,11 +2158,10 @@ pub(crate) async fn build_target_state(
     build_target_state_for_pond(ship, &local_pond_id).await
 }
 
-/// Build the target's current node state for a named pond, keyed by `node_id`,
-/// for a cross-pond import: the foreign pond's rows live under their own
-/// `pond_id` partition, so the diff against the source manifest is computed
-/// over that pond_id rather than the local one.  Returns empty maps when the
-/// foreign pond has no root row yet (a first import has nothing to diff).
+/// Build the complete target state for a named foreign pond during a full
+/// import/rebuild. Returns empty maps when the foreign pond has no root row yet.
+/// Incremental graft pulls use the foreign pond's reserved manifest root and
+/// do not call this helper.
 ///
 /// # Errors
 ///
@@ -1370,7 +2174,6 @@ pub(crate) async fn build_target_state_for_pond(
     (
         HashMap<String, ManifestEntry>,
         HashMap<String, Vec<ObjectHash>>,
-        HashMap<String, Vec<ObjectHash>>,
     ),
     StewardError,
 > {
@@ -1379,7 +2182,7 @@ pub(crate) async fn build_target_state_for_pond(
         Ok(index) => index,
         // A foreign pond with no root row yet: first import, empty target.
         Err(StewardError::DeltaLake(msg)) if msg.contains("no root directory row") => {
-            return Ok((HashMap::new(), HashMap::new(), HashMap::new()));
+            return Ok((HashMap::new(), HashMap::new()));
         }
         Err(e) => return Err(e),
     };
@@ -1387,27 +2190,13 @@ pub(crate) async fn build_target_state_for_pond(
         .into_iter()
         .map(|e| (e.node_id.clone(), e))
         .collect();
-    // Filter to the requested pond BEFORE dropping the pond_id component.  The
-    // fold scans the whole data table and keys `series_versions` by
-    // (pond_id, node_id); under D8 the source's node_ids are adopted verbatim,
-    // so a mirror/import can hold the same series node_id under two different
-    // pond_ids.  Collapsing to node_id-only without this filter lets a foreign
-    // pond's version list win nondeterministically, corrupting the append-only
-    // prefix used by incremental pull.  Mirrors the pond filter in
-    // node_manifest_entries.
-    let series = index
-        .series_versions
-        .into_iter()
-        .filter(|((pond, _node_id), _versions)| pond == pond_id)
-        .map(|((_pond, node_id), versions)| (node_id, versions))
-        .collect();
     let series_leaves = index
         .series_leaf_hashes
         .into_iter()
         .filter(|((pond, _node_id), _leaves)| pond == pond_id)
         .map(|((_pond, node_id), leaves)| (node_id, leaves))
         .collect();
-    Ok((by_id, series, series_leaves))
+    Ok((by_id, series_leaves))
 }
 
 /// Materialize the content objects reachable from a pond's root tree.
@@ -1431,17 +2220,17 @@ pub async fn materialize_content_objects(ship: &Ship) -> Result<MaterializedObje
     // is the one caller that scans with content (`want_content = true`).
     let rows = scan_live_rows(table, true).await?;
     let index = fold_rows(rows, &local_pond_id, Some(&mut materialized))?;
-    // The node manifest travels with the closure so a consumer can adopt the
-    // source's node_ids (Section 4.5).  It is kept separate from the pure
-    // content objects because it is pond-specific (it carries node_ids); the
-    // commit references it by hash.
-    let manifest = node_manifest_entries(&index);
-    let manifest_bytes = encode_manifest(&manifest).map_err(StewardError::Content)?;
-    materialized.manifest = Some((ObjectHash::of_bytes(&manifest_bytes), manifest_bytes));
+    let records = node_manifest_records(&index)?;
+    let (manifest_root, nodes) = build_manifest_map(&records).map_err(StewardError::Content)?;
+    for (hash, bytes) in nodes {
+        materialized.put_inline(ContentObjectKind::ManifestNode, hash, bytes)?;
+    }
+    materialized.manifest_root = Some(manifest_root);
+    materialized.manifest_records = records;
     Ok(materialized)
 }
 
-/// Build the "initial" whole-range identity pack index for one folded v2
+/// Build a whole-range root pack index for one fully folded current
 /// series, directly from its already-persisted rows -- no payload bytes are
 /// read, decoded, concatenated, or re-encoded, and no new physical object is
 /// minted.
@@ -1467,12 +2256,9 @@ pub async fn materialize_content_objects(ship: &Ship) -> Result<MaterializedObje
 ///
 /// Deterministic and idempotent: called with the same persisted
 /// [`SeriesPackMaterial`], this always produces byte-identical
-/// [`PackIndex`] encodings, so it is safe to call repeatedly (on every push,
-/// or on-demand when a local `pond://` source is asked for a series it has
-/// not yet advertised) without ever diverging. Shared by the remote
-/// publication path ([`publish_initial_series_packs`]) and
-/// [`crate::content_source::LocalPondSource`]'s on-demand materialization
-/// of `data/_packs/v3/series=<hex>` for an unpushed local pond.
+/// [`PackIndex`] encodings. Initial publication and explicit full
+/// materialization may call it repeatedly without diverging; ordinary
+/// appends use [`build_series_segment_pack`] over only their new suffix.
 ///
 /// # Errors
 ///
@@ -1497,13 +2283,59 @@ pub(crate) fn build_initial_pack_index(
     if material.manifest.leaf_count() == 0 {
         return Ok(None);
     }
-    let leaf_versions: Vec<&SeriesVersionData> = material
-        .versions
-        .iter()
-        .filter(|v| v.logical_leaf_hash.is_some())
-        .collect();
+    build_series_segment_pack(
+        material.series_hash,
+        material.entry_type,
+        &material.manifest,
+        None,
+        0,
+        &MerkleFrontier::empty(),
+        &material.versions,
+    )
+    .map(Some)
+}
 
-    let mut whole_series_leaf_hashes = Vec::with_capacity(leaf_versions.len());
+/// Build one canonical linked segment ending at `manifest`.
+///
+/// `versions` contains only the newly appended rows for ordinary commits.
+/// The prior manifest's compact frontier supplies the complete historical
+/// prefix proof, so descriptor construction, physical spans, and proof bytes
+/// are proportional to this suffix plus at most 64 frontier hashes.
+#[allow(clippy::too_many_arguments)]
+fn build_series_segment_pack(
+    series_hash: ObjectHash,
+    entry_type: EntryType,
+    manifest: &SeriesManifest,
+    parent_series_hash: Option<ObjectHash>,
+    leaf_start: u64,
+    prefix_frontier: &MerkleFrontier,
+    versions: &[SeriesVersionData],
+) -> Result<sync_store::content::PackIndex, StewardError> {
+    if !matches!(
+        entry_type,
+        EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries
+    ) {
+        return Err(StewardError::DeltaLake(format!(
+            "series pack material carries an unexpected entry type {entry_type:?}"
+        )));
+    }
+    if prefix_frontier.leaf_count() != leaf_start {
+        return Err(StewardError::Content(format!(
+            "series segment starts at leaf {leaf_start} but its prefix frontier contains {} leaves",
+            prefix_frontier.leaf_count()
+        )));
+    }
+    let leaf_versions = versions
+        .iter()
+        .filter(|version| version.logical_leaf_hash.is_some())
+        .collect::<Vec<_>>();
+    if leaf_versions.is_empty() {
+        return Err(StewardError::Content(
+            "cannot build a series segment without a logical leaf".to_string(),
+        ));
+    }
+
+    let mut range_leaf_hashes = Vec::with_capacity(leaf_versions.len());
     let mut object_spans = Vec::with_capacity(leaf_versions.len());
     let mut leaf_descriptors = Vec::with_capacity(leaf_versions.len());
     let mut logical_cursor: u64 = 0;
@@ -1535,7 +2367,7 @@ pub(crate) fn build_initial_pack_index(
             attrs,
         )
         .map_err(StewardError::Content)?;
-        whole_series_leaf_hashes.push(leaf_hash);
+        range_leaf_hashes.push(leaf_hash);
         let logical_end = logical_cursor.checked_add(logical_count).ok_or_else(|| {
             StewardError::Content("series logical object span overflow".to_string())
         })?;
@@ -1559,91 +2391,51 @@ pub(crate) fn build_initial_pack_index(
         leaf_descriptors.push(descriptor);
     }
 
-    let total_leaf_count = whole_series_leaf_hashes.len() as u64;
-    let range_proof = sync_store::content::generate_range_proof(
-        &whole_series_leaf_hashes,
-        0,
-        leaf_versions.len(),
-    )
-    .map_err(StewardError::Content)?;
-    let range_root = material.manifest.leaf_merkle_root();
+    let range_leaf_count = u64::try_from(range_leaf_hashes.len())
+        .map_err(|_| StewardError::Content("series segment leaf count exceeds u64".to_string()))?;
+    let leaf_end = leaf_start
+        .checked_add(range_leaf_count)
+        .ok_or_else(|| StewardError::Content("series segment leaf range overflow".to_string()))?;
+    if leaf_end != manifest.leaf_count() {
+        return Err(StewardError::Content(format!(
+            "series segment [{leaf_start}, {leaf_end}) does not end at manifest leaf count {}",
+            manifest.leaf_count()
+        )));
+    }
+    let range_proof = generate_append_range_proof(prefix_frontier, range_leaf_hashes.len())
+        .map_err(StewardError::Content)?;
+    let range_root = manifest.leaf_merkle_root();
 
-    let pack = sync_store::content::PackIndex::new_with_spans(
-        material.series_hash,
-        0,
-        total_leaf_count,
-        total_leaf_count,
+    let pack = sync_store::content::PackIndex::new_segment_with_spans(
+        series_hash,
+        parent_series_hash,
+        leaf_start,
+        leaf_end,
+        manifest.leaf_count(),
         range_root,
         range_proof,
         object_spans,
-        material.manifest.logical_count(),
+        logical_cursor,
         physical_byte_count,
         leaf_descriptors,
     )
     .map_err(StewardError::Content)?;
+    pack.validate_series_segment()
+        .map_err(StewardError::Content)?;
 
     // Self-check before ever handing this pack to a publisher: a pack built
     // from this pond's own just-folded rows must verify against the
     // manifest those same rows just folded to, or the persisted state and
     // the fold disagree -- an internal bug that must not be published.
     sync_store::content::verify_pack_against_manifest(
-        material.series_hash,
-        &material.manifest,
+        series_hash,
+        manifest,
         &pack,
-        &whole_series_leaf_hashes,
+        &range_leaf_hashes,
     )
     .map_err(StewardError::Content)?;
 
-    Ok(Some(pack))
-}
-
-/// Build and publish one whole-range "initial" identity pack for every v2
-/// series captured in `materialized.series_material`
-/// (`docs/logical-series-identity-design.md`).
-///
-/// A freshly-folded `watertown.series.v2` manifest is otherwise unfetchable the
-/// moment it is pushed: the dual reader
-/// (`crate::content_pull::fetch_series_v2`) requires an exact pack cover
-/// before it will trust any series content, and nothing else in this
-/// codebase publishes one. Each pack is minted directly from persisted rows
-/// by [`build_initial_pack_index`] -- no payload bytes are read, decoded, or
-/// re-encoded, and no new physical object is written; the pack instead
-/// advertises the exact per-version physical objects the ordinary content
-/// push already published (inline or external). Call this only after that
-/// ordinary push has durably landed those objects on `remote` (blobs-first,
-/// index-last applies across the whole push, not only within one pack).
-///
-/// `known_present` names the physical object hashes this same push already
-/// durably wrote (the just-committed inline objects and streamed external
-/// blobs) -- passed through to
-/// [`sync_store::ContentRemote::publish_pack_with_known_present`] so
-/// publishing these packs never re-probes an object this push just proved
-/// present with its own write, only objects it did not itself just write
-/// (item 3, `docs/logical-series-identity-design.md`).
-///
-/// # Errors
-///
-/// Returns an error if [`build_initial_pack_index`] fails for any series, or
-/// if publishing the pack to `remote` fails (including when a physical
-/// object the pack names is not actually present on `remote` yet -- which
-/// would mean this was called before the ordinary push completed).
-pub(crate) async fn publish_initial_series_packs(
-    remote: &sync_store::ContentRemote,
-    series_material: &[SeriesPackMaterial],
-    known_present: &HashSet<ObjectHash>,
-) -> Result<usize, StewardError> {
-    let mut published = 0usize;
-    for material in series_material {
-        let Some(pack) = build_initial_pack_index(material)? else {
-            continue;
-        };
-        let _ = remote
-            .publish_pack_with_known_present(material.series_hash, &pack, &[], known_present)
-            .await
-            .map_err(|e| StewardError::Content(format!("publish initial series pack: {e}")))?;
-        published += 1;
-    }
-    Ok(published)
+    Ok(pack)
 }
 
 /// This version's `logical_attributes`, re-encoded canonically (see
@@ -1998,8 +2790,8 @@ fn parse_optional_object_hash(
 
 /// Build one series version's [`SeriesVersionData`] from its row's scalar
 /// fields. Shared by the full fold ([`fold_rows`]) and the incremental fold
-/// ([`incremental_spine_inputs`], [`read_series_committed`]) so a row's v2
-/// fields are parsed identically everywhere.
+/// ([`incremental_spine_inputs_v2`], [`read_series_live_metadata_ordered`]) so
+/// a row's logical-series fields are parsed identically everywhere.
 #[allow(clippy::too_many_arguments)]
 fn series_version_data(
     version: i64,
@@ -2055,7 +2847,125 @@ fn series_version_data(
     })
 }
 
-/// Build a series node's `watertown.series.v2` [`SeriesManifest`] and its single
+fn append_series_manifest(
+    entry_type: EntryType,
+    prior: Option<&SeriesManifest>,
+    prior_meta: Option<&VersionMeta>,
+    appended: &[SeriesVersionData],
+) -> Result<(SeriesManifest, VersionMeta), StewardError> {
+    let payload_kind = match entry_type {
+        EntryType::FilePhysicalSeries => PayloadKind::File,
+        EntryType::TablePhysicalSeries => PayloadKind::Table,
+        other => {
+            return Err(StewardError::DeltaLake(format!(
+                "append_series_manifest called for non-series entry type {other:?}"
+            )));
+        }
+    };
+    if let Some(prior) = prior
+        && prior.payload_kind() != payload_kind
+    {
+        return Err(StewardError::DeltaLake(format!(
+            "series changed payload kind from {:?} to {payload_kind:?}",
+            prior.payload_kind()
+        )));
+    }
+
+    let mut frontier = prior.map_or_else(MerkleFrontier::empty, |manifest| {
+        manifest.merkle_frontier().clone()
+    });
+    let mut logical_count = prior.map_or(0, SeriesManifest::logical_count);
+    let mut min_event_time = prior.and_then(SeriesManifest::min_event_time);
+    let mut max_event_time = prior.and_then(SeriesManifest::max_event_time);
+    let mut logical_attributes = prior
+        .and_then(SeriesManifest::logical_attributes)
+        .map(ToOwned::to_owned);
+    let mut latest_meta = prior_meta.cloned();
+    let mut appended_leaf = false;
+
+    for version in appended {
+        let Some(leaf_hash) = version.logical_leaf_hash else {
+            if version.blob_size > 0 {
+                return Err(StewardError::DeltaLake(format!(
+                    "series version at timestamp {:?} is nonempty ({} bytes) but has no \
+                     logical_leaf_hash -- corrupt row (persisted-leaf invariant violated)",
+                    version.meta.timestamp, version.blob_size
+                )));
+            }
+            continue;
+        };
+        match payload_kind {
+            PayloadKind::Table if version.schema_fingerprint.is_none() => {
+                return Err(StewardError::DeltaLake(
+                    "leaf-bearing table series version has no series_schema_fingerprint"
+                        .to_string(),
+                ));
+            }
+            PayloadKind::File if version.schema_fingerprint.is_some() => {
+                return Err(StewardError::DeltaLake(
+                    "leaf-bearing file series version must not carry a series_schema_fingerprint"
+                        .to_string(),
+                ));
+            }
+            _ => {}
+        }
+        let count = version.logical_count.ok_or_else(|| {
+            StewardError::DeltaLake(
+                "series version has a logical_leaf_hash but no logical_count".to_string(),
+            )
+        })?;
+        let count = u64::try_from(count).map_err(|_| {
+            StewardError::DeltaLake("series version has a negative logical_count".to_string())
+        })?;
+        if count == 0 {
+            return Err(StewardError::DeltaLake(
+                "series version logical_count must be positive".to_string(),
+            ));
+        }
+        frontier
+            .append(leaf_hash)
+            .map_err(StewardError::DeltaLake)?;
+        logical_count = logical_count.checked_add(count).ok_or_else(|| {
+            StewardError::DeltaLake("series logical_count aggregate overflow".to_string())
+        })?;
+        if let Some(min) = version.meta.min_event_time {
+            min_event_time = Some(min_event_time.map_or(min, |current| current.min(min)));
+        }
+        if let Some(max) = version.meta.max_event_time {
+            max_event_time = Some(max_event_time.map_or(max, |current| current.max(max)));
+        }
+        logical_attributes = canonical_leaf_attributes(version)?;
+        latest_meta = Some(version.meta.clone());
+        appended_leaf = true;
+    }
+
+    let manifest = SeriesManifest::new(
+        payload_kind,
+        logical_count,
+        frontier.leaf_count(),
+        min_event_time,
+        max_event_time,
+        logical_attributes,
+        frontier,
+    )
+    .map_err(StewardError::DeltaLake)?;
+    let meta = VersionMeta {
+        timestamp: latest_meta
+            .as_ref()
+            .and_then(|metadata| metadata.timestamp)
+            .or_else(|| appended.last().and_then(|version| version.meta.timestamp)),
+        min_event_time,
+        max_event_time,
+        extended_attributes: if appended_leaf {
+            latest_meta.and_then(|metadata| metadata.extended_attributes)
+        } else {
+            prior_meta.and_then(|metadata| metadata.extended_attributes.clone())
+        },
+    };
+    Ok((manifest, meta))
+}
+
+/// Build a series node's `watertown.series.v3` [`SeriesManifest`] and its single
 /// aggregate [`VersionMeta`] from its live versions in fold order (oldest
 /// first).
 ///
@@ -2163,7 +3073,7 @@ pub(crate) fn build_series_manifest(
         latest_raw_attrs = v.raw_extended_attributes.clone();
     }
 
-    let leaf_merkle_root = merkle_root(&leaf_hashes);
+    let merkle_frontier = MerkleFrontier::from_leaves(&leaf_hashes);
     let logical_attributes = match &latest_raw_attrs {
         Some(json) => Some(
             encode_canonical_attributes(json)
@@ -2179,7 +3089,7 @@ pub(crate) fn build_series_manifest(
         min_event_time,
         max_event_time,
         logical_attributes,
-        leaf_merkle_root,
+        merkle_frontier,
     )
     .map_err(StewardError::DeltaLake)?;
 
@@ -2296,7 +3206,7 @@ fn hash_directory(
     let encoded = encode_tree(&tree_entries).map_err(StewardError::DeltaLake)?;
     let hash = ObjectHash::of_bytes(&encoded);
     if let Some(sink) = sink {
-        sink.put_inline(hash, encoded);
+        sink.put_inline(ContentObjectKind::Tree, hash, encoded)?;
     }
     let _ = memo.insert(key.clone(), hash);
     let _ = dirs.insert(key.clone(), children);
@@ -2331,19 +3241,18 @@ fn hash_child(
             let (manifest, meta) = build_series_manifest(entry_type, versions)?;
             let hash = manifest.hash();
             if let Some(sink) = sink {
-                // The v2 watertown.series.v2 manifest object, plus each version's
+                // The watertown.series.v3 manifest object, plus each version's
                 // physical blob: small versions inline, large (externalized)
                 // versions by hash (D7). Physical blobs stay available for
                 // initial pack publication/fetch even though the series'
                 // identity is now the manifest hash, not a hash over these
                 // blobs (`docs/logical-series-identity-design.md`).
-                sink.put_inline(hash, manifest.encode());
+                sink.put_inline(ContentObjectKind::SeriesManifest, hash, manifest.encode())?;
                 for v in versions.iter() {
-                    record_blob(sink, v.blob_hash, v.content.as_deref());
+                    record_blob(sink, v.blob_hash, v.content.as_deref())?;
                 }
-                // Capture what `publish_initial_series_packs` needs to mint
-                // this series' whole-range identity pack, so the dual
-                // reader can fetch it the moment it is pushed.
+                // Capture what initial publication needs to mint this
+                // series' whole-range root pack.
                 // `build_initial_pack_index` (the sole reader of
                 // `SeriesPackMaterial::versions`) never reads a version's
                 // inline `content` -- it was already recorded above via
@@ -2374,7 +3283,7 @@ fn hash_child(
             let hash = ObjectHash::of_bytes(bytes);
             if let Some(sink) = sink {
                 // Symlink targets are small; always inline.
-                sink.put_inline(hash, bytes.to_vec());
+                sink.put_inline(ContentObjectKind::RawBlob, hash, bytes.to_vec())?;
             }
             Ok((hash, vec![facts.meta.clone()]))
         }
@@ -2390,7 +3299,11 @@ fn hash_child(
             let hash = recipe_hash(factory, config);
             if let Some(sink) = sink {
                 // Recipes (factory + config) are small; always inline.
-                sink.put_inline(hash, encode_recipe(factory, config));
+                sink.put_inline(
+                    ContentObjectKind::Recipe,
+                    hash,
+                    encode_recipe(factory, config),
+                )?;
             }
             Ok((hash, vec![facts.meta.clone()]))
         }
@@ -2399,7 +3312,7 @@ fn hash_child(
             let facts = leaf_facts(key, latest)?;
             let hash = row_blob_hash(&facts.blake3, facts.content.as_deref());
             if let Some(sink) = sink {
-                record_blob(sink, hash, facts.content.as_deref());
+                record_blob(sink, hash, facts.content.as_deref())?;
             }
             Ok((hash, vec![facts.meta.clone()]))
         }
@@ -2409,11 +3322,16 @@ fn hash_child(
 /// Record a file/version blob into the materialization sink: inline when the
 /// bytes are in-row (small), external by hash when the content is `None`
 /// (an externalized large file -- Decision D7).
-fn record_blob(sink: &mut MaterializedObjects, hash: ObjectHash, content: Option<&[u8]>) {
+fn record_blob(
+    sink: &mut MaterializedObjects,
+    hash: ObjectHash,
+    content: Option<&[u8]>,
+) -> Result<(), StewardError> {
     match content {
-        Some(bytes) => sink.put_inline(hash, bytes.to_vec()),
+        Some(bytes) => sink.put_inline(ContentObjectKind::RawBlob, hash, bytes.to_vec())?,
         None => sink.put_external(hash),
     }
+    Ok(())
 }
 
 /// Look up a non-directory node's latest facts, erroring if it is missing.
@@ -2434,6 +3352,77 @@ mod tests {
     fn obsolete_commit_tip_is_rejected() {
         let obsolete = b"dp.commit.3\nintentionally-not-a-current-commit";
         assert!(log_tip_hash(obsolete).is_err());
+    }
+
+    #[test]
+    fn producer_one_leaf_segment_metadata_is_bounded_after_1_100_1000_leaves() {
+        fn build(prior_count: usize) -> sync_store::content::PackIndex {
+            let prior_leaves = (0..prior_count)
+                .map(|index| ObjectHash::of_bytes(format!("prior-{index}").as_bytes()))
+                .collect::<Vec<_>>();
+            let prior_frontier = MerkleFrontier::from_leaves(&prior_leaves);
+            let prior_manifest = SeriesManifest::new(
+                PayloadKind::File,
+                prior_count as u64 * 8,
+                prior_count as u64,
+                None,
+                None,
+                None,
+                prior_frontier.clone(),
+            )
+            .expect("prior manifest");
+            let appended = SeriesVersionData {
+                version: prior_count as i64 + 1,
+                blob_hash: ObjectHash::of_bytes(b"new-blob"),
+                content: None,
+                meta: VersionMeta {
+                    timestamp: Some(1),
+                    min_event_time: None,
+                    max_event_time: None,
+                    extended_attributes: None,
+                },
+                raw_extended_attributes: None,
+                logical_leaf_hash: Some(ObjectHash::of_bytes(b"new-leaf")),
+                logical_count: Some(8),
+                schema_fingerprint: None,
+                blob_size: 8,
+            };
+            let (manifest, _) = append_series_manifest(
+                EntryType::FilePhysicalSeries,
+                Some(&prior_manifest),
+                Some(&VersionMeta {
+                    timestamp: Some(0),
+                    min_event_time: None,
+                    max_event_time: None,
+                    extended_attributes: None,
+                }),
+                std::slice::from_ref(&appended),
+            )
+            .expect("append manifest");
+            build_series_segment_pack(
+                manifest.hash(),
+                EntryType::FilePhysicalSeries,
+                &manifest,
+                Some(prior_manifest.hash()),
+                prior_count as u64,
+                &prior_frontier,
+                &[appended],
+            )
+            .expect("build suffix segment")
+        }
+
+        let packs = [build(1), build(100), build(1_000)];
+        for (prior, pack) in [1u64, 100, 1_000].into_iter().zip(&packs) {
+            assert_eq!(pack.leaf_start(), prior);
+            assert_eq!(pack.leaf_end(), prior + 1);
+            assert_eq!(pack.leaf_descriptors().len(), 1);
+            assert_eq!(pack.physical_object_hashes().len(), 1);
+        }
+        let sizes = packs.map(|pack| pack.encode().len() as u64);
+        assert!(
+            sizes.iter().max().unwrap() - sizes.iter().min().unwrap() <= 4 * 1024,
+            "only bounded Merkle proof overhead may vary with prior leaf count: {sizes:?}"
+        );
     }
 
     // Build an in-memory `content_live` table from OplogEntry rows so the narrow
@@ -2664,7 +3653,7 @@ mod tests {
             .get(&one_series_child.child_hash)
             .expect("manifest object materialized under its own hash");
         let manifest_one = SeriesManifest::decode(manifest_bytes_one)
-            .expect("decode watertown.series.v2 manifest");
+            .expect("decode watertown.series.v3 manifest");
         assert_eq!(manifest_one.payload_kind(), PayloadKind::File);
         assert_eq!(manifest_one.logical_count(), 4, "4 bytes in v1");
         assert_eq!(manifest_one.leaf_count(), 1);
@@ -2711,7 +3700,7 @@ mod tests {
             .get(&two_series_child.child_hash)
             .expect("manifest object materialized under its own hash");
         let manifest_two = SeriesManifest::decode(manifest_bytes_two)
-            .expect("decode watertown.series.v2 manifest");
+            .expect("decode watertown.series.v3 manifest");
         assert_eq!(manifest_two.logical_count(), 10, "4 + 6 bytes across both");
         assert_eq!(manifest_two.leaf_count(), 2);
         assert_eq!(

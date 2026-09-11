@@ -68,10 +68,10 @@ mkdir -p "$REMOTE"
 # the consumer folds in its OWN pond_id partition alongside the mounted
 # producer pond, so its cross-pond root has an extra entry.
 status_pushed_tip() {  # POND_DIR
-    POND="$1" pond status 2>/dev/null | awk '/last pushed:/ {print $NF}'
+    POND="$1" pond status 2>/dev/null | awk '/last pushed:/ {print $3}'
 }
 status_pulled_tip() {  # POND_DIR
-    POND="$1" pond status 2>/dev/null | awk '/last pulled:/ {print $NF}'
+    POND="$1" pond status 2>/dev/null | awk '/last pulled:/ {print $3}'
 }
 
 echo "--- Part A: byte replica, top-level root equality ---"

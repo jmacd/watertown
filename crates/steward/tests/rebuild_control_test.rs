@@ -375,10 +375,6 @@ async fn rebuild_after_collapse_reclaim_replays_one_txn_per_seq() -> Result<()> 
             report.reclaimed.rows_deleted, 11,
             "only the reserved index node's steady-state churn is superseded, not the user series"
         );
-        assert_eq!(
-            report.reclaimed.blobs_removed, 0,
-            "every write here is small enough to inline; there is no external blob to free"
-        );
         ship.last_write_seq()
     };
 

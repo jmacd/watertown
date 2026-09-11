@@ -15,13 +15,13 @@
 //! Spending happens during the post-commit push, and a push cannot write the
 //! pond: writing would commit, which would push, which would spend, which
 //! would write.  The accumulated usage is therefore parked in the control
-//! table and flushed into the pond at the **start of the next write
-//! transaction** -- piggybacking on a write the caller was doing anyway.
+//! table and flushed into the pond only when the next write transaction has
+//! already produced another real data change.
 //!
-//! That breaks the loop and is self-limiting: the write that emits sample *N*
-//! triggers a push that queues sample *N+1*, emitted by the following write.
-//! A pond that stops being written stops emitting, which is correct -- an idle
-//! pond is also not spending.
+//! Deferring the decision until commit breaks the loop: an otherwise unchanged
+//! collection leaves its samples queued and produces no commit or push. A pond
+//! that stops changing stops emitting, which is correct -- an idle pond is
+//! also not spending.
 //!
 //! # Why samples are cleared at commit, not at read
 //!

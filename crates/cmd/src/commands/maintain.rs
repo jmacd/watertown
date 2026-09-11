@@ -18,7 +18,7 @@ use log::info;
 /// logical-series-v2 series into a smaller, bounded set of
 /// content-addressed physical pack objects published under this pond's own
 /// local `data/_packs` namespace. This never rewrites or deletes an Oplog
-/// append row and never changes a series' `watertown.series.v2` manifest, content
+/// append row and never changes a series' `watertown.series.v3` manifest, content
 /// tree/commit root, Delta version, or txn sequence -- only local disk
 /// state under `_packs/` is mutated, so it always returns `Ok`. A pre-v2
 /// (legacy) series carries no persisted v2 leaf identity and is reported as
@@ -26,8 +26,9 @@ use log::info;
 /// When `prune` is true, first deletes replicated control-table lifecycle
 /// history at or below a safe horizon so the subsequent checkpoint +
 /// vacuum reclaims it in the SAME pass (no extra ship open / read txn).
-/// Collapse likewise runs before the checkpoint + vacuum, since its
-/// reclamation phase deletes the rows that collapse superseded.
+/// Pack maintenance likewise runs before checkpoint + vacuum because it also
+/// deletes superseded rows of the reserved `.pond-node-index`. User-series
+/// rows and `_large_files` are never reclaimed through this option.
 ///
 /// When `dry_run` is true nothing is modified: the command reports what
 /// collapse and prune *would* do and returns.
@@ -86,14 +87,9 @@ pub async fn maintain_command(
         None
     };
 
-    // Collapse (pack-only physical maintenance) BEFORE maintain, for the
-    // same reason as prune above: its reclamation phase deletes superseded
-    // rows, and those tombstones are only turned back into free space by
-    // the checkpoint + vacuum that follows. `Ship::collapse_versions` never
-    // touches a Delta root/version/txn sequence, so a real failure here is a
-    // genuine error, not a gated no-op -- unlike the old logical-series-v2
-    // gate this used to report, pack-only maintenance always runs
-    // reclamation as part of the same call.
+    // Pack maintenance runs before the checkpoint/vacuum so tombstones from
+    // deleting obsolete reserved-index pointers can be reclaimed in this pass.
+    // It never deletes user-series rows or their `_large_files` payloads.
     let collapse_report = if collapse_versions > 0 {
         Some(
             ship.collapse_versions(collapse_versions)
@@ -146,13 +142,9 @@ pub async fn maintain_command(
 
 /// Report what maintenance would do, changing nothing.
 ///
-/// Collapse is the operation worth previewing.  It rewrites every live version
-/// of a series into one merged run, and that merged run is new content: it
-/// replicates like any other write, so the next push carries the whole series
-/// again.  Nothing deletes the superseded blobs from the remote, so the space
-/// is spent permanently, and a series larger than the byte budget can reach a
-/// state the limiter will never admit.  Reporting the size beforehand is how
-/// that is caught while it is still a number rather than a bill.
+/// Pack maintenance is the operation worth previewing: it reads selected live
+/// series and creates an additive whole-range physical layout under local
+/// `_packs`, without changing logical content or publishing remotely.
 async fn report_dry_run(
     ship: &mut steward::Steward,
     collapse_versions: usize,
@@ -234,12 +226,12 @@ async fn report_dry_run(
                 println!(
                     "  a repack publishes new physical pack objects and a pack index to this \
                      pond's own local `data/_packs` storage (or `pond://` sidecar storage for a \
-                     replica) only; today's `pond push` never uploads them -- it only publishes \
-                     fresh 1:1 packs built from the Oplog rows a push itself just carried, so a \
-                     maintained/repacked pack stays local (or `pond://`-visible) unless and \
-                     until an explicit pack uploader is added. This never rewrites an Oplog row \
-                     or changes a series' watertown.series.v2 manifest, content root, Delta version, or \
-                     txn sequence."
+                     replica) only. `pond push` never uploads them implicitly; after the matching \
+                     snapshot is published, run `pond backup publish-consolidated NAME` to upload \
+                     verified objects, pack, and immutable consolidated locator under the named \
+                     push/both backup's limiter. This never rewrites or reclaims a user Oplog row \
+                     or changes a series' watertown.series.v3 manifest, content root, Delta \
+                     version, or txn sequence."
                 );
             }
         }

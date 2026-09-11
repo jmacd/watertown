@@ -7,6 +7,15 @@
 > disagree about *how* the commit spine is computed and stored, **this document
 > wins**. The object model (blobs, trees, commits, the transparency log file
 > layout) is carried forward unchanged.
+>
+> **Native-v2 update:** `low-cost-correctness-review.md` Section 16 supersedes
+> this document's flat INDEX-node encoding and legacy remote layout. The local
+> INDEX node now stores only a persistent Patricia-map root pointer;
+> `watertown.commit.v2` carries that root and the transaction's bounded
+> identity/object delta. Remote payloads are raw immutable
+> `_content/v2/objects` with receipts and a dedicated `_publication/` Delta
+> active-row table. The historical phase narrative below remains useful
+> rationale, not the current wire/storage specification.
 
 ---
 
@@ -17,60 +26,72 @@ Phases track the plan in Section 8; each is independently reviewable.
 | Phase | Scope | Status |
 |---|---|---|
 | Tier 0 | Single narrow post-commit scan (no inline blob bytes) + checksum row-leaf reset | **Done** |
-| 2 | Reserved delta-versioned index node (persisted node manifest) | **Done** |
-| 3 | Incremental node-keyed Merkle (updater + `O(n)` rebuilder oracle) | **Done** |
+| 2 | Reserved index node (now a fixed-size persistent-map root pointer) | **Done, superseded encoding** |
+| 3 | Persistent path-compressed node-identity Merkle map | **Done in native v2** |
 | D9 | Unified single-pond storage: authoritative LOG + derived INDEX; control demoted (Section 10) | Design accepted |
 | 4a | Spine relocation + atomic commit (LOG node, in-txn `commit_object`) | **Done** |
 | 4b | Incremental commit fold (content root from changeset along touched path) | **Done** |
-| 5 | `commit_object` gains node-keyed Merkle root (`node_manifest_root`) alongside flat `node_manifest_hash` | **Done** |
+| 5 | `watertown.commit.v2` names the persistent manifest root and bounded delta | **Done** |
 | 5b | Checksum subsumption (per-directory `tree_hash` replaces `row_leaf_digest`) | **Done** |
 | 6 | Validation (equivalence + rebuild-from-pond; keep tlog/pull/719 green; presubmit) | **Done** |
 
 ### Remote pull ancestry cost invariant
 
-The content remote duplicates every canonical commit-log leaf into a dedicated
-Delta `partition_key=commits` partition in the same transaction that publishes
-the ordinary `objects` rows. A producer always supplies its full authoritative
-local commit log, so the first push by an upgraded producer atomically backfills
-an old remote; no separate migration or partial-index state is published.
-Before constructing later write batches, the producer-side remote reads and
-authenticates the live commit index with one partition-pruned query, then
-filters already-present hashes from the append. Under the normal serialized
-single-writer push model, each canonical commit therefore contributes exactly
-one physical `commits` row; a push with no missing commits creates no Add file
-for that partition. The ordinary objects and newly missing index rows remain in
-the same Delta transaction, preserving atomic visibility.
+There is no remote object or commit index in native v2. A cold open reads the
+checkpointed, retention-bounded `_publication/` table. An acknowledged
+consumer follows immutable per-push publication records only until its known
+record/tip boundary. A structured acknowledgement fixes the exact read count
+from the generation delta and requires its immutable record at that boundary;
+a tip-only walk is capped by the active generation. Fetch then reads changed
+manifest records and changed objects by exact raw keys and never lists a
+cumulative payload namespace. An initial clone explicitly traverses the
+requested manifest map. Tests compare identical
+consumer changes after 1, 100, and 1,000 prior updates and assert equal request
+counts with only fixed encoding variance in bytes.
 
-Remote pulls read that physically isolated partition once, authenticate every
-key/value/commit, and walk exact parent links in memory from the ref tip to the
-known boundary (or genesis when the boundary is unrelated). Current-tree
-metadata then requires exactly two `objects` queries: root plus node manifest,
-followed by the manifest's exact closure. Only after destination series
-prefixes have been validated, a pull with missing series leaves may issue one
-additional exact `objects` batch containing the deduplicated physical hashes
-whose spans intersect those suffixes. Returned inline payloads are
-hash-verified and cached; misses stream from external blob storage. Payload
-materialization never falls back to per-hash `objects` point queries. Before
-that batch, authenticated span lengths bound the possible retained inline
-payload to 64 MiB (objects at or above the 64 KiB externalization threshold
-stream instead). A larger collection of tiny inline objects is rejected before
-remote payload reads rather than risking an allocator OOM; maintenance can
-consolidate such a pathological suffix into bounded external pack objects.
+### Local incremental pull cost invariant
 
-The indexed remote invariant is therefore one commit-index read, two exact
-current-closure object batches, and at most one exact suffix-payload object
-batch. Diagnostics report zero `object_point_queries` and three
-`object_batch_queries` when series payload hashes are required (two when no
-series payload is needed). This prevents either producer lag of `N` commits or
-`N` changed physical payloads from becoming `N` full scans of the large inline
-object partition.
+An acknowledged destination does not fold its complete local Delta table to
+plan an ordinary pull. Its reserved `.pond-node-index` stores the current
+persistent Patricia-map root; imported foreign ponds carry the same reserved
+pointer under their own pond partition. A fixed local cursor normally supplies
+that pointer without opening the series; after cache loss one latest-row query
+recovers and rewrites the cursor. Planning point-loads only changed
+node records plus the parent paths needed for ordering, deletion, and
+collision-safe rename handling. A missing/mismatched root or map object fails
+loudly and requires an explicit full rebuild; there is no silent full-scan
+fallback.
 
-Rollout is deliberately fail closed: until an old remote receives one upgraded
-producer push its commit index is empty, and any indexed remote missing the tip
-or an intermediate ancestry row is rejected. Readers never hide an incomplete
-index by falling back to unbounded object-partition point queries. Local
-`pond://` sources explicitly report the index as unsupported and retain their
-cheap sequential in-memory/on-disk walk.
+For a changed series, the prior manifest record names the local
+`watertown.series.v3` object. Fetch starts at the current canonical locator and
+extends backward only until it covers that node's exact stored leaf frontier;
+a new node instead reaches leaf zero (preferring a consolidated locator when
+available). The retained frontier may fall inside a differently segmented
+pack. Its Merkle frontier and aggregate metadata are authenticated without
+enumerating retained leaf rows. Materialization appends only the verified
+suffix; file-series physical hashing resumes from its persisted Bao frontier
+and at most one bounded tail block.
+
+Mirror retries and exact-identity no-ops authenticate the destination with one
+bounded latest-row query against the authoritative reserved manifest pointer,
+never from the best-effort cursor alone, and verify its root record against the
+fetched tip commit. If the data
+transaction already applied that tip but the source-bound acknowledgement did
+not commit, the retry repairs only the acknowledgement. An authenticated
+fast-forward whose before/after content roots are identical likewise advances
+mirror acknowledgement without a data transaction; graft import atomically
+advances its source-tip pin. Graft pulls fetch one exact selected publication
+state, authenticate that same graph to the structured acknowledgement, and
+only then narrow it to an applied pin. A cleared acknowledgement requires the
+pin's immutable publication record, commit, and roots to be reconstructed
+within the active generation bound.
+
+Cost tests apply an unrelated file change beside an unchanged 1,000-leaf
+series and one-leaf appends after 1, 100, and 1,000 retained leaves. They expose
+whether a full target scan ran and count local manifest-node files, manifest
+root cursor/latest-row reads, manifest records, prior series manifests, and
+retained leaf hashes read. Ordinary incremental results are fixed plus changed
+paths, with zero retained leaf hashes scanned.
 
 **Tier 0 (done).** Landed on branch `jmacd/65`. The two full-table `SELECT *`
 post-commit scans (content-tree fold + partition checksums) are now one shared
@@ -620,10 +641,9 @@ independently reviewable and keeps the whole suite green.
    equivalence for both roots is asserted on every write transaction by the
    `StewardTransactionGuard` fold oracle (`root_tree_hash`,
    `node_manifest_hash`, `node_manifest_root`, and the manifest bytes). The
-   oracle is always on in debug builds and opt-in in release builds via the
-   `POND_VERIFY_FOLD` environment variable (see
-   `content_tree::fold_verification_enabled`), so a high-value pond can validate
-   every commit without a debug rebuild. A new
+   oracle is an explicit `POND_VERIFY_FOLD` diagnostic in every build (see
+   `content_tree::fold_verification_enabled`); debug mode alone never adds the
+   hidden `O(n)` pass. A new
    `content_tree_test::incremental_roots_match_full_fold_over_diverse_mutations`
    drives create / nested-dir / overwrite / rename / delete through that oracle.
    A new `rebuild_control_test::rebuild_control_preserves_content_roots` discards

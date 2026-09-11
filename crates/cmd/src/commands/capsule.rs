@@ -42,15 +42,7 @@ pub async fn capsule_import_command(
     path: &std::path::Path,
     target: &std::path::Path,
     birthplace: &str,
-    experimental: bool,
 ) -> Result<()> {
-    if !experimental {
-        return Err(anyhow!(
-            "capsule import is experimental: bounded resume and active-remote preflight are not \
-             yet implemented; pass --experimental only after reviewing the restored namespace \
-             safety requirements"
-        ));
-    }
     let report = steward::import_capsule(path, target, birthplace.to_string())
         .await
         .map_err(|error| {
@@ -62,7 +54,8 @@ pub async fn capsule_import_command(
         })?;
     log::info!(
         "[OK] capsule imported into {} (pond_id={}, source_pond_id={}, capsule_root={}, \
-         entries={}, directories={}, physical={}, symlinks={}, dynamic={}, logical_count={})",
+         entries={}, directories={}, physical={}, symlinks={}, dynamic={}, logical_count={}, \
+         batches={})",
         report.target.display(),
         report.target_pond_id,
         report.source_pond_id,
@@ -72,33 +65,102 @@ pub async fn capsule_import_command(
         report.physical,
         report.symlinks,
         report.dynamic,
-        report.logical_count
+        report.logical_count,
+        report.batches
     );
     log::warn!(
         "capsule import persistently disabled automatic post-commit factories and remote pushes \
-         at {}; review and preflight the restored namespace before setting \
-         `post_commit_dispatch` to `enabled` with `pond control set-config`",
+         at {}; run `POND={} pond capsule activate` after repairing any restored remote or \
+         automatic factory configuration",
+        report.target.display(),
         report.target.display()
     );
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn capsule_import_requires_experimental_acknowledgement() {
-        let error = capsule_import_command(
-            std::path::Path::new("missing-capsule"),
-            std::path::Path::new("missing-target"),
-            "test",
-            false,
-        )
+/// Preflight restored automatic configuration and enable post-commit
+/// dispatch only if every remote and `/system/run/*` config is safe.
+pub async fn capsule_activate_command(target: &std::path::Path) -> Result<()> {
+    let report = steward::activate_capsule_import(target)
         .await
-        .expect_err("incomplete importer must require explicit acknowledgement");
-        assert!(error.to_string().contains("--experimental"));
+        .map_err(|error| anyhow!("activate capsule import at {}: {error}", target.display()))?;
+    log::info!(
+        "[OK] capsule import activated at {} (remotes={}, run_configs={})",
+        report.target.display(),
+        report.remotes,
+        report.run_configs
+    );
+    Ok(())
+}
+
+/// Build the current logical snapshot and publish an immutable
+/// `pondcapsule.4` generation to one backup.
+pub async fn capsule_publish_command(ship_context: &ShipContext, name: &str) -> Result<()> {
+    let mut steward = ship_context.open_pond().await?;
+    match remote_mode_for(&steward, name).await? {
+        RemoteMode::Push | RemoteMode::Both => {}
+        RemoteMode::Pull => {
+            return Err(anyhow!(
+                "remote `{name}` is pull-only; capsules publish only to backup remotes"
+            ));
+        }
     }
+    let attachment = load_remote_attachment(&mut steward, name).await?;
+    let storage_options = {
+        let pond = steward
+            .as_pond_mut()
+            .ok_or_else(|| anyhow!("capsule publish requires a pond steward"))?;
+        steward::storage_profile::prepare_storage(pond, &attachment).await?
+    };
+    let limit_spec = attachment.resolved_limits()?;
+    let mut limits = {
+        let pond = steward
+            .as_pond_mut()
+            .ok_or_else(|| anyhow!("capsule publish requires a pond steward"))?;
+        steward::LimiterSet::open(pond, &limit_spec)
+            .await
+            .map_err(|error| anyhow!("bind limiters for remote `{name}`: {error}"))?
+    };
+    let build = steward::build_recovery_capsule(
+        steward
+            .as_pond()
+            .ok_or_else(|| anyhow!("capsule publish requires a pond steward"))?,
+    )
+    .await?;
+    let manifest = build.manifest.clone();
+    let objects_dir = build.payloads.objects_dir().to_path_buf();
+    let url = attachment.url.clone();
+    let publish_url = url.clone();
+    let operation = steward::storage_meter::metered_op(
+        &url,
+        &mut limits,
+        Box::pin(async move {
+            let remote = sync_store::ContentRemote::open_at_url(&publish_url, storage_options)
+                .await
+                .map_err(|error| anyhow!("open backup for capsule publication: {error}"))?;
+            remote
+                .publish_capsule_directory(&manifest, &objects_dir)
+                .await
+                .map_err(|error| anyhow!("publish capsule: {error}"))
+        }),
+    )
+    .await;
+    let pond = steward
+        .as_pond_mut()
+        .ok_or_else(|| anyhow!("capsule publish requires a pond steward"))?;
+    limits
+        .commit(pond.control_table_mut())
+        .await
+        .map_err(|error| anyhow!("record capsule-publication limiter usage: {error}"))?;
+    let outcome = operation?;
+    log::info!(
+        "[OK] capsule published to {} (root={}, payloads_uploaded={}, payloads_total={})",
+        name,
+        outcome.root,
+        outcome.payloads_uploaded,
+        outcome.payloads_total
+    );
+    Ok(())
 }
 
 /// Publish or inspect one explicit native-format recovery recipe.

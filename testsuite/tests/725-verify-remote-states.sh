@@ -84,7 +84,8 @@ check '! grep -q "is behind local by" /tmp/725-verify3.log' \
 
 echo "--- Step 6: a push after compaction completes; verify still UpToDate ---"
 pond push origin > /tmp/725-push.log 2>&1
-check 'grep -qE "push origin complete" /tmp/725-push.log' "push after compaction completed"
+check 'grep -q "remote already acknowledged the current content tip" /tmp/725-push.log' \
+    "push after compaction reports an acknowledged no-op"
 pond verify origin > /tmp/725-verify4.log 2>&1
 check_contains /tmp/725-verify4.log "verify still clean after the no-op push" \
     "live data matches remote tip"

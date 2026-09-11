@@ -16,7 +16,7 @@
 //! | Node kind                         | `child_hash`                                   |
 //! |-----------------------------------|------------------------------------------------|
 //! | file (physical version)           | `blake3(version bytes)` -- the blob hash       |
-//! | series / multi-version file       | the `watertown.series.v2` manifest hash        |
+//! | series / multi-version file       | the `watertown.series.v3` manifest hash        |
 //! | directory                         | the subtree's [`tree_hash`]                    |
 //! | symlink                           | `blake3(target path)` -- [`ObjectHash::of_bytes`] |
 //! | dynamic dir / `table:dynamic`     | `blake3(stored config bytes)` -- the recipe    |

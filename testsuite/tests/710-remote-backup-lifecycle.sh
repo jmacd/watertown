@@ -59,7 +59,7 @@ check '[ -n "'"${PUSHED1}"'" ] && [ "'"${PUSHED1}"'" != "-" ]'  "PUSHED_TIP set 
 
 echo "--- Step 4: re-push is idempotent (tip unchanged) ---"
 pond push origin > /tmp/710-push.log 2>&1
-check_contains /tmp/710-push.log "push reports completion with a tip" "push origin complete"
+check_contains /tmp/710-push.log "re-push reports acknowledged no-op" "remote already acknowledged the current content tip"
 PUSHED_AGAIN=$(backup_field origin 5)
 check '[ "'"${PUSHED_AGAIN}"'" = "'"${PUSHED1}"'" ]'            "re-push leaves PUSHED_TIP unchanged (no new content)"
 

@@ -235,17 +235,23 @@ const ACCESS_OPERATIONS: [AccessOperation; 7] = [
     AccessOperation::Delete,
     AccessOperation::Copy,
 ];
-const ACCESS_CLASSES: [AccessClass; 10] = [
+const ACCESS_CLASSES: [AccessClass; 16] = [
     AccessClass::DeltaLog,
     AccessClass::DeltaObjects,
     AccessClass::DeltaCommits,
     AccessClass::DeltaRefs,
     AccessClass::DeltaMeta,
+    AccessClass::ContentObjects,
+    AccessClass::ContentReceipts,
+    AccessClass::PublicationRecords,
+    AccessClass::PublicationDeltaLog,
+    AccessClass::PublicationDeltaData,
+    AccessClass::ContentPacks,
     AccessClass::PackIndexes,
     AccessClass::PackObjects,
     AccessClass::Blobs,
     AccessClass::Recovery,
-    AccessClass::Other,
+    AccessClass::Fallback,
 ];
 
 /// One physical object-store operation category.
@@ -298,7 +304,19 @@ pub enum AccessClass {
     DeltaRefs,
     /// Parquet files for the remote-metadata partition.
     DeltaMeta,
-    /// Pack-v3 index metadata.
+    /// Native-v2 canonical payload objects.
+    ContentObjects,
+    /// Native-v2 immutable object receipts.
+    ContentReceipts,
+    /// Native-v2 immutable per-push publication records.
+    PublicationRecords,
+    /// Dedicated publication table transaction log/checkpoints.
+    PublicationDeltaLog,
+    /// Dedicated publication table Parquet data.
+    PublicationDeltaData,
+    /// Native-v2 immutable pack indexes.
+    ContentPacks,
+    /// Pack-v4 index metadata.
     PackIndexes,
     /// Shared physical pack payloads.
     PackObjects,
@@ -307,7 +325,7 @@ pub enum AccessClass {
     /// Recovery capsule and recipe objects.
     Recovery,
     /// Paths outside the recognized storage layout.
-    Other,
+    Fallback,
 }
 
 impl AccessClass {
@@ -322,11 +340,17 @@ impl AccessClass {
             Self::DeltaCommits => "delta_commits",
             Self::DeltaRefs => "delta_refs",
             Self::DeltaMeta => "delta_meta",
+            Self::ContentObjects => "content_v2_objects",
+            Self::ContentReceipts => "content_v2_receipts",
+            Self::PublicationRecords => "content_v2_publications",
+            Self::PublicationDeltaLog => "publication_delta_log",
+            Self::PublicationDeltaData => "publication_delta_data",
+            Self::ContentPacks => "content_v2_packs",
             Self::PackIndexes => "pack_indexes",
             Self::PackObjects => "pack_objects",
             Self::Blobs => "blobs",
             Self::Recovery => "recovery",
-            Self::Other => "other",
+            Self::Fallback => "fallback",
         }
     }
 }
@@ -368,6 +392,7 @@ pub struct AccessSummary {
     total: AccessTotals,
     operations: [AccessTotals; ACCESS_OPERATIONS.len()],
     classes: [AccessTotals; ACCESS_CLASSES.len()],
+    physical_creates: [AccessTotals; ACCESS_CLASSES.len()],
     /// Single-object Delta queries issued.
     pub object_point_queries: u64,
     /// Single-object queries that returned an inline object.
@@ -399,6 +424,12 @@ impl AccessSummary {
         self.classes[class.index()]
     }
 
+    /// Successful canonical physical creates attributed to `class`.
+    #[must_use]
+    pub fn physical_creates(&self, class: AccessClass) -> AccessTotals {
+        self.physical_creates[class.index()]
+    }
+
     fn add_access(&mut self, operation: AccessOperation, class: AccessClass, ops: u64, bytes: u64) {
         self.total.add(ops, bytes);
         self.operations[operation.index()].add(ops, bytes);
@@ -412,6 +443,7 @@ impl AccessSummary {
         }
         for class in ACCESS_CLASSES {
             self.classes[class.index()].merge(other.class(class));
+            self.physical_creates[class.index()].merge(other.physical_creates(class));
         }
         self.object_point_queries = self
             .object_point_queries
@@ -460,6 +492,9 @@ impl AccessSummary {
         for class in ACCESS_CLASSES {
             difference.classes[class.index()] =
                 self.class(class).saturating_sub(earlier.class(class));
+            difference.physical_creates[class.index()] = self
+                .physical_creates(class)
+                .saturating_sub(earlier.physical_creates(class));
         }
         difference
     }
@@ -493,6 +528,15 @@ impl fmt::Display for AccessSummary {
                 class.name(),
                 totals.bytes
             )?;
+            let creates = self.physical_creates(class);
+            write!(
+                f,
+                " {}_physical_creates={} {}_physical_create_bytes={}",
+                class.name(),
+                creates.ops,
+                class.name(),
+                creates.bytes
+            )?;
         }
         write!(
             f,
@@ -523,6 +567,9 @@ impl AccessEvent {
 
 fn classify_path(location: &ObjectPath, prefix: Option<&ObjectPath>) -> AccessClass {
     let mut path = location.as_ref();
+    let publication_root = prefix
+        .and_then(ObjectPath::filename)
+        .is_some_and(|name| name == "_publication");
     if let Some(prefix) = prefix {
         let prefix = prefix.as_ref().trim_end_matches('/');
         if path == prefix {
@@ -534,19 +581,38 @@ fn classify_path(location: &ObjectPath, prefix: Option<&ObjectPath>) -> AccessCl
             path = relative;
         }
     }
-    if path == "_delta_log" || path.starts_with("_delta_log/") {
+    path = path.trim_start_matches('/');
+    if publication_root {
+        if path_is_or_under(path, "_delta_log") {
+            return AccessClass::PublicationDeltaLog;
+        }
+        return AccessClass::PublicationDeltaData;
+    }
+    if path_is_or_under(path, "_delta_log") {
         return AccessClass::DeltaLog;
     }
-    if path == "_packs/v3" || path.starts_with("_packs/v3/") {
+    if path_is_or_under(path, "_content/v2/objects") {
+        return AccessClass::ContentObjects;
+    }
+    if path_is_or_under(path, "_content/v2/receipts") {
+        return AccessClass::ContentReceipts;
+    }
+    if path_is_or_under(path, "_content/v2/publications") {
+        return AccessClass::PublicationRecords;
+    }
+    if path_is_or_under(path, "_content/v2/packs") {
+        return AccessClass::ContentPacks;
+    }
+    if path_is_or_under(path, "_packs/v4") {
         return AccessClass::PackIndexes;
     }
-    if path == "_packs/objects" || path.starts_with("_packs/objects/") {
+    if path_is_or_under(path, "_packs/objects") {
         return AccessClass::PackObjects;
     }
-    if path == "_blobs" || path.starts_with("_blobs/") {
+    if path_is_or_under(path, "_blobs") {
         return AccessClass::Blobs;
     }
-    if path == "recovery" || path.starts_with("recovery/") {
+    if path_is_or_under(path, "recovery") {
         return AccessClass::Recovery;
     }
     for component in path.split('/') {
@@ -558,11 +624,30 @@ fn classify_path(location: &ObjectPath, prefix: Option<&ObjectPath>) -> AccessCl
             _ => {}
         }
     }
-    AccessClass::Other
+    AccessClass::Fallback
+}
+
+fn path_is_or_under(path: &str, root: &str) -> bool {
+    path == root
+        || path.starts_with(&format!("{root}/"))
+        || path.contains(&format!("/{root}/"))
+        || path.ends_with(&format!("/{root}"))
 }
 
 fn classify_prefix(prefix: Option<&ObjectPath>, root_prefix: Option<&ObjectPath>) -> AccessClass {
-    prefix.map_or(AccessClass::Other, |path| classify_path(path, root_prefix))
+    prefix.map_or_else(
+        || {
+            if root_prefix
+                .and_then(ObjectPath::filename)
+                .is_some_and(|name| name == "_publication")
+            {
+                AccessClass::PublicationDeltaData
+            } else {
+                AccessClass::Fallback
+            }
+        },
+        |path| classify_path(path, root_prefix),
+    )
 }
 
 /// Bind `meter` to the remote at `key` until the returned value is dropped.
@@ -761,12 +846,23 @@ pub fn access_summary_under(key: &RemoteKey) -> AccessSummary {
     summary
 }
 
+#[cfg(test)]
 pub(crate) fn record_object_point_query(key: &RemoteKey, hit: bool) {
     observation(key).add_object_point_query(hit);
 }
 
+#[cfg(test)]
 pub(crate) fn record_object_batch_query(key: &RemoteKey, requested: usize, returned: usize) {
     observation(key).add_object_batch_query(requested, returned);
+}
+
+/// Record a successful canonical physical create.
+///
+/// Ordinary access counters include failed conditional attempts. This
+/// separate counter is the release-gate proof that retries and historical
+/// reintroduction did not create another physical payload.
+pub(crate) fn record_physical_create(key: &RemoteKey, class: AccessClass, bytes: u64) {
+    observation(key).add_physical_create(class, bytes);
 }
 
 /// The counters for `key`, created on first use.
@@ -824,6 +920,7 @@ impl Observation {
             .add_access(event.operation, event.class, ops, bytes);
     }
 
+    #[cfg(test)]
     fn add_object_point_query(&self, hit: bool) {
         let mut summary = self
             .summary
@@ -835,6 +932,7 @@ impl Observation {
         }
     }
 
+    #[cfg(test)]
     fn add_object_batch_query(&self, requested: usize, returned: usize) {
         let mut summary = self
             .summary
@@ -843,6 +941,14 @@ impl Observation {
         summary.object_batch_queries = summary.object_batch_queries.saturating_add(1);
         summary.object_batch_keys = summary.object_batch_keys.saturating_add(requested as u64);
         summary.object_batch_hits = summary.object_batch_hits.saturating_add(returned as u64);
+    }
+
+    fn add_physical_create(&self, class: AccessClass, bytes: u64) {
+        self.summary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .physical_creates[class.index()]
+        .add(1, bytes);
     }
 }
 
@@ -1278,7 +1384,7 @@ mod tests {
         );
         assert_eq!(
             classify_path(
-                &ObjectPath::from("_packs/v3/series=secret/pack=secret"),
+                &ObjectPath::from("_packs/v4/series=secret/pack=secret"),
                 None
             ),
             AccessClass::PackIndexes
@@ -1296,8 +1402,30 @@ mod tests {
             AccessClass::Recovery
         );
         assert_eq!(
+            classify_path(&ObjectPath::from("_content/v2/objects/blake3=secret"), None),
+            AccessClass::ContentObjects
+        );
+        assert_eq!(
+            classify_path(
+                &ObjectPath::from("_content/v2/receipts/blake3=secret"),
+                None
+            ),
+            AccessClass::ContentReceipts
+        );
+        assert_eq!(
+            classify_path(
+                &ObjectPath::from("_content/v2/publications/blake3=secret"),
+                None
+            ),
+            AccessClass::PublicationRecords
+        );
+        assert_eq!(
+            classify_path(&ObjectPath::from("_content/v2/packs/blake3=secret"), None),
+            AccessClass::ContentPacks
+        );
+        assert_eq!(
             classify_path(&ObjectPath::from("unrecognized/secret"), None),
-            AccessClass::Other
+            AccessClass::Fallback
         );
         let prefix = ObjectPath::from("table/prefix");
         assert_eq!(
@@ -1314,6 +1442,34 @@ mod tests {
             ),
             AccessClass::PackObjects
         );
+        let publication_prefix = ObjectPath::from("table/prefix/_publication");
+        assert_eq!(
+            classify_path(
+                &ObjectPath::from("table/prefix/_publication/_delta_log/1.json"),
+                Some(&publication_prefix)
+            ),
+            AccessClass::PublicationDeltaLog
+        );
+        assert_eq!(
+            classify_path(
+                &ObjectPath::from("table/prefix/_publication/pond_id=x/ref_name=main/part.parquet"),
+                Some(&publication_prefix)
+            ),
+            AccessClass::PublicationDeltaData
+        );
+    }
+
+    #[test]
+    fn physical_create_counters_are_separate_from_attempts() {
+        let key = RemoteKey::new("mem://physical-create-counter");
+        let before = access_summary_under(&key);
+        record_physical_create(&key, AccessClass::ContentObjects, 123);
+        let delta = access_summary_under(&key).saturating_sub(&before);
+        assert_eq!(
+            delta.physical_creates(AccessClass::ContentObjects),
+            AccessTotals { ops: 1, bytes: 123 }
+        );
+        assert_eq!(delta.total(), AccessTotals::default());
     }
 
     #[test]

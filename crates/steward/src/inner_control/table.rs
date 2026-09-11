@@ -781,9 +781,25 @@ impl ControlTable {
     /// (e.g., `last_pulled_seq:<remote>`); the Steward always uses its
     /// local pond_id when calling this.
     pub async fn config_set(&mut self, pond_id: Uuid, key: &str, value: &str) -> Result<()> {
+        self.config_set_after(pond_id, key, value, i64::MIN).await
+    }
+
+    /// Set a configuration value with a timestamp strictly newer than
+    /// `after_micros`, preserving deterministic latest-write-wins ordering for
+    /// callers that serialize read/compare/write updates.
+    pub async fn config_set_after(
+        &mut self,
+        pond_id: Uuid,
+        key: &str,
+        value: &str,
+        after_micros: i64,
+    ) -> Result<()> {
         let mut meta = HashMap::new();
         let _ = meta.insert("v".to_string(), value.to_string());
         let metadata_json = serde_json::to_string(&meta)?;
+        let ts_micros = Utc::now()
+            .timestamp_micros()
+            .max(after_micros.saturating_add(1));
         let rec = ControlRecord {
             pond_id,
             record_kind: RecordKind::Setting,
@@ -792,7 +808,7 @@ impl ControlTable {
             commit_kind: None,
             parent_seq: None,
             duration_ms: None,
-            ts_micros: Utc::now().timestamp_micros(),
+            ts_micros,
             metadata_json,
         };
         self.write_record(rec).await
@@ -800,8 +816,34 @@ impl ControlTable {
 
     /// Read the current value of `(pond_id, key)`, or `None` if never set.
     pub async fn config_get(&self, pond_id: Uuid, key: &str) -> Result<Option<String>> {
-        let map = self.config_list(pond_id).await?;
-        Ok(map.get(key).cloned())
+        Ok(self
+            .config_get_with_timestamp(pond_id, key)
+            .await?
+            .map(|(_, value)| value))
+    }
+
+    /// Read the latest timestamped value of one setting.
+    pub async fn config_get_with_timestamp(
+        &self,
+        pond_id: Uuid,
+        key: &str,
+    ) -> Result<Option<(i64, String)>> {
+        let all = self.all_records_for(pond_id).await?;
+        let mut latest = None;
+        for rec in all
+            .iter()
+            .filter(|record| record.record_kind == RecordKind::Setting && record.txn_id == key)
+        {
+            let map: HashMap<String, String> = serde_json::from_str(&rec.metadata_json)?;
+            if let Some(value) = map.get("v")
+                && latest
+                    .as_ref()
+                    .is_none_or(|(timestamp, _)| rec.ts_micros >= *timestamp)
+            {
+                latest = Some((rec.ts_micros, value.clone()));
+            }
+        }
+        Ok(latest)
     }
 
     /// Read all current settings for `pond_id` (latest-write-wins per key).

@@ -224,8 +224,8 @@ impl Pathed<crate::file::Handle> {
         self.handle.async_writer().await
     }
 
-    /// Get async writer that replaces all earlier versions of a series node with
-    /// a fresh baseline (see [`crate::file::File::async_writer_collapsing`]).
+    /// Internal backend writer for the reserved manifest index (see
+    /// [`crate::file::File::async_writer_collapsing`]).
     pub async fn async_writer_collapsing(
         &self,
     ) -> Result<Pin<Box<dyn crate::file::FileMetadataWriter>>> {

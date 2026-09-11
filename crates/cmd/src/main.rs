@@ -194,6 +194,24 @@ enum BackupCommand {
         #[arg(long)]
         purge: bool,
     },
+    /// Delete abandoned immutable-payload upload staging objects.
+    CleanupUploads {
+        /// Logical name of the backup.
+        name: String,
+        /// Delete staging objects at least this old.
+        #[arg(long, default_value_t = 86_400)]
+        older_than_seconds: i64,
+    },
+    /// Publish verified local whole-range series packs to this backup.
+    ///
+    /// This is the only operation that installs remote consolidated-pack
+    /// locators. It validates the backup's pond identity and exact current
+    /// `main` publication, uploads immutable physical objects, then each pack,
+    /// then its locator. It never runs as part of collection or ordinary push.
+    PublishConsolidated {
+        /// Logical name of a push/both backup.
+        name: String,
+    },
     /// List backup-mode attachments only.
     List,
 }
@@ -201,6 +219,11 @@ enum BackupCommand {
 /// Portable recovery-capsule operations.
 #[derive(Debug, Subcommand)]
 enum CapsuleCommand {
+    /// Build and publish the current portable `pondcapsule.4` snapshot.
+    Publish {
+        /// Logical backup name.
+        name: String,
+    },
     /// Publish or inspect a static native-format recovery recipe.
     Recipe {
         #[command(subcommand)]
@@ -220,11 +243,14 @@ enum CapsuleCommand {
     ///
     /// The target must not already exist. A private sibling staging
     /// directory is created next to it, given a fresh pond identity, and
-    /// populated from the capsule with post-commit factory execution and
-    /// remote auto-push suppressed; only after the staged result is
-    /// re-verified against the capsule's logical contract is it renamed
-    /// atomically onto the target. On any failure the staging directory is
-    /// left in place for inspection rather than silently removed.
+    /// populated in bounded, journaled transactions with post-commit factory
+    /// execution and remote auto-push suppressed. Retrying the same command
+    /// resumes the matching staging directory at an exact entry/leaf cursor.
+    /// Only after the staged result is re-verified against the capsule's
+    /// logical contract is it renamed atomically onto the target. On any
+    /// failure the staging directory is left in place for inspection rather
+    /// than silently removed. The promoted pond remains inert until
+    /// `pond capsule activate` passes its safety preflight.
     Import {
         /// Directory containing the downloaded `recovery/` tree.
         path: PathBuf,
@@ -232,11 +258,13 @@ enum CapsuleCommand {
         /// `pond init --birthplace`).
         #[arg(long)]
         birthplace: String,
-        /// Acknowledge that bounded resume and active-remote preflight are
-        /// not yet implemented.
-        #[arg(long, required = true)]
-        experimental: bool,
     },
+    /// Safely enable post-commit dispatch on a completed capsule import.
+    ///
+    /// Reads and validates every restored `/sys/remotes/*` attachment and
+    /// `/system/run/*` dynamic config without executing factories. Dispatch
+    /// remains suppressed if any entry is invalid or unsafe.
+    Activate,
 }
 
 #[derive(Debug, Subcommand)]
@@ -294,13 +322,11 @@ enum Commands {
         /// Also compact small parquet files into larger ones
         #[arg(long)]
         compact: bool,
-        /// Also collapse multi-version `data:series` files whose live version
-        /// count exceeds this threshold into a single merged version. Pass 0 to
-        /// disable (the default). On a logical-series-v2 pond this is a
-        /// reported, exit-0 no-op instead: row-rewriting collapse would
-        /// destroy logical leaf identity, so it is skipped with a warning
-        /// (see docs/logical-series-identity-design.md) rather than run or
-        /// fail the command; checkpoint/vacuum/prune still proceed normally.
+        /// Repack native-v2 series whose live physical fanout exceeds this
+        /// threshold into verified whole-range packs under local `data/_packs`.
+        /// Pass 0 to disable (the default). This never rewrites or reclaims user
+        /// logical-series rows; publish selected packs explicitly with
+        /// `pond backup publish-consolidated NAME`.
         #[arg(long, default_value = "0")]
         collapse_versions: usize,
         /// Also prune replicated control-table lifecycle history at or below a
@@ -314,8 +340,7 @@ enum Commands {
         /// (retention-only; pruned history is then unrecoverable).
         #[arg(long)]
         allow_no_remote: bool,
-        /// Report what maintenance would do -- which series collapse would
-        /// merge and how many bytes that would push -- without changing
+        /// Report which local series packs would be rebuilt, without changing
         /// anything.
         #[arg(long)]
         dry_run: bool,
@@ -788,6 +813,16 @@ async fn main() -> Result<()> {
             BackupCommand::Remove { name, purge } => {
                 commands::remove_remote_command(&ship_context, &name, purge).await
             }
+            BackupCommand::CleanupUploads {
+                name,
+                older_than_seconds,
+            } => {
+                commands::cleanup_backup_uploads_command(&ship_context, &name, older_than_seconds)
+                    .await
+            }
+            BackupCommand::PublishConsolidated { name } => {
+                commands::publish_consolidated_packs_command(&ship_context, &name).await
+            }
             BackupCommand::List => {
                 commands::list_remotes_command(
                     &ship_context,
@@ -797,6 +832,9 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Capsule { command } => match command {
+            CapsuleCommand::Publish { name } => {
+                commands::capsule_publish_command(&ship_context, &name).await
+            }
             CapsuleCommand::Recipe { command } => {
                 let (name, action) = match command {
                     CapsuleRecipeCommand::Publish { name } => {
@@ -811,13 +849,13 @@ async fn main() -> Result<()> {
             CapsuleCommand::Inspect { path } | CapsuleCommand::Verify { path } => {
                 commands::capsule_inspect_command(&path)
             }
-            CapsuleCommand::Import {
-                path,
-                birthplace,
-                experimental,
-            } => {
+            CapsuleCommand::Import { path, birthplace } => {
                 let target = ship_context.resolve_pond_path()?;
-                commands::capsule_import_command(&path, &target, &birthplace, experimental).await
+                commands::capsule_import_command(&path, &target, &birthplace).await
+            }
+            CapsuleCommand::Activate => {
+                let target = ship_context.resolve_pond_path()?;
+                commands::capsule_activate_command(&target).await
             }
         },
         Commands::Freeze { command } => match command {
@@ -991,6 +1029,14 @@ mod tests {
 
     #[test]
     fn parses_target_format_recipe_commands_at_existing_paths() {
+        let capsule = Cli::try_parse_from(["pond", "capsule", "publish", "backup"]).unwrap();
+        assert!(matches!(
+            capsule.command,
+            Commands::Capsule {
+                command: CapsuleCommand::Publish { ref name }
+            } if name == "backup"
+        ));
+
         let publish =
             Cli::try_parse_from(["pond", "capsule", "recipe", "publish", "backup"]).unwrap();
         assert!(matches!(
@@ -1022,5 +1068,83 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn parses_explicit_backup_upload_cleanup() {
+        let cleanup = Cli::try_parse_from([
+            "pond",
+            "backup",
+            "cleanup-uploads",
+            "origin",
+            "--older-than-seconds",
+            "3600",
+        ])
+        .expect("cleanup syntax");
+        assert!(matches!(
+            cleanup.command,
+            Commands::Backup {
+                command: BackupCommand::CleanupUploads {
+                    ref name,
+                    older_than_seconds: 3600,
+                }
+            } if name == "origin"
+        ));
+    }
+
+    #[test]
+    fn parses_explicit_consolidated_pack_publication() {
+        let publish = Cli::try_parse_from(["pond", "backup", "publish-consolidated", "origin"])
+            .expect("consolidated publication syntax");
+        assert!(matches!(
+            publish.command,
+            Commands::Backup {
+                command: BackupCommand::PublishConsolidated { ref name }
+            } if name == "origin"
+        ));
+    }
+
+    #[test]
+    fn parses_capsule_import_without_experimental_gate_and_activation() {
+        let import = Cli::try_parse_from([
+            "pond",
+            "--pond",
+            "restored",
+            "capsule",
+            "import",
+            "capsule",
+            "--birthplace",
+            "recovery-host",
+        ])
+        .expect("production import syntax");
+        assert!(matches!(
+            import.command,
+            Commands::Capsule {
+                command: CapsuleCommand::Import { .. }
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "pond",
+                "--pond",
+                "restored",
+                "capsule",
+                "import",
+                "capsule",
+                "--birthplace",
+                "recovery-host",
+                "--experimental",
+            ])
+            .is_err()
+        );
+
+        let activate = Cli::try_parse_from(["pond", "--pond", "restored", "capsule", "activate"])
+            .expect("activation syntax");
+        assert!(matches!(
+            activate.command,
+            Commands::Capsule {
+                command: CapsuleCommand::Activate
+            }
+        ));
     }
 }

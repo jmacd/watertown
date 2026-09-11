@@ -117,6 +117,7 @@ pub struct ControlTable {
     pond_metadata: PondMetadata,
     factory_modes: HashMap<String, String>,
     settings: HashMap<String, String>,
+    raw_settings: HashMap<String, String>,
 }
 
 impl ControlTable {
@@ -135,6 +136,7 @@ impl ControlTable {
             pond_metadata: pond_metadata.clone(),
             factory_modes: HashMap::new(),
             settings: HashMap::new(),
+            raw_settings: HashMap::new(),
         })
     }
 
@@ -147,12 +149,13 @@ impl ControlTable {
         let pond_metadata = load_pond_metadata(&inner).await?;
         let pond_id_uuid = pond_id_to_std(&pond_metadata.pond_id);
         let local_config = inner.config_list(pond_id_uuid).await.map_err(map_err)?;
-        let (factory_modes, settings) = split_config(local_config);
+        let (factory_modes, settings, raw_settings) = split_config(local_config);
         Ok(Self {
             inner,
             pond_metadata,
             factory_modes,
             settings,
+            raw_settings,
         })
     }
 
@@ -800,16 +803,12 @@ impl ControlTable {
         self.inner.write_record(record).await.map_err(map_err)
     }
 
-    /// Raw per-replica setting read (no prefix munging).  Used by
-    /// the sync-remote adapter for keys like `last_pulled_seq:<url>`
-    /// and `last_pushed_seq:<url>` which must match the sync_steward
-    /// key format exactly.  See [`Self::get_setting`] for the
-    /// watertown user-facing API (which adds a `"setting:"` prefix).
+    /// Raw per-replica setting read (no prefix munging). Used for remote
+    /// mode/mount settings and structured publication acknowledgements.
+    /// See [`Self::get_setting`] for the user-facing API, which adds a
+    /// `"setting:"` prefix.
     pub async fn raw_config_get(&self, key: &str) -> Result<Option<String>, StewardError> {
-        self.inner
-            .config_get(self.pond_id_uuid(), key)
-            .await
-            .map_err(map_err)
+        Ok(self.raw_settings.get(key).cloned())
     }
 
     /// Raw per-replica setting write (no prefix munging).  Companion
@@ -818,7 +817,33 @@ impl ControlTable {
         self.inner
             .config_set(self.pond_id_uuid(), key, value)
             .await
+            .map_err(map_err)?;
+        let _ = self.raw_settings.insert(key.to_string(), value.to_string());
+        Ok(())
+    }
+
+    pub(crate) async fn raw_config_entry(
+        &self,
+        key: &str,
+    ) -> Result<Option<(i64, String)>, StewardError> {
+        self.inner
+            .config_get_with_timestamp(self.pond_id_uuid(), key)
+            .await
             .map_err(map_err)
+    }
+
+    pub(crate) async fn raw_config_set_after(
+        &mut self,
+        key: &str,
+        value: &str,
+        after_micros: i64,
+    ) -> Result<(), StewardError> {
+        self.inner
+            .config_set_after(self.pond_id_uuid(), key, value, after_micros)
+            .await
+            .map_err(map_err)?;
+        let _ = self.raw_settings.insert(key.to_string(), value.to_string());
+        Ok(())
     }
 
     // -------- Queries --------
@@ -1011,17 +1036,24 @@ async fn load_pond_metadata(inner: &InnerControlTable) -> Result<PondMetadata, S
 
 fn split_config(
     all: HashMap<String, String>,
-) -> (HashMap<String, String>, HashMap<String, String>) {
+) -> (
+    HashMap<String, String>,
+    HashMap<String, String>,
+    HashMap<String, String>,
+) {
     let mut modes = HashMap::new();
     let mut settings = HashMap::new();
+    let mut raw_settings = HashMap::new();
     for (k, v) in all {
         if let Some(name) = k.strip_prefix(FACTORY_MODE_PREFIX) {
             let _previous = modes.insert(name.to_string(), v);
         } else if let Some(name) = k.strip_prefix(SETTING_PREFIX) {
             let _previous = settings.insert(name.to_string(), v);
+        } else {
+            let _previous = raw_settings.insert(k, v);
         }
     }
-    (modes, settings)
+    (modes, settings, raw_settings)
 }
 
 /// Render the pond identity banner to stdout.

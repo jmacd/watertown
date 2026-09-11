@@ -120,11 +120,15 @@ async fn materialized_hashes_match_inventory() {
     assert!(mat.external_blobs.is_empty(), "no large blobs expected");
 
     let mat_hashes: std::collections::BTreeSet<ObjectHash> = mat.inline.keys().copied().collect();
-    assert_eq!(
-        mat_hashes,
-        inv.hashes(),
-        "materialized object hashes match the reachability inventory"
+    let inventory = inv.hashes();
+    assert!(
+        inventory.is_subset(&mat_hashes),
+        "materialization must contain every content-tree object"
     );
+    for hash in mat_hashes.difference(&inventory) {
+        let _ = sync_store::content::ManifestMapNode::decode(&mat.inline[hash])
+            .expect("additional objects are persistent manifest-map nodes");
+    }
 
     // The root tree object is present and decodes to its own hash.
     let report = steward::compute_content_tree(&ship).await.expect("root");

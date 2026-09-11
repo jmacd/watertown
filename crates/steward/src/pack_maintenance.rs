@@ -6,7 +6,7 @@
 //! --collapse-versions N` (`docs/logical-series-identity-design.md`).
 //!
 //! This module never rewrites or deletes an Oplog append row, never
-//! changes a `watertown.series.v2` manifest/tree/commit root, Delta version, or txn
+//! changes a `watertown.series.v3` manifest/tree/commit root, Delta version, or txn
 //! sequence, and never changes logical metadata. What it *does* do is
 //! discover native v2 series whose current physical representation is
 //! fragmented past a requested threshold and publish a smaller, bounded set
@@ -14,9 +14,8 @@
 //! advertisement) to the local pond's own `data/_packs` namespace
 //! ([`crate::pack_store`]), so a remote or `pond://` reader can select the
 //! bounded layout instead of the original one-object-per-append stream --
-//! exactly the same acceptance path gate 7's initial pack publication
-//! already uses (see [`crate::content_tree::build_initial_pack_index`]),
-//! just built from a repack instead of a 1:1 mapping of existing objects.
+//! as a full-range consolidated segment that terminates linked-segment
+//! traversal without changing logical identity.
 //!
 //! # Why this is safe
 //!
@@ -24,7 +23,7 @@
 //! series' already-committed logical content, never a replacement for the
 //! Oplog rows themselves. [`crate::content_tree::build_series_manifest`]
 //! (the exact same fold every push/verify path uses) is called on the
-//! series' live rows to get the untouched, canonical `watertown.series.v2`
+//! series' live rows to get the untouched, canonical `watertown.series.v3`
 //! manifest; every leaf hash a fresh pack claims is recomputed from the
 //! real, live-fetched content and checked against that persisted leaf hash
 //! before it is trusted (requirement 3's "recompute/verify"); and the
@@ -153,7 +152,7 @@ pub enum PackCandidateOutcome {
 pub struct PackMaintenanceCandidate {
     /// The series node's identity.
     pub file_id: FileID,
-    /// The series' `watertown.series.v2` manifest hash, or `None` for
+    /// The series' `watertown.series.v3` manifest hash, or `None` for
     /// [`PackCandidateOutcome::UnsupportedLegacy`] (a pre-v2 series has no
     /// v2 manifest to hash).
     pub series_hash: Option<ObjectHash>,

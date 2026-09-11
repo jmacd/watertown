@@ -737,29 +737,49 @@ impl WD {
         }
     }
 
-    /// Like [`WD::async_writer_path_with_type`], but the returned writer replaces
-    /// every earlier version of an existing series node with a fresh baseline,
-    /// stamping a `collapsed_through` sentinel. Used by content-addressed pull to
-    /// replicate a source-side series compaction. The node must already exist; a
-    /// missing node is created normally (nothing to collapse).
+    /// Retired native-v2 user-series collapse entry point.
+    ///
+    /// `FilePhysicalSeries` and `TablePhysicalSeries` are append-only in the
+    /// reset native format. Callers must append with
+    /// [`WD::async_writer_path_with_type`]; replacing a logical series requires
+    /// an explicit capsule reset rather than a merged Oplog row.
     pub async fn async_writer_path_collapsing_with_type<P: AsRef<Path>>(
         &self,
-        path: P,
-        entry_type: EntryType,
+        _path: P,
+        _entry_type: EntryType,
     ) -> Result<Pin<Box<dyn crate::file::FileMetadataWriter>>> {
-        let path_ref = path.as_ref();
-        let (wd, lookup) = self.resolve_path(path_ref).await?;
+        Err(Error::InvalidConfig(
+            "collapsing writes for user FilePhysicalSeries/TablePhysicalSeries are retired in \
+             native-v2: logical series are append-only. Use async_writer_path_with_type to \
+             append, or restore replacement content through a verified pondcapsule.4 reset. \
+             Only the reserved .pond-node-index collapses internally."
+                .to_string(),
+        ))
+    }
+
+    /// Open the reserved node-manifest index for its internal bounded rewrite.
+    ///
+    /// This is intentionally separate from the retired public user-series
+    /// collapse surface and validates the well-known node identity before
+    /// exposing the backend collapsing primitive.
+    #[doc(hidden)]
+    pub async fn async_writer_reserved_index(
+        &self,
+    ) -> Result<Pin<Box<dyn crate::file::FileMetadataWriter>>> {
+        let (wd, lookup) = self.resolve_path(INDEX_NODE_NAME).await?;
         match lookup {
             Lookup::Found(node) => {
                 wd.check_writable()?;
+                if !node.id().node_id().is_index() {
+                    return Err(Error::Internal(format!(
+                        "reserved index path {} resolves to unexpected node {}",
+                        INDEX_NODE_NAME,
+                        node.id().node_id()
+                    )));
+                }
                 node.as_file().await?.async_writer_collapsing().await
             }
-            Lookup::NotFound(_, _) => {
-                let (_, writer) = self
-                    .create_file_path_streaming_with_type(path, entry_type)
-                    .await?;
-                Ok(writer)
-            }
+            Lookup::NotFound(full_path, _) => Err(Error::not_found(full_path)),
             Lookup::Empty(_) => Err(Error::empty_path()),
         }
     }

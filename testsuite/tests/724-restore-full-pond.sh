@@ -62,7 +62,7 @@ BIG_MD5=$(md5sum /tmp/724-big.bin | cut -d' ' -f1)
 echo "--- Step 2: backup add (auto-push) to a file:// remote ---"
 pond backup add origin "file://${REMOTE}" > /tmp/724-backup.log 2>&1
 check 'grep -q "added remote origin" /tmp/724-backup.log' "backup add origin succeeded"
-P1_TIP=$(POND="$P1" pond status 2>/dev/null | awk '/last pushed:/ {print $NF}')
+P1_TIP=$(POND="$P1" pond status 2>/dev/null | awk '/last pushed:/ {print $3}')
 check '[ ${#P1_TIP} -eq 64 ]' "producer pushed tip is a 64-hex content hash"
 
 echo "--- Step 3: fresh consumer restores the whole pond ---"
@@ -85,7 +85,7 @@ check '[ "'"$P2_BIG_MD5"'" = "'"$BIG_MD5"'" ]' "restored >64KB /data/big.bin md5
 check 'pond cat /data/f1.txt 2>/dev/null | grep -q row-one' "restored /data/f1.txt content intact"
 
 echo "--- Step 6: consumer converged on the producer's content tip ---"
-P2_PULLED=$(pond status 2>/dev/null | awk '/last pulled:/ {print $NF}')
+P2_PULLED=$(pond status 2>/dev/null | awk '/last pulled:/ {print $3}')
 check '[ "'"$P2_PULLED"'" = "'"$P1_TIP"'" ]' "restored pulled tip equals producer pushed tip"
 
 echo "--- Step 7: the mirror attachment tracks upstream incrementally ---"

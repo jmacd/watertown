@@ -47,7 +47,8 @@
 mod capsule;
 mod commit;
 mod manifest;
-mod node_merkle;
+mod manifest_map;
+mod protocol;
 mod series_leaf;
 mod series_manifest;
 mod series_merkle;
@@ -64,8 +65,15 @@ pub use capsule::{
     verify_incremental_capsule_payload_directory,
 };
 pub use commit::{Commit, ContentModelVersion, Provenance};
-pub use manifest::{ManifestEntry, decode_manifest, encode_manifest, manifest_hash};
-pub use node_merkle::{NodeMerkle, rebuild_root as node_merkle_rebuild_root};
+pub use manifest::ManifestEntry;
+pub use manifest_map::{
+    ManifestChange, ManifestMapEditor, ManifestMapNode, ManifestRecord, ManifestRecordChild,
+    build_manifest_map, decode_manifest_root, encode_manifest_root, manifest_key,
+};
+pub use protocol::{
+    ContentObjectKind, NATIVE_FORMAT_V2, ObjectDescriptor, ObjectReceipt, PackDescriptor,
+    PublicationRecord,
+};
 pub use series_leaf::{
     IncrementalFileLeafHasher, IncrementalTableLeafHasher, canonicalize_schema,
     encode_canonical_attributes, encode_canonical_batch_rows, encode_canonical_schema,
@@ -73,10 +81,13 @@ pub use series_leaf::{
     table_leaf_hash_canonical,
 };
 pub use series_manifest::{PayloadKind, SeriesManifest};
-pub use series_merkle::{RangeProof, generate_range_proof, merkle_root, verify_range_proof};
+pub use series_merkle::{
+    MerkleFrontier, RangeProof, generate_append_range_proof, generate_range_proof, merkle_root,
+    verify_range_proof,
+};
 pub use series_pack::{
     PackIndex, PackLeafDescriptor, PackObjectSpan, effective_leaf_schema_fingerprint,
-    select_exact_cover, verify_pack_against_manifest,
+    select_exact_cover, verify_complete_pack_against_manifest, verify_pack_against_manifest,
 };
 pub use series_pack_builder::{
     BuiltSeriesPack, FileLeafInput, FilePackLayout, TableLeafInput, TablePackLayout,
@@ -265,6 +276,20 @@ impl<'a> Cursor<'a> {
         let mut arr = [0u8; 4];
         arr.copy_from_slice(slice);
         Ok(u32::from_le_bytes(arr))
+    }
+
+    pub(crate) fn take_u16(&mut self) -> Result<u16, String> {
+        let slice = self.take(2)?;
+        let mut arr = [0u8; 2];
+        arr.copy_from_slice(slice);
+        Ok(u16::from_le_bytes(arr))
+    }
+
+    pub(crate) fn take_array<const N: usize>(&mut self) -> Result<[u8; N], String> {
+        let slice = self.take(N)?;
+        let mut array = [0u8; N];
+        array.copy_from_slice(slice);
+        Ok(array)
     }
 
     pub(crate) fn take_i64(&mut self) -> Result<i64, String> {

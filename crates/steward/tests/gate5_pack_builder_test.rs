@@ -32,13 +32,14 @@ use tempfile::tempdir;
 use uuid::Uuid;
 
 use steward::{FetchedObject, fetch_object_graph};
-use sync_store::ContentRemote;
 use sync_store::content::{
-    BuiltSeriesPack, Commit, ContentModelVersion, FileLeafInput, FilePackLayout, ManifestEntry,
-    ObjectHash, PayloadKind, Provenance, SeriesManifest, TableLeafInput, TablePackLayout,
-    TreeEntry, build_file_pack, build_table_pack, encode_manifest, encode_tree,
-    manifest_hash as sync_manifest_hash, node_merkle_rebuild_root, tree_hash,
+    BuiltSeriesPack, Commit, ContentModelVersion, ContentObjectKind, FileLeafInput, FilePackLayout,
+    ManifestEntry, ManifestRecord, ManifestRecordChild, MerkleFrontier, ObjectDescriptor,
+    ObjectHash, PackDescriptor, PayloadKind, Provenance, PublicationRecord, SeriesManifest,
+    TableLeafInput, TablePackLayout, TreeEntry, build_file_pack, build_manifest_map,
+    build_table_pack, encode_tree, tree_hash,
 };
+use sync_store::{ContentRemote, PublicationExpectation, PublicationState};
 use tinyfs::EntryType;
 
 fn pid() -> Uuid {
@@ -55,30 +56,41 @@ async fn push_series_root(
     entry_type: EntryType,
     series_hash: ObjectHash,
     mut objects: Vec<(ObjectHash, Vec<u8>)>,
+    pack: PackDescriptor,
 ) -> ObjectHash {
     let tree_entries = vec![TreeEntry::bare(series_name, entry_type, series_hash)];
     let tree_bytes = encode_tree(&tree_entries).expect("encode tree");
     let root_hash = tree_hash(&tree_entries).expect("tree hash");
 
-    let manifest_entries = vec![
-        ManifestEntry::bare("root", "", "", EntryType::DirectoryPhysical, root_hash),
-        ManifestEntry::bare(
-            format!("node-{series_name}"),
-            "root",
-            series_name,
-            entry_type,
-            series_hash,
-        ),
+    let manifest_records = vec![
+        ManifestRecord::new(
+            ManifestEntry::bare("root", "", "", EntryType::DirectoryPhysical, root_hash),
+            vec![ManifestRecordChild::new(
+                format!("node-{series_name}"),
+                series_name,
+                entry_type,
+            )],
+        )
+        .expect("root record"),
+        ManifestRecord::new(
+            ManifestEntry::bare(
+                format!("node-{series_name}"),
+                "root",
+                series_name,
+                entry_type,
+                series_hash,
+            ),
+            vec![],
+        )
+        .expect("series record"),
     ];
-    let manifest_bytes = encode_manifest(&manifest_entries).expect("encode manifest");
-    let manifest_hash_val = sync_manifest_hash(&manifest_entries).expect("manifest hash");
-    let manifest_root = node_merkle_rebuild_root(&manifest_entries).expect("manifest merkle root");
+    let (manifest_root, manifest_objects) =
+        build_manifest_map(&manifest_records).expect("manifest map");
 
     let commit = Commit::new(
-        ContentModelVersion::LogicalSeriesV2,
+        ContentModelVersion::PublicationV2,
         root_hash,
         None,
-        manifest_hash_val,
         manifest_root,
         Provenance {
             pond_id: "test-pond".to_string(),
@@ -92,16 +104,64 @@ async fn push_series_root(
     let commit_hash = commit.hash();
 
     objects.push((root_hash, tree_bytes));
-    objects.push((manifest_hash_val, manifest_bytes));
+    objects.extend(manifest_objects);
     objects.push((commit_hash, commit_bytes.clone()));
+    let mut descriptors = Vec::new();
+    for (hash, bytes) in objects {
+        let kind = if hash == commit_hash {
+            ContentObjectKind::Commit
+        } else if hash == root_hash {
+            ContentObjectKind::Tree
+        } else if hash == series_hash {
+            ContentObjectKind::SeriesManifest
+        } else if bytes.starts_with(b"watertown.manifest-map-node.") {
+            ContentObjectKind::ManifestNode
+        } else {
+            ContentObjectKind::RawBlob
+        };
+        let descriptor = ObjectDescriptor::new(hash, kind);
+        let _ = remote
+            .put_immutable_object(descriptor, &bytes)
+            .await
+            .expect("publish object");
+        descriptors.push(descriptor);
+    }
+    let changes = manifest_records
+        .into_iter()
+        .map(|record| {
+            sync_store::content::ManifestChange::new(None, Some(record))
+                .expect("initial manifest change")
+        })
+        .collect();
+    let record = PublicationRecord::new(
+        pid(),
+        "main",
+        commit_hash,
+        manifest_root,
+        None,
+        descriptors,
+        vec![pack],
+        changes,
+    )
+    .expect("publication record");
     let _ = remote
-        .push_objects_with_commit_index(&objects, &[(commit_hash, commit_bytes)])
+        .put_publication_record(&record)
         .await
-        .expect("push objects and commit index");
+        .expect("publish record");
+    let state = PublicationState::new(
+        pid(),
+        "main",
+        commit_hash,
+        manifest_root,
+        record.hash(),
+        1,
+        1,
+    )
+    .expect("publication state");
     let _ = remote
-        .advance_ref("main", commit_hash)
+        .compare_and_swap_publication(PublicationExpectation::Missing, state)
         .await
-        .expect("advance ref");
+        .expect("advance publication");
     commit_hash
 }
 
@@ -119,17 +179,28 @@ async fn publish_built_pack(
     let mut remote = ContentRemote::create_at(dir.path(), pid())
         .await
         .expect("create clean remote");
+    for (hash, bytes) in &built.physical_objects {
+        let _ = remote
+            .put_immutable_object(
+                ObjectDescriptor::new(*hash, ContentObjectKind::RawBlob),
+                bytes,
+            )
+            .await
+            .expect("publish physical object");
+    }
+    let pack = PackDescriptor::new(manifest_hash, built.index.hash());
     let published = remote
-        .publish_pack(manifest_hash, &built.index, &built.physical_objects)
+        .put_immutable_pack(pack, &built.index.encode())
         .await
         .expect("publish builder-produced pack");
-    assert_eq!(published, built.index.hash());
+    assert!(published);
     let _ = push_series_root(
         &mut remote,
         series_name,
         entry_type,
         manifest_hash,
         vec![(manifest_hash, manifest.encode())],
+        pack,
     )
     .await;
     remote
@@ -173,7 +244,6 @@ async fn file_series_repack_layouts_fetch_identical_logical_content() {
         offset += len;
     }
     let leaf_hashes: Vec<ObjectHash> = leaves.iter().map(FileLeafInput::leaf_hash).collect();
-    let root = sync_store::content::merkle_root(&leaf_hashes);
     let manifest = SeriesManifest::new(
         PayloadKind::File,
         bytes.len() as u64,
@@ -181,7 +251,7 @@ async fn file_series_repack_layouts_fetch_identical_logical_content() {
         None,
         None,
         None,
-        root,
+        MerkleFrontier::from_leaves(&leaf_hashes),
     )
     .expect("valid manifest");
     let manifest_hash = manifest.hash();
@@ -308,7 +378,6 @@ async fn table_series_repack_layouts_fetch_identical_logical_content() {
         offset += count;
     }
     let leaf_hashes: Vec<ObjectHash> = leaves.iter().map(TableLeafInput::leaf_hash).collect();
-    let root = sync_store::content::merkle_root(&leaf_hashes);
     let manifest = SeriesManifest::new(
         PayloadKind::Table,
         rows.len() as u64,
@@ -316,7 +385,7 @@ async fn table_series_repack_layouts_fetch_identical_logical_content() {
         None,
         None,
         None,
-        root,
+        MerkleFrontier::from_leaves(&leaf_hashes),
     )
     .expect("valid manifest");
     let manifest_hash = manifest.hash();

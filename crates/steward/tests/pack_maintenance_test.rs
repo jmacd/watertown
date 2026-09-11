@@ -23,7 +23,8 @@
 
 use std::path::Path;
 use steward::{
-    ContentSource, LocalPondSource, Ship, compute_content_tree, fetch_object_graph, rebuild_pond,
+    ContentSource, LocalPondSource, Ship, compute_content_tree, fetch_object_graph,
+    fetch_object_graph_since, rebuild_pond,
 };
 use sync_store::content::PackIndex;
 use tempfile::tempdir;
@@ -35,6 +36,91 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn meta(label: &str) -> PondUserMetadata {
     PondUserMetadata::new(vec!["test".into(), label.into()])
+}
+
+#[tokio::test]
+async fn maintenance_does_not_mutate_local_publication_identity_or_lineage() {
+    let dir = tempdir().expect("tempdir");
+    let pond_path = dir.path().join("pond");
+    let mut ship = Ship::create_pond(&pond_path, "stable-local-publication")
+        .await
+        .expect("create pond");
+    for value in [b"one".as_slice(), b"two".as_slice()] {
+        let bytes = value.to_vec();
+        ship.write_transaction(&meta("stable-publication-append"), async move |fs| {
+            let root = fs.root().await?;
+            let mut writer = root
+                .async_writer_path_with_type("/series", EntryType::FilePhysicalSeries)
+                .await?;
+            writer.write_all(&bytes).await.map_other()?;
+            writer.shutdown().await.map_other()?;
+            Ok(())
+        })
+        .await
+        .expect("append");
+    }
+    let before = LocalPondSource::open(&pond_path)
+        .await
+        .expect("open before maintenance");
+    let before_state = before
+        .get_publication_state("main")
+        .await
+        .expect("state")
+        .expect("publication");
+    let before_record = before
+        .get_publication_record(before_state.publication_record)
+        .await
+        .expect("record")
+        .expect("publication record");
+    drop(before);
+
+    let report = ship.collapse_versions(1).await.expect("run maintenance");
+    assert_eq!(report.series_repacked, 1);
+    let maintained = LocalPondSource::open(&pond_path)
+        .await
+        .expect("open after maintenance");
+    let maintained_state = maintained
+        .get_publication_state("main")
+        .await
+        .expect("state")
+        .expect("publication");
+    assert_eq!(maintained_state, before_state);
+    let maintained_record = maintained
+        .get_publication_record(maintained_state.publication_record)
+        .await
+        .expect("record")
+        .expect("publication record");
+    assert_eq!(maintained_record, before_record);
+    drop(maintained);
+
+    let bytes = b"three".to_vec();
+    ship.write_transaction(&meta("stable-publication-next"), async move |fs| {
+        let root = fs.root().await?;
+        let mut writer = root
+            .async_writer_path_with_type("/series", EntryType::FilePhysicalSeries)
+            .await?;
+        writer.write_all(&bytes).await.map_other()?;
+        writer.shutdown().await.map_other()?;
+        Ok(())
+    })
+    .await
+    .expect("append after maintenance");
+    drop(ship);
+
+    let advanced = LocalPondSource::open(&pond_path)
+        .await
+        .expect("open advanced source");
+    let graph = fetch_object_graph_since(&advanced, "main", Some(before_state.snapshot_tip))
+        .await
+        .expect("old synthetic lineage remains authenticated");
+    assert_eq!(
+        graph.publication_boundary.as_ref().map(|(_, r)| r),
+        Some(&before_record)
+    );
+    assert_eq!(
+        graph.commits.last().map(|(hash, _)| *hash),
+        Some(before_state.snapshot_tip)
+    );
 }
 
 fn table_batch(ts_micros: i64, label: &str) -> arrow_array::RecordBatch {
@@ -164,15 +250,12 @@ async fn maintained_pack_for_series(
         .expect("get tip object")
         .expect("tip commit object is served");
     let commit = sync_store::content::Commit::decode(&commit_bytes).expect("decode tip commit");
-    let manifest_bytes = source
-        .get_object(commit.node_manifest_hash)
+    let manifest_records = steward::fetch_manifest_records(source, commit.manifest_root)
         .await
-        .expect("get node manifest object")
-        .expect("node manifest object is served");
-    let manifest_entries =
-        sync_store::content::decode_manifest(&manifest_bytes).expect("decode node manifest");
-    let series_hash = manifest_entries
+        .expect("fetch manifest map");
+    let series_hash = manifest_records
         .iter()
+        .map(|record| &record.entry)
         .find(|entry| entry.name == series_name && entry.entry_type == entry_type)
         .unwrap_or_else(|| panic!("manifest contains {series_name} as {entry_type:?}"))
         .child_hash;
@@ -291,15 +374,12 @@ async fn collapse_versions_repacks_a_table_series() {
         .expect("get tip object")
         .expect("tip commit object is served");
     let commit = sync_store::content::Commit::decode(&commit_bytes).expect("decode tip commit");
-    let manifest_bytes = source
-        .get_object(commit.node_manifest_hash)
+    let manifest_records = steward::fetch_manifest_records(&source, commit.manifest_root)
         .await
-        .expect("get node manifest object")
-        .expect("node manifest object is served");
-    let manifest_entries =
-        sync_store::content::decode_manifest(&manifest_bytes).expect("decode node manifest");
-    let series_entry = manifest_entries
+        .expect("fetch manifest map");
+    let series_entry = manifest_records
         .iter()
+        .map(|record| &record.entry)
         .find(|e| e.name == "events.table" && e.entry_type == EntryType::TablePhysicalSeries)
         .expect("the table series has a manifest entry");
     let series_hash = series_entry.child_hash;
@@ -471,15 +551,12 @@ async fn collapse_versions_repacks_a_table_series_mixing_dictionary_and_plain_la
         .expect("get tip object")
         .expect("tip commit object is served");
     let commit = sync_store::content::Commit::decode(&commit_bytes).expect("decode tip commit");
-    let manifest_bytes = source
-        .get_object(commit.node_manifest_hash)
+    let manifest_records = steward::fetch_manifest_records(&source, commit.manifest_root)
         .await
-        .expect("get node manifest object")
-        .expect("node manifest object is served");
-    let manifest_entries =
-        sync_store::content::decode_manifest(&manifest_bytes).expect("decode node manifest");
-    let series_entry = manifest_entries
+        .expect("fetch manifest map");
+    let series_entry = manifest_records
         .iter()
+        .map(|record| &record.entry)
         .find(|e| e.name == "events.table" && e.entry_type == EntryType::TablePhysicalSeries)
         .expect("the mixed-encoding table series has a manifest entry");
     let series_hash = series_entry.child_hash;
@@ -659,7 +736,7 @@ async fn collapse_versions_splits_table_pack_at_schema_transitions() {
 /// reconstructs the original series content byte-for-byte.
 #[tokio::test]
 async fn collapse_versions_produces_a_pack_whose_leaf_spans_a_physical_object_boundary() {
-    use sync_store::content::{Commit, decode_manifest};
+    use sync_store::content::Commit;
 
     let temp_dir = tempdir().expect("tempdir");
     let pond_path = temp_dir.path().join("boundary_pond");
@@ -720,14 +797,12 @@ async fn collapse_versions_produces_a_pack_whose_leaf_spans_a_physical_object_bo
         .expect("get tip object")
         .expect("tip commit object is served");
     let commit = Commit::decode(&commit_bytes).expect("decode tip commit");
-    let manifest_bytes = source
-        .get_object(commit.node_manifest_hash)
+    let manifest_records = steward::fetch_manifest_records(&source, commit.manifest_root)
         .await
-        .expect("get node manifest object")
-        .expect("node manifest object is served");
-    let manifest_entries = decode_manifest(&manifest_bytes).expect("decode node manifest");
-    let series_entry = manifest_entries
+        .expect("fetch manifest map");
+    let series_entry = manifest_records
         .iter()
+        .map(|record| &record.entry)
         .find(|e| e.name == "boundary.series" && e.entry_type == EntryType::FilePhysicalSeries)
         .expect("the boundary series has a manifest entry");
     let series_hash = series_entry.child_hash;
@@ -802,7 +877,7 @@ async fn collapse_versions_produces_a_pack_whose_leaf_spans_a_physical_object_bo
 
 /// If a repack fails after durably writing its physical objects but before
 /// publishing the pack index that would name them (simulated here by
-/// making the series' own `_packs/v3/series=<hex>` advertisement directory
+/// making the series' own `_packs/v4/series=<hex>` advertisement directory
 /// unwritable), `collapse_versions` must fail cleanly: the call returns an
 /// error, no pack index is published (no advertisement can ever name a
 /// missing object, but equally no advertisement should exist at all here),

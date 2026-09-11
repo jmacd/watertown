@@ -35,7 +35,8 @@ pub mod verify;
 
 pub use apply::apply_command;
 pub use capsule::{
-    RecoveryRecipeAction, capsule_import_command, capsule_inspect_command, capsule_recipe_command,
+    RecoveryRecipeAction, capsule_activate_command, capsule_import_command,
+    capsule_inspect_command, capsule_publish_command, capsule_recipe_command,
 };
 pub use cat::cat_command;
 pub use control::control_command;
@@ -52,7 +53,7 @@ pub use maintain::maintain_command;
 pub use mkdir::mkdir_command;
 pub use mknod::mknod_command;
 pub use pull::{pull_command, pull_command_with_rebuild};
-pub use push::push_command;
+pub use push::{cleanup_backup_uploads_command, publish_consolidated_packs_command, push_command};
 pub use rebuild_control::rebuild_control_command;
 pub use recover::recover_command;
 pub use remote::{

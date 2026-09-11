@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `watertown.series-pack.v3` pack index: a physical pack's proof of membership in a
+//! `watertown.series-pack.v4` pack index: a physical pack's proof of membership in a
 //! logical series, and the verification helper that checks a pack against a
 //! decoded series manifest.
 //!
@@ -40,18 +40,26 @@
 //! boundaries remain independent of leaf boundaries, but the explicit spans
 //! let an incremental reader omit objects wholly contained in a locally-held,
 //! authenticated leaf prefix.
+//!
+//! # Linked series states
+//!
+//! A canonical append segment additionally names `parent_series_hash`, the
+//! immutable manifest for the complete prefix ending at `leaf_start`. Root and
+//! explicitly consolidated segments have no parent and cover the whole range.
+//! The link is part of these content-addressed pack bytes, so old segment
+//! metadata is never rewritten when a series grows.
 
 use std::collections::BTreeMap;
 
 use super::series_leaf::{LEAF_HAS_MAX, LEAF_HAS_MIN, validate_canonical_attributes};
 use super::series_manifest::{PayloadKind, SeriesManifest};
 use super::series_merkle::{
-    RangeProof, decode_range_proof, encode_range_proof, verify_range_proof,
+    MerkleFrontier, RangeProof, decode_range_proof, encode_range_proof, verify_range_proof,
 };
 use super::{Cursor, ObjectHash, push_len_prefixed};
 
 /// Magic header for the current pack-index wire format.
-const PACK_MAGIC: &[u8] = b"watertown.series-pack.v3\n";
+const PACK_MAGIC: &[u8] = b"watertown.series-pack.v4\n";
 
 /// Known `bounds_flags` bits for a [`PackLeafDescriptor`]; any other bit set
 /// is a decode error, matching [`super::series_leaf`]'s and
@@ -67,7 +75,7 @@ const MIN_DESCRIPTOR_WIRE_BYTES: usize = 32 + 8 + 4 + 1 + 4;
 /// One encoded [`PackObjectSpan`]: hash plus four `u64` interval endpoints.
 const OBJECT_SPAN_WIRE_BYTES: usize = 32 + 8 + 8 + 8 + 8;
 
-/// One logical leaf's per-leaf metadata within a `watertown.series-pack.v3` pack
+/// One logical leaf's per-leaf metadata within a `watertown.series-pack.v4` pack
 /// index: exactly one descriptor for each logical leaf in
 /// `[leaf_start, leaf_end)`, in leaf order.
 ///
@@ -121,7 +129,7 @@ impl PackLeafDescriptor {
         })
     }
 
-    /// Construct a descriptor for the v3 pack codec, carrying its logical
+    /// Construct a descriptor for the v4 pack codec, carrying its logical
     /// leaf hash and optionally its schema fingerprint.
     pub fn new_with_leaf_hash_and_schema(
         logical_leaf_hash: ObjectHash,
@@ -387,7 +395,7 @@ fn validate_descriptor(
     Ok(())
 }
 
-/// A `watertown.series-pack.v3` pack index: one contiguous logical-leaf range,
+/// A `watertown.series-pack.v4` pack index: one contiguous logical-leaf range,
 /// covered by one or more physical objects, together with its membership
 /// proof against a named series.
 ///
@@ -400,6 +408,7 @@ fn validate_descriptor(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackIndex {
     series_hash: ObjectHash,
+    parent_series_hash: Option<ObjectHash>,
     leaf_start: u64,
     leaf_end: u64,
     total_leaf_count: u64,
@@ -413,7 +422,7 @@ pub struct PackIndex {
 }
 
 impl PackIndex {
-    /// Construct a strictly validated v3 pack index.
+    /// Construct a strictly validated v4 pack index.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_spans(
         series_hash: ObjectHash,
@@ -427,6 +436,44 @@ impl PackIndex {
         physical_byte_count: u64,
         leaf_descriptors: Vec<PackLeafDescriptor>,
     ) -> Result<Self, String> {
+        Self::new_segment_with_spans(
+            series_hash,
+            None,
+            leaf_start,
+            leaf_end,
+            total_leaf_count,
+            range_root,
+            range_proof,
+            object_spans,
+            logical_count,
+            physical_byte_count,
+            leaf_descriptors,
+        )
+    }
+
+    /// Construct a validated pack index that may link this series state to
+    /// the immutable prior series state whose leaf prefix it extends.
+    ///
+    /// Generic derived packs may leave `parent_series_hash` absent. A pack
+    /// installed as a canonical series locator must additionally pass
+    /// [`Self::validate_series_segment`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_segment_with_spans(
+        series_hash: ObjectHash,
+        parent_series_hash: Option<ObjectHash>,
+        leaf_start: u64,
+        leaf_end: u64,
+        total_leaf_count: u64,
+        range_root: ObjectHash,
+        range_proof: RangeProof,
+        object_spans: Vec<PackObjectSpan>,
+        logical_count: u64,
+        physical_byte_count: u64,
+        leaf_descriptors: Vec<PackLeafDescriptor>,
+    ) -> Result<Self, String> {
+        if parent_series_hash == Some(series_hash) {
+            return Err("pack parent_series_hash must not equal series_hash".to_string());
+        }
         validate(
             leaf_start,
             leaf_end,
@@ -441,6 +488,7 @@ impl PackIndex {
         let physical_object_hashes = object_spans.iter().map(|span| span.object_hash).collect();
         Ok(Self {
             series_hash,
+            parent_series_hash,
             leaf_start,
             leaf_end,
             total_leaf_count,
@@ -454,10 +502,42 @@ impl PackIndex {
         })
     }
 
-    /// The `watertown.series.v2` object hash this pack claims to belong to.
+    /// The `watertown.series.v3` object hash this pack claims to belong to.
     #[must_use]
     pub fn series_hash(&self) -> ObjectHash {
         self.series_hash
+    }
+
+    /// Immutable prior series state whose complete leaf sequence precedes
+    /// this pack's range.
+    #[must_use]
+    pub fn parent_series_hash(&self) -> Option<ObjectHash> {
+        self.parent_series_hash
+    }
+
+    /// Validate that this pack can serve as one canonical linked series
+    /// segment.
+    ///
+    /// A root segment (including an explicit consolidated pack) covers the
+    /// complete series and has no parent. An append segment covers the
+    /// nonempty suffix ending at the current series tip and names its prior
+    /// immutable series state.
+    pub fn validate_series_segment(&self) -> Result<(), String> {
+        if self.leaf_end != self.total_leaf_count {
+            return Err(format!(
+                "canonical series segment must end at total_leaf_count {}, got leaf_end {}",
+                self.total_leaf_count, self.leaf_end
+            ));
+        }
+        match self.parent_series_hash {
+            None if self.leaf_start == 0 => Ok(()),
+            None => Err(format!(
+                "root series segment must start at leaf 0, got {}",
+                self.leaf_start
+            )),
+            Some(_) if self.leaf_start > 0 => Ok(()),
+            Some(_) => Err("append series segment must start after leaf 0".to_string()),
+        }
     }
 
     /// The first logical leaf index this pack covers (inclusive).
@@ -532,11 +612,13 @@ impl PackIndex {
         &self.leaf_descriptors
     }
 
-    /// Serialize this pack index into its `watertown.series-pack.v3` wire bytes:
+    /// Serialize this pack index into its `watertown.series-pack.v4` wire bytes:
     ///
     /// ```text
     /// PACK_MAGIC
     /// 32      series_hash
+    /// u8      parent_series_hash presence
+    /// [32]    parent_series_hash
     /// u64 LE  leaf_start
     /// u64 LE  leaf_end
     /// u64 LE  total_leaf_count
@@ -565,6 +647,8 @@ impl PackIndex {
         let mut buf = Vec::with_capacity(
             PACK_MAGIC.len()
                 + 32
+                + 1
+                + usize::from(self.parent_series_hash.is_some()) * 32
                 + 8
                 + 8
                 + 8
@@ -580,6 +664,13 @@ impl PackIndex {
         );
         buf.extend_from_slice(PACK_MAGIC);
         buf.extend_from_slice(self.series_hash.as_bytes());
+        match self.parent_series_hash {
+            Some(parent) => {
+                buf.push(1);
+                buf.extend_from_slice(parent.as_bytes());
+            }
+            None => buf.push(0),
+        }
         buf.extend_from_slice(&self.leaf_start.to_le_bytes());
         buf.extend_from_slice(&self.leaf_end.to_le_bytes());
         buf.extend_from_slice(&self.total_leaf_count.to_le_bytes());
@@ -613,7 +704,7 @@ impl PackIndex {
         ObjectHash::of_bytes(&self.encode())
     }
 
-    /// Decode a `watertown.series-pack.v3` pack index (the inverse of
+    /// Decode a `watertown.series-pack.v4` pack index (the inverse of
     /// [`PackIndex::encode`]), applying the same invariants as
     /// [`PackIndex::new_with_spans`].
     ///
@@ -632,6 +723,11 @@ impl PackIndex {
         let mut cur = Cursor::new(bytes);
         cur.expect_tag(PACK_MAGIC)?;
         let series_hash = cur.take_hash()?;
+        let parent_series_hash = match cur.take_u8()? {
+            0 => None,
+            1 => Some(cur.take_hash()?),
+            other => return Err(format!("invalid pack parent flag {other}")),
+        };
         let leaf_start = cur.take_u64()?;
         let leaf_end = cur.take_u64()?;
         let total_leaf_count = cur.take_u64()?;
@@ -675,8 +771,9 @@ impl PackIndex {
                 cur.remaining()
             ));
         }
-        Self::new_with_spans(
+        Self::new_segment_with_spans(
             series_hash,
+            parent_series_hash,
             leaf_start,
             leaf_end,
             total_leaf_count,
@@ -1011,6 +1108,70 @@ pub fn verify_pack_against_manifest(
     Ok(())
 }
 
+/// Verify a whole-range root/consolidated pack against its current series
+/// manifest.
+///
+/// In addition to [`verify_pack_against_manifest`]'s Merkle membership checks,
+/// this requires `[0, manifest.leaf_count())`, no parent series link, and exact
+/// aggregate logical count, event bounds, latest logical attributes, and
+/// canonical frontier.
+pub fn verify_complete_pack_against_manifest(
+    manifest_hash: ObjectHash,
+    manifest: &SeriesManifest,
+    pack: &PackIndex,
+) -> Result<(), String> {
+    pack.validate_series_segment()?;
+    if pack.parent_series_hash().is_some()
+        || pack.leaf_start() != 0
+        || pack.leaf_end() != manifest.leaf_count()
+    {
+        return Err(
+            "consolidated pack must be a parentless whole-range series segment".to_string(),
+        );
+    }
+    let leaf_hashes = pack
+        .leaf_descriptors()
+        .iter()
+        .map(PackLeafDescriptor::logical_leaf_hash)
+        .collect::<Vec<_>>();
+    verify_pack_against_manifest(manifest_hash, manifest, pack, &leaf_hashes)?;
+    if pack.logical_count() != manifest.logical_count() {
+        return Err(format!(
+            "complete pack covers {} logical unit(s), manifest declares {}",
+            pack.logical_count(),
+            manifest.logical_count()
+        ));
+    }
+    let mut min: Option<i64> = None;
+    let mut max: Option<i64> = None;
+    for descriptor in pack.leaf_descriptors() {
+        if let Some(value) = descriptor.min_event_time() {
+            min = Some(min.map_or(value, |current| current.min(value)));
+        }
+        if let Some(value) = descriptor.max_event_time() {
+            max = Some(max.map_or(value, |current| current.max(value)));
+        }
+    }
+    if min != manifest.min_event_time() || max != manifest.max_event_time() {
+        return Err("complete pack aggregate event bounds disagree with the manifest".to_string());
+    }
+    let attributes = pack
+        .leaf_descriptors()
+        .last()
+        .and_then(PackLeafDescriptor::logical_attributes);
+    if attributes != manifest.logical_attributes() {
+        return Err(
+            "complete pack latest logical attributes disagree with the manifest".to_string(),
+        );
+    }
+    if MerkleFrontier::from_leaves(&leaf_hashes) != *manifest.merkle_frontier() {
+        return Err(
+            "complete pack leaf descriptors do not reconstruct the manifest frontier".to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Deterministically choose a minimal exact cover of `[0, total_leaf_count)`
 /// from a set of candidate pack indexes already known to belong to
 /// `manifest_hash` (`docs/logical-series-identity-design.md` delivery gate
@@ -1174,7 +1335,7 @@ pub fn select_exact_cover(
 mod tests {
     use super::super::series_leaf::encode_canonical_attributes;
     use super::super::series_manifest::PayloadKind;
-    use super::super::series_merkle::{generate_range_proof, merkle_root};
+    use super::super::series_merkle::{MerkleFrontier, generate_range_proof, merkle_root};
     use super::*;
 
     fn h(s: &str) -> ObjectHash {
@@ -1183,7 +1344,6 @@ mod tests {
 
     fn build_series(labels: &[&str]) -> (Vec<ObjectHash>, SeriesManifest, ObjectHash) {
         let leaves: Vec<ObjectHash> = labels.iter().map(|s| h(s)).collect();
-        let root = merkle_root(&leaves);
         let manifest = SeriesManifest::new(
             PayloadKind::File,
             leaves.len() as u64 * 10,
@@ -1191,7 +1351,7 @@ mod tests {
             None,
             None,
             None,
-            root,
+            MerkleFrontier::from_leaves(&leaves),
         )
         .unwrap();
         let manifest_hash = manifest.hash();
@@ -1249,6 +1409,7 @@ mod tests {
     fn descriptor_section_start(pack: &PackIndex) -> usize {
         PACK_MAGIC.len()
             + 32
+            + 1
             + 8
             + 8
             + 8
@@ -1271,6 +1432,53 @@ mod tests {
     }
 
     #[test]
+    fn linked_append_segment_round_trips_and_validates() {
+        let (leaves, manifest, series_hash) = build_series(&["a", "b", "c"]);
+        let parent = h("parent-series");
+        let pack = PackIndex::new_segment_with_spans(
+            series_hash,
+            Some(parent),
+            2,
+            3,
+            3,
+            manifest.leaf_merkle_root(),
+            generate_range_proof(&leaves, 2, 3).unwrap(),
+            vec![PackObjectSpan::new(h("object"), 0, 10, 0, 10).unwrap()],
+            10,
+            10,
+            one_leaf_per_range(&leaves, 2, 3, 10),
+        )
+        .unwrap();
+        pack.validate_series_segment().unwrap();
+        let decoded = PackIndex::decode(&pack.encode()).unwrap();
+        assert_eq!(decoded, pack);
+        assert_eq!(decoded.parent_series_hash(), Some(parent));
+    }
+
+    #[test]
+    fn canonical_segment_shape_fails_closed() {
+        let (leaves, _manifest, series_hash) = build_series(&["a", "b", "c"]);
+        let partial_root = build_pack(&leaves, series_hash, 1, 3);
+        assert!(partial_root.validate_series_segment().is_err());
+
+        let linked_from_zero = PackIndex::new_segment_with_spans(
+            series_hash,
+            Some(h("parent")),
+            0,
+            3,
+            3,
+            merkle_root(&leaves),
+            generate_range_proof(&leaves, 0, 3).unwrap(),
+            vec![PackObjectSpan::new(h("object"), 0, 30, 0, 30).unwrap()],
+            30,
+            30,
+            one_leaf_per_range(&leaves, 0, 3, 10),
+        )
+        .unwrap();
+        assert!(linked_from_zero.validate_series_segment().is_err());
+    }
+
+    #[test]
     fn pack_round_trips_per_leaf_schema_fingerprints() {
         let leaves = vec![h("leaf-a"), h("leaf-b")];
         let manifest = SeriesManifest::new(
@@ -1280,7 +1488,7 @@ mod tests {
             None,
             None,
             None,
-            merkle_root(&leaves),
+            MerkleFrontier::from_leaves(&leaves),
         )
         .unwrap();
         let descriptors = vec![
@@ -1345,7 +1553,7 @@ mod tests {
             None,
             None,
             None,
-            merkle_root(&leaves),
+            MerkleFrontier::from_leaves(&leaves),
         )
         .unwrap();
         let missing_schema = PackIndex::new_with_spans(
@@ -1377,7 +1585,7 @@ mod tests {
             None,
             None,
             None,
-            merkle_root(&leaves),
+            MerkleFrontier::from_leaves(&leaves),
         )
         .unwrap();
         let injected_schema = PackIndex::new_with_spans(
@@ -1438,6 +1646,14 @@ mod tests {
         let (leaves, _manifest, series_hash) = build_series(&["a", "b"]);
         let mut bytes = build_pack(&leaves, series_hash, 0, 2).encode();
         bytes[..b"watertown.series-pack.v2\n".len()].copy_from_slice(b"watertown.series-pack.v2\n");
+        assert!(PackIndex::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_obsolete_pack_v3_magic() {
+        let (leaves, _manifest, series_hash) = build_series(&["a", "b"]);
+        let mut bytes = build_pack(&leaves, series_hash, 0, 2).encode();
+        bytes[..b"watertown.series-pack.v3\n".len()].copy_from_slice(b"watertown.series-pack.v3\n");
         assert!(PackIndex::decode(&bytes).is_err());
     }
 
@@ -2113,7 +2329,7 @@ mod tests {
         // legitimate proof bytes, discarding the real (small) count and
         // object list, and check that decode fails on truncation rather
         // than attempting a huge allocation.
-        let proof_len_pos = PACK_MAGIC.len() + 32 + 8 + 8 + 8 + 32;
+        let proof_len_pos = PACK_MAGIC.len() + 32 + 1 + 8 + 8 + 8 + 32;
         let mut proof_len_bytes = [0u8; 4];
         proof_len_bytes.copy_from_slice(&bytes[proof_len_pos..proof_len_pos + 4]);
         let proof_len = u32::from_le_bytes(proof_len_bytes) as usize;
@@ -2360,7 +2576,7 @@ mod tests {
             None,
             None,
             None,
-            merkle_root(&[]),
+            MerkleFrontier::empty(),
         )
         .unwrap();
         let cover = select_exact_cover(manifest.hash(), manifest.leaf_count(), &[]).unwrap();

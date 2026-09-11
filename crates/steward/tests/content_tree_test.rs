@@ -150,10 +150,9 @@ async fn differing_content_yields_differing_root() {
 /// A rich mix of mutation kinds (create, nested dir, overwrite, rename,
 /// delete) exercised in sequence.  Every write transaction runs the
 /// `StewardTransactionGuard` debug oracle, which asserts the *incremental*
-/// spine roots (`root_tree_hash`, `node_manifest_hash`, `node_manifest_root`,
-/// and the manifest bytes) are byte-identical to a full fold of the same live
-/// state.  Reaching the end without a panic proves incremental-vs-rebuild
-/// equivalence for both roots across all of these mutation kinds (Phase 6).
+/// roots (`root_tree_hash` and persistent `manifest_root`) are byte-identical
+/// to a full fold of the same live state. Reaching the end without a panic
+/// proves incremental-vs-rebuild equivalence across these mutation kinds.
 #[tokio::test]
 async fn incremental_roots_match_full_fold_over_diverse_mutations() {
     let tmp = tempdir().expect("tempdir");

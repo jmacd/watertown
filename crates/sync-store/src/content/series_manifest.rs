@@ -8,12 +8,18 @@
 //! [`super::series_leaf`]): the payload kind, aggregate logical row/byte
 //! count, leaf count, aggregate event-time bounds, canonical logical
 //! attributes, and the
-//! [`super::series_merkle`] leaf Merkle root. Its own BLAKE3 hash --
+//! [`super::series_merkle`] leaf Merkle root and compact append frontier. Its
+//! own BLAKE3 hash --
 //! [`SeriesManifest::hash`] over [`SeriesManifest::encode`] -- is both the
 //! series' identity and the content address a `ManifestEntry.child_hash`
 //! (once wired up in a later gate) would name.
 //!
-//! `watertown.series.v2` has no series-global table schema field. Table
+//! The frontier contains at most 64 perfect-subtree hashes and is uniquely
+//! derived from the ordered leaves. It lets an append compute the next root
+//! and suffix membership proof from the prior manifest plus new leaf hashes;
+//! it is not a pack choice and does not make physical layout part of identity.
+//!
+//! `watertown.series.v3` has no series-global table schema field. Table
 //! schemas are immutable per logical leaf, committed by each leaf hash and
 //! carried explicitly by the corresponding pack descriptor.
 //!
@@ -28,11 +34,11 @@
 
 use super::series_leaf::validate_canonical_attributes;
 use super::series_leaf::{LEAF_HAS_MAX, LEAF_HAS_MIN, LEAF_KIND_FILE, LEAF_KIND_TABLE};
-use super::series_merkle::merkle_root;
+use super::series_merkle::MerkleFrontier;
 use super::{Cursor, ObjectHash, push_len_prefixed};
 
 /// Magic header for the current native series-manifest format.
-pub(crate) const MANIFEST_MAGIC: &[u8] = b"watertown.series.v2\n";
+pub(crate) const MANIFEST_MAGIC: &[u8] = b"watertown.series.v3\n";
 
 /// Known `bounds_flags` bits; any other bit set is a decode error, matching
 /// [`super::series_leaf`]'s and [`super::tree`]'s "unknown flag" convention.
@@ -83,10 +89,11 @@ pub struct SeriesManifest {
     max_event_time: Option<i64>,
     logical_attributes: Option<Vec<u8>>,
     leaf_merkle_root: ObjectHash,
+    merkle_frontier: MerkleFrontier,
 }
 
 impl SeriesManifest {
-    /// Construct a validated `watertown.series.v2` root object.
+    /// Construct a validated `watertown.series.v3` root object.
     ///
     /// `logical_attributes`, when given, must already be canonical logical-
     /// attribute bytes exactly as
@@ -101,8 +108,8 @@ impl SeriesManifest {
     /// Returns an error if:
     /// - `logical_attributes` is `Some` but not canonical JSON object bytes,
     ///   or is `Some(&[])` (which must instead be `None`);
-    /// - `leaf_count == 0` and `leaf_merkle_root` is not the empty Merkle
-    ///   root, or `leaf_count > 0` and it is.
+    /// - `leaf_count` disagrees with `merkle_frontier`, or the frontier does
+    ///   not reduce to the declared leaf Merkle root.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         payload_kind: PayloadKind,
@@ -111,13 +118,15 @@ impl SeriesManifest {
         min_event_time: Option<i64>,
         max_event_time: Option<i64>,
         logical_attributes: Option<Vec<u8>>,
-        leaf_merkle_root: ObjectHash,
+        merkle_frontier: MerkleFrontier,
     ) -> Result<Self, String> {
+        let leaf_merkle_root = merkle_frontier.root();
         validate(
             logical_count,
             leaf_count,
             &logical_attributes,
             leaf_merkle_root,
+            &merkle_frontier,
         )?;
         Ok(Self {
             payload_kind,
@@ -127,6 +136,7 @@ impl SeriesManifest {
             max_event_time,
             logical_attributes,
             leaf_merkle_root,
+            merkle_frontier,
         })
     }
 
@@ -176,6 +186,12 @@ impl SeriesManifest {
         self.leaf_merkle_root
     }
 
+    /// Compact append frontier for this complete leaf sequence.
+    #[must_use]
+    pub fn merkle_frontier(&self) -> &MerkleFrontier {
+        &self.merkle_frontier
+    }
+
     /// Serialize this object into the current native wire format.
     ///
     /// ```text
@@ -188,6 +204,8 @@ impl SeriesManifest {
     /// [i64 LE max_event_time]
     /// u32 LE  logical_attributes length (0 = absent) + bytes
     /// 32      leaf_merkle_root
+    /// u32 LE  Merkle-frontier peak count
+    /// repeated: 32-byte peak hash, largest subtree first
     /// ```
     ///
     /// These bytes *are* the object; [`SeriesManifest::hash`] is `blake3` of
@@ -218,6 +236,13 @@ impl SeriesManifest {
             None => push_len_prefixed(&mut buf, &[]),
         }
         buf.extend_from_slice(self.leaf_merkle_root.as_bytes());
+        let peak_hashes = self.merkle_frontier.peak_hashes();
+        let peak_count =
+            u32::try_from(peak_hashes.len()).expect("series Merkle frontier exceeds u32::MAX");
+        buf.extend_from_slice(&peak_count.to_le_bytes());
+        for hash in peak_hashes {
+            buf.extend_from_slice(hash.as_bytes());
+        }
         buf
     }
 
@@ -265,17 +290,24 @@ impl SeriesManifest {
             Some(attrs_bytes.to_vec())
         };
         let leaf_merkle_root = cur.take_hash()?;
+        let peak_count = cur.take_u32()? as usize;
+        let mut peak_hashes = Vec::with_capacity(cur.bounded_capacity(peak_count, 32));
+        for _ in 0..peak_count {
+            peak_hashes.push(cur.take_hash()?);
+        }
         if !cur.is_empty() {
             return Err(format!(
                 "{} trailing byte(s) after series manifest",
                 cur.remaining()
             ));
         }
+        let merkle_frontier = MerkleFrontier::from_peak_hashes(leaf_count, peak_hashes)?;
         validate(
             logical_count,
             leaf_count,
             &logical_attributes,
             leaf_merkle_root,
+            &merkle_frontier,
         )?;
         Ok(Self {
             payload_kind,
@@ -285,6 +317,7 @@ impl SeriesManifest {
             max_event_time,
             logical_attributes,
             leaf_merkle_root,
+            merkle_frontier,
         })
     }
 }
@@ -296,6 +329,7 @@ fn validate(
     leaf_count: u64,
     logical_attributes: &Option<Vec<u8>>,
     leaf_merkle_root: ObjectHash,
+    merkle_frontier: &MerkleFrontier,
 ) -> Result<(), String> {
     if (leaf_count == 0) != (logical_count == 0) {
         return Err(format!(
@@ -311,16 +345,14 @@ fn validate(
         }
         validate_canonical_attributes(attrs)?;
     }
-    let empty_root = merkle_root(&[]);
-    if leaf_count == 0 && leaf_merkle_root != empty_root {
-        return Err(
-            "leaf_count is zero but leaf_merkle_root is not the empty Merkle root".to_string(),
-        );
+    if merkle_frontier.leaf_count() != leaf_count {
+        return Err(format!(
+            "series Merkle frontier has {} leaves but manifest declares {leaf_count}",
+            merkle_frontier.leaf_count()
+        ));
     }
-    if leaf_count > 0 && leaf_merkle_root == empty_root {
-        return Err(
-            "leaf_merkle_root is the empty Merkle root but leaf_count is nonzero".to_string(),
-        );
+    if merkle_frontier.root() != leaf_merkle_root {
+        return Err("series Merkle frontier does not reduce to leaf_merkle_root".to_string());
     }
     Ok(())
 }
@@ -341,7 +373,7 @@ mod tests {
             Some(10),
             Some(20),
             None,
-            merkle_root(&[h("l1"), h("l2"), h("l3")]),
+            MerkleFrontier::from_leaves(&[h("l1"), h("l2"), h("l3")]),
         )
         .unwrap()
     }
@@ -354,7 +386,7 @@ mod tests {
             None,
             None,
             None,
-            merkle_root(&[h("l1"), h("l2")]),
+            MerkleFrontier::from_leaves(&[h("l1"), h("l2")]),
         )
         .unwrap()
     }
@@ -390,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_leaf_count_requires_empty_root() {
+    fn zero_leaf_count_requires_empty_frontier() {
         let err = SeriesManifest::new(
             PayloadKind::File,
             0,
@@ -398,14 +430,22 @@ mod tests {
             None,
             None,
             None,
-            h("not-the-empty-root"),
+            MerkleFrontier::from_leaves(&[h("unexpected")]),
         )
         .unwrap_err();
-        assert!(err.contains("empty"));
+        assert!(err.contains("frontier"));
         // The correct pairing succeeds.
         assert!(
-            SeriesManifest::new(PayloadKind::File, 0, 0, None, None, None, merkle_root(&[]))
-                .is_ok()
+            SeriesManifest::new(
+                PayloadKind::File,
+                0,
+                0,
+                None,
+                None,
+                None,
+                MerkleFrontier::empty(),
+            )
+            .is_ok()
         );
     }
 
@@ -419,21 +459,37 @@ mod tests {
                 None,
                 None,
                 None,
-                merkle_root(&[h("leaf")]),
+                MerkleFrontier::from_leaves(&[h("leaf")]),
             )
             .is_err()
         );
         assert!(
-            SeriesManifest::new(PayloadKind::File, 1, 0, None, None, None, merkle_root(&[]),)
-                .is_err()
+            SeriesManifest::new(
+                PayloadKind::File,
+                1,
+                0,
+                None,
+                None,
+                None,
+                MerkleFrontier::empty(),
+            )
+            .is_err()
         );
     }
 
     #[test]
     fn nonzero_leaf_count_rejects_empty_root() {
-        let err = SeriesManifest::new(PayloadKind::File, 10, 1, None, None, None, merkle_root(&[]))
-            .unwrap_err();
-        assert!(err.contains("empty"));
+        let err = SeriesManifest::new(
+            PayloadKind::File,
+            10,
+            1,
+            None,
+            None,
+            None,
+            MerkleFrontier::empty(),
+        )
+        .unwrap_err();
+        assert!(err.contains("frontier"));
     }
 
     #[test]
@@ -448,7 +504,7 @@ mod tests {
             None,
             None,
             Some(non_canonical),
-            merkle_root(&[h("l1")]),
+            MerkleFrontier::from_leaves(&[h("l1")]),
         )
         .unwrap_err();
         assert!(!err.is_empty());
@@ -463,7 +519,7 @@ mod tests {
                 None,
                 None,
                 Some(canonical),
-                merkle_root(&[h("l1")]),
+                MerkleFrontier::from_leaves(&[h("l1")]),
             )
             .is_ok()
         );
@@ -478,7 +534,7 @@ mod tests {
             None,
             None,
             Some(Vec::new()),
-            merkle_root(&[h("l1")]),
+            MerkleFrontier::from_leaves(&[h("l1")]),
         )
         .unwrap_err();
         assert!(err.contains("absent"));
@@ -493,10 +549,34 @@ mod tests {
 
     #[test]
     fn decode_rejects_obsolete_series_magics() {
+        let mut v2 = valid_file().encode();
+        v2[..b"watertown.series.v2\n".len()].copy_from_slice(b"watertown.series.v2\n");
+        assert!(SeriesManifest::decode(&v2).is_err());
         let mut v1 = valid_file().encode();
         v1[..b"watertown.series.v1\n".len()].copy_from_slice(b"watertown.series.v1\n");
         assert!(SeriesManifest::decode(&v1).is_err());
         assert!(SeriesManifest::decode(b"dp.series.1\n\0\0\0\0").is_err());
+    }
+
+    #[test]
+    fn decode_rejects_wrong_frontier_peak_count() {
+        let manifest = valid_file();
+        let mut bytes = manifest.encode();
+        let peak_count_offset =
+            bytes.len() - manifest.merkle_frontier().peak_hashes().len() * 32 - 4;
+        bytes[peak_count_offset..peak_count_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(SeriesManifest::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_frontier_root_mismatch() {
+        let manifest = valid_file();
+        let mut bytes = manifest.encode();
+        let root_offset =
+            bytes.len() - manifest.merkle_frontier().peak_hashes().len() * 32 - 4 - 32;
+        bytes[root_offset] ^= 0xff;
+        let error = SeriesManifest::decode(&bytes).unwrap_err();
+        assert!(error.contains("frontier"));
     }
 
     #[test]
@@ -559,7 +639,7 @@ mod tests {
             Some(11),
             Some(20),
             None,
-            merkle_root(&[h("l1"), h("l2"), h("l3")]),
+            MerkleFrontier::from_leaves(&[h("l1"), h("l2"), h("l3")]),
         )
         .unwrap();
         assert_ne!(base.hash(), different_bounds.hash());
@@ -571,7 +651,7 @@ mod tests {
             Some(10),
             Some(20),
             Some(b"{}".to_vec()),
-            merkle_root(&[h("l1"), h("l2"), h("l3")]),
+            MerkleFrontier::from_leaves(&[h("l1"), h("l2"), h("l3")]),
         )
         .unwrap();
         assert_ne!(base.hash(), with_attrs.hash());
@@ -586,7 +666,7 @@ mod tests {
             None,
             None,
             None,
-            merkle_root(&[h("l1"), h("l2")]),
+            MerkleFrontier::from_leaves(&[h("l1"), h("l2")]),
         )
         .unwrap();
         let after = SeriesManifest::new(
@@ -596,7 +676,7 @@ mod tests {
             None,
             None,
             None,
-            merkle_root(&[h("l1"), h("l2"), h("l3")]),
+            MerkleFrontier::from_leaves(&[h("l1"), h("l2"), h("l3")]),
         )
         .unwrap();
         assert_ne!(before.hash(), after.hash());
@@ -617,7 +697,7 @@ mod tests {
             Some(10),
             Some(20),
             None,
-            merkle_root(&[h("l1"), h("l2"), h("l3")]),
+            MerkleFrontier::from_leaves(&[h("l1"), h("l2"), h("l3")]),
         )
         .unwrap();
         assert_eq!(a.hash(), b.hash());

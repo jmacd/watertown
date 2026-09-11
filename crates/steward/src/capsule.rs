@@ -10,8 +10,8 @@ use sync_store::content::SeriesManifest;
 use sync_store::{
     CapsuleDynamicMetadata, CapsuleEntry, CapsuleLeaf, CapsuleManifest, CapsuleNode, CapsuleObject,
     CapsulePayloadKind, CapsuleSource, IncrementalFileLeafHasher, IncrementalTableLeafHasher,
-    ManifestEntry, ObjectHash, capsule_series_root, decode_manifest, decode_recipe,
-    encode_canonical_attributes, encode_canonical_batch_rows, schema_fingerprint,
+    ManifestEntry, ObjectHash, capsule_series_root, decode_recipe, encode_canonical_attributes,
+    encode_canonical_batch_rows, schema_fingerprint,
 };
 use tinyfs::EntryType;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -125,10 +125,14 @@ pub(crate) async fn build_recovery_capsule_from_materialized(
     materialized: &crate::content_tree::MaterializedObjects,
     prior: Option<&CapsuleManifest>,
 ) -> Result<CapsuleBuild, StewardError> {
-    let (manifest_hash, manifest_bytes) = materialized.manifest.as_ref().ok_or_else(|| {
-        StewardError::Content("materialized pond has no node manifest".to_string())
+    let manifest_root = materialized.manifest_root.ok_or_else(|| {
+        StewardError::Content("materialized pond has no manifest root".to_string())
     })?;
-    let native_entries = decode_manifest(manifest_bytes).map_err(StewardError::Content)?;
+    let native_entries = materialized
+        .manifest_records
+        .iter()
+        .map(|record| record.entry.clone())
+        .collect::<Vec<_>>();
     let paths = resolve_paths(&native_entries)?;
 
     let pond_id = ship.control_table().pond_id_uuid().to_string();
@@ -140,11 +144,11 @@ pub(crate) async fn build_recovery_capsule_from_materialized(
         .ok_or_else(|| StewardError::Content("pond has no content tip".to_string()))?;
     let source_commit = sync_store::Commit::decode(tip_bytes)
         .map_err(|error| StewardError::Content(format!("decode content tip: {error}")))?;
-    if source_commit.node_manifest_hash != *manifest_hash {
+    if source_commit.manifest_root != manifest_root {
         return Err(StewardError::Content(format!(
-            "node manifest hashes to {} but the content tip names {}",
-            manifest_hash.to_hex(),
-            source_commit.node_manifest_hash.to_hex()
+            "manifest map roots to {} but the content tip names {}",
+            manifest_root.to_hex(),
+            source_commit.manifest_root.to_hex()
         )));
     }
     let source_tip = source_commit.hash();
@@ -686,8 +690,8 @@ async fn stage_payload(
     if let Some(existing) = payloads.objects.get(&hash) {
         return Ok(existing.clone());
     }
-    if let Some(bytes) = materialized.inline.get(&hash) {
-        return insert_payload(payloads, bytes.clone());
+    if let Some(object) = materialized.inline.get(&hash) {
+        return insert_payload(payloads, object.bytes.clone());
     }
     if !materialized.external_blobs.contains(&hash) {
         return Err(StewardError::Content(format!(

@@ -959,7 +959,7 @@ fn write_table_object(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::content::series_merkle::merkle_root as whole_merkle_root;
+    use crate::content::series_merkle::MerkleFrontier;
     use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Field};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -1003,7 +1003,6 @@ mod tests {
             leaves.push(leaf);
             offset += count;
         }
-        let root = whole_merkle_root(&leaf_hashes);
         let manifest = SeriesManifest::new(
             PayloadKind::File,
             bytes.len() as u64,
@@ -1011,7 +1010,7 @@ mod tests {
             None,
             None,
             None,
-            root,
+            MerkleFrontier::from_leaves(&leaf_hashes),
         )
         .expect("valid manifest");
         let manifest_hash = manifest.hash();
@@ -1052,7 +1051,6 @@ mod tests {
             leaves.push(leaf);
             offset += count;
         }
-        let root = whole_merkle_root(&leaf_hashes);
         let manifest = SeriesManifest::new(
             PayloadKind::Table,
             rows.len() as u64,
@@ -1060,7 +1058,7 @@ mod tests {
             None,
             None,
             None,
-            root,
+            MerkleFrontier::from_leaves(&leaf_hashes),
         )
         .expect("valid manifest");
         let manifest_hash = manifest.hash();
@@ -1357,9 +1355,16 @@ mod tests {
         let bytes = b"abcd".to_vec();
         let fixture = build_file_series(&bytes, &[4]);
         // A table-kind manifest with the same root shape.
-        let root = whole_merkle_root(&fixture.leaf_hashes);
-        let table_manifest = SeriesManifest::new(PayloadKind::Table, 4, 1, None, None, None, root)
-            .expect("table manifest");
+        let table_manifest = SeriesManifest::new(
+            PayloadKind::Table,
+            4,
+            1,
+            None,
+            None,
+            None,
+            MerkleFrontier::from_leaves(&fixture.leaf_hashes),
+        )
+        .expect("table manifest");
         let table_manifest_hash = table_manifest.hash();
         let layout = FilePackLayout::new(10).expect("layout");
         let err = build_file_pack(
@@ -1419,12 +1424,18 @@ mod tests {
         let bytes = b"abcd".to_vec();
         let leaf = FileLeafInput::new(bytes.clone(), Some(10), Some(20), None).expect("leaf");
         let leaf_hash = leaf.leaf_hash();
-        let root = whole_merkle_root(&[leaf_hash]);
         // Manifest declares different aggregate bounds than the leaf
         // actually carries.
-        let manifest =
-            SeriesManifest::new(PayloadKind::File, 4, 1, Some(999), Some(1000), None, root)
-                .expect("manifest");
+        let manifest = SeriesManifest::new(
+            PayloadKind::File,
+            4,
+            1,
+            Some(999),
+            Some(1000),
+            None,
+            MerkleFrontier::from_leaves(&[leaf_hash]),
+        )
+        .expect("manifest");
         let manifest_hash = manifest.hash();
         let layout = FilePackLayout::new(10).expect("layout");
         let err = build_file_pack(manifest_hash, &manifest, &[leaf_hash], 0, &[leaf], &layout)
@@ -1442,9 +1453,16 @@ mod tests {
         let real_leaf =
             FileLeafInput::new(bytes.clone(), None, None, Some(attrs.clone())).expect("real leaf");
         let real_hash = real_leaf.leaf_hash();
-        let root = whole_merkle_root(&[real_hash]);
-        let manifest =
-            SeriesManifest::new(PayloadKind::File, 4, 1, None, None, None, root).expect("manifest");
+        let manifest = SeriesManifest::new(
+            PayloadKind::File,
+            4,
+            1,
+            None,
+            None,
+            None,
+            MerkleFrontier::from_leaves(&[real_hash]),
+        )
+        .expect("manifest");
         let manifest_hash = manifest.hash();
         // Same bytes, different (also canonical) attributes: the recomputed
         // hash cannot match the real one.
@@ -1779,9 +1797,16 @@ mod tests {
         let schema = i64_string_schema();
         let rows: Vec<(i64, &str)> = vec![(1, "a")];
         let fixture = build_table_series(&schema, &rows, &[1]);
-        let root = whole_merkle_root(&fixture.leaf_hashes);
-        let file_manifest = SeriesManifest::new(PayloadKind::File, 1, 1, None, None, None, root)
-            .expect("file manifest");
+        let file_manifest = SeriesManifest::new(
+            PayloadKind::File,
+            1,
+            1,
+            None,
+            None,
+            None,
+            MerkleFrontier::from_leaves(&fixture.leaf_hashes),
+        )
+        .expect("file manifest");
         let file_manifest_hash = file_manifest.hash();
         let layout = TablePackLayout::new(10).expect("layout");
         let err = build_table_pack(
@@ -1855,7 +1880,7 @@ mod tests {
             None,
             None,
             None,
-            whole_merkle_root(&leaf_hashes),
+            MerkleFrontier::from_leaves(&leaf_hashes),
         )
         .expect("manifest");
         let built = build_table_pack(
@@ -1941,10 +1966,16 @@ mod tests {
         let leaf = TableLeafInput::new(schema, vec![b], Some(10), Some(20), None)
             .expect("leaf with bounds");
         let leaf_hash = leaf.leaf_hash();
-        let root = whole_merkle_root(&[leaf_hash]);
-        let manifest =
-            SeriesManifest::new(PayloadKind::Table, 1, 1, Some(999), Some(1000), None, root)
-                .expect("manifest with wrong aggregate bounds");
+        let manifest = SeriesManifest::new(
+            PayloadKind::Table,
+            1,
+            1,
+            Some(999),
+            Some(1000),
+            None,
+            MerkleFrontier::from_leaves(&[leaf_hash]),
+        )
+        .expect("manifest with wrong aggregate bounds");
         let manifest_hash = manifest.hash();
         let layout = TablePackLayout::new(10).expect("layout");
         let err = build_table_pack(manifest_hash, &manifest, &[leaf_hash], 0, &[leaf], &layout)

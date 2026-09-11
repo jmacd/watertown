@@ -14,7 +14,7 @@ use deltalake::logstore::{
 };
 use deltalake::{DeltaResult, DeltaTableError, Path};
 use object_store::ObjectStoreScheme;
-use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
+use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, S3CopyIfNotExists};
 use std::str::FromStr;
 use std::sync::Arc;
 use url::Url;
@@ -28,7 +28,9 @@ impl ObjectStoreFactory for S3CompatibleStoreFactory {
         url: &Url,
         config: &StorageConfig,
     ) -> DeltaResult<(ObjectStoreRef, Path)> {
-        let mut builder = AmazonS3Builder::new().with_url(url.to_string());
+        let mut builder = AmazonS3Builder::new()
+            .with_url(url.to_string())
+            .with_copy_if_not_exists(S3CopyIfNotExists::Multipart);
         for (key, value) in config.raw.iter() {
             if let Ok(config_key) = AmazonS3ConfigKey::from_str(&key.to_ascii_lowercase()) {
                 builder = builder.with_config(config_key, value.clone());

@@ -7,7 +7,7 @@
 //! against both implementations: [`ContentRemote`] (a `file://` object
 //! store) and [`LocalPondSource`] (a `pond://` producer clone on disk).
 //!
-//! Both must agree on the same `_packs/v3/series=<hex>/pack=<hex>` key layout
+//! Both must agree on the same `_packs/v4/series=<hex>/pack=<hex>` key layout
 //! and the same strict validation (content-address and series-binding
 //! checks), so a selector built against the [`ContentSource`] trait works
 //! unmodified regardless of which backend serves it.
@@ -15,8 +15,8 @@
 use steward::{ContentSource, LocalPondSource, Ship};
 use sync_store::ContentRemote;
 use sync_store::content::{
-    ObjectHash, PackIndex, PackLeafDescriptor, PackObjectSpan, PayloadKind, SeriesManifest,
-    generate_range_proof, merkle_root,
+    MerkleFrontier, ObjectHash, PackIndex, PackLeafDescriptor, PackObjectSpan, PayloadKind,
+    SeriesManifest, generate_range_proof, merkle_root,
 };
 use tempfile::tempdir;
 use tinyfs::arrow::parquet::ParquetExt;
@@ -55,7 +55,7 @@ fn build_series_and_pack(leaf_labels: &[&str], blob_label: &str) -> (ObjectHash,
         None,
         None,
         None,
-        root,
+        MerkleFrontier::from_leaves(&leaves),
     )
     .expect("valid manifest");
     let series_hash = manifest.hash();
@@ -115,20 +115,25 @@ async fn content_remote_trait_object_lists_and_fetches_published_packs() {
 
     let (series_hash, pack) = build_series_and_pack(&["a", "b", "c"], "remote-blob");
     let blob_hash = pack.physical_object_hashes()[0];
-    let pack_hash = remote
-        .publish_pack(series_hash, &pack, &[(blob_hash, b"remote-blob".to_vec())])
+    let _ = remote
+        .put_immutable_object(
+            sync_store::content::ObjectDescriptor::new(
+                blob_hash,
+                sync_store::content::ContentObjectKind::RawBlob,
+            ),
+            b"remote-blob",
+        )
+        .await
+        .expect("publish physical object");
+    let descriptor = sync_store::content::PackDescriptor::new(series_hash, pack.hash());
+    let _ = remote
+        .put_immutable_pack(descriptor, &pack.encode())
         .await
         .expect("publish pack");
 
     let source: &dyn ContentSource = &remote;
-    let listed = source
-        .list_pack_hashes(series_hash)
-        .await
-        .expect("list pack hashes");
-    assert_eq!(listed, std::collections::HashSet::from([pack_hash]));
-
     let fetched = source
-        .get_pack_index(series_hash, pack_hash)
+        .get_publication_pack(descriptor)
         .await
         .expect("fetch pack index")
         .expect("published pack must be fetchable through the trait");
@@ -219,7 +224,7 @@ async fn local_pond_source_ignores_obsolete_v2_advertisements() {
 }
 
 /// A pack advertisement placed directly under the producer clone's
-/// `_packs/v3/series=<hex>/pack=<hex>` -- the same relative layout
+/// `_packs/v4/series=<hex>/pack=<hex>` -- the same relative layout
 /// [`ContentRemote`] uses -- is discovered and fetched byte-for-byte,
 /// proving `LocalPondSource` reads a real persistent location rather than a
 /// stub.
@@ -334,9 +339,7 @@ async fn local_pond_source_rejects_cross_series_index() {
 #[tokio::test]
 async fn local_pond_source_serves_a_real_unpushed_native_series() {
     use steward::Ship;
-    use sync_store::content::{
-        Commit, SeriesManifest, decode_manifest, verify_pack_against_manifest,
-    };
+    use sync_store::content::{Commit, SeriesManifest, verify_pack_against_manifest};
     use tinyfs::EntryType;
     use tokio::io::AsyncWriteExt;
 
@@ -387,14 +390,12 @@ async fn local_pond_source_serves_a_real_unpushed_native_series() {
         .expect("get tip object")
         .expect("tip commit object is served");
     let commit = Commit::decode(&commit_bytes).expect("decode tip commit");
-    let manifest_bytes = source
-        .get_object(commit.node_manifest_hash)
+    let manifest_records = steward::fetch_manifest_records(&source, commit.manifest_root)
         .await
-        .expect("get node manifest object")
-        .expect("node manifest object is served");
-    let manifest_entries = decode_manifest(&manifest_bytes).expect("decode node manifest");
-    let series_entry = manifest_entries
+        .expect("fetch manifest map");
+    let series_entry = manifest_records
         .iter()
+        .map(|record| &record.entry)
         .find(|e| e.name == "native.series" && e.entry_type == EntryType::FilePhysicalSeries)
         .expect("the written series has a manifest entry");
     let series_hash = series_entry.child_hash;
@@ -412,8 +413,8 @@ async fn local_pond_source_serves_a_real_unpushed_native_series() {
         "one logical leaf per append"
     );
 
-    // No push, no manual advertisement: the pack must still be discoverable
-    // and fetchable, synthesized on demand from persisted rows.
+    // No push and no manual advertisement: each commit still persisted its
+    // immutable append segment in the pond-local content cache.
     let listed = source
         .list_pack_hashes(series_hash)
         .await
@@ -421,36 +422,34 @@ async fn local_pond_source_serves_a_real_unpushed_native_series() {
     assert_eq!(
         listed.len(),
         1,
-        "an unpushed series still advertises exactly its synthesized initial pack"
+        "an unpushed series advertises exactly its current linked segment head"
     );
     let pack_hash = *listed.iter().next().expect("one pack hash");
 
     let pack_bytes = source
         .get_pack_index(series_hash, pack_hash)
         .await
-        .expect("fetch synthesized pack index")
-        .expect("the synthesized pack must be fetchable by its own hash");
-    let pack = PackIndex::decode(&pack_bytes).expect("decode synthesized pack index");
+        .expect("fetch linked pack segment")
+        .expect("the linked pack segment must be fetchable by its own hash");
+    let pack = PackIndex::decode(&pack_bytes).expect("decode linked pack segment");
 
     assert_eq!(
         pack.leaf_start(),
-        0,
-        "a fresh series' initial pack covers the whole range"
+        chunks.len() as u64 - 1,
+        "the current head covers only the latest append"
     );
     assert_eq!(pack.leaf_end(), chunks.len() as u64);
     assert_eq!(pack.total_leaf_count(), series_manifest.leaf_count());
+    assert!(pack.parent_series_hash().is_some());
 
     // Self-check: the pack's range proof must actually fold to the series
     // manifest's leaf_merkle_root over the SAME leaf hashes this test can
     // independently recompute from the plaintext it wrote (raw byte
     // FilePhysicalSeries appends carry no temporal bounds/attributes).
-    let range_leaf_hashes: Vec<ObjectHash> = chunks
-        .iter()
-        .map(|c| {
-            sync_store::content::file_leaf_hash(c, None, None, None)
-                .expect("recompute file leaf hash")
-        })
-        .collect();
+    let range_leaf_hashes = vec![
+        sync_store::content::file_leaf_hash(chunks.last().expect("latest chunk"), None, None, None)
+            .expect("recompute latest file leaf hash"),
+    ];
     verify_pack_against_manifest(series_hash, &series_manifest, &pack, &range_leaf_hashes)
         .expect("pack must self-check against the manifest it was constructed from");
 
@@ -480,7 +479,22 @@ async fn local_pond_source_serves_a_real_unpushed_native_series() {
         }
     }
 
-    // Idempotent/deterministic: synthesizing again (a second list+fetch)
+    let graph = steward::fetch_object_graph(&source, "main")
+        .await
+        .expect("fresh pond clone walks only the linked series chain");
+    let fetched = graph
+        .objects
+        .get(&series_hash)
+        .and_then(|object| match object {
+            steward::FetchedObject::SeriesV2(series) => Some(series.as_ref()),
+            _ => None,
+        })
+        .expect("fetched series");
+    assert_eq!(fetched.leaf_start, 0);
+    assert_eq!(fetched.leaf_hashes.len(), chunks.len());
+    assert_eq!(fetched.packs.len(), chunks.len());
+
+    // Idempotent/deterministic: reading the same immutable head again
     // must reproduce byte-identical pack bytes.
     let listed_again = source
         .list_pack_hashes(series_hash)
@@ -490,7 +504,7 @@ async fn local_pond_source_serves_a_real_unpushed_native_series() {
     let pack_bytes_again = source
         .get_pack_index(series_hash, pack_hash)
         .await
-        .expect("fetch synthesized pack index again")
+        .expect("fetch linked pack segment again")
         .expect("still fetchable");
     assert_eq!(pack_bytes_again, pack_bytes);
 }
@@ -540,14 +554,14 @@ fn decode_parquet_rows(bytes: &[u8]) -> arrow_array::RecordBatch {
 /// A `pond://` (`LocalPondSource`) `TablePhysicalSeries` case: appends three
 /// table-series versions via the real native writer
 /// (`write_series_from_batch`), then walks the same public `ContentSource`
-/// path the file-series test above uses to reach the series' synthesized
-/// initial pack, and additionally verifies `PackIndex::physical_byte_count`
+/// path the file-series test above uses to reach the series' commit-produced
+/// root pack, and additionally verifies `PackIndex::physical_byte_count`
 /// against the real fetched object bytes and decodes the fetched Parquet
 /// payload to prove every row survives readback.
 #[tokio::test]
 async fn local_pond_source_serves_a_real_unpushed_native_table_series() {
     use steward::Ship;
-    use sync_store::content::{Commit, SeriesManifest, decode_manifest};
+    use sync_store::content::{Commit, SeriesManifest};
     use tinyfs::EntryType;
 
     let tmp = tempdir().expect("tempdir");
@@ -590,14 +604,12 @@ async fn local_pond_source_serves_a_real_unpushed_native_table_series() {
         .expect("get tip object")
         .expect("tip commit object is served");
     let commit = Commit::decode(&commit_bytes).expect("decode tip commit");
-    let manifest_bytes = source
-        .get_object(commit.node_manifest_hash)
+    let manifest_records = steward::fetch_manifest_records(&source, commit.manifest_root)
         .await
-        .expect("get node manifest object")
-        .expect("node manifest object is served");
-    let manifest_entries = decode_manifest(&manifest_bytes).expect("decode node manifest");
-    let series_entry = manifest_entries
+        .expect("fetch manifest map");
+    let series_entry = manifest_records
         .iter()
+        .map(|record| &record.entry)
         .find(|e| e.name == "native.table" && e.entry_type == EntryType::TablePhysicalSeries)
         .expect("the written table series has a manifest entry");
     let series_hash = series_entry.child_hash;
@@ -619,14 +631,14 @@ async fn local_pond_source_serves_a_real_unpushed_native_table_series() {
         .list_pack_hashes(series_hash)
         .await
         .expect("list pack hashes for the unpushed table series");
-    assert_eq!(listed.len(), 1, "exactly one synthesized initial pack");
+    assert_eq!(listed.len(), 1, "exactly one commit-produced root pack");
     let pack_hash = *listed.iter().next().expect("one pack hash");
     let pack_bytes = source
         .get_pack_index(series_hash, pack_hash)
         .await
-        .expect("fetch synthesized pack index")
-        .expect("the synthesized table pack must be fetchable");
-    let pack = PackIndex::decode(&pack_bytes).expect("decode synthesized table pack index");
+        .expect("fetch commit-produced pack index")
+        .expect("the commit-produced table pack must be fetchable");
+    let pack = PackIndex::decode(&pack_bytes).expect("decode table pack index");
 
     assert_eq!(pack.leaf_end(), versions.len() as u64);
     assert_eq!(pack.total_leaf_count(), series_manifest.leaf_count());
@@ -677,14 +689,14 @@ async fn local_pond_source_serves_a_real_unpushed_native_table_series() {
 /// A `pond://` (`LocalPondSource`) external/large `FilePhysicalSeries` case:
 /// one append whose content exceeds `tlogfs::large_files::LARGE_FILE_THRESHOLD`
 /// so it is stored as an external blob, not inlined. Verifies the
-/// synthesized pack's sole physical object is discoverable via the
+/// commit-produced root pack's sole physical object is discoverable via the
 /// external-blob path (`has_blob`/`get_blob_reader`, not `get_object`),
 /// that `physical_byte_count` matches the real streamed byte count, and
 /// that the full external payload reads back byte-for-byte.
 #[tokio::test]
 async fn local_pond_source_serves_a_real_unpushed_external_large_series() {
     use steward::Ship;
-    use sync_store::content::{Commit, SeriesManifest, decode_manifest};
+    use sync_store::content::{Commit, SeriesManifest};
     use tinyfs::EntryType;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -730,14 +742,12 @@ async fn local_pond_source_serves_a_real_unpushed_external_large_series() {
         .expect("get tip object")
         .expect("tip commit object is served");
     let commit = Commit::decode(&commit_bytes).expect("decode tip commit");
-    let manifest_bytes = source
-        .get_object(commit.node_manifest_hash)
+    let manifest_records = steward::fetch_manifest_records(&source, commit.manifest_root)
         .await
-        .expect("get node manifest object")
-        .expect("node manifest object is served");
-    let manifest_entries = decode_manifest(&manifest_bytes).expect("decode node manifest");
-    let series_entry = manifest_entries
+        .expect("fetch manifest map");
+    let series_entry = manifest_records
         .iter()
+        .map(|record| &record.entry)
         .find(|e| e.name == "native.external" && e.entry_type == EntryType::FilePhysicalSeries)
         .expect("the written external series has a manifest entry");
     let series_hash = series_entry.child_hash;
@@ -759,14 +769,14 @@ async fn local_pond_source_serves_a_real_unpushed_external_large_series() {
         .list_pack_hashes(series_hash)
         .await
         .expect("list pack hashes for the unpushed external series");
-    assert_eq!(listed.len(), 1, "exactly one synthesized initial pack");
+    assert_eq!(listed.len(), 1, "exactly one commit-produced root pack");
     let pack_hash = *listed.iter().next().expect("one pack hash");
     let pack_bytes = source
         .get_pack_index(series_hash, pack_hash)
         .await
-        .expect("fetch synthesized pack index")
-        .expect("the synthesized external-series pack must be fetchable");
-    let pack = PackIndex::decode(&pack_bytes).expect("decode synthesized pack index");
+        .expect("fetch commit-produced pack index")
+        .expect("the commit-produced external-series pack must be fetchable");
+    let pack = PackIndex::decode(&pack_bytes).expect("decode pack index");
     assert_eq!(pack.physical_object_hashes().len(), 1);
     let hash = pack.physical_object_hashes()[0];
 
@@ -799,8 +809,8 @@ async fn local_pond_source_serves_a_real_unpushed_external_large_series() {
 
 /// `LocalPondSource` must be able to fetch a *maintenance-published* pack's
 /// physical objects, not only the ordinary v1 external-blob closure it
-/// captures at `open()` time, and not only the on-demand synthesized
-/// initial pack the two tests above exercise.
+/// captures at `open()` time, and not only the commit-produced root packs the
+/// two tests above exercise.
 ///
 /// `steward::pack_maintenance::run_pack_maintenance` (reached through
 /// `Ship::collapse_versions`) repacks several externalized per-append blobs
@@ -814,13 +824,13 @@ async fn local_pond_source_serves_a_real_unpushed_external_large_series() {
 /// index naming them was published. This test forces that repack (multiple
 /// externalized appends over the large-file threshold, well within one
 /// pack's bounded byte cap so they land in a single new physical object),
-/// then fetches the *published* pack (not the synthesized one) through the
+/// then fetches the *published* maintenance pack through the
 /// public `ContentSource` surface and confirms every physical object it
 /// names is fetchable and reconstructs the exact original series bytes.
 #[tokio::test]
 async fn local_pond_source_fetches_a_maintenance_published_pack_object() {
     use steward::Ship;
-    use sync_store::content::{Commit, decode_manifest};
+    use sync_store::content::Commit;
     use tinyfs::EntryType;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -888,22 +898,20 @@ async fn local_pond_source_fetches_a_maintenance_published_pack_object() {
         .expect("get tip object")
         .expect("tip commit object is served");
     let commit = Commit::decode(&commit_bytes).expect("decode tip commit");
-    let manifest_bytes = source
-        .get_object(commit.node_manifest_hash)
+    let manifest_records = steward::fetch_manifest_records(&source, commit.manifest_root)
         .await
-        .expect("get node manifest object")
-        .expect("node manifest object is served");
-    let manifest_entries = decode_manifest(&manifest_bytes).expect("decode node manifest");
-    let series_entry = manifest_entries
+        .expect("fetch manifest map");
+    let series_entry = manifest_records
         .iter()
+        .map(|record| &record.entry)
         .find(|e| e.name == "native.maintained" && e.entry_type == EntryType::FilePhysicalSeries)
         .expect("the maintained series has a manifest entry");
     let series_hash = series_entry.child_hash;
 
     // The *published* pack advertisement directory on disk -- maintenance's
     // real repack output -- read directly, so this test cannot accidentally
-    // pass merely by exercising `list_pack_hashes`'s on-demand synthesized
-    // pack fallback instead of the maintenance-published one.
+    // pass merely by exercising the commit-produced linked segment instead
+    // of the maintenance-published one.
     let series_dir = steward::get_data_path(&pond_path)
         .join(sync_store::pack_keys::PACK_INDEX_ROOT)
         .join(sync_store::pack_keys::series_dir_name(series_hash));
@@ -923,8 +931,8 @@ async fn local_pond_source_fetches_a_maintenance_published_pack_object() {
     // advertisement set already forms a full exact cover of this series'
     // leaf range, `list_pack_hashes` (the exact-cover candidate set every
     // `pond://` fetch path selects from) must resolve to *only* that
-    // maintained hash -- the synthesized initial pack must be a
-    // fallback-only candidate, never added alongside a real full cover.
+    // maintained hash -- the ordinary commit-produced segment must not be
+    // selected ahead of an explicit full-range maintenance pack.
     let listed_hashes = source
         .list_pack_hashes(series_hash)
         .await
@@ -934,7 +942,7 @@ async fn local_pond_source_fetches_a_maintenance_published_pack_object() {
         std::collections::HashSet::from([pack_hash]),
         "once real on-disk advertisements already form a full exact cover, list_pack_hashes \
          must report only the maintained/published pack hash {pack_hash} -- never also \
-         synthesizing and offering the initial pack as a spurious extra candidate"
+         offering the ordinary linked segment as a spurious extra candidate"
     );
 
     let pack_bytes = source

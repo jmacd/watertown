@@ -8,6 +8,11 @@ coherent. It is the architectural companion to the phased implementation plan in
 `docs/incremental-content-tree-design.md` (see its Section 10 and progress
 table); read this for the "what and why," read that for the "how and when."
 
+Native-v2 publication further refines the INDEX representation: it is now a
+fixed-size pointer to a pond-local immutable, path-compressed Patricia map,
+rather than one flat manifest value. Remote publication is specified by
+`low-cost-correctness-review.md` Section 16.
+
 ## 1. The one invariant
 
 > **The pond is one `data/` Delta Lake instance. Everything durable and shared
@@ -29,12 +34,16 @@ Every design choice below is a consequence of holding this invariant.
 |- data/                     THE POND -- one Delta Lake instance, the only source of truth
 |  |- _delta_log/            Delta transaction log (commit history, pond_txn metadata)
 |  |- _large_files/blake3=*  external blobs > 64 KiB (no Delta schema fits raw bytes)
+|  |- _content/v2/objects/   pond-local immutable commit/tree/manifest cache
+|  |- _content/v2/state/     fixed local manifest-root cursors (recoverable)
+|  |- _packs/                 explicit local whole-range pack maintenance sidecars
 |  |- part_id=<uuid>/*.parquet
 |  |    filesystem rows: one partition per directory; user files + dirs
 |  |
 |  |- INDEX node   (tinyfs::INDEX_NODE_UUID,  ".pond-node-index")
-|  |    DERIVED cache. Node manifest + incremental Merkle/child-hash caches.
-|  |    Fold-excluded, hidden from enumeration. Rebuilt on pull.
+|  |    DERIVED cache. Fixed-size persistent manifest-map root pointer.
+|  |    Fold-excluded, hidden from enumeration. Updated incrementally on pull;
+|  |    rebuilt only by full clone/rebuild.
 |  |
 |  +- LOG node     (tinyfs::LOG_NODE_UUID,    ".pond-commit-log")
 |       AUTHORITATIVE history. Append-only series; one version per
@@ -48,7 +57,9 @@ Every design choice below is a consequence of holding this invariant.
 |  |- audit log              Begin / DataCommitted / Failed / Completed per txn
 |  |- spine cache            root_tree_hash / parent / commit_hash / commit_object
 |  |                         (a copy of the LOG tail; NOT authoritative)
-|  +- operator settings      remote configs' modes, last_pushed/last_pulled seq
+|  +- operator settings      remote configs/modes and structured publication
+|                            acknowledgements (format, tip, manifest root,
+|                            record head, generation)
 |                            (local to this replica; the only non-rebuildable state)
 |
 |- tlog/                     DERIVED export -- C2SP tlog-tiles + checkpoint over the LOG node
@@ -68,7 +79,7 @@ only in authority and transfer semantics.
 
 | | content | authoritative? | transferred on pull? | recovered by |
 |---|---|---|---|---|
-| **INDEX** node | node manifest + incremental caches | derived | no (rebuilt) | re-fold the live rows |
+| **INDEX** node | persistent manifest-map root pointer | derived | no (recomputed locally) | incremental pull delta or explicit full fold |
 | **LOG** node | append-only `commit_object` per commit | **authoritative** | yes | it *is* the history |
 
 They are fold-excluded for the same reason: their contents are *derived from*
@@ -76,10 +87,17 @@ They are fold-excluded for the same reason: their contents are *derived from*
 otherwise be hashed into. Folding them in would be self-referential -- the same
 argument that excluded the index node in Phase 2.
 
-They are two nodes rather than one because their economics differ. INDEX is
-`O(n)` in pond size and cheaply rebuilt, so it is **not shipped** (bandwidth).
-LOG is small, append-only, and carries provenance that exists nowhere else, so
-it **is shipped** -- it is the history.
+They are two nodes rather than one because their economics differ. INDEX is a
+small pointer into rebuildable pond-local immutable map nodes and is **not
+shipped as filesystem content**. LOG is small, append-only, and carries
+provenance that exists nowhere else, so it remains authoritative local
+history; native-v2 publication transfers only the commit delta since the
+acknowledged remote tip.
+
+The generic collapsed-row primitive is not a user-series feature in native-v2.
+`FilePhysicalSeries` and `TablePhysicalSeries` writes are append-only; the
+public collapsing path rejects them. Only INDEX replaces its prior fixed-size
+pointer, and local maintenance may delete those excluded obsolete rows.
 
 ### Why the LOG node is what makes control disposable
 
@@ -101,15 +119,15 @@ version**, and the control spine is demoted to a redundant cache.
 A single `pond` invocation is one transaction with one `TransactionGuard`. On a
 content-changing write, before the Delta transaction finalizes, the steward:
 
-1. **Folds the changeset** (step 4b: incremental, `O(change)` along the touched
-   path; today's 4a code still folds `O(n)` and keeps the full fold as an
-   oracle). This yields the new `root_tree_hash` and the node-manifest Merkle
-   root without a second scan.
-2. **Writes the INDEX node** version: the node manifest plus the incremental
-   caches needed to make the *next* commit `O(change)`.
+1. **Folds the changeset** incrementally along touched content and identity
+   paths, with an optional full-fold oracle. This yields `root_tree_hash`, the
+   persistent manifest-map root, changed map nodes, changed content objects,
+   and per-node before/after records.
+2. **Writes the immutable local objects**, then writes the collapsing INDEX
+   node version containing only the fixed-size map-root pointer.
 3. **Reads the LOG tip** (parent commit hash) from the committed table and
-   **builds the commit object** (`root_tree_hash` + parent + `node_manifest_hash`
-   + `node_manifest_root` + provenance).
+   **builds the `watertown.commit.v2` object** (`root_tree_hash` + parent +
+   `manifest_root` + bounded manifest/object/pack delta + provenance).
 4. **Appends the LOG node** version = that commit object.
 5. Commits INDEX + LOG + data rows **in one Delta transaction**.
 
@@ -142,22 +160,28 @@ Step 4a made the architecture correct. The remaining steps make it efficient and
 remove the last pond-derived data from the authoritative-in-control position.
 
 - **4b -- incremental commit fold.** Both roots (`root_tree_hash` and the
-  manifest Merkle root) are computed from the changeset along the touched path
-  instead of a full scan, and the INDEX node persists the incremental caches
-  (child-hash map + `NodeMerkle` nodes) that make this possible. Commit cost
-  goes from `O(n)` to `O(change)`. The in-transaction incremental fold is
-  cross-checked against a full `O(n)` fold by an oracle that is always on in
-  debug builds and opt-in in release builds via the `POND_VERIFY_FOLD`
-  environment variable, so a high-value pond can validate every commit without a
-  debug rebuild. **This is a performance change, not an authority change** --
+  manifest-map root) are computed from the changeset along touched paths
+  instead of a full scan. The INDEX node stores the current root while
+  immutable Patricia nodes under `data/_content/v2/objects` preserve unchanged
+  subtrees by hash. Commit cost goes from `O(n)` to `O(change)`. The
+  in-transaction incremental fold can be explicitly cross-checked against a
+  full `O(n)` fold by setting `POND_VERIFY_FOLD` in any build. It is never
+  enabled merely by using a debug binary, so ordinary cost tests and operator
+  commands retain the production path. **This is a performance change, not an authority change** --
   but it is what makes the INDEX node a genuine durable incremental cache rather
   than a per-commit full rewrite.
-- **5 -- `commit_object` node-keyed Merkle root.** *(Done.)* The commit object
-  gains a `node_manifest_root` (the `NodeMerkle` root) alongside the flat
-  `node_manifest_hash`. The flat hash is retained as the manifest object's
-  push/pull fetch-and-verify key; the Merkle root adds an incremental identity
-  commitment (verified by the pull path against the tip commit) and paves the
-  way for a later incremental (delta-INDEX) manifest transfer.
+- **4c -- incremental pull planning.** An acknowledged mirror or foreign graft
+  reads its destination INDEX root and point-loads only changed manifest records
+  plus required parent paths. A changed series loads its prior
+  `watertown.series.v3` manifest and compares the stored leaf count/root/bounded
+  frontier with the fetched suffix's parent state; it never folds the complete
+  destination table or hashes retained leaves. Missing local map state fails
+  loudly and requires an explicit full rebuild.
+- **5 -- persistent manifest map in `commit_object`.** *(Done.)*
+  `watertown.commit.v2` names the persistent manifest root and carries only the
+  transaction's canonical before/after identity changes plus introduced
+  object/pack descriptors. The former monolithic `node_manifest_hash` field is
+  not part of the native-v2 commit or transfer path.
 - **5b -- checksum subsumption.** *(Done.)* A partition *is* a directory; that
   directory's `tree_hash` in the content tree *is* its content checksum.
   `fsck` and the compaction invariant now compare content-tree hashes

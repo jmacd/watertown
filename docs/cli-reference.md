@@ -18,6 +18,8 @@
 | `pond log` | View transaction history | `pond log --limit 20` |
 | `pond remote add` | Attach a pull-mode remote (mirror or import) | `pond remote add upstream s3://bucket /imports/upstream` |
 | `pond backup add` | Attach a backup (push or push+pull) | `pond backup add origin s3://bucket` |
+| `pond backup cleanup-uploads` | Delete abandoned native-v2 upload staging after a grace period | `pond backup cleanup-uploads origin` |
+| `pond backup publish-consolidated` | Explicitly publish verified local whole-range series packs | `pond backup publish-consolidated origin` |
 | `pond remote list` | List attached remotes (all) | `pond remote list` |
 | `pond backup list` | List push-side attachments | `pond backup list` |
 | `pond remote remove` | Detach a remote (also works for backups) | `pond remote remove origin` |
@@ -27,7 +29,7 @@
 | `pond freeze` | Persistently freeze, inspect, or re-enable pond data writes | `pond freeze status` |
 | `pond pull` | Pull from pull/both-mode remotes | `pond pull` |
 | `pond restore` | Bootstrap a whole-pond replica from a backup (disaster recovery) | `pond restore origin file:///mnt/backups/origin` |
-| `pond maintain` | Delta maintenance; `--compact` records a pushable Compact bundle | `pond maintain --compact` |
+| `pond maintain` | Local Delta and optional pack-only maintenance | `pond maintain --compact` |
 | `pond verify` | Compare local data against remote checksums (D6.1) | `pond verify origin` |
 | `pond fsck` | Local integrity check: content checksums + content-tree root fingerprint | `pond fsck --verbose` |
 | `pond status` | Operator status aggregate: identity, watermarks, recovery (D6.2) | `pond status` |
@@ -477,6 +479,18 @@ pond remote list
 # List backups only
 pond backup list
 
+# Delete upload staging left by interrupted multipart publication after the
+# default 24-hour grace period.
+pond backup cleanup-uploads origin
+
+# Use a different grace period when an operator has confirmed no publication
+# can still be active.
+pond backup cleanup-uploads origin --older-than-seconds 3600
+
+# After local pack maintenance, explicitly publish its verified whole-range
+# packs to one push/both backup.
+pond backup publish-consolidated origin
+
 # Detach a remote (clears config + watermarks; preserves any materialized
 # mount entry so previously-imported data is still readable by path).
 pond remote remove origin
@@ -489,6 +503,17 @@ pond remote remove --purge upstream
 `pond remote add` writes `/sys/remotes/<name>` as YAML and records
 `remote_mode:<name>` and `remote_mount_path:<name>` in the control
 table.  Re-adding the same name errors unless `--overwrite` is given.
+
+`pond backup publish-consolidated NAME` is an explicit, metered maintenance
+operation. It requires a `push`/`both` attachment whose pond identity and
+current `main` publication exactly match the local tip. It validates every
+local pack and physical object against the current `watertown.series.v3`
+manifest, uploads immutable objects first, then the pack, then installs the
+fixed-key consolidated locator. It reports each selected series/pack and the
+selected/created object and byte totals. A failure before the locator leaves
+the existing linked series path valid; retry converges without duplicate
+canonical payloads. Collection and ordinary `pond push` never invoke this
+operation implicitly.
 
 **Attach-time conflict checks** (pull-mode only):
 
@@ -539,18 +564,29 @@ pond push origin
 After every write transaction, the steward also auto-pushes all
 `push`/`both`-mode remotes -- so this command is mostly used when an
 earlier auto-push failed (transient network), or right after attaching
-a brand-new remote. Native pushes do not generate capsules; they idempotently
-install or verify the small static recovery recipe before writing backup data.
+a brand-new remote. An acknowledged unchanged tip returns before credentials,
+limiters, or remote storage are opened.
+
+Native-v2 publication writes changed immutable objects and receipts first,
+then changed pack indexes, then one immutable publication record, and finally
+advances the dedicated `_publication/` Delta row with a generation/record-head
+compare-and-swap. Payloads are never stored in append-versioned Delta rows.
+Native pushes do not implicitly generate portable capsules.
+They also do not upload local packs produced by
+`pond maintain --collapse-versions`; use the explicit backup subcommand above.
 
 ---
 
 ### pond capsule
 
-Install static native-format recovery recipes and verify portable logical
-recovery snapshots. The only recipe is the current
-`watertown.commit.v1` to `pondcapsule.4` path.
+Publish and verify portable logical recovery snapshots. A legacy
+`watertown.commit.v1` extraction recipe remains available only for explicitly
+selected rollback-window remotes; native-v2 backups publish capsules directly.
 
 ```bash
+# Build and publish the current logical snapshot explicitly.
+pond capsule publish azure
+
 # Install or verify the current recipe.
 pond capsule recipe publish azure
 pond capsule recipe inspect azure
@@ -562,17 +598,22 @@ pond capsule inspect ./recovered
 pond capsule verify ./recovered
 
 # Import into the nonexistent path named by POND using a fresh pond identity.
-# Import is experimental until bounded resume and active-remote preflight ship.
 POND=/srv/watertown/recovered pond capsule import ./recovered \
-  --birthplace watershop-capsule-rehearsal \
-  --experimental
+  --birthplace watershop-capsule-rehearsal
+
+# After repairing any unsafe restored automatic configuration:
+POND=/srv/watertown/recovered pond capsule activate
 ```
 
-Every backup push installs the current hash-addressed recipe. If the
+`pond capsule publish` builds `pondcapsule.4` from the current persistent
+manifest map, writes payloads before the capsule manifest/reference, and is
+safe to retry. It is explicit and separate from ordinary native publication.
+
+`pond capsule recipe publish` is retained for legacy extraction. If the
 discoverable recipe is absent it is created with current bytes. If it already
 exists, it is left unchanged only when its exact bytes match its own
 hash-addressed immutable copy. Missing or mismatched immutable copies fail
-without backfill. Explicit publication creates
+without backfill. Recipe publication creates
 `recovery/recipes/watertown.commit.v1/<recipe-hash>/README.sh` before
 `recovery/README.sh`.
 
@@ -584,11 +625,13 @@ canonical manifest, every physical object hash and size, every Parquet schema,
 every ordered logical file/table leaf hash, and each logical series root.
 
 Inspection and import accept only `pondcapsule.4`; obsolete capsule formats
-are rejected. Import accepts only a nonexistent target. It constructs a private sibling
-staging pond with a fresh identity, persistently suppresses post-commit
-factories and automatic pushes, and atomically promotes the target only after
-an exact logical comparison. The importer currently leaves active-remote
-preflight to the operator and requires `--experimental`.
+are rejected. Import accepts only a nonexistent target. It constructs or
+resumes a capsule-root-addressed private sibling staging pond with a fresh
+identity, commits bounded journaled entry/leaf batches, persistently
+suppresses post-commit factories and automatic pushes, and atomically
+promotes the target only after an exact logical comparison. The promoted pond
+remains inert until `pond capsule activate` validates restored remote
+attachments, modes, destinations, and automatic factory configs.
 
 See [capsule-recovery-runbook.md](capsule-recovery-runbook.md) for the complete
 writer-quiescence, exact-tip, staged-import, cutover, rollback, and retention
@@ -634,7 +677,7 @@ local tip, and final remote tip agree. Follow
 
 ### pond pull
 
-Pull new bundles from one or more remotes.
+Pull new native-v2 publications from one or more remotes.
 
 ```bash
 # Pull every remote with mode=pull or mode=both
@@ -661,10 +704,12 @@ replaces only that foreign pond partition, validates the replacement before
 commit, and commits the mount and graft pin in the same transaction. It refuses
 to unlink local content or a different pond's graft at the configured path.
 
-Ordinary pulls are fast-forward only: a differing remote tip must descend from
-the recorded `last_pulled_tip`. A stale or out-of-order remote ref is rejected
-rather than rolling a mirror or graft backward. Use `--rebuild-graft` for an
-intentional cross-pond replacement.
+Ordinary pulls are fast-forward only. Local consumer acknowledgement records
+the remote URL, pond id, ref, native format, snapshot tip, manifest root,
+publication-record head, and generation. A known consumer walks only newer
+per-push records; a stale, unknown, or out-of-order baseline is rejected rather
+than triggering a full-inventory fallback or rolling a mirror/graft backward.
+Use `--rebuild-graft` for an intentional cross-pond replacement.
 
 ---
 
@@ -971,6 +1016,12 @@ pond maintain
 
 # Also compact: merge many small parquet files into fewer large ones
 pond maintain --compact
+
+# Repack over-fragmented native-v2 series into verified local whole-range packs
+pond maintain --collapse-versions 100
+
+# Preview selected local series and physical work
+pond maintain --dry-run --collapse-versions 100
 ```
 
 `--compact` compacts the pond's own-`pond_id` partitions as a **recorded,
@@ -981,6 +1032,15 @@ content closure.
 Compaction never changes logical content -- watertown snapshots each
 partition's checksum before and after the merge and aborts if they
 differ.  A run with nothing to merge is a clean no-op.
+
+`--collapse-versions N` is pack-only physical maintenance despite its
+historical name. It reads series whose live physical fanout exceeds `N` and
+publishes bounded, content-addressed whole-range packs under local
+`data/_packs`. It never collapses, rewrites, or reclaims user
+`FilePhysicalSeries`/`TablePhysicalSeries` Oplog rows or `_large_files`
+payloads. The only collapsed rows it may delete are obsolete pointers from the
+reserved `.pond-node-index`. Remote publication is a separate
+`pond backup publish-consolidated NAME` operation.
 
 ---
 

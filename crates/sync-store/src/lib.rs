@@ -30,6 +30,7 @@ pub mod content_remote;
 mod error;
 pub mod metered_store;
 pub mod pack_keys;
+mod publication;
 mod recovery_recipe;
 mod s3_registration;
 pub mod schema;
@@ -43,21 +44,26 @@ pub use s3_registration::register_s3_handlers;
 pub use content::{
     CAPSULE_FORMAT_V4, CapsuleDynamicMetadata, CapsuleEntry, CapsuleLeaf, CapsuleManifest,
     CapsuleNode, CapsuleObject, CapsulePayloadKind, CapsuleSource, CapsuleVerifyReport, Commit,
-    IncrementalFileLeafHasher, IncrementalTableLeafHasher, ManifestEntry, NodeMerkle, ObjectHash,
-    Provenance, TreeEntry, VersionMeta, canonicalize_schema, capsule_leaf_hash,
-    capsule_manifest_bytes, capsule_root, capsule_series_root, decode_capsule_manifest,
-    decode_manifest, decode_recipe, decode_tree, encode_canonical_attributes,
-    encode_canonical_batch_rows, encode_canonical_schema, encode_capsule_attributes,
-    file_leaf_hash, node_merkle_rebuild_root, read_capsule_manifest, schema_fingerprint,
+    IncrementalFileLeafHasher, IncrementalTableLeafHasher, ManifestEntry, ObjectHash, Provenance,
+    TreeEntry, VersionMeta, canonicalize_schema, capsule_leaf_hash, capsule_manifest_bytes,
+    capsule_root, capsule_series_root, decode_capsule_manifest, decode_recipe, decode_tree,
+    encode_canonical_attributes, encode_canonical_batch_rows, encode_canonical_schema,
+    encode_capsule_attributes, file_leaf_hash, read_capsule_manifest, schema_fingerprint,
     table_leaf_hash, tree_hash, verify_capsule_directory, verify_capsule_payload_directory,
     verify_incremental_capsule_payload_directory,
 };
-pub use content_remote::{ContentRemote, RecoveryRecipePublishOutcome};
+pub use content_remote::{
+    ConsolidatedPackWriteOutcome, ContentRemote, ImmutableWriteOutcome, PublicationFailurePoint,
+    RecoveryRecipePublishOutcome, UploadCleanupOutcome,
+};
 pub use error::{Result, StoreError};
 pub use metered_store::{
     AccessClass, AccessOperation, AccessSummary, AccessTotals, MeterBinding, MeteredStore,
     Observation, RemoteKey, StorageMeter, access_summary_under, bind_meter, observed_under,
     record_arrears,
+};
+pub use publication::{
+    PublicationExpectation, PublicationState, PublicationTable, publication_url,
 };
 pub use recovery_recipe::{
     recovery_recipe_watertown_commit_v1, recovery_recipe_watertown_commit_v1_hash,

@@ -7,11 +7,9 @@
 //! `pond remote` subcommands: `add`, `remove`, `list`.
 //!
 //! Remote attachments live as small YAML files under `/sys/remotes/<name>`.
-//! Per-remote runtime state (`last_pushed_tip:<url>`, `last_pulled_tip:<url>`,
-//! `remote_mode:<name>`) lives in the control table's raw_config map; the
-//! YAML on disk is intentionally portable (no per-pond frontier state).  The
-//! tips are the CA3 single-commit-hash frontier that replaced the retired
-//! per-pond seq watermarks.
+//! Per-remote runtime state (mode, mount, and structured publication
+//! acknowledgements keyed by URL/pond/ref) lives in the control table; the
+//! YAML on disk is intentionally portable.
 //!
 //! The data types ([`RemoteAttachment`] / [`RemoteMode`]) live in the
 //! [`steward`] crate so the post-commit auto-push dispatcher can use them
@@ -568,16 +566,21 @@ pub async fn attach_remote(
     .map_err(|e| anyhow!("Failed to add remote: {}", e))?;
 
     if let Some(migration) = watermark_migration {
-        ship.control_table_mut()
-            .raw_config_set(&format!("last_pulled_tip:{url}"), &migration.tip)
+        let state = migration
+            .destination_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| anyhow!("verified replacement publication state was not retained"))?;
+        steward::write_pull_ack(ship.control_table_mut(), url, &state)
             .await
-            .map_err(|e| anyhow!("record migrated pull watermark for `{name}`: {e}"))?;
+            .map_err(|e| anyhow!("record migrated pull acknowledgement for `{name}`: {e}"))?;
         if migration.old_url == url {
             log::info!(
                 "[OK] verified existing pull watermark for {} at {} ({})",
                 name,
                 url,
-                migration.tip
+                state.snapshot_tip
             );
         } else {
             log::info!(
@@ -585,7 +588,7 @@ pub async fn attach_remote(
                 name,
                 migration.old_url,
                 url,
-                migration.tip
+                state.snapshot_tip
             );
         }
     }
@@ -611,12 +614,17 @@ pub async fn attach_remote(
 #[derive(Debug)]
 struct PullWatermarkMigration {
     old_url: String,
-    tip: String,
+    acknowledgement: steward::PublicationAcknowledgement,
     foreign_pond_id: String,
+    destination_state: std::sync::Mutex<Option<sync_store::PublicationState>>,
 }
 
 impl PullWatermarkMigration {
-    fn verify(&self, remote_pond_id: uuid::Uuid, remote_tip: Option<&str>) -> Result<()> {
+    fn verify(
+        &self,
+        remote_pond_id: uuid::Uuid,
+        remote_state: Option<&sync_store::PublicationState>,
+    ) -> Result<()> {
         if remote_pond_id.to_string() != self.foreign_pond_id {
             return Err(anyhow!(
                 "cannot migrate pull watermark: replacement remote has pond_id {}, \
@@ -625,17 +633,31 @@ impl PullWatermarkMigration {
                 self.foreign_pond_id
             ));
         }
-        match remote_tip {
-            Some(tip) if tip == self.tip => Ok(()),
-            Some(tip) => Err(anyhow!(
-                "cannot migrate pull watermark: replacement remote tip {} does not \
-                 exactly match pinned tip {}; refresh the source pond while both remotes \
-                 are synchronized before retrying",
-                tip,
-                self.tip
+        let expected = self
+            .acknowledgement
+            .state(&self.old_url, remote_pond_id, "main")?;
+        match remote_state {
+            Some(state)
+                if state.snapshot_tip == expected.snapshot_tip
+                    && state.manifest_root == expected.manifest_root =>
+            {
+                *self
+                    .destination_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(state.clone());
+                Ok(())
+            }
+            Some(state) => Err(anyhow!(
+                "cannot migrate pull watermark: replacement publication tip {} manifest {} \
+                 does not exactly match pinned tip {} manifest {}; \
+                 refresh the source pond while both remotes are synchronized before retrying",
+                state.snapshot_tip,
+                state.manifest_root,
+                expected.snapshot_tip,
+                expected.manifest_root
             )),
             None => Err(anyhow!(
-                "cannot migrate pull watermark: replacement remote has no `main` tip"
+                "cannot migrate pull watermark: replacement remote has no `main` publication"
             )),
         }
     }
@@ -644,7 +666,7 @@ impl PullWatermarkMigration {
 async fn prepare_watermark_migration(
     ship: &mut steward::Steward,
     name: &str,
-    new_url: &str,
+    _new_url: &str,
     mode: RemoteMode,
     mount_path: Option<&str>,
     overwrite: bool,
@@ -686,28 +708,6 @@ async fn prepare_watermark_migration(
         ));
     }
 
-    let tip = ship
-        .control_table()
-        .raw_config_get(&format!("last_pulled_tip:{}", old_attachment.url))
-        .await
-        .map_err(|e| anyhow!("read existing pull watermark for `{name}`: {e}"))?
-        .filter(|tip| !tip.is_empty())
-        .ok_or_else(|| {
-            if old_attachment.url == new_url {
-                anyhow!(
-                    "cannot verify completed pull watermark migration: replacement URL `{}` \
-                     is already attached but has no pull watermark; restore the original \
-                     attachment and retry the migration",
-                    old_attachment.url
-                )
-            } else {
-                anyhow!(
-                    "cannot migrate pull watermark: existing URL `{}` has no pull watermark",
-                    old_attachment.url
-                )
-            }
-        })?;
-
     let pin_path = steward::GraftPin::pin_path(name);
     let tx = ship
         .begin_read(&steward::PondUserMetadata::new(vec![
@@ -742,18 +742,35 @@ async fn prepare_watermark_migration(
             mount_path
         ));
     }
-    if pin.pinned_tip != tip {
+    let foreign_pond_id = uuid::Uuid::parse_str(&pin.foreign_pond_id)
+        .map_err(|error| anyhow!("graft pin has invalid pond id: {error}"))?;
+    let acknowledgement = steward::read_pull_ack(
+        ship.control_table(),
+        &old_attachment.url,
+        foreign_pond_id,
+        "main",
+    )
+    .await?
+    .ok_or_else(|| {
+        anyhow!(
+            "cannot migrate pull watermark: existing URL `{}` has no structured pull \
+             acknowledgement",
+            old_attachment.url
+        )
+    })?;
+    if pin.pinned_tip != acknowledgement.snapshot_tip {
         return Err(anyhow!(
             "cannot migrate pull watermark: graft pin tip {} differs from existing URL watermark {}",
             pin.pinned_tip,
-            tip
+            acknowledgement.snapshot_tip
         ));
     }
 
     Ok(PullWatermarkMigration {
         old_url: old_attachment.url,
-        tip,
+        acknowledgement,
         foreign_pond_id: pin.foreign_pond_id,
+        destination_state: std::sync::Mutex::new(None),
     })
 }
 
@@ -765,22 +782,28 @@ async fn verify_watermark_destination(
     let Some(migration) = migration else {
         return Ok(());
     };
-    let tip = source
-        .get_tip("main")
+    let state = source
+        .get_publication_state("main")
         .await
-        .map_err(|e| anyhow!("read tip from `{url}`: {e}"))?;
-    let tip_text = tip.as_ref().map(ToString::to_string);
-    migration.verify(source.pond_id(), tip_text.as_deref())?;
-    let tip = tip.expect("verified destination tip is present");
+        .map_err(|e| anyhow!("read publication from `{url}`: {e}"))?;
+    migration.verify(source.pond_id(), state.as_ref())?;
+    let tip = state
+        .expect("verified destination publication is present")
+        .snapshot_tip;
     if source
         .get_object(tip)
         .await
-        .map_err(|e| anyhow!("read pinned commit {} from `{url}`: {e}", migration.tip))?
+        .map_err(|e| {
+            anyhow!(
+                "read pinned commit {} from `{url}`: {e}",
+                migration.acknowledgement.snapshot_tip
+            )
+        })?
         .is_none()
     {
         return Err(anyhow!(
             "cannot migrate pull watermark: replacement remote does not contain pinned commit {}",
-            migration.tip
+            migration.acknowledgement.snapshot_tip
         ));
     }
     Ok(())
@@ -1049,13 +1072,15 @@ pub async fn remove_remote_command(
         log::warn!("[WARN] failed to clear {}: {}", mount_key, e);
     }
     if let Some(url) = url_to_clear {
-        for key in [
-            format!("last_pushed_tip:{url}"),
-            format!("last_pulled_tip:{url}"),
-        ] {
-            if let Err(e) = ship.control_table_mut().raw_config_set(&key, "").await {
-                log::warn!("[WARN] failed to clear {}: {}", key, e);
-            }
+        let pond_id = ship.control_table().pond_id_uuid();
+        if let Err(error) =
+            steward::clear_acknowledgements(ship.control_table_mut(), &url, pond_id, "main").await
+        {
+            log::warn!(
+                "[WARN] failed to clear publication acknowledgements for {}: {}",
+                url,
+                error
+            );
         }
     }
 
@@ -1119,21 +1144,22 @@ pub async fn list_remotes_command(
             .map_err(|error| anyhow!("could not read mount for remote `{name}`: {error}"))?
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "-".to_string());
+        let pond_id = ship.control_table().pond_id_uuid();
         let pushed_tip = short_tip(
-            ship.control_table()
-                .raw_config_get(&format!("last_pushed_tip:{}", attachment.url))
+            steward::read_push_ack(ship.control_table(), &attachment.url, pond_id, "main")
                 .await
                 .map_err(|error| {
-                    anyhow!("could not read pushed tip for remote `{name}`: {error}")
-                })?,
+                    anyhow!("could not read pushed acknowledgement for remote `{name}`: {error}")
+                })?
+                .map(|ack| ack.snapshot_tip),
         );
         let pulled_tip = short_tip(
-            ship.control_table()
-                .raw_config_get(&format!("last_pulled_tip:{}", attachment.url))
+            steward::read_pull_ack_for_remote(ship.control_table(), &attachment.url, "main")
                 .await
                 .map_err(|error| {
-                    anyhow!("could not read pulled tip for remote `{name}`: {error}")
-                })?,
+                    anyhow!("could not read pulled acknowledgement for remote `{name}`: {error}")
+                })?
+                .map(|ack| ack.snapshot_tip),
         );
         println!(
             "{:<20} {:<50} {:<6} {:<20} {:<18} {:<18}",

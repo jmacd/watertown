@@ -58,7 +58,7 @@ check '[ -n "'"${SRC_MD5}"'" ]' "producer series md5 computed"
 echo "--- Step 2: backup add (pushes existing history) ---"
 pond backup add origin "file://${REMOTE}" > /tmp/717-backup.log 2>&1
 check 'grep -q "added remote origin" /tmp/717-backup.log' "backup add origin succeeded"
-TIP_BEFORE=$(pond status 2>/dev/null | awk '/last pushed:/ {print $NF}')
+TIP_BEFORE=$(pond status 2>/dev/null | awk '/last pushed:/ {print $3}')
 ROOT_BEFORE=$(pond fsck 2>/dev/null)
 PACKS_BEFORE=$(count_pack_objects "$P1")
 check '[ ${#TIP_BEFORE} -eq 64 ]' "producer pushed tip is a 64-hex content hash"
@@ -77,7 +77,7 @@ check '[ "'"${PACKS_AFTER}"'" -gt "'"${PACKS_BEFORE}"'" ]' \
     "maintenance created local physical pack objects (${PACKS_BEFORE} -> ${PACKS_AFTER})"
 
 echo "--- Step 4: maintenance leaves content and remote tips unchanged ---"
-TIP_AFTER=$(pond status 2>/dev/null | awk '/last pushed:/ {print $NF}')
+TIP_AFTER=$(pond status 2>/dev/null | awk '/last pushed:/ {print $3}')
 ROOT_AFTER=$(pond fsck 2>/dev/null)
 check '[ "'"${TIP_AFTER}"'" = "'"${TIP_BEFORE}"'" ]' \
     "pushed content tip is unchanged by local pack maintenance"

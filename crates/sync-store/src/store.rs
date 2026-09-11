@@ -762,6 +762,38 @@ impl Store {
         Ok(out)
     }
 
+    /// Count physical rows in `(pond_id, partition)`, including superseded
+    /// versions and tombstones.
+    ///
+    /// This is intentionally different from [`Self::list`]: it exposes
+    /// append amplification for diagnostics and regression tests.
+    pub async fn partition_row_count(&self, pond_id: Uuid, partition: &str) -> Result<u64> {
+        let sql = format!(
+            "SELECT COUNT(*) AS row_count \
+             FROM {table} \
+             WHERE {pid} = '{pid_v}' AND {pk} = '{p}'",
+            table = TABLE_NAME,
+            pid = schema::col::POND_ID,
+            pid_v = pond_id,
+            pk = schema::col::PARTITION_KEY,
+            p = sql_escape(partition),
+        );
+        let batches = self.session_ctx.sql(&sql).await?.collect().await?;
+        let batch = batches
+            .first()
+            .ok_or_else(|| StoreError::Invariant("partition_row_count returned no batch".into()))?;
+        let counts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                StoreError::Invariant("partition_row_count: count is not Int64".into())
+            })?;
+        u64::try_from(counts.value(0)).map_err(|_| {
+            StoreError::Invariant("partition_row_count returned a negative count".into())
+        })
+    }
+
     /// Compute the per-partition content checksum using the supplied
     /// strategy.
     ///

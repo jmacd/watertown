@@ -45,9 +45,10 @@ pub struct CompactOutcome {
 /// Outcome of a pack-only physical maintenance sweep
 /// ([`Ship::collapse_versions`]).
 ///
-/// Every field describes *physical* pack state only: no Oplog append row,
-/// `watertown.series.v2` manifest, tree/commit root, Delta version, or txn sequence
-/// is ever touched by this operation (`docs/logical-series-identity-design.md`).
+/// User logical content is untouched: no user Oplog row,
+/// `watertown.series.v3` manifest, tree/commit root, or txn sequence changes.
+/// The trailing reserved-index reclaim may advance the data Delta maintenance
+/// version while deleting obsolete `.pond-node-index` pointers.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CollapseReport {
     /// Number of native v2 series (`FilePhysicalSeries`/`TablePhysicalSeries`)
@@ -76,9 +77,7 @@ pub struct CollapseReport {
     pub pack_objects_removed: usize,
     /// Bytes reclaimed by this run's pack-object GC sweep.
     pub pack_bytes_freed: u64,
-    /// What the reclamation pass that follows pack maintenance actually
-    /// freed (the pre-existing row/blob reclamation mechanism, unrelated
-    /// to pack-object GC above).
+    /// Superseded rows removed from the reserved `.pond-node-index`.
     pub reclaimed: crate::reclaim::ReclaimStats,
 }
 
@@ -775,11 +774,9 @@ impl Ship {
             self.last_write_seq = txn_seq;
         }
 
-        // Limiter usage queued by an earlier push rides out on this write
-        // (Decision L12).  Spending happens during the post-commit push, which
-        // cannot write the pond without recursing, so the samples wait in the
-        // control table for a write that was going to happen anyway.  Read
-        // transactions carry nothing.
+        // Limiter usage queued by earlier remote activity may ride out on this
+        // write, but the guard emits it only after the factory has produced
+        // another real data change. A no-op transaction leaves it queued.
         let pending_usage = if is_write {
             crate::limiter_usage::read_pending(&self.control_table).await
         } else {
@@ -796,19 +793,8 @@ impl Ship {
             &mut self.last_write_seq,
             &self.pond_path,
             write_lock,
+            pending_usage,
         );
-
-        if !pending_usage.is_empty() {
-            // The rows go through this transaction, so they are durable only
-            // if it commits -- which is also when the queue is drained.  A
-            // failure here is logged and dropped: refusing a user's write
-            // because a metric could not be recorded would trade a monitoring
-            // gap for an outage.
-            match crate::limiter_usage::emit(&guard, &pending_usage).await {
-                Ok(()) => guard.note_emitted_usage(pending_usage.len()),
-                Err(e) => log::warn!("limiter usage: failed to emit into the pond: {e}"),
-            }
-        }
 
         Ok(guard)
     }
@@ -901,6 +887,7 @@ impl Ship {
             &mut self.last_write_seq,
             self.pond_path.clone(),
             Some(write_lock),
+            Vec::new(),
         ))
     }
 
@@ -1014,14 +1001,13 @@ impl Ship {
         Ok(report)
     }
 
-    /// Report which series collapse would merge at `threshold`, and what
-    /// merging them would cost, without merging anything.
+    /// Legacy-named coarse survey of series whose live version count exceeds
+    /// `threshold`.
     ///
-    /// Runs only phase 1 of [`Ship::collapse_versions`] -- the same discovery,
-    /// under a read transaction that takes no control-table records and
-    /// consumes no sequence number -- so asking is free and leaves no trace.
-    /// Sharing the discovery is the point: a preview that computed candidacy
-    /// its own way could disagree with the collapse it claims to predict.
+    /// This does not imply that user rows are collapsible; native-v2 uses the
+    /// result only as the coarse input to pack-only physical maintenance.
+    /// Runs under a read transaction that takes no control-table records and
+    /// consumes no sequence number.
     ///
     /// # Errors
     /// Returns an error if the read transaction or the discovery query fails.
@@ -1094,9 +1080,10 @@ impl Ship {
     /// pack objects, published to this pond's own `data/_packs` namespace
     /// (`docs/logical-series-identity-design.md`).
     ///
-    /// **This never rewrites or deletes an Oplog append row, never changes
-    /// a `watertown.series.v2` manifest/tree/commit root, Delta version, or txn
-    /// sequence, and never changes logical metadata.** Every physical
+    /// **This never rewrites or deletes a user Oplog append row, never changes
+    /// a `watertown.series.v3` manifest/tree/commit root or txn sequence, and
+    /// never changes logical metadata.** Reserved-index reclamation may append
+    /// a Delta maintenance commit. Every physical
     /// object this publishes is durably written and content-addressed
     /// *before* the [`sync_store::content::PackIndex`] naming it is
     /// published, so a crash mid-repack can never expose an advertisement
@@ -1105,12 +1092,10 @@ impl Ship {
     /// already-bounded rather than repacked again (see
     /// [`CollapseReport::already_bounded`]).
     ///
-    /// Reclamation (the pre-existing row/blob sweep, [`Ship::reclaim`])
-    /// still runs unconditionally afterward, exactly as before: a pond can
-    /// carry debt from before reclamation existed, from a crash between
-    /// maintenance and reclaim, or from a blob staged by a transaction
-    /// that never committed, and reclamation is otherwise only reachable
-    /// through this method.
+    /// Reserved-index reclamation ([`Ship::reclaim`]) runs afterward so the
+    /// internal fixed-size manifest-root pointer does not accumulate obsolete
+    /// collapsed rows. User series and `_large_files` are not rewritten or
+    /// swept.
     ///
     /// # Errors
     /// Returns an error if discovery fails, if a series' recomputed leaf
@@ -1151,27 +1136,20 @@ impl Ship {
             reclaimed: crate::reclaim::ReclaimStats::default(),
         };
 
-        // Reclaim unconditionally, whether or not any series needed
-        // repacking: a pond can carry debt from before reclamation
-        // existed, from a crash between maintenance and reclaim, or from a
-        // blob staged by a transaction that never committed. Reclamation
-        // is otherwise only reachable through this method, so gating it
-        // behind pack maintenance finding work would make it permanently
-        // unreachable for an already fully-bounded pond -- exactly the
-        // ponds least in need of further pack work but still eligible for
-        // reclamation.
+        // The reserved manifest index collapses its prior pointer on every
+        // content commit. Delete those excluded, obsolete rows regardless of
+        // whether a user series needed repacking.
         report.reclaimed = self.reclaim(&meta).await?;
 
         Ok(report)
     }
 
-    /// Delete rows no reader can see and sweep the blobs they held down.
+    /// Delete superseded rows of the reserved `.pond-node-index`.
     ///
-    /// Content-preserving and therefore invisible to replication: steward's
-    /// content fold already prunes superseded rows, so `root_tree_hash` is
-    /// unchanged and mirrors -- which never received them -- stay converged.
-    /// `reclaim_superseded` asserts that rather than assuming it, and skips the
-    /// irreversible blob sweep if it does not hold.
+    /// Native-v2 user series are append-only and are never considered here.
+    /// The index node is excluded from every content fold, so deleting its old
+    /// pointers is invisible to replication and requires no `_large_files`
+    /// inventory or sweep.
     ///
     /// Consuming no sequence of its own is what makes reclamation a tail of the
     /// collapse rather than a transaction: it introduces no new logical
@@ -1192,16 +1170,11 @@ impl Ship {
         let mut txn_meta = PondTxnMetadata::new(self.last_write_seq, meta.clone());
         txn_meta.pond_id = pond_id.to_string();
 
-        // The sweep deletes every blob no committed row names, which it cannot
-        // distinguish from a blob a concurrent writer has staged but not yet
-        // committed.  Exclusion is the guarantee that makes it safe.
         let _write_lock =
             crate::write_lock::WriteLockGuard::try_acquire_for_write(&control_dir, &txn_meta)?;
 
-        let (new_table, stats) = crate::reclaim::reclaim_superseded(
+        let (new_table, stats) = crate::reclaim::reclaim_internal_index_rows(
             self.data_persistence.table().clone(),
-            &get_data_path(&self.pond_path),
-            &pond_id.to_string(),
             txn_meta.to_delta_maintenance_metadata(),
         )
         .await?;
@@ -2407,7 +2380,7 @@ mod tests {
         // node-manifest index node is created on the first write, updated as a
         // single collapsed live version thereafter, carries the full node
         // manifest, is excluded from the fold, and is hidden from listings.
-        use sync_store::content::decode_manifest;
+        use sync_store::content::decode_manifest_root;
 
         const INDEX_NAME: &str = ".pond-node-index";
 
@@ -2464,8 +2437,18 @@ mod tests {
         assert!(names.iter().any(|n| n == "b"));
         _ = tx.commit().await.expect("commit read");
 
-        // The manifest carries every real node exactly once, and never itself.
-        let manifest = decode_manifest(&index_bytes).expect("decode manifest");
+        // The index node is now a fixed-size pointer to the persistent
+        // identity map; full materialization is explicit diagnostic work.
+        let manifest_root = decode_manifest_root(&index_bytes).expect("decode manifest root");
+        let materialized = crate::content_tree::materialize_content_objects(&ship)
+            .await
+            .expect("materialize manifest records");
+        assert_eq!(materialized.manifest_root, Some(manifest_root));
+        let manifest = materialized
+            .manifest_records
+            .iter()
+            .map(|record| &record.entry)
+            .collect::<Vec<_>>();
         assert!(
             !manifest
                 .iter()
@@ -2511,7 +2494,7 @@ mod tests {
     /// once a series exceeds the requested threshold's physical object
     /// count, it is repacked into a bounded physical pack published under
     /// this pond's own `data/_packs`, while every Oplog row, the series'
-    /// `watertown.series.v2` manifest, and the Delta write sequence are left
+    /// `watertown.series.v3` manifest, and the Delta write sequence are left
     /// completely untouched. A threshold nobody exceeds still no-ops
     /// cleanly, and repeated maintenance settles (idempotent).
     #[tokio::test]
@@ -2654,21 +2637,11 @@ mod tests {
         );
     }
 
-    /// The lower-level `collapse_file_series` helper
-    /// (`tlogfs::persistence::State::collapse_file_series`) is unsupported
-    /// for logical-series-v2 (a merged row cannot carry a single persisted
-    /// logical leaf hash for the versions it would absorb -- BLOCKER 3):
-    /// called directly it must reject rather than merge, content and version
-    /// count must stay untouched, and the series must remain fully usable
-    /// afterward (further ordinary appends still work).
-    ///
-    /// The real, supported way to collapse history for a logical-series-v2
-    /// node is `WD::async_writer_path_collapsing_with_type`, used by
-    /// content-pull replication to mirror a source pond's collapse: it is
-    /// exercised here too, proving a genuine merged-history write still
-    /// round-trips byte-identical content through the normal read path.
+    /// Both the low-level row merger and the public path writer reject user
+    /// logical-series collapse. Native-v2 series remain append-only and usable
+    /// after either rejected attempt.
     #[tokio::test]
-    async fn test_collapse_file_series_low_level_is_rejected_and_pull_mirror_collapse_works() {
+    async fn test_user_series_collapse_surfaces_are_rejected() {
         use tinyfs::ResultExt;
         use tokio::io::AsyncWriteExt;
 
@@ -2748,60 +2721,41 @@ mod tests {
         );
         _ = tx.commit().await.expect("commit read");
 
-        // The supported replacement: a pull-mirror collapsing write
-        // (`async_writer_path_collapsing_with_type`) supersedes every earlier
-        // version with one fresh baseline. Verify it round-trips correctly
-        // and that the series stays discoverable/appendable afterward.
-        let meta = PondUserMetadata::new(vec!["pull-mirror-collapse".to_string()]);
-        let cumulative_for_write = cumulative.clone();
-        ship.write_transaction(&meta, async move |fs| {
-            let root = fs.root().await?;
-            let mut writer = root
-                .async_writer_path_collapsing_with_type(
-                    file_path,
-                    tinyfs::EntryType::FilePhysicalSeries,
-                )
-                .await?;
-            writer.write_all(&cumulative_for_write).await.map_other()?;
-            writer.shutdown().await.map_other()?;
-            Ok(())
-        })
-        .await
-        .expect("pull-mirror collapsing write");
+        // The public path API is also retired for user series. It must fail
+        // before opening a writer or queuing a row.
+        let meta = PondUserMetadata::new(vec!["retired-public-collapse".to_string()]);
+        let error = ship
+            .write_transaction(&meta, async move |fs| {
+                let root = fs.root().await?;
+                let _ = root
+                    .async_writer_path_collapsing_with_type(
+                        file_path,
+                        tinyfs::EntryType::FilePhysicalSeries,
+                    )
+                    .await?;
+                Ok(())
+            })
+            .await
+            .expect_err("public user-series collapsing writer must reject");
+        assert!(
+            error.to_string().contains("append-only"),
+            "rejection must explain the native-v2 invariant: {error}"
+        );
 
-        let meta = PondUserMetadata::new(vec!["read-after-mirror".to_string()]);
+        // Neither rejected path changed the four live appends.
+        let meta = PondUserMetadata::new(vec!["read-after-rejections".to_string()]);
         let tx = ship.begin_read(&meta).await.expect("begin read");
         let root = tx.root().await.expect("root");
-        let content = root
-            .read_file_path_to_vec(file_path)
-            .await
-            .expect("read pull-mirrored content");
         assert_eq!(
-            content, cumulative,
-            "pull-mirror collapsing write preserves byte-identical content"
-        );
-        _ = tx.commit().await.expect("commit read");
-
-        // The merged version now supersedes every prior version, so only one
-        // live version remains and the series is no longer a collapse
-        // candidate at threshold 1.
-        let meta = PondUserMetadata::new(vec!["read-candidates".to_string()]);
-        let tx = ship.begin_read(&meta).await.expect("begin read");
-        let candidates = {
-            let state = tx.state().expect("state");
-            state
-                .list_collapsible_series(1)
+            root.read_file_path_to_vec(file_path)
                 .await
-                .expect("list collapsible series")
-        };
-        _ = tx.commit().await.expect("commit read");
-        assert!(
-            candidates.is_empty(),
-            "a single merged live version must not itself be a collapse candidate"
+                .expect("read after rejections"),
+            cumulative
         );
+        _ = tx.commit().await.expect("commit read");
 
-        // The series remains normally appendable after a pull-mirror collapse.
-        let meta = PondUserMetadata::new(vec!["append-after-mirror".to_string()]);
+        // The series remains normally appendable after both rejections.
+        let meta = PondUserMetadata::new(vec!["append-after-rejection".to_string()]);
         ship.write_transaction(&meta, async move |fs| {
             let root = fs.root().await?;
             let mut writer = root
@@ -2812,7 +2766,7 @@ mod tests {
             Ok(())
         })
         .await
-        .expect("append after pull-mirror collapse");
+        .expect("append after rejected collapse");
 
         let meta = PondUserMetadata::new(vec!["read-final".to_string()]);
         let tx = ship.begin_read(&meta).await.expect("begin read");
@@ -2825,7 +2779,7 @@ mod tests {
         expected.extend_from_slice(b"dave,4\n");
         assert_eq!(
             content, expected,
-            "an ordinary append after a pull-mirror collapse is fully live"
+            "an ordinary append after a rejected collapse is fully live"
         );
         _ = tx.commit().await.expect("commit read");
     }

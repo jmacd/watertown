@@ -3,39 +3,34 @@
 //! Shared key layout for the pack-advertisement namespace
 //! (`docs/logical-series-identity-design.md` delivery gate 3).
 //!
-//! A pack index is derived storage metadata excluded from the logical
-//! content tree, so it cannot be discovered through the commit/tree object
-//! closure the way an inline object or a `_blobs/blob=<hash>` physical blob
-//! can. Every backend instead advertises pack indexes under one namespace,
-//! keyed first by the `watertown.series.v2` series hash and then by the pack's own
-//! content address:
+//! A pack index is derived storage metadata excluded from the logical content
+//! tree. This module defines the local pond sidecar used by explicit pack
+//! maintenance, keyed first by the `watertown.series.v3` series hash and then
+//! by the pack's own content address:
 //!
 //! ```text
-//! _packs/v3/series=<64-hex series_hash>/pack=<64-hex pack_hash>
+//! _packs/v4/series=<64-hex series_hash>/pack=<64-hex pack_hash>
 //! ```
 //!
-//! This module holds only the pure string formatting/parsing for that
-//! layout -- no I/O -- so [`crate::content_remote::ContentRemote`] (an
-//! `object_store` backend) and a `pond://` local source (a plain
-//! filesystem) can each resolve the *same* relative path components against
-//! their own root and agree on discovery byte-for-byte. Both directions are
-//! strict: a name that does not parse back to exactly the value it was
-//! built from is rejected rather than guessed at, since every segment here
-//! is untrusted the moment it comes from a listing.
+//! Native remotes instead store content-addressed packs beneath
+//! `_content/v2/packs` and use fixed-key series locators; ordinary remote
+//! publication and fetch never list this sidecar namespace. Formatting and
+//! parsing here remain strict because explicit local maintenance and audit do
+//! enumerate these untrusted directory entries.
 
 use crate::content::ObjectHash;
 
 /// Stable root holding shared immutable pack objects and versioned indexes.
 pub const PACKS_ROOT: &str = "_packs";
 
-/// Version-isolated root holding v3 pack advertisements.
+/// Version-isolated root holding v4 pack advertisements.
 ///
 /// Readers and writers intentionally do not inspect advertisements directly
 /// under the former `_packs/series=...` layout, so a v2 sidecar cannot be
 /// mistaken for a v3 index. Physical objects remain shared under
 /// `_packs/objects` because their content hashes and deterministic bytes are
 /// independent of the index codec version.
-pub const PACK_INDEX_ROOT: &str = "_packs/v3";
+pub const PACK_INDEX_ROOT: &str = "_packs/v4";
 
 /// The directory name for one series' pack advertisements: `series=<hex>`.
 #[must_use]
@@ -207,7 +202,7 @@ mod tests {
     #[test]
     fn pack_namespace_is_version_isolated() {
         assert_eq!(PACKS_ROOT, "_packs");
-        assert_eq!(PACK_INDEX_ROOT, "_packs/v3");
+        assert_eq!(PACK_INDEX_ROOT, "_packs/v4");
     }
 
     #[test]

@@ -205,8 +205,9 @@ impl Steward {
         }
     }
 
-    /// Report which series collapse would merge at `threshold`, and what
-    /// merging them would cost, without merging anything.
+    /// Legacy-named coarse survey of series whose live version count exceeds
+    /// `threshold`. Native-v2 uses it only for pack-maintenance candidacy; it
+    /// does not advertise user-row collapse.
     ///
     /// Returns an empty survey for Host stewards, which hold no series.
     ///

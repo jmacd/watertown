@@ -8,7 +8,10 @@ use std::sync::Arc;
 
 use arrow_array::{RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use steward::{Ship, build_recovery_capsule, import_capsule};
+use steward::{
+    CapsuleImportLimits, CapsuleImportProvenance, Ship, activate_capsule_import,
+    build_recovery_capsule, import_capsule, import_capsule_with_limits,
+};
 use sync_store::{CapsuleManifest, CapsuleNode, ContentRemote};
 use tempfile::tempdir;
 use tinyfs::EntryType;
@@ -177,6 +180,42 @@ async fn build_source_capsule(
 
     (remote_path, ship, capsule.manifest)
 }
+
+fn published_capsule_root(capsule_dir: &std::path::Path) -> sync_store::content::ObjectHash {
+    let root = std::fs::read_to_string(capsule_dir.join("recovery/refs/latest"))
+        .expect("read capsule latest ref");
+    sync_store::content::ObjectHash::from_hex(root.trim()).expect("parse capsule root")
+}
+
+async fn construct_unjournaled_staging(
+    path: &std::path::Path,
+    birthplace: &str,
+    manifest: &CapsuleManifest,
+    capsule_root: sync_store::content::ObjectHash,
+) {
+    let mut ship = Ship::create_pond(path, birthplace)
+        .await
+        .expect("construct initialized staging pond");
+    ship.control_table_mut()
+        .set_setting("post_commit_dispatch", "suppressed")
+        .await
+        .expect("suppress staged pond");
+    drop(ship);
+    let provenance = CapsuleImportProvenance {
+        format: "pondcapsule.4-import-provenance.1".to_string(),
+        source_pond_id: manifest.source.pond_id.clone(),
+        source_birthplace: manifest.source.birthplace.clone(),
+        source_tip: manifest.source.source_tip.to_hex(),
+        capsule_root: capsule_root.to_hex(),
+        importer_version: env!("CARGO_PKG_VERSION").to_string(),
+        imported_at_micros: 0,
+    };
+    std::fs::write(
+        path.join("CAPSULE_IMPORT_PROVENANCE.json"),
+        serde_json::to_vec_pretty(&provenance).unwrap(),
+    )
+    .expect("write constructed provenance");
+}
 #[tokio::test]
 async fn imports_every_node_kind_and_verifies_the_logical_contract() {
     let temporary = tempdir().expect("tempdir");
@@ -225,11 +264,12 @@ async fn imports_every_node_kind_and_verifies_the_logical_contract() {
     assert_eq!(report.physical, 3, "plain file, file series, table series");
     assert_eq!(report.symlinks, 1);
     assert_eq!(report.dynamic, 1);
+    assert!(report.batches >= 1);
     assert_ne!(report.target_pond_id, report.source_pond_id);
 
     let provenance_bytes =
         std::fs::read(target.join("CAPSULE_IMPORT_PROVENANCE.json")).expect("read provenance file");
-    let provenance: steward::CapsuleImportProvenance =
+    let provenance: CapsuleImportProvenance =
         serde_json::from_slice(&provenance_bytes).expect("decode provenance");
     assert_eq!(provenance.source_pond_id, report.source_pond_id);
     assert_eq!(provenance.capsule_root, report.capsule_root.to_hex());
@@ -333,6 +373,700 @@ async fn imports_every_node_kind_and_verifies_the_logical_contract() {
         panic!("both entries must be symlinks");
     };
     assert_eq!(source_target, rebuilt_target);
+}
+
+#[tokio::test]
+async fn resumes_multi_batch_import_without_duplicate_series_leaves() {
+    let temporary = tempdir().expect("tempdir");
+    let (capsule_dir, _source_ship, source_manifest) = build_source_capsule(temporary.path()).await;
+    let target = temporary.path().join("restored");
+    let limits = CapsuleImportLimits {
+        max_units: 1,
+        max_logical_count: 1,
+    };
+
+    let stopped = import_capsule_with_limits(
+        &capsule_dir,
+        &target,
+        "capsule-import-test-target",
+        limits,
+        Some(5),
+    )
+    .await
+    .expect("partial import");
+    assert!(stopped.is_none());
+    assert!(!target.exists());
+    let staging = std::fs::read_dir(temporary.path())
+        .expect("read staging parent")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().contains(".restored.capsule-import-"))
+        })
+        .expect("resumable staging directory");
+    assert!(
+        std::fs::read_dir(&staging)
+            .expect("read staging")
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("CAPSULE_IMPORT_JOURNAL."))
+    );
+    std::fs::write(
+        staging.join(".CAPSULE_IMPORT_CHECKPOINT_STAGING.interrupted"),
+        b"{\"truncated\":",
+    )
+    .expect("construct interrupted staging checkpoint");
+
+    let report = import_capsule_with_limits(
+        &capsule_dir,
+        &target,
+        "capsule-import-test-target",
+        limits,
+        None,
+    )
+    .await
+    .expect("resume import")
+    .expect("completed report");
+    assert!(report.batches > 5, "test must force several transactions");
+    assert!(
+        !target
+            .join(".CAPSULE_IMPORT_CHECKPOINT_STAGING.interrupted")
+            .exists(),
+        "resume must ignore and clean an unpublished staging checkpoint"
+    );
+
+    let restored = Ship::open_pond(&target).await.expect("open restored pond");
+    let rebuilt = build_recovery_capsule(&restored)
+        .await
+        .expect("rebuild restored capsule");
+    assert_logical_projection(&source_manifest, &rebuilt.manifest);
+    let file_leaves = match &rebuilt
+        .manifest
+        .entries
+        .iter()
+        .find(|entry| entry.path == "/data/log.series")
+        .expect("file series")
+        .node
+    {
+        CapsuleNode::Physical { leaves, .. } => leaves,
+        other => panic!("unexpected node: {other:?}"),
+    };
+    assert_eq!(file_leaves.len(), 2);
+    let table_leaves = match &rebuilt
+        .manifest
+        .entries
+        .iter()
+        .find(|entry| entry.path == "/data/table.series")
+        .expect("table series")
+        .node
+    {
+        CapsuleNode::Physical { leaves, .. } => leaves,
+        other => panic!("unexpected node: {other:?}"),
+    };
+    assert_eq!(table_leaves.len(), 3);
+}
+
+#[tokio::test]
+async fn foreign_deterministic_staging_without_journal_is_rejected() {
+    let temporary = tempdir().expect("tempdir");
+    let (capsule_dir, _source_ship, source_manifest) = build_source_capsule(temporary.path()).await;
+    let target = temporary.path().join("restored");
+    let capsule_root = published_capsule_root(&capsule_dir);
+    let staging = temporary.path().join(format!(
+        ".restored.capsule-import-{}",
+        capsule_root.to_hex()
+    ));
+    construct_unjournaled_staging(
+        &staging,
+        "capsule-import-test-target",
+        &source_manifest,
+        capsule_root,
+    )
+    .await;
+
+    let error = import_capsule(&capsule_dir, &target, "capsule-import-test-target")
+        .await
+        .expect_err("unjournaled matching-name pond must not be adopted");
+    assert!(error.to_string().contains("durable journal"));
+    assert!(!target.exists());
+    assert!(staging.exists());
+}
+
+#[tokio::test]
+async fn retry_publishes_unjournaled_unique_initialization_directory() {
+    let temporary = tempdir().expect("tempdir");
+    let (capsule_dir, _source_ship, _source_manifest) =
+        build_source_capsule(temporary.path()).await;
+    let target = temporary.path().join("restored");
+    let capsule_root = published_capsule_root(&capsule_dir);
+    let token = "constructed";
+    let intent = temporary.path().join(format!(
+        ".restored.capsule-init-{}-{token}.json",
+        capsule_root.to_hex()
+    ));
+    std::fs::write(
+        &intent,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "format": "pondcapsule.4-import-init.1",
+            "token": token,
+            "capsule_root": capsule_root.to_hex(),
+            "target": target.to_str().unwrap(),
+            "birthplace": "capsule-import-test-target",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let container = temporary.path().join(format!(
+        ".restored.capsule-init-{}-{token}.work",
+        capsule_root.to_hex()
+    ));
+    std::fs::create_dir(&container).unwrap();
+    let initialization = container.join("pond");
+    let _ = Ship::create_pond(&initialization, "capsule-import-test-target")
+        .await
+        .expect("construct interrupted initialization before metadata");
+
+    let report = import_capsule(&capsule_dir, &target, "capsule-import-test-target")
+        .await
+        .expect("ordinary retry recovers unpublished initialization directory");
+    assert_eq!(report.capsule_root, capsule_root);
+    assert!(target.exists());
+    assert!(!intent.exists());
+    assert!(!container.exists());
+    assert!(!initialization.exists());
+}
+
+#[tokio::test]
+async fn retry_recreates_importer_owned_partial_initialization_pond() {
+    let temporary = tempdir().expect("tempdir");
+    let (capsule_dir, _source_ship, _source_manifest) =
+        build_source_capsule(temporary.path()).await;
+    let target = temporary.path().join("restored");
+    let capsule_root = published_capsule_root(&capsule_dir);
+    let token = "partial";
+    let intent = temporary.path().join(format!(
+        ".restored.capsule-init-{}-{token}.json",
+        capsule_root.to_hex()
+    ));
+    std::fs::write(
+        &intent,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "format": "pondcapsule.4-import-init.1",
+            "token": token,
+            "capsule_root": capsule_root.to_hex(),
+            "target": target.to_str().unwrap(),
+            "birthplace": "capsule-import-test-target",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let container = temporary.path().join(format!(
+        ".restored.capsule-init-{}-{token}.work",
+        capsule_root.to_hex()
+    ));
+    std::fs::create_dir(&container).unwrap();
+    let partial = container.join("pond");
+    std::fs::create_dir(&partial).unwrap();
+    std::fs::write(partial.join("partial"), b"incomplete").unwrap();
+
+    let report = import_capsule(&capsule_dir, &target, "capsule-import-test-target")
+        .await
+        .expect("owned partial pond is safely recreated");
+    assert_eq!(report.capsule_root, capsule_root);
+    assert!(target.exists());
+    assert!(!intent.exists());
+    assert!(!container.exists());
+}
+
+#[tokio::test]
+async fn foreign_initialization_container_without_intent_is_rejected() {
+    let temporary = tempdir().expect("tempdir");
+    let (capsule_dir, _source_ship, _source_manifest) =
+        build_source_capsule(temporary.path()).await;
+    let target = temporary.path().join("restored");
+    let capsule_root = published_capsule_root(&capsule_dir);
+    let foreign = temporary.path().join(format!(
+        ".restored.capsule-init-{}-foreign.work",
+        capsule_root.to_hex()
+    ));
+    std::fs::create_dir(&foreign).unwrap();
+    std::fs::write(foreign.join("keep"), b"foreign").unwrap();
+
+    let error = import_capsule(&capsule_dir, &target, "capsule-import-test-target")
+        .await
+        .expect_err("unowned matching container must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("no matching importer ownership intent")
+    );
+    assert_eq!(std::fs::read(foreign.join("keep")).unwrap(), b"foreign");
+    assert!(!target.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn initialization_symlink_is_rejected_without_following_it() {
+    use std::os::unix::fs::symlink;
+
+    let temporary = tempdir().expect("tempdir");
+    let (capsule_dir, _source_ship, _source_manifest) =
+        build_source_capsule(temporary.path()).await;
+    let target = temporary.path().join("restored");
+    let capsule_root = published_capsule_root(&capsule_dir);
+    let token = "symlink";
+    let intent = temporary.path().join(format!(
+        ".restored.capsule-init-{}-{token}.json",
+        capsule_root.to_hex()
+    ));
+    std::fs::write(
+        &intent,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "format": "pondcapsule.4-import-init.1",
+            "token": token,
+            "capsule_root": capsule_root.to_hex(),
+            "target": target.to_str().unwrap(),
+            "birthplace": "capsule-import-test-target",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let outside = temporary.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("keep"), b"outside").unwrap();
+    let container = temporary.path().join(format!(
+        ".restored.capsule-init-{}-{token}.work",
+        capsule_root.to_hex()
+    ));
+    symlink(&outside, &container).unwrap();
+
+    let error = import_capsule(&capsule_dir, &target, "capsule-import-test-target")
+        .await
+        .expect_err("initialization symlink must be rejected");
+    assert!(error.to_string().contains("not a regular directory"));
+    assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"outside");
+    assert!(!target.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn non_utf8_target_is_rejected_before_creating_import_artifacts() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let temporary = tempdir().expect("tempdir");
+    let (capsule_dir, _source_ship, _source_manifest) =
+        build_source_capsule(temporary.path()).await;
+    let target = temporary
+        .path()
+        .join(OsString::from_vec(b"restored-\xff".to_vec()));
+    let before = std::fs::read_dir(temporary.path()).unwrap().count();
+
+    let error = import_capsule(&capsule_dir, &target, "capsule-import-test-target")
+        .await
+        .expect_err("non-UTF-8 target must be rejected");
+    assert!(error.to_string().contains("not valid UTF-8"));
+    assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), before);
+    assert!(target.symlink_metadata().is_err());
+}
+
+#[tokio::test]
+async fn table_payload_footer_opens_are_linear_across_import_and_resume() {
+    const LEAVES: usize = 24;
+    let temporary = tempdir().expect("tempdir");
+    let mut source = Ship::create_pond(temporary.path().join("source"), "table-linear")
+        .await
+        .expect("create source");
+    for index in 0..LEAVES {
+        let batch = table_batch(index as i64, &format!("value-{index}"), None);
+        source
+            .write_transaction(&meta("table-leaf"), async move |transaction| {
+                let root = transaction.root().await?;
+                let _ = root
+                    .write_series_from_batch("/table.series", &batch, Some("timestamp"))
+                    .await?;
+                Ok(())
+            })
+            .await
+            .expect("append table leaf");
+    }
+    let capsule = build_recovery_capsule(&source)
+        .await
+        .expect("build capsule");
+    let table = capsule
+        .manifest
+        .entries
+        .iter()
+        .find(|entry| entry.path == "/table.series")
+        .expect("table entry");
+    let CapsuleNode::Physical {
+        objects, leaves, ..
+    } = &table.node
+    else {
+        panic!("table entry must be physical")
+    };
+    assert_eq!(leaves.len(), LEAVES);
+    assert!(
+        objects.len() >= LEAVES / 2,
+        "test requires many physical objects, got {}",
+        objects.len()
+    );
+    let remote_path = temporary.path().join("remote");
+    let pond_id = uuid::Uuid::parse_str(source.data_persistence().pond_id()).unwrap();
+    let remote = ContentRemote::create_at(&remote_path, pond_id)
+        .await
+        .expect("create capsule remote");
+    let _ = remote
+        .publish_capsule_directory(&capsule.manifest, capsule.payloads.objects_dir())
+        .await
+        .expect("publish capsule");
+
+    let fresh_target = temporary.path().join("restored-fresh");
+    let fresh = import_capsule(&remote_path, &fresh_target, "table-linear-fresh")
+        .await
+        .expect("fresh import");
+    assert!(
+        fresh.table_payload_opens <= objects.len() * 2,
+        "fresh import used {} opens for {} objects",
+        fresh.table_payload_opens,
+        objects.len()
+    );
+    assert!(
+        fresh.table_object_range_checks <= LEAVES * 2,
+        "{} range checks for {LEAVES} leaves indicates prefix rescanning",
+        fresh.table_object_range_checks
+    );
+
+    let target = temporary.path().join("restored");
+    let limits = CapsuleImportLimits {
+        max_units: 1,
+        max_logical_count: 1,
+    };
+    let stopped = import_capsule_with_limits(
+        &remote_path,
+        &target,
+        "table-linear-target",
+        limits,
+        Some(3),
+    )
+    .await
+    .expect("partial import");
+    assert!(stopped.is_none());
+    let report =
+        import_capsule_with_limits(&remote_path, &target, "table-linear-target", limits, None)
+            .await
+            .expect("resume import")
+            .expect("complete import");
+    assert!(
+        report.table_payload_opens <= objects.len() * 2,
+        "{} opens for {} objects indicates prefix rescanning",
+        report.table_payload_opens,
+        objects.len()
+    );
+    assert!(
+        report.table_payload_opens >= objects.len(),
+        "resume rebuilds one O(objects) metadata index"
+    );
+    assert!(
+        report.table_object_range_checks <= LEAVES * 2,
+        "{} range checks for {LEAVES} leaves indicates prefix rescanning",
+        report.table_object_range_checks
+    );
+}
+
+#[tokio::test]
+async fn file_payload_range_work_is_linear_across_import_and_resume() {
+    const LEAVES: usize = 32;
+    let temporary = tempdir().expect("tempdir");
+    let mut source = Ship::create_pond(temporary.path().join("source"), "file-linear")
+        .await
+        .expect("create source");
+    for index in 0..LEAVES {
+        let bytes = format!("file-leaf-{index:04}-payload").into_bytes();
+        source
+            .write_transaction(&meta("file-leaf"), async move |transaction| {
+                let root = transaction.root().await?;
+                let mut writer = root
+                    .async_writer_path_with_type("/file.series", EntryType::FilePhysicalSeries)
+                    .await?;
+                writer.write_all(&bytes).await?;
+                writer.shutdown().await?;
+                Ok(())
+            })
+            .await
+            .expect("append file leaf");
+    }
+    let capsule = build_recovery_capsule(&source)
+        .await
+        .expect("build capsule");
+    let file = capsule
+        .manifest
+        .entries
+        .iter()
+        .find(|entry| entry.path == "/file.series")
+        .expect("file entry");
+    let CapsuleNode::Physical {
+        objects, leaves, ..
+    } = &file.node
+    else {
+        panic!("file entry must be physical")
+    };
+    assert_eq!(leaves.len(), LEAVES);
+    assert!(
+        objects.len() >= LEAVES / 2,
+        "test requires many physical objects, got {}",
+        objects.len()
+    );
+    let remote_path = temporary.path().join("remote");
+    let pond_id = uuid::Uuid::parse_str(source.data_persistence().pond_id()).unwrap();
+    let remote = ContentRemote::create_at(&remote_path, pond_id)
+        .await
+        .expect("create capsule remote");
+    let _ = remote
+        .publish_capsule_directory(&capsule.manifest, capsule.payloads.objects_dir())
+        .await
+        .expect("publish capsule");
+
+    let fresh_target = temporary.path().join("restored-fresh");
+    let fresh = import_capsule(&remote_path, &fresh_target, "file-linear-fresh")
+        .await
+        .expect("fresh import");
+    assert!(
+        fresh.file_payload_opens <= objects.len() * 2,
+        "fresh import used {} opens for {} objects",
+        fresh.file_payload_opens,
+        objects.len()
+    );
+    assert!(
+        fresh.file_object_range_checks <= LEAVES * 2,
+        "{} range checks for {LEAVES} leaves indicates prefix rescanning",
+        fresh.file_object_range_checks
+    );
+
+    let target = temporary.path().join("restored");
+    let limits = CapsuleImportLimits {
+        max_units: 1,
+        max_logical_count: 1,
+    };
+    let stopped =
+        import_capsule_with_limits(&remote_path, &target, "file-linear-target", limits, Some(5))
+            .await
+            .expect("partial import");
+    assert!(stopped.is_none());
+    let report =
+        import_capsule_with_limits(&remote_path, &target, "file-linear-target", limits, None)
+            .await
+            .expect("resume import")
+            .expect("complete import");
+    assert!(
+        report.file_payload_opens <= objects.len() * 2,
+        "{} opens for {} objects indicates prefix rescanning",
+        report.file_payload_opens,
+        objects.len()
+    );
+    assert!(
+        report.file_object_range_checks <= LEAVES * 2,
+        "{} range checks for {LEAVES} leaves indicates prefix rescanning",
+        report.file_object_range_checks
+    );
+}
+
+#[tokio::test]
+async fn resume_rejects_conflicting_capsule_or_parameters() {
+    let temporary = tempdir().expect("tempdir");
+    let (capsule_dir, _source_ship, _) = build_source_capsule(temporary.path()).await;
+    let target = temporary.path().join("restored");
+    let limits = CapsuleImportLimits {
+        max_units: 1,
+        max_logical_count: 1,
+    };
+    let _ = import_capsule_with_limits(
+        &capsule_dir,
+        &target,
+        "capsule-import-test-target",
+        limits,
+        Some(1),
+    )
+    .await
+    .expect("partial import");
+
+    let error =
+        import_capsule_with_limits(&capsule_dir, &target, "different-birthplace", limits, None)
+            .await
+            .expect_err("conflicting birthplace must fail");
+    assert!(error.to_string().contains("resume parameters conflict"));
+
+    let other_capsule_parent = temporary.path().join("other");
+    std::fs::create_dir(&other_capsule_parent).expect("other source parent");
+    let (other_capsule, _other_ship, _) = build_source_capsule(&other_capsule_parent).await;
+    let error = import_capsule_with_limits(
+        &other_capsule,
+        &target,
+        "capsule-import-test-target",
+        limits,
+        None,
+    )
+    .await
+    .expect_err("conflicting capsule must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("conflicting capsule import staging")
+    );
+}
+
+#[tokio::test]
+async fn resume_does_not_skip_a_corrupt_final_checkpoint() {
+    let temporary = tempdir().expect("tempdir");
+    let (capsule_dir, _source_ship, _) = build_source_capsule(temporary.path()).await;
+    let target = temporary.path().join("restored");
+    let limits = CapsuleImportLimits {
+        max_units: 1,
+        max_logical_count: 1,
+    };
+    let _ = import_capsule_with_limits(
+        &capsule_dir,
+        &target,
+        "capsule-import-test-target",
+        limits,
+        Some(1),
+    )
+    .await
+    .expect("partial import");
+    let staging = std::fs::read_dir(temporary.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().contains(".restored.capsule-import-"))
+        })
+        .expect("staging directory");
+    std::fs::write(
+        staging.join("CAPSULE_IMPORT_JOURNAL.99999999999999999999.json"),
+        b"{\"truncated\":",
+    )
+    .expect("write corrupt final checkpoint");
+
+    let error = import_capsule_with_limits(
+        &capsule_dir,
+        &target,
+        "capsule-import-test-target",
+        limits,
+        None,
+    )
+    .await
+    .expect_err("corrupt highest final checkpoint must fail");
+    assert!(
+        error.to_string().contains("decode durable journal"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn activation_refuses_invalid_run_config_and_keeps_pond_inert() {
+    let temporary = tempdir().expect("tempdir");
+    let (capsule_dir, _source_ship, _) = build_source_capsule(temporary.path()).await;
+    let target = temporary.path().join("restored");
+    let _ = import_capsule(&capsule_dir, &target, "capsule-import-test-target")
+        .await
+        .expect("import capsule");
+
+    let error = activate_capsule_import(&target)
+        .await
+        .expect_err("unknown restored factory must be refused");
+    assert!(error.to_string().contains("no-such-factory-is-registered"));
+    let restored = Ship::open_pond(&target)
+        .await
+        .expect("reopen restored pond");
+    assert!(restored.control_table().post_commit_dispatch_suppressed());
+}
+
+#[tokio::test]
+async fn activation_refuses_invalid_remote_config_and_keeps_pond_inert() {
+    let temporary = tempdir().expect("tempdir");
+    let mut source = Ship::create_pond(temporary.path().join("source"), "source")
+        .await
+        .expect("create source");
+    source
+        .write_transaction(&meta("bad-remote"), async move |transaction| {
+            let root = transaction.root().await?;
+            let _ = root.create_dir_all("/sys/remotes").await?;
+            let _ = create_file_path(&root, "/sys/remotes/bad", b"url: '[not a url'\n").await?;
+            Ok(())
+        })
+        .await
+        .expect("write invalid remote");
+    let capsule = build_recovery_capsule(&source)
+        .await
+        .expect("build capsule");
+    let remote_path = temporary.path().join("remote");
+    let pond_id = uuid::Uuid::parse_str(source.data_persistence().pond_id()).expect("pond id");
+    let remote = ContentRemote::create_at(&remote_path, pond_id)
+        .await
+        .expect("create capsule remote");
+    let _ = remote
+        .publish_capsule_directory(&capsule.manifest, capsule.payloads.objects_dir())
+        .await
+        .expect("publish capsule");
+    let target = temporary.path().join("restored");
+    let _ = import_capsule(&remote_path, &target, "target")
+        .await
+        .expect("import capsule");
+
+    let error = activate_capsule_import(&target)
+        .await
+        .expect_err("invalid remote YAML must be refused");
+    assert!(error.to_string().contains("remote"));
+    let restored = Ship::open_pond(&target)
+        .await
+        .expect("reopen restored pond");
+    assert!(restored.control_table().post_commit_dispatch_suppressed());
+}
+
+#[tokio::test]
+async fn activation_succeeds_after_safe_empty_preflight() {
+    let temporary = tempdir().expect("tempdir");
+    let mut source = Ship::create_pond(temporary.path().join("source"), "source")
+        .await
+        .expect("create source");
+    source
+        .write_transaction(&meta("content"), async move |transaction| {
+            let root = transaction.root().await?;
+            let _ = create_file_path(&root, "/content.txt", b"safe").await?;
+            Ok(())
+        })
+        .await
+        .expect("write source content");
+    let capsule = build_recovery_capsule(&source)
+        .await
+        .expect("build capsule");
+    let remote_path = temporary.path().join("remote");
+    let pond_id = uuid::Uuid::parse_str(source.data_persistence().pond_id()).expect("pond id");
+    let remote = ContentRemote::create_at(&remote_path, pond_id)
+        .await
+        .expect("create capsule remote");
+    let _ = remote
+        .publish_capsule_directory(&capsule.manifest, capsule.payloads.objects_dir())
+        .await
+        .expect("publish capsule");
+    let target = temporary.path().join("restored");
+    let _ = import_capsule(&remote_path, &target, "target")
+        .await
+        .expect("import capsule");
+
+    let report = activate_capsule_import(&target)
+        .await
+        .expect("activate safe import");
+    assert_eq!(report.remotes, 0);
+    assert_eq!(report.run_configs, 0);
+    let restored = Ship::open_pond(&target)
+        .await
+        .expect("reopen restored pond");
+    assert!(!restored.control_table().post_commit_dispatch_suppressed());
 }
 
 #[tokio::test]
