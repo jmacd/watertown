@@ -65,7 +65,8 @@ check_contains /tmp/712-verify1.log "verify clean after compact, no push" "live 
 
 echo "--- Step 4: push after compaction is a harmless no-op that completes ---"
 pond push origin > /tmp/712-push.log 2>&1
-check 'grep -qE "push origin complete" /tmp/712-push.log' "push after compaction completes"
+check 'grep -q "remote already acknowledged the current content tip" /tmp/712-push.log' \
+    "push after compaction reports an acknowledged no-op"
 pond verify origin > /tmp/712-verify2.log 2>&1
 check_contains /tmp/712-verify2.log "verify still clean after the no-op push" "live data matches remote"
 

@@ -1,22 +1,21 @@
 #!/bin/bash
 # REQUIRES: compose
-# TEST: Commit-indexed MinIO pull batches lagged inline series payloads
+# TEST: Native MinIO pull bounds lagged inline series payload reads
 # DESCRIPTION:
 #   Build a producer with enough separately-committed history to make a full
 #   ancestry walk expensive, create a small inline table:series baseline,
 #   publish it, and import it into a consumer. Then append eight separately
 #   committed versions to that same series, publish them in two producer
 #   pushes while the consumer remains behind, and let it catch up afterward.
-#   Trace that lagged pull at MinIO and require one commit-partition scan, no
-#   object point queries, exactly three object batches (two current-closure
-#   batches plus one exact suffix-payload batch), content convergence, and a
-#   conservative physical-read ceiling.
+#   Trace that lagged pull at MinIO and require native publication/pack reads,
+#   no legacy Delta commit or object-batch queries, content convergence, and
+#   conservative physical and native-object read ceilings.
 #
 #   This exercises the production CLI path that unit tests cannot:
-#     durable graft pin -> pond pull -> indexed ancestry -> exact closure
-#     -> validated series prefix -> exact inline suffix payload batch -> MinIO.
-#   Producer lag and changed pack objects must never turn into repeated full
-#   objects-partition scans.
+#     durable graft pin -> pond pull -> publication records -> exact closure
+#     -> validated series prefix -> linked suffix packs and payloads -> MinIO.
+#   Producer lag must never turn into legacy partition scans or unbounded native
+#   object reads.
 set -euo pipefail
 source check.sh
 
@@ -29,10 +28,7 @@ LAG_COMMITS=8
 ROWS_PER_VERSION=7
 FINAL_SERIES_ROWS=$(((LAG_COMMITS + 1) * ROWS_PER_VERSION))
 REQUEST_CEILING=200
-# This fixture's current closure names 33 exact metadata keys. The lagged
-# suffix contributes one distinct inline physical object per appended version;
-# the baseline object's span must be excluded by prefix validation.
-EXPECTED_BATCH_KEYS=$((33 + LAG_COMMITS))
+NATIVE_OBJECT_READ_CEILING=64
 WORK_DIR="${PWD}/.test-543-bounded-pull"
 
 TRACE_PID=
@@ -185,6 +181,10 @@ BATCH_QUERIES=$(printf '%s\n' "${ACCESS_SUMMARY}" | sed -n 's/.* object_batch_qu
 BATCH_KEYS=$(printf '%s\n' "${ACCESS_SUMMARY}" | sed -n 's/.* object_batch_keys=\([0-9][0-9]*\).*/\1/p')
 BATCH_HITS=$(printf '%s\n' "${ACCESS_SUMMARY}" | sed -n 's/.* object_batch_hits=\([0-9][0-9]*\).*/\1/p')
 COMMIT_OPS=$(printf '%s\n' "${ACCESS_SUMMARY}" | sed -n 's/.* delta_commits_ops=\([0-9][0-9]*\).*/\1/p')
+PUBLICATION_OPS=$(printf '%s\n' "${ACCESS_SUMMARY}" | sed -n 's/.* content_v2_publications_ops=\([0-9][0-9]*\).*/\1/p')
+OBJECT_OPS=$(printf '%s\n' "${ACCESS_SUMMARY}" | sed -n 's/.* content_v2_objects_ops=\([0-9][0-9]*\).*/\1/p')
+RECEIPT_OPS=$(printf '%s\n' "${ACCESS_SUMMARY}" | sed -n 's/.* content_v2_receipts_ops=\([0-9][0-9]*\).*/\1/p')
+PACK_OPS=$(printf '%s\n' "${ACCESS_SUMMARY}" | sed -n 's/.* content_v2_packs_ops=\([0-9][0-9]*\).*/\1/p')
 echo "Initial pull MinIO traffic: ${INITIAL_REQUESTS} read request(s)"
 echo "Incremental pull MinIO traffic: ${REQUESTS} read request(s), ${GETS} GET(s)"
 echo "Incremental pull access summary: ${ACCESS_SUMMARY#*storage_access_summary }"
@@ -214,6 +214,10 @@ object_batch_queries=${BATCH_QUERIES}
 object_batch_keys=${BATCH_KEYS}
 object_batch_hits=${BATCH_HITS}
 delta_commits_ops=${COMMIT_OPS}
+content_v2_publications_ops=${PUBLICATION_OPS}
+content_v2_objects_ops=${OBJECT_OPS}
+content_v2_receipts_ops=${RECEIPT_OPS}
+content_v2_packs_ops=${PACK_OPS}
 EOF
 fi
 
@@ -233,17 +237,17 @@ check \
     "test '${POINT_QUERIES}' = 0" \
     "lagged ancestry, closure, and payload reads use no object point queries"
 check \
-    "test '${BATCH_QUERIES}' = 3" \
-    "indexed pull uses two current-closure batches plus one exact suffix-payload batch"
+    "test '${BATCH_QUERIES}' = 0 && test '${BATCH_KEYS}' = 0 && test '${BATCH_HITS}' = 0" \
+    "native pull performs no legacy object-batch queries"
 check \
-    "test '${BATCH_KEYS}' = '${EXPECTED_BATCH_KEYS}'" \
-    "exact batches request current metadata plus only the ${LAG_COMMITS} lagged payload objects"
+    "test '${COMMIT_OPS}' = 0" \
+    "native pull performs no legacy Delta commit-partition reads"
 check \
-    "test '${BATCH_HITS}' = '${EXPECTED_BATCH_KEYS}'" \
-    "all lagged series payload objects resolve through the inline batch"
+    "test '${PUBLICATION_OPS}' -gt 0 && test '${PACK_OPS}' -gt 0" \
+    "incremental pull reads native publication records and linked packs"
 check \
-    "test '${COMMIT_OPS}' -gt 0" \
-    "indexed pull reads the dedicated Delta commits partition"
+    "test '${OBJECT_OPS}' -gt 0 && test '${OBJECT_OPS}' -le '${NATIVE_OBJECT_READ_CEILING}' && test '${RECEIPT_OPS}' -gt 0 && test '${RECEIPT_OPS}' -le '$((LAG_COMMITS + 1))'" \
+    "native object and receipt reads stay bounded by current metadata plus the lagged suffix"
 check_not_contains \
     "${COMMAND_LOG}" \
     "incremental pull reports no generic error" \

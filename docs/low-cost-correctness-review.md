@@ -576,7 +576,10 @@ Small payloads use object-store `PutMode::Create` directly. Large streamed
 payloads are hash-verified in a unique `_content/v2/fallback/uploads/` staging
 key and promoted with atomic `copy_if_not_exists`, then the staging key is
 deleted; this is the object-store 0.12 conditional-create equivalent for the
-multipart path, which does not expose `PutMode`.
+multipart path, which does not expose `PutMode`. Watertown's S3-compatible
+store registration enables object-store's multipart conditional-copy mode by
+default; an explicit `aws_copy_if_not_exists` storage option may override it
+for providers that require a custom conditional-copy header.
 
 The rejected cumulative object index, ref sidecar, Delta object/commit
 publication path, full commit-index scan, object-partition preload, and

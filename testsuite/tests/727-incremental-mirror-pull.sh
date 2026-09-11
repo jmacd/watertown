@@ -89,7 +89,7 @@ pond copy "host+series:///tmp/727-v1.parquet" /data/temps.series >/dev/null 2>&1
 
 pond backup add origin "file://${REMOTE}" > /tmp/727-backup.log 2>&1
 check 'grep -q "added remote origin" /tmp/727-backup.log' "backup add origin succeeded"
-P1_TIP1=$(pond status 2>/dev/null | awk '/last pushed:/ {print $NF}')
+P1_TIP1=$(pond status 2>/dev/null | awk '/last pushed:/ {print $3}')
 check '[ ${#P1_TIP1} -eq 64 ]' "producer pushed tip (v1) is a 64-hex content hash"
 
 echo "--- Step 2: fresh consumer restores the whole pond (mirror) ---"
@@ -101,7 +101,7 @@ check 'pond cat /data/a.txt 2>/dev/null | grep -q alpha' "mirror has the file af
 pond cat --sql "SELECT count(*) AS n FROM source" --format table /data/temps.series \
     > /tmp/727-p2-v1.txt 2>/dev/null
 check 'grep -qE "\| 7 " /tmp/727-p2-v1.txt' "mirror series has v1 only (7 rows)"
-P2_PULLED1=$(pond status 2>/dev/null | awk '/last pulled:/ {print $NF}')
+P2_PULLED1=$(pond status 2>/dev/null | awk '/last pulled:/ {print $3}')
 check '[ "'"$P2_PULLED1"'" = "'"$P1_TIP1"'" ]' "mirror tip equals producer tip after restore"
 
 echo "--- Step 3: producer makes a delta: new file + new series version ---"
@@ -112,7 +112,7 @@ pond copy "host+series:///tmp/727-v2.parquet" /data/temps.series >/dev/null 2>&1
 pond cat --sql "SELECT count(*) AS n FROM source" --format table /data/temps.series \
     > /tmp/727-p1-v2.txt 2>/dev/null
 check 'grep -qE "\| 14 " /tmp/727-p1-v2.txt' "producer series now has 14 rows (2 versions)"
-P1_TIP2=$(pond status 2>/dev/null | awk '/last pushed:/ {print $NF}')
+P1_TIP2=$(pond status 2>/dev/null | awk '/last pushed:/ {print $3}')
 check '[ ${#P1_TIP2} -eq 64 ] && [ "'"$P1_TIP2"'" != "'"$P1_TIP1"'" ]' \
     "producer pushed tip advanced after the delta"
 
@@ -132,7 +132,7 @@ pond cat --sql "SELECT count(*) AS n FROM source WHERE temperature = 11.0" --for
     /data/temps.series > /tmp/727-p2-day1.txt 2>/dev/null
 check 'grep -qE "\| 7 " /tmp/727-p2-day1.txt' "mirror still has v1 rows (day1 -- not lost)"
 check 'pond fsck >/dev/null 2>&1' "mirror still passes fsck after the incremental pull"
-P2_PULLED2=$(pond status 2>/dev/null | awk '/last pulled:/ {print $NF}')
+P2_PULLED2=$(pond status 2>/dev/null | awk '/last pulled:/ {print $3}')
 check '[ "'"$P2_PULLED2"'" = "'"$P1_TIP2"'" ]' \
     "mirror tip re-converged to producer tip after the incremental delta"
 
