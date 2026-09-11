@@ -38,11 +38,10 @@ impl ObjectStoreFactory for AzureStoreFactory {
                 builder = builder.with_config(config_key, value.clone());
             }
         }
-        let (_, path) =
-            ObjectStoreScheme::parse(url).map_err(|e| DeltaTableError::GenericError {
-                source: Box::new(e),
-            })?;
-        let prefix = Path::parse(path)?;
+        ObjectStoreScheme::parse(url).map_err(|e| DeltaTableError::GenericError {
+            source: Box::new(e),
+        })?;
+        let prefix = azure_prefix(url)?;
         let store = builder.build().map_err(|e| DeltaTableError::GenericError {
             source: Box::new(e),
         })?;
@@ -57,6 +56,10 @@ impl ObjectStoreFactory for AzureStoreFactory {
             prefix,
         ))
     }
+}
+
+fn azure_prefix(url: &Url) -> DeltaResult<Path> {
+    Path::parse(url.path().trim_matches('/')).map_err(Into::into)
 }
 
 #[derive(Clone, Default, Debug)]
@@ -106,6 +109,18 @@ pub fn register_azure_handlers() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn azure_root_has_empty_prefix() {
+        let url = Url::parse("az://container").unwrap();
+        assert_eq!(azure_prefix(&url).unwrap(), Path::from(""));
+    }
+
+    #[test]
+    fn azure_child_path_is_preserved() {
+        let url = Url::parse("az://container/_publication/").unwrap();
+        assert_eq!(azure_prefix(&url).unwrap(), Path::from("_publication"));
+    }
 
     /// Registration must be safe to repeat: profiles register their handlers
     /// at every bind, not once at startup.
