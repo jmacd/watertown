@@ -34,6 +34,10 @@ pub enum StoreError {
     /// A logical invariant was violated (returned instead of panicking).
     #[error("invariant violation: {0}")]
     Invariant(String),
+
+    /// A partially initialized content remote has not recorded its identity.
+    #[error("remote has no recorded pond_id")]
+    MissingPondId,
 }
 
 /// Convenience alias.

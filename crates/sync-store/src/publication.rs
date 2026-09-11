@@ -11,6 +11,7 @@ use datafusion::execution::context::SessionContext;
 use deltalake::DeltaTable;
 use deltalake::kernel::{
     DataType as DeltaDataType, PrimitiveType, StructField as DeltaStructField,
+    StructType as DeltaStructType,
 };
 use deltalake::protocol::SaveMode;
 use url::Url;
@@ -110,6 +111,19 @@ pub struct PublicationTable {
 }
 
 impl PublicationTable {
+    /// Whether this is an empty table with exactly the publication schema.
+    pub fn is_pristine(&self) -> Result<bool> {
+        let snapshot = self.table.snapshot()?;
+        let expected_schema = DeltaStructType::try_new(delta_columns()).map_err(|error| {
+            StoreError::Invariant(format!("invalid built-in publication schema: {error}"))
+        })?;
+        let expected_partitions = vec![column::POND_ID.to_string(), column::REF_NAME.to_string()];
+        Ok(self.table.version() == Some(0)
+            && self.table.get_file_uris()?.next().is_none()
+            && snapshot.schema().as_ref() == &expected_schema
+            && snapshot.metadata().partition_columns() == &expected_partitions)
+    }
+
     /// Create a new local publication table beneath `remote_root`.
     pub async fn create(remote_root: impl AsRef<Path>) -> Result<Self> {
         let root = remote_root.as_ref();

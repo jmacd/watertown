@@ -286,14 +286,37 @@ impl ContentRemote {
     }
 
     /// Create a fresh remote at `url` with `storage_options` (e.g. S3 creds),
-    /// recording `pond_id`.  Errors if a table already exists.
+    /// recording `pond_id`.
+    ///
+    /// A provider may durably create a Delta table and still return an error.
+    /// Resume only tables that contain their creation commit and no data; any
+    /// non-pristine existing state remains an error.
     pub async fn create_at_url(
         url: &str,
         pond_id: Uuid,
         storage_options: std::collections::HashMap<String, String>,
     ) -> Result<Self> {
-        let store = Store::create_at_url(url, storage_options.clone()).await?;
-        let publication = PublicationTable::create_at_url(url, storage_options).await?;
+        let store = match Store::create_at_url(url, storage_options.clone()).await {
+            Ok(store) => store,
+            Err(create_error) => {
+                let existing = Store::open_at_url(url, storage_options.clone()).await;
+                match existing {
+                    Ok(store) if store.is_pristine()? => store,
+                    _ => return Err(create_error),
+                }
+            }
+        };
+        let publication = match PublicationTable::create_at_url(url, storage_options.clone()).await
+        {
+            Ok(publication) => publication,
+            Err(create_error) => {
+                let existing = PublicationTable::open_at_url(url, storage_options).await;
+                match existing {
+                    Ok(publication) if publication.is_pristine()? => publication,
+                    _ => return Err(create_error),
+                }
+            }
+        };
         let mut me = Self {
             store,
             publication,
@@ -315,7 +338,7 @@ impl ContentRemote {
         let bytes = store
             .get(Uuid::nil(), META_PARTITION, POND_ID_KEY)
             .await?
-            .ok_or_else(|| StoreError::Invariant("remote has no recorded pond_id".to_string()))?;
+            .ok_or(StoreError::MissingPondId)?;
         let s = String::from_utf8(bytes)
             .map_err(|e| StoreError::Invariant(format!("pond_id not utf8: {e}")))?;
         let pond_id =
@@ -3296,7 +3319,9 @@ mod tests {
     #[tokio::test]
     async fn url_remote_persists_and_discovers_pond_id() {
         let dir = tempdir().unwrap();
-        let url = format!("file://{}/remote", dir.path().display());
+        let remote = dir.path().join("remote");
+        std::fs::create_dir(&remote).unwrap();
+        let url = format!("file://{}", remote.display());
         let pond = Uuid::new_v4();
         let _ = ContentRemote::create_at_url(&url, pond, Default::default())
             .await
@@ -3305,6 +3330,92 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(opened.pond_id(), pond);
+    }
+
+    #[tokio::test]
+    async fn url_remote_resumes_pristine_root_table() {
+        let dir = tempdir().unwrap();
+        let url = format!("file://{}/remote", dir.path().display());
+        let pond = Uuid::new_v4();
+        Store::create_at_url(&url, Default::default())
+            .await
+            .unwrap();
+
+        ContentRemote::create_at_url(&url, pond, Default::default())
+            .await
+            .unwrap();
+
+        let opened = ContentRemote::open_at_url(&url, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(opened.pond_id(), pond);
+    }
+
+    #[tokio::test]
+    async fn url_remote_resumes_pristine_publication_table() {
+        let dir = tempdir().unwrap();
+        let url = format!("file://{}/remote", dir.path().display());
+        let pond = Uuid::new_v4();
+        Store::create_at_url(&url, Default::default())
+            .await
+            .unwrap();
+        PublicationTable::create_at_url(&url, Default::default())
+            .await
+            .unwrap();
+
+        ContentRemote::create_at_url(&url, pond, Default::default())
+            .await
+            .unwrap();
+
+        let opened = ContentRemote::open_at_url(&url, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(opened.pond_id(), pond);
+    }
+
+    #[tokio::test]
+    async fn url_remote_refuses_initialized_table() {
+        let dir = tempdir().unwrap();
+        let url = format!("file://{}/remote", dir.path().display());
+        ContentRemote::create_at_url(&url, Uuid::new_v4(), Default::default())
+            .await
+            .unwrap();
+
+        let error =
+            match ContentRemote::create_at_url(&url, Uuid::new_v4(), Default::default()).await {
+                Ok(_) => panic!("initialized remote must not be claimed"),
+                Err(error) => error,
+            };
+
+        assert!(error.to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn url_remote_refuses_foreign_pristine_table() {
+        let dir = tempdir().unwrap();
+        let remote = dir.path().join("remote");
+        std::fs::create_dir(&remote).unwrap();
+        let url = format!("file://{}", remote.display());
+        deltalake::DeltaTable::try_from_url(url::Url::parse(&url).unwrap())
+            .await
+            .unwrap()
+            .create()
+            .with_columns(vec![deltalake::kernel::StructField::new(
+                "foreign",
+                deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::String),
+                false,
+            )])
+            .with_save_mode(deltalake::protocol::SaveMode::ErrorIfExists)
+            .await
+            .unwrap();
+
+        let error =
+            match ContentRemote::create_at_url(&url, Uuid::new_v4(), Default::default()).await {
+                Ok(_) => panic!("foreign pristine table must not be claimed"),
+                Err(error) => error,
+            };
+
+        assert!(error.to_string().contains("already exists"));
     }
 
     #[tokio::test]
