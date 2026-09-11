@@ -14,6 +14,7 @@ use arrow_array::{
 use chrono::Utc;
 use datafusion::execution::context::SessionContext;
 use deltalake::DeltaTable;
+use deltalake::kernel::StructType as DeltaStructType;
 use deltalake::kernel::schema::partitions::{PartitionFilter, PartitionValue};
 use deltalake::operations::optimize::OptimizeType;
 use deltalake::protocol::SaveMode;
@@ -93,6 +94,23 @@ const CHECKPOINT_INTERVAL: u64 = 10;
 const COMPACT_INTERVAL: u64 = 25;
 
 impl Store {
+    /// Whether this is an empty table with exactly the current store schema.
+    pub fn is_pristine(&self) -> Result<bool> {
+        let snapshot = self.table.snapshot()?;
+        let expected_schema =
+            DeltaStructType::try_new(schema::delta_columns()).map_err(|error| {
+                StoreError::Invariant(format!("invalid built-in store schema: {error}"))
+            })?;
+        let expected_partitions: Vec<String> = schema::partition_columns()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        Ok(self.table.version() == Some(0)
+            && self.table.get_file_uris()?.next().is_none()
+            && snapshot.schema().as_ref() == &expected_schema
+            && snapshot.metadata().partition_columns() == &expected_partitions)
+    }
+
     /// Create a new store at `path`.  The directory is created if missing.
     /// Errors if a Delta table already exists there.
     pub async fn create(path: impl AsRef<Path>) -> Result<Self> {

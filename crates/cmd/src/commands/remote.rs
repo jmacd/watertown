@@ -59,11 +59,12 @@ async fn run_remote_probe<T>(
 fn remote_is_uninitialized(error: &sync_store::StoreError) -> bool {
     matches!(
         error,
-        sync_store::StoreError::Delta(
-            deltalake::DeltaTableError::NotATable(_)
-                | deltalake::DeltaTableError::NotInitialized
-                | deltalake::DeltaTableError::InvalidTableLocation(_)
-        )
+        sync_store::StoreError::MissingPondId
+            | sync_store::StoreError::Delta(
+                deltalake::DeltaTableError::NotATable(_)
+                    | deltalake::DeltaTableError::NotInitialized
+                    | deltalake::DeltaTableError::InvalidTableLocation(_)
+            )
     )
 }
 
@@ -1311,5 +1312,12 @@ mod tests {
     #[test]
     fn test_remote_config_path_format() {
         assert_eq!(remote_config_path("origin"), "/sys/remotes/origin");
+    }
+
+    #[test]
+    fn missing_remote_identity_is_resumable() {
+        assert!(remote_is_uninitialized(
+            &sync_store::StoreError::MissingPondId
+        ));
     }
 }
