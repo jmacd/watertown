@@ -446,11 +446,17 @@ async fn an_applied_backup_is_actually_governed() {
         .await
         .expect("write");
 
-    // One op per hour: the attach itself spends nothing, but the first push
-    // needs several remote operations.
-    apply_yaml(&ctx, tmp.path(), &governed_backup_yaml(&url, 100, 1))
+    // One op per hour cannot cover the post-commit push triggered by the
+    // attachment. The attachment remains durably applied, but the command must
+    // now surface that publication failure instead of reporting false success.
+    let apply_error = apply_yaml(&ctx, tmp.path(), &governed_backup_yaml(&url, 100, 1))
         .await
-        .expect("apply");
+        .expect_err("apply must surface the governed auto-push failure");
+    let apply_message = format!("{apply_error:#}");
+    assert!(
+        apply_message.contains("rate limit") || apply_message.contains("retry in"),
+        "expected a rate-limit refusal from apply, got: {apply_message}"
+    );
 
     let err = push_command(&ctx, Some("origin".to_string()))
         .await
