@@ -75,7 +75,8 @@ pub(crate) async fn materialize_tlog(
     // Decision D9: the authoritative leaf sequence is the pond-resident commit
     // log node, not the disposable control table.  Each log-node version holds
     // one encoded commit object; the tile export is reconciled against them.
-    let leaves = match read_log_leaves(table, &pond_id.to_string()).await {
+    let data_path = crate::get_data_path(pond_path);
+    let leaves = match read_log_leaves(table, &data_path, &pond_id.to_string()).await {
         Ok(l) => l,
         Err(e) => {
             log::error!("failed to read transparency-log leaf sequence: {e}");
@@ -1915,6 +1916,7 @@ struct SeriesVersionMetaRow {
 /// read (which would concatenate every leaf).
 pub(crate) async fn read_log_leaves(
     table: deltalake::DeltaTable,
+    data_path: &std::path::Path,
     pond_id: &str,
 ) -> Result<Vec<Vec<u8>>, StewardError> {
     let ctx = SessionContext::new();
@@ -1922,7 +1924,7 @@ pub(crate) async fn read_log_leaves(
         .register_table("log_live", Arc::new(table))
         .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
     let sql = format!(
-        "SELECT version, content FROM log_live \
+        "SELECT version, content, blake3 FROM log_live \
          WHERE pond_id = '{pond_id}' AND node_id = '{log}' ORDER BY version",
         log = tinyfs::LOG_NODE_UUID,
     );
@@ -1938,12 +1940,26 @@ pub(crate) async fn read_log_leaves(
         let parsed: Vec<LogLeaf> = serde_arrow::from_record_batch(batch)
             .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
         for row in parsed {
-            let bytes = row.content.ok_or_else(|| {
-                StewardError::Content(format!(
-                    "commit-log leaf at version {} has no content",
-                    row.version
-                ))
-            })?;
+            let bytes = match (row.content, row.blake3) {
+                (Some(bytes), _) => bytes,
+                (None, Some(blake3)) => {
+                    tlogfs::large_files::read_external_bytes(data_path, &blake3)
+                        .await
+                        .map_err(|error| {
+                            StewardError::Content(format!(
+                                "read external commit-log leaf at version {} ({blake3}): {error}",
+                                row.version
+                            ))
+                        })?
+                }
+                (None, None) => {
+                    return Err(StewardError::Content(format!(
+                        "commit-log leaf at version {} has neither inline content nor an \
+                         external blob hash",
+                        row.version
+                    )));
+                }
+            };
             leaves.push(bytes);
         }
     }
@@ -1956,6 +1972,7 @@ pub(crate) async fn read_log_leaves(
 struct LogLeaf {
     version: i64,
     content: Option<Vec<u8>>,
+    blake3: Option<String>,
 }
 
 /// Read exactly the latest committed reserved manifest-index pointer for one
@@ -2009,6 +2026,7 @@ pub(crate) async fn index_root_pointer_bytes(
 /// when the log node is empty (genesis).
 pub(crate) async fn log_tip_commit_hash(
     table: deltalake::DeltaTable,
+    data_path: &std::path::Path,
     pond_id: &str,
 ) -> Result<Option<ObjectHash>, StewardError> {
     let ctx = SessionContext::new();
@@ -2016,8 +2034,8 @@ pub(crate) async fn log_tip_commit_hash(
         .register_table("log_tip", Arc::new(table))
         .map_err(|error| StewardError::DeltaLake(error.to_string()))?;
     let sql = format!(
-        "SELECT version, content FROM log_tip WHERE pond_id = '{pond_id}' AND node_id = '{log}' \
-         ORDER BY version DESC LIMIT 1",
+        "SELECT version, content, blake3 FROM log_tip WHERE pond_id = '{pond_id}' \
+         AND node_id = '{log}' ORDER BY version DESC LIMIT 1",
         log = tinyfs::LOG_NODE_UUID,
     );
     let batches = ctx
@@ -2036,15 +2054,24 @@ pub(crate) async fn log_tip_commit_hash(
     }
     match rows.as_slice() {
         [] => Ok(None),
-        [row] => {
-            let bytes = row.content.as_deref().ok_or_else(|| {
-                StewardError::Content(format!(
-                    "commit-log tip at version {} has no content",
-                    row.version
-                ))
-            })?;
-            log_tip_hash(bytes)
-        }
+        [row] => match (&row.content, &row.blake3) {
+            (Some(bytes), _) => log_tip_hash(bytes),
+            (None, Some(blake3)) => {
+                let bytes = tlogfs::large_files::read_external_bytes(data_path, blake3)
+                    .await
+                    .map_err(|error| {
+                        StewardError::Content(format!(
+                            "read external commit-log tip at version {} ({blake3}): {error}",
+                            row.version
+                        ))
+                    })?;
+                log_tip_hash(&bytes)
+            }
+            (None, None) => Err(StewardError::Content(format!(
+                "commit-log tip at version {} has neither inline content nor an external blob hash",
+                row.version
+            ))),
+        },
         _ => Err(StewardError::Content(
             "bounded commit-log tip query returned multiple rows".to_string(),
         )),
@@ -2071,9 +2098,10 @@ fn log_tip_hash(bytes: &[u8]) -> Result<Option<ObjectHash>, StewardError> {
 /// Returns an error if the log node cannot be read or a leaf cannot be decoded.
 pub(crate) async fn read_log_spines(
     table: deltalake::DeltaTable,
+    data_path: &std::path::Path,
     pond_id: &str,
 ) -> Result<HashMap<i64, CommitSpine>, StewardError> {
-    let leaves = read_log_leaves(table, pond_id).await?;
+    let leaves = read_log_leaves(table, data_path, pond_id).await?;
     let mut spines = HashMap::with_capacity(leaves.len());
     for bytes in leaves {
         let commit = Commit::decode(&bytes)
@@ -3347,6 +3375,51 @@ fn leaf_facts<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn commit_log_reads_externalized_commit_objects() {
+        let temp_dir = tempfile::TempDir::new().expect("tempdir");
+        let pond_path = temp_dir.path().join("pond");
+        let mut ship = Ship::create_pond(&pond_path, "test-host")
+            .await
+            .expect("create pond");
+        let metadata = crate::PondUserMetadata::new(vec![
+            "large-commit".to_string(),
+            "x".repeat(tlogfs::large_files::LARGE_FILE_THRESHOLD + 4096),
+        ]);
+
+        ship.write_transaction(&metadata, async |fs| {
+            let root = fs.root().await?;
+            let _ = root.create_dir_path("/changed").await?;
+            Ok(())
+        })
+        .await
+        .expect("commit with externalized commit object");
+
+        let pond_id = ship.control_table().pond_id_uuid().to_string();
+        let leaves = read_log_leaves(
+            ship.data_persistence().table().clone(),
+            ship.data_persistence().store_path(),
+            &pond_id,
+        )
+        .await
+        .expect("read externalized commit-log leaf");
+        assert_eq!(leaves.len(), 1);
+        assert!(
+            leaves[0].len() > tlogfs::large_files::LARGE_FILE_THRESHOLD,
+            "test must force the commit object out of line"
+        );
+        let commit = Commit::decode(&leaves[0]).expect("decode externalized commit");
+        let tip = log_tip_commit_hash(
+            ship.data_persistence().table().clone(),
+            ship.data_persistence().store_path(),
+            &pond_id,
+        )
+        .await
+        .expect("read externalized tip")
+        .expect("tip exists");
+        assert_eq!(tip, commit.hash());
+    }
 
     #[test]
     fn obsolete_commit_tip_is_rejected() {

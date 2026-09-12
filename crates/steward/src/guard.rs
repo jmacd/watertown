@@ -25,6 +25,17 @@ use tlogfs::transaction_guard::TransactionGuard;
 /// `docs/incremental-content-tree-design.md` Section 10, Decision D9).
 const LOG_NODE_NAME: &str = ".pond-commit-log";
 
+fn post_commit_remote_result(failures: Vec<String>) -> Result<(), StewardError> {
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(StewardError::Content(format!(
+            "post-commit auto-push failed after local transaction committed: {}",
+            failures.join("; ")
+        )))
+    }
+}
+
 /// Configuration for a post-commit factory to be executed
 struct PostCommitFactoryConfig {
     factory_name: String,
@@ -593,9 +604,10 @@ impl<'a> StewardTransactionGuard<'a> {
                     self.run_post_commit_factories().await;
 
                     // D4: Run post-commit auto-push for /sys/remotes/* entries.
-                    // Same "after-commit, new transaction" model as factories
-                    // above; failures are logged but do not undo the commit.
-                    self.run_post_commit_remotes().await;
+                    // The local commit is already durable, but publication
+                    // failure must still fail the command so unattended runs
+                    // cannot report success while a remote remains stale.
+                    self.run_post_commit_remotes().await?;
                 }
 
                 Ok(Some(new_version))
@@ -618,13 +630,23 @@ impl<'a> StewardTransactionGuard<'a> {
                         "Write-no-op steward transaction {} completed (seq={})",
                         self.txn_meta.user.txn_id, self.txn_meta.txn_seq
                     );
+                    self.committed = true;
+                    if !self.suppress_post_commit
+                        && !self.control_table.post_commit_dispatch_suppressed()
+                    {
+                        // A prior local commit may have succeeded while its
+                        // publication failed. Retrying a now-idempotent source
+                        // run must retry that pending push even when it makes
+                        // no new local changes.
+                        self.run_post_commit_remotes().await?;
+                    }
                 } else {
                     debug!(
                         "Read-only steward transaction {} completed (seq={})",
                         self.txn_meta.user.txn_id, self.txn_meta.txn_seq
                     );
+                    self.committed = true;
                 }
-                self.committed = true;
                 Ok(None)
             }
             Err(e) => {
@@ -707,8 +729,12 @@ impl<'a> StewardTransactionGuard<'a> {
 
         let root = data_tx.root().await?;
         let local_store = crate::local_content::LocalContentStore::new(&self.pond_path);
-        let parent_commit_hash =
-            crate::content_tree::log_tip_commit_hash(committed_table.clone(), &pond_id_str).await?;
+        let parent_commit_hash = crate::content_tree::log_tip_commit_hash(
+            committed_table.clone(),
+            data_tx.persistence().store_path(),
+            &pond_id_str,
+        )
+        .await?;
 
         // The fixed local cursor is the normal baseline. Recover it from one
         // bounded latest-index query after a crash/cache loss, validating it
@@ -1417,25 +1443,22 @@ impl<'a> StewardTransactionGuard<'a> {
     /// `both`.  This is the replacement for the legacy
     /// `/system/run/<N>-remote` factory dispatch.
     ///
-    /// Like [`Self::run_post_commit_factories`], failures from any
-    /// individual remote are logged but do not roll back the data
-    /// commit (the local write has already succeeded).  The legacy
-    /// factory-based dispatcher continues to run alongside this method
-    /// until D4.5 deletes `crates/remote`.
-    async fn run_post_commit_remotes(&mut self) {
+    /// Failures do not roll back the already-durable local data commit, but
+    /// they are returned after all configured remotes have been attempted so
+    /// the caller cannot report a false success.
+    async fn run_post_commit_remotes(&mut self) -> Result<(), StewardError> {
         debug!("Starting post-commit /sys/remotes/* discovery");
 
-        let remotes = match self.discover_sys_remotes().await {
-            Ok(r) => r,
-            Err(e) => {
-                log::warn!("Failed to discover /sys/remotes/*: {}", e);
-                return;
-            }
-        };
+        let (remotes, mut failures) = self.discover_sys_remotes().await.map_err(|error| {
+            StewardError::Content(format!(
+                "post-commit auto-push failed after local transaction committed: \
+                 discover /sys/remotes: {error}"
+            ))
+        })?;
 
         if remotes.is_empty() {
             debug!("No /sys/remotes/* entries found");
-            return;
+            return post_commit_remote_result(failures);
         }
 
         // Filter by mode (raw_config key `remote_mode:<name>`); default is push.
@@ -1444,17 +1467,16 @@ impl<'a> StewardTransactionGuard<'a> {
             let mode_key = format!("{}{}", crate::REMOTE_MODE_PREFIX, name);
             let mode_str = match self.control_table.raw_config_get(&mode_key).await {
                 Ok(Some(v)) if !v.is_empty() => v,
-                _ => "push".to_string(),
+                Ok(_) => "push".to_string(),
+                Err(error) => {
+                    failures.push(format!("{name}: read mode: {error}"));
+                    continue;
+                }
             };
             let mode = match crate::RemoteMode::parse(&mode_str) {
                 Ok(m) => m,
                 Err(e) => {
-                    log::warn!(
-                        "post-commit auto-push: skipping `{}` (invalid mode `{}`: {})",
-                        name,
-                        mode_str,
-                        e
-                    );
+                    failures.push(format!("{name}: invalid mode `{mode_str}`: {e}"));
                     continue;
                 }
             };
@@ -1471,7 +1493,7 @@ impl<'a> StewardTransactionGuard<'a> {
 
         if to_push.is_empty() {
             debug!("No /sys/remotes/* entries are in push/both mode");
-            return;
+            return post_commit_remote_result(failures);
         }
 
         // Open a fresh Ship for the push.  This is safe because the
@@ -1480,22 +1502,23 @@ impl<'a> StewardTransactionGuard<'a> {
         // the same underlying Delta table.  `self.control_table` is
         // about to become stale but the guard drops immediately after
         // commit() returns.
-        let mut steward = match crate::Steward::open_pond(&self.pond_path).await {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!(
-                    "post-commit auto-push: failed to reopen pond at {:?}: {}",
-                    self.pond_path,
-                    e
-                );
-                return;
-            }
-        };
+        let mut steward = crate::Steward::open_pond(&self.pond_path)
+            .await
+            .map_err(|error| {
+                StewardError::Content(format!(
+                    "post-commit auto-push failed after local transaction committed: \
+                     reopen pond at {:?}: {error}",
+                    self.pond_path
+                ))
+            })?;
         let ship = match steward.as_pond_mut() {
             Some(s) => s,
             None => {
-                log::error!("post-commit auto-push: reopened steward is not a pond (internal bug)");
-                return;
+                return Err(StewardError::Content(
+                    "post-commit auto-push failed after local transaction committed: \
+                     reopened steward is not a pond"
+                        .to_string(),
+                ));
             }
         };
 
@@ -1529,7 +1552,7 @@ impl<'a> StewardTransactionGuard<'a> {
                 match Box::pin(crate::storage_profile::prepare_storage(ship, &attachment)).await {
                     Ok(o) => o,
                     Err(e) => {
-                        log::error!("post-commit auto-push: {} bad storage options: {}", name, e);
+                        failures.push(format!("{name}: bad storage options: {e}"));
                         continue;
                     }
                 };
@@ -1539,7 +1562,7 @@ impl<'a> StewardTransactionGuard<'a> {
             let limit_spec = match attachment.resolved_limits() {
                 Ok(v) => v,
                 Err(e) => {
-                    log::error!("post-commit auto-push: {} bad limits: {}", name, e);
+                    failures.push(format!("{name}: bad limits: {e}"));
                     continue;
                 }
             };
@@ -1551,11 +1574,7 @@ impl<'a> StewardTransactionGuard<'a> {
             let mut limits = match Box::pin(crate::LimiterSet::open(ship, &limit_spec)).await {
                 Ok(l) => l,
                 Err(e) => {
-                    log::error!(
-                        "post-commit auto-push: {} could not bind limiters: {}",
-                        name,
-                        e
-                    );
+                    failures.push(format!("{name}: could not bind limiters: {e}"));
                     continue;
                 }
             };
@@ -1575,11 +1594,7 @@ impl<'a> StewardTransactionGuard<'a> {
             // still spent what it spent, and an unattended retry every commit
             // would otherwise never be charged for its failures.
             if let Err(e) = limits.commit(ship.control_table_mut()).await {
-                log::warn!(
-                    "post-commit auto-push: {} failed to record limiter usage: {}",
-                    name,
-                    e
-                );
+                failures.push(format!("{name}: failed to record limiter usage: {e}"));
             }
 
             match pushed {
@@ -1596,20 +1611,18 @@ impl<'a> StewardTransactionGuard<'a> {
                     )
                     .await
                     {
-                        log::warn!(
-                            "post-commit auto-push: {} pushed but failed to record acknowledgement: {}",
-                            name,
-                            e
-                        );
+                        failures.push(format!(
+                            "{name}: pushed but failed to record acknowledgement: {e}"
+                        ));
                     }
                 }
                 Err(e) => {
-                    log::error!("post-commit auto-push: {} failed: {}", name, e);
-                    // Continue with the next remote; one bad target
-                    // shouldn't poison the others.
+                    failures.push(format!("{name}: {e}"));
                 }
             }
         }
+
+        post_commit_remote_result(failures)
     }
 
     /// Discover all `/sys/remotes/*` entries and parse their YAML.
@@ -1617,7 +1630,7 @@ impl<'a> StewardTransactionGuard<'a> {
     /// list if `/sys/remotes` does not exist yet.
     async fn discover_sys_remotes(
         &self,
-    ) -> Result<Vec<(String, crate::RemoteAttachment)>, StewardError> {
+    ) -> Result<(Vec<(String, crate::RemoteAttachment)>, Vec<String>), StewardError> {
         let data_path = crate::get_data_path(Path::new(&self.pond_path));
         let pond_id = self.control_table.pond_metadata().pond_id.to_string();
         let mut data_persistence = tlogfs::OpLogPersistence::open(&data_path, pond_id)
@@ -1625,7 +1638,7 @@ impl<'a> StewardTransactionGuard<'a> {
             .map_err(StewardError::DataInit)?;
 
         let discovery_metadata = PondTxnMetadata::new(
-            self.txn_meta.txn_seq,
+            data_persistence.last_txn_seq(),
             tlogfs::PondUserMetadata::new(vec![
                 "internal".to_string(),
                 "post-commit-remote-discovery".to_string(),
@@ -1646,9 +1659,18 @@ impl<'a> StewardTransactionGuard<'a> {
 
         // If /sys/remotes doesn't exist yet (no `pond remote add` has
         // been run), bail out cleanly.
-        if root.resolve_path(crate::SYS_REMOTES_DIR).await.is_err() {
-            _ = discovery_tx.commit().await;
-            return Ok(Vec::new());
+        match root.resolve_path(crate::SYS_REMOTES_DIR).await {
+            Ok(_) => {}
+            Err(tinyfs::Error::NotFound(_)) => {
+                let _ = discovery_tx
+                    .commit()
+                    .await
+                    .map_err(|e| StewardError::DataInit(tlogfs::TLogFSError::TinyFS(e)))?;
+                return Ok((Vec::new(), Vec::new()));
+            }
+            Err(error) => {
+                return Err(StewardError::DataInit(tlogfs::TLogFSError::TinyFS(error)));
+            }
         }
 
         let pattern = format!("{}/*", crate::SYS_REMOTES_DIR);
@@ -1658,43 +1680,40 @@ impl<'a> StewardTransactionGuard<'a> {
             .map_err(|e| StewardError::DataInit(tlogfs::TLogFSError::TinyFS(e)))?;
 
         let mut out: Vec<(String, crate::RemoteAttachment)> = Vec::new();
+        let mut failures = Vec::new();
         for (node_path, _captures) in matches {
             let cfg_path = node_path.path().to_path_buf();
             let name = match cfg_path.file_name().and_then(|n| n.to_str()) {
                 Some(n) => n.to_string(),
-                None => continue,
+                None => {
+                    failures.push(format!(
+                        "{}: attachment path has no UTF-8 file name",
+                        cfg_path.display()
+                    ));
+                    continue;
+                }
             };
 
             let mut reader = match root.async_reader_path(&cfg_path).await {
                 Ok(r) => r,
                 Err(e) => {
-                    log::warn!(
-                        "post-commit auto-push: cannot read {}: {}",
-                        cfg_path.display(),
-                        e
-                    );
+                    failures.push(format!("{name}: cannot read {}: {e}", cfg_path.display()));
                     continue;
                 }
             };
             let mut buf = Vec::new();
             if let Err(e) = tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buf).await {
-                log::warn!(
-                    "post-commit auto-push: read error on {}: {}",
-                    cfg_path.display(),
-                    e
-                );
+                failures.push(format!("{name}: read error on {}: {e}", cfg_path.display()));
                 continue;
             }
 
             match crate::RemoteAttachment::from_yaml_bytes(&buf) {
                 Ok(att) => out.push((name, att)),
                 Err(e) => {
-                    log::warn!(
-                        "post-commit auto-push: invalid YAML in {}: {}",
-                        cfg_path.display(),
-                        e
-                    );
-                    continue;
+                    failures.push(format!(
+                        "{name}: invalid YAML in {}: {e}",
+                        cfg_path.display()
+                    ));
                 }
             }
         }
@@ -1706,7 +1725,7 @@ impl<'a> StewardTransactionGuard<'a> {
 
         // Deterministic order so logs are easy to read.
         out.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(out)
+        Ok((out, failures))
     }
 }
 

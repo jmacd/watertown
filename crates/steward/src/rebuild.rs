@@ -173,7 +173,7 @@ pub async fn rebuild_control_table(
     let data_table = deltalake::open_table(data_url)
         .await
         .map_err(|e| StewardError::Aborted(format!("open data table for spine replay: {e}")))?;
-    let spines = crate::content_tree::read_log_spines(data_table, &pond_id_str).await?;
+    let spines = crate::content_tree::read_log_spines(data_table, &data_path, &pond_id_str).await?;
 
     let metadata = PondMetadata {
         pond_id: pond_id_uuid7,

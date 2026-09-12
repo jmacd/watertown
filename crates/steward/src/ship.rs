@@ -590,7 +590,7 @@ impl Ship {
         let fresh_data = deltalake::open_table(data_url)
             .await
             .map_err(|error| StewardError::DeltaLake(error.to_string()))?;
-        let source_tip = crate::content_tree::log_tip_commit_hash(fresh_data, &pond_id)
+        let source_tip = crate::content_tree::log_tip_commit_hash(fresh_data, &data_path, &pond_id)
             .await?
             .map(|tip| tip.to_hex());
         let freeze = crate::WriteFreeze::new(pond_id, source_tip, reason.to_string());
