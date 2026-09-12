@@ -158,7 +158,7 @@ export function buildMetricChartSpec(opts) {
       data: { values: annotations },
       mark: { type: "rect", clip: true, tooltip: true },
       encoding: {
-        x: { field: "start", type: "temporal", scale: { domain: xDomain }, axis: null },
+        x: { field: "start", type: "temporal", scale: { domain: xDomain, nice: false }, axis: null },
         x2: { field: "end" },
         color: { field: "color", type: "nominal", scale: null, legend: null },
         opacity: { field: "opacity", type: "quantitative", scale: null, legend: null },
@@ -198,7 +198,12 @@ export function buildMetricChartSpec(opts) {
         field: xField,
         type: "temporal",
         title: "Date",
-        scale: { domain: xDomain },
+        // `nice: false` keeps the rendered scale pinned to the exact
+        // `xDomain` edges. Vega's default temporal "nice" rounds the domain
+        // out to a tidy time unit (e.g. the nearest hour), which would leave
+        // the axis (and anything computed from the queried domain) subtly
+        // offset from what's actually plotted.
+        scale: { domain: xDomain, nice: false },
         axis: { grid: true },
       },
     },

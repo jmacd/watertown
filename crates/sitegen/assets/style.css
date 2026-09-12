@@ -665,6 +665,40 @@ tr:hover td {
   font-weight: 600;
 }
 
+/* Highlighted marker at the exact hovered intersection point on a line. */
+.hover-dot {
+  position: absolute;
+  z-index: 11;
+  width: 8px;
+  height: 8px;
+  margin-left: -4px;
+  margin-top: -4px;
+  border-radius: 50%;
+  background: var(--bg);
+  border: 2px solid;
+  pointer-events: none;
+  box-shadow: var(--shadow-sm);
+}
+
+/* Value badge pinned to the y-axis (left margin) at the hovered value's
+   height, so the reading is visible without hunting through the tooltip. */
+.hover-axis-value {
+  position: absolute;
+  left: 0;
+  z-index: 11;
+  transform: translateY(-50%);
+  background: var(--bg);
+  border: 1px solid;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: var(--shadow-sm);
+}
+
 /* ── Charts ─────────────────────────────────────────────────── */
 
 .chart-container {
