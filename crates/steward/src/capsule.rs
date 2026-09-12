@@ -136,9 +136,12 @@ pub(crate) async fn build_recovery_capsule_from_materialized(
     let paths = resolve_paths(&native_entries)?;
 
     let pond_id = ship.control_table().pond_id_uuid().to_string();
-    let commits =
-        crate::content_tree::read_log_leaves(ship.data_persistence().table().clone(), &pond_id)
-            .await?;
+    let commits = crate::content_tree::read_log_leaves(
+        ship.data_persistence().table().clone(),
+        ship.data_persistence().store_path(),
+        &pond_id,
+    )
+    .await?;
     let tip_bytes = commits
         .last()
         .ok_or_else(|| StewardError::Content("pond has no content tip".to_string()))?;

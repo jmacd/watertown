@@ -72,6 +72,7 @@ struct CollectedIncrementalDelta {
 pub(crate) async fn current_snapshot(ship: &Ship) -> Result<Snapshot, StewardError> {
     let tip = crate::content_tree::log_tip_commit_hash(
         ship.data_persistence().table().clone(),
+        ship.data_persistence().store_path(),
         &ship.control_table().pond_id_uuid().to_string(),
     )
     .await?

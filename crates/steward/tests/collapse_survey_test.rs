@@ -215,22 +215,29 @@ async fn a_high_threshold_finds_nothing() {
 async fn naming_files_does_not_instantiate_them() {
     let (_t, mut ship) = pond_with_series().await;
 
-    ship.write_transaction(&meta("unresolvable"), async move |fs| {
-        let root = fs.root().await?;
-        _ = root.create_dir_path("/sys").await?;
-        _ = root.create_dir_path("/sys/remotes").await?;
-        _ = root
-            .create_dynamic_path(
-                "/sys/remotes/broken.yaml",
-                tinyfs::EntryType::FileDynamic,
-                "no-such-factory-is-registered",
-                b"endpoint: ${MISSING_ENV_VAR_THAT_IS_NOT_SET}\n".to_vec(),
-            )
-            .await?;
-        Ok(())
-    })
-    .await
-    .expect("stage an unresolvable dynamic node");
+    let write_error = ship
+        .write_transaction(&meta("unresolvable"), async move |fs| {
+            let root = fs.root().await?;
+            _ = root.create_dir_path("/sys").await?;
+            _ = root.create_dir_path("/sys/remotes").await?;
+            _ = root
+                .create_dynamic_path(
+                    "/sys/remotes/broken.yaml",
+                    tinyfs::EntryType::FileDynamic,
+                    "no-such-factory-is-registered",
+                    b"endpoint: ${MISSING_ENV_VAR_THAT_IS_NOT_SET}\n".to_vec(),
+                )
+                .await?;
+            Ok(())
+        })
+        .await
+        .expect_err("unresolvable remote must fail post-commit discovery");
+    assert!(
+        write_error
+            .to_string()
+            .contains("post-commit auto-push failed after local transaction committed"),
+        "the dynamic node must remain durable for the naming test: {write_error}"
+    );
 
     let seq_before = ship
         .control_table()

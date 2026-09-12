@@ -991,7 +991,7 @@ async fn activation_refuses_invalid_remote_config_and_keeps_pond_inert() {
     let mut source = Ship::create_pond(temporary.path().join("source"), "source")
         .await
         .expect("create source");
-    source
+    let write_error = source
         .write_transaction(&meta("bad-remote"), async move |transaction| {
             let root = transaction.root().await?;
             let _ = root.create_dir_all("/sys/remotes").await?;
@@ -999,7 +999,13 @@ async fn activation_refuses_invalid_remote_config_and_keeps_pond_inert() {
             Ok(())
         })
         .await
-        .expect("write invalid remote");
+        .expect_err("invalid remote must fail post-commit auto-push");
+    assert!(
+        write_error
+            .to_string()
+            .contains("post-commit auto-push failed after local transaction committed"),
+        "the invalid config must remain durable for the activation test: {write_error}"
+    );
     let capsule = build_recovery_capsule(&source)
         .await
         .expect("build capsule");

@@ -685,14 +685,21 @@ async fn pond_remote_list_rejects_unreadable_attachment() {
     )
     .await
     .expect("create remote attachment");
-    write_small_file(
+    let write_error = write_small_file(
         &ctx,
         &remote_config_path("broken"),
         b"not: [valid remote yaml",
         vec!["test", "write-broken-remote"],
     )
     .await
-    .expect("write malformed remote attachment");
+    .expect_err("malformed attachment must fail post-commit remote discovery");
+    assert!(
+        write_error
+            .to_string()
+            .contains("post-commit auto-push failed after local transaction committed"),
+        "the malformed attachment is durable, but the command must not report success: \
+         {write_error:#}"
+    );
 
     let error = list_remotes_command(&ctx, None)
         .await
@@ -1319,6 +1326,79 @@ async fn post_commit_auto_push_publishes_to_file_remote() {
         .await
         .expect("read /auto.txt on dst");
     assert_eq!(bytes, b"published by auto-push");
+}
+
+#[tokio::test]
+async fn post_commit_auto_push_failure_surfaces_and_noop_retries() {
+    init_log();
+    let scratch = TempDir::new().expect("tempdir");
+    let src_pond = scratch.path().join("src_pond");
+    let remote_path = scratch.path().join("remote_bucket");
+    let held_remote = scratch.path().join("held_remote");
+    let remote_url = format!("file://{}", remote_path.display());
+    let src_ctx = ctx_for(&src_pond, vec!["pond", "init"]);
+    init_command(&src_ctx, "test-host").await.expect("init src");
+    add_backup_command(
+        &src_ctx,
+        "origin",
+        &remote_url,
+        false,
+        None,
+        None,
+        None,
+        None,
+        false,
+        false,
+    )
+    .await
+    .expect("remote add");
+
+    std::fs::rename(&remote_path, &held_remote).expect("hold remote directory");
+    std::fs::write(&remote_path, b"not a directory").expect("block remote path");
+    let error = write_small_file(
+        &src_ctx,
+        "/pending.txt",
+        b"locally committed",
+        vec!["copy", "pending.txt"],
+    )
+    .await
+    .expect_err("failed auto-push must fail the initiating command");
+    assert!(
+        error
+            .to_string()
+            .contains("post-commit auto-push failed after local transaction committed"),
+        "error must distinguish durable local success from publication failure: {error:#}"
+    );
+    assert_eq!(
+        read_small_file(&src_ctx, "/pending.txt")
+            .await
+            .expect("local commit remains readable"),
+        b"locally committed"
+    );
+
+    std::fs::remove_file(&remote_path).expect("remove blocking file");
+    std::fs::rename(&held_remote, &remote_path).expect("restore remote directory");
+    let mut steward = src_ctx.open_pond().await.expect("open source");
+    let ship = steward.as_pond_mut().expect("source is a pond");
+    let no_op = ship
+        .begin_write(&PondUserMetadata::new(vec![
+            "retry-pending-push".to_string(),
+        ]))
+        .await
+        .expect("begin no-op retry");
+    assert_eq!(
+        no_op.commit().await.expect("no-op retries pending push"),
+        None
+    );
+    drop(steward);
+    let acknowledged = src_ctx.open_pond().await.expect("reopen source");
+    let acknowledged = acknowledged.as_pond().expect("source is a pond");
+    assert!(
+        steward::remote_ref_is_acknowledged(acknowledged, &remote_url, "main")
+            .await
+            .expect("read acknowledgement"),
+        "successful no-op retry must acknowledge the current local tip"
+    );
 }
 
 /// D4.4: a remote with mode=pull must NOT be auto-pushed to.  We

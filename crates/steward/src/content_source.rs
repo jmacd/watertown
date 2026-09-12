@@ -351,6 +351,7 @@ impl LocalPondSource {
         let pond_id = ship.control_table().pond_id_uuid();
         let commit_log = crate::content_tree::read_log_leaves(
             ship.data_persistence().table().clone(),
+            ship.data_persistence().store_path(),
             &pond_id.to_string(),
         )
         .await?;

@@ -90,6 +90,7 @@ pub async fn verify_content_against_remote(
         .map_err(|error| StewardError::DeltaLake(error.to_string()))?;
     let local_spines = crate::content_tree::read_log_spines(
         data_table,
+        &data_path,
         &ship.control_table().pond_id_uuid().to_string(),
     )
     .await?;
