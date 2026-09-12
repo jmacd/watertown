@@ -16,6 +16,8 @@ WORKDIR /vendor
 COPY vendor-download.sh download.sh
 RUN bash download.sh
 
+FROM quay.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 AS minio-client
+
 FROM debian:bookworm-slim
 
 # Install runtime dependencies and useful debugging tools
@@ -53,16 +55,9 @@ RUN apt-get update && \
         git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install MinIO client (mc) for S3 testing
-# Detect architecture for proper binary
-RUN ARCH=$(dpkg --print-architecture) && \
-    if [ "$ARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; then \
-        MC_ARCH="arm64"; \
-    else \
-        MC_ARCH="amd64"; \
-    fi && \
-    curl -fsSL "https://dl.min.io/client/mc/release/linux-${MC_ARCH}/mc" -o /usr/local/bin/mc && \
-    chmod +x /usr/local/bin/mc
+# The legacy dl.min.io binary endpoint is gone. Copy the multi-arch client
+# from its immutable official image instead.
+COPY --from=minio-client /usr/bin/mc /usr/local/bin/mc
 
 # Install DuckDB for backup verification and emergency recovery
 # Detect architecture and download appropriate version

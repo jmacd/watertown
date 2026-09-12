@@ -19,6 +19,7 @@ use deltalake::logstore::{
 use deltalake::{DeltaResult, DeltaTableError, Path};
 use object_store::ObjectStoreScheme;
 use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
+use object_store::prefix::PrefixStore;
 use std::str::FromStr;
 use std::sync::Arc;
 use url::Url;
@@ -68,11 +69,17 @@ struct AzureLogStoreFactory {}
 impl LogStoreFactory for AzureLogStoreFactory {
     fn with_options(
         &self,
-        prefixed_store: ObjectStoreRef,
+        _prefixed_store: ObjectStoreRef,
         root_store: ObjectStoreRef,
         location: &Url,
         options: &StorageConfig,
     ) -> DeltaResult<Arc<dyn LogStore>> {
+        let prefix = azure_prefix(location)?;
+        let prefixed_store: ObjectStoreRef = if prefix.as_ref().is_empty() {
+            root_store.clone()
+        } else {
+            Arc::new(PrefixStore::new(root_store.clone(), prefix))
+        };
         Ok(default_logstore(
             prefixed_store,
             root_store,
@@ -120,6 +127,32 @@ mod tests {
     fn azure_child_path_is_preserved() {
         let url = Url::parse("az://container/_publication/").unwrap();
         assert_eq!(azure_prefix(&url).unwrap(), Path::from("_publication"));
+    }
+
+    #[tokio::test]
+    async fn azure_child_logstore_does_not_alias_root() {
+        let root: ObjectStoreRef = Arc::new(object_store::memory::InMemory::new());
+        root.put(
+            &Path::from("_delta_log/00000000000000000000.json"),
+            bytes::Bytes::from_static(b"root").into(),
+        )
+        .await
+        .unwrap();
+        let location = Url::parse("az://container/_publication/").unwrap();
+        let logstore = AzureLogStoreFactory::default()
+            .with_options(root.clone(), root, &location, &StorageConfig::default())
+            .unwrap();
+
+        assert!(!logstore.is_delta_table_location().await.unwrap());
+        logstore
+            .object_store(None)
+            .put(
+                &Path::from("_delta_log/00000000000000000000.json"),
+                bytes::Bytes::from_static(b"publication").into(),
+            )
+            .await
+            .unwrap();
+        assert!(logstore.is_delta_table_location().await.unwrap());
     }
 
     /// Registration must be safe to repeat: profiles register their handlers
