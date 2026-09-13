@@ -1030,48 +1030,39 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
     syncGeometry();
     new ResizeObserver(syncGeometry).observe(plotEl);
 
-    function nearestByTime(t) {
+    // Index of the last sample at or before `t` (i.e. the left endpoint of
+    // the segment straddling `t`). Used to interpolate the line's true
+    // value under the cursor rather than snapping to whichever endpoint is
+    // merely nearest in time.
+    function floorIdx(t) {
       let lo = 0, hi = sampleMs.length - 1;
       if (t <= sampleMs[0]) return 0;
-      if (t >= sampleMs[hi]) return hi;
+      if (t >= sampleMs[hi]) return hi - 1;
       while (lo <= hi) {
         const mid = (lo + hi) >> 1;
-        if (sampleMs[mid] < t) lo = mid + 1; else hi = mid - 1;
+        if (sampleMs[mid] <= t) lo = mid + 1; else hi = mid - 1;
       }
-      // `lo` is the first sample >= t; pick whichever neighbour is closer --
-      // i.e. the sample closest to the cursor in time, never the next one.
-      return (Math.abs(sampleMs[lo] - t) < Math.abs(t - sampleMs[lo - 1])) ? lo : lo - 1;
+      return lo - 1;
     }
 
-    // Nearest-in-time is not the same as nearest-to-the-cursor: when the
-    // series moves steeply (e.g. a pump cycle's drop/recovery covering
-    // several minutes' worth of y-range within just a pixel or two of x),
-    // the time-nearest sample can be visually far from where the cursor
-    // actually sits over the line. Search a small window of neighbouring
-    // samples (by time) and pick whichever one's rendered position is
-    // truly closest to the cursor in screen space, so the highlighted
-    // point always matches what the user is pointing at.
-    function nearestIdx(clampedX, offsetY, marginTop, xScale, yScale) {
-      const t = +xScale.invert(clampedX);
-      const byTime = nearestByTime(t);
-      if (offsetY == null || !hover.series.length) return byTime;
-      const primaryCol = hover.series[0].col;
-      const WINDOW = 6;
-      const from = Math.max(0, byTime - WINDOW);
-      const to = Math.min(sampleMs.length - 1, byTime + WINDOW);
-      let best = byTime, bestDist = Infinity;
-      for (let i = from; i <= to; i++) {
-        const v = hover.rows[i][primaryCol];
-        if (v == null || Number.isNaN(Number(v))) continue;
-        const dx = xScale(sampleMs[i]) - clampedX;
-        const dy = marginTop + yScale(Number(v)) - offsetY;
-        const dist = dx * dx + dy * dy;
-        if (dist < bestDist) {
-          bestDist = dist;
-          best = i;
-        }
-      }
-      return best;
+    // The crosshair stays exactly under the cursor's x, and each series'
+    // dot is placed at the line's *interpolated* value at that instant --
+    // i.e. exactly where the rendered line crosses the vertical cursor
+    // line -- rather than snapping to whichever real sample is "nearest".
+    // Nearest-sample snapping is wrong here because a single pixel of x can
+    // span several minutes of a steep pump-cycle drop/recovery; picking one
+    // endpoint's raw value would visibly disagree with where the line
+    // actually is under the cursor.
+    function valueAt(t, col) {
+      const i0 = floorIdx(t);
+      const i1 = Math.min(i0 + 1, sampleMs.length - 1);
+      const v0 = hover.rows[i0][col];
+      const v1 = hover.rows[i1][col];
+      if (v0 == null || Number.isNaN(Number(v0))) return v1 == null ? null : Number(v1);
+      if (v1 == null || Number.isNaN(Number(v1)) || i1 === i0) return Number(v0);
+      const span = sampleMs[i1] - sampleMs[i0];
+      const frac = span > 0 ? Math.max(0, Math.min(1, (t - sampleMs[i0]) / span)) : 0;
+      return Number(v0) + frac * (Number(v1) - Number(v0));
     }
 
     function showHover(offsetX, offsetY) {
@@ -1080,18 +1071,19 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
       const xScale = view.scale("x");
       const yScale = view.scale("y");
       const clampedX = Math.max(0, Math.min(offsetX, plotWidth));
-      const idx = nearestIdx(clampedX, offsetY, marginTop, xScale, yScale);
-      const row = hover.rows[idx];
-      const px = xScale(sampleMs[idx]);
+      const t = +xScale.invert(clampedX);
+      const px = clampedX;
 
       crosshair.style.left = px + "px";
       crosshair.style.display = "block";
 
       const timeEl = document.createElement("div");
       timeEl.className = "tt-time";
-      timeEl.textContent = new Date(sampleMs[idx]).toLocaleString();
+      timeEl.textContent = new Date(t).toLocaleString();
       tooltip.replaceChildren(timeEl);
       hover.series.forEach((s, i) => {
+        const v = valueAt(t, s.col);
+
         const r = document.createElement("div");
         r.className = "tt-row";
         const dot = document.createElement("span");
@@ -1102,13 +1094,12 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
         lab.textContent = s.label;
         const val = document.createElement("span");
         val.className = "tt-val";
-        val.textContent = hover.fmt(row[s.col]);
+        val.textContent = hover.fmt(v);
         r.append(dot, lab, val);
         tooltip.appendChild(r);
 
         // Highlight the exact intersection point on the line, and echo its
         // value on the y-axis, for every series that has a value here.
-        const v = row[s.col];
         const dotEl = dots[i];
         const axisEl = axisLabels[i];
         if (v == null || Number.isNaN(Number(v))) {
