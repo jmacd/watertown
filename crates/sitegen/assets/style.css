@@ -680,25 +680,6 @@ tr:hover td {
   box-shadow: var(--shadow-sm);
 }
 
-/* Value badge pinned to the y-axis (left margin) at the hovered value's
-   height, so the reading is visible without hunting through the tooltip. */
-.hover-axis-value {
-  position: absolute;
-  left: 0;
-  z-index: 11;
-  transform: translateY(-50%);
-  background: var(--bg);
-  border: 1px solid;
-  border-radius: 4px;
-  padding: 1px 5px;
-  font-size: 0.72rem;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-  pointer-events: none;
-  box-shadow: var(--shadow-sm);
-}
-
 /* ── Charts ─────────────────────────────────────────────────── */
 
 .chart-container {

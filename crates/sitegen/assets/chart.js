@@ -945,12 +945,9 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
   // Attach a brush overlay to a chart wrapper.  The overlay sits on top of
   // the chart SVG and translates pixel drag → time domain → re-render.
   //
-  // `view` is the live Vega View for this chart: its own `x`/`y` scales (and
-  // `origin()`/`width()` geometry) are read fresh on every interaction so the
-  // overlay always agrees with what Vega actually rendered -- including any
-  // axis "nice" rounding, margin changes from label width, or a post-embed
-  // `refit()` -- instead of duplicating that math from cached values that can
-  // drift out of sync and misalign the crosshair from the plotted line.
+  // `view` is the live Vega View for this chart: its own `x`/`y` scales,
+  // origin, padding, and dimensions are read fresh on every interaction so the
+  // overlay always agrees with what Vega actually rendered.
   function attachBrush(plotEl, view, hover) {
     // Overlay is a child of the plot element itself (not the wrapper, which
     // also contains the header above it) so its coordinate space starts at
@@ -958,8 +955,6 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
     plotEl.style.position = "relative";
     const overlay = document.createElement("div");
     overlay.className = "brush-overlay";
-    overlay.style.top = "0";
-    overlay.style.height = "100%";
     plotEl.appendChild(overlay);
 
     // Re-read the plot geometry from the live view and re-position the
@@ -968,13 +963,16 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
     // leaves the overlay's hit-area/pixel-math out of sync with the render.
     function syncGeometry() {
       const origin = view.origin();
-      overlay.style.left = origin[0] + "px";
+      const padding = view.padding();
+      const paddingLeft = typeof padding === "number" ? padding : padding.left;
+      const paddingTop = typeof padding === "number" ? padding : padding.top;
+      const plotLeft = origin[0] + paddingLeft;
+      const plotTop = origin[1] + paddingTop;
+      overlay.style.left = plotLeft + "px";
+      overlay.style.top = plotTop + "px";
       overlay.style.width = view.width() + "px";
-      // Right-anchor the axis-value badges just left of the axis line
-      // (`origin[0]` is where the plot area -- and the axis -- begins).
-      const rightGap = Math.max(0, plotEl.clientWidth - origin[0] + 4);
-      axisLabels.forEach(l => (l.style.right = rightGap + "px"));
-      return { marginTop: origin[1], plotWidth: view.width() };
+      overlay.style.height = view.height() + "px";
+      return { plotWidth: view.width() };
     }
 
     const rect = document.createElement("div");
@@ -985,12 +983,11 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
     // A thin vertical line tracks the cursor (snapped to the nearest sample)
     // and a small box lists each series' value (with its colour and units) at
     // that instant, plus a highlighted dot on each series marking exactly
-    // where the crosshair intersects the line, and a value badge on the
-    // y-axis for each dot so the reading is visible without needing the
-    // tooltip. Built on the same overlay so it shares the plot geometry and
-    // yields to brushing while a drag is in progress.
+    // where the crosshair intersects the line. Built on the same overlay so it
+    // shares the plot geometry and yields to brushing while a drag is in
+    // progress.
     let crosshair = null, tooltip = null, sampleMs = null;
-    let dots = [], axisLabels = [];
+    let dots = [];
     if (hover && hover.rows.length) {
       crosshair = document.createElement("div");
       crosshair.className = "crosshair-line";
@@ -1009,19 +1006,6 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
         dot.style.display = "none";
         overlay.appendChild(dot);
         return dot;
-      });
-
-      // Axis-value badges live on the plot element (not clipped by the
-      // overlay's plot-area width) so they can sit in the left margin, over
-      // the y-axis, at the exact height of each series' hovered value.
-      axisLabels = hover.series.map(s => {
-        const lab = document.createElement("div");
-        lab.className = "hover-axis-value";
-        lab.style.color = s.color;
-        lab.style.borderColor = s.color;
-        lab.style.display = "none";
-        plotEl.appendChild(lab);
-        return lab;
       });
 
       sampleMs = hover.rows.map(hover.toMs);
@@ -1067,7 +1051,7 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
 
     function showHover(offsetX, offsetY) {
       if (!crosshair) return;
-      const { marginTop, plotWidth } = syncGeometry();
+      const { plotWidth } = syncGeometry();
       const xScale = view.scale("x");
       const yScale = view.scale("y");
       const clampedX = Math.max(0, Math.min(offsetX, plotWidth));
@@ -1098,23 +1082,16 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
         r.append(dot, lab, val);
         tooltip.appendChild(r);
 
-        // Highlight the exact intersection point on the line, and echo its
-        // value on the y-axis, for every series that has a value here.
+        // Highlight the exact intersection point on the line.
         const dotEl = dots[i];
-        const axisEl = axisLabels[i];
         if (v == null || Number.isNaN(Number(v))) {
           dotEl.style.display = "none";
-          axisEl.style.display = "none";
           return;
         }
-        const py = marginTop + yScale(Number(v));
+        const py = yScale(Number(v));
         dotEl.style.left = px + "px";
         dotEl.style.top = py + "px";
         dotEl.style.display = "block";
-
-        axisEl.textContent = hover.fmt(v);
-        axisEl.style.top = py + "px";
-        axisEl.style.display = "block";
       });
       tooltip.style.display = "block";
 
@@ -1131,7 +1108,6 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
       crosshair.style.display = "none";
       tooltip.style.display = "none";
       dots.forEach(d => (d.style.display = "none"));
-      axisLabels.forEach(l => (l.style.display = "none"));
     }
 
     let startX = null;
@@ -1370,8 +1346,8 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
       // Attach brush-to-zoom on the rendered SVG, plus a hover crosshair that
       // reports each series' value at the pointed-to sample. The brush/hover
       // overlay is library-agnostic DOM positioned from the Vega view geometry:
-      // `origin()[0]` is the data-rect left (y-axis gutter), `width()` the inner
-      // plot width.
+      // the view origin plus its renderer padding locates the data rectangle,
+      // while `width()` and `height()` give the inner plot dimensions.
       const hoverSeries = series
         .map((s, i) => ({ col: s.avg, color: colorFor(i), label: legendLabel(s.base) }))
         .filter(h => h.col);

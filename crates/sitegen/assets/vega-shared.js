@@ -113,14 +113,14 @@ export function buildMetricChartSpec(opts) {
     series,
     xField = "timestamp",
     xDomain,
-    yLabel,
     height = 300,
     byteAxis = false,
     yZero = false,
     theme,
     annotations = [],
   } = opts;
-  const yAxis = { grid: true, title: yLabel || null };
+  const yAxis = { grid: true, title: null };
+  const xAxis = { grid: true, title: "Date" };
   if (byteAxis) yAxis.format = "~s";
   // For rate/flow metrics (`yZero`), zero is a meaningful baseline, so anchor
   // the y scale at 0 for every series mapped to it.  Other charts plot
@@ -128,14 +128,9 @@ export function buildMetricChartSpec(opts) {
   const yScale = yZero ? { zero: true } : null;
   const layers = [];
 
-  // Dedicated invisible layer that always carries the y-axis (and, for rate
-  // charts, pins 0 into the shared domain).  Without it the axis is bound to
-  // the first data layer, so it vanishes whenever that series has no points in
-  // the visible window (e.g. a short recent window where only one of two lines
-  // has data) -- taking the zero reference with it.  This layer always has one
-  // datum, so the axis renders regardless of which series is populated.  Only
-  // emitted for `yZero` charts to avoid forcing 0 onto arbitrary-scale charts.
-  let yAssigned = false;
+  // For rate charts, pin 0 into the shared domain even when no series contains
+  // a zero-valued point. All layers declare the same axis so Vega-Lite merges
+  // them into one conventional numeric axis.
   if (yZero) {
     layers.push({
       data: { values: [{ __axis0: 0 }] },
@@ -144,7 +139,6 @@ export function buildMetricChartSpec(opts) {
         y: { field: "__axis0", type: "quantitative", scale: yScale, axis: yAxis },
       },
     });
-    yAssigned = true;
   }
 
   // Optional annotation bands: a secondary interval dataset (e.g. pump state /
@@ -158,7 +152,7 @@ export function buildMetricChartSpec(opts) {
       data: { values: annotations },
       mark: { type: "rect", clip: true, tooltip: true },
       encoding: {
-        x: { field: "start", type: "temporal", scale: { domain: xDomain, nice: false }, axis: null },
+        x: { field: "start", type: "temporal", scale: { domain: xDomain, nice: false }, axis: xAxis },
         x2: { field: "end" },
         color: { field: "color", type: "nominal", scale: null, legend: null },
         opacity: { field: "opacity", type: "quantitative", scale: null, legend: null },
@@ -172,20 +166,18 @@ export function buildMetricChartSpec(opts) {
       layers.push({
         mark: { type: "area", color: s.color, opacity: 0.15, clip: true, invalid: null },
         encoding: {
-          y: { field: escapeField(s.min), type: "quantitative", axis: yAssigned ? null : yAxis, ...(yScale ? { scale: yScale } : {}) },
+          y: { field: escapeField(s.min), type: "quantitative", axis: yAxis, ...(yScale ? { scale: yScale } : {}) },
           y2: { field: escapeField(s.max) },
         },
       });
-      yAssigned = true;
     }
     if (s.avg) {
       layers.push({
         mark: { type: "line", color: s.color, strokeWidth: 1.5, clip: true, invalid: null },
         encoding: {
-          y: { field: escapeField(s.avg), type: "quantitative", axis: yAssigned ? null : yAxis, ...(yScale ? { scale: yScale } : {}) },
+          y: { field: escapeField(s.avg), type: "quantitative", axis: yAxis, ...(yScale ? { scale: yScale } : {}) },
         },
       });
-      yAssigned = true;
     }
   }
   return {
@@ -204,7 +196,7 @@ export function buildMetricChartSpec(opts) {
         // the axis (and anything computed from the queried domain) subtly
         // offset from what's actually plotted.
         scale: { domain: xDomain, nice: false },
-        axis: { grid: true },
+        axis: xAxis,
       },
     },
     layer: layers,
