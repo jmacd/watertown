@@ -1030,7 +1030,7 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
     syncGeometry();
     new ResizeObserver(syncGeometry).observe(plotEl);
 
-    function nearestIdx(t) {
+    function nearestByTime(t) {
       let lo = 0, hi = sampleMs.length - 1;
       if (t <= sampleMs[0]) return 0;
       if (t >= sampleMs[hi]) return hi;
@@ -1043,14 +1043,44 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
       return (Math.abs(sampleMs[lo] - t) < Math.abs(t - sampleMs[lo - 1])) ? lo : lo - 1;
     }
 
+    // Nearest-in-time is not the same as nearest-to-the-cursor: when the
+    // series moves steeply (e.g. a pump cycle's drop/recovery covering
+    // several minutes' worth of y-range within just a pixel or two of x),
+    // the time-nearest sample can be visually far from where the cursor
+    // actually sits over the line. Search a small window of neighbouring
+    // samples (by time) and pick whichever one's rendered position is
+    // truly closest to the cursor in screen space, so the highlighted
+    // point always matches what the user is pointing at.
+    function nearestIdx(clampedX, offsetY, marginTop, xScale, yScale) {
+      const t = +xScale.invert(clampedX);
+      const byTime = nearestByTime(t);
+      if (offsetY == null || !hover.series.length) return byTime;
+      const primaryCol = hover.series[0].col;
+      const WINDOW = 6;
+      const from = Math.max(0, byTime - WINDOW);
+      const to = Math.min(sampleMs.length - 1, byTime + WINDOW);
+      let best = byTime, bestDist = Infinity;
+      for (let i = from; i <= to; i++) {
+        const v = hover.rows[i][primaryCol];
+        if (v == null || Number.isNaN(Number(v))) continue;
+        const dx = xScale(sampleMs[i]) - clampedX;
+        const dy = marginTop + yScale(Number(v)) - offsetY;
+        const dist = dx * dx + dy * dy;
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = i;
+        }
+      }
+      return best;
+    }
+
     function showHover(offsetX, offsetY) {
       if (!crosshair) return;
       const { marginTop, plotWidth } = syncGeometry();
       const xScale = view.scale("x");
       const yScale = view.scale("y");
       const clampedX = Math.max(0, Math.min(offsetX, plotWidth));
-      const t = +xScale.invert(clampedX);
-      const idx = nearestIdx(t);
+      const idx = nearestIdx(clampedX, offsetY, marginTop, xScale, yScale);
       const row = hover.rows[idx];
       const px = xScale(sampleMs[idx]);
 
