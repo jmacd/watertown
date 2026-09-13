@@ -945,16 +945,35 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
   // Attach a brush overlay to a chart wrapper.  The overlay sits on top of
   // the chart SVG and translates pixel drag → time domain → re-render.
   //
-  // `domainBegin` / `domainEnd` are epoch-ms values that correspond to the
-  // left/right edges of the plot area (the SVG viewBox minus margins).
-  function attachBrush(wrapper, plotEl, domainBegin, domainEnd, marginLeft, plotWidth, hover) {
+  // `view` is the live Vega View for this chart: its own `x`/`y` scales,
+  // origin, padding, and dimensions are read fresh on every interaction so the
+  // overlay always agrees with what Vega actually rendered.
+  function attachBrush(plotEl, view, hover) {
+    // Overlay is a child of the plot element itself (not the wrapper, which
+    // also contains the header above it) so its coordinate space starts at
+    // the top of the actual chart, matching the Vega view's own origin.
+    plotEl.style.position = "relative";
     const overlay = document.createElement("div");
     overlay.className = "brush-overlay";
-    // Position over just the plot area (inside margins)
-    overlay.style.left = marginLeft + "px";
-    overlay.style.width = plotWidth + "px";
-    wrapper.style.position = "relative";
-    wrapper.appendChild(overlay);
+    plotEl.appendChild(overlay);
+
+    // Re-read the plot geometry from the live view and re-position the
+    // overlay to match. Called on attach and on every resize so a delayed
+    // `refit()` (e.g. the initial zero-width-container correction) never
+    // leaves the overlay's hit-area/pixel-math out of sync with the render.
+    function syncGeometry() {
+      const origin = view.origin();
+      const padding = view.padding();
+      const paddingLeft = typeof padding === "number" ? padding : padding.left;
+      const paddingTop = typeof padding === "number" ? padding : padding.top;
+      const plotLeft = origin[0] + paddingLeft;
+      const plotTop = origin[1] + paddingTop;
+      overlay.style.left = plotLeft + "px";
+      overlay.style.top = plotTop + "px";
+      overlay.style.width = view.width() + "px";
+      overlay.style.height = view.height() + "px";
+      return { plotWidth: view.width() };
+    }
 
     const rect = document.createElement("div");
     rect.className = "brush-rect";
@@ -963,9 +982,12 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
     // ── Hover crosshair + value tooltip ──────────────────────────────────────
     // A thin vertical line tracks the cursor (snapped to the nearest sample)
     // and a small box lists each series' value (with its colour and units) at
-    // that instant. Built on the same overlay so it shares the plot geometry
-    // and yields to brushing while a drag is in progress.
+    // that instant, plus a highlighted dot on each series marking exactly
+    // where the crosshair intersects the line. Built on the same overlay so it
+    // shares the plot geometry and yields to brushing while a drag is in
+    // progress.
     let crosshair = null, tooltip = null, sampleMs = null;
+    let dots = [];
     if (hover && hover.rows.length) {
       crosshair = document.createElement("div");
       crosshair.className = "crosshair-line";
@@ -977,37 +999,75 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
       tooltip.style.display = "none";
       overlay.appendChild(tooltip);
 
+      dots = hover.series.map(s => {
+        const dot = document.createElement("div");
+        dot.className = "hover-dot";
+        dot.style.borderColor = s.color;
+        dot.style.display = "none";
+        overlay.appendChild(dot);
+        return dot;
+      });
+
       sampleMs = hover.rows.map(hover.toMs);
     }
 
-    function nearestIdx(t) {
+    syncGeometry();
+    new ResizeObserver(syncGeometry).observe(plotEl);
+
+    // Index of the last sample at or before `t` (i.e. the left endpoint of
+    // the segment straddling `t`). Used to interpolate the line's true
+    // value under the cursor rather than snapping to whichever endpoint is
+    // merely nearest in time.
+    function floorIdx(t) {
       let lo = 0, hi = sampleMs.length - 1;
       if (t <= sampleMs[0]) return 0;
-      if (t >= sampleMs[hi]) return hi;
+      if (t >= sampleMs[hi]) return hi - 1;
       while (lo <= hi) {
         const mid = (lo + hi) >> 1;
-        if (sampleMs[mid] < t) lo = mid + 1; else hi = mid - 1;
+        if (sampleMs[mid] <= t) lo = mid + 1; else hi = mid - 1;
       }
-      // `lo` is the first sample >= t; pick whichever neighbour is closer.
-      return (Math.abs(sampleMs[lo] - t) < Math.abs(t - sampleMs[lo - 1])) ? lo : lo - 1;
+      return lo - 1;
+    }
+
+    // The crosshair stays exactly under the cursor's x, and each series'
+    // dot is placed at the line's *interpolated* value at that instant --
+    // i.e. exactly where the rendered line crosses the vertical cursor
+    // line -- rather than snapping to whichever real sample is "nearest".
+    // Nearest-sample snapping is wrong here because a single pixel of x can
+    // span several minutes of a steep pump-cycle drop/recovery; picking one
+    // endpoint's raw value would visibly disagree with where the line
+    // actually is under the cursor.
+    function valueAt(t, col) {
+      const i0 = floorIdx(t);
+      const i1 = Math.min(i0 + 1, sampleMs.length - 1);
+      const v0 = hover.rows[i0][col];
+      const v1 = hover.rows[i1][col];
+      if (v0 == null || Number.isNaN(Number(v0))) return v1 == null ? null : Number(v1);
+      if (v1 == null || Number.isNaN(Number(v1)) || i1 === i0) return Number(v0);
+      const span = sampleMs[i1] - sampleMs[i0];
+      const frac = span > 0 ? Math.max(0, Math.min(1, (t - sampleMs[i0]) / span)) : 0;
+      return Number(v0) + frac * (Number(v1) - Number(v0));
     }
 
     function showHover(offsetX, offsetY) {
       if (!crosshair) return;
+      const { plotWidth } = syncGeometry();
+      const xScale = view.scale("x");
+      const yScale = view.scale("y");
       const clampedX = Math.max(0, Math.min(offsetX, plotWidth));
-      const t = domainBegin + (clampedX / plotWidth) * (domainEnd - domainBegin);
-      const idx = nearestIdx(t);
-      const row = hover.rows[idx];
-      const px = ((sampleMs[idx] - domainBegin) / (domainEnd - domainBegin)) * plotWidth;
+      const t = +xScale.invert(clampedX);
+      const px = clampedX;
 
       crosshair.style.left = px + "px";
       crosshair.style.display = "block";
 
       const timeEl = document.createElement("div");
       timeEl.className = "tt-time";
-      timeEl.textContent = new Date(sampleMs[idx]).toLocaleString();
+      timeEl.textContent = new Date(t).toLocaleString();
       tooltip.replaceChildren(timeEl);
-      for (const s of hover.series) {
+      hover.series.forEach((s, i) => {
+        const v = valueAt(t, s.col);
+
         const r = document.createElement("div");
         r.className = "tt-row";
         const dot = document.createElement("span");
@@ -1018,10 +1078,21 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
         lab.textContent = s.label;
         const val = document.createElement("span");
         val.className = "tt-val";
-        val.textContent = hover.fmt(row[s.col]);
+        val.textContent = hover.fmt(v);
         r.append(dot, lab, val);
         tooltip.appendChild(r);
-      }
+
+        // Highlight the exact intersection point on the line.
+        const dotEl = dots[i];
+        if (v == null || Number.isNaN(Number(v))) {
+          dotEl.style.display = "none";
+          return;
+        }
+        const py = yScale(Number(v));
+        dotEl.style.left = px + "px";
+        dotEl.style.top = py + "px";
+        dotEl.style.display = "block";
+      });
       tooltip.style.display = "block";
 
       // Prefer the right of the line; flip left if it would overflow.
@@ -1036,6 +1107,7 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
       if (!crosshair) return;
       crosshair.style.display = "none";
       tooltip.style.display = "none";
+      dots.forEach(d => (d.style.display = "none"));
     }
 
     let startX = null;
@@ -1050,6 +1122,7 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
     });
 
     overlay.addEventListener("mousemove", e => {
+      const { plotWidth } = syncGeometry();
       if (startX === null) { showHover(e.offsetX, e.offsetY); return; }
       const curX = Math.max(0, Math.min(e.offsetX, plotWidth));
       const left = Math.min(startX, curX);
@@ -1060,6 +1133,7 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
 
     const finish = e => {
       if (startX === null) return;
+      const { plotWidth } = syncGeometry();
       const endX = Math.max(0, Math.min(e.offsetX, plotWidth));
       const left = Math.min(startX, endX);
       const right = Math.max(startX, endX);
@@ -1069,9 +1143,11 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
       // Ignore tiny drags (< 5 px)
       if (right - left < 5) return;
 
-      // Map pixel range → time domain
-      const t0 = domainBegin + (left / plotWidth) * (domainEnd - domainBegin);
-      const t1 = domainBegin + (right / plotWidth) * (domainEnd - domainBegin);
+      // Map pixel range → time domain using the live x scale, matching
+      // exactly what is rendered (including any axis rounding).
+      const xScale = view.scale("x");
+      const t0 = +xScale.invert(left);
+      const t1 = +xScale.invert(right);
 
       zoomDomain = [t0, t1];
       // Deactivate duration buttons, show reset
@@ -1270,8 +1346,8 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
       // Attach brush-to-zoom on the rendered SVG, plus a hover crosshair that
       // reports each series' value at the pointed-to sample. The brush/hover
       // overlay is library-agnostic DOM positioned from the Vega view geometry:
-      // `origin()[0]` is the data-rect left (y-axis gutter), `width()` the inner
-      // plot width.
+      // the view origin plus its renderer padding locates the data rectangle,
+      // while `width()` and `height()` give the inner plot dimensions.
       const hoverSeries = series
         .map((s, i) => ({ col: s.avg, color: colorFor(i), label: legendLabel(s.base) }))
         .filter(h => h.col);
@@ -1281,7 +1357,7 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
         series: hoverSeries,
         fmt: fmtVal,
       };
-      attachBrush(wrapper, plotDiv, domainBegin, domainEnd, view.origin()[0], view.width(), hover);
+      attachBrush(plotDiv, view, hover);
     }
   }
 

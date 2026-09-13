@@ -1,8 +1,10 @@
 # Low-cost correctness findings and release gates
 
-Status: release-blocking review.
+Status: release gates satisfied; production activated 2026-09-12.
 
 Date: 2026-09-08.
+
+Production qualification: 2026-09-12.
 
 ## 1. Decision
 
@@ -424,9 +426,9 @@ All gates below are required before this work is release-ready.
 | LC-13 | Normal-limit production canary succeeds | Producer, consumer, and maintenance metrics remain within measured proportional bounds without a limiter override |
 | LC-14 | Documentation matches behavior | Operator and design documentation describe command boundaries, publication state, recovery, and cost invariants accurately |
 
-The production site timer must remain disabled until the repaired/migrated Noyo
-remote completes a normal-limit catch-up and a subsequent scheduled
-normal-limit cycle succeeds.
+LC-12 and LC-13 were satisfied on 2026-09-12 by the measurements in Section
+14. All four production timers were then enabled, and their immediately
+triggered no-override cycle completed successfully.
 
 ## 11. Required regression matrix
 
@@ -598,12 +600,11 @@ missing/corrupt local input failures, failure after pack durability but before
 locator installation, fresh clone through one consolidated pack, an unrelated
 file change beside an unchanged 1,000-leaf series, one-leaf local apply cost
 after 1/100/1,000 retained leaves with zero retained leaf hashes scanned, and
-equal generic remote consumer cost after 1, 100, and 1,000 prior updates. The
-production/backend qualification and canary gates LC-12 and LC-13 remain
-operational work; this implementation does not claim those observations.
-The consolidated-pack and local-planning tests use local/in-memory backends.
-They do not qualify live S3 or Azure conditional-create, read-after-write,
-limiter, or cost behavior.
+equal generic remote consumer cost after 1, 100, and 1,000 prior updates.
+Live Azure producer, consumer, acknowledgement, limiter, and activation
+qualification completed on 2026-09-12 as recorded in Section 14. The
+consolidated-pack and local-planning tests still use local/in-memory backends
+and do not independently qualify live S3 behavior.
 
 ## 13. Why the earlier efficiency evaluation was insufficient
 
@@ -638,18 +639,72 @@ maintenance rewrite.
 
 ## 14. Production verification report
 
-For each producer, record one unchanged cycle and one representative changed
-cycle:
+Production was qualified on 2026-09-12 with Watertown `0.165.228`
+(`7aecbc9e`) using fresh `-0003` local volumes and Azure containers. The
+promoted `prod-arm64` image digest was
+`sha256:f13fe24accc0b9a5cb900f4ae45fcd43944351aee9a92f5c52844d83912e3df9`.
+The retained `-0002` state was not modified.
+
+Initial full snapshots used the documented, command-scoped
+`POND_IGNORE_LIMITS=1` seed authorization:
+
+| Producer | Objects | Metered operations | Metered bytes | Published tip |
+|---|---:|---:|---:|---|
+| Water | 521 | 4,853 | 11,845,845,353 | `92db4921f882756f22b941a84c4a2d39e2f1765ab620d8ea5d52bc3fb8d2786f` |
+| Septic | 31 | 249 | 187,833,885 | `753979b39a2395a0ccb1005e25b502b20c147aa0d4cd65941ef789da8b383871` |
+| Noyo | 66 | 340 | 822,478 | `8efdcfb35302613890f337dd88350704a0df2128bcc957a04ee0917586047c02` |
+
+Those full-transfer numbers establish successful Azure publication and
+fetchability, not ordinary-operation efficiency. The following producer
+cycles ran without an override:
 
 | Producer | Source change | Data commits | Backup opens | New objects | Payload bytes written | Consumer bytes read | Maintenance bytes rewritten |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| water | | | | | | | |
-| septic | | | | | | | |
-| Noyo Git data | | | | | | | |
-| Noyo site content | | | | | | | |
-| Noyo HydroVu | | | | | | | |
+| Water | 327,519 appended bytes | 1 | 1 | 44 | 389,205 | 160,554 | 0 remote |
+| Septic | unchanged, 2 files / 187,435,864 bytes | 0 | 0 | 0 | 0 | 120,143 | 0 remote |
+| Noyo Git data | unchanged ref | 0 | 0 | 0 | 0 | included below | 0 remote |
+| Noyo site content | unchanged ref | 0 | 0 | 0 | 0 | included below | 0 remote |
+| Noyo HydroVu | 5,787 observations | 1 | 1 | 57 | 395,610 | 132,496 | 0 remote |
 
-Also record:
+Water's changed push used 246 total Azure operations and 796,383 total bytes,
+advancing the acknowledged tip to
+`2d7793eb7fee6f10f3441b348d8f4c81cae6779456f3f78885bbecd3771cb941`.
+Noyo's changed push used 312 operations and 791,907 bytes, advancing to
+`21287f97b098aa1dc19fb2f72a48fef74beb51ada0477d3f4ec2806a43b90458`.
+An explicit Water push at an already acknowledged tip returned before remote
+open. The unchanged Septic ingest and both unchanged Noyo Git pulls likewise
+produced no data commit and skipped publication.
+
+The first site import fetched the three complete live snapshots under the
+seed override:
+
+| Remote | Operations | Bytes read |
+|---|---:|---:|
+| Water | 1,149 | 11,845,743,324 |
+| Noyo | 216 | 944,885 |
+| Septic | 104 | 187,573,289 |
+
+The subsequent normal-limit site canary found every tip current. Each pull
+used 37 operations with no payload or pack traversal:
+
+| Remote | Bytes read | Current tip |
+|---|---:|---|
+| Water | 160,554 | `2d7793eb7fee6f10f3441b348d8f4c81cae6779456f3f78885bbecd3771cb941` |
+| Noyo | 132,496 | `21287f97b098aa1dc19fb2f72a48fef74beb51ada0477d3f4ec2806a43b90458` |
+| Septic | 120,143 | `753979b39a2395a0ccb1005e25b502b20c147aa0d4cd65941ef789da8b383871` |
+
+Site generation completed in 266.521 seconds with a 501.95 MiB peak and
+atomically deployed `build-20260912-233552`. After timer activation, all four
+immediately triggered services completed successfully and deployed
+`build-20260912-234140`; both `https://casparwater.us/` and
+`https://casparwater.us/noyo-harbor/` returned HTTP 200.
+
+The normal consumer pulls had no fallback or inventory scans, and maintenance
+reported content-preserving local compaction with no replica update. All
+non-zero remote work was attributable to the measured source change or fixed
+current-publication metadata. This satisfies LC-12 and LC-13.
+
+For future qualification runs, continue to record:
 
 - current snapshot tip before and after;
 - acknowledged remote tip before and after;
