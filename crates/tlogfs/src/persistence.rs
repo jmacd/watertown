@@ -12,6 +12,7 @@ use arrow::array::{Array, DictionaryArray};
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::UInt16Type;
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::Utc;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use deltalake::DeltaTable;
@@ -1987,6 +1988,27 @@ impl PersistenceLayer for State {
 
     async fn read_file_version(&self, id: FileID, version: u64) -> TinyFSResult<Vec<u8>> {
         self.inner.lock().await.read_file_version(id, version).await
+    }
+
+    async fn open_file_version(
+        &self,
+        id: FileID,
+        version: u64,
+    ) -> TinyFSResult<Pin<Box<dyn tinyfs::AsyncReadSeek>>> {
+        self.inner.lock().await.open_file_version(id, version).await
+    }
+
+    async fn read_file_version_range(
+        &self,
+        id: FileID,
+        version: u64,
+        range: Range<u64>,
+    ) -> TinyFSResult<Bytes> {
+        self.inner
+            .lock()
+            .await
+            .read_file_version_range(id, version, range)
+            .await
     }
 
     async fn set_extended_attributes(
@@ -4479,7 +4501,7 @@ impl InnerState {
         Ok(version_infos)
     }
 
-    async fn read_file_version(&self, id: FileID, version: u64) -> TinyFSResult<Vec<u8>> {
+    async fn load_file_version_record(&self, id: FileID, version: u64) -> TinyFSResult<OplogEntry> {
         // OPTIMIZATION: Query for specific version instead of fetching all versions
         // Query for specific version only
         let sql = format!(
@@ -4523,51 +4545,109 @@ impl InnerState {
             })
             .cloned();
 
-        let target_record = {
-            pending_record
-                .or_else(|| records.into_iter().next())
-                .ok_or_else(|| {
-                    tinyfs::Error::NotFound(PathBuf::from(format!(
-                        "Version {version} of file {id} not found",
-                    )))
-                })?
-        };
+        pending_record
+            .or_else(|| records.into_iter().next())
+            .ok_or_else(|| {
+                tinyfs::Error::NotFound(PathBuf::from(format!(
+                    "Version {version} of file {id} not found",
+                )))
+            })
+    }
+
+    async fn large_file_reader(
+        &self,
+        target_record: &OplogEntry,
+    ) -> TinyFSResult<crate::large_files::ParquetFileReader> {
+        let blake3 = target_record
+            .blake3
+            .as_ref()
+            .ok_or_else(|| tinyfs::Error::Other("Large file entry missing BLAKE3".to_string()))?;
+
+        let large_file_path = crate::large_files::find_large_file_path(&self.path, blake3)
+            .await
+            .map_other_context("Error searching for large file")?
+            .ok_or_else(|| {
+                tinyfs::Error::NotFound(PathBuf::from(format!(
+                    "Large file with BLAKE3 {} not found",
+                    blake3
+                )))
+            })?;
+
+        let stored_size = target_record.size.ok_or_else(|| {
+            tinyfs::Error::Other("Large file entry missing logical size".to_string())
+        })?;
+        let logical_size = u64::try_from(stored_size).map_err(|_| {
+            tinyfs::Error::Other(format!(
+                "Large file entry has invalid logical size {}",
+                stored_size
+            ))
+        })?;
+        Ok(crate::large_files::ParquetFileReader::with_total_size(
+            large_file_path,
+            logical_size,
+        ))
+    }
+
+    async fn open_file_version(
+        &self,
+        id: FileID,
+        version: u64,
+    ) -> TinyFSResult<Pin<Box<dyn tinyfs::AsyncReadSeek>>> {
+        let target_record = self.load_file_version_record(id, version).await?;
 
         // Load content based on file type
         if target_record.is_large_file() {
-            // Large file: read from external storage
-            let sha256 = target_record.blake3.as_ref().ok_or_else(|| {
-                tinyfs::Error::Other("Large file entry missing BLAKE3".to_string())
-            })?;
-
-            let large_file_path = crate::large_files::find_large_file_path(&self.path, sha256)
-                .await
-                .map_other_context("Error searching for large file")?
-                .ok_or_else(|| {
-                    tinyfs::Error::NotFound(PathBuf::from(format!(
-                        "Large file with BLAKE3 {} not found",
-                        sha256
-                    )))
-                })?;
-
-            // Large files are stored as chunked parquet - use ParquetFileReader to reconstruct
-            use tokio::io::AsyncReadExt;
-            let mut reader = crate::large_files::ParquetFileReader::new(large_file_path)
-                .await
-                .map_other_context("Failed to open large file reader")?;
-
-            let mut content = Vec::new();
-            let _ = reader
-                .read_to_end(&mut content)
-                .await
-                .map_other_context("Failed to read large file")?;
-
-            Ok(content)
+            Ok(Box::pin(self.large_file_reader(&target_record).await?))
         } else {
-            // Small file: content stored inline
-            target_record
-                .content
-                .ok_or_else(|| tinyfs::Error::Other("Small file entry missing content".to_string()))
+            let content = target_record.content.ok_or_else(|| {
+                tinyfs::Error::Other("Small file entry missing content".to_string())
+            })?;
+            Ok(Box::pin(std::io::Cursor::new(content)))
+        }
+    }
+
+    async fn read_file_version(&self, id: FileID, version: u64) -> TinyFSResult<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+
+        let mut reader = self.open_file_version(id, version).await?;
+        let mut content = Vec::new();
+        let _ = reader
+            .read_to_end(&mut content)
+            .await
+            .map_other_context("Failed to read file version")?;
+        Ok(content)
+    }
+
+    async fn read_file_version_range(
+        &self,
+        id: FileID,
+        version: u64,
+        range: Range<u64>,
+    ) -> TinyFSResult<Bytes> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+        let target_record = self.load_file_version_record(id, version).await?;
+        if target_record.is_large_file() {
+            let mut reader = self.large_file_reader(&target_record).await?;
+            let range =
+                tinyfs::persistence::validate_file_version_range(range, reader.total_size())?;
+            _ = reader
+                .seek(std::io::SeekFrom::Start(range.start as u64))
+                .await
+                .map_other_context("Failed to seek large file version")?;
+            let mut content = vec![0; range.len()];
+            _ = reader
+                .read_exact(&mut content)
+                .await
+                .map_other_context("Failed to read large file version range")?;
+            Ok(Bytes::from(content))
+        } else {
+            let content = target_record.content.ok_or_else(|| {
+                tinyfs::Error::Other("Small file entry missing content".to_string())
+            })?;
+            let range =
+                tinyfs::persistence::validate_file_version_range(range, content.len() as u64)?;
+            Ok(Bytes::copy_from_slice(&content[range]))
         }
     }
 

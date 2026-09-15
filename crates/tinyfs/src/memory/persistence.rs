@@ -9,7 +9,11 @@ use crate::persistence::{FileVersionInfo, PersistenceLayer};
 use crate::transaction_guard::TransactionState;
 use crate::{EntryType, NodeMetadata};
 use async_trait::async_trait;
+use bytes::Bytes;
 use std::collections::HashMap;
+use std::io::Cursor;
+use std::ops::Range;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -159,6 +163,33 @@ impl PersistenceLayer for MemoryPersistence {
 
     async fn read_file_version(&self, id: FileID, version: u64) -> Result<Vec<u8>> {
         self.state.lock().await.read_file_version(id, version).await
+    }
+
+    async fn open_file_version(
+        &self,
+        id: FileID,
+        version: u64,
+    ) -> Result<Pin<Box<dyn crate::AsyncReadSeek>>> {
+        let content = self
+            .state
+            .lock()
+            .await
+            .read_file_version(id, version)
+            .await?;
+        Ok(Box::pin(Cursor::new(content)))
+    }
+
+    async fn read_file_version_range(
+        &self,
+        id: FileID,
+        version: u64,
+        range: Range<u64>,
+    ) -> Result<Bytes> {
+        self.state
+            .lock()
+            .await
+            .read_file_version_range(id, version, range)
+            .await
     }
 
     async fn set_extended_attributes(
@@ -499,6 +530,32 @@ impl State {
                 "File {id} not found",
             ))))
         }
+    }
+
+    async fn read_file_version_range(
+        &self,
+        id: FileID,
+        version: u64,
+        range: Range<u64>,
+    ) -> Result<Bytes> {
+        let versions = self.file_versions.get(&id).ok_or_else(|| {
+            Error::NotFound(std::path::PathBuf::from(format!(
+                "No versions found for file {id}"
+            )))
+        })?;
+        let file_version = versions
+            .iter()
+            .find(|file_version| file_version.version == version)
+            .ok_or_else(|| {
+                Error::NotFound(std::path::PathBuf::from(format!(
+                    "Version {version} of file {id} not found"
+                )))
+            })?;
+        let range = crate::persistence::validate_file_version_range(
+            range,
+            file_version.content.len() as u64,
+        )?;
+        Ok(Bytes::copy_from_slice(&file_version.content[range]))
     }
 
     async fn set_extended_attributes(

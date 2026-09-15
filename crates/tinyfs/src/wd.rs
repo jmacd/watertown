@@ -716,9 +716,18 @@ impl WD {
         match lookup {
             Lookup::Found(node) => {
                 wd.check_writable()?;
+                let existing_type = node.entry_type();
+                if existing_type != entry_type {
+                    return Err(Error::entry_type_mismatch(
+                        path_ref,
+                        entry_type,
+                        existing_type,
+                    ));
+                }
                 log::debug!(
-                    "async_writer_path_with_type: file exists at path '{}', returning existing file writer (no directory update)",
-                    path_ref.display()
+                    "async_writer_path_with_type: file exists at path '{}' with requested type {}, returning existing file writer (no directory update)",
+                    path_ref.display(),
+                    entry_type
                 );
                 node.as_file().await?.async_writer().await
             }

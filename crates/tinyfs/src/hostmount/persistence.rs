@@ -9,9 +9,13 @@ use crate::persistence::{FileVersionInfo, PersistenceLayer};
 use crate::transaction_guard::TransactionState;
 use crate::{EntryType, NodeMetadata};
 use async_trait::async_trait;
+use bytes::Bytes;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::Mutex;
 
 /// Host filesystem persistence layer.
@@ -292,6 +296,49 @@ impl PersistenceLayer for HostmountPersistence {
         tokio::fs::read(&path)
             .await
             .map_other_context(format!("Failed to read '{}'", path.display()))
+    }
+
+    async fn open_file_version(
+        &self,
+        id: FileID,
+        _version: u64,
+    ) -> Result<Pin<Box<dyn crate::AsyncReadSeek>>> {
+        let path = self
+            .path_registry
+            .lock()
+            .await
+            .get(&id)
+            .ok_or(Error::IDNotFound(id))?
+            .clone();
+        let file = tokio::fs::File::open(&path)
+            .await
+            .map_other_context(format!("Failed to open '{}'", path.display()))?;
+        Ok(Box::pin(file))
+    }
+
+    async fn read_file_version_range(
+        &self,
+        id: FileID,
+        version: u64,
+        range: Range<u64>,
+    ) -> Result<Bytes> {
+        let mut reader = self.open_file_version(id, version).await?;
+        let size = reader
+            .seek(std::io::SeekFrom::End(0))
+            .await
+            .map_other_context("Failed to determine host file size")?;
+        let range = crate::persistence::validate_file_version_range(range, size)?;
+        _ = reader
+            .seek(std::io::SeekFrom::Start(range.start as u64))
+            .await
+            .map_other_context("Failed to seek host file")?;
+
+        let mut data = vec![0; range.len()];
+        _ = reader
+            .read_exact(&mut data)
+            .await
+            .map_other_context("Failed to read host file range")?;
+        Ok(Bytes::from(data))
     }
 
     async fn set_extended_attributes(

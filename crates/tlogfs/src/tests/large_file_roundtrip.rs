@@ -161,6 +161,51 @@ async fn test_large_file_size_consistency() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+#[tokio::test]
+async fn test_large_file_version_range() -> Result<(), Box<dyn std::error::Error>> {
+    use tinyfs::PersistenceLayer;
+
+    let (_temp_dir, store_path) = test_dir();
+    let mut persistence = OpLogPersistence::create_test_uncompressed(&store_path).await?;
+    let content_size = LARGE_FILE_THRESHOLD + 50000;
+    let original_content: Vec<u8> = (0..content_size).map(|i| (i % 251) as u8).collect();
+
+    let tx = persistence.begin_test().await?;
+    let wd = tx.root().await?;
+    _ = tinyfs::async_helpers::convenience::create_file_path(
+        &wd,
+        "/range_test.dat",
+        &original_content,
+    )
+    .await?;
+    tx.commit_test().await?;
+
+    let tx = persistence.begin_test().await?;
+    let wd = tx.root().await?;
+    let id = wd.get_node_path("/range_test.dat").await?.id();
+    let state = tx.state()?;
+    let version = state.list_file_versions(id).await?[0].version;
+
+    let middle = (content_size / 2) as u64;
+    let middle_range = middle..middle + 257;
+    let middle_bytes = state
+        .read_file_version_range(id, version, middle_range.clone())
+        .await?;
+    assert_eq!(
+        middle_bytes.as_ref(),
+        &original_content[middle_range.start as usize..middle_range.end as usize]
+    );
+
+    let tail_start = content_size as u64 - 97;
+    let tail = state
+        .read_file_version_range(id, version, tail_start..content_size as u64 + 1000)
+        .await?;
+    assert_eq!(tail.as_ref(), &original_content[tail_start as usize..]);
+
+    tx.commit_test().await?;
+    Ok(())
+}
+
 /// Test large file with multiple reads (simulating DataFusion schema inference + data read)
 ///
 /// DataFusion typically:

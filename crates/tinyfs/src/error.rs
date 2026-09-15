@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::node::FileID;
+use crate::{entry_type::EntryType, node::FileID};
 use std::path::{Path, PathBuf};
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -14,6 +14,12 @@ pub enum Error {
     AlreadyExists(PathBuf),
     #[error("EmptyPath")]
     EmptyPath,
+    #[error("EntryTypeMismatch: {path} (requested {requested}, existing {existing})")]
+    EntryTypeMismatch {
+        path: PathBuf,
+        requested: EntryType,
+        existing: EntryType,
+    },
     #[error("IDNotFound: {0}")]
     IDNotFound(FileID),
     #[error("Immutable: {0}")]
@@ -24,6 +30,8 @@ pub enum Error {
     InvalidComponent(PathBuf),
     #[error("InvalidConfig: {0}")]
     InvalidConfig(String),
+    #[error("InvalidRange: {start}..{end} for content of size {size}")]
+    InvalidRange { start: u64, end: u64, size: u64 },
     #[error("MultipleWildcards: {0}")]
     MultipleWildcards(String),
     #[error("NotADirectory: {0}")]
@@ -65,6 +73,23 @@ impl Error {
 
     pub fn not_a_file<P: AsRef<Path>>(path: P) -> Self {
         Error::NotAFile(path.as_ref().to_path_buf())
+    }
+
+    pub fn entry_type_mismatch<P: AsRef<Path>>(
+        path: P,
+        requested: EntryType,
+        existing: EntryType,
+    ) -> Self {
+        Error::EntryTypeMismatch {
+            path: path.as_ref().to_path_buf(),
+            requested,
+            existing,
+        }
+    }
+
+    #[must_use]
+    pub fn invalid_range(start: u64, end: u64, size: u64) -> Self {
+        Error::InvalidRange { start, end, size }
     }
 
     pub fn prefix_not_supported<P: AsRef<Path>>(path: P) -> Self {

@@ -639,6 +639,19 @@ impl ParquetFileReader {
         })
     }
 
+    /// Create a reader when the logical size is already available from version metadata.
+    #[must_use]
+    pub fn with_total_size(file_path: PathBuf, total_size: u64) -> Self {
+        Self {
+            file_path,
+            total_size,
+            position: 0,
+            current_chunk: None,
+            chunk_position: 0,
+            pending_load: None,
+        }
+    }
+
     /// Get total size of the file
     #[must_use]
     pub fn total_size(&self) -> u64 {

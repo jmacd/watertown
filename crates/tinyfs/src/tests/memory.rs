@@ -640,6 +640,46 @@ async fn test_memory_file_series_async_writer_with_versions() {
     }
 }
 
+#[tokio::test]
+async fn test_memory_persistence_version_range_and_reader() {
+    use crate::memory::MemoryPersistence;
+    use crate::node::PartID;
+    use crate::{EntryType, FileID, PersistenceLayer};
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let persistence = MemoryPersistence::default();
+    let id = FileID::new_in_partition(
+        PartID::root(),
+        EntryType::FilePhysicalVersion,
+        crate::local_pond_uuid(),
+    );
+    persistence
+        .store_file_version(id, 1, b"0123456789".to_vec())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        persistence
+            .read_file_version_range(id, 1, 3..7)
+            .await
+            .unwrap(),
+        b"3456".as_slice()
+    );
+    assert_eq!(
+        persistence
+            .read_file_version_range(id, 1, 8..20)
+            .await
+            .unwrap(),
+        b"89".as_slice()
+    );
+
+    let mut reader = persistence.open_file_version(id, 1).await.unwrap();
+    _ = reader.seek(std::io::SeekFrom::Start(5)).await.unwrap();
+    let mut tail = Vec::new();
+    _ = reader.read_to_end(&mut tail).await.unwrap();
+    assert_eq!(tail, b"56789");
+}
+
 #[async_trait::async_trait]
 impl crate::wd::Visitor<Vec<u8>> for FileContentVisitor {
     async fn visit(

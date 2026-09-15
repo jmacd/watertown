@@ -7,8 +7,11 @@ use crate::error::Result;
 use crate::node::{FileID, Node};
 use crate::transaction_guard::TransactionState;
 use async_trait::async_trait;
+use bytes::Bytes;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 
 /// Information about a specific version of a file
@@ -26,6 +29,26 @@ pub struct FileVersionInfo {
     pub entry_type: EntryType,
     /// Extended metadata for this version
     pub extended_metadata: Option<HashMap<String, String>>,
+}
+
+/// Validate and clamp a logical file-version range.
+///
+/// The end offset is clamped to the content size. An empty range is accepted
+/// only at or before EOF; a start beyond EOF or a reversed range is rejected.
+pub fn validate_file_version_range(range: Range<u64>, size: u64) -> Result<Range<usize>> {
+    if range.start > range.end
+        || range.start > size
+        || (range.start == size && range.end > range.start)
+    {
+        return Err(crate::Error::invalid_range(range.start, range.end, size));
+    }
+
+    let end = range.end.min(size);
+    let start = usize::try_from(range.start)
+        .map_err(|_| crate::Error::invalid_range(range.start, range.end, size))?;
+    let end = usize::try_from(end)
+        .map_err(|_| crate::Error::invalid_range(range.start, range.end, size))?;
+    Ok(start..end)
 }
 
 /// Pure persistence layer - no caching, no NodeRef management
@@ -109,6 +132,24 @@ pub trait PersistenceLayer: Send + Sync {
     /// If version is None, reads the latest version
     async fn read_file_version(&self, id: FileID, version: u64) -> Result<Vec<u8>>;
 
+    /// Open a streaming, seekable reader for a specific logical file version.
+    async fn open_file_version(
+        &self,
+        id: FileID,
+        version: u64,
+    ) -> Result<Pin<Box<dyn crate::AsyncReadSeek>>>;
+
+    /// Read a byte range from a specific logical file version.
+    ///
+    /// Implementations must avoid materializing the complete version when the
+    /// backend supports random access.
+    async fn read_file_version_range(
+        &self,
+        id: FileID,
+        version: u64,
+        range: Range<u64>,
+    ) -> Result<Bytes>;
+
     /// Set extended attributes on an existing node
     /// This should modify the pending version of the node in the current transaction
     async fn set_extended_attributes(
@@ -116,4 +157,25 @@ pub trait PersistenceLayer: Send + Sync {
         id: FileID,
         attributes: HashMap<String, String>,
     ) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_file_version_range;
+    use crate::Error;
+
+    #[test]
+    fn version_ranges_are_clamped_and_validated() {
+        assert_eq!(validate_file_version_range(2..8, 10).unwrap(), 2..8);
+        assert_eq!(validate_file_version_range(8..20, 10).unwrap(), 8..10);
+        assert_eq!(validate_file_version_range(10..10, 10).unwrap(), 10..10);
+        assert_eq!(
+            validate_file_version_range(10..11, 10),
+            Err(Error::invalid_range(10, 11, 10))
+        );
+        assert_eq!(
+            validate_file_version_range(8..7, 10),
+            Err(Error::invalid_range(8, 7, 10))
+        );
+    }
 }
