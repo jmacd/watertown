@@ -7,6 +7,9 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+use tokio::sync::{Barrier, Notify};
 
 use super::super::memory::new_fs;
 use crate::async_helpers::convenience;
@@ -122,6 +125,88 @@ impl crate::wd::Visitor<String> for BasenameVisitor {
         let result = node.basename();
         self.results.push(result.clone());
         Ok(result)
+    }
+}
+
+struct FailingVisitor;
+
+#[async_trait::async_trait]
+impl crate::wd::Visitor<()> for FailingVisitor {
+    async fn visit(
+        &mut self,
+        _node: crate::node::NodePath,
+        _captured: &[String],
+    ) -> error::Result<()> {
+        Err(error::Error::Other("visitor failed".to_string()))
+    }
+}
+
+struct BarrierVisitor {
+    barrier: Arc<Barrier>,
+}
+
+#[async_trait::async_trait]
+impl crate::wd::Visitor<()> for BarrierVisitor {
+    async fn visit(
+        &mut self,
+        _node: crate::node::NodePath,
+        _captured: &[String],
+    ) -> error::Result<()> {
+        _ = self.barrier.wait().await;
+        Ok(())
+    }
+}
+
+struct CancelOnceDirectory {
+    calls: AtomicUsize,
+    entered: Arc<Notify>,
+}
+
+impl CancelOnceDirectory {
+    fn new_handle(entered: Arc<Notify>) -> DirectoryHandle {
+        DirectoryHandle::new(Arc::new(tokio::sync::Mutex::new(Box::new(Self {
+            calls: AtomicUsize::new(0),
+            entered,
+        }))))
+    }
+}
+
+#[async_trait::async_trait]
+impl Directory for CancelOnceDirectory {
+    async fn get(&self, _name: &str) -> error::Result<Option<Node>> {
+        Ok(None)
+    }
+
+    async fn insert(&mut self, name: String, _id: Node) -> error::Result<()> {
+        Err(error::Error::immutable(name))
+    }
+
+    async fn remove(&mut self, name: &str) -> error::Result<Option<Node>> {
+        Err(error::Error::immutable(name))
+    }
+
+    async fn entries(
+        &self,
+    ) -> error::Result<Pin<Box<dyn Stream<Item = error::Result<DirectoryEntry>> + Send>>> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.entered.notify_one();
+            std::future::pending::<()>().await;
+        }
+        Ok(Box::pin(stream::empty()))
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::Metadata for CancelOnceDirectory {
+    async fn metadata(&self) -> error::Result<crate::NodeMetadata> {
+        Ok(crate::NodeMetadata {
+            version: 1,
+            size: None,
+            blake3: None,
+            bao_outboard: None,
+            entry_type: crate::EntryType::DirectoryDynamic,
+            timestamp: 0,
+        })
     }
 }
 
@@ -341,6 +426,87 @@ async fn test_visit_directory_loop() {
             result
         ),
     }
+
+    let matches = root.collect_matches("/loop/test.txt").await.unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].0.path(), Path::new("/loop/test.txt"));
+}
+
+#[tokio::test]
+async fn test_visit_recovers_after_visitor_error() {
+    let fs = new_fs().await;
+    let root = fs.root().await.unwrap();
+    _ = root.create_dir_path("/recover").await.unwrap();
+    _ = convenience::create_file_path(&root, "/recover/file.txt", b"content")
+        .await
+        .unwrap();
+
+    let mut failing = FailingVisitor;
+    let error = root
+        .visit_with_visitor("/recover/*", &mut failing)
+        .await
+        .unwrap_err();
+    assert_eq!(error, error::Error::Other("visitor failed".to_string()));
+
+    let matches = root.collect_matches("/recover/*").await.unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].0.path(), Path::new("/recover/file.txt"));
+}
+
+#[tokio::test]
+async fn test_concurrent_visits_do_not_share_active_nodes() {
+    let fs = new_fs().await;
+    let root = fs.root().await.unwrap();
+    _ = root.create_dir_path("/shared").await.unwrap();
+    _ = convenience::create_file_path(&root, "/shared/file.txt", b"content")
+        .await
+        .unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let mut first = BarrierVisitor {
+        barrier: barrier.clone(),
+    };
+    let mut second = BarrierVisitor { barrier };
+    let (first_result, second_result) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(
+            root.visit_with_visitor("/shared/*", &mut first),
+            root.visit_with_visitor("/shared/*", &mut second)
+        )
+    })
+    .await
+    .expect("concurrent traversals should both reach the shared directory");
+
+    assert!(first_result.is_ok(), "first traversal: {first_result:?}");
+    assert!(second_result.is_ok(), "second traversal: {second_result:?}");
+}
+
+#[tokio::test]
+async fn test_cancelled_visit_releases_active_nodes() {
+    let fs = new_fs().await;
+    let root = fs.root().await.unwrap();
+    let entered = Arc::new(Notify::new());
+    _ = root
+        .create_node_path("/cancel", || {
+            Ok(NodeType::Directory(CancelOnceDirectory::new_handle(
+                entered.clone(),
+            )))
+        })
+        .await
+        .unwrap();
+
+    let visit_root = root.clone();
+    let task = tokio::spawn(async move {
+        let mut visitor = crate::wd::CollectingVisitor::new();
+        visit_root
+            .visit_with_visitor("/cancel/*", &mut visitor)
+            .await
+    });
+    entered.notified().await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+
+    let matches = root.collect_matches("/cancel/*").await.unwrap();
+    assert!(matches.is_empty());
 }
 
 #[tokio::test]

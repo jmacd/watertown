@@ -49,6 +49,11 @@ Locations:
 - `crates/tinyfs/src/fs.rs:22,107-121`
 - `crates/tinyfs/src/wd.rs:1233-1257`
 
+Status: addressed in September 2026 by replacing `FS`-global active-node state
+with a task-scoped traversal context. Nested dynamic-directory visits reuse the
+current context, while independent traversals receive isolated state. RAII
+guards remove active nodes after success, errors, or task cancellation.
+
 Traversal stores its set of active nodes in an `FS`-global `HashSet<FileID>`.
 This state describes one traversal stack, but its lifetime and scope are the
 whole filesystem instance.

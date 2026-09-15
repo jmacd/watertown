@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::future::Future;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::EntryType;
 use crate::caching_persistence::CachingPersistence;
@@ -13,13 +13,65 @@ use crate::node::*;
 use crate::persistence::{FileVersionInfo, PersistenceLayer};
 use crate::wd::WD;
 
+tokio::task_local! {
+    static VISIT_CONTEXT: Arc<VisitContext>;
+}
+
+#[derive(Default)]
+struct VisitContext {
+    active: Mutex<HashSet<FileID>>,
+}
+
+impl VisitContext {
+    fn active(&self) -> MutexGuard<'_, HashSet<FileID>> {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn enter(self: &Arc<Self>, node: &NodePath) -> Result<VisitNodeGuard> {
+        let id = node.id();
+        if !self.active().insert(id) {
+            return Err(Error::visit_loop(node.path()));
+        }
+        Ok(VisitNodeGuard {
+            context: Arc::clone(self),
+            id,
+        })
+    }
+}
+
+pub(crate) struct VisitNodeGuard {
+    context: Arc<VisitContext>,
+    id: FileID,
+}
+
+impl Drop for VisitNodeGuard {
+    fn drop(&mut self) {
+        _ = self.context.active().remove(&self.id);
+    }
+}
+
+pub(crate) async fn with_visit_context<F: Future>(future: F) -> F::Output {
+    if VISIT_CONTEXT.try_with(|_| ()).is_ok() {
+        future.await
+    } else {
+        VISIT_CONTEXT
+            .scope(Arc::new(VisitContext::default()), future)
+            .await
+    }
+}
+
+pub(crate) fn enter_visit_node(node: &NodePath) -> Result<VisitNodeGuard> {
+    VISIT_CONTEXT
+        .try_with(|context| context.enter(node))
+        .unwrap_or_else(|_| Err(Error::internal("visit context is not initialized")))
+}
+
 /// Main filesystem structure - pure persistence layer architecture (Phase 5)
 #[derive(Clone)]
 pub struct FS {
     pub(crate) persistence: Arc<dyn PersistenceLayer>,
-
-    /// Coordination state for loop detection    
-    busy: Arc<Mutex<HashSet<FileID>>>,
 }
 
 impl FS {
@@ -31,7 +83,6 @@ impl FS {
 
         Ok(FS {
             persistence: Arc::new(cached_persistence),
-            busy: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -39,10 +90,7 @@ impl FS {
     /// Does not add caching - assumes the persistence layer is already wrapped if needed
     #[must_use]
     pub fn from_arc(persistence: Arc<dyn PersistenceLayer>) -> Self {
-        FS {
-            persistence,
-            busy: Arc::new(Mutex::new(HashSet::new())),
-        }
+        FS { persistence }
     }
 
     /// Returns a working directory context for the root directory
@@ -101,22 +149,6 @@ impl FS {
         let node = Node::new(id, node_type);
         self.persistence.store_node(&node).await?;
         Ok(node)
-    }
-
-    // Loop detection methods - these work the same regardless of persistence vs backend
-    pub(crate) async fn enter_node(&self, node: &NodePath) -> Result<()> {
-        let mut busy = self.busy.lock().await;
-        let id = node.id();
-        if busy.contains(&id) {
-            return Err(Error::visit_loop(node.path()));
-        }
-        _ = busy.insert(id);
-        Ok(())
-    }
-
-    pub(crate) async fn exit_node(&self, node: &NodePath) {
-        let mut busy = self.busy.lock().await;
-        _ = busy.remove(&node.id());
     }
 
     pub(crate) async fn create_file_node_pending_write(
