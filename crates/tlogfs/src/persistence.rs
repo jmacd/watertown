@@ -2937,7 +2937,7 @@ impl InnerState {
         }
 
         // Collect readers and sizes for each version
-        let mut readers: Vec<Pin<Box<dyn tokio::io::AsyncRead + Send>>> =
+        let mut readers: Vec<Pin<Box<dyn tinyfs::AsyncReadSeek>>> =
             Vec::with_capacity(valid_records.len());
         let mut sizes: Vec<u64> = Vec::with_capacity(valid_records.len());
 

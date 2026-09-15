@@ -1830,6 +1830,27 @@ async fn test_file_physical_series_version_concatenation() {
             "FilePhysicalSeries should concatenate all versions in oldest-to-newest order"
         );
 
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut reader = wd
+            .async_reader_path(file_path)
+            .await
+            .expect("open seekable series reader");
+
+        _ = reader.seek(std::io::SeekFrom::End(-10)).await.unwrap();
+        let mut tail = String::new();
+        _ = reader.read_to_string(&mut tail).await.unwrap();
+        assert_eq!(tail, "carol,300\n");
+
+        _ = reader.seek(std::io::SeekFrom::Start(21)).await.unwrap();
+        let mut second_version = vec![0; 8];
+        _ = reader.read_exact(&mut second_version).await.unwrap();
+        assert_eq!(second_version, b"bob,200\n");
+
+        _ = reader.seek(std::io::SeekFrom::Start(0)).await.unwrap();
+        let mut replay = String::new();
+        _ = reader.read_to_string(&mut replay).await.unwrap();
+        assert_eq!(replay, expected);
+
         log::debug!("[OK] Content matches expected concatenation");
     }
 

@@ -206,6 +206,59 @@ async fn test_large_file_version_range() -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+#[tokio::test]
+async fn test_mixed_large_and_inline_series_seeking() -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+    let (_temp_dir, store_path) = test_dir();
+    let mut persistence = OpLogPersistence::create_test_uncompressed(&store_path).await?;
+    let large = vec![0x5a; LARGE_FILE_THRESHOLD + 4096];
+    let inline = b"inline-tail";
+
+    let tx = persistence.begin_test().await?;
+    let wd = tx.root().await?;
+    let mut writer = wd
+        .async_writer_path_with_type("/mixed.series", tinyfs::EntryType::FilePhysicalSeries)
+        .await?;
+    writer.write_all(&large).await?;
+    writer.shutdown().await?;
+    tx.commit_test().await?;
+
+    let tx = persistence.begin_test().await?;
+    let wd = tx.root().await?;
+    let mut writer = wd
+        .async_writer_path_with_type("/mixed.series", tinyfs::EntryType::FilePhysicalSeries)
+        .await?;
+    writer.write_all(inline).await?;
+    writer.shutdown().await?;
+    tx.commit_test().await?;
+
+    let tx = persistence.begin_test().await?;
+    let wd = tx.root().await?;
+    let mut reader = wd.async_reader_path("/mixed.series").await?;
+
+    let boundary_start = large.len() as u64 - 8;
+    assert_eq!(
+        reader
+            .seek(std::io::SeekFrom::Start(boundary_start))
+            .await?,
+        boundary_start
+    );
+    let mut crossing = Vec::new();
+    _ = reader.read_to_end(&mut crossing).await?;
+    let mut expected = vec![0x5a; 8];
+    expected.extend_from_slice(inline);
+    assert_eq!(crossing, expected);
+
+    _ = reader.seek(std::io::SeekFrom::Start(0)).await?;
+    let mut prefix = [0; 16];
+    _ = reader.read_exact(&mut prefix).await?;
+    assert_eq!(prefix, [0x5a; 16]);
+
+    tx.commit_test().await?;
+    Ok(())
+}
+
 /// Test large file with multiple reads (simulating DataFusion schema inference + data read)
 ///
 /// DataFusion typically:

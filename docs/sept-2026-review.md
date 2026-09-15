@@ -140,6 +140,10 @@ Location:
 
 - `crates/tinyfs/src/chained_reader.rs:103-143`
 
+Status: addressed in September 2026 by retaining seekable child readers and
+mapping logical `Start`, `Current`, and `End` seeks onto consistent per-child
+positions. Position changes are applied only after every child seek completes.
+
 After data has been consumed, `start_seek(SeekFrom::Start(0))` returns success
 without resetting the logical position, current segment, or underlying readers.
 `poll_complete` reports the old position, and later reads continue from that
