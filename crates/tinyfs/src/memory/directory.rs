@@ -18,6 +18,7 @@ use std::sync::Arc;
 /// testing, development, and lightweight filesystem operations.
 pub struct MemoryDirectory {
     entries: BTreeMap<String, Node>,
+    entry_type: EntryType,
 }
 
 #[async_trait]
@@ -28,7 +29,7 @@ impl Metadata for MemoryDirectory {
             size: None,         // Directories don't have sizes
             blake3: None,       // Directories don't have checksums
             bao_outboard: None, // Directories don't have bao-tree data
-            entry_type: EntryType::DirectoryPhysical,
+            entry_type: self.entry_type,
             timestamp: 0, // TODO
         })
     }
@@ -71,8 +72,18 @@ impl MemoryDirectory {
     /// Create a new MemoryDirectory handle
     #[must_use]
     pub fn new_handle() -> Handle {
+        Self::new_handle_with_entry_type(EntryType::DirectoryPhysical)
+    }
+
+    /// Create a new MemoryDirectory handle with an explicit directory type.
+    #[must_use]
+    pub fn new_handle_with_entry_type(entry_type: EntryType) -> Handle {
+        debug_assert!(entry_type.is_directory());
         Handle::new(Arc::new(tokio::sync::Mutex::new(Box::new(
-            MemoryDirectory::default(),
+            MemoryDirectory {
+                entries: BTreeMap::new(),
+                entry_type,
+            },
         ))))
     }
 
@@ -88,6 +99,7 @@ impl Default for MemoryDirectory {
     fn default() -> Self {
         Self {
             entries: BTreeMap::new(),
+            entry_type: EntryType::DirectoryPhysical,
         }
     }
 }

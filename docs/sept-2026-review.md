@@ -161,6 +161,13 @@ Locations:
 - `crates/tinyfs/src/memory/persistence.rs:116-153,301-329,447`
 - `crates/tinyfs/src/memory/file.rs:50-52,494-510`
 
+Status: addressed in September 2026. Metadata lookup no longer calls back into
+the persistence layer while holding its state mutex; dynamic nodes retain their
+file or directory operational type; version timestamps use Unix microseconds;
+and writer shutdown propagates persistence and integrity-input failures while
+releasing write state. Regression tests cover pending metadata, failure
+propagation and retry, dynamic node types, and timestamp units.
+
 The memory implementation diverges from expected persistence semantics in
 several ways:
 
