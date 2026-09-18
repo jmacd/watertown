@@ -1,672 +1,130 @@
-# Independent Live Monitoring Projection
+# Independent Live Monitoring
 
 > **Status:** Design proposal (unimplemented).
 >
-> This document proposes a bounded, in-memory projection of a committed
-> tlogfs pond for reliable DataFusion monitoring. The projection is primarily
-> a failure-domain boundary, not a query cache: after a generation is
-> published, monitoring continues without access to the source pond, Delta
-> Lake, TinyFS persistence, format caches, site generation, or a functioning
-> projection refresh task.
+> This document proposes a bounded in-memory TinyFS image for live monitoring.
+> The image contains selected source data and TinyFS factory definitions.
+> Existing Watertown resolution and DataFusion synthesize query providers from
+> that image without access to the source pond.
 
----
+## 1. Purpose
 
-## 0. Context
+Monitoring may eventually evaluate water observations every 15 minutes while
+the website continues rebuilding every three hours. The production ponds
+currently run hourly. That cadence should not change until several months of
+storage-access measurements establish the Azure transaction cost of doing so.
 
-Ponds currently combine several activities that need not run at the same
-cadence. A water pond may ingest and commit observations every 15 minutes,
-while regenerating the complete website is appropriate only every three hours.
-Monitoring should be able to evaluate every committed water update without
-making site generation more frequent or coupling its reliability to the
-website build.
+The monitor itself belongs on Watershop, next to the authoritative local pond.
+It should evaluate a committed update without waiting for that commit's Azure
+backup and should continue using the last complete data image if the pond or
+refresh path becomes unavailable.
 
-The intended near-term cycle is:
+The design makes one architectural move:
 
-```text
-water ingestion
-      |
-      v
-water pond commit -- every 15 minutes
-      |
-      +--> refresh recent projection
-      |       |
-      |       +--> evaluate water monitors
-      |
-      +----------------------------+
-                                   |
-site-generation scheduler -- every 3 hours
-                                   |
-                                   v
-                         read latest pond state
-```
+> Build a bounded `MemoryPersistence` image containing the TinyFS data and
+> factory definitions required by monitors, validate it, and atomically publish
+> it to the monitor runtime.
 
-The longer-term system may receive Arrow-native telemetry through a Rust MQTT
-surface and the OpenTelemetry OTAP dataflow engine. Those paths could admit
-data to monitoring before a tlogfs commit. They are deliberately outside the
-initial scope. The projection model should accept a source-neutral batch later
-without requiring its monitor runtime to acquire pond dependencies.
+After publication, existing Watertown providers and DataFusion resolve factory
+nodes and perform all derivation in memory. Unlike site generation, monitoring
+does not materialize factory-generated output into the image.
 
-## 1. Primary requirement
+## 2. Primary invariant
 
-The design is governed by one guarantee:
+A published monitoring image is:
 
-> After projection generation `N` is published, scheduled monitoring remains
-> functional against `N` if the source pond becomes unavailable or projection
-> refresh stops.
+- a complete view of one committed pond snapshot;
+- limited to declared monitor tables, their factory definitions, and the
+  bounded source data needed to resolve them;
+- self-contained, with no live pond, Delta Lake, cache, or site-generation
+  dependency;
+- immutable after publication; and
+- replaced only by another complete, validated image.
 
-This implies:
+If refresh fails, the current image remains queryable and its increasing age is
+visible to monitor policy.
 
-- A published generation is self-contained.
-- It contains no live tlogfs readers or pond-backed `TableProvider`s.
-- Refresh is atomic; partial candidates are never visible.
-- Refresh failure preserves the previous valid generation.
-- Monitor evaluations expose the age and source frontier of their input.
-- Source failure never silently looks like healthy, empty data.
-- Site generation failure has no effect on projection or monitor execution.
+The first implementation isolates monitoring from pond and refresh failures
+while the process remains alive. It does not claim process-failure isolation.
 
-Memory materialization may also improve repeated query cost, but that is not
-its reason for existence.
-
-## 2. Goals
-
-1. Present a bounded recent-time view of selected pond series to DataFusion.
-2. Preserve a coherent source frontier across all tables in one generation.
-3. Consume and publish each authoritative pond content commit in strict order.
-4. Continue monitoring the last valid generation during pond outages.
-5. Make stale data explicit to monitor policy and alert output.
-6. Reuse unchanged Arrow data between generations.
-7. Bound retained memory and reject incomplete candidates under pressure.
-8. Leave a clean input seam for future MQTT and OTAP Arrow batches.
-9. Eventually support restart without immediate pond access through a local
-   projection checkpoint.
-
-## 3. Non-goals
-
-The initial project does not:
-
-- replace tlogfs as the authoritative telemetry store;
-- introduce a second writable TinyFS filesystem;
-- alter current ingestion or site-generation scheduling;
-- execute arbitrary effectful factories in the monitor process;
-- provide exactly-once external notifications;
-- handle multiple ponds in one consistency domain;
-- consume pre-commit MQTT or OTAP data;
-- persist the first implementation's projection across process restart;
-- survive failure of the monitor process itself in the initial single-process
-  deployment.
-
-## 4. Why this is not `MemoryPersistence`
-
-`MemoryPersistence` models TinyFS nodes, byte streams, and file versions. The
-monitoring projection needs resolved Arrow schemas, `RecordBatch` chunks,
-event-time bounds, cheap eviction, immutable publication, and DataFusion table
-providers.
-
-Routing a projected table through `MemoryPersistence` would:
-
-- serialize Arrow back into a byte-oriented filesystem representation;
-- duplicate persistence and version semantics that tlogfs already owns;
-- carry TinyFS transaction and handle dependencies into monitoring;
-- make atomic multi-table publication difficult;
-- weaken the desired failure-domain boundary.
-
-TinyFS remains important at the projection input boundary. It supplies the
-namespace, typed nodes, version metadata, bounded reads, and dynamic recipes.
-The published output is a smaller query-oriented model.
-
-## 5. Consistency unit
-
-A projection generation is an immutable view of one committed pond frontier:
-
-```rust
-struct ProjectionGeneration {
-    projection_id: ProjectionId,
-    generation: u64,
-    source: SourceFrontier,
-    window: WindowDefinition,
-    namespace: ProjectedNamespace,
-    tables: HashMap<TableId, ProjectedTable>,
-    monitors: Vec<MonitorDefinition>,
-    query: Arc<GenerationQueryContext>,
-    built_at_micros: i64,
-}
-
-struct SourceFrontier {
-    pond_id: PondId,
-    txn_seq: i64,
-    commit_hash: ObjectHash,
-    parent_commit_hash: Option<ObjectHash>,
-    root_tree_hash: ObjectHash,
-    manifest_root: ObjectHash,
-    committed_at_micros: i64,
-}
-```
-
-Bootstrap resolves all required inputs from one committed snapshot. Incremental
-refresh then consumes the pond's immutable `watertown.commit.v2` objects in
-strict parent-hash and transaction-sequence order. Each commit carries the
-resulting manifest root and its canonical bounded manifest changes. A
-generation is the result of applying exactly one complete commit to the prior
-generation; it must not combine table A at transaction 418 with table B at
-transaction 417 unless the projection explicitly declares separate consistency
-domains.
-
-Each monitor evaluation pins an `Arc<ProjectionGeneration>` and uses only that
-generation's DataFusion catalog. A concurrent refresh may publish the next
-generation, but the running evaluation completes against the generation it
-started with.
-
-## 6. Component boundaries
+## 3. Architecture
 
 ```text
-                  pond-dependent process or component
-       +------------------------------------------------+
-       |                                                |
-tlogfs pond --> ProjectionSource --> ProjectionBuilder  |
-       |                                  |             |
-       +----------------------------------|-------------+
-                                          |
-                               validated immutable image
-                                          |
-       +----------------------------------|-------------+
-       |                                  v             |
-       |                          ProjectionHost         |
-       |                                  |             |
-       |                         DataFusion catalog      |
-       |                                  |             |
-       |                          MonitorRuntime         |
-       |                                                |
-       +------------------------------------------------+
-                   pond-independent monitoring domain
+Watershop
+  committed local pond snapshot
+    |\
+    | \-> independent pond backup to existing Azure Blob storage
+    |
+    \-> copy bounded data and factory definitions
+        -> candidate MemoryPersistence image
+        -> normal TinyFS factory resolution and DataFusion planning
+        -> atomic image publication
+        -> scheduled SQL monitors
+        -> durable condition state
+        -> small status publication to Azure
+
+Azure
+  Static Web Apps shell -> status API or status object
+  Flex Function timer   -> stale-Watershop detection and ACS SMS
 ```
 
-The initial components run in one process. Their crate and API boundaries make
-source and refresh-task failure isolation real and testable, but they do not
-claim process-crash isolation. A later deployment may move projection refresh
-to a separate process without changing the generation or monitor APIs.
-
-### 6.1 `ProjectionSource`
-
-This is the only projection component that understands tlogfs:
-
-```rust
-#[async_trait]
-trait ProjectionSource {
-    async fn bootstrap(
-        &self,
-        spec: &ProjectionSpec,
-    ) -> Result<SourceSnapshot>;
-
-    async fn commits_after(
-        &self,
-        frontier: &SourceFrontier,
-        limit: usize,
-    ) -> Result<Vec<sync_store::content::Commit>>;
-
-    async fn materialize(
-        &self,
-        spec: &ProjectionSpec,
-        commit: &sync_store::content::Commit,
-    ) -> Result<CommitMaterialization>;
-}
-```
-
-Its responsibilities are:
-
-- open one consistent committed snapshot for bootstrap;
-- resolve configured TinyFS paths and globs;
-- list selected physical-series versions;
-- use `SeriesReadBounds` for conservative version pruning;
-- decode selected versions into Arrow batches;
-- collect timestamp-column and schema metadata;
-- collect monitor definitions and pure dynamic recipes;
-- expose the existing shared content `Commit` as the authoritative incremental
-  change contract;
-- read the permanent commit chain in strict parent/sequence order;
-- materialize selected objects and changed-series packs named by each commit;
-- authenticate the exact source frontier and carry its target manifest root;
-- return owned data with no live pond-backed handles.
-
-The first implementation reads commits from the pond-local authoritative log
-and content store. A later source adapter may read the same commit and content
-model from remote storage. Bootstrap and recovery may materialize a complete
-manifest, but normal refresh does not invent a second projection-specific
-change feed or rescan the complete namespace.
-
-### 6.2 `ProjectionBuilder`
-
-The builder converts a bootstrap snapshot or next content commit into a
-candidate generation:
-
-```rust
-struct ProjectionBuilder {
-    current: Arc<ProjectionGeneration>,
-    candidate: MutableGeneration,
-}
-```
-
-It:
-
-- reuses unchanged chunks from the current generation;
-- applies canonical manifest additions, replacements, moves, and removals;
-- adds newly committed selected series material;
-- merges compatible schemas;
-- applies exact event-time filtering;
-- removes physically expired chunks;
-- resolves monitor dependencies;
-- measures retained Arrow buffer memory;
-- validates the complete candidate;
-- builds a generation-scoped DataFusion catalog;
-- freezes the candidate into an immutable generation.
-
-The builder cannot publish. A failed build is discarded as a unit.
-
-### 6.3 `ProjectionHost`
-
-The host owns the current generation and has no tlogfs dependency:
-
-```rust
-struct ProjectionHost {
-    current: ArcSwap<ProjectionGeneration>,
-    status: watch::Sender<ProjectionStatus>,
-}
-
-impl ProjectionHost {
-    fn snapshot(&self) -> Arc<ProjectionGeneration>;
-    fn status(&self) -> ProjectionStatus;
-    fn publish(&self, candidate: ProjectionGeneration);
-}
-```
-
-Publication is a single atomic pointer replacement. Existing readers retain
-their old `Arc` and its catalog; new readers receive the new generation.
-`ProjectionHost` does not expose independent table lookup, because resolving a
-table through the mutable host after pinning a generation could mix providers
-from different frontiers.
-
-### 6.4 `MonitorRuntime`
-
-The monitor runtime consumes only a projection host, a clock, monitor state,
-and alert sinks:
-
-```rust
-struct MonitorRuntime {
-    projection: Arc<ProjectionHost>,
-    clock: Arc<dyn Clock>,
-    state: Arc<dyn MonitorStateStore>,
-    sinks: Vec<Arc<dyn AlertSink>>,
-}
-```
-
-It does not know how to:
-
-- open or transact with a pond;
-- read Delta Lake;
-- resolve a TinyFS path;
-- locate a Parquet file;
-- use a pond format cache;
-- regenerate a website.
-
-This negative interface is essential to the reliability goal.
-
-## 7. Projection configuration
-
-An initial configuration could be:
-
-```yaml
-id: water-monitoring
-
-source:
-  pond: water
-
-selection:
-  include:
-    - /observations/**
-    - /telemetry/water/**
-  exclude:
-    - /derived/site/**
-
-window:
-  event_time: 2d
-  lateness_allowance: 6h
-
-refresh:
-  interval: 15m
-  timeout: 5m
-
-resources:
-  memory_limit: 2GiB
-
-freshness:
-  warn_after: 30m
-  fail_after: 2h
-```
-
-The physical retention window is:
-
-```text
-event-time query window + lateness allowance
-```
-
-For a two-day query window and a six-hour lateness allowance, the projection
-retains 54 hours. Exact monitor queries still apply a two-day predicate. The
-allowance permits late records to alter recent monitor results without
-retaining unbounded history.
-
-## 8. In-memory table representation
-
-Tables retain chunks corresponding to source versions:
-
-```rust
-struct ProjectedTable {
-    id: TableId,
-    pond_path: String,
-    file_id: FileID,
-    timestamp_column: String,
-    schema: SchemaRef,
-    chunks: Arc<[ProjectedChunk]>,
-    loaded_through_version: u64,
-    last_changed_txn_seq: i64,
-    last_changed_at_micros: i64,
-}
-
-struct ProjectedChunk {
-    source_version: u64,
-    content_hash: Option<String>,
-    min_event_time: i64,
-    max_event_time: i64,
-    batches: Arc<[RecordBatch]>,
-    memory_bytes: usize,
-}
-```
-
-This shape allows:
-
-- sharing unchanged chunks between generations;
-- allocating only new or boundary data during refresh;
-- deduplication by source file and version;
-- dropping fully expired chunks without scanning rows;
-- filtering only boundary chunks;
-- exposing chunks as DataFusion partitions without copying all rows into a
-  replacement `MemTable`.
-
-If source versions lack temporal bounds, they must be retained conservatively
-until decoded and bounded. The builder measures the resulting Arrow buffers and
-rejects an over-budget candidate. Missing bounds must never silently drop data.
-
-## 9. Time semantics
-
-The system distinguishes:
-
-- **event time:** timestamp carried by an observation;
-- **commit time:** time at which tlogfs committed its version;
-- **projection time:** time at which a generation was built;
-- **evaluation time:** time at which a monitor query runs.
-
-A typical monitor window is:
-
-```text
-event_time >= evaluation_time - configured_window
-```
-
-Per-version minimum and maximum event times are pruning metadata, not a
-correctness predicate. The projector or query must apply an exact row-level
-predicate.
-
-Evaluation correctness must not depend on physical eviction running at an
-exact instant. If the clock advances while no pond commit occurs, queries use a
-new cutoff against the same immutable generation. A maintenance refresh may
-later remove chunks that cannot match any valid query.
-
-## 10. Refresh protocol
-
-The refresh state machine is:
-
-```text
-Idle
-  |
-  v
-Discovering source frontier
-  |
-  v
-Building candidate
-  |
-  v
-Validating candidate
-  |
-  +---- failure ----> retain current generation; report degraded
-  |
-  v
-Publishing atomically
-  |
-  v
-Idle
-```
-
-Attempted and published frontiers are distinct:
-
-```rust
-struct ProjectionStatus {
-    state: RefreshState,
-    current_generation: u64,
-    published_frontier: SourceFrontier,
-    attempted_frontier: Option<SourceFrontier>,
-    last_success_micros: i64,
-    last_error: Option<ProjectionError>,
-    memory_bytes: usize,
-}
-```
-
-If transaction 418 is corrupt or incompatible, generation 417 remains current.
-The next refresh retries 418 and later commits remain queued. Strict ordering
-does not permit a skip, including an acknowledged skip. Recovery requires
-repairing the referenced source content, deliberately changing the projection
-specification, disabling an invalid monitor, or restoring a verified snapshot
-at exactly frontier 418.
-
-### 10.1 Initial snapshot
-
-For each selected series:
-
-1. Compute the physical retention cutoff.
-2. Use `SeriesReadBounds::from_event_time_lo(cutoff)`.
-3. List and load retained source versions.
-4. Decode them into Arrow.
-5. Apply exact event-time filtering where required.
-6. Record source version, hash, schema, and temporal bounds.
-7. Build monitor definitions and dependencies.
-8. Validate and publish one complete generation.
-
-### 10.2 Incremental refresh
-
-For each next commit in the chain:
-
-1. Verify pond identity, transaction sequence, parent commit hash, and commit
-   hash.
-2. Apply its canonical manifest changes to the projected namespace, including
-   additions, removals, renames, type changes, and symlink changes. Resolve
-   affected paths using the before/after records and bounded parent-chain
-   lookups against the persistent manifest map.
-3. Determine which changed nodes enter, leave, or remain in the configured
-   selection.
-4. Materialize selected introduced objects and changed-series packs.
-5. Deduplicate series material by `(FileID, version)` and verify repeated
-   content hashes.
-6. Combine unseen versions with the physical event-time cutoff.
-7. Reuse unchanged chunks and evict expired chunks.
-8. Verify materialized object and pack hashes against the authenticated commit,
-   and record its manifest root as the candidate frontier.
-9. Build and validate a complete candidate.
-10. Atomically publish one generation for that commit.
-11. Evaluate all enabled monitors.
-
-A commit that changes no selected Arrow data still publishes a metadata-only
-generation, reusing every table chunk. This records that the complete pond
-chain has been verified without pretending that any selected series received
-new observations. In the initial implementation every published generation
-triggers all monitors; a separate timer evaluates monitors when commits stop so
-pending durations, logical windows, and freshness thresholds still advance.
-
-At approximately 15-minute water commits, a two-day window spans about 192
-commit intervals per continuously updated series. This is a reasonable initial
-scale while still exercising long-running refresh behavior.
-
-## 11. Candidate validation
-
-A candidate is publishable only when:
-
-- its frontier is not older than the current frontier;
-- every node selected from the resulting namespace resolves;
-- every required table has a known timestamp column;
-- every Arrow batch matches the published schema;
-- schema evolution is explicitly compatible;
-- exact time filtering succeeds;
-- no duplicate source versions have conflicting hashes;
-- retained Arrow buffer memory is within the configured projection limit;
-- no table is incomplete because an input read failed.
-
-Monitor inputs may be declared optional. A missing required monitor dependency
-invalidates that monitor but does not invalidate the data generation. It must
-never be replaced by an empty table: zero matching rows could otherwise be
-mistaken for a healthy condition.
-
-Monitor validation is isolated from data-generation validation. Each enabled
-monitor's SQL is parsed and planned against the candidate catalog. An invalid
-monitor enters a configuration-error state, retains any prior firing condition
-instead of resolving it, and emits a separate configuration incident. It does
-not prevent publication of the data generation or execution of other monitors.
-A deleted or renamed required series therefore requires a deliberate monitor
-configuration update; the host neither preserves a ghost table nor substitutes
-an empty one.
-
-## 12. Memory-pressure policy
-
-The projector should not evict arbitrary in-window data to admit a fresh
-generation.
-
-It should:
-
-1. Drop chunks outside physical retention.
-2. Reuse existing immutable chunks.
-3. Measure candidate Arrow buffer memory before publication.
-4. Reject the candidate if it still exceeds the retained projection limit.
-5. Continue monitoring the previous complete generation.
-6. Report memory pressure and increasing pipeline staleness.
-
-Old but known-complete data is safer than a new incomplete projection.
-
-The configured window is fixed and tuned by the operator for the deployment's
-available memory. The projector never shortens it automatically under pressure.
-The projection `memory_limit` bounds retained Arrow buffers, not total process
-RSS: candidate construction, pinned prior generations, and DataFusion
-execution can overlap. DataFusion therefore uses its own execution memory pool
-and query-admission limit. The configuration and status API should name these
-budgets separately rather than claim one hard process-memory bound.
-
-## 13. Projected namespace
-
-The monitor runtime does not need a complete operational TinyFS. It needs
-stable names for projected inputs and enough metadata to explain dependencies:
-
-```rust
-struct ProjectedNamespace {
-    by_path: HashMap<String, ProjectedNode>,
-    by_id: HashMap<FileID, String>,
-}
-
-enum ProjectedNode {
-    Directory,
-    Table(TableId),
-    OrdinaryFile(SourceDescriptor),
-    DynamicRecipe {
-        factory: String,
-        config: Bytes,
-    },
-    Symlink {
-        target: String,
-    },
-}
-```
-
-Projected tables are self-contained. Other nodes may be visible for discovery
-without being readable in the isolated runtime unless explicitly
-materialized. The namespace does not pretend to support TinyFS writes,
-transactions, arbitrary historical versions, or mutation.
-
-## 14. DataFusion catalog
-
-Each generation owns a catalog and query context containing only self-contained
-providers. The provider for a projected table scans its immutable Arrow chunks
-as partitions. It must not call back into `ProviderContext.persistence`.
-
-Monitor SQL is planned against the candidate catalog during validation and
-again executed against a pinned published generation. A provider cache, if
-used, is generation-scoped. Query code receives the pinned generation, never a
-mutable-host table resolver, so providers from different frontiers cannot be
-mixed.
-
-## 15. Factory reuse
-
-The current `ProviderContext` combines a DataFusion session with
-`PersistenceLayer`, TinyFS transaction construction, pond/cache paths, provider
-caches, and site-export hints. Importing it unchanged would violate the
-monitor-runtime boundary.
-
-A smaller query-side interface is needed:
-
-```rust
-struct QueryContext {
-    session: Arc<SessionContext>,
-    tables: Arc<dyn TableResolver>,
-}
-
-#[async_trait]
-trait TableResolver {
-    async fn resolve(
-        &self,
-        reference: &str,
-    ) -> Result<Arc<dyn TableProvider>>;
-}
-```
-
-Factories should eventually declare capabilities:
-
-```rust
-enum FactoryCapability {
-    PureTableTransform,
-    PondRead,
-    PondWrite,
-    ExternalIo,
-    Executable,
-}
-```
-
-Only pure table transforms belong inside the isolated monitor runtime.
-Candidate examples include SQL-derived tables, joins, pivots, renames, and
-temporal reductions when every input is already projected. Ingest, storage,
-site generation, initialization, and executable factories remain outside.
-
-The first implementation should use plain SQL over projected physical tables.
-Factory refactoring should follow only after the reliability boundary works.
-
-## 16. Monitor model
-
-A monitor definition identifies:
-
-- a stable monitor ID;
-- SQL producing zero or more active conditions;
-- a condition-key column;
-- evaluation interval;
-- required projection freshness;
-- pending and resolution durations;
-- no-data and stale-data policies;
-- labels, annotations, and notification routes.
-
-Example:
+Site generation reads the pond on its own schedule and is not part of this
+path. It can remain on Watershop and publish its completed static output to
+Azure every three hours.
+
+The full Watertown/DataFusion monitor does not run in an Azure Function.
+Azure receives compact results, not the recent source window. This removes the
+remote push from alert latency and avoids rebuilding a memory image in a
+scale-to-zero runtime for every observation.
+
+## 4. Why `MemoryPersistence`
+
+`MemoryPersistence` already implements the TinyFS persistence abstraction used
+by Watertown providers. It preserves the model that existing code understands:
+
+- TinyFS paths and node identities;
+- physical series and their versions;
+- dynamic nodes and their stored factory configuration;
+- ordinary file and table formats;
+- `QueryableFile` and `TableProvider` construction;
+- a `ProviderContext` backed by in-memory persistence; and
+- DataFusion query execution.
+
+The monitoring image should be another use of these abstractions, not a second
+namespace, table, chunk, or provider system.
+
+The image owns a `ProviderContext` created with its `MemoryPersistence`.
+`cache_dir` and `pond_path` remain unset. Once the candidate is published, no
+writer or transaction interface is exposed to monitor execution.
+
+`MemoryPersistence` already stores dynamic-node factory type and configuration,
+so copied factory nodes can be resolved normally against the in-memory
+filesystem. The implementation may need a focused extension so copied
+physical-series versions preserve the source metadata needed for bounded
+reads, especially event-time bounds and stable source-version identity. That
+metadata belongs in the TinyFS abstraction because it is useful to every
+in-memory series reader, not only monitoring.
+
+## 5. Monitor definition
+
+A monitor declares the query tables visible to its SQL and the source data that
+must be copied into the image:
 
 ```yaml
 id: high-water
 interval: 15m
+
+tables:
+  water_levels:
+    path: /monitoring/water/res=1h.series
+
+image:
+  sources:
+    - path: /observations/water-levels
+      retain: 54h
+  definitions:
+    - path: /monitoring/water
+
 query: |
   SELECT
     station_id AS condition_key,
@@ -676,348 +134,558 @@ query: |
   GROUP BY station_id
   HAVING MAX(level) > 8.0
 
+window: 48h
 for: 30m
 resolve_after: 30m
 
 freshness:
-  live_inputs:
-    - water_levels
+  inputs:
+    - /observations/water-levels
   warn_after: 30m
   fail_after: 2h
   on_stale: retain
 ```
 
-State is keyed by `(monitor_id, condition_key)`:
+In this example `/monitoring/water` is a copied `temporal-reduce` factory node
+whose configuration reads `/observations/water-levels`. Resolving
+`res=1h.series` constructs the existing factory-backed table provider inside
+the image. Its aggregated rows are not copied from the pond and are not
+written back into `MemoryPersistence`.
+
+`tables` maps monitor-local DataFusion names to TinyFS paths. A path may name a
+physical queryable file or a queryable node synthesized by a factory.
+
+`image.sources` selects stored data to copy, with bounds for physical series.
+`image.definitions` selects the factory nodes, directories, symlinks, and small
+ordinary files needed to resolve the tables. The initial implementation makes
+this closure explicit rather than adding factory-specific dependency analysis.
+Candidate validation fails if a copied factory refers to something outside the
+image.
+
+For a monitor over a raw series, the table may refer to the source path
+directly:
+
+```yaml
+tables:
+  water_levels:
+    path: /observations/water-levels
+
+image:
+  sources:
+    - path: /observations/water-levels
+    retain: 54h
+```
+
+The initial implementation requires explicit table and image declarations
+rather than inferring them from SQL or factory configurations. This keeps
+retention reviewable and avoids making dependency analysis part of the storage
+design. Validation rejects SQL that refers to an undeclared table.
+
+## 6. Selection and retention
+
+The image contains the union of source data and definitions declared by enabled
+monitors. Factory definitions are small; retention limits apply primarily to
+physical series data.
+
+If several monitors select the same source series, the image retains enough
+data for the largest requirement:
+
+```text
+physical retention = maximum monitor window + lateness allowance
+```
+
+For example, a 48-hour query window with six hours of allowed lateness retains
+54 hours of source data.
+
+The builder uses `SeriesReadBounds::from_event_time_lo` when reading physical
+series from the committed pond snapshot. These bounds conservatively prune
+whole source versions. Versions without temporal bounds are retained rather
+than silently discarded.
+
+Physical retention is not the query correctness predicate. Monitor SQL applies
+the exact row-level event-time predicate using its evaluation time. Therefore:
+
+- rows age out logically even if no new pond commit occurs;
+- late rows can affect a recent window while they remain physically retained;
+  and
+- source-version boundaries may retain some older rows without changing query
+  results.
+
+Changing an enabled monitor, its tables, source selection, definitions, or
+retention requirement causes the next refresh to build an image for the new
+complete input set.
+
+## 7. Factory resolution and query-time derivation
+
+The monitoring image copies physical data and dynamic factory definitions. It
+does not copy or persist factory-generated output.
+
+When a monitor resolves a factory-backed table, Watertown invokes the same
+factory/provider path it normally uses, but the `ProviderContext` points to the
+published `MemoryPersistence`. A factory such as `temporal-reduce` therefore
+reads its bounded in-memory inputs and constructs its normal DataFusion
+provider. Recomputing temporal aggregation over a small in-memory window is
+expected to be inexpensive.
+
+This distinction has three useful consequences:
+
+1. Site generation and monitoring share factory and query semantics.
+2. The published image has no hidden dependency on pond paths, caches, or
+   external I/O.
+3. Derived data is synthesized from bounded source data instead of becoming
+   another retained copy.
+
+Only queryable factories whose dependencies resolve entirely inside the image
+belong on this path. Monitoring does not run factory initialization, executable
+commands, ingestion, storage, site export, or providers that require external
+I/O. Candidate validation resolves every declared table after source pond
+access is removed, so an accidental external dependency prevents publication.
+
+## 8. Image model
+
+The host publishes one object:
 
 ```rust
-enum ConditionState {
-    Inactive,
-    Pending { since_micros: i64 },
-    Firing { since_micros: i64 },
-    Resolved { at_micros: i64 },
-    Unknown { since_micros: i64 },
+struct MonitoringImage {
+    generation: u64,
+    source: SourceFrontier,
+    built_at_micros: i64,
+    inputs: HashMap<String, InputMetadata>,
+    persistence: Arc<MemoryPersistence>,
+    query: Arc<ProviderContext>,
+}
+
+struct SourceFrontier {
+    pond_id: PondId,
+    txn_seq: i64,
+    commit_hash: ObjectHash,
+    committed_at_micros: i64,
+}
+
+struct InputMetadata {
+    path: String,
+    retained_after_micros: i64,
+    latest_event_time_micros: Option<i64>,
 }
 ```
+
+The concrete fields may follow existing commit and metadata types. The
+important property is ownership: everything required to resolve and query an
+input is held by the image.
+
+`MemoryPersistence` is mutable while a candidate is being built. Publication
+transfers it into an immutable role. Monitor code receives a pinned
+`Arc<MonitoringImage>` and cannot mutate its filesystem.
+
+## 9. Refresh protocol
+
+Refresh always operates on one committed pond snapshot:
+
+1. Read enabled monitor definitions.
+2. Compute the union of table paths, source selections, factory definitions,
+   and physical retention cutoffs.
+3. Open one committed pond snapshot.
+4. Create a fresh `MemoryPersistence`.
+5. Recreate the selected TinyFS namespace and copy bounded physical series,
+   factory definitions, symlinks, and required ordinary data, preserving
+   relevant source metadata.
+6. Construct the ordinary in-memory `ProviderContext`.
+7. Remove source-pond access and resolve every declared table through existing
+   Watertown factory and provider code.
+8. Parse and plan every enabled monitor query against its declared tables.
+9. Record the source frontier, image time, and input event-time metadata.
+10. Atomically replace the current `Arc<MonitoringImage>`.
+11. Evaluate monitors against the newly published image.
+12. Commit resulting condition state and notification intent locally.
+13. Publish a compact status artifact independently of the full pond backup.
+
+Any error before publication discards the candidate. There is no partial
+update and no mutation of the current image.
+
+The first implementation performs a complete bounded rebuild after each
+relevant local pond commit. The Steward-to-monitor notification is an
+in-process signal, Unix-domain socket message, or localhost request carrying a
+pond identity and committed frontier. It is only a wake-up hint: the monitor
+opens and verifies the committed snapshot itself.
+
+The notification is not a public webhook and does not wait for Azure. Pond
+backup, status publication, and monitor evaluation are independent post-commit
+effects with durable retry state. A two-day in-memory window rebuilt at the
+eventual monitoring cadence is the baseline to measure before introducing
+incremental complexity.
+
+## 10. Query execution
+
+Each evaluation pins the current image and resolves that monitor's declared
+TinyFS table paths under their configured DataFusion names. Physical and
+factory-backed tables use the same interface. It then executes the monitor SQL
+with values such as `$window_start` derived from a controlled evaluation clock.
+
+The query receives no source-pond context. Its `ProviderContext` refers only to
+the image's `MemoryPersistence`, with no pond path or format-cache directory.
+
+The initial SQL contract is:
+
+- read-only `SELECT` queries only;
+- only declared monitor tables are visible;
+- zero result rows mean no active conditions;
+- each result row has a non-null `condition_key`;
+- execution has time, memory, and result-row limits; and
+- query failure is reported as monitor failure, never as an empty result.
+
+An evaluation retains its pinned image even if refresh publishes a newer one.
+It therefore cannot mix source snapshots.
+
+## 11. Freshness and condition state
 
 Every evaluation records:
 
-```rust
-struct EvaluationContext {
-    generation: u64,
-    source_frontier: SourceFrontier,
-    evaluation_time_micros: i64,
-    pipeline_age_micros: i64,
-    live_input_ages: HashMap<TableId, i64>,
-    window_start_micros: i64,
-}
-```
+- image generation;
+- source commit and transaction sequence;
+- evaluation time;
+- image publication time;
+- time since the source frontier was committed; and
+- latest observed event time for each declared input, when available.
 
-Every state transition can therefore explain which pond transaction and
-projection generation produced it.
+This separates two questions:
 
-Pipeline freshness and input freshness are distinct. Pipeline age measures the
-time since the latest commit successfully consumed by the projector. A monitor
-may additionally declare selected series as live inputs and set
-monitor-specific thresholds for the time since each input last changed. Static
-lookup tables need not be declared live. A pond that continues committing does
-not by itself make a stalled live series fresh.
+- **pipeline freshness:** how far the published image is behind expected pond
+  commits;
+- **input freshness:** how recent the observations in a selected physical
+  source are.
 
-## 17. Freshness behavior
+The initial stale-data policy for safety monitors is:
 
-Source unavailability must be visible but must not stop the runtime.
+1. retain an active condition rather than resolve it from stale or failed data;
+2. emit a separate freshness or evaluation incident; and
+3. resume ordinary transitions after a successful fresh evaluation.
 
-Useful stale-data policies are:
+Condition state, evaluation health, and freshness are separate values. A
+condition can remain firing while its latest evaluation is stale or failed.
 
-- `retain`: preserve the prior condition state without resolving it;
-- `evaluate-stale`: run SQL and label results stale;
-- `unknown`: transition conditions to an explicit unknown state;
-- `alert`: create a separate projection-freshness incident.
+Monitor state starts in memory if necessary to prove the query path. SQLite is
+the preferred first durable extension. Condition updates and notification
+outbox insertion should then be one transaction so delivery failure cannot
+interrupt evaluation.
 
-For safety monitoring, the initial default should be:
-
-1. retain active condition state;
-2. emit a separate freshness condition;
-3. never resolve an alert solely because source data stopped arriving.
-
-## 18. Monitor and notification state
-
-If independence is the objective, monitor state cannot exist only in the
-source pond. A small local state store, likely SQLite, should eventually hold:
-
-- current condition states;
-- last evaluated generation;
-- notification idempotency keys;
-- pending notification outbox entries;
-- projection checkpoint metadata.
-
-This is operational state, not authoritative telemetry.
-
-Condition updates and outbox insertion should be atomic:
-
-```text
-monitor transition
-    |
-    +--> update condition state
-    +--> insert notification outbox row
-              |
-              v
-        asynchronous delivery
-```
-
-Email, MQTT, or webhook failure then cannot break query evaluation. External
-delivery is idempotent by monitor, condition key, transition, and generation.
-
-## 19. Restart independence
-
-The first implementation may rebuild from tlogfs after restart. Runtime
-independence during an outage is the first milestone; restart independence is
-the next.
-
-A later local checkpoint can use Arrow IPC or Parquet chunks:
-
-```text
-projection/
-  current.manifest
-  generations/
-    000042/
-      manifest.json
-      table-<id>-chunk-<version>.arrow
-```
-
-Checkpoint publication is:
-
-1. Write a candidate under a temporary generation name.
-2. Flush and validate every file.
-3. Write and flush the generation manifest.
-4. Atomically rename the generation into place.
-5. Atomically replace `current.manifest`.
-6. Publish the equivalent in-memory generation.
-
-On restart:
-
-1. Load the newest valid local checkpoint.
-2. Resume monitoring immediately with recorded freshness.
-3. Attempt pond refresh in the background.
-4. Atomically replace the generation when refresh succeeds.
-
-The checkpoint is reconstructible and does not become a second authoritative
-pond.
-
-## 20. Future live input seam
-
-Future MQTT and OTAP paths should produce a source-neutral envelope:
-
-```rust
-struct ProjectionBatch {
-    batch_id: BatchId,
-    destination: PondPath,
-    source_file: Option<FileID>,
-    source_version: Option<u64>,
-    schema_fingerprint: SchemaFingerprint,
-    min_event_time: Option<i64>,
-    max_event_time: Option<i64>,
-    batches: Arc<[RecordBatch]>,
-}
-```
-
-The initial tlogfs source adapter produces this from committed versions.
-Future Arrow-native ingestion can produce it before or alongside persistence.
-Deduplication requires a stable batch identity persisted with the corresponding
-tlogfs version.
-
-That future path must preserve:
-
-- tlogfs as recovery truth;
-- idempotent reconciliation between live and committed data;
-- explicit provisional versus committed evaluation frontiers;
-- monitor independence from the transport implementation.
-
-No MQTT or OTAP dependency is required to implement the current design.
-
-## 21. Failure behavior
+## 12. Failure behavior
 
 | Failure | Required behavior |
 |---|---|
-| Pond unavailable | Continue monitoring the current generation; freshness degrades |
-| Projection refresh task stops or panics | The monitor runtime continues serving its current generation; supervision reports and restarts refresh |
-| Monitor process crashes, phase 1 | Monitoring is unavailable until the process restarts and rebuilds from the pond |
-| Refresh fails | Retain current generation and retry the same source frontier |
-| One commit or source version is corrupt | Reject the whole candidate; block later commits until operator recovery |
-| Schema becomes incompatible | Reject candidate and report the affected table |
-| Memory limit is exceeded | Reject candidate; never install partial data |
-| One monitor definition is invalid | Retain its prior firing state, mark it configuration-error unknown, emit a configuration incident, and continue publication |
-| One monitor execution fails | Retain its prior firing state, record an evaluation error, and continue other monitors and refresh |
-| Notification endpoint fails | Outbox retries; monitor execution continues |
-| Site generation fails | No effect on projection or monitors |
-| Query overlaps publication | Query completes against its pinned generation |
-| Clock advances without commits | Exact query cutoff advances; freshness is accurate |
-| Monitor process restarts, phase 1 | Rebuild from pond before evaluating |
-| Monitor process restarts, checkpoint phase | Load local generation and evaluate while refreshing |
+| Pond unavailable | Continue scheduled queries against the current image and report increasing staleness |
+| Refresh fails | Discard the candidate and retain the current image |
+| Refresh task stops | Continue scheduled queries; supervision reports and restarts refresh |
+| Selected input cannot be read | Reject the complete candidate |
+| Monitor input is missing | Mark that monitor invalid; never substitute an empty table |
+| Monitor SQL is invalid | Keep its prior condition state, report configuration failure, and continue other monitors |
+| Monitor execution fails | Keep its prior condition state, report evaluation failure, and continue other monitors |
+| Notification delivery fails | Retain an outbox entry for retry |
+| Azure pond backup fails | Retain local monitoring results and retry backup independently |
+| Azure status publication fails | Retain the local result, retry publication, and let the cloud stale timer expose the outage |
+| Watershop becomes unavailable | Continue serving the last status; cloud timer changes it to stale and may send an SMS |
+| Site generation fails | No effect on monitoring |
+| Query overlaps publication | Complete against the image pinned when the query began |
+| Monitor process crashes | Monitoring stops until restart in the initial deployment |
 
-## 22. Testing strategy
+## 13. Resource policy
 
-### 22.1 Projection correctness
+The configured input windows bound the retained source data. Candidate
+construction can temporarily overlap the current image, and active queries can
+pin older images, so retained-data size is not a hard process RSS limit.
 
-- A static projection returns the same bounded rows as direct tlogfs queries.
-- Exact row filtering removes old rows from boundary versions.
-- Versions wholly outside the window are not materialized.
-- Unknown temporal bounds are retained conservatively.
-- Duplicate source versions do not duplicate rows.
-- Conflicting content for the same source version fails validation.
-- Compatible schema evolution produces the expected merged schema.
-- Incompatible schema evolution rejects the candidate.
-- Commit parent/hash/sequence discontinuity blocks publication.
-- Manifest additions, removals, renames, and type changes update the projected
-  namespace exactly.
-- A metadata-only commit publishes a new frontier while reusing all Arrow
-  chunks.
+The initial deployment therefore also needs:
 
-### 22.2 Atomicity and concurrency
+- a maximum candidate size;
+- a DataFusion execution memory pool;
+- a query concurrency limit;
+- a query deadline; and
+- cancellation of queries that exceed that deadline.
 
-- A query begun on generation `N` finishes on `N` while `N+1` publishes.
-- New queries use `N+1` immediately after publication.
-- No query observes a mixture of generations.
-- A failed candidate leaves the current pointer unchanged.
-- Shared old chunks remain alive until the last pinned generation releases
-  them.
+If a candidate exceeds its limit, refresh fails and the current complete image
+remains published. The system never shortens a requested retention window or
+evicts arbitrary in-window data to make a candidate fit.
 
-### 22.3 Time behavior
+## 14. Deployment and cost decision
 
-- Rows age out logically without a new pond commit.
-- Physical maintenance later releases expired chunks.
-- Late rows inside the allowance enter the correct query window.
-- Rows outside the allowance follow the configured policy.
-- A controlled test clock makes every cutoff deterministic.
+### 14.1 Current repository topology
 
-### 22.4 Failure isolation
+The production data path already has the pieces needed for a low-cost
+deployment:
 
-- Build a generation, remove all pond access, and continue querying it.
-- Continue scheduled monitor transitions while pond refresh fails.
-- Surface increasing pipeline age.
-- Preserve a firing condition during pipeline or live-input staleness.
-- Recover by publishing a newer complete generation when pond access returns.
-- Monitor SQL failure does not affect other monitors.
-- Invalid monitor configuration does not block data-generation publication.
-- Deleting a required series disables the dependent monitor without installing
-  an empty replacement table.
-- Notification failure does not affect monitor state.
+- water, septic, and noyo run on Watershop and publish to the existing
+  `casparwaterprod` West US 2 Hot/LRS storage account;
+- steady source volume is approximately 15-17 MB/day, or 0.45-0.51 GB/month;
+- `site-prod` already has a three-hour schedule and can remain on Watershop;
+- Azure Communication Services already exists for email, although an
+  SMS-capable number is not yet provisioned; and
+- the Linode host serves the generated site and proxies
+  `influx.casparwater.us`.
 
-### 22.5 Memory
+Replacing the website host does not by itself replace InfluxDB. That endpoint
+must be retired or relocated before the Linode can be deleted.
 
-- Candidate memory estimation includes Arrow buffers without double-counting
-  shared buffers.
-- Incremental refresh shares unchanged chunks.
-- Expired chunks are released after pinned generations finish.
-- Over-budget candidates are rejected before publication.
-- Repeated refreshes reach a memory plateau for a fixed physical window.
-- Unknown temporal bounds are decoded conservatively and charged to the same
-  retained-buffer limit.
+### 14.2 Preferred deployment
 
-### 22.6 Restart checkpoint
+The current preferred deployment is:
 
-- A complete checkpoint loads without pond access.
-- A partially written generation is ignored.
-- A corrupt current manifest falls back to the newest valid generation.
-- Condition state and notification outbox recover independently.
+1. Keep the producer ponds, monitor engine, and `site-prod` on Watershop.
+2. Evaluate monitors from the local committed pond through the bounded
+   `MemoryPersistence` image described here.
+3. Push pond backups to the existing private Azure containers independently.
+4. Publish the completed static site to Azure Static Web Apps Free every three
+   hours.
+5. Publish only a compact current-status artifact on monitor transitions and
+   successful evaluations.
+6. Use a small scale-to-zero Azure Function to serve private status, detect a
+   stale Watershop publisher on a timer, deduplicate transitions, and send ACS
+   SMS.
 
-## 23. Implementation phases
+The browser loads a stable static HTML/JavaScript shell and fetches current
+status. A 15-minute monitoring interval does not imply 2,880 complete site
+deployments per month.
 
-### Phase 1: Static independent projection
+Running Watertown in Functions is not planned. If all computation must later
+leave Watershop, a scheduled Container Apps Job is the compatible alternative:
+it can run the existing Rust/DataFusion process to completion and scale to
+zero. That migration should be justified by operational requirements, not
+assumed to be cheaper.
 
-- Define immutable generation, table, chunk, frontier, and status types.
-- Build one two-day projection from a committed water pond snapshot.
-- Register self-contained DataFusion providers.
-- Close or deny access to the source pond.
-- Prove queries continue to run.
+### 14.3 Cost snapshot and uncertainty
 
-**Acceptance test:** after generation 1 is installed, remove source-pond access,
-advance a controlled clock through several query intervals, and obtain correct
-bounded results with accurate stale metadata.
+The following planning estimates were collected on 2026-09-17 for West US 2
+pay-as-you-go pricing:
 
-### Phase 2: Atomic refresh
+| Replacement | Approximate incremental monthly cost |
+|---|---:|
+| Static Web Apps Free and Flex Functions | $0 at the expected workload, before storage and SMS |
+| ACS toll-free number and 20 one-segment US messages | $2.20 |
+| Static Web Apps Standard | $9 |
+| Linux App Service Basic B1 | $12.41 |
+| B1s VM, 32-GiB Standard SSD, and Standard IPv4 | $13.64 |
+| Blob static website behind Front Door Standard | more than $35 |
 
-- Add `ProjectionHost`.
-- Build candidates without changing the published generation.
-- Validate and atomically replace generations.
-- Test concurrent queries during replacement.
+Static Web Apps Free is the least expensive custom-domain HTTPS frontend.
+Direct Blob static hosting does not provide HTTPS for a custom hostname
+without another edge service. The Free plan has no SLA; Standard should be
+chosen only if that changes from a personal operational site to an
+availability commitment.
 
-### Phase 3: Incremental committed updates
+Pricing references:
 
-- Consume the shared content commit chain in strict parent/sequence order.
-- Apply canonical manifest changes, including removals and renames.
-- Load only selected introduced objects and changed-series packs.
-- Reuse unchanged chunks and evict expired chunks.
-- Publish metadata-only generations for commits with no selected Arrow changes.
-- Reject and retry blocked commits without advancing to later frontiers.
+- [Azure Static Web Apps plans](https://learn.microsoft.com/azure/static-web-apps/plans)
+- [Azure Functions pricing](https://azure.microsoft.com/pricing/details/functions/)
+- [Azure Blob Storage pricing](https://azure.microsoft.com/pricing/details/storage/blobs/)
+- [Azure Communication Services SMS pricing](https://learn.microsoft.com/azure/communication-services/concepts/sms-pricing)
+- [Azure Front Door pricing](https://azure.microsoft.com/pricing/details/frontdoor/)
 
-### Phase 4: SQL monitor runtime
+Compute and storage capacity are not the important unknowns. The existing
+11.4-GB seed costs about $0.21/month in Hot LRS, and each new 0.5-GB month adds
+less than one cent to subsequent monthly capacity cost. Functions and Event
+Grid remain inside their free grants at this scale.
 
-- Define monitor SQL and condition-key contracts.
-- Add freshness, no-data, pending, firing, and resolution behavior.
-- Isolate invalid monitor definitions from projection publication.
-- Evaluate all monitors after every published commit and on a separate timer.
-- Store initial condition state in memory.
+Azure storage transactions are the uncertainty. The repository records about
+1,100-1,600 physical provider requests for an ordinary mature push and a
+worst-case rate near 38,000 requests/day at the current hourly cadence. If the
+same fixed work occurs four times as often:
 
-### Phase 5: Local operational state
+| Producer cadence | Approximate requests/month | Cost bound from current Azure operation prices |
+|---|---:|---:|
+| Hourly worst case | 1.14 million | $0.46-$5.70 |
+| Every 15 minutes | 4.56 million | $1.82-$22.80 |
 
-- Persist condition state and notification outbox in SQLite.
-- Add idempotent alert delivery.
-- Preserve monitor progress across runtime restart.
+The range is wide because Azure prices read/other operations at approximately
+$0.004 per 10,000 and write/list operations at approximately $0.05 per 10,000.
+One aggregate `ops` counter cannot select the correct price.
 
-### Phase 6: Projection checkpoint
+### 14.4 Observation period
 
-- Persist immutable Arrow generations locally.
-- Load the last valid generation before contacting the pond.
-- Refresh in the background.
+Deployment selection and any move from hourly to 15-minute full pond pushes
+are paused for at least 90 days of representative measurements. Selfmon
+materializes one event per completed Azure storage-meter scope at:
 
-### Phase 7: Pure factory reuse
+```text
+/metrics/azure-access.series
+```
 
-- Introduce `QueryContext` and `TableResolver`.
-- Classify factory capabilities.
-- Migrate selected pure transforms into the isolated runtime.
+Each row retains:
 
-### Phase 8: Future live admission
+- timestamp, pond, and non-sensitive remote label;
+- inherited ungoverned operation and byte arrears;
+- total operations and bytes;
+- GET, HEAD, LIST, PUT, multipart, delete, and copy operations and bytes; and
+- operation counts by storage path class, including Delta metadata, content
+  objects, receipts, publications, packs, blobs, recovery, and fallback.
 
-- Add MQTT and OTAP `ProjectionBatch` producers.
-- Persist stable batch identities in tlogfs.
-- Reconcile provisional live data with committed versions.
-- Preserve the same projection and monitor interfaces.
+This complements the metrics already retained by selfmon:
 
-## 24. Relationship to TinyFS redesign
+- limiter charged and independently observed operations and bytes;
+- pond timer health, last-run age, and actual run duration;
+- transaction rate, local pond size, Parquet count, and Delta-log count;
+- producer and sitegen peak RSS; and
+- selfmon step failures.
 
-This project should precede broad `PersistenceLayer` decomposition because it
-will reveal the practical boundaries more clearly:
+The access events come from Watertown's existing
+`storage_access_summary` journal record at the physical `ObjectStore`
+boundary. Selfmon ingests that journal once and incrementally materializes a
+typed physical series. It does not poll Azure or introduce a competing
+counter.
 
-- namespace and node persistence;
-- versioned-series access;
-- committed snapshot and change feed;
-- projection/read policy;
-- query-provider construction;
-- writable transactions.
+A first monthly query can preserve the categories needed to apply Azure's
+prices at decision time:
 
-The projection should not force hostmount, overlay, or memory persistence to
-pretend they support versioned live views. Future capability traits can express
-which backends provide committed frontiers, version metadata, and incremental
-change discovery.
+```sql
+SELECT
+  date_trunc('month', timestamp) AS month,
+  pond,
+  COUNT(*) AS remote_scopes,
+  SUM(get_ops) AS get_ops,
+  SUM(head_ops) AS head_ops,
+  SUM(list_ops) AS list_ops,
+  SUM(put_ops) AS put_ops,
+  SUM(multipart_ops) AS multipart_ops,
+  SUM(delete_ops) AS delete_ops,
+  SUM(copy_ops) AS copy_ops,
+  SUM(get_bytes) AS downloaded_bytes,
+  SUM(put_bytes + multipart_bytes) AS uploaded_bytes
+FROM source
+GROUP BY date_trunc('month', timestamp), pond
+ORDER BY month, pond
+```
 
-The independent hostmount rename defect remains valid but is orthogonal to this
-design.
+Run it against `series:///metrics/azure-access.series`. Do not collapse these
+columns into read/write billing classes in storage: Azure can change meter
+definitions and prices, while the physical operation facts remain valid.
 
-## 25. Open decisions
+At the end of the observation period, group the series by calendar month,
+pond, and operation category. Reconcile those totals with Azure Cost
+Management meters for read, write, list/create, other operations, capacity,
+and egress. The decision requires:
 
-1. When the refresh component should move out of the initial monitor process
-   and which explicit image-transfer protocol it should use.
-2. How selected paths map to stable SQL table names.
-3. Which schema changes are automatically compatible.
-4. Whether monitor definitions live in the source pond, local configuration,
-   or both with explicit precedence.
-5. Which stale-data policy is the default for safety monitors.
-6. Whether phase-one monitor state is in memory or starts directly with SQLite.
-7. Whether Arrow IPC or Parquet is preferable for local generation
-   checkpoints.
-8. Which existing factories qualify as pure transforms after dependency
-   review.
+1. p50, p95, and maximum operations per successful producer push;
+2. operation mix and bytes by pond and storage path class;
+3. actual pushes, failures, retries, and no-op pushes per month;
+4. retained Azure capacity growth;
+5. measured producer, monitor-image, query, and sitegen duration and peak RSS;
+6. status API traffic and Application Insights ingestion; and
+7. actual recurring ACS number, carrier, and message charges.
 
-These decisions can be made incrementally. None changes the core invariant:
-only a complete, validated, self-contained generation is published to the
-monitor runtime.
+Do not extrapolate a 15-minute Azure bill solely by multiplying the current
+aggregate limiter value by four. After the hourly baseline is stable, trial
+one producer at 15 minutes and compare its measured category mix before
+changing the other ponds.
+
+## 15. Implementation phases
+
+### Phase 0: Measure the existing system
+
+- Deploy the selfmon Azure-access materialization.
+- Keep production producer timers hourly.
+- Retain at least 90 days of access, limiter, runtime, memory, and size data.
+- Reconcile application counts with Azure billing meters monthly.
+- Run a bounded 15-minute trial on one producer only after the hourly baseline
+  is trustworthy.
+
+**Acceptance test:** every production Azure push or pull produces one typed
+access row per remote scope, category totals sum to `total_ops`, and monthly
+aggregates can be reconciled to Azure's billed operation categories.
+
+### Phase 1: Static image
+
+- Define `MonitoringImage` and its source metadata.
+- Copy one bounded physical series and a `temporal-reduce` factory definition
+  into `MemoryPersistence`.
+- Resolve the factory-generated table through its existing Watertown provider.
+- Remove access to the source pond.
+- Run a representative DataFusion query over the in-memory aggregation.
+
+**Acceptance test:** after publication, deny all source-pond access and obtain
+the same bounded query result as a direct pond query.
+
+### Phase 2: Monitor input planning
+
+- Define explicit table, source, definition, and retention configuration.
+- Compute the union required by enabled monitors.
+- Build a complete image from one committed snapshot.
+- Validate that SQL uses only declared tables.
+
+**Acceptance test:** two monitors sharing an input with different windows
+produce one image retaining the larger requirement and correct results for
+both windows.
+
+### Phase 3: Atomic refresh
+
+- Add a host containing the current `Arc<MonitoringImage>`.
+- Build candidates independently.
+- Publish with one atomic pointer replacement.
+- Preserve the current image on every candidate failure.
+
+**Acceptance test:** a query pinned to generation `N` finishes on `N` while new
+queries begin on `N+1`.
+
+### Phase 4: Scheduled monitoring
+
+- Evaluate monitors after successful refresh and on their configured timers.
+- Add condition, pending, resolution, stale, and evaluation-error behavior.
+- Expose image and input freshness with every result.
+
+**Acceptance test:** monitoring continues against the last image during a pond
+outage and never resolves an active condition solely because data became
+stale.
+
+### Phase 5: Durable operational state
+
+- Store condition state and notification outbox entries in SQLite.
+- Deliver notifications asynchronously and idempotently.
+
+### Phase 6: Measure before optimizing
+
+Measure complete rebuild time, peak memory, retained image size, and query
+latency under the expected two-day water workload.
+
+Only measured problems justify optimizations such as:
+
+- reusing unchanged in-memory versions;
+- incrementally copying committed source versions;
+- caching query plans;
+- deriving input dependencies from SQL; or
+- checkpointing an image for process-restart independence.
+
+These optimizations must preserve the same published-image and query
+interfaces.
+
+## 16. Non-goals
+
+The initial implementation does not:
+
+- create a projection-specific namespace or table-provider hierarchy;
+- materialize derived factory output;
+- run initializing, executable, ingest, storage, export, or external-I/O
+  factories in the monitor runtime;
+- consume uncommitted MQTT or OTAP batches;
+- wait for an Azure pond backup before evaluating a local commit;
+- run the Watertown/DataFusion monitor in Azure Functions;
+- rebuild the complete static site at the monitoring cadence;
+- incrementally replay the complete pond commit chain;
+- provide exactly-once external notification delivery;
+- persist images across process restart; or
+- survive failure of the monitor process.
+
+## 17. Open implementation questions
+
+The initial implementation needs answers to a small set of concrete questions:
+
+1. Which existing TinyFS operation should copy a physical-series version while
+   preserving its event-time and identity metadata?
+2. What read-only wrapper should prevent mutation after a
+   `MemoryPersistence` candidate is published?
+3. Should image source/definition selection remain explicit, or should
+   queryable factories eventually expose their TinyFS dependencies?
+4. How should committed pond metadata map onto `SourceFrontier` using existing
+   types?
+5. What initial candidate-size, query-memory, concurrency, and deadline limits
+   fit the deployed water workload?
+
+These questions refine existing abstractions. They do not change the core
+architecture: bounded TinyFS data and factory definitions are copied into
+memory, existing Watertown tools synthesize and query providers there, and
+complete images are replaced atomically.
