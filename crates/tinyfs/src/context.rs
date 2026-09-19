@@ -13,6 +13,8 @@ use datafusion::execution::context::SessionContext;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+type CachedTableProvider = (Option<u64>, Arc<dyn datafusion::catalog::TableProvider>);
+
 /// Result type for tinyfs context operations
 pub type Result<T> = std::result::Result<T, crate::Error>;
 
@@ -46,11 +48,8 @@ pub struct ProviderContext {
     pub datafusion_session: Arc<SessionContext>,
 
     /// Table provider cache for performance
-    pub table_provider_cache: Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<String, Arc<dyn datafusion::catalog::TableProvider>>,
-        >,
-    >,
+    pub table_provider_cache:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, CachedTableProvider>>>,
 
     /// TinyFS persistence layer for transaction management
     pub persistence: Arc<dyn PersistenceLayer>,
@@ -106,7 +105,21 @@ impl ProviderContext {
         &self,
         key: &str,
     ) -> Option<Arc<dyn datafusion::catalog::TableProvider>> {
-        self.table_provider_cache.lock().ok()?.get(key).cloned()
+        let generation = match self.persistence.coherence_state() {
+            Some(state) => {
+                state.ensure_open().ok()?;
+                Some(state.generation())
+            }
+            None => None,
+        };
+        let mut cache = self.table_provider_cache.lock().ok()?;
+        let (cached_generation, provider) = cache.get(key)?;
+        if *cached_generation == generation {
+            Some(provider.clone())
+        } else {
+            _ = cache.remove(key);
+            None
+        }
     }
 
     /// Set cached TableProvider
@@ -115,11 +128,36 @@ impl ProviderContext {
         key: String,
         provider: Arc<dyn datafusion::catalog::TableProvider>,
     ) -> Result<()> {
+        let generation = match self.persistence.coherence_state() {
+            Some(state) => {
+                state.ensure_open()?;
+                Some(state.generation())
+            }
+            None => None,
+        };
+        self.set_table_provider_cache_at(key, provider, generation)
+    }
+
+    /// Cache a provider under the generation it actually represents.
+    pub fn set_table_provider_cache_at(
+        &self,
+        key: String,
+        provider: Arc<dyn datafusion::catalog::TableProvider>,
+        generation: Option<u64>,
+    ) -> Result<()> {
+        if let Some(state) = self.persistence.coherence_state() {
+            let expected = generation.ok_or_else(|| {
+                crate::Error::Other(
+                    "Missing provider generation for coherent persistence".to_string(),
+                )
+            })?;
+            state.ensure_generation(expected)?;
+        }
         _ = self
             .table_provider_cache
             .lock()
             .map_other_context("Mutex poisoned")?
-            .insert(key, provider);
+            .insert(key, (generation, provider));
         Ok(())
     }
 

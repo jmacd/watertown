@@ -167,6 +167,11 @@ impl File for MemoryFile {
     }
 
     async fn async_writer(&self) -> error::Result<Pin<Box<dyn crate::file::FileMetadataWriter>>> {
+        let writer_guard = self
+            .persistence
+            .coherence_state()
+            .expect("memory persistence has coherence state")
+            .begin_writer(self.id)?;
         // Acquire write lock
         let mut state = self.write_state.write().await;
         if *state == WriteState::Writing {
@@ -184,6 +189,7 @@ impl File for MemoryFile {
             self.id,
             self.persistence.clone(),
             allocated_version,
+            writer_guard,
             self.entry_type,
             self.content.clone(),
             self.write_state.clone(),
@@ -212,38 +218,63 @@ impl crate::file::QueryableFile for MemoryFile {
             ListingOptions, ListingTableConfig, ListingTableUrl,
         };
 
-        // Use the same pattern as tlogfs: create a ListingTable with a tinyfs:// URL
-        // The TinyFsObjectStore (registered in SessionContext) handles reading from MemoryPersistence
-
-        // Build URL pattern for this file: tinyfs:///pond/{pond_id}/part/{part_id}/node/{node_id}/version/
-        // This matches the TinyFsObjectStore path format expectations
-        let url_pattern = format!(
-            "tinyfs:///pond/{}/part/{}/node/{}/version/",
-            id.pond_id(),
-            id.part_id(),
-            id.node_id()
-        );
-
-        let table_url =
-            ListingTableUrl::parse(&url_pattern).map_other_context("Failed to parse table URL")?;
+        let coherence = context.persistence.coherence_state();
+        let generation = coherence.as_ref().map(|state| state.generation());
+        let versions = context.persistence.list_file_versions(id).await?;
+        let table_urls = versions
+            .into_iter()
+            .filter(|version| version.size > 0)
+            .map(|version| {
+                ListingTableUrl::parse(format!(
+                    "tinyfs:///pond/{}/part/{}/node/{}/version/{}.parquet",
+                    id.pond_id(),
+                    id.part_id(),
+                    id.node_id(),
+                    version.version
+                ))
+                .map_other_context("Failed to parse table URL")
+            })
+            .collect::<error::Result<Vec<_>>>()?;
+        if table_urls.is_empty() {
+            return Err(error::Error::not_found(format!(
+                "No readable versions found for {id}"
+            )));
+        }
 
         // Create ListingTable configuration with Parquet format
         let file_format = Arc::new(ParquetFormat::default());
         let listing_options = ListingOptions::new(file_format);
-        let config = ListingTableConfig::new(table_url).with_listing_options(listing_options);
-
-        // Infer schema from the SessionContext (which will use the registered ObjectStore)
         let ctx = &context.datafusion_session;
-        let config_with_schema = config
-            .infer_schema(&ctx.state())
-            .await
-            .map_other_context("Schema inference failed")?;
+        let mut schemas = Vec::with_capacity(table_urls.len());
+        for table_url in &table_urls {
+            let inferred = ListingTableConfig::new(table_url.clone())
+                .with_listing_options(listing_options.clone())
+                .infer_schema(&ctx.state())
+                .await
+                .map_other_context("Schema inference failed")?;
+            let schema = inferred.file_schema.ok_or_else(|| {
+                error::Error::Other(format!("Could not infer schema for {table_url}"))
+            })?;
+            schemas.push(schema.as_ref().clone());
+        }
+        let schema = arrow::datatypes::Schema::try_merge(schemas)
+            .map_other_context("Schema merge failed")?;
+        let config_with_schema = ListingTableConfig::new_with_multi_paths(table_urls)
+            .with_listing_options(listing_options)
+            .with_schema(Arc::new(schema));
+        if let (Some(coherence), Some(generation)) = (&coherence, generation) {
+            coherence.ensure_generation(generation)?;
+        }
 
         // Create ListingTable
         let listing_table = ListingTable::try_new(config_with_schema)
             .map_other_context("ListingTable creation failed")?;
 
-        Ok(Arc::new(listing_table))
+        Ok(crate::coherent_table_provider(
+            Arc::new(listing_table),
+            coherence,
+            generation,
+        ))
     }
 }
 
@@ -273,6 +304,7 @@ struct MemoryFileWriter {
     id: FileID,
     persistence: MemoryPersistence,
     allocated_version: u64,
+    writer_guard: Option<crate::WriterGuard>,
     entry_type: EntryType,
     content: Arc<Mutex<Vec<u8>>>,
     write_state: Arc<RwLock<WriteState>>,
@@ -287,6 +319,7 @@ impl MemoryFileWriter {
         id: FileID,
         persistence: MemoryPersistence,
         allocated_version: u64,
+        writer_guard: crate::WriterGuard,
         entry_type: EntryType,
         content: Arc<Mutex<Vec<u8>>>,
         write_state: Arc<RwLock<WriteState>>,
@@ -295,6 +328,7 @@ impl MemoryFileWriter {
             id,
             persistence,
             allocated_version,
+            writer_guard: Some(writer_guard),
             entry_type,
             content,
             write_state,
@@ -526,6 +560,7 @@ impl AsyncWrite for MemoryFileWriter {
         {
             Poll::Ready(result) => {
                 self.completed = true;
+                _ = self.writer_guard.take();
                 if let Err(error) = &result {
                     self.completion_error = Some(error.to_string());
                 }

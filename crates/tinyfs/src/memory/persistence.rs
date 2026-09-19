@@ -38,6 +38,7 @@ struct MemoryFileVersion {
 #[derive(Clone)]
 pub struct MemoryPersistence {
     state: Arc<Mutex<State>>,
+    coherence: Arc<crate::CoherenceState>,
     /// Transaction state for enforcing single-writer pattern
     pub txn_state: Arc<TransactionState>,
     #[cfg(test)]
@@ -70,6 +71,7 @@ impl Default for MemoryPersistence {
     fn default() -> Self {
         Self {
             state: Arc::new(Mutex::new(State::default())),
+            coherence: Arc::new(crate::CoherenceState::default()),
             txn_state: Arc::new(TransactionState::new()),
             #[cfg(test)]
             fail_next_store: Arc::new(AtomicBool::new(false)),
@@ -89,13 +91,20 @@ impl PersistenceLayer for MemoryPersistence {
         self.txn_state.clone()
     }
 
+    fn coherence_state(&self) -> Option<Arc<crate::CoherenceState>> {
+        Some(self.coherence.clone())
+    }
+
     // Node operations
     async fn load_node(&self, id: FileID) -> Result<Node> {
         self.state.lock().await.load_node(id).await
     }
 
     async fn store_node(&self, node: &Node) -> Result<()> {
-        self.state.lock().await.store_node(node).await
+        let _mutation = self.coherence.begin_mutation()?;
+        self.state.lock().await.store_node(node).await?;
+        _ = self.coherence.advance()?;
+        Ok(())
     }
 
     // Factory methods for creating nodes directly with persistence
@@ -116,11 +125,15 @@ impl PersistenceLayer for MemoryPersistence {
         target: &std::path::Path,
         _mtime: Option<i64>,
     ) -> Result<Node> {
-        self.state
+        let _mutation = self.coherence.begin_mutation()?;
+        let node = self
+            .state
             .lock()
             .await
             .create_symlink_node(id, target)
-            .await
+            .await?;
+        _ = self.coherence.advance()?;
+        Ok(node)
     }
 
     async fn create_dynamic_node(
@@ -130,6 +143,7 @@ impl PersistenceLayer for MemoryPersistence {
         config_content: Vec<u8>,
         _mtime: Option<i64>,
     ) -> Result<Node> {
+        let _mutation = self.coherence.begin_mutation()?;
         let entry_type = id.entry_type();
         if !entry_type.is_dynamic() {
             return Err(Error::Other(format!(
@@ -142,6 +156,7 @@ impl PersistenceLayer for MemoryPersistence {
             .await
             .store_dynamic_node_config(id, factory_type, config_content)
             .await?;
+        _ = self.coherence.advance()?;
 
         let node_type = if entry_type.is_directory() {
             NodeType::Directory(MemoryDirectory::new_handle_with_entry_type(entry_type))
@@ -165,11 +180,14 @@ impl PersistenceLayer for MemoryPersistence {
         factory_type: &str,
         config_content: Vec<u8>,
     ) -> Result<()> {
+        let _mutation = self.coherence.begin_mutation()?;
         self.state
             .lock()
             .await
             .update_dynamic_node_config(id, factory_type, config_content)
-            .await
+            .await?;
+        _ = self.coherence.advance()?;
+        Ok(())
     }
 
     async fn metadata(&self, id: FileID) -> Result<NodeMetadata> {
@@ -248,11 +266,14 @@ impl PersistenceLayer for MemoryPersistence {
         id: FileID,
         attributes: HashMap<String, String>,
     ) -> Result<()> {
+        let _mutation = self.coherence.begin_mutation()?;
         self.state
             .lock()
             .await
             .set_extended_attributes(id, attributes)
-            .await
+            .await?;
+        _ = self.coherence.advance()?;
+        Ok(())
     }
 }
 
@@ -284,11 +305,14 @@ impl MemoryPersistence {
     ) -> Result<()> {
         #[cfg(test)]
         self.take_store_failure()?;
+        let _mutation = self.coherence.begin_mutation()?;
         self.state
             .lock()
             .await
             .store_file_version(id, version, content)
-            .await
+            .await?;
+        _ = self.coherence.advance()?;
+        Ok(())
     }
 
     /// Store a file version with extended metadata (for testing)
@@ -302,11 +326,14 @@ impl MemoryPersistence {
     ) -> Result<()> {
         #[cfg(test)]
         self.take_store_failure()?;
+        let _mutation = self.coherence.begin_mutation()?;
         self.state
             .lock()
             .await
             .store_file_version_with_metadata(id, version, content, entry_type, extended_metadata)
-            .await
+            .await?;
+        _ = self.coherence.advance()?;
+        Ok(())
     }
 
     /// Store a file version with bao_outboard data (for testing)
@@ -319,11 +346,14 @@ impl MemoryPersistence {
     ) -> Result<()> {
         #[cfg(test)]
         self.take_store_failure()?;
+        let _mutation = self.coherence.begin_mutation()?;
         self.state
             .lock()
             .await
             .store_file_version_with_bao(id, version, content, bao_outboard)
-            .await
+            .await?;
+        _ = self.coherence.advance()?;
+        Ok(())
     }
 
     /// Allocate next version number for a file write

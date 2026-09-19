@@ -155,6 +155,8 @@ pub struct State {
     >,
     /// Transaction state for enforcing single-writer pattern (shared with tinyfs)
     txn_state: Arc<TinyFsTransactionState>,
+    /// Shared transaction lifecycle and provider-cache generation.
+    coherence: Arc<tinyfs::CoherenceState>,
     /// Options for large file storage (compression, etc.)
     large_file_options: crate::large_files::LargeFileOptions,
     /// Format provider cache directory ({POND}/cache/), computed from data path
@@ -915,6 +917,7 @@ impl OpLogPersistence {
             session_context,
             table_provider_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             txn_state: self.txn_state.clone(),
+            coherence: Arc::new(tinyfs::CoherenceState::default()),
             large_file_options: self.large_file_options.clone(),
             cache_dir,
             pond_path: pond_root,
@@ -1135,6 +1138,22 @@ impl OpLogPersistence {
 }
 
 impl State {
+    pub fn coherence_state(&self) -> Arc<tinyfs::CoherenceState> {
+        self.coherence.clone()
+    }
+
+    pub fn begin_writer(&self, id: FileID) -> TinyFSResult<tinyfs::WriterGuard> {
+        self.coherence.begin_writer(id)
+    }
+
+    fn begin_mutation(&self) -> Result<tinyfs::MutationGuard, TLogFSError> {
+        self.coherence.begin_mutation().map_err(Into::into)
+    }
+
+    fn mark_mutated(&self) -> Result<(), TLogFSError> {
+        self.coherence.advance().map(|_| ()).map_err(Into::into)
+    }
+
     /// Get the Delta table for this transaction
     /// This allows factories to access the table for operations like reading Parquet files
     pub async fn table(&self) -> DeltaTable {
@@ -1154,6 +1173,7 @@ impl State {
         &self,
         id: &FileID,
     ) -> Result<Vec<DirectoryEntry>, TLogFSError> {
+        self.coherence.ensure_open().map_other()?;
         self.inner.lock().await.query_directory_entries(*id).await
     }
 
@@ -1163,20 +1183,25 @@ impl State {
     /// commit+reload cycle. The directory is NOT marked as modified,
     /// so it won't be flushed as an empty OpLog record — the real
     /// directory content comes from the imported foreign parquet files.
-    pub async fn register_empty_directory(&self, id: FileID) {
+    pub async fn register_empty_directory(&self, id: FileID) -> Result<(), TLogFSError> {
+        let _mutation = self.begin_mutation()?;
         let mut inner = self.inner.lock().await;
         let _ = inner.directories.insert(id, DirectoryState::new_empty());
         // NOT marked as modified — the foreign parquet files contain the
         // real directory records. We only need this in the cache so child
         // insertions work during mknod.
+        drop(inner);
+        self.mark_mutated()
     }
 
     /// Register an external parquet file for inclusion as a Delta Add action
     /// at commit time. This ensures imported parquet files are part of the
     /// same Delta commit as the normal OpLog records, maintaining the
     /// single-transaction invariant.
-    pub async fn add_external_parquet(&self, action: ExternalAddAction) {
+    pub async fn add_external_parquet(&self, action: ExternalAddAction) -> Result<(), TLogFSError> {
+        let _mutation = self.begin_mutation()?;
         self.inner.lock().await.external_add_actions.push(action);
+        self.mark_mutated()
     }
 
     /// Get the large file storage options (compression settings, etc.)
@@ -1717,12 +1742,14 @@ impl State {
     ///
     /// Should only be called during pond bootstrap from steward or tests
     pub async fn initialize_root_directory(&self) -> Result<(), TLogFSError> {
+        let _mutation = self.begin_mutation()?;
         let pond_id = self.pond_uuid();
         self.inner
             .lock()
             .await
             .initialize_root_directory(pond_id)
-            .await
+            .await?;
+        self.mark_mutated()
     }
 
     async fn begin_impl(&self) -> Result<(), TLogFSError> {
@@ -1747,6 +1774,7 @@ impl State {
         &self,
         id: FileID,
     ) -> Result<Pin<Box<dyn tinyfs::AsyncReadSeek>>, TLogFSError> {
+        self.coherence.ensure_open().map_other()?;
         self.inner.lock().await.async_file_reader(id).await
     }
 
@@ -1758,6 +1786,7 @@ impl State {
         id: FileID,
         bounds: tinyfs::SeriesReadBounds,
     ) -> Result<Pin<Box<dyn tinyfs::AsyncReadSeek>>, TLogFSError> {
+        self.coherence.ensure_open().map_other()?;
         self.inner
             .lock()
             .await
@@ -1775,7 +1804,9 @@ impl State {
     /// `TablePhysicalSeries` row with no logical leaf identity (item 5,
     /// `docs/logical-series-identity-design.md`).
     pub async fn add_oplog_entry(&self, entry: OplogEntry) -> Result<(), TLogFSError> {
+        let _mutation = self.begin_mutation()?;
         self.inner.lock().await.push_stamped_entry(entry).await?;
+        self.mark_mutated()?;
         Ok(())
     }
 
@@ -1818,6 +1849,7 @@ impl State {
     /// node; the value is otherwise unused because the fold hashes directory
     /// content, not version numbers.
     pub async fn uncommitted_live_rows(&self) -> Result<Vec<OplogEntry>, TLogFSError> {
+        self.coherence.ensure_open().map_other()?;
         let inner = self.inner.lock().await;
         let mut rows: Vec<OplogEntry> = inner.records.clone();
         let now = Utc::now().timestamp_micros();
@@ -1841,6 +1873,7 @@ impl State {
     /// Get the factory name for a specific node from the oplog
     /// Returns None if the node has no associated factory (static files/directories)
     pub async fn get_factory_for_node(&self, id: FileID) -> Result<Option<String>, TLogFSError> {
+        self.coherence.ensure_open().map_other()?;
         self.inner.lock().await.get_factory_for_node(id).await
     }
 
@@ -1851,6 +1884,7 @@ impl State {
         &self,
         id: FileID,
     ) -> Result<Option<(String, Vec<u8>)>, TLogFSError> {
+        self.coherence.ensure_open().map_other()?;
         self.inner.lock().await.get_dynamic_node_config(id).await
     }
 
@@ -1888,6 +1922,10 @@ impl PersistenceLayer for State {
         self.txn_state.clone()
     }
 
+    fn coherence_state(&self) -> Option<Arc<tinyfs::CoherenceState>> {
+        Some(self.coherence.clone())
+    }
+
     fn pond_uuid(&self) -> uuid7::Uuid {
         self.pond_id
             .parse::<uuid7::Uuid>()
@@ -1895,14 +1933,18 @@ impl PersistenceLayer for State {
     }
 
     async fn load_node(&self, id: FileID) -> TinyFSResult<Node> {
+        self.coherence.ensure_open()?;
         self.inner.lock().await.load_node(id, self.clone()).await
     }
 
     async fn store_node(&self, node: &Node) -> TinyFSResult<()> {
-        self.inner.lock().await.store_node(node).await
+        let _mutation = self.coherence.begin_mutation()?;
+        self.inner.lock().await.store_node(node).await?;
+        self.mark_mutated().map_err(error_utils::to_tinyfs_error)
     }
 
     async fn create_file_node(&self, id: FileID) -> TinyFSResult<Node> {
+        self.coherence.ensure_open()?;
         self.inner
             .lock()
             .await
@@ -1911,6 +1953,7 @@ impl PersistenceLayer for State {
     }
 
     async fn create_directory_node(&self, id: FileID) -> TinyFSResult<Node> {
+        self.coherence.ensure_open()?;
         self.inner
             .lock()
             .await
@@ -1919,12 +1962,14 @@ impl PersistenceLayer for State {
     }
 
     async fn initialize_foreign_root(&self, pond_id: uuid7::Uuid) -> TinyFSResult<()> {
+        let _mutation = self.coherence.begin_mutation()?;
         self.inner
             .lock()
             .await
             .initialize_root_directory(pond_id)
             .await
-            .map_err(error_utils::to_tinyfs_error)
+            .map_err(error_utils::to_tinyfs_error)?;
+        self.mark_mutated().map_err(error_utils::to_tinyfs_error)
     }
 
     async fn create_symlink_node(
@@ -1933,11 +1978,15 @@ impl PersistenceLayer for State {
         target: &Path,
         mtime: Option<i64>,
     ) -> TinyFSResult<Node> {
-        self.inner
+        let _mutation = self.coherence.begin_mutation()?;
+        let node = self
+            .inner
             .lock()
             .await
             .create_symlink_node(id, target, self.clone(), mtime)
-            .await
+            .await?;
+        self.mark_mutated().map_err(error_utils::to_tinyfs_error)?;
+        Ok(node)
     }
 
     async fn create_dynamic_node(
@@ -1947,15 +1996,20 @@ impl PersistenceLayer for State {
         config_content: Vec<u8>,
         mtime: Option<i64>,
     ) -> TinyFSResult<Node> {
-        self.inner
+        let _mutation = self.coherence.begin_mutation()?;
+        let node = self
+            .inner
             .lock()
             .await
             .create_dynamic_node(id, factory_type, config_content, self.clone(), mtime)
             .await
-            .map_err(error_utils::to_tinyfs_error)
+            .map_err(error_utils::to_tinyfs_error)?;
+        self.mark_mutated().map_err(error_utils::to_tinyfs_error)?;
+        Ok(node)
     }
 
     async fn get_dynamic_node_config(&self, id: FileID) -> TinyFSResult<Option<(String, Vec<u8>)>> {
+        self.coherence.ensure_open()?;
         self.inner
             .lock()
             .await
@@ -1970,23 +2024,28 @@ impl PersistenceLayer for State {
         factory_type: &str,
         config_content: Vec<u8>,
     ) -> TinyFSResult<()> {
+        let _mutation = self.coherence.begin_mutation()?;
         self.inner
             .lock()
             .await
             .update_dynamic_node_config(id, factory_type, config_content)
             .await
-            .map_err(error_utils::to_tinyfs_error)
+            .map_err(error_utils::to_tinyfs_error)?;
+        self.mark_mutated().map_err(error_utils::to_tinyfs_error)
     }
 
     async fn metadata(&self, id: FileID) -> TinyFSResult<NodeMetadata> {
+        self.coherence.ensure_open()?;
         self.inner.lock().await.metadata(id).await
     }
 
     async fn list_file_versions(&self, id: FileID) -> TinyFSResult<Vec<FileVersionInfo>> {
+        self.coherence.ensure_open()?;
         self.inner.lock().await.list_file_versions(id).await
     }
 
     async fn read_file_version(&self, id: FileID, version: u64) -> TinyFSResult<Vec<u8>> {
+        self.coherence.ensure_open()?;
         self.inner.lock().await.read_file_version(id, version).await
     }
 
@@ -1995,6 +2054,7 @@ impl PersistenceLayer for State {
         id: FileID,
         version: u64,
     ) -> TinyFSResult<Pin<Box<dyn tinyfs::AsyncReadSeek>>> {
+        self.coherence.ensure_open()?;
         self.inner.lock().await.open_file_version(id, version).await
     }
 
@@ -2004,6 +2064,7 @@ impl PersistenceLayer for State {
         version: u64,
         range: Range<u64>,
     ) -> TinyFSResult<Bytes> {
+        self.coherence.ensure_open()?;
         self.inner
             .lock()
             .await
@@ -2016,22 +2077,26 @@ impl PersistenceLayer for State {
         id: FileID,
         attributes: HashMap<String, String>,
     ) -> TinyFSResult<()> {
+        let _mutation = self.coherence.begin_mutation()?;
         self.inner
             .lock()
             .await
             .set_extended_attributes(id, attributes)
-            .await
+            .await?;
+        self.mark_mutated().map_err(error_utils::to_tinyfs_error)
     }
 }
 
 impl State {
     /// Load symlink target path
     pub async fn load_symlink_target(&self, id: FileID) -> TinyFSResult<PathBuf> {
+        self.coherence.ensure_open()?;
         self.inner.lock().await.load_symlink_target(id).await
     }
 
     /// Query oplog records for a node (used by directory operations)
     pub async fn query_records(&self, id: FileID) -> Result<Vec<OplogEntry>, TLogFSError> {
+        self.coherence.ensure_open().map_other()?;
         self.inner.lock().await.query_records(id).await
     }
 
@@ -2042,16 +2107,19 @@ impl State {
         id: FileID,
         content: Vec<u8>,
     ) -> Result<(), TLogFSError> {
+        let _mutation = self.begin_mutation()?;
         self.inner
             .lock()
             .await
             .update_directory_content(id, content)
-            .await
+            .await?;
+        self.mark_mutated()
     }
 
     /// Ensure directory is loaded into in-memory state
     /// If not present, loads from OpLog and caches with modified: false
     pub async fn ensure_directory_loaded(&self, id: FileID) -> Result<(), TLogFSError> {
+        self.coherence.ensure_open().map_other()?;
         self.inner.lock().await.ensure_directory_loaded(id).await
     }
 
@@ -2062,6 +2130,7 @@ impl State {
         dir_id: FileID,
         entry_name: &str,
     ) -> Result<Option<tinyfs::DirectoryEntry>, TLogFSError> {
+        self.coherence.ensure_open().map_other()?;
         Ok(self
             .inner
             .lock()
@@ -2075,6 +2144,7 @@ impl State {
         &self,
         dir_id: FileID,
     ) -> Result<Vec<tinyfs::DirectoryEntry>, TLogFSError> {
+        self.coherence.ensure_open().map_other()?;
         Ok(self.inner.lock().await.get_all_directory_entries(dir_id))
     }
 
@@ -2082,6 +2152,7 @@ impl State {
     /// This reserves the version so that concurrent writes get sequential versions
     /// The actual content write happens later in shutdown()
     pub async fn allocate_version_for_write(&self, id: FileID) -> Result<i64, TLogFSError> {
+        self.coherence.ensure_open().map_other()?;
         self.inner.lock().await.allocate_version_for_write(id).await
     }
 
@@ -2104,6 +2175,7 @@ impl State {
         mtime: Option<i64>,
         exact_logical_attributes: Option<Vec<u8>>,
     ) -> Result<(), TLogFSError> {
+        let _mutation = self.begin_mutation()?;
         self.inner
             .lock()
             .await
@@ -2117,7 +2189,8 @@ impl State {
                 mtime,
                 exact_logical_attributes,
             )
-            .await
+            .await?;
+        self.mark_mutated()
     }
 
     /// Store a FileSeries directly from Parquet bytes, extracting temporal
@@ -2129,11 +2202,15 @@ impl State {
         content: &[u8],
         timestamp_column: Option<&str>,
     ) -> Result<(i64, i64), TLogFSError> {
-        self.inner
+        let _mutation = self.begin_mutation()?;
+        let bounds = self
+            .inner
             .lock()
             .await
             .store_file_series_from_parquet(id, content, timestamp_column)
-            .await
+            .await?;
+        self.mark_mutated()?;
+        Ok(bounds)
     }
 
     /// Insert a directory entry into in-memory state
@@ -2144,10 +2221,12 @@ impl State {
         dir_id: FileID,
         entry: tinyfs::DirectoryEntry,
     ) -> Result<(), TLogFSError> {
+        let _mutation = self.begin_mutation()?;
         self.inner
             .lock()
             .await
-            .insert_directory_entry(dir_id, entry)
+            .insert_directory_entry(dir_id, entry)?;
+        self.mark_mutated()
     }
 
     /// Remove a directory entry by name
@@ -2158,7 +2237,16 @@ impl State {
         dir_id: FileID,
         name: &str,
     ) -> Result<Option<tinyfs::DirectoryEntry>, TLogFSError> {
-        self.inner.lock().await.remove_directory_entry(dir_id, name)
+        let _mutation = self.begin_mutation()?;
+        let removed = self
+            .inner
+            .lock()
+            .await
+            .remove_directory_entry(dir_id, name)?;
+        if removed.is_some() {
+            self.mark_mutated()?;
+        }
+        Ok(removed)
     }
 
     /// Get the shared DataFusion SessionContext
@@ -2167,6 +2255,7 @@ impl State {
     /// preventing ObjectStore registry conflicts and ensuring consistent configuration.
     /// This is the method SqlDerived should use instead of creating its own SessionContext.
     pub async fn session_context(&self) -> Result<Arc<SessionContext>, TLogFSError> {
+        self.coherence.ensure_open().map_other()?;
         let inner = self.inner.lock().await;
         Ok(inner.session_context.clone())
     }
@@ -4142,10 +4231,12 @@ impl InnerState {
         trace.metric("memory_scan_us", pending_start.elapsed().as_micros() as u64);
         trace.metric("pending_count", records.len() as u64);
 
-        // Step 3: Combine and sort by timestamp
+        // Step 3: Combine and sort by logical version. Imported records may
+        // retain equal or non-monotonic mtimes, while version is the node's
+        // ordering authority.
         let mut all_records = committed_records;
         all_records.extend(records);
-        all_records.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
+        all_records.sort_by_key(|r| std::cmp::Reverse((r.version, r.timestamp)));
 
         trace.metric("total_count", all_records.len() as u64);
 
@@ -4482,6 +4573,10 @@ impl InnerState {
                     if let Some(attrs) = &record.extended_attributes {
                         _ = metadata.insert("extended_attributes".to_string(), attrs.clone());
                     }
+                    if let Some(fingerprint) = &record.series_schema_fingerprint {
+                        _ = metadata
+                            .insert("series_schema_fingerprint".to_string(), fingerprint.clone());
+                    }
                     Some(metadata)
                 } else {
                     None
@@ -4505,7 +4600,8 @@ impl InnerState {
         // OPTIMIZATION: Query for specific version instead of fetching all versions
         // Query for specific version only
         let sql = format!(
-            "SELECT * FROM delta_table WHERE part_id = '{}' AND node_id = '{}' AND version = {} LIMIT 1",
+            "SELECT * FROM delta_table WHERE pond_id = '{}' AND part_id = '{}' AND node_id = '{}' AND version = {} LIMIT 1",
+            id.pond_id(),
             id.part_id(),
             id.node_id(),
             version
@@ -4541,6 +4637,7 @@ impl InnerState {
             .find(|r| {
                 r.part_id == id.part_id()
                     && r.node_id == id.node_id()
+                    && r.pond_id == id.pond_id().to_string()
                     && r.version == version as i64
             })
             .cloned();

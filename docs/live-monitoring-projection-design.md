@@ -1,129 +1,170 @@
-# Independent Live Monitoring
+# Transactional Live Monitoring
 
-> **Status:** Design proposal (unimplemented).
->
-> This document proposes a bounded in-memory TinyFS image for live monitoring.
-> The image contains selected source data and TinyFS factory definitions.
-> Existing Watertown resolution and DataFusion synthesize query providers from
-> that image without access to the source pond.
+> **Status:** Revised design with an implemented and tested transactional
+> read-after-write path. Physical-series providers are coherent snapshots:
+> mutations invalidate older providers, and closed transaction state cannot be
+> reused.
 
 ## 1. Purpose
 
-Monitoring may eventually evaluate water observations every 15 minutes while
-the website continues rebuilding every three hours. The production ponds
-currently run hourly. That cadence should not change until several months of
-storage-access measurements establish the Azure transaction cost of doing so.
+Monitoring should be a small extension of the existing pond write path, not a
+second data system. Watertown already has the necessary storage and query
+abstractions:
 
-The monitor itself belongs on Watershop, next to the authoritative local pond.
-It should evaluate a committed update without waiting for that commit's Azure
-backup and should continue using the last complete data image if the pond or
-refresh path becomes unavailable.
+- TinyFS physical series for durable Parquet data;
+- one transaction `State` shared by filesystem and provider operations;
+- DataFusion table providers over physical-series versions; and
+- normal pond commits for atomic publication.
 
-The design makes one architectural move:
+The monitor should use those abstractions directly. It does not need a copied
+`MemoryPersistence` filesystem, a projection-specific namespace, SQLite, or a
+second commit for monitor results.
 
-> Build a bounded `MemoryPersistence` image containing the TinyFS data and
-> factory definitions required by monitors, validate it, and atomically publish
-> it to the monitor runtime.
+The central workflow is:
 
-After publication, existing Watertown providers and DataFusion resolve factory
-nodes and perform all derivation in memory. Unlike site generation, monitoring
-does not materialize factory-generated output into the image.
+```text
+begin pond write transaction
+    -> write observations
+    -> build bounded providers over the staged physical series
+    -> evaluate monitor SQL with DataFusion
+    -> append evaluation, transition, and notification-intent rows
+    -> commit observations and monitor state once
+    -> publish the committed status to the in-process service cache
+    -> deliver notifications asynchronously
+```
 
-## 2. Primary invariant
+The website remains independent and may continue rebuilding every three
+hours. Azure pond backup is also independent. Neither is on the alert-latency
+path.
 
-A published monitoring image is:
+## 2. Transaction coherence contract
 
-- a complete view of one committed pond snapshot;
-- limited to declared monitor tables, their factory definitions, and the
-  bounded source data needed to resolve them;
-- self-contained, with no live pond, Delta Lake, cache, or site-generation
-  dependency;
-- immutable after publication; and
-- replaced only by another complete, validated image.
+TLogFS reads combine committed Delta records with the transaction's pending
+records. The same transaction `State` backs TinyFS reads and its
+`ProviderContext`.
 
-If refresh fails, the current image remains queryable and its increasing age is
-visible to monitor policy.
+The transaction exposes one shared coherence state:
 
-The first implementation isolates monitoring from pond and refresh failures
-while the process remains alive. It does not claim process-failure isolation.
+- every completed visibility-changing mutation advances a generation;
+- a physical-series provider is an immutable snapshot of one generation;
+- requesting the same provider from the same `ProviderContext` after a
+  mutation builds a new snapshot instead of returning the cached old one;
+- scanning or executing a provider after its generation becomes stale returns
+  an explicit error;
+- physical providers enumerate their exact live version URLs, so DataFusion's
+  list-files cache cannot preserve an earlier wildcard listing;
+- each executing provider partition holds a query guard while it can still
+  read transaction state;
+- each open file writer holds a transaction-global writer guard keyed by
+  `FileID`, including writers opened through distinct TinyFS handles;
+- commit is rejected while a writer or transaction read is active; and
+- commit, abort, and guard drop close the shared state, so later TinyFS and
+  provider operations fail rather than return a stale subset.
+
+This is snapshot invalidation, not mutable providers. A completed query result
+remains usable, but a provider or plan from generation N cannot be used after
+generation N+1. Callers request a provider again after any intervening write.
+
+The Steward integration tests in
+`crates/steward/tests/read_after_write_test.rs` verify:
+
+1. a physical series written in a transaction is immediately readable through
+   raw TinyFS;
+2. a provider created after that write exposes the pending Parquet version to
+   DataFusion;
+3. monitor state can be written after the query and read through both TinyFS
+   and DataFusion before commit;
+4. observations and monitor state survive one combined commit; and
+5. committed series history and a newly staged version are both visible after
+   an earlier provider primed the same context;
+6. the earlier registered provider fails as stale rather than returning its
+   old subset;
+7. multiple staged versions are queried together;
+8. schema evolution across staged versions produces a merged query schema;
+9. `LatestVersion` selects only the highest live version;
+10. a provider context retained across commit or abort fails as closed; and
+11. commit rejects unfinished writers and active transaction reads.
+
+The implementation also scopes version lookup by `pond_id`, `part_id`,
+`node_id`, and version, and uses version number rather than wall-clock time for
+latest-version ordering.
+
+The contract currently applies to local physical TinyFS series, which are the
+only initial monitor inputs. Dynamic factories and external sources remain
+outside the monitor transaction contract.
 
 ## 3. Architecture
 
 ```text
-Watershop
-  committed local pond snapshot
-    |\
-    | \-> independent pond backup to existing Azure Blob storage
-    |
-    \-> copy bounded data and factory definitions
-        -> candidate MemoryPersistence image
-        -> normal TinyFS factory resolution and DataFusion planning
-        -> atomic image publication
-        -> scheduled SQL monitors
-        -> durable condition state
-        -> small status publication to Azure
-
-Azure
-  Static Web Apps shell -> status API or status object
-  Flex Function timer   -> stale-Watershop detection and ACS SMS
+Watershop producer process
+  Steward write transaction
+    -> physical observation series
+    -> bounded TinyFS providers
+    -> DataFusion monitor SQL
+    -> physical monitoring event series
+    -> one atomic pond commit
+          |\
+          | \-> independent Azure pond backup
+          |
+          \-> committed-status notification
+                -> local monitoring service
+                -> in-memory current-status cache
+                -> HTTPS status endpoint
+                -> asynchronous SMS delivery
 ```
 
-Site generation reads the pond on its own schedule and is not part of this
-path. It can remain on Watershop and publish its completed static output to
-Azure every three hours.
+The producer computes authoritative monitor state because only it owns the
+open write transaction. A long-running local monitoring service receives a
+small notification after commit. A Unix-domain socket or authenticated
+localhost endpoint is sufficient on Watershop; a public write webhook is not
+required.
 
-The full Watertown/DataFusion monitor does not run in an Azure Function.
-Azure receives compact results, not the recent source window. This removes the
-remote push from alert latency and avoids rebuilding a memory image in a
-scale-to-zero runtime for every observation.
+The notification is a wake-up hint carrying the pond identity, committed
+frontier, and optionally the already computed compact status. The service
+accepts only committed state. If it misses a hint or restarts, it reconstructs
+current status from the durable monitoring series.
 
-## 4. Why `MemoryPersistence`
+The HTTPS service serves the latest committed status from memory. Memory is a
+serving cache, not a database and not part of commit correctness.
 
-`MemoryPersistence` already implements the TinyFS persistence abstraction used
-by Watertown providers. It preserves the model that existing code understands:
+## 4. Initial monitor input restriction
 
-- TinyFS paths and node identities;
-- physical series and their versions;
-- dynamic nodes and their stored factory configuration;
-- ordinary file and table formats;
-- `QueryableFile` and `TableProvider` construction;
-- a `ProviderContext` backed by in-memory persistence; and
-- DataFusion query execution.
+Initial monitors query local physical pond series only.
 
-The monitoring image should be another use of these abstractions, not a second
-namespace, table, chunk, or provider system.
+They do not resolve dynamic factory nodes, run ingestion or storage factories,
+materialize factory output, access external sources, read cross-pond imports
+written in the same transaction, or query the internal committed-only
+`delta_table`. Temporal reduction and similar operations belong in monitor SQL
+over the bounded raw inputs:
 
-The image owns a `ProviderContext` created with its `MemoryPersistence`.
-`cache_dir` and `pond_path` remain unset. Once the candidate is published, no
-writer or transaction interface is exposed to monitor execution.
+```sql
+SELECT
+  station_id AS condition_key,
+  MAX(level) AS observed_value
+FROM water_levels
+WHERE timestamp >= $window_start
+GROUP BY station_id
+HAVING MAX(level) > 8.0
+```
 
-`MemoryPersistence` already stores dynamic-node factory type and configuration,
-so copied factory nodes can be resolved normally against the in-memory
-filesystem. The implementation may need a focused extension so copied
-physical-series versions preserve the source metadata needed for bounded
-reads, especially event-time bounds and stable source-version identity. That
-metadata belongs in the TinyFS abstraction because it is useful to every
-in-memory series reader, not only monitoring.
+This deliberately removes factory lifecycle and external-I/O failure domains
+from the transaction that persists observations. DataFusion can perform the
+small aggregation over the recent physical data directly.
+
+Factory-backed monitor inputs can be reconsidered only after the raw-series
+path is operational. A future factory must be read-only, side-effect-free, and
+resolve entirely through the current transaction context.
 
 ## 5. Monitor definition
 
-A monitor declares the query tables visible to its SQL and the source data that
-must be copied into the image:
+A monitor explicitly declares its physical input tables and query policy:
 
 ```yaml
 id: high-water
-interval: 15m
 
 tables:
   water_levels:
-    path: /monitoring/water/res=1h.series
-
-image:
-  sources:
-    - path: /observations/water-levels
-      retain: 54h
-  definitions:
-    - path: /monitoring/water
+    path: /observations/water-levels.series
 
 query: |
   SELECT
@@ -135,279 +176,229 @@ query: |
   HAVING MAX(level) > 8.0
 
 window: 48h
+lateness: 6h
 for: 30m
 resolve_after: 30m
 
 freshness:
-  inputs:
-    - /observations/water-levels
   warn_after: 30m
   fail_after: 2h
   on_stale: retain
 ```
 
-In this example `/monitoring/water` is a copied `temporal-reduce` factory node
-whose configuration reads `/observations/water-levels`. Resolving
-`res=1h.series` constructs the existing factory-backed table provider inside
-the image. Its aggregated rows are not copied from the pond and are not
-written back into `MemoryPersistence`.
+The initial implementation keeps table declarations explicit rather than
+inferring paths from SQL. Validation rejects:
 
-`tables` maps monitor-local DataFusion names to TinyFS paths. A path may name a
-physical queryable file or a queryable node synthesized by a factory.
+- undeclared tables;
+- paths that are not physical queryable series;
+- non-`SELECT` SQL;
+- missing or null condition keys; and
+- unsupported external or dynamic inputs.
 
-`image.sources` selects stored data to copy, with bounds for physical series.
-`image.definitions` selects the factory nodes, directories, symlinks, and small
-ordinary files needed to resolve the tables. The initial implementation makes
-this closure explicit rather than adding factory-specific dependency analysis.
-Candidate validation fails if a copied factory refers to something outside the
-image.
+Definitions are loaded and validated before producer work begins where
+possible. Runtime planning and execution errors still become explicit
+evaluation-error records rather than empty successful results.
 
-For a monitor over a raw series, the table may refer to the source path
-directly:
+## 6. Bounded query execution
 
-```yaml
-tables:
-  water_levels:
-    path: /observations/water-levels
+There is no separate in-memory retention policy because no source data is
+copied into another filesystem. Pond retention remains the producer's durable
+data policy.
 
-image:
-  sources:
-    - path: /observations/water-levels
-    retain: 54h
-```
+For each evaluation:
 
-The initial implementation requires explicit table and image declarations
-rather than inferring them from SQL or factory configurations. This keeps
-retention reviewable and avoids making dependency analysis part of the storage
-design. Validation rejects SQL that refers to an undeclared table.
+1. finish all source writers;
+2. use the transaction's `ProviderContext`;
+3. derive `window_start` from a controlled evaluation timestamp;
+4. request each physical series after the writes through a bounded provider
+   with an event-time lower bound of `window_start - lateness`;
+5. let `SeriesReadBounds` prune whole Parquet versions that cannot contribute;
+6. apply the exact row-level timestamp predicate in SQL; and
+7. execute and fully collect the result with a deadline, memory-pool limit,
+   and result-row limit.
 
-## 6. Selection and retention
+Versions without temporal metadata are retained conservatively. Version
+pruning is an optimization; the SQL predicate is the correctness boundary.
+All physical provider modes, including unbounded and latest-version reads,
+enumerate explicit current version URLs. Bounds reduce that exact set further.
 
-The image contains the union of source data and definitions declared by enabled
-monitors. Factory definitions are small; retention limits apply primarily to
-physical series data.
+The configured window bounds the scanned input and query memory, not the
+durable pond history. Rows age out logically even when no new commit occurs,
+and late observations can still affect the window while within the declared
+lateness allowance.
 
-If several monitors select the same source series, the image retains enough
-data for the largest requirement:
+`WD::read_table_as_batch` is not the logical-series read path. For a
+`TablePhysicalSeries` it reads the latest single Parquet version, whereas the
+DataFusion provider unions the live versions. Monitoring must therefore use
+the provider path for historical windows; raw TinyFS reads are useful only for
+version-specific checks.
+
+## 7. Durable monitoring data
+
+Monitoring state is append-only Parquet in TinyFS:
 
 ```text
-physical retention = maximum monitor window + lateness allowance
+/monitoring/evaluations.series
+/monitoring/conditions.series
+/monitoring/notifications.series
 ```
 
-For example, a 48-hour query window with six hours of allowed lateness retains
-54 hours of source data.
+An implementation may partition these paths by producer or monitor if
+measurements justify it. It should batch all rows of one kind for one source
+update into one record batch rather than produce a file per condition.
 
-The builder uses `SeriesReadBounds::from_event_time_lo` when reading physical
-series from the committed pond snapshot. These bounds conservatively prune
-whole source versions. Versions without temporal bounds are retained rather
-than silently discarded.
+### Evaluations
 
-Physical retention is not the query correctness predicate. Monitor SQL applies
-the exact row-level event-time predicate using its evaluation time. Therefore:
+Each evaluation row records at least:
 
-- rows age out logically even if no new pond commit occurs;
-- late rows can affect a recent window while they remain physically retained;
-  and
-- source-version boundaries may retain some older rows without changing query
-  results.
+- pond and source transaction identity;
+- monitor ID and definition version;
+- evaluation timestamp;
+- input frontier and latest input event time;
+- outcome: success, stale, planning error, execution error, or limit error;
+- duration and rows examined/returned where available; and
+- error category and bounded diagnostic text.
 
-Changing an enabled monitor, its tables, source selection, definitions, or
-retention requirement causes the next refresh to build an image for the new
-complete input set.
+### Conditions
 
-## 7. Factory resolution and query-time derivation
+Condition rows are transition events, not mutable records:
 
-The monitoring image copies physical data and dynamic factory definitions. It
-does not copy or persist factory-generated output.
+- pending;
+- firing;
+- resolved;
+- retained because input is stale or evaluation failed; and
+- optionally acknowledged or silenced.
 
-When a monitor resolves a factory-backed table, Watertown invokes the same
-factory/provider path it normally uses, but the `ProviderContext` points to the
-published `MemoryPersistence`. A factory such as `temporal-reduce` therefore
-reads its bounded in-memory inputs and constructs its normal DataFusion
-provider. Recomputing temporal aggregation over a small in-memory window is
-expected to be inexpensive.
+Each transition has a stable monitor/condition key, sequence, source
+transaction, observed value, and transition timestamp. Current state is
+reconstructed with a DataFusion window query such as:
 
-This distinction has three useful consequences:
-
-1. Site generation and monitoring share factory and query semantics.
-2. The published image has no hidden dependency on pond paths, caches, or
-   external I/O.
-3. Derived data is synthesized from bounded source data instead of becoming
-   another retained copy.
-
-Only queryable factories whose dependencies resolve entirely inside the image
-belong on this path. Monitoring does not run factory initialization, executable
-commands, ingestion, storage, site export, or providers that require external
-I/O. Candidate validation resolves every declared table after source pond
-access is removed, so an accidental external dependency prevents publication.
-
-## 8. Image model
-
-The host publishes one object:
-
-```rust
-struct MonitoringImage {
-    generation: u64,
-    source: SourceFrontier,
-    built_at_micros: i64,
-    inputs: HashMap<String, InputMetadata>,
-    persistence: Arc<MemoryPersistence>,
-    query: Arc<ProviderContext>,
-}
-
-struct SourceFrontier {
-    pond_id: PondId,
-    txn_seq: i64,
-    commit_hash: ObjectHash,
-    committed_at_micros: i64,
-}
-
-struct InputMetadata {
-    path: String,
-    retained_after_micros: i64,
-    latest_event_time_micros: Option<i64>,
-}
+```sql
+SELECT *
+FROM (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (
+      PARTITION BY monitor_id, condition_key
+      ORDER BY transition_seq DESC
+    ) AS rank
+  FROM conditions
+)
+WHERE rank = 1
 ```
 
-The concrete fields may follow existing commit and metadata types. The
-important property is ownership: everything required to resolve and query an
-input is held by the image.
+### Notification intents
 
-`MemoryPersistence` is mutable while a candidate is being built. Publication
-transfers it into an immutable role. Monitor code receives a pinned
-`Arc<MonitoringImage>` and cannot mutate its filesystem.
+The observation transaction appends notification intent for newly firing or
+resolved conditions. Delivery workers append attempted, delivered, or failed
+events in later independent transactions. This provides at-least-once
+delivery without making network I/O part of the observation commit.
 
-## 9. Refresh protocol
+Those later delivery acknowledgements are not a second monitor-evaluation
+commit. The authoritative observation, evaluation, transition, and initial
+notification intent are already atomic.
 
-Refresh always operates on one committed pond snapshot:
+## 8. Transaction protocol
 
-1. Read enabled monitor definitions.
-2. Compute the union of table paths, source selections, factory definitions,
-   and physical retention cutoffs.
-3. Open one committed pond snapshot.
-4. Create a fresh `MemoryPersistence`.
-5. Recreate the selected TinyFS namespace and copy bounded physical series,
-   factory definitions, symlinks, and required ordinary data, preserving
-   relevant source metadata.
-6. Construct the ordinary in-memory `ProviderContext`.
-7. Remove source-pond access and resolve every declared table through existing
-   Watertown factory and provider code.
-8. Parse and plan every enabled monitor query against its declared tables.
-9. Record the source frontier, image time, and input event-time metadata.
-10. Atomically replace the current `Arc<MonitoringImage>`.
-11. Evaluate monitors against the newly published image.
-12. Commit resulting condition state and notification intent locally.
-13. Publish a compact status artifact independently of the full pond backup.
+For one producer update:
 
-Any error before publication discards the candidate. There is no partial
-update and no mutation of the current image.
+1. Begin one Steward write transaction.
+2. Write all observation batches and finish their writers.
+3. Obtain or reuse the transaction's `ProviderContext`.
+4. Capture one evaluation timestamp.
+5. Load enabled monitor definitions applicable to the written sources.
+6. Request bounded explicit-version providers for those physical
+   source series.
+7. Query prior committed condition transitions needed for `for`,
+   `resolve_after`, deduplication, and stale-data behavior.
+8. Run and fully collect each monitor query.
+9. Deregister its temporary DataFusion tables.
+10. Convert results into evaluation, condition-transition, and notification
+   rows.
+11. Append those rows to the monitoring physical series and shut down every
+    output writer.
+12. Commit once. The transaction rejects the commit if a writer or underlying
+    transaction read is still active.
+13. Discard the transaction's filesystem, contexts, providers, and plans.
+14. Only after commit succeeds, replace the service's in-memory status or send
+    the local committed-status notification.
+15. Schedule Azure backup, status publication, and notification delivery
+    independently.
 
-The first implementation performs a complete bounded rebuild after each
-relevant local pond commit. The Steward-to-monitor notification is an
-in-process signal, Unix-domain socket message, or localhost request carrying a
-pond identity and committed frontier. It is only a wake-up hint: the monitor
-opens and verifies the committed snapshot itself.
+No network operation occurs while the pond transaction is open.
 
-The notification is not a public webhook and does not wait for Azure. Pond
-backup, status publication, and monitor evaluation are independent post-commit
-effects with durable retry state. A two-day in-memory window rebuilt at the
-eventual monitoring cadence is the baseline to measure before introducing
-incremental complexity.
+## 9. Error and commit policy
 
-## 10. Query execution
+Monitor configuration or query failure should not discard valid source
+observations. The evaluator records an evaluation error, retains prior active
+conditions, and commits the observation update.
 
-Each evaluation pins the current image and resolves that monitor's declared
-TinyFS table paths under their configured DataFusion names. Physical and
-factory-backed tables use the same interface. It then executes the monitor SQL
-with values such as `$window_start` derived from a controlled evaluation clock.
+Failures that prevent the combined durable state from being written are
+different:
 
-The query receives no source-pond context. Its `ProviderContext` refers only to
-the image's `MemoryPersistence`, with no pond path or format-cache directory.
+| Failure | Behavior |
+|---|---|
+| Monitor SQL planning/execution fails | Append evaluation error, retain prior conditions, commit observations |
+| Monitor exceeds time, memory, or result limit | Append limit error, retain prior conditions, commit observations |
+| Input is stale | Record stale evaluation and retain active conditions |
+| Required physical input is missing | Record invalid-input error; never substitute an empty table |
+| Monitoring event batch cannot be encoded | Fail the combined transaction |
+| A source or monitor-output writer has not shut down | Reject commit before planning or persistence |
+| A query stream is still executing at commit | Reject commit; never drain pending records under an active read |
+| Pond commit fails | Publish no new authoritative status; retain the previously committed service state |
+| A transaction context is used after commit or abort | Reject it as closed rather than returning cached rows |
+| Local service notification fails | Commit remains authoritative; service catches up from the pond |
+| SMS delivery fails | Retain notification intent and retry asynchronously |
+| Azure backup fails | Retain local commit and retry backup independently |
+| Site generation fails | No effect on monitoring |
 
-The initial SQL contract is:
+A value observed before a failed pond commit is not authoritative. A future
+safety-critical ingest path may emit a separate provisional incident, but it
+must be labeled provisional and must not resolve or replace committed monitor
+state.
 
-- read-only `SELECT` queries only;
-- only declared monitor tables are visible;
-- zero result rows mean no active conditions;
-- each result row has a non-null `condition_key`;
-- execution has time, memory, and result-row limits; and
-- query failure is reported as monitor failure, never as an empty result.
+## 10. Freshness
 
-An evaluation retains its pinned image even if refresh publishes a newer one.
-It therefore cannot mix source snapshots.
+Every evaluation distinguishes:
 
-## 11. Freshness and condition state
+- **commit freshness:** age of the latest successful producer transaction;
+- **input freshness:** age of the latest event in each selected source; and
+- **evaluation freshness:** age and outcome of the latest monitor run.
 
-Every evaluation records:
+The initial stale-data policy is:
 
-- image generation;
-- source commit and transaction sequence;
-- evaluation time;
-- image publication time;
-- time since the source frontier was committed; and
-- latest observed event time for each declared input, when available.
-
-This separates two questions:
-
-- **pipeline freshness:** how far the published image is behind expected pond
-  commits;
-- **input freshness:** how recent the observations in a selected physical
-  source are.
-
-The initial stale-data policy for safety monitors is:
-
-1. retain an active condition rather than resolve it from stale or failed data;
-2. emit a separate freshness or evaluation incident; and
+1. never resolve an active condition solely because input is stale or a query
+   failed;
+2. append a separate freshness/evaluation incident; and
 3. resume ordinary transitions after a successful fresh evaluation.
 
-Condition state, evaluation health, and freshness are separate values. A
-condition can remain firing while its latest evaluation is stale or failed.
+The HTTPS response exposes all three freshness values so a green condition
+state cannot hide a stopped producer or evaluator.
 
-Monitor state starts in memory if necessary to prove the query path. SQLite is
-the preferred first durable extension. Condition updates and notification
-outbox insertion should then be one transaction so delivery failure cannot
-interrupt evaluation.
+## 11. Live service and process failure
 
-## 12. Failure behavior
+The service keeps a compact immutable current-status object in memory and
+atomically replaces it only for a newer committed frontier. Readers never
+observe a partial update.
 
-| Failure | Required behavior |
-|---|---|
-| Pond unavailable | Continue scheduled queries against the current image and report increasing staleness |
-| Refresh fails | Discard the candidate and retain the current image |
-| Refresh task stops | Continue scheduled queries; supervision reports and restarts refresh |
-| Selected input cannot be read | Reject the complete candidate |
-| Monitor input is missing | Mark that monitor invalid; never substitute an empty table |
-| Monitor SQL is invalid | Keep its prior condition state, report configuration failure, and continue other monitors |
-| Monitor execution fails | Keep its prior condition state, report evaluation failure, and continue other monitors |
-| Notification delivery fails | Retain an outbox entry for retry |
-| Azure pond backup fails | Retain local monitoring results and retry backup independently |
-| Azure status publication fails | Retain the local result, retry publication, and let the cloud stale timer expose the outage |
-| Watershop becomes unavailable | Continue serving the last status; cloud timer changes it to stale and may send an SMS |
-| Site generation fails | No effect on monitoring |
-| Query overlaps publication | Complete against the image pinned when the query began |
-| Monitor process crashes | Monitoring stops until restart in the initial deployment |
+On startup it queries the monitoring Parquet series to reconstruct:
 
-## 13. Resource policy
+- latest condition per key;
+- latest evaluation per monitor;
+- pending notification intents; and
+- source/evaluation freshness.
 
-The configured input windows bound the retained source data. Candidate
-construction can temporarily overlap the current image, and active queries can
-pin older images, so retained-data size is not a hard process RSS limit.
+If the producer, service, or Watershop host is unavailable, the last locally
+committed state remains correct but may not be externally reachable. A compact
+Azure status publication and cloud stale timer can expose that host-level
+failure without moving the full monitor engine into Azure.
 
-The initial deployment therefore also needs:
+The public HTTPS endpoint is read-only and must not expose pond mutation APIs,
+filesystem paths, raw query execution, or producer webhooks.
 
-- a maximum candidate size;
-- a DataFusion execution memory pool;
-- a query concurrency limit;
-- a query deadline; and
-- cancellation of queries that exceed that deadline.
+## 12. Deployment and cost decision
 
-If a candidate exceeds its limit, refresh fails and the current complete image
-remains published. The system never shortens a requested retention window or
-evicts arbitrary in-window data to make a candidate fit.
-
-## 14. Deployment and cost decision
-
-### 14.1 Current repository topology
+### 12.1 Current repository topology
 
 The production data path already has the pieces needed for a low-cost
 deployment:
@@ -424,21 +415,21 @@ deployment:
 Replacing the website host does not by itself replace InfluxDB. That endpoint
 must be retired or relocated before the Linode can be deleted.
 
-### 14.2 Preferred deployment
+### 12.2 Preferred deployment
 
 The current preferred deployment is:
 
-1. Keep the producer ponds, monitor engine, and `site-prod` on Watershop.
-2. Evaluate monitors from the local committed pond through the bounded
-   `MemoryPersistence` image described here.
+1. Keep the producer ponds, transaction evaluator, monitoring service, and
+   `site-prod` on Watershop.
+2. Evaluate monitors directly inside each local observation transaction.
 3. Push pond backups to the existing private Azure containers independently.
 4. Publish the completed static site to Azure Static Web Apps Free every three
    hours.
 5. Publish only a compact current-status artifact on monitor transitions and
    successful evaluations.
-6. Use a small scale-to-zero Azure Function to serve private status, detect a
-   stale Watershop publisher on a timer, deduplicate transitions, and send ACS
-   SMS.
+6. Use a small scale-to-zero Azure Function to detect a stale Watershop
+   publisher on a timer, deduplicate transitions, and send ACS SMS if this is
+   simpler than direct delivery from Watershop.
 
 The browser loads a stable static HTML/JavaScript shell and fetches current
 status. A 15-minute monitoring interval does not imply 2,880 complete site
@@ -450,7 +441,7 @@ it can run the existing Rust/DataFusion process to completion and scale to
 zero. That migration should be justified by operational requirements, not
 assumed to be cheaper.
 
-### 14.3 Cost snapshot and uncertainty
+### 12.3 Cost snapshot and uncertainty
 
 The following planning estimates were collected on 2026-09-17 for West US 2
 pay-as-you-go pricing:
@@ -497,7 +488,7 @@ The range is wide because Azure prices read/other operations at approximately
 $0.004 per 10,000 and write/list operations at approximately $0.05 per 10,000.
 One aggregate `ops` counter cannot select the correct price.
 
-### 14.4 Observation period
+### 12.4 Observation period
 
 Deployment selection and any move from hourly to 15-minute full pond pushes
 are paused for at least 90 days of representative measurements. Selfmon
@@ -565,7 +556,8 @@ and egress. The decision requires:
 2. operation mix and bytes by pond and storage path class;
 3. actual pushes, failures, retries, and no-op pushes per month;
 4. retained Azure capacity growth;
-5. measured producer, monitor-image, query, and sitegen duration and peak RSS;
+5. measured producer, monitor-query, service, and sitegen duration and peak
+   RSS;
 6. status API traffic and Application Insights ingestion; and
 7. actual recurring ACS number, carrier, and message charges.
 
@@ -574,118 +566,151 @@ aggregate limiter value by four. After the hourly baseline is stable, trial
 one producer at 15 minutes and compare its measured category mix before
 changing the other ponds.
 
-## 15. Implementation phases
+## 13. Implementation plan
 
-### Phase 0: Measure the existing system
+### Parallel track: Measure Azure traffic
 
-- Deploy the selfmon Azure-access materialization.
 - Keep production producer timers hourly.
 - Retain at least 90 days of access, limiter, runtime, memory, and size data.
 - Reconcile application counts with Azure billing meters monthly.
 - Run a bounded 15-minute trial on one producer only after the hourly baseline
   is trustworthy.
 
-**Acceptance test:** every production Azure push or pull produces one typed
-access row per remote scope, category totals sum to `total_ops`, and monthly
-aggregates can be reconciled to Azure's billed operation categories.
+**Acceptance:** every production Azure push or pull produces a typed access
+row per remote scope, category totals sum to `total_ops`, and monthly
+aggregates reconcile with Azure billing categories.
 
-### Phase 1: Static image
+### Phase 0: Transaction/query coherence — implemented
 
-- Define `MonitoringImage` and its source metadata.
-- Copy one bounded physical series and a `temporal-reduce` factory definition
-  into `MemoryPersistence`.
-- Resolve the factory-generated table through its existing Watertown provider.
-- Remove access to the source pond.
-- Run a representative DataFusion query over the in-memory aggregation.
+- Transaction-global writer guards reject duplicate writers across distinct
+  handles and reject commit while any writer remains unfinished.
+- A shared mutation generation versions `ProviderContext` cache entries and
+  invalidates physical providers and plans built before a later mutation.
+- Physical providers enumerate exact live version URLs for all, bounded,
+  latest, and specific-version reads, bypassing mutable wildcard listings.
+- Provider execution holds transaction-read guards; commit cannot drain
+  pending state while an underlying provider stream is reading it.
+- Commit, abort, and guard drop close the shared state. Old physical providers
+  and TinyFS persistence operations return a closed-state error.
+- Version loads include `pond_id`, and latest-version selection uses the
+  highest live version number.
 
-**Acceptance test:** after publication, deny all source-pond access and obtain
-the same bounded query result as a direct pond query.
+**Acceptance:** the regression matrix covers provider-before-write,
+provider-after-write in the same context, multiple pending appends, bounded
+and unbounded reads, unfinished writers, active transaction reads,
+latest-version selection, commit, and old-context use. Each case sees the
+complete selected snapshot or returns a specific stale/closed error; none
+silently returns the previously observed stale subset.
 
-### Phase 2: Monitor input planning
+### Phase 1: Define physical monitor records
 
-- Define explicit table, source, definition, and retention configuration.
-- Compute the union required by enabled monitors.
-- Build a complete image from one committed snapshot.
-- Validate that SQL uses only declared tables.
+- Define schemas for evaluations, condition transitions, and notification
+  events.
+- Include source transaction identity and monitor definition version in every
+  row.
+- Add helpers that batch rows and append each series at most once per producer
+  update.
+- Add DataFusion queries that reconstruct current condition and notification
+  state.
 
-**Acceptance test:** two monitors sharing an input with different windows
-produce one image retaining the larger requirement and correct results for
-both windows.
+**Acceptance:** state reconstructed from append-only Parquet is identical
+before and after process restart.
 
-### Phase 3: Atomic refresh
+### Phase 2: Define and validate monitors
 
-- Add a host containing the current `Arc<MonitoringImage>`.
-- Build candidates independently.
-- Publish with one atomic pointer replacement.
-- Preserve the current image on every candidate failure.
+- Add explicit raw physical-series table declarations.
+- Parse and validate read-only SQL.
+- Reject dynamic, external, and missing inputs.
+- Derive version bounds from window and lateness.
+- Enforce query deadlines, memory limits, and result limits.
 
-**Acceptance test:** a query pinned to generation `N` finishes on `N` while new
-queries begin on `N+1`.
+**Acceptance:** a representative temporal aggregation scans only eligible
+versions, applies the exact row predicate, and produces deterministic
+condition keys.
 
-### Phase 4: Scheduled monitoring
+### Phase 3: Integrate the transaction evaluator
 
-- Evaluate monitors after successful refresh and on their configured timers.
-- Add condition, pending, resolution, stale, and evaluation-error behavior.
-- Expose image and input freshness with every result.
+- Add an evaluator that receives the existing Steward transaction after all
+  source writers finish.
+- Enter the enforced query phase and construct bounded explicit-version
+  providers from its fresh context.
+- Query prior condition state and current staged observations.
+- Fully collect and close all query streams.
+- Append evaluation, transition, and notification batches.
+- Finish all output writers.
+- Commit once through the existing producer transaction.
+- Keep monitor query failures distinct from failures to encode or persist
+  monitoring state.
 
-**Acceptance test:** monitoring continues against the last image during a pond
-outage and never resolves an active condition solely because data became
-stale.
+**Acceptance:** one transaction writes observations, queries them, writes
+monitor state, and commits both; injected query failure commits observations
+with an error evaluation, while injected storage failure commits neither.
 
-### Phase 5: Durable operational state
+### Phase 4: Serve committed state
 
-- Store condition state and notification outbox entries in SQLite.
-- Deliver notifications asynchronously and idempotently.
+- Add a local service that reconstructs status from the monitoring series on
+  startup.
+- Accept only committed-frontier notifications from local producers.
+- Atomically replace the in-memory status object.
+- Serve a read-only authenticated HTTPS status endpoint.
+- Expose commit, input, and evaluation freshness.
 
-### Phase 6: Measure before optimizing
+**Acceptance:** a service restart reconstructs the same status; a notification
+sent for a failed commit is rejected; concurrent readers see either the old or
+new complete status.
 
-Measure complete rebuild time, peak memory, retained image size, and query
-latency under the expected two-day water workload.
+### Phase 5: Deliver alerts
 
-Only measured problems justify optimizations such as:
+- Read durable notification intents after commit.
+- Send SMS through the selected ACS path.
+- Append attempted, delivered, and failed events.
+- Use stable idempotency keys and retry with bounded backoff.
+- Recover pending intents after restart.
 
-- reusing unchanged in-memory versions;
-- incrementally copying committed source versions;
-- caching query plans;
-- deriving input dependencies from SQL; or
-- checkpointing an image for process-restart independence.
+**Acceptance:** crash and retry tests demonstrate at-least-once delivery
+without losing an intent; repeated delivery attempts retain one stable event
+identity.
 
-These optimizations must preserve the same published-image and query
-interfaces.
+### Phase 6: Publish compact cloud status
 
-## 16. Non-goals
+- Publish only the compact committed status to Azure.
+- Add a scale-to-zero stale-publisher check if host-level outage alerts are
+  required.
+- Keep full pond backup and static-site publication independent.
+
+**Acceptance:** Watershop loss leaves the last status available and causes the
+cloud view to become explicitly stale without running Watertown in Azure.
+
+## 14. Non-goals
 
 The initial implementation does not:
 
-- create a projection-specific namespace or table-provider hierarchy;
-- materialize derived factory output;
-- run initializing, executable, ingest, storage, export, or external-I/O
-  factories in the monitor runtime;
-- consume uncommitted MQTT or OTAP batches;
-- wait for an Azure pond backup before evaluating a local commit;
-- run the Watertown/DataFusion monitor in Azure Functions;
-- rebuild the complete static site at the monitoring cadence;
-- incrementally replay the complete pond commit chain;
-- provide exactly-once external notification delivery;
-- persist images across process restart; or
-- survive failure of the monitor process.
+- build or publish a copied `MemoryPersistence` image;
+- introduce SQLite or another mutable state database;
+- require a second commit for monitor evaluation;
+- query dynamic factories or external sources;
+- materialize temporal aggregation before monitor SQL;
+- run network notification or Azure publication inside a pond transaction;
+- wait for Azure backup before evaluating a local update;
+- rebuild the static site at monitor cadence;
+- provide exactly-once SMS delivery; or
+- treat uncommitted observations as authoritative incidents.
 
-## 17. Open implementation questions
+## 15. Open decisions
 
-The initial implementation needs answers to a small set of concrete questions:
+The one-commit architecture has the required physical-series transaction
+coherence. Remaining product decisions are:
 
-1. Which existing TinyFS operation should copy a physical-series version while
-   preserving its event-time and identity metadata?
-2. What read-only wrapper should prevent mutation after a
-   `MemoryPersistence` candidate is published?
-3. Should image source/definition selection remain explicit, or should
-   queryable factories eventually expose their TinyFS dependencies?
-4. How should committed pond metadata map onto `SourceFrontier` using existing
-   types?
-5. What initial candidate-size, query-memory, concurrency, and deadline limits
-   fit the deployed water workload?
+1. Should a monitor definition error append one evaluation-error row on every
+   producer run, or be rate-limited after the first unchanged error?
+2. Which query time, memory, and result-row limits fit the measured water
+   workload?
+3. Should SMS delivery run directly on Watershop or through a small Azure
+   Function?
+4. What authentication and exposure model should the HTTPS status endpoint
+   use?
+5. Which producer should receive the first transactional monitor integration?
 
-These questions refine existing abstractions. They do not change the core
-architecture: bounded TinyFS data and factory definitions are copied into
-memory, existing Watertown tools synthesize and query providers there, and
-complete images are replaced atomically.
+These decisions do not change the core model: staged physical observations are
+queried through the current transaction, monitoring events are appended to
+TinyFS Parquet, and all authoritative state commits once.

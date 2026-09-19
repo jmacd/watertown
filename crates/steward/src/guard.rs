@@ -469,6 +469,20 @@ impl<'a> StewardTransactionGuard<'a> {
         // Calculate duration for recording
         let duration_ms = self.start_time.elapsed().as_millis() as i64;
 
+        let quiescent = if let Some(data_tx) = self.data_tx.as_ref() {
+            data_tx
+                .state()?
+                .coherence_state()
+                .ensure_quiescent()
+                .map_err(tlogfs::TLogFSError::from)
+                .map_err(StewardError::DataInit)
+        } else {
+            Ok(())
+        };
+        if let Err(error) = quiescent {
+            return Err(self.abort_preserving(error).await);
+        }
+
         // Step 1: Transaction metadata was already provided at begin().
         // (Legacy per-import watermark callbacks were removed alongside
         // the chunked-parquet remote factory in D4.5; cross-pond import

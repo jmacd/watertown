@@ -62,6 +62,13 @@ pub trait PersistenceLayer: Send + Sync {
     /// This allows transaction guards to be created from the persistence layer
     fn transaction_state(&self) -> Arc<TransactionState>;
 
+    /// Shared lifecycle and mutation generation for transaction-scoped
+    /// persistence. Backends without transactional cache coherence may return
+    /// `None`.
+    fn coherence_state(&self) -> Option<Arc<crate::CoherenceState>> {
+        None
+    }
+
     /// Get the pond UUID for this persistence layer.
     /// Returns the real pond UUID for OpLog-backed ponds, or a well-known
     /// placeholder for memory/hostmount persistence.
