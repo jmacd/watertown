@@ -7,7 +7,6 @@
 //! Determines which file versions to include when querying data.
 
 use log::debug;
-use tinyfs::FileID;
 
 /// Version selection for ListingTable
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Default)]
@@ -38,20 +37,6 @@ impl VersionSelection {
         }
     }
 
-    /// Generate URL pattern for this version selection
-    /// Eliminates duplicate URL pattern generation throughout the codebase
-    #[must_use]
-    pub fn to_url_pattern(&self, file_id: &FileID) -> String {
-        match self {
-            VersionSelection::AllVersions | VersionSelection::LatestVersion => {
-                crate::TinyFsPathBuilder::url_all_versions(file_id)
-            }
-            VersionSelection::SpecificVersion(version) => {
-                crate::TinyFsPathBuilder::url_specific_version(file_id, *version)
-            }
-        }
-    }
-
     /// Convert to cache key string
     /// Used for TableProvider caching to avoid schema inference overhead
     #[must_use]
@@ -69,21 +54,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_version_selection_url_patterns() {
-        let file_id = FileID::root();
-
-        let all = VersionSelection::AllVersions;
-        let url = all.to_url_pattern(&file_id);
-        assert!(url.starts_with("tinyfs:///pond/"));
-        assert!(url.contains("/version/"));
-
-        let latest = VersionSelection::LatestVersion;
-        let url = latest.to_url_pattern(&file_id);
-        assert!(url.starts_with("tinyfs:///pond/"));
-
-        let specific = VersionSelection::SpecificVersion(42);
-        let url = specific.to_url_pattern(&file_id);
-        assert!(url.starts_with("tinyfs:///pond/"));
-        assert!(url.ends_with("/version/42.parquet"));
+    fn test_version_selection_cache_keys_are_distinct() {
+        assert_eq!(VersionSelection::AllVersions.to_cache_string(), "all");
+        assert_eq!(VersionSelection::LatestVersion.to_cache_string(), "latest");
+        assert_eq!(
+            VersionSelection::SpecificVersion(42).to_cache_string(),
+            "v42"
+        );
     }
 }

@@ -9,6 +9,7 @@ use crate::node::FileID;
 use crate::persistence::PersistenceLayer;
 use crate::{EntryType, FS, NodeType};
 use futures::StreamExt;
+use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -188,6 +189,33 @@ async fn test_read_file_to_vec() {
 
     let contents = root.read_file_path_to_vec("hello.txt").await.unwrap();
     assert_eq!(contents, b"Hello, World!");
+}
+
+#[tokio::test]
+async fn test_read_file_version_range() {
+    let dir = create_test_tree();
+    let persistence = Arc::new(HostmountPersistence::new(dir.path().to_path_buf()).unwrap());
+    let fs = FS::from_arc(persistence.clone());
+    let root = fs.root().await.unwrap();
+    let id = root.get_node_path("hello.txt").await.unwrap().id();
+    persistence
+        .register_path(id, dir.path().join("hello.txt"))
+        .await;
+
+    assert_eq!(
+        persistence
+            .read_file_version_range(id, 1, 7..12)
+            .await
+            .unwrap(),
+        b"World".as_slice()
+    );
+    assert_eq!(
+        persistence
+            .read_file_version_range(id, 1, 7..100)
+            .await
+            .unwrap(),
+        b"World!".as_slice()
+    );
 }
 
 #[tokio::test]

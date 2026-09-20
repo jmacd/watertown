@@ -18,9 +18,12 @@ use crate::node::{FileID, Node};
 use crate::persistence::{FileVersionInfo, PersistenceLayer};
 use crate::transaction_guard::TransactionState;
 use async_trait::async_trait;
+use bytes::Bytes;
 use log::debug;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -119,6 +122,10 @@ impl<P: PersistenceLayer + Send + Sync + 'static> PersistenceLayer for CachingPe
 
     fn transaction_state(&self) -> Arc<TransactionState> {
         self.inner.transaction_state()
+    }
+
+    fn coherence_state(&self) -> Option<Arc<crate::CoherenceState>> {
+        self.inner.coherence_state()
     }
 
     fn pond_uuid(&self) -> uuid7::Uuid {
@@ -257,6 +264,23 @@ impl<P: PersistenceLayer + Send + Sync + 'static> PersistenceLayer for CachingPe
     /// Read file version - pass through
     async fn read_file_version(&self, id: FileID, version: u64) -> Result<Vec<u8>> {
         self.inner.read_file_version(id, version).await
+    }
+
+    async fn open_file_version(
+        &self,
+        id: FileID,
+        version: u64,
+    ) -> Result<Pin<Box<dyn crate::AsyncReadSeek>>> {
+        self.inner.open_file_version(id, version).await
+    }
+
+    async fn read_file_version_range(
+        &self,
+        id: FileID,
+        version: u64,
+        range: Range<u64>,
+    ) -> Result<Bytes> {
+        self.inner.read_file_version_range(id, version, range).await
     }
 
     /// Set extended attributes - invalidate cache

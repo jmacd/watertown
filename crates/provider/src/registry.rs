@@ -30,6 +30,8 @@ use tokio::sync::Mutex;
 pub enum ExecutionMode {
     /// Factory operates as a pond read-writer (normal mode)
     PondReadWriter,
+    /// Factory reads a committed pond snapshot during automatic post-commit work
+    ControlReader,
     /// Factory operates as a control writer (special mode for system operations)
     ControlWriter,
     /// Factory applies table-provider transformations (called by other factories)
@@ -43,7 +45,25 @@ pub struct ExecutionContext {
     args: Vec<String>,
 }
 
+/// Pond access required when an executable factory runs automatically after commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostCommitAccess {
+    /// Execute against the committed read snapshot without opening a write transaction.
+    ReadOnly,
+    /// Execute in a separate write transaction after the parent commit.
+    ReadWrite,
+}
+
 impl ExecutionContext {
+    /// Create a read-only post-commit execution context
+    #[must_use]
+    pub fn control_reader(args: Vec<String>) -> Self {
+        Self {
+            mode: ExecutionMode::ControlReader,
+            args,
+        }
+    }
+
     /// Create a control writer execution context
     #[must_use]
     pub fn control_writer(args: Vec<String>) -> Self {
@@ -197,6 +217,9 @@ pub struct DynamicFactory {
         >,
     >,
 
+    /// Access required for automatic execution from `/system/run/*`.
+    pub post_commit_access: Option<PostCommitAccess>,
+
     /// Apply table provider transformation (optional, for transform factories)
     /// Takes a FactoryContext (with FileID to read config) and input TableProvider
     /// Returns transformed TableProvider
@@ -301,6 +324,12 @@ impl FactoryRegistry {
         DYNAMIC_FACTORIES
             .iter()
             .find(|factory| factory.name == name)
+    }
+
+    /// Return the pond access required for automatic post-commit execution.
+    #[must_use]
+    pub fn post_commit_access(name: &str) -> Option<PostCommitAccess> {
+        Self::get_factory(name)?.post_commit_access
     }
 
     /// List all available factories
@@ -503,6 +532,7 @@ macro_rules! register_dynamic_factory {
                 try_as_queryable: None,
                 initialize: None,
                 execute: None,
+                post_commit_access: None,
                 apply_table_transform: None,
             };
         }
@@ -535,6 +565,7 @@ macro_rules! register_dynamic_factory {
                 try_as_queryable: None,
                 initialize: None,
                 execute: None,
+                post_commit_access: None,
                 apply_table_transform: None,
             };
         }
@@ -566,6 +597,7 @@ macro_rules! register_dynamic_factory {
                 try_as_queryable: None,
                 initialize: None,
                 execute: None,
+                post_commit_access: None,
                 apply_table_transform: None,
             };
         }
@@ -598,6 +630,7 @@ macro_rules! register_dynamic_factory {
                 try_as_queryable: Some($queryable_fn),
                 initialize: None,
                 execute: None,
+                post_commit_access: None,
                 apply_table_transform: None,
             };
         }
@@ -607,6 +640,52 @@ macro_rules! register_dynamic_factory {
 /// Register an executable factory (for run configurations)
 #[macro_export]
 macro_rules! register_executable_factory {
+    (
+        name: $name:expr,
+        description: $description:expr,
+        post_commit: read_only,
+        validate: $validate_fn:expr,
+        initialize: $init_fn:expr,
+        execute: $execute_fn:expr
+    ) => {
+        paste::paste! {
+            fn [<initialize_wrapper_ $name:snake>](
+                config: serde_json::Value,
+                context: $crate::FactoryContext,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send>> {
+                Box::pin(async move {
+                    $init_fn(config, context).await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+                })
+            }
+
+            fn [<execute_wrapper_ $name:snake>](
+                config: serde_json::Value,
+                context: $crate::FactoryContext,
+                ctx: $crate::registry::ExecutionContext,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send>> {
+                Box::pin(async move {
+                    $execute_fn(config, context, ctx).await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+                })
+            }
+
+            #[allow(unsafe_code)]
+            #[linkme::distributed_slice($crate::registry::DYNAMIC_FACTORIES)]
+            static [<FACTORY_ $name:snake:upper>]: $crate::registry::DynamicFactory = $crate::registry::DynamicFactory {
+                name: $name,
+                description: $description,
+                create_directory: None,
+                create_file: None,
+                validate_config: $validate_fn,
+                validate_raw_config: None,
+                try_as_queryable: None,
+                initialize: Some([<initialize_wrapper_ $name:snake>]),
+                execute: Some([<execute_wrapper_ $name:snake>]),
+                post_commit_access: Some($crate::registry::PostCommitAccess::ReadOnly),
+                apply_table_transform: None,
+            };
+        }
+    };
+
     (
         name: $name:expr,
         description: $description:expr,
@@ -646,6 +725,7 @@ macro_rules! register_executable_factory {
                 try_as_queryable: None,
                 initialize: Some([<initialize_wrapper_ $name:snake>]),
                 execute: Some([<execute_wrapper_ $name:snake>]),
+                post_commit_access: Some($crate::registry::PostCommitAccess::ReadWrite),
                 apply_table_transform: None,
             };
         }
@@ -683,6 +763,7 @@ macro_rules! register_table_transform_factory {
                 try_as_queryable: None,
                 initialize: None,
                 execute: None,
+                post_commit_access: None,
                 apply_table_transform: Some([<transform_wrapper_ $name:snake>]),
             };
         }

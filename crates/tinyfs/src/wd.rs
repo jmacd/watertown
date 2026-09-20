@@ -716,9 +716,18 @@ impl WD {
         match lookup {
             Lookup::Found(node) => {
                 wd.check_writable()?;
+                let existing_type = node.entry_type();
+                if existing_type != entry_type {
+                    return Err(Error::entry_type_mismatch(
+                        path_ref,
+                        entry_type,
+                        existing_type,
+                    ));
+                }
                 log::debug!(
-                    "async_writer_path_with_type: file exists at path '{}', returning existing file writer (no directory update)",
-                    path_ref.display()
+                    "async_writer_path_with_type: file exists at path '{}' with requested type {}, returning existing file writer (no directory update)",
+                    path_ref.display(),
+                    entry_type
                 );
                 node.as_file().await?.async_writer().await
             }
@@ -1014,14 +1023,14 @@ impl WD {
         let mut stack = vec![self.np.clone()];
         let mut results = Vec::new();
 
-        self.visit_recursive_with_visitor(
+        crate::fs::with_visit_context(self.visit_recursive_with_visitor(
             &pattern_components,
             &mut visited,
             &mut captured,
             &mut stack,
             &mut results,
             visitor,
-        )
+        ))
         .await?;
 
         Ok(results)
@@ -1229,8 +1238,10 @@ impl WD {
 
         // If the component is a directory, recurse.
         if current.id().entry_type().is_directory() {
-            // Prevent dynamic file expansion from recursing.
-            self.fs.enter_node(&current).await?;
+            // Dynamic directories can start nested visits. The task-scoped
+            // guard detects re-entry within this traversal and always removes
+            // the node when recursion exits, errors, or is cancelled.
+            let _active = crate::fs::enter_visit_node(&current)?;
             // Ensure correct parent directory for resolve().
             stack.push(child.clone());
 
@@ -1252,9 +1263,8 @@ impl WD {
                 visitor,
             )
             .await?;
-
             _ = stack.pop();
-            self.fs.exit_node(&current).await;
+            _ = stack.pop();
         }
 
         Ok(())

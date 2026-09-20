@@ -9,8 +9,14 @@ use crate::persistence::{FileVersionInfo, PersistenceLayer};
 use crate::transaction_guard::TransactionState;
 use crate::{EntryType, NodeMetadata};
 use async_trait::async_trait;
+use bytes::Bytes;
 use std::collections::HashMap;
+use std::io::Cursor;
+use std::ops::Range;
+use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 
 /// Version information for a file in memory persistence
@@ -32,8 +38,11 @@ struct MemoryFileVersion {
 #[derive(Clone)]
 pub struct MemoryPersistence {
     state: Arc<Mutex<State>>,
+    coherence: Arc<crate::CoherenceState>,
     /// Transaction state for enforcing single-writer pattern
     pub txn_state: Arc<TransactionState>,
+    #[cfg(test)]
+    fail_next_store: Arc<AtomicBool>,
 }
 
 pub struct State {
@@ -62,7 +71,10 @@ impl Default for MemoryPersistence {
     fn default() -> Self {
         Self {
             state: Arc::new(Mutex::new(State::default())),
+            coherence: Arc::new(crate::CoherenceState::default()),
             txn_state: Arc::new(TransactionState::new()),
+            #[cfg(test)]
+            fail_next_store: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -79,13 +91,20 @@ impl PersistenceLayer for MemoryPersistence {
         self.txn_state.clone()
     }
 
+    fn coherence_state(&self) -> Option<Arc<crate::CoherenceState>> {
+        Some(self.coherence.clone())
+    }
+
     // Node operations
     async fn load_node(&self, id: FileID) -> Result<Node> {
         self.state.lock().await.load_node(id).await
     }
 
     async fn store_node(&self, node: &Node) -> Result<()> {
-        self.state.lock().await.store_node(node).await
+        let _mutation = self.coherence.begin_mutation()?;
+        self.state.lock().await.store_node(node).await?;
+        _ = self.coherence.advance()?;
+        Ok(())
     }
 
     // Factory methods for creating nodes directly with persistence
@@ -106,11 +125,15 @@ impl PersistenceLayer for MemoryPersistence {
         target: &std::path::Path,
         _mtime: Option<i64>,
     ) -> Result<Node> {
-        self.state
+        let _mutation = self.coherence.begin_mutation()?;
+        let node = self
+            .state
             .lock()
             .await
             .create_symlink_node(id, target)
-            .await
+            .await?;
+        _ = self.coherence.advance()?;
+        Ok(node)
     }
 
     async fn create_dynamic_node(
@@ -120,16 +143,31 @@ impl PersistenceLayer for MemoryPersistence {
         config_content: Vec<u8>,
         _mtime: Option<i64>,
     ) -> Result<Node> {
-        // Store the config content as a file version
+        let _mutation = self.coherence.begin_mutation()?;
+        let entry_type = id.entry_type();
+        if !entry_type.is_dynamic() {
+            return Err(Error::Other(format!(
+                "create_dynamic_node called with non-dynamic entry type: {entry_type}"
+            )));
+        }
+
         self.state
             .lock()
             .await
             .store_dynamic_node_config(id, factory_type, config_content)
             .await?;
+        _ = self.coherence.advance()?;
 
-        // Create a MemoryFile with persistence reference (for version lookups)
-        let file_handle = crate::memory::MemoryFile::new_handle(id, self.clone(), id.entry_type());
-        Ok(Node::new(id, NodeType::File(file_handle)))
+        let node_type = if entry_type.is_directory() {
+            NodeType::Directory(MemoryDirectory::new_handle_with_entry_type(entry_type))
+        } else {
+            NodeType::File(crate::memory::MemoryFile::new_handle(
+                id,
+                self.clone(),
+                entry_type,
+            ))
+        };
+        Ok(Node::new(id, node_type))
     }
 
     async fn get_dynamic_node_config(&self, id: FileID) -> Result<Option<(String, Vec<u8>)>> {
@@ -142,15 +180,50 @@ impl PersistenceLayer for MemoryPersistence {
         factory_type: &str,
         config_content: Vec<u8>,
     ) -> Result<()> {
+        let _mutation = self.coherence.begin_mutation()?;
         self.state
             .lock()
             .await
             .update_dynamic_node_config(id, factory_type, config_content)
-            .await
+            .await?;
+        _ = self.coherence.advance()?;
+        Ok(())
     }
 
     async fn metadata(&self, id: FileID) -> Result<NodeMetadata> {
-        self.state.lock().await.metadata(id).await
+        let node = {
+            let state = self.state.lock().await;
+            if let Some(latest) = state
+                .file_versions
+                .get(&id)
+                .and_then(|versions| versions.last())
+            {
+                return Ok(NodeMetadata {
+                    version: latest.version,
+                    size: Some(latest.content.len() as u64),
+                    blake3: Some(latest.blake3.clone()),
+                    bao_outboard: latest.bao_outboard.clone(),
+                    entry_type: latest.entry_type,
+                    timestamp: latest.timestamp,
+                });
+            }
+            state.nodes.get(&id).cloned().ok_or_else(|| {
+                Error::NotFound(std::path::PathBuf::from(format!("Node {id} not found")))
+            })?
+        };
+
+        match node.node_type {
+            NodeType::File(_) => Ok(NodeMetadata {
+                version: 0,
+                size: Some(0),
+                blake3: None,
+                bao_outboard: None,
+                entry_type: id.entry_type(),
+                timestamp: 0,
+            }),
+            NodeType::Directory(handle) => handle.metadata().await,
+            NodeType::Symlink(handle) => handle.metadata().await,
+        }
     }
 
     async fn list_file_versions(&self, id: FileID) -> Result<Vec<FileVersionInfo>> {
@@ -161,20 +234,65 @@ impl PersistenceLayer for MemoryPersistence {
         self.state.lock().await.read_file_version(id, version).await
     }
 
+    async fn open_file_version(
+        &self,
+        id: FileID,
+        version: u64,
+    ) -> Result<Pin<Box<dyn crate::AsyncReadSeek>>> {
+        let content = self
+            .state
+            .lock()
+            .await
+            .read_file_version(id, version)
+            .await?;
+        Ok(Box::pin(Cursor::new(content)))
+    }
+
+    async fn read_file_version_range(
+        &self,
+        id: FileID,
+        version: u64,
+        range: Range<u64>,
+    ) -> Result<Bytes> {
+        self.state
+            .lock()
+            .await
+            .read_file_version_range(id, version, range)
+            .await
+    }
+
     async fn set_extended_attributes(
         &self,
         id: FileID,
         attributes: HashMap<String, String>,
     ) -> Result<()> {
+        let _mutation = self.coherence.begin_mutation()?;
         self.state
             .lock()
             .await
             .set_extended_attributes(id, attributes)
-            .await
+            .await?;
+        _ = self.coherence.advance()?;
+        Ok(())
     }
 }
 
 impl MemoryPersistence {
+    #[cfg(test)]
+    pub(crate) fn fail_next_store(&self) {
+        self.fail_next_store.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn take_store_failure(&self) -> Result<()> {
+        if self.fail_next_store.swap(false, Ordering::SeqCst) {
+            return Err(Error::Other(
+                "injected memory persistence store failure".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Store a file version for testing
     ///
     /// Adds a new version of a file to the in-memory storage. Versions are stored
@@ -185,11 +303,16 @@ impl MemoryPersistence {
         version: u64,
         content: Vec<u8>,
     ) -> Result<()> {
+        #[cfg(test)]
+        self.take_store_failure()?;
+        let _mutation = self.coherence.begin_mutation()?;
         self.state
             .lock()
             .await
             .store_file_version(id, version, content)
-            .await
+            .await?;
+        _ = self.coherence.advance()?;
+        Ok(())
     }
 
     /// Store a file version with extended metadata (for testing)
@@ -201,11 +324,16 @@ impl MemoryPersistence {
         entry_type: EntryType,
         extended_metadata: Option<HashMap<String, String>>,
     ) -> Result<()> {
+        #[cfg(test)]
+        self.take_store_failure()?;
+        let _mutation = self.coherence.begin_mutation()?;
         self.state
             .lock()
             .await
             .store_file_version_with_metadata(id, version, content, entry_type, extended_metadata)
-            .await
+            .await?;
+        _ = self.coherence.advance()?;
+        Ok(())
     }
 
     /// Store a file version with bao_outboard data (for testing)
@@ -216,11 +344,16 @@ impl MemoryPersistence {
         content: Vec<u8>,
         bao_outboard: Vec<u8>,
     ) -> Result<()> {
+        #[cfg(test)]
+        self.take_store_failure()?;
+        let _mutation = self.coherence.begin_mutation()?;
         self.state
             .lock()
             .await
             .store_file_version_with_bao(id, version, content, bao_outboard)
-            .await
+            .await?;
+        _ = self.coherence.advance()?;
+        Ok(())
     }
 
     /// Allocate next version number for a file write
@@ -296,38 +429,6 @@ impl State {
         let node = Node::new(id, NodeType::Symlink(symlink_handle.clone()));
         self.store_node(&node).await?;
         Ok(node)
-    }
-
-    async fn metadata(&self, id: FileID) -> Result<NodeMetadata> {
-        // Get metadata from stored versions if they exist (for files with version history)
-        if let Some(versions) = self.file_versions.get(&id)
-            && let Some(latest) = versions.last()
-        {
-            // Use stored blake3 hash (computed at write time)
-            // This is critical for corruption detection - must NOT recompute from content
-            let blake3 = Some(latest.blake3.clone());
-
-            return Ok(NodeMetadata {
-                version: latest.version,
-                size: Some(latest.content.len() as u64),
-                blake3,
-                bao_outboard: latest.bao_outboard.clone(),
-                entry_type: latest.entry_type,
-                timestamp: latest.timestamp,
-            });
-        }
-
-        // Look up node (for nodes without version history, or as fallback)
-        let node = self.nodes.get(&id).ok_or_else(|| {
-            Error::NotFound(std::path::PathBuf::from(format!("Node {id} not found")))
-        })?;
-
-        // Fall back to node's own metadata (for newly created files without versions yet)
-        match &node.node_type {
-            NodeType::File(handle) => handle.metadata().await,
-            NodeType::Directory(handle) => handle.metadata().await,
-            NodeType::Symlink(handle) => handle.metadata().await,
-        }
     }
 
     async fn store_file_version(
@@ -444,7 +545,7 @@ impl State {
 
         let file_version = MemoryFileVersion {
             version,
-            timestamp: chrono::Utc::now().timestamp_millis(),
+            timestamp: chrono::Utc::now().timestamp_micros(),
             content,
             entry_type,
             extended_metadata,
@@ -499,6 +600,32 @@ impl State {
                 "File {id} not found",
             ))))
         }
+    }
+
+    async fn read_file_version_range(
+        &self,
+        id: FileID,
+        version: u64,
+        range: Range<u64>,
+    ) -> Result<Bytes> {
+        let versions = self.file_versions.get(&id).ok_or_else(|| {
+            Error::NotFound(std::path::PathBuf::from(format!(
+                "No versions found for file {id}"
+            )))
+        })?;
+        let file_version = versions
+            .iter()
+            .find(|file_version| file_version.version == version)
+            .ok_or_else(|| {
+                Error::NotFound(std::path::PathBuf::from(format!(
+                    "Version {version} of file {id} not found"
+                )))
+            })?;
+        let range = crate::persistence::validate_file_version_range(
+            range,
+            file_version.content.len() as u64,
+        )?;
+        Ok(Bytes::copy_from_slice(&file_version.content[range]))
     }
 
     async fn set_extended_attributes(

@@ -9,6 +9,10 @@ pub enum Error {
     #[error("Invalid URL: {0}")]
     InvalidUrl(String),
 
+    /// A valid URL pattern did not resolve any files.
+    #[error("No files match pattern: {0}")]
+    NoFilesMatched(String),
+
     /// Decompression error
     #[error("Decompression error: {0}")]
     DecompressionError(String),

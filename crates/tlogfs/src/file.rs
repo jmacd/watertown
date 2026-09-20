@@ -154,22 +154,9 @@ impl OpLogFile {
         &self,
         collapse_prior: bool,
     ) -> tinyfs::Result<Pin<Box<dyn FileMetadataWriter>>> {
-        // Acquire write lock and check for recursive writes
-        // The main threat model here is preventing recursive scenarios where
-        // a dynamically synthesized file evaluation tries to write a file
-        // that is already being written in the same execution context
-        let mut state = self.transaction_state.write().await;
-        match *state {
-            TransactionWriteState::WritingInTransaction => {
-                return Err(tinyfs::Error::Other(
-                    "File is already being written in this transaction".to_string(),
-                ));
-            }
-            TransactionWriteState::Ready => {
-                *state = TransactionWriteState::WritingInTransaction;
-            }
-        }
-        drop(state);
+        // This guard is transaction-global, so distinct TinyFS handles for the
+        // same file cannot bypass writer exclusion.
+        let writer_guard = self.state.begin_writer(self.id)?;
 
         debug!("OpLogFile::async_writer()");
 
@@ -245,10 +232,15 @@ impl OpLogFile {
             crate::large_files::HybridWriter::with_options(store_path, options)
         };
 
+        let mut state = self.transaction_state.write().await;
+        *state = TransactionWriteState::WritingInTransaction;
+        drop(state);
+
         Ok(Box::pin(OpLogFileWriter::with_storage(
             persistence,
             file_id,
             transaction_state,
+            writer_guard,
             entry_type,
             storage,
             allocated_version,
@@ -327,6 +319,7 @@ pub struct OpLogFileWriter {
     state: State,
     file_id: FileID,
     transaction_state: Arc<RwLock<TransactionWriteState>>,
+    writer_guard: Option<tinyfs::WriterGuard>,
     completed: bool,
     completion_future: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     entry_type: tinyfs::EntryType,
@@ -363,6 +356,7 @@ impl OpLogFileWriter {
         state: State,
         file_id: FileID,
         transaction_state: Arc<RwLock<TransactionWriteState>>,
+        writer_guard: tinyfs::WriterGuard,
         entry_type: tinyfs::EntryType,
         storage: crate::large_files::HybridWriter,
         allocated_version: i64,
@@ -373,6 +367,7 @@ impl OpLogFileWriter {
             state,
             file_id,
             transaction_state,
+            writer_guard: Some(writer_guard),
             completed: false,
             completion_future: None,
             entry_type,
@@ -771,6 +766,7 @@ impl AsyncWrite for OpLogFileWriter {
         {
             Poll::Ready(()) => {
                 this.completed = true;
+                _ = this.writer_guard.take();
                 Poll::Ready(Ok(()))
             }
             Poll::Pending => Poll::Pending,

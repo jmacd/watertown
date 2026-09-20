@@ -2795,7 +2795,10 @@ query: ""
 
             // Write new version to same path using async_writer (version 2)
             let mut file_writer = root
-                .async_writer_path("/hydrovu/devices/station_a/SensorA_v1.series")
+                .async_writer_path_with_type(
+                    "/hydrovu/devices/station_a/SensorA_v1.series",
+                    EntryType::TablePhysicalSeries,
+                )
                 .await
                 .unwrap();
             use tokio::io::AsyncWriteExt;

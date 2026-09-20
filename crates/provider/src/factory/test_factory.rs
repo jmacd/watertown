@@ -71,7 +71,7 @@ async fn initialize_test(
 /// Execute test factory - prints message multiple times
 async fn execute_test(
     config: Value,
-    _context: crate::FactoryContext,
+    context: crate::FactoryContext,
     ctx: crate::ExecutionContext,
 ) -> Result<(), tinyfs::Error> {
     let parsed_config: TestConfig =
@@ -95,19 +95,30 @@ async fn execute_test(
         log::debug!("[{}] {}", i, parsed_config.message);
     }
 
-    // If file_to_read is specified, read and verify it
-    if parsed_config.file_to_read.is_some() {
-        log::warn!("File reading temporarily disabled during Step 7 migration");
+    if let Some(path) = &parsed_config.file_to_read {
+        let actual = context.root().await?.read_file_path_to_vec(path).await?;
+        if let Some(expected) = &parsed_config.expected_content
+            && actual != expected.as_bytes()
+        {
+            return Err(tinyfs::Error::Other(format!(
+                "test factory read '{path}' as {:?}, expected {:?}",
+                String::from_utf8_lossy(&actual),
+                expected
+            )));
+        }
     }
 
     // For testing purposes, create a result file on the host filesystem
-    let result_path = "/tmp/test-executor-result.txt";
+    let result_path = format!(
+        "/tmp/test-executor-result-{}.txt",
+        context.file_id.node_id()
+    );
     let result_content = format!(
         "Executed {} times\nMessage: {}\nContext: {:?}\n",
         parsed_config.repeat_count, parsed_config.message, ctx
     );
 
-    std::fs::write(result_path, result_content).map_other_context("Failed to write result")?;
+    std::fs::write(&result_path, result_content).map_other_context("Failed to write result")?;
 
     log::info!(
         "Test factory execution completed, result written to {}",
@@ -120,6 +131,7 @@ async fn execute_test(
 crate::register_executable_factory!(
     name: "test-executor",
     description: "Test executable factory for unit testing",
+    post_commit: read_only,
     validate: validate_test_config,
     initialize: |config, context| async move {
         initialize_test(config, context).await

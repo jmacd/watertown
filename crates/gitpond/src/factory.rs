@@ -281,6 +281,7 @@ static FACTORY_GIT_INGEST: provider::registry::DynamicFactory =
         try_as_queryable: None,
         initialize: Some(initialize_wrapper),
         execute: Some(execute_wrapper),
+        post_commit_access: Some(provider::PostCommitAccess::ReadWrite),
         apply_table_transform: None,
     };
 

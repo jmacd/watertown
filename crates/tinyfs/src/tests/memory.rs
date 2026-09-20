@@ -12,6 +12,129 @@ use std::path::PathBuf;
 use crate::async_helpers::convenience;
 
 #[tokio::test]
+async fn test_pending_file_metadata_does_not_deadlock() {
+    use crate::EntryType;
+    use crate::node::{FileID, NodeType, PartID, local_pond_uuid};
+    use crate::persistence::PersistenceLayer;
+    use std::time::Duration;
+
+    let persistence = crate::memory::MemoryPersistence::default();
+    let id = FileID::new_in_partition(
+        PartID::root(),
+        EntryType::FilePhysicalVersion,
+        local_pond_uuid(),
+    );
+    let node = persistence.create_file_node(id).await.unwrap();
+    persistence.store_node(&node).await.unwrap();
+
+    let file = match &node.node_type {
+        NodeType::File(file) => file,
+        _ => panic!("expected file"),
+    };
+    let _writer = file.async_writer().await.unwrap();
+
+    let metadata = tokio::time::timeout(Duration::from_millis(250), persistence.metadata(id))
+        .await
+        .expect("metadata lookup deadlocked")
+        .unwrap();
+    assert_eq!(metadata.version, 0);
+    assert_eq!(metadata.size, Some(0));
+    assert_eq!(metadata.entry_type, EntryType::FilePhysicalVersion);
+}
+
+#[tokio::test]
+async fn test_memory_writer_propagates_store_failure_and_recovers() {
+    use crate::EntryType;
+    use crate::node::{FileID, NodeType, PartID, local_pond_uuid};
+    use crate::persistence::PersistenceLayer;
+    use tokio::io::AsyncWriteExt;
+
+    let persistence = crate::memory::MemoryPersistence::default();
+    let id = FileID::new_in_partition(
+        PartID::root(),
+        EntryType::FilePhysicalVersion,
+        local_pond_uuid(),
+    );
+    let node = persistence.create_file_node(id).await.unwrap();
+    persistence.store_node(&node).await.unwrap();
+    let file = match &node.node_type {
+        NodeType::File(file) => file,
+        _ => panic!("expected file"),
+    };
+
+    persistence.fail_next_store();
+    let mut writer = file.async_writer().await.unwrap();
+    writer.write_all(b"not persisted").await.unwrap();
+    let error = writer.shutdown().await.unwrap_err();
+    assert!(error.to_string().contains("injected memory persistence"));
+    assert!(
+        writer
+            .shutdown()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("injected")
+    );
+    assert!(persistence.list_file_versions(id).await.unwrap().is_empty());
+    drop(writer);
+
+    let mut retry = file.async_writer().await.unwrap();
+    retry.write_all(b"persisted").await.unwrap();
+    retry.shutdown().await.unwrap();
+
+    let versions = persistence.list_file_versions(id).await.unwrap();
+    assert_eq!(versions.len(), 1);
+    assert_eq!(
+        persistence
+            .read_file_version(id, versions[0].version)
+            .await
+            .unwrap(),
+        b"persisted"
+    );
+}
+
+#[tokio::test]
+async fn test_memory_file_version_timestamps_are_microseconds() {
+    use crate::EntryType;
+    use crate::node::{FileID, PartID, local_pond_uuid};
+    use crate::persistence::PersistenceLayer;
+
+    let persistence = crate::memory::MemoryPersistence::default();
+    let id = FileID::new_in_partition(
+        PartID::root(),
+        EntryType::FilePhysicalVersion,
+        local_pond_uuid(),
+    );
+    let before = chrono::Utc::now().timestamp_micros();
+    persistence
+        .store_file_version(id, 1, b"content".to_vec())
+        .await
+        .unwrap();
+    let after = chrono::Utc::now().timestamp_micros();
+
+    let versions = persistence.list_file_versions(id).await.unwrap();
+    assert_eq!(versions.len(), 1);
+    assert!((before..=after).contains(&versions[0].timestamp));
+}
+
+#[tokio::test]
+async fn test_memory_persistence_active_transaction_contract() {
+    use std::sync::Arc;
+
+    use crate::persistence::PersistenceLayer;
+
+    let persistence = crate::memory::MemoryPersistence::default();
+    let fs = crate::FS::new(persistence.clone()).await.unwrap();
+    let root = fs.root().await.unwrap();
+    let context =
+        crate::ProviderContext::new_for_testing(Arc::new(persistence) as Arc<dyn PersistenceLayer>);
+
+    _ = crate::testing::persistence_contract::assert_active_transaction_read_write(&root, &context)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn test_create_file() {
     let fs = new_fs().await;
     let root = fs.root().await.unwrap();
@@ -430,6 +553,14 @@ async fn test_create_dynamic_file_path() {
         dynamic_node.id().entry_type(),
         crate::EntryType::FileDynamic
     );
+    assert!(matches!(
+        &dynamic_node.node.node_type,
+        crate::NodeType::File(_)
+    ));
+    assert_eq!(
+        dynamic_node.node.node_type.entry_type().await.unwrap(),
+        crate::EntryType::FileDynamic
+    );
 
     // Verify we can resolve it
     let (_, lookup) = root.resolve_path("/config/test.yaml").await.unwrap();
@@ -463,6 +594,14 @@ async fn test_create_dynamic_directory_path() {
     // Verify the node was created
     assert_eq!(
         dynamic_node.id().entry_type(),
+        crate::EntryType::DirectoryDynamic
+    );
+    assert!(matches!(
+        &dynamic_node.node.node_type,
+        crate::NodeType::Directory(_)
+    ));
+    assert_eq!(
+        dynamic_node.node.node_type.entry_type().await.unwrap(),
         crate::EntryType::DirectoryDynamic
     );
 
@@ -638,6 +777,46 @@ async fn test_memory_file_series_async_writer_with_versions() {
         }
         _ => panic!("File should exist"),
     }
+}
+
+#[tokio::test]
+async fn test_memory_persistence_version_range_and_reader() {
+    use crate::memory::MemoryPersistence;
+    use crate::node::PartID;
+    use crate::{EntryType, FileID, PersistenceLayer};
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let persistence = MemoryPersistence::default();
+    let id = FileID::new_in_partition(
+        PartID::root(),
+        EntryType::FilePhysicalVersion,
+        crate::local_pond_uuid(),
+    );
+    persistence
+        .store_file_version(id, 1, b"0123456789".to_vec())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        persistence
+            .read_file_version_range(id, 1, 3..7)
+            .await
+            .unwrap(),
+        b"3456".as_slice()
+    );
+    assert_eq!(
+        persistence
+            .read_file_version_range(id, 1, 8..20)
+            .await
+            .unwrap(),
+        b"89".as_slice()
+    );
+
+    let mut reader = persistence.open_file_version(id, 1).await.unwrap();
+    _ = reader.seek(std::io::SeekFrom::Start(5)).await.unwrap();
+    let mut tail = Vec::new();
+    _ = reader.read_to_end(&mut tail).await.unwrap();
+    assert_eq!(tail, b"56789");
 }
 
 #[async_trait::async_trait]

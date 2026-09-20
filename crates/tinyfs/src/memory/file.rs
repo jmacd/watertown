@@ -167,6 +167,11 @@ impl File for MemoryFile {
     }
 
     async fn async_writer(&self) -> error::Result<Pin<Box<dyn crate::file::FileMetadataWriter>>> {
+        let writer_guard = self
+            .persistence
+            .coherence_state()
+            .expect("memory persistence has coherence state")
+            .begin_writer(self.id)?;
         // Acquire write lock
         let mut state = self.write_state.write().await;
         if *state == WriteState::Writing {
@@ -184,6 +189,7 @@ impl File for MemoryFile {
             self.id,
             self.persistence.clone(),
             allocated_version,
+            writer_guard,
             self.entry_type,
             self.content.clone(),
             self.write_state.clone(),
@@ -212,38 +218,63 @@ impl crate::file::QueryableFile for MemoryFile {
             ListingOptions, ListingTableConfig, ListingTableUrl,
         };
 
-        // Use the same pattern as tlogfs: create a ListingTable with a tinyfs:// URL
-        // The TinyFsObjectStore (registered in SessionContext) handles reading from MemoryPersistence
-
-        // Build URL pattern for this file: tinyfs:///pond/{pond_id}/part/{part_id}/node/{node_id}/version/
-        // This matches the TinyFsObjectStore path format expectations
-        let url_pattern = format!(
-            "tinyfs:///pond/{}/part/{}/node/{}/version/",
-            id.pond_id(),
-            id.part_id(),
-            id.node_id()
-        );
-
-        let table_url =
-            ListingTableUrl::parse(&url_pattern).map_other_context("Failed to parse table URL")?;
+        let coherence = context.persistence.coherence_state();
+        let generation = coherence.as_ref().map(|state| state.generation());
+        let versions = context.persistence.list_file_versions(id).await?;
+        let table_urls = versions
+            .into_iter()
+            .filter(|version| version.size > 0)
+            .map(|version| {
+                ListingTableUrl::parse(format!(
+                    "tinyfs:///pond/{}/part/{}/node/{}/version/{}.parquet",
+                    id.pond_id(),
+                    id.part_id(),
+                    id.node_id(),
+                    version.version
+                ))
+                .map_other_context("Failed to parse table URL")
+            })
+            .collect::<error::Result<Vec<_>>>()?;
+        if table_urls.is_empty() {
+            return Err(error::Error::not_found(format!(
+                "No readable versions found for {id}"
+            )));
+        }
 
         // Create ListingTable configuration with Parquet format
         let file_format = Arc::new(ParquetFormat::default());
         let listing_options = ListingOptions::new(file_format);
-        let config = ListingTableConfig::new(table_url).with_listing_options(listing_options);
-
-        // Infer schema from the SessionContext (which will use the registered ObjectStore)
         let ctx = &context.datafusion_session;
-        let config_with_schema = config
-            .infer_schema(&ctx.state())
-            .await
-            .map_other_context("Schema inference failed")?;
+        let mut schemas = Vec::with_capacity(table_urls.len());
+        for table_url in &table_urls {
+            let inferred = ListingTableConfig::new(table_url.clone())
+                .with_listing_options(listing_options.clone())
+                .infer_schema(&ctx.state())
+                .await
+                .map_other_context("Schema inference failed")?;
+            let schema = inferred.file_schema.ok_or_else(|| {
+                error::Error::Other(format!("Could not infer schema for {table_url}"))
+            })?;
+            schemas.push(schema.as_ref().clone());
+        }
+        let schema = arrow::datatypes::Schema::try_merge(schemas)
+            .map_other_context("Schema merge failed")?;
+        let config_with_schema = ListingTableConfig::new_with_multi_paths(table_urls)
+            .with_listing_options(listing_options)
+            .with_schema(Arc::new(schema));
+        if let (Some(coherence), Some(generation)) = (&coherence, generation) {
+            coherence.ensure_generation(generation)?;
+        }
 
         // Create ListingTable
         let listing_table = ListingTable::try_new(config_with_schema)
             .map_other_context("ListingTable creation failed")?;
 
-        Ok(Arc::new(listing_table))
+        Ok(crate::coherent_table_provider(
+            Arc::new(listing_table),
+            coherence,
+            generation,
+        ))
     }
 }
 
@@ -273,12 +304,14 @@ struct MemoryFileWriter {
     id: FileID,
     persistence: MemoryPersistence,
     allocated_version: u64,
+    writer_guard: Option<crate::WriterGuard>,
     entry_type: EntryType,
     content: Arc<Mutex<Vec<u8>>>,
     write_state: Arc<RwLock<WriteState>>,
     buffer: Vec<u8>,
     completed: bool,
-    completion_future: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    completion_error: Option<String>,
+    completion_future: Option<Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>>,
 }
 
 impl MemoryFileWriter {
@@ -286,6 +319,7 @@ impl MemoryFileWriter {
         id: FileID,
         persistence: MemoryPersistence,
         allocated_version: u64,
+        writer_guard: crate::WriterGuard,
         entry_type: EntryType,
         content: Arc<Mutex<Vec<u8>>>,
         write_state: Arc<RwLock<WriteState>>,
@@ -294,11 +328,13 @@ impl MemoryFileWriter {
             id,
             persistence,
             allocated_version,
+            writer_guard: Some(writer_guard),
             entry_type,
             content,
             write_state,
             buffer: Vec::new(),
             completed: false,
+            completion_error: None,
             completion_future: None,
         }
     }
@@ -363,7 +399,10 @@ impl AsyncWrite for MemoryFileWriter {
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
         if self.completed {
-            return Poll::Ready(Ok(()));
+            return Poll::Ready(match &self.completion_error {
+                Some(error) => Err(std::io::Error::other(error.clone())),
+                None => Ok(()),
+            });
         }
 
         // Create completion future if not already created
@@ -377,28 +416,28 @@ impl AsyncWrite for MemoryFileWriter {
             let buffer = std::mem::take(&mut self.buffer);
 
             let future = Box::pin(async move {
-                // Compute bao_outboard if this is a series or version type
-                let bao_outboard = match entry_type {
-                    EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries => {
-                        // Get previous version's bao_outboard (if any)
-                        let prev_version = allocated_version.saturating_sub(1);
+                let result: error::Result<()> = async {
+                    // Compute bao_outboard if this is a series or version type
+                    let bao_outboard = match entry_type {
+                        EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries => {
+                            let prev_version = allocated_version.saturating_sub(1);
+                            let prev_bao = if prev_version > 0 {
+                                persistence.metadata(id).await?.bao_outboard
+                            } else {
+                                None
+                            };
 
-                        let prev_bao = if prev_version > 0 {
-                            // Get bao_outboard from metadata
-                            persistence
-                                .metadata(id)
-                                .await
-                                .ok()
-                                .and_then(|meta| meta.bao_outboard)
-                        } else {
-                            None
-                        };
+                            let series_outboard = if let Some(prev_bao_bytes) = prev_bao {
+                                let prev_outboard =
+                                    utilities::bao_outboard::SeriesOutboard::from_bytes(
+                                        &prev_bao_bytes,
+                                    )
+                                    .map_err(|error| {
+                                        error::Error::Other(format!(
+                                            "Invalid previous series outboard: {error}"
+                                        ))
+                                    })?;
 
-                        let series_outboard = if let Some(prev_bao_bytes) = prev_bao {
-                            // Deserialize previous SeriesOutboard
-                            if let Ok(prev_outboard) =
-                                utilities::bao_outboard::SeriesOutboard::from_bytes(&prev_bao_bytes)
-                            {
                                 // Calculate pending bytes needed from previous content
                                 let pending_size = (prev_outboard.cumulative_size
                                     % utilities::bao_outboard::BLOCK_SIZE as u64)
@@ -407,10 +446,7 @@ impl AsyncWrite for MemoryFileWriter {
                                 // Efficiently read only the pending bytes we need
                                 // Read versions from newest to oldest until we have enough bytes
                                 let pending_bytes = if pending_size > 0 {
-                                    let versions = persistence
-                                        .list_file_versions(id)
-                                        .await
-                                        .unwrap_or_default();
+                                    let versions = persistence.list_file_versions(id).await?;
 
                                     // Collect bytes from tail, reading only necessary versions
                                     let mut tail_bytes = Vec::with_capacity(pending_size);
@@ -427,8 +463,7 @@ impl AsyncWrite for MemoryFileWriter {
                                             // This version has enough bytes - read only the tail we need
                                             let version_content = persistence
                                                 .read_file_version(id, v.version)
-                                                .await
-                                                .unwrap_or_default();
+                                                .await?;
                                             let start = version_content
                                                 .len()
                                                 .saturating_sub(bytes_still_needed);
@@ -440,8 +475,7 @@ impl AsyncWrite for MemoryFileWriter {
                                             // Need entire version - prepend it
                                             let version_content = persistence
                                                 .read_file_version(id, v.version)
-                                                .await
-                                                .unwrap_or_default();
+                                                .await?;
                                             let mut new_tail = version_content;
                                             new_tail.append(&mut tail_bytes);
                                             tail_bytes = new_tail;
@@ -468,59 +502,50 @@ impl AsyncWrite for MemoryFileWriter {
                                     ),
                                 )
                             } else {
-                                None
-                            }
-                        } else {
-                            // First version
-                            Some(
-                                utilities::bao_outboard::SeriesOutboard::first_version_inline(
-                                    &buffer,
-                                ),
+                                Some(
+                                    utilities::bao_outboard::SeriesOutboard::first_version_inline(
+                                        &buffer,
+                                    ),
+                                )
+                            };
+
+                            series_outboard.map(|so| so.to_bytes())
+                        }
+                        EntryType::FilePhysicalVersion => {
+                            let version_outboard =
+                                utilities::bao_outboard::VersionOutboard::new(&buffer);
+                            Some(version_outboard.to_bytes())
+                        }
+                        _ => None,
+                    };
+
+                    if let Some(bao_bytes) = bao_outboard {
+                        persistence
+                            .store_file_version_with_bao(
+                                id,
+                                allocated_version,
+                                buffer.clone(),
+                                bao_bytes,
                             )
-                        };
-
-                        series_outboard.map(|so| so.to_bytes())
+                            .await?;
+                    } else {
+                        persistence
+                            .store_file_version(id, allocated_version, buffer.clone())
+                            .await?;
                     }
-                    EntryType::FilePhysicalVersion => {
-                        // Compute standalone VersionOutboard
-                        let version_outboard =
-                            utilities::bao_outboard::VersionOutboard::new(&buffer);
-                        Some(version_outboard.to_bytes())
-                    }
-                    _ => None,
-                };
 
-                // Store content with version and bao_outboard in persistence
-                let store_result = if let Some(bao_bytes) = bao_outboard {
-                    persistence
-                        .store_file_version_with_bao(
-                            id,
-                            allocated_version,
-                            buffer.clone(),
-                            bao_bytes,
-                        )
-                        .await
-                } else {
-                    persistence
-                        .store_file_version(id, allocated_version, buffer.clone())
-                        .await
-                };
-
-                if let Err(_e) = store_result {
-                    // Failed to store version - silent failure as this is internal state
-                }
-
-                // Update content (for backward compatibility with tests that read from content directly)
-                {
                     let mut content_guard = content.lock().await;
                     *content_guard = buffer;
+                    Ok(())
                 }
+                .await;
 
-                // Reset write state
                 {
                     let mut state = write_state.write().await;
                     *state = WriteState::Ready;
                 }
+
+                result.map_err(std::io::Error::other)
             });
             self.completion_future = Some(future);
         }
@@ -533,9 +558,13 @@ impl AsyncWrite for MemoryFileWriter {
             .as_mut()
             .poll(cx)
         {
-            Poll::Ready(()) => {
+            Poll::Ready(result) => {
                 self.completed = true;
-                Poll::Ready(Ok(()))
+                _ = self.writer_guard.take();
+                if let Err(error) = &result {
+                    self.completion_error = Some(error.to_string());
+                }
+                Poll::Ready(result)
             }
             Poll::Pending => Poll::Pending,
         }

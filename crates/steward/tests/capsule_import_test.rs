@@ -108,57 +108,64 @@ async fn build_source_capsule(
         .await
         .expect("create source pond");
 
-    ship.write_transaction(&meta("content"), async move |transaction| {
-        let root = transaction.root().await?;
-        let _ = root.create_dir_all("/data").await?;
-        let _ = root.create_dir_all("/system/run").await?;
-        let _ = create_file_path(&root, "/data/plain.txt", b"plain bytes").await?;
-        root.set_extended_attributes(
-            "/data/plain.txt",
-            HashMap::from([("capsule.test".to_string(), "plain".to_string())]),
-        )
-        .await?;
-
-        for (index, bytes) in [b"first-".as_slice(), b"second-leaf".as_slice()]
-            .into_iter()
-            .enumerate()
-        {
-            let mut writer = root
-                .async_writer_path_with_type("/data/log.series", EntryType::FilePhysicalSeries)
-                .await?;
-            writer.write_all(bytes).await?;
-            writer.shutdown().await?;
+    let post_commit_error = ship
+        .write_transaction(&meta("content"), async move |transaction| {
+            let root = transaction.root().await?;
+            let _ = root.create_dir_all("/data").await?;
+            let _ = root.create_dir_all("/system/run").await?;
+            let _ = create_file_path(&root, "/data/plain.txt", b"plain bytes").await?;
             root.set_extended_attributes(
-                "/data/log.series",
-                HashMap::from([("capsule.test".to_string(), format!("leaf-{index}"))]),
+                "/data/plain.txt",
+                HashMap::from([("capsule.test".to_string(), "plain".to_string())]),
             )
             .await?;
-        }
-        for (timestamp, value) in [(100, "a"), (200, "b"), (300, "c")] {
-            let batch = table_batch(
-                timestamp,
-                value,
-                (timestamp == 300).then_some("schema-evolved"),
-            );
-            let _ = root
-                .write_series_from_batch("/data/table.series", &batch, Some("timestamp"))
+
+            for (index, bytes) in [b"first-".as_slice(), b"second-leaf".as_slice()]
+                .into_iter()
+                .enumerate()
+            {
+                let mut writer = root
+                    .async_writer_path_with_type("/data/log.series", EntryType::FilePhysicalSeries)
+                    .await?;
+                writer.write_all(bytes).await?;
+                writer.shutdown().await?;
+                root.set_extended_attributes(
+                    "/data/log.series",
+                    HashMap::from([("capsule.test".to_string(), format!("leaf-{index}"))]),
+                )
                 .await?;
-        }
-        let _ = root
-            .create_symlink_path("/data/link", "/data/plain.txt")
-            .await?;
-        let _ = root
-            .create_dynamic_path(
-                "/system/run/10-capsule-import-test",
-                EntryType::FileDynamic,
-                "no-such-factory-is-registered",
-                b"key: value\n".to_vec(),
-            )
-            .await?;
-        Ok(())
-    })
-    .await
-    .expect("write source content");
+            }
+            for (timestamp, value) in [(100, "a"), (200, "b"), (300, "c")] {
+                let batch = table_batch(
+                    timestamp,
+                    value,
+                    (timestamp == 300).then_some("schema-evolved"),
+                );
+                let _ = root
+                    .write_series_from_batch("/data/table.series", &batch, Some("timestamp"))
+                    .await?;
+            }
+            let _ = root
+                .create_symlink_path("/data/link", "/data/plain.txt")
+                .await?;
+            let _ = root
+                .create_dynamic_path(
+                    "/system/run/10-capsule-import-test",
+                    EntryType::FileDynamic,
+                    "no-such-factory-is-registered",
+                    b"key: value\n".to_vec(),
+                )
+                .await?;
+            Ok(())
+        })
+        .await
+        .expect_err("the deliberately unregistered post-commit factory must fail visibly");
+    assert!(
+        post_commit_error
+            .to_string()
+            .contains("no-such-factory-is-registered"),
+        "unexpected post-commit error: {post_commit_error}"
+    );
 
     let capsule = build_recovery_capsule(&ship)
         .await

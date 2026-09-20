@@ -161,6 +161,104 @@ async fn test_large_file_size_consistency() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+#[tokio::test]
+async fn test_large_file_version_range() -> Result<(), Box<dyn std::error::Error>> {
+    use tinyfs::PersistenceLayer;
+
+    let (_temp_dir, store_path) = test_dir();
+    let mut persistence = OpLogPersistence::create_test_uncompressed(&store_path).await?;
+    let content_size = LARGE_FILE_THRESHOLD + 50000;
+    let original_content: Vec<u8> = (0..content_size).map(|i| (i % 251) as u8).collect();
+
+    let tx = persistence.begin_test().await?;
+    let wd = tx.root().await?;
+    _ = tinyfs::async_helpers::convenience::create_file_path(
+        &wd,
+        "/range_test.dat",
+        &original_content,
+    )
+    .await?;
+    tx.commit_test().await?;
+
+    let tx = persistence.begin_test().await?;
+    let wd = tx.root().await?;
+    let id = wd.get_node_path("/range_test.dat").await?.id();
+    let state = tx.state()?;
+    let version = state.list_file_versions(id).await?[0].version;
+
+    let middle = (content_size / 2) as u64;
+    let middle_range = middle..middle + 257;
+    let middle_bytes = state
+        .read_file_version_range(id, version, middle_range.clone())
+        .await?;
+    assert_eq!(
+        middle_bytes.as_ref(),
+        &original_content[middle_range.start as usize..middle_range.end as usize]
+    );
+
+    let tail_start = content_size as u64 - 97;
+    let tail = state
+        .read_file_version_range(id, version, tail_start..content_size as u64 + 1000)
+        .await?;
+    assert_eq!(tail.as_ref(), &original_content[tail_start as usize..]);
+
+    tx.commit_test().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_mixed_large_and_inline_series_seeking() -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+    let (_temp_dir, store_path) = test_dir();
+    let mut persistence = OpLogPersistence::create_test_uncompressed(&store_path).await?;
+    let large = vec![0x5a; LARGE_FILE_THRESHOLD + 4096];
+    let inline = b"inline-tail";
+
+    let tx = persistence.begin_test().await?;
+    let wd = tx.root().await?;
+    let mut writer = wd
+        .async_writer_path_with_type("/mixed.series", tinyfs::EntryType::FilePhysicalSeries)
+        .await?;
+    writer.write_all(&large).await?;
+    writer.shutdown().await?;
+    tx.commit_test().await?;
+
+    let tx = persistence.begin_test().await?;
+    let wd = tx.root().await?;
+    let mut writer = wd
+        .async_writer_path_with_type("/mixed.series", tinyfs::EntryType::FilePhysicalSeries)
+        .await?;
+    writer.write_all(inline).await?;
+    writer.shutdown().await?;
+    tx.commit_test().await?;
+
+    let tx = persistence.begin_test().await?;
+    let wd = tx.root().await?;
+    let mut reader = wd.async_reader_path("/mixed.series").await?;
+
+    let boundary_start = large.len() as u64 - 8;
+    assert_eq!(
+        reader
+            .seek(std::io::SeekFrom::Start(boundary_start))
+            .await?,
+        boundary_start
+    );
+    let mut crossing = Vec::new();
+    _ = reader.read_to_end(&mut crossing).await?;
+    let mut expected = vec![0x5a; 8];
+    expected.extend_from_slice(inline);
+    assert_eq!(crossing, expected);
+
+    _ = reader.seek(std::io::SeekFrom::Start(0)).await?;
+    let mut prefix = [0; 16];
+    _ = reader.read_exact(&mut prefix).await?;
+    assert_eq!(prefix, [0x5a; 16]);
+
+    tx.commit_test().await?;
+    Ok(())
+}
+
 /// Test large file with multiple reads (simulating DataFusion schema inference + data read)
 ///
 /// DataFusion typically:

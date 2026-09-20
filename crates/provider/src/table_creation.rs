@@ -12,7 +12,9 @@ use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
+use datafusion::error::DataFusionError;
 use log::debug;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tinyfs::{FileID, ProviderContext};
 
@@ -41,7 +43,7 @@ use crate::{TableProviderKey, TableProviderOptions, VersionSelection};
 /// use tinyfs::{FileID, ProviderContext};
 ///
 /// let options = TableProviderOptions {
-///     version_selection: VersionSelection::Latest,
+///     version_selection: VersionSelection::LatestVersion,
 ///     additional_urls: vec![],
 /// };
 /// let provider = create_table_provider(file_id, &context, options).await?;
@@ -85,6 +87,92 @@ pub async fn pruned_version_urls(
     Ok(if urls.is_empty() { None } else { Some(urls) })
 }
 
+struct SelectedVersion {
+    url: String,
+    schema_fingerprint: Option<String>,
+}
+
+async fn selected_versions(
+    file_id: FileID,
+    context: &ProviderContext,
+    selection: &VersionSelection,
+    bounds: tinyfs::SeriesReadBounds,
+) -> Result<Vec<SelectedVersion>> {
+    let versions = context.persistence.list_file_versions(file_id).await?;
+    let mut selected: Vec<_> = versions.iter().filter(|version| version.size > 0).collect();
+
+    match selection {
+        VersionSelection::AllVersions => {}
+        VersionSelection::LatestVersion => {
+            if let Some(latest) = selected.iter().max_by_key(|version| version.version) {
+                selected = vec![*latest];
+            }
+        }
+        VersionSelection::SpecificVersion(target) => {
+            selected.retain(|version| version.version == *target);
+        }
+    }
+    let schema_fallback = selected
+        .iter()
+        .max_by_key(|version| version.version)
+        .copied();
+    if bounds != tinyfs::SeriesReadBounds::NONE {
+        selected.retain(|version| {
+            bounds.retains(
+                crate::format_cache::version_max_event_time(version),
+                version.version as i64,
+            )
+        });
+        if selected.is_empty()
+            && let Some(fallback) = schema_fallback
+        {
+            selected.push(fallback);
+        }
+    }
+
+    Ok(selected
+        .into_iter()
+        .map(|version| SelectedVersion {
+            url: crate::TinyFsPathBuilder::url_specific_version(&file_id, version.version),
+            schema_fingerprint: version
+                .extended_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("series_schema_fingerprint"))
+                .cloned(),
+        })
+        .collect())
+}
+
+async fn listing_config_with_merged_schema(
+    context: &ProviderContext,
+    table_urls: Vec<ListingTableUrl>,
+    schema_fingerprints: &[Option<String>],
+) -> Result<ListingTableConfig> {
+    let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()));
+    let mut schemas = Vec::with_capacity(table_urls.len());
+    let mut seen_fingerprints = HashSet::new();
+    for (table_url, fingerprint) in table_urls.iter().zip(schema_fingerprints) {
+        if let Some(fingerprint) = fingerprint
+            && !seen_fingerprints.insert(fingerprint)
+        {
+            continue;
+        }
+        let inferred = ListingTableConfig::new(table_url.clone())
+            .with_listing_options(listing_options.clone())
+            .infer_schema(&context.datafusion_session.state())
+            .await?;
+        let schema = inferred.file_schema.ok_or_else(|| {
+            DataFusionError::Plan(format!("Could not infer schema for {table_url}"))
+        })?;
+        schemas.push(schema.as_ref().clone());
+    }
+    let schema = arrow::datatypes::Schema::try_merge(schemas)
+        .map_err(|error| DataFusionError::ArrowError(Box::new(error), None))?;
+    Ok(ListingTableConfig::new_with_multi_paths(table_urls)
+        .with_listing_options(listing_options)
+        .with_schema(Arc::new(schema)))
+}
+
 pub async fn create_table_provider(
     file_id: FileID,
     context: &ProviderContext,
@@ -97,6 +185,8 @@ pub async fn create_table_provider(
 
     // Use centralized debug logging to eliminate duplication
     options.version_selection.log_debug(&file_id.node_id());
+    let coherence = context.persistence.coherence_state();
+    let provider_generation = coherence.as_ref().map(|state| state.generation());
 
     // Check cache first (only for simple cases without additional_urls)
     if options.additional_urls.is_empty() {
@@ -123,34 +213,32 @@ pub async fn create_table_provider(
         debug!("[WARN] CACHE BYPASS: additional_urls present, creating fresh TableProvider");
     }
 
-    let pruned_urls: Option<Vec<String>> =
-        if options.additional_urls.is_empty() && options.bounds != tinyfs::SeriesReadBounds::NONE {
-            pruned_version_urls(file_id, context, options.bounds).await?
-        } else {
-            None
-        };
+    let selected_versions = if options.additional_urls.is_empty() {
+        Some(selected_versions(file_id, context, &options.version_selection, options.bounds).await?)
+    } else {
+        None
+    };
 
-    // Create ListingTable URL(s) - either from options.additional_urls or pattern generation
-    let (config, debug_info) = if let Some(urls) = &pruned_urls {
-        let mut table_urls = Vec::with_capacity(urls.len());
-        for url_str in urls {
-            table_urls.push(ListingTableUrl::parse(url_str)?);
+    // Use explicit version URLs so DataFusion's list-files cache cannot hide a
+    // version completed after an earlier provider was built.
+    let (table_urls, schema_fingerprints, debug_info) = if let Some(versions) = &selected_versions {
+        if versions.is_empty() {
+            return Err(crate::Error::TinyFs(tinyfs::Error::not_found(format!(
+                "No readable versions found for {file_id}"
+            ))));
+        }
+        let mut table_urls = Vec::with_capacity(versions.len());
+        let mut schema_fingerprints = Vec::with_capacity(versions.len());
+        for version in versions {
+            table_urls.push(ListingTableUrl::parse(&version.url)?);
+            schema_fingerprints.push(version.schema_fingerprint.clone());
         }
 
-        let file_format = Arc::new(ParquetFormat::default());
-        let listing_options = ListingOptions::new(file_format);
-        let config = ListingTableConfig::new_with_multi_paths(table_urls)
-            .with_listing_options(listing_options);
-        (config, format!("bounded: {} version URL(s)", urls.len()))
-    } else if options.additional_urls.is_empty() {
-        // Default behavior: single URL from pattern
-        let url_pattern = options.version_selection.to_url_pattern(&file_id);
-        let table_url = ListingTableUrl::parse(&url_pattern)?;
-
-        let file_format = Arc::new(ParquetFormat::default());
-        let listing_options = ListingOptions::new(file_format);
-        let config = ListingTableConfig::new(table_url).with_listing_options(listing_options);
-        (config, format!("single URL: {}", url_pattern))
+        (
+            table_urls,
+            schema_fingerprints,
+            format!("{} explicit version URL(s)", versions.len()),
+        )
     } else {
         // Multiple URLs provided via options - use only the provided URLs, not the default pattern
         let mut table_urls = Vec::new();
@@ -160,13 +248,13 @@ pub async fn create_table_provider(
             table_urls.push(ListingTableUrl::parse(url_str)?);
         }
 
-        let file_format = Arc::new(ParquetFormat::default());
-        let listing_options = ListingOptions::new(file_format);
-        let config = ListingTableConfig::new_with_multi_paths(table_urls.clone())
-            .with_listing_options(listing_options);
-
         let urls_str: Vec<String> = table_urls.iter().map(|u| u.to_string()).collect();
-        (config, format!("multiple URLs: [{}]", urls_str.join(", ")))
+        let schema_fingerprints = vec![None; table_urls.len()];
+        (
+            table_urls,
+            schema_fingerprints,
+            format!("multiple URLs: [{}]", urls_str.join(", ")),
+        )
     };
 
     debug!("Creating table provider with {debug_info}");
@@ -176,11 +264,17 @@ pub async fn create_table_provider(
     // 2. Skip 0-byte files (temporal override metadata-only versions)
     // 3. Merge schemas from all valid Parquet versions
     // 4. Provide the unified schema
-    let config_with_schema = config
-        .infer_schema(&context.datafusion_session.state())
-        .await?;
+    let config_with_schema =
+        listing_config_with_merged_schema(context, table_urls, &schema_fingerprints).await?;
+    if let (Some(coherence), Some(generation)) = (&coherence, provider_generation) {
+        coherence.ensure_generation(generation)?;
+    }
 
-    let table_provider = Arc::new(ListingTable::try_new(config_with_schema)?);
+    let table_provider: Arc<dyn TableProvider> = tinyfs::coherent_table_provider(
+        Arc::new(ListingTable::try_new(config_with_schema)?),
+        coherence,
+        provider_generation,
+    );
 
     log::debug!("[LIST] CREATED TableProvider: file_id={file_id}, urls={debug_info}");
 
@@ -193,7 +287,11 @@ pub async fn create_table_provider(
         )
         .to_cache_string();
 
-        context.set_table_provider_cache(cache_key, table_provider.clone())?;
+        context.set_table_provider_cache_at(
+            cache_key,
+            table_provider.clone(),
+            provider_generation,
+        )?;
         debug!("[SAVE] CACHED: Stored TableProvider for file_id: {file_id}");
     }
 

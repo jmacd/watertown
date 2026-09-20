@@ -7,8 +7,10 @@
 pub mod export;
 pub mod factory;
 pub mod registry;
+pub mod testing;
 pub mod transform;
 
+mod datafusion_functions;
 mod error;
 mod format;
 pub mod format_cache;
@@ -25,6 +27,7 @@ mod url_pattern_matcher;
 pub mod version_cache;
 mod version_selection;
 
+pub use datafusion_functions::{counter_delta_udwf, register_datafusion_functions};
 pub use error::{Error, Result};
 pub use factory::dynamic_dir::{DynamicDirConfig, DynamicDirDirectory, DynamicDirEntry};
 pub use factory::sql_derived::SqlDerivedConfig;
@@ -33,7 +36,7 @@ pub use format_registry::{FORMAT_PROVIDERS, FormatProviderEntry, FormatRegistry}
 pub use provider_api::Provider;
 pub use registry::{
     ConfigFile, DYNAMIC_FACTORIES, DynamicFactory, ExecutionContext, ExecutionMode, FactoryCommand,
-    FactoryRegistry, QueryableFile, SchemeKind, SchemeRegistry,
+    FactoryRegistry, PostCommitAccess, QueryableFile, SchemeKind, SchemeRegistry,
 };
 pub use sql_transform::transform_sql;
 pub use table_creation::{

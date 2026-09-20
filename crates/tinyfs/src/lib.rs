@@ -7,6 +7,7 @@ pub mod async_helpers;
 pub mod bao_validating_reader;
 pub mod caching_persistence;
 pub mod chained_reader;
+pub mod coherence;
 pub mod context;
 mod dir;
 mod entry_type;
@@ -42,6 +43,9 @@ pub use wd::{CopyDestination, Lookup, Visitor, WD};
 // WARNING: These load entire files into memory - use sparingly
 pub use async_helpers::buffer_helpers;
 pub use caching_persistence::CachingPersistence;
+pub use coherence::{
+    CoherenceState, MutationGuard, QueryGuard, WriterGuard, coherent_table_provider,
+};
 pub use entry_type::EntryType;
 pub use error::{Error, Result, ResultExt};
 pub use hostmount::HostmountPersistence;

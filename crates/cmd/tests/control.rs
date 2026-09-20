@@ -545,7 +545,7 @@ fail: true
         .await
         .expect("Failed to create config");
 
-    mknod_command(
+    let create_failure = mknod_command(
         &setup.ship_context,
         "test-executor",
         "/system/run/20-fail",
@@ -553,7 +553,12 @@ fail: true
         false,
     )
     .await
-    .expect("Failed to create factory node");
+    .expect_err("the newly installed failing post-commit factory must fail the command");
+    assert!(
+        create_failure
+            .to_string()
+            .contains("post-commit factory execution failed")
+    );
 
     // Factory 3: Success (proves factory 2's failure didn't block execution)
     setup
@@ -567,7 +572,7 @@ repeat_count: 1
         .await
         .expect("Failed to create config");
 
-    mknod_command(
+    let create_third = mknod_command(
         &setup.ship_context,
         "test-executor",
         "/system/run/30-success",
@@ -575,13 +580,23 @@ repeat_count: 1
         false,
     )
     .await
-    .expect("Failed to create factory node");
+    .expect_err("the existing failing factory must remain visible");
+    assert!(
+        create_third
+            .to_string()
+            .contains("post-commit factory execution failed")
+    );
 
     // Execute write transaction to trigger post-commit
-    setup
+    let trigger_error = setup
         .execute_write_transaction("test_failure_isolation")
         .await
-        .expect("Failed to execute write transaction");
+        .expect_err("post-commit failure must fail the command after the local commit");
+    assert!(
+        trigger_error
+            .to_string()
+            .contains("post-commit factory execution failed")
+    );
 
     let txn_seq = setup
         .get_last_txn_seq()

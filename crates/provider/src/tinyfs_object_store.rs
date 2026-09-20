@@ -10,10 +10,9 @@
 //!
 //! Path format: "/node/{node_id}" maps to TinyFS node ID
 
-use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::tinyfs_path::TinyFsPathBuilder;
 use async_trait::async_trait;
@@ -25,6 +24,8 @@ use object_store::{
     PutPayload, PutResult, Result as ObjectStoreResult, path::Path as ObjectPath,
 };
 use tinyfs::PersistenceLayer;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio_util::io::ReaderStream;
 
 /// File series information for ObjectStore registry
 #[derive(Debug, Clone)]
@@ -33,14 +34,6 @@ struct FileSeriesInfo {
     file_id: tinyfs::FileID,
     /// Version information for all versions in the series
     versions: Vec<tinyfs::FileVersionInfo>,
-}
-
-/// Metadata for a file version (cached from list() call)
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields are cached for future use; currently only presence check matters
-struct CachedVersionMeta {
-    size: u64,
-    sha256: Option<String>,
 }
 
 /// TinyFS-backed ObjectStore implementation.
@@ -52,19 +45,13 @@ struct CachedVersionMeta {
 pub struct TinyFsObjectStore<P: PersistenceLayer> {
     /// Persistence layer for dynamic file discovery and version access
     persistence: P,
-    /// Metadata cache: maps clean path (without metadata) to version metadata
-    /// Populated during list() calls, consumed by get_range() to avoid redundant queries
-    metadata_cache: Arc<Mutex<HashMap<String, CachedVersionMeta>>>,
 }
 
 impl<P: PersistenceLayer> TinyFsObjectStore<P> {
     /// Create a new TinyFS ObjectStore from any PersistenceLayer
     #[must_use]
     pub fn new(persistence: P) -> Self {
-        Self {
-            persistence,
-            metadata_cache: Arc::new(Mutex::new(HashMap::new())),
-        }
+        Self { persistence }
     }
 
     /// Create ObjectMeta for a specific version
@@ -244,6 +231,7 @@ impl<P: PersistenceLayer + Clone + 'static> ObjectStore for TinyFsObjectStore<P>
             self.create_object_meta_for_version(location, &series_info, version_num)?;
         let size = object_meta.size;
         debug!("ObjectStore file metadata - size: {size}");
+        options.check_preconditions(&object_meta)?;
 
         // If this is a head request, return metadata only
         if options.head {
@@ -272,65 +260,53 @@ impl<P: PersistenceLayer + Clone + 'static> ObjectStore for TinyFsObjectStore<P>
             }
         };
 
-        // Get version-specific content using read_file_version (which returns Vec<u8>)
-        let version_data = self
+        let response_range = match options.range.as_ref() {
+            Some(range) => range
+                .as_range(size)
+                .map_err(|source| object_store::Error::Generic {
+                    store: "TinyFS",
+                    source: format!("Invalid range for object of size {size}: {source}").into(),
+                })?,
+            None => 0..size,
+        };
+
+        let mut reader = self
             .persistence
-            .read_file_version(series_info.file_id, version_to_read)
+            .open_file_version(series_info.file_id, version_to_read)
             .await
             .map_err(|e| object_store::Error::Generic {
                 store: "TinyFS",
-                source: format!("Failed to read version {}: {}", version_to_read, e).into(),
+                source: format!("Failed to open version {}: {}", version_to_read, e).into(),
             })?;
 
-        // Return the version data directly - no buffering needed since read_file_version handles efficiency
-        let byte_count = version_data.len();
-        debug!("ObjectStore read version {version_to_read} directly, got {byte_count} bytes");
+        _ = reader
+            .seek(std::io::SeekFrom::Start(response_range.start))
+            .await
+            .map_err(|e| object_store::Error::Generic {
+                store: "TinyFS",
+                source: format!(
+                    "Failed to seek version {version_to_read} to {}: {e}",
+                    response_range.start
+                )
+                .into(),
+            })?;
 
-        // Create a stream from the version data
-        let stream = async_stream::stream! {
-            debug!("ObjectStore starting to stream file content for series_key: {series_key}");
-            let data = version_data;
-            let total_bytes = data.len();
-            let chunk_size = 8192; // 8KB chunks
-            let mut offset = 0;
-            let mut chunk_count = 0;
-
-            while offset < total_bytes {
-                let end = std::cmp::min(offset + chunk_size, total_bytes);
-                let chunk_data = &data[offset..end];
-                let chunk_len = chunk_data.len();
-
-                chunk_count += 1;
-
-                // Log first few bytes of first chunk for diagnostics
-                if chunk_count == 1 {
-                    let preview = if chunk_len >= 8 {
-                        format!("{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}...",
-                            chunk_data[0], chunk_data[1], chunk_data[2], chunk_data[3],
-                            chunk_data[4], chunk_data[5], chunk_data[6], chunk_data[7])
-                    } else {
-                        format!("{:02x?}", &chunk_data[..chunk_len.min(8)])
-                    };
-                    debug!("ObjectStore chunk {chunk_count}: {chunk_len} bytes, starts with: {preview}");
-                } else {
-                    debug!("ObjectStore chunk {chunk_count}: {chunk_len} bytes (offset: {offset})");
-                }
-
-                yield Ok(Bytes::copy_from_slice(chunk_data));
-                offset = end;
+        let bytes_to_read = response_range.end - response_range.start;
+        let stream = ReaderStream::new(reader.take(bytes_to_read)).map_err(move |e| {
+            object_store::Error::Generic {
+                store: "TinyFS",
+                source: format!("Failed to stream version {version_to_read}: {e}").into(),
             }
+        });
 
-            debug!("ObjectStore stream complete after {total_bytes} bytes in {chunk_count} chunks for series_key: {series_key}");
-        };
-
-        let range_end = object_meta.size;
-        let meta_size = object_meta.size;
-        debug!("ObjectStore returning GetResult with range 0..{range_end}, meta.size: {meta_size}");
+        debug!(
+            "ObjectStore streaming version {version_to_read}, range {response_range:?}, logical size {size}"
+        );
 
         Ok(GetResult {
             meta: object_meta.clone(),
             payload: object_store::GetResultPayload::Stream(stream.boxed()),
-            range: 0..object_meta.size,
+            range: response_range,
             attributes: Default::default(),
         })
     }
@@ -340,203 +316,39 @@ impl<P: PersistenceLayer + Clone + 'static> ObjectStore for TinyFsObjectStore<P>
         location: &ObjectPath,
         range: Range<u64>,
     ) -> ObjectStoreResult<Bytes> {
-        let path = location.as_ref();
-        debug!("[SEARCH] ObjectStore get_range called for path: {path}, range: {range:?}");
-
-        let (_series_key, version_num) = match self.parse_versioned_path(location) {
-            Ok(result) => {
-                let _series_key = &result.0;
-                let version_num = &result.1;
-                debug!(
-                    "[OK] ObjectStore get_range parsed path - series_key: {_series_key}, version: {version_num:?}"
-                );
-                result
-            }
-            Err(e) => {
-                debug!("[ERR] ObjectStore get_range failed to parse path {path}: {e}");
-                return Err(e);
-            }
-        };
-
-        // OPTIMIZATION: Check cache first to avoid database query
-        let location_str = location.as_ref();
-
-        // Parse the path to get node_id and part_id
-        let parsed_path =
-            parse_tinyfs_path(location_str, self.persistence.pond_uuid()).map_err(|err| {
-                object_store::Error::Generic {
-                    store: "TinyFS",
-                    source: err.into(),
-                }
+        object_store::GetRange::Bounded(range.clone())
+            .is_valid()
+            .map_err(|source| object_store::Error::Generic {
+                store: "TinyFS",
+                source: format!("Invalid range: {source}").into(),
             })?;
-
-        // Try to get metadata from cache
-        let cached_metadata = if let Ok(cache) = self.metadata_cache.lock() {
-            cache.get(location_str).cloned()
-        } else {
-            None
-        };
-
-        let has_cached_metadata = cached_metadata.is_some();
-
-        if has_cached_metadata {
-            debug!("[OK] ObjectStore get_range: metadata found in cache, skipping version query");
-        } else {
-            debug!(
-                "[WARN] ObjectStore get_range: no cached metadata, will query for latest version if needed"
-            );
-        }
-
-        // FAIL-FAST: Version must be specified in path for file series
-        let version_to_read = version_num.ok_or_else(|| object_store::Error::Generic {
-            store: "TinyFS",
-            source: format!(
-                "File series path '{}' missing version number. Paths must include version like 'tinyfs:///.../file.series?version=1'",
-                location
-            ).into(),
-        })?;
-        debug!("[SEARCH] ObjectStore get_range using version: {version_to_read}");
-
-        debug!(
-            "[SEARCH] ObjectStore get_range reading version {version_to_read} for DataFusion schema inference"
-        );
-
-        // Get version-specific content using read_file_version
-        let version_data = match self
-            .persistence
-            .read_file_version(parsed_path.file_id, version_to_read)
-            .await
-        {
-            Ok(data) => {
-                let len = data.len();
-                debug!("[OK] ObjectStore get_range successfully read {len} bytes from persistence");
-                data
-            }
-            Err(e) => {
-                debug!("[ERR] ObjectStore get_range failed to read version {version_to_read}: {e}");
-                return Err(object_store::Error::Generic {
-                    store: "TinyFS",
-                    source: format!("Failed to read version {}: {}", version_to_read, e).into(),
-                });
-            }
-        };
-
-        let total_size = version_data.len() as u64;
-        debug!(
-            "[SEARCH] ObjectStore get_range: file has {total_size} bytes total, requested range: {range:?}"
-        );
-
-        // Validate range bounds
-        if range.start >= total_size {
-            let start = range.start;
-            debug!(
-                "[ERR] ObjectStore get_range: range start {start} exceeds file size {total_size}"
-            );
-            return Err(object_store::Error::Generic {
+        let parsed_path = parse_tinyfs_path(location.as_ref(), self.persistence.pond_uuid())
+            .map_err(|err| object_store::Error::Generic {
+                store: "TinyFS",
+                source: err.into(),
+            })?;
+        let version = parsed_path
+            .version
+            .ok_or_else(|| object_store::Error::Generic {
                 store: "TinyFS",
                 source: format!(
-                    "Range start {} exceeds file size {}",
-                    range.start, total_size
+                    "File series path '{}' must identify a specific version",
+                    location
                 )
                 .into(),
-            });
-        }
+            })?;
 
-        let end = std::cmp::min(range.end, total_size);
-        let start_usize = range.start as usize;
-        let end_usize = end as usize;
-
-        if start_usize >= version_data.len() || end_usize > version_data.len() {
-            let data_len = version_data.len();
-            debug!(
-                "[ERR] ObjectStore get_range: invalid slice bounds start={start_usize}, end={end_usize}, data_len={data_len}"
-            );
-            return Err(object_store::Error::Generic {
-                store: "TinyFS", // @@@ ugh
-                source: "Invalid range bounds".into(),
-            });
-        }
-
-        let range_data = &version_data[start_usize..end_usize];
-        let range_size = range_data.len();
-        debug!("[SEARCH] ObjectStore get_range returning {range_size} bytes from range {range:?}");
-
-        // Log first few bytes for debugging DataFusion schema inference
-        if range.start == 0 && range_size >= 16 {
-            let preview = format!(
-                "{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-                range_data[0],
-                range_data[1],
-                range_data[2],
-                range_data[3],
-                range_data[4],
-                range_data[5],
-                range_data[6],
-                range_data[7],
-                range_data[8],
-                range_data[9],
-                range_data[10],
-                range_data[11],
-                range_data[12],
-                range_data[13],
-                range_data[14],
-                range_data[15]
-            );
-            debug!("[SEARCH] ObjectStore get_range (file start): {preview}");
-        }
-
-        // Log last few bytes for Parquet footer detection (DataFusion reads footer first)
-        if range.end == total_size && range_size >= 16 {
-            let start_idx = range_size.saturating_sub(16);
-            let preview = format!(
-                "{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-                range_data[start_idx],
-                range_data[start_idx + 1],
-                range_data[start_idx + 2],
-                range_data[start_idx + 3],
-                range_data[start_idx + 4],
-                range_data[start_idx + 5],
-                range_data[start_idx + 6],
-                range_data[start_idx + 7],
-                range_data[start_idx + 8],
-                range_data[start_idx + 9],
-                range_data[start_idx + 10],
-                range_data[start_idx + 11],
-                range_data[start_idx + 12],
-                range_data[start_idx + 13],
-                range_data[start_idx + 14],
-                range_data[start_idx + 15]
-            );
-            debug!("[SEARCH] ObjectStore get_range (file end): {preview}");
-        }
-
-        // Check if this looks like a Parquet file
-        if range.start == 0 && range_size >= 4 {
-            if &range_data[0..4] == b"PAR1" {
-                debug!(
-                    "[OK] ObjectStore get_range: File starts with PAR1 - valid Parquet magic number"
-                );
-            } else {
-                debug!(
-                    "[ERR] ObjectStore get_range: File does NOT start with PAR1 - may not be valid Parquet"
-                );
-            }
-        }
-
-        // Check for Parquet footer magic number (PAR1 at end)
-        if range.end == total_size && range_size >= 4 {
-            let footer_start = range_size.saturating_sub(4);
-            if &range_data[footer_start..] == b"PAR1" {
-                debug!("[OK] ObjectStore get_range: File ends with PAR1 - valid Parquet footer");
-            } else {
-                debug!(
-                    "[ERR] ObjectStore get_range: File does NOT end with PAR1 - may not be valid Parquet"
-                );
-            }
-        }
-
-        debug!("[OK] ObjectStore get_range successfully returning {range_size} bytes");
-        Ok(Bytes::copy_from_slice(range_data))
+        debug!(
+            "ObjectStore reading version {version} range {range:?} from {}",
+            parsed_path.file_id
+        );
+        self.persistence
+            .read_file_version_range(parsed_path.file_id, version, range)
+            .await
+            .map_err(|e| object_store::Error::Generic {
+                store: "TinyFS",
+                source: format!("Failed to read version {version} range: {e}").into(),
+            })
     }
 
     async fn delete(&self, location: &ObjectPath) -> ObjectStoreResult<()> {
@@ -554,7 +366,6 @@ impl<P: PersistenceLayer + Clone + 'static> ObjectStore for TinyFsObjectStore<P>
         prefix: Option<&ObjectPath>,
     ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
         let persistence = self.persistence.clone();
-        let metadata_cache = self.metadata_cache.clone();
         let prefix = prefix.map(|p| p.as_ref().to_string());
         let pond_id = self.persistence.pond_uuid();
 
@@ -591,19 +402,6 @@ impl<P: PersistenceLayer + Clone + 'static> ObjectStore for TinyFsObjectStore<P>
 
                                 // Use clean path (DataFusion-compatible format)
                                 let clean_path = version_path.clone();
-
-                                // OPTIMIZATION: Cache metadata to avoid re-querying in get_range()
-                                // Store metadata keyed by clean path for later retrieval
-                                let cache_key = clean_path.clone();
-                                let cached_meta = CachedVersionMeta {
-                                    size: version_info.size,
-                                    sha256: version_info.blake3.clone(),
-                                };
-
-                                // Insert into cache (lock briefly, then release)
-                                if let Ok(mut cache) = metadata_cache.lock() {
-                                    let _ = cache.insert(cache_key, cached_meta);
-                                }
 
                                 debug!("ObjectStore discovered version: {version_path}");
 
@@ -789,6 +587,7 @@ pub fn register_tinyfs_object_store<P: PersistenceLayer + Clone + 'static>(
     ctx: &datafusion::execution::context::SessionContext,
     persistence: P,
 ) -> Result<Arc<TinyFsObjectStore<P>>, Box<dyn std::error::Error + Send + Sync>> {
+    crate::register_datafusion_functions(ctx)?;
     let object_store = Arc::new(TinyFsObjectStore::new(persistence));
 
     let url =
@@ -800,4 +599,71 @@ pub fn register_tinyfs_object_store<P: PersistenceLayer + Clone + 'static>(
 
     debug!("Registered TinyFS ObjectStore with SessionContext - ready for any TinyFS path");
     Ok(object_store)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::GetRange;
+    use tinyfs::{EntryType, FileID, MemoryPersistence, PartID};
+
+    async fn test_store() -> (TinyFsObjectStore<MemoryPersistence>, ObjectPath, Vec<u8>) {
+        let persistence = MemoryPersistence::default();
+        let id = FileID::new_in_partition(
+            PartID::root(),
+            EntryType::TablePhysicalVersion,
+            tinyfs::local_pond_uuid(),
+        );
+        let content = b"0123456789abcdefghijklmnopqrstuvwxyz".to_vec();
+        persistence
+            .store_file_version(id, 1, content.clone())
+            .await
+            .unwrap();
+        let path = ObjectPath::from(TinyFsPathBuilder::specific_version(&id, 1));
+        (TinyFsObjectStore::new(persistence), path, content)
+    }
+
+    #[tokio::test]
+    async fn get_range_returns_only_requested_version_bytes() {
+        let (store, path, content) = test_store().await;
+        let bytes = store.get_range(&path, 10..16).await.unwrap();
+        assert_eq!(bytes.as_ref(), &content[10..16]);
+
+        let bytes = store.get_range(&path, 30..100).await.unwrap();
+        assert_eq!(bytes.as_ref(), &content[30..]);
+    }
+
+    #[tokio::test]
+    async fn get_opts_honors_offset_and_suffix_ranges() {
+        let (store, path, content) = test_store().await;
+
+        let result = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Offset(12)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.range, 12..content.len() as u64);
+        assert_eq!(result.bytes().await.unwrap().as_ref(), &content[12..]);
+
+        let result = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Suffix(5)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.range, content.len() as u64 - 5..content.len() as u64);
+        assert_eq!(
+            result.bytes().await.unwrap().as_ref(),
+            &content[content.len() - 5..]
+        );
+    }
 }

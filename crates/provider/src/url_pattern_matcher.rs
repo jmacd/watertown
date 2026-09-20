@@ -170,8 +170,8 @@ impl UrlPatternMatcher {
         }
 
         if matched_files.is_empty() {
-            return Err(Error::InvalidUrl(format!(
-                "No files match pattern: {} with entry types: {:?}",
+            return Err(Error::NoFilesMatched(format!(
+                "{} with entry types: {:?}",
                 pattern, entry_types
             )));
         }
@@ -197,10 +197,7 @@ impl UrlPatternMatcher {
             .map_err(|e| Error::InvalidUrl(format!("Pattern expansion failed: {}", e)))?;
 
         if matches.is_empty() {
-            return Err(Error::InvalidUrl(format!(
-                "No files match pattern: {}",
-                pattern
-            )));
+            return Err(Error::NoFilesMatched(pattern.to_string()));
         }
 
         // For format providers, we match any file and let the provider handle the content

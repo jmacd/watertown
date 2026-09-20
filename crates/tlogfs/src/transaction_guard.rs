@@ -109,12 +109,11 @@ impl<'a> TransactionGuard<'a> {
     /// This is the clean production API that Steward uses.
     ///
     /// Returns the commit outcome together with the underlying persistence
-    /// reference.  The steward layer needs post-commit access to the
-    /// persistence (to read the just-landed Delta state for the D5.7
-    /// partition-checksum snapshot recorded on `DataCommitted`), and the
-    /// reference is exactly what was owned by this guard.  Handing it back
-    /// after the embedded tinyfs guard has been dropped avoids a separate
-    /// `OpLogPersistence::open` round-trip.
+    /// reference. The steward layer uses it to open a fresh read-only snapshot
+    /// for post-commit discovery and host-side reporting. Handing it back after
+    /// the embedded TinyFS guard has been dropped preserves closure of the
+    /// original transaction and avoids a separate `OpLogPersistence::open`
+    /// round-trip.
     ///
     /// The embedded tinyfs::TransactionGuard will be dropped after commit, clearing the transaction state.
     pub async fn commit(self) -> TinyFSResult<(Option<i64>, &'a mut OpLogPersistence)> {
@@ -146,13 +145,28 @@ impl<'a> TransactionGuard<'a> {
 
         if !is_write {
             // Read transactions don't commit data - just clean up state
+            if let Some(state) = persistence.state.as_ref() {
+                state.coherence_state().close();
+            }
             persistence.state = None;
             persistence.fs = None;
             drop(inner);
             return Ok((None, persistence));
         }
 
+        let coherence = persistence
+            .state
+            .as_ref()
+            .map(State::coherence_state)
+            .ok_or_else(|| tinyfs::Error::Other("Transaction state is missing".to_string()))?;
+        if let Err(error) = coherence.begin_commit() {
+            persistence.state = None;
+            persistence.fs = None;
+            drop(inner);
+            return Err(error);
+        }
         let result = persistence.commit(metadata).await;
+        coherence.close();
 
         // Clear state so any subsequent guard knows we committed
         persistence.state = None;
@@ -176,8 +190,11 @@ impl<'a> TransactionGuard<'a> {
     /// **Should only be used in test code.**
     #[cfg(test)]
     pub async fn commit_test(self) -> TinyFSResult<()> {
+        let coherence = self.state().map_other()?.coherence_state();
+        coherence.begin_commit()?;
         // Use the transaction's actual sequence number from begin_test()
         let result = self.persistence.commit(self.metadata.clone()).await;
+        coherence.close();
 
         result
             .map_other_context("Transaction commit failed")
@@ -193,11 +210,14 @@ impl<'a> TransactionGuard<'a> {
     /// **Should only be used in test code.**
     #[cfg(test)]
     pub async fn commit_test_with_sequence(self, txn_seq: i64) -> TinyFSResult<Option<i64>> {
+        let coherence = self.state().map_other()?.coherence_state();
+        coherence.begin_commit()?;
         let metadata = PondTxnMetadata::new(
             txn_seq,
             PondUserMetadata::new(vec!["test".to_string(), "transaction".to_string()]),
         );
         let result = self.persistence.commit(metadata).await;
+        coherence.close();
 
         result.map_other_context("Transaction commit failed")
     }
@@ -221,6 +241,7 @@ impl<'a> Drop for TransactionGuard<'a> {
     /// The embedded tinyfs::TransactionGuard will handle clearing the TransactionState.
     fn drop(&mut self) {
         if let Some(ref state) = self.persistence.state {
+            state.coherence_state().close();
             let (pending_records, modified_dirs) = state.pending_operation_counts();
             let total_pending = pending_records + modified_dirs;
 

@@ -8,7 +8,7 @@
 //! with simple memory buffering for Arrow/Parquet integration.
 
 use crate::async_helpers::convenience;
-use crate::{error::Result, memory::new_fs};
+use crate::{EntryType, Error, error::Result, memory::new_fs};
 use arrow_array::{Float64Array, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
@@ -99,6 +99,51 @@ async fn test_async_writer_basic() -> Result<()> {
     let content = root.read_file_path_to_vec("/output.txt").await?;
     assert_eq!(content, test_data);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_async_writer_path_with_type_rejects_existing_type_mismatch() -> Result<()> {
+    let fs = new_fs().await;
+    let root = fs.root().await?;
+    let path = "/typed.series";
+
+    {
+        let mut writer = root
+            .async_writer_path_with_type(path, EntryType::FilePhysicalSeries)
+            .await?;
+        writer.write_all(b"first\n").await.unwrap();
+        writer.shutdown().await.unwrap();
+    }
+
+    match root
+        .async_writer_path_with_type(path, EntryType::TablePhysicalSeries)
+        .await
+    {
+        Err(Error::EntryTypeMismatch {
+            path: error_path,
+            requested,
+            existing,
+        }) => {
+            assert_eq!(error_path, std::path::PathBuf::from(path));
+            assert_eq!(requested, EntryType::TablePhysicalSeries);
+            assert_eq!(existing, EntryType::FilePhysicalSeries);
+        }
+        Err(error) => panic!("expected EntryTypeMismatch, got {error}"),
+        Ok(_) => panic!("expected EntryTypeMismatch, got a writer"),
+    }
+
+    assert_eq!(root.read_file_path_to_vec(path).await?, b"first\n");
+
+    {
+        let mut writer = root
+            .async_writer_path_with_type(path, EntryType::FilePhysicalSeries)
+            .await?;
+        writer.write_all(b"second\n").await.unwrap();
+        writer.shutdown().await.unwrap();
+    }
+
+    assert_eq!(root.read_file_path_to_vec(path).await?, b"first\nsecond\n");
     Ok(())
 }
 
