@@ -9,6 +9,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod persistence_contract;
+
 /// Configuration for test directory factory
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]

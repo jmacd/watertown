@@ -18,6 +18,7 @@ mod email;
 mod factory;
 mod layouts;
 pub mod markdown;
+mod monitor;
 pub mod partitions;
 pub mod report;
 mod routes;

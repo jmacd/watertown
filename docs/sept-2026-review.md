@@ -15,7 +15,104 @@ APIs imply semantics that the hostmount or memory backends do not provide.
 Some of these inconsistencies create credible data-loss or data-corruption
 paths.
 
+## Status on 2026-09-19
+
+Findings 2-6 have been addressed with regression coverage. The subsequent
+transaction-coherence work also made physical-series providers
+generation-aware, rejected stale and post-transaction reads, rejected commit
+with unfinished writers or active transaction reads, corrected latest-version
+selection and cross-pond version lookup, and aligned memory-provider behavior.
+That work is documented in `live-monitoring-projection-design.md`, but it is
+general TinyFS/TLogFS hardening; live monitoring itself is paused.
+
+Three review outcomes remain:
+
+1. **Fix hostmount rename.** Finding 1 is still an open high-severity bug:
+   `WD::rename_entry` composes `Directory::remove` and `insert`, while
+   `HostDirectory::remove` physically deletes content.
+2. **Expand the backend conformance suite.** The first shared TinyFS and
+   DataFusion contracts now run against memory and TLogFS. Extend them to
+   directory rename/unlink behavior, dynamic-node typing, error injection, and
+   hostmount after its rename semantics are fixed.
+3. **Split capabilities only after the tests expose the boundary.**
+   `PersistenceLayer` remains broad and now also has optional coherence state.
+   Capability decomposition is still desirable, but should be driven by the
+   conformance matrix rather than started as an unconstrained refactor.
+
+The next implementation item is therefore the hostmount-safe rename primitive
+and enrolling hostmount in the applicable contract tests. Live monitoring is
+not a prerequisite.
+
+### Cross-persistence validation baseline
+
+The first backend-independent harnesses now exercise the contracts needed by
+transactional read-after-write:
+
+- `tinyfs::testing::persistence_contract` drives TinyFS operations through an
+  active filesystem and provider context. It verifies independent-handle
+  visibility, transaction-global writer exclusion, immediate reads after
+  writer shutdown, append ordering, exact-version reads, seeks, range
+  validation, provider-cache generation invalidation, and stale-provider
+  rejection.
+- `provider::testing::assert_series_read_after_write` writes real Parquet
+  `TablePhysicalSeries` versions and queries them through DataFusion. Version 1
+  is queryable before commit; appending version 2 makes the old provider fail
+  as stale; rebuilding through the same `ProviderContext` returns all rows.
+- Memory instantiates both active-snapshot contracts in
+  `crates/tinyfs/src/tests/memory.rs` and
+  `crates/provider/tests/memory_persistence_tests.rs`.
+- TLogFS instantiates both contracts inside a real write transaction in
+  `crates/tlogfs/src/tests/persistence_contract.rs`, then verifies durable
+  visibility after commit, rollback after guard drop, and rejection of both
+  persistence reads and registered DataFusion providers after transaction
+  closure.
+
+| Contract | Memory | TLogFS | Hostmount |
+|---|---|---|---|
+| completed write is immediately readable | covered | covered in transaction | not enrolled |
+| independent handles share writer exclusion and visibility | covered | covered in transaction | not enrolled |
+| append versions are ordered and individually readable | covered | covered before and after commit | unsupported |
+| seek and range semantics are consistent | covered | covered before commit | unsupported |
+| provider cache follows mutation generation | covered | covered | unsupported |
+| DataFusion reads a staged series version | covered | covered before commit | unsupported |
+| old DataFusion provider fails after append | covered | covered | unsupported |
+| rebuilt provider sees committed plus staged versions | covered | covered | unsupported |
+| commit persists and closes old contexts/providers | not a memory capability | covered | unsupported |
+| abort discards writes and closes old contexts/providers | not a memory capability | covered | unsupported |
+
+The distinction in the last two rows is intentional. `MemoryPersistence`
+applies writes immediately and its coherence state spans the persistence
+instance; it does not stage a durable transaction or implement commit/abort.
+It is therefore a useful reference backend for active-snapshot semantics, but
+must not be used as evidence for rollback, durability, or post-transaction
+lifecycle behavior.
+
+The first TLogFS run exposed and fixed a coherence defect:
+`InnerState::load_node` reconstructed pending directories but ignored
+`pending_files`. A second TinyFS handle could see a newly inserted directory
+entry while failing to load its still-open file, so it never reached the
+transaction-global writer guard. Pending files are now reconstructed from
+transaction state before consulting committed Delta records.
+
+The next test increments should be:
+
+1. add the atomic rename primitive and enroll memory, TLogFS, and hostmount in
+   shared rename, replacement, and unlink tests;
+2. add deterministic barrier-controlled tests for a provider scan overlapping
+   mutation and commit, rather than testing active-query rejection only with a
+   manually acquired guard;
+3. add backend-neutral fault injection for writer finalization, metadata,
+   version listing, and ranged reads, proving failures remain visible and do
+   not publish partial state;
+4. cover dynamic file/directory reconstruction and exact logical attributes
+   through the same backend matrix; and
+5. decide whether memory should gain explicit transaction snapshots or should
+   formally advertise only the active-snapshot capability.
+
 ## Findings
+
+Each finding retains the original failure description for rationale. Its
+`Status` paragraph is authoritative for the current implementation.
 
 ### 1. High: hostmount rename destroys file and directory contents
 
@@ -24,6 +121,10 @@ Locations:
 - `crates/tinyfs/src/dir.rs:84-85`
 - `crates/tinyfs/src/wd.rs:591-608`
 - `crates/tinyfs/src/hostmount/directory.rs:226-247`
+
+Status: open. Rechecked on 2026-09-19: `WD::rename_entry` still calls
+`remove` followed by `insert`, and `HostDirectory::remove` still uses
+`remove_file` or `remove_dir_all`.
 
 `Directory::remove` is documented and used as an unlink operation that returns
 the removed node without deleting it. `WD::rename_entry` consequently implements
@@ -168,6 +269,11 @@ and writer shutdown propagates persistence and integrity-input failures while
 releasing write state. Regression tests cover pending metadata, failure
 propagation and retry, dynamic node types, and timestamp units.
 
+Follow-up in progress: the shared harness now covers memory and TLogFS
+read/write, version/range, and provider-coherence semantics. Hostmount cannot
+join the directory mutation portion until Finding 1 is fixed, and dynamic-node
+and fault-injection coverage remain to be added.
+
 The memory implementation diverges from expected persistence semantics in
 several ways:
 
@@ -241,18 +347,24 @@ replacing it.
 
 ## Recommended remediation order
 
-1. Add regression coverage for rename and replace remove-plus-insert with a
-   backend atomic rename operation.
-2. Make traversal loop state invocation-local or RAII-safe.
-3. Enforce entry-type equality when opening typed writers.
-4. Introduce streaming and ranged version reads, then migrate the object-store
-   adapter.
-5. Correct `ChainedReader` seeking or narrow the `AsyncReadSeek` contract.
-6. Establish a shared backend conformance suite and repair the memory and
-   hostmount discrepancies it exposes.
-7. Split `PersistenceLayer` into core persistence plus explicit capability
-   traits without changing downstream behavior all at once.
+Completed:
 
-The first three changes address immediate correctness risks and can be made
-without a broad redesign. Streaming reads and capability decomposition should
-follow as staged migrations so existing consumers remain stable.
+- traversal loop state is invocation-local and RAII-safe;
+- typed writers reject incompatible existing nodes;
+- streaming and ranged version reads back the object-store adapter;
+- `ChainedReader` implements real seeking; and
+- the identified memory-persistence defects are repaired.
+
+Remaining order:
+
+1. Add cross-backend regression coverage for rename and replace
+   remove-plus-insert with a backend rename primitive. Hostmount must use
+   `std::fs::rename`; transactional backends must update one directory mapping
+   atomically.
+2. Grow the initial conformance suite to cover only semantics that each
+   participating backend explicitly claims to support.
+3. Use failures and explicit unsupported cases from that suite to define
+   capability traits, then migrate callers incrementally.
+
+This keeps the next step narrow and correctness-driven. It does not require
+live monitoring or a speculative `PersistenceLayer` rewrite.

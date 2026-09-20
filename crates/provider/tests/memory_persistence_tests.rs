@@ -7,11 +7,9 @@
 //! These tests verify that MemoryPersistence properly supports:
 //! - File operations (read/write via FS API)
 //! - Versioned Parquet storage via store_file_version/list_file_versions
-//! - QueryableFile interface (MemoryFile currently returns error)
-//!
-//! **Action Items:**
-//! 1. Implement MemoryFile::as_table_provider() to support Parquet data
-//! 2. Add ProviderContext::new_for_testing() helper
+//! - QueryableFile and in-transaction provider coherence
+
+use std::sync::Arc;
 
 use tinyfs::{FileID, PersistenceLayer};
 
@@ -139,4 +137,21 @@ async fn test_parquet_data_generation() {
         .expect("Generate parquet 4");
     assert!(!parquet4.is_empty());
     assert_eq!(&parquet4[0..4], b"PAR1");
+}
+
+#[tokio::test]
+async fn memory_matches_datafusion_persistence_contract() {
+    let persistence = tinyfs::MemoryPersistence::default();
+    let session = Arc::new(datafusion::execution::context::SessionContext::new());
+    _ = provider::register_tinyfs_object_store(&session, persistence.clone())
+        .expect("register TinyFS object store");
+    let context = tinyfs::ProviderContext::new(
+        session,
+        Arc::new(persistence.clone()) as Arc<dyn PersistenceLayer>,
+    );
+    let fs = tinyfs::FS::new(persistence)
+        .await
+        .expect("memory filesystem");
+    let root = fs.root().await.expect("root");
+    provider::testing::assert_series_read_after_write(&root, &context).await;
 }

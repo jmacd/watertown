@@ -181,7 +181,7 @@ mod tests {
             Err(Error::invalid_range(10, 11, 10))
         );
         assert_eq!(
-            validate_file_version_range(8..7, 10),
+            validate_file_version_range(std::ops::Range { start: 8, end: 7 }, 10,),
             Err(Error::invalid_range(8, 7, 10))
         );
     }

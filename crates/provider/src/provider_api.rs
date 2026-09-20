@@ -404,10 +404,7 @@ impl Provider {
             })?;
 
             if matches.is_empty() {
-                return Err(Error::InvalidUrl(format!(
-                    "No files match pattern: {}",
-                    url_str
-                )));
+                return Err(Error::NoFilesMatched(url_str.to_string()));
             }
 
             let ctx = SessionContext::new();
@@ -760,10 +757,7 @@ impl Provider {
             })?;
 
             if matches.is_empty() {
-                return Err(Error::InvalidUrl(format!(
-                    "No files match pattern: {}",
-                    url_str
-                )));
+                return Err(Error::NoFilesMatched(url_str.to_string()));
             }
 
             if matches.len() == 1 {

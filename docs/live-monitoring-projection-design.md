@@ -1,716 +1,378 @@
-# Transactional Live Monitoring
+# Post-commit live monitoring
 
-> **Status:** Revised design with an implemented and tested transactional
-> read-after-write path. Physical-series providers are coherent snapshots:
-> mutations invalidate older providers, and closed transaction state cannot be
-> reused.
+> **Status:** The first static-monitoring slice is implemented. It evaluates
+> committed pond data after a write, publishes a local HTML and JSON status,
+> then runs remote backup. Alert delivery and durable monitor-event series are
+> deferred.
 
-## 1. Purpose
+## 1. Decisions
 
-Monitoring should be a small extension of the existing pond write path, not a
-second data system. Watertown already has the necessary storage and query
-abstractions:
+The first implementation uses these explicit choices:
 
-- TinyFS physical series for durable Parquet data;
-- one transaction `State` shared by filesystem and provider operations;
-- DataFusion table providers over physical-series versions; and
-- normal pond commits for atomic publication.
+- A committed read-only snapshot is opened after the primary write commits.
+  The original write transaction, filesystem, providers, and plans remain
+  closed.
+- The snapshot is opened from the `OpLogPersistence` returned by commit. Its
+  Delta table already contains the new snapshot, so post-commit discovery does
+  not reopen or rescan the pond.
+- Read-only and read-write post-commit factories are distinct capabilities.
+  Read-only factories share the committed snapshot; existing mutating
+  factories continue to receive separate write transactions.
+- `/system/run/*` remains lexically ordered. The water monitor is
+  `/system/run/00-monitor`, so it runs before other factories. Remote backup
+  runs after the complete factory queue.
+- Generated monitoring artifacts belong to the host publication directory,
+  not the pond namespace. They do not require a second pond commit and are not
+  included in pond backup.
+- A monitoring failure does not prevent backup. Factory execution continues,
+  all configured remotes are attempted, and the command then returns a visible
+  error containing every post-commit failure.
+- The initial low-well rule uses the raw `well_depth_value` field. It alarms
+  when at least one value exists in the trailing three hours and every
+  observed value is strictly below 40 m. Gaps and sample age do not suppress
+  this first rule. No samples produce `unknown`, not an alarm.
+- The chlorine-feed rule uses raw `chlorine_level_value` observations and the
+  canonical one-minute pump-state series. It accumulates only positive gauge
+  deltas while the preceding aligned pump state is `pumping`; refill drops are
+  ignored.
 
-The monitor should use those abstractions directly. It does not need a copied
-`MemoryPersistence` filesystem, a projection-specific namespace, SQLite, or a
-second commit for monitor results.
+These choices implement the requested small local status page without
+weakening transaction coherence or prematurely introducing a long-running
+service, notification transport, or second monitoring database.
 
-The central workflow is:
+## 2. Transaction coherence boundary
 
-```text
-begin pond write transaction
-    -> write observations
-    -> build bounded providers over the staged physical series
-    -> evaluate monitor SQL with DataFusion
-    -> append evaluation, transition, and notification-intent rows
-    -> commit observations and monitor state once
-    -> publish the committed status to the in-process service cache
-    -> deliver notifications asynchronously
-```
+TLogFS write commit closes the transaction's shared `CoherenceState` and
+clears the transaction `State` and filesystem. Existing TinyFS handles,
+cached providers, registered DataFusion tables, and plans from that state must
+continue to fail as closed. Post-commit monitoring does not add an exception.
 
-The website remains independent and may continue rebuilding every three
-hours. Azure pond backup is also independent. Neither is on the alert-latency
-path.
+`tlogfs::TransactionGuard::commit` returns the underlying
+`&mut OpLogPersistence` after installing the finalized Delta snapshot in its
+table handle. Steward immediately calls `begin_read` on that persistence with
+the committed sequence. This creates a new:
 
-## 2. Transaction coherence contract
+- TLogFS `State`;
+- TinyFS filesystem;
+- `ProviderContext`;
+- DataFusion session and object-store registration; and
+- open coherence generation.
 
-TLogFS reads combine committed Delta records with the transaction's pending
-records. The same transaction `State` backs TinyFS reads and its
-`ProviderContext`.
+The read snapshot is therefore fresh and usable while the original write
+snapshot remains permanently closed. Closing post-commit execution commits
+the read guard as a read no-op, which closes this second context too.
 
-The transaction exposes one shared coherence state:
+The cross-persistence contracts remain the underlying correctness baseline:
 
-- every completed visibility-changing mutation advances a generation;
-- a physical-series provider is an immutable snapshot of one generation;
-- requesting the same provider from the same `ProviderContext` after a
-  mutation builds a new snapshot instead of returning the cached old one;
-- scanning or executing a provider after its generation becomes stale returns
-  an explicit error;
-- physical providers enumerate their exact live version URLs, so DataFusion's
-  list-files cache cannot preserve an earlier wildcard listing;
-- each executing provider partition holds a query guard while it can still
-  read transaction state;
-- each open file writer holds a transaction-global writer guard keyed by
-  `FileID`, including writers opened through distinct TinyFS handles;
-- commit is rejected while a writer or transaction read is active; and
-- commit, abort, and guard drop close the shared state, so later TinyFS and
-  provider operations fail rather than return a stale subset.
+- `tinyfs::testing::persistence_contract` verifies independent handles,
+  transaction-global writer exclusion, version and range reads, cache
+  invalidation, and stale-provider rejection for memory and TLogFS.
+- `provider::testing::assert_series_read_after_write` verifies real DataFusion
+  read-after-write and provider rebuilding for both backends.
+- `crates/tlogfs/src/tests/persistence_contract.rs` verifies commit, abort,
+  fresh-snapshot durability, and closure of old providers.
+- `crates/steward/tests/test_post_commit_factory.rs` verifies that a read-only
+  post-commit factory sees a file from the just-completed commit and does not
+  allocate another write sequence.
+- `crates/cmd/tests/monitor_post_commit.rs` commits measurement, condition, and
+  monitor-factory nodes through a real TLogFS `Ship`, then verifies post-commit
+  `rate-while` JSON/HTML output and confirms that monitoring allocates no
+  second write sequence.
 
-This is snapshot invalidation, not mutable providers. A completed query result
-remains usable, but a provider or plan from generation N cannot be used after
-generation N+1. Callers request a provider again after any intervening write.
+## 3. Post-commit dispatch
 
-The Steward integration tests in
-`crates/steward/tests/read_after_write_test.rs` verify:
-
-1. a physical series written in a transaction is immediately readable through
-   raw TinyFS;
-2. a provider created after that write exposes the pending Parquet version to
-   DataFusion;
-3. monitor state can be written after the query and read through both TinyFS
-   and DataFusion before commit;
-4. observations and monitor state survive one combined commit; and
-5. committed series history and a newly staged version are both visible after
-   an earlier provider primed the same context;
-6. the earlier registered provider fails as stale rather than returning its
-   old subset;
-7. multiple staged versions are queried together;
-8. schema evolution across staged versions produces a merged query schema;
-9. `LatestVersion` selects only the highest live version;
-10. a provider context retained across commit or abort fails as closed; and
-11. commit rejects unfinished writers and active transaction reads.
-
-The implementation also scopes version lookup by `pond_id`, `part_id`,
-`node_id`, and version, and uses version number rather than wall-clock time for
-latest-version ordering.
-
-The contract currently applies to local physical TinyFS series, which are the
-only initial monitor inputs. Dynamic factories and external sources remain
-outside the monitor transaction contract.
-
-## 3. Architecture
+The successful write path is:
 
 ```text
-Watershop producer process
-  Steward write transaction
-    -> physical observation series
-    -> bounded TinyFS providers
-    -> DataFusion monitor SQL
-    -> physical monitoring event series
-    -> one atomic pond commit
-          |\
-          | \-> independent Azure pond backup
-          |
-          \-> committed-status notification
-                -> local monitoring service
-                -> in-memory current-status cache
-                -> HTTPS status endpoint
-                -> asynchronous SMS delivery
+primary write transaction
+  -> finish pending writers and queries
+  -> commit Delta data
+  -> close original coherence state
+  -> record DataCommitted
+  -> open fresh read snapshot from returned OpLogPersistence
+  -> discover and sort /system/run/*
+  -> execute factories in lexical order
+       read-only factory  -> shared committed read snapshot + host side effects
+       read-write factory -> independent post-commit pond write transaction
+  -> close shared read snapshot
+  -> attempt every push-mode remote backup
+  -> return success, or one combined visible post-commit error
 ```
 
-The producer computes authoritative monitor state because only it owns the
-open write transaction. A long-running local monitoring service receives a
-small notification after commit. A Unix-domain socket or authenticated
-localhost endpoint is sufficient on Watershop; a public write webhook is not
-required.
+The shared read snapshot represents the primary parent commit. A read-only
+factory does not observe pond writes made by an earlier read-write
+post-commit factory in the same queue. This is deliberate: observers report
+the committed source transaction, not a moving sequence of secondary commits.
+The initial monitor sorts first, so this distinction is unambiguous for water.
 
-The notification is a wake-up hint carrying the pond identity, committed
-frontier, and optionally the already computed compact status. The service
-accepts only committed state. If it misses a hint or restarts, it reconstructs
-current status from the durable monitoring series.
+Factory registration declares automatic access:
 
-The HTTPS service serves the latest committed status from memory. Memory is a
-serving cache, not a database and not part of commit correctness.
-
-## 4. Initial monitor input restriction
-
-Initial monitors query local physical pond series only.
-
-They do not resolve dynamic factory nodes, run ingestion or storage factories,
-materialize factory output, access external sources, read cross-pond imports
-written in the same transaction, or query the internal committed-only
-`delta_table`. Temporal reduction and similar operations belong in monitor SQL
-over the bounded raw inputs:
-
-```sql
-SELECT
-  station_id AS condition_key,
-  MAX(level) AS observed_value
-FROM water_levels
-WHERE timestamp >= $window_start
-GROUP BY station_id
-HAVING MAX(level) > 8.0
+```rust
+register_executable_factory!(
+    name: "monitor-report",
+    description: "...",
+    post_commit: read_only,
+    validate: validate_config,
+    initialize: initialize,
+    execute: execute
+);
 ```
 
-This deliberately removes factory lifecycle and external-I/O failure domains
-from the transaction that persists observations. DataFusion can perform the
-small aggregation over the recent physical data directly.
+Existing executable factories default to `ReadWrite`. Steward invokes
+read-only factories with `ExecutionMode::ControlReader`; manual `pond run`
+continues to use `PondReadWriter`.
 
-Factory-backed monitor inputs can be reconsidered only after the raw-series
-path is operational. A future factory must be read-only, side-effect-free, and
-resolve entirely through the current transaction context.
+## 4. Monitor configuration
 
-## 5. Monitor definition
-
-A monitor explicitly declares its physical input tables and query policy:
+Each pond carries its own `/system/run` configuration. The first water
+configuration is:
 
 ```yaml
-id: high-water
-
-tables:
-  water_levels:
-    path: /observations/water-levels.series
-
-query: |
-  SELECT
-    station_id AS condition_key,
-    MAX(level) AS observed_value
-  FROM water_levels
-  WHERE timestamp >= $window_start
-  GROUP BY station_id
-  HAVING MAX(level) > 8.0
-
-window: 48h
-lateness: 6h
-for: 30m
-resolve_after: 30m
-
-freshness:
-  warn_after: 30m
-  fail_after: 2h
-  on_stale: retain
+version: v1
+kind: mknod
+metadata:
+  path: /system/run/00-monitor
+spec:
+  factory: monitor-report
+  config:
+    pond: "${env:POND_INSTANCE}"
+    title: "Caspar Water status"
+    output_dir: "${env:MONITOR_OUTPUT_DIR}"
+    checks:
+      - id: well-depth-low
+        label: "Well depth below 40"
+        source: "oteljson:///ingest/casparwater*.json"
+        timestamp_column: timestamp
+        value_column: well_depth_value
+        unit: m
+        threshold: 40
+        window: 3h
+      - id: chlorine-feed-response
+        label: "Chlorine feed responds while well pump runs"
+        type: rate-while
+        measurement:
+          source: "oteljson:///ingest/casparwater*.json"
+          timestamp: timestamp
+          column: chlorine_level_value
+          accumulation: positive-deltas
+        condition:
+          source: "series:///pump-state/well-pump-state"
+          timestamp: timestamp
+          predicate:
+            column: phase
+            operator: eq
+            value: pumping
+        alignment:
+          method: previous
+          tolerance: 2m
+        window: 24h
+        minimum_active_time: 30m
+        alarm:
+          operator: lt
+          value: 2.5
+          unit: sensor-units-per-pump-hour
 ```
 
-The initial implementation keeps table declarations explicit rather than
-inferring paths from SQL. Validation rejects:
+The raw field is `well_depth_value`, not `well_depth_level`. It is measured in
+meters. The source is the read-only OTel JSON projection over physical files
+already ingested under `/ingest`; monitor execution performs no ingestion or
+other external I/O.
 
-- undeclared tables;
-- paths that are not physical queryable series;
-- non-`SELECT` SQL;
-- missing or null condition keys; and
-- unsupported external or dynamic inputs.
+Configuration validation rejects:
 
-Definitions are loaded and validated before producer work begins where
-possible. Runtime planning and execution errors still become explicit
-evaluation-error records rather than empty successful results.
+- missing pond, title, output directory, or checks;
+- duplicate or path-unsafe check IDs;
+- empty source or column names;
+- non-finite thresholds; and
+- invalid or zero windows, evidence durations, or alignment tolerances.
 
-## 6. Bounded query execution
+Environment references are stored verbatim in pond history and expanded at
+execution. Expansion errors are returned; post-commit execution no longer
+falls back to unexpanded configuration bytes.
 
-There is no separate in-memory retention policy because no source data is
-copied into another filesystem. Pond retention remains the producer's durable
-data policy.
+## 5. Initial water rule
 
-For each evaluation:
+For each check, the factory:
 
-1. finish all source writers;
-2. use the transaction's `ProviderContext`;
-3. derive `window_start` from a controlled evaluation timestamp;
-4. request each physical series after the writes through a bounded provider
-   with an event-time lower bound of `window_start - lateness`;
-5. let `SeriesReadBounds` prune whole Parquet versions that cannot contribute;
-6. apply the exact row-level timestamp predicate in SQL; and
-7. execute and fully collect the result with a deadline, memory-pool limit,
-   and result-row limit.
+1. fixes `period_end` to the monitor execution time;
+2. calculates `period_start = period_end - window`;
+3. asks the provider for an event-time-bounded source beginning at
+   `period_start`;
+4. applies exact row predicates for
+   `[period_start, period_end)` and non-null values in DataFusion;
+5. converts timestamps to UTC microseconds and values to `Float64`;
+6. rejects non-finite values explicitly; and
+7. classifies the collected observations.
 
-Versions without temporal metadata are retained conservatively. Version
-pruning is an optimization; the SQL predicate is the correctness boundary.
-All physical provider modes, including unbounded and latest-version reads,
-enumerate explicit current version URLs. Bounds reduce that exact set further.
-
-The configured window bounds the scanned input and query memory, not the
-durable pond history. Rows age out logically even when no new commit occurs,
-and late observations can still affect the window while within the declared
-lateness allowance.
-
-`WD::read_table_as_batch` is not the logical-series read path. For a
-`TablePhysicalSeries` it reads the latest single Parquet version, whereas the
-DataFusion provider unions the live versions. Monitoring must therefore use
-the provider path for historical windows; raw TinyFS reads are useful only for
-version-specific checks.
-
-## 7. Durable monitoring data
-
-Monitoring state is append-only Parquet in TinyFS:
+Classification is:
 
 ```text
-/monitoring/evaluations.series
-/monitoring/conditions.series
-/monitoring/notifications.series
+no observations                         -> unknown
+all observations have value < threshold -> alarm
+one or more values >= threshold          -> healthy
 ```
 
-An implementation may partition these paths by producer or monitor if
-measurements justify it. It should batch all rows of one kind for one source
-update into one record batch rather than produce a file per condition.
+Equality at 40 m is healthy because the configured condition is strictly
+"below 40". Null values are not observations. Observation gaps do not affect
+the first rule, as explicitly selected; the page still displays sample count,
+first and last observation times, latest value, minimum, and maximum so an
+operator can see sparse coverage.
 
-### Evaluations
+## 6. Rate-while rules
 
-Each evaluation row records at least:
+`rate-while` is a typed monitor, not user-supplied SQL. Its current vocabulary
+is deliberately bounded:
 
-- pond and source transaction identity;
-- monitor ID and definition version;
-- evaluation timestamp;
-- input frontier and latest input event time;
-- outcome: success, stale, planning error, execution error, or limit error;
-- duration and rows examined/returned where available; and
-- error category and bounded diagnostic text.
+- `accumulation: positive-deltas`;
+- condition predicate `operator: eq`;
+- alignment `method: previous`; and
+- alarm `operator: lt`.
 
-### Conditions
-
-Condition rows are transition events, not mutable records:
-
-- pending;
-- firing;
-- resolved;
-- retained because input is stale or evaluation failed; and
-- optionally acknowledged or silenced.
-
-Each transition has a stable monitor/condition key, sequence, source
-transaction, observed value, and transition timestamp. Current state is
-reconstructed with a DataFusion window query such as:
+The measurement query uses the reusable DataFusion window function:
 
 ```sql
-SELECT *
-FROM (
-  SELECT
-    *,
-    ROW_NUMBER() OVER (
-      PARTITION BY monitor_id, condition_key
-      ORDER BY transition_seq DESC
-    ) AS rank
-  FROM conditions
-)
-WHERE rank = 1
+counter_delta(CAST(chlorine_level_value AS DOUBLE))
+  OVER (ORDER BY timestamp)
 ```
 
-### Notification intents
+`counter_delta` returns null for the first row or a null predecessor, the
+increase for a positive delta, and zero for an unchanged or decreasing value.
+It rejects non-finite inputs. Watertown registers the function in every
+DataFusion session that receives the TinyFS object store, so monitor SQL and
+other pond queries share the same semantics.
 
-The observation transaction appends notification intent for newly firing or
-resolved conditions. Delivery workers append attempted, delivered, or failed
-events in later independent transactions. This provides at-least-once
-delivery without making network I/O part of the observation commit.
-
-Those later delivery acknowledgements are not a second monitor-evaluation
-commit. The authoritative observation, evaluation, transition, and initial
-notification intent are already atomic.
-
-## 8. Transaction protocol
-
-For one producer update:
-
-1. Begin one Steward write transaction.
-2. Write all observation batches and finish their writers.
-3. Obtain or reuse the transaction's `ProviderContext`.
-4. Capture one evaluation timestamp.
-5. Load enabled monitor definitions applicable to the written sources.
-6. Request bounded explicit-version providers for those physical
-   source series.
-7. Query prior committed condition transitions needed for `for`,
-   `resolve_after`, deduplication, and stale-data behavior.
-8. Run and fully collect each monitor query.
-9. Deregister its temporary DataFusion tables.
-10. Convert results into evaluation, condition-transition, and notification
-   rows.
-11. Append those rows to the monitoring physical series and shut down every
-    output writer.
-12. Commit once. The transaction rejects the commit if a writer or underlying
-    transaction read is still active.
-13. Discard the transaction's filesystem, contexts, providers, and plans.
-14. Only after commit succeeds, replace the service's in-memory status or send
-    the local committed-status notification.
-15. Schedule Azure backup, status publication, and notification delivery
-    independently.
-
-No network operation occurs while the pond transaction is open.
-
-## 9. Error and commit policy
-
-Monitor configuration or query failure should not discard valid source
-observations. The evaluator records an evaluation error, retains prior active
-conditions, and commits the observation update.
-
-Failures that prevent the combined durable state from being written are
-different:
-
-| Failure | Behavior |
-|---|---|
-| Monitor SQL planning/execution fails | Append evaluation error, retain prior conditions, commit observations |
-| Monitor exceeds time, memory, or result limit | Append limit error, retain prior conditions, commit observations |
-| Input is stale | Record stale evaluation and retain active conditions |
-| Required physical input is missing | Record invalid-input error; never substitute an empty table |
-| Monitoring event batch cannot be encoded | Fail the combined transaction |
-| A source or monitor-output writer has not shut down | Reject commit before planning or persistence |
-| A query stream is still executing at commit | Reject commit; never drain pending records under an active read |
-| Pond commit fails | Publish no new authoritative status; retain the previously committed service state |
-| A transaction context is used after commit or abort | Reject it as closed rather than returning cached rows |
-| Local service notification fails | Commit remains authoritative; service catches up from the pond |
-| SMS delivery fails | Retain notification intent and retry asynchronously |
-| Azure backup fails | Retain local commit and retry backup independently |
-| Site generation fails | No effect on monitoring |
-
-A value observed before a failed pond commit is not authoritative. A future
-safety-critical ingest path may emit a separate provisional incident, but it
-must be labeled provisional and must not resolve or replace committed monitor
-state.
-
-## 10. Freshness
-
-Every evaluation distinguishes:
-
-- **commit freshness:** age of the latest successful producer transaction;
-- **input freshness:** age of the latest event in each selected source; and
-- **evaluation freshness:** age and outcome of the latest monitor run.
-
-The initial stale-data policy is:
-
-1. never resolve an active condition solely because input is stale or a query
-   failed;
-2. append a separate freshness/evaluation incident; and
-3. resume ordinary transitions after a successful fresh evaluation.
-
-The HTTPS response exposes all three freshness values so a green condition
-state cannot hide a stopped producer or evaluator.
-
-## 11. Live service and process failure
-
-The service keeps a compact immutable current-status object in memory and
-atomically replaces it only for a newer committed frontier. Readers never
-observe a partial update.
-
-On startup it queries the monitoring Parquet series to reconstruct:
-
-- latest condition per key;
-- latest evaluation per monitor;
-- pending notification intents; and
-- source/evaluation freshness.
-
-If the producer, service, or Watershop host is unavailable, the last locally
-committed state remains correct but may not be externally reachable. A compact
-Azure status publication and cloud stale timer can expose that host-level
-failure without moving the full monitor engine into Azure.
-
-The public HTTPS endpoint is read-only and must not expose pond mutation APIs,
-filesystem paths, raw query execution, or producer webhooks.
-
-## 12. Deployment and cost decision
-
-### 12.1 Current repository topology
-
-The production data path already has the pieces needed for a low-cost
-deployment:
-
-- water, septic, and noyo run on Watershop and publish to the existing
-  `casparwaterprod` West US 2 Hot/LRS storage account;
-- steady source volume is approximately 15-17 MB/day, or 0.45-0.51 GB/month;
-- `site-prod` already has a three-hour schedule and can remain on Watershop;
-- Azure Communication Services already exists for email, although an
-  SMS-capable number is not yet provisioned; and
-- the Linode host serves the generated site and proxies
-  `influx.casparwater.us`.
-
-Replacing the website host does not by itself replace InfluxDB. That endpoint
-must be retired or relocated before the Linode can be deleted.
-
-### 12.2 Preferred deployment
-
-The current preferred deployment is:
-
-1. Keep the producer ponds, transaction evaluator, monitoring service, and
-   `site-prod` on Watershop.
-2. Evaluate monitors directly inside each local observation transaction.
-3. Push pond backups to the existing private Azure containers independently.
-4. Publish the completed static site to Azure Static Web Apps Free every three
-   hours.
-5. Publish only a compact current-status artifact on monitor transitions and
-   successful evaluations.
-6. Use a small scale-to-zero Azure Function to detect a stale Watershop
-   publisher on a timer, deduplicate transitions, and send ACS SMS if this is
-   simpler than direct delivery from Watershop.
-
-The browser loads a stable static HTML/JavaScript shell and fetches current
-status. A 15-minute monitoring interval does not imply 2,880 complete site
-deployments per month.
-
-Running Watertown in Functions is not planned. If all computation must later
-leave Watershop, a scheduled Container Apps Job is the compatible alternative:
-it can run the existing Rust/DataFusion process to completion and scale to
-zero. That migration should be justified by operational requirements, not
-assumed to be cheaper.
-
-### 12.3 Cost snapshot and uncertainty
-
-The following planning estimates were collected on 2026-09-17 for West US 2
-pay-as-you-go pricing:
-
-| Replacement | Approximate incremental monthly cost |
-|---|---:|
-| Static Web Apps Free and Flex Functions | $0 at the expected workload, before storage and SMS |
-| ACS toll-free number and 20 one-segment US messages | $2.20 |
-| Static Web Apps Standard | $9 |
-| Linux App Service Basic B1 | $12.41 |
-| B1s VM, 32-GiB Standard SSD, and Standard IPv4 | $13.64 |
-| Blob static website behind Front Door Standard | more than $35 |
-
-Static Web Apps Free is the least expensive custom-domain HTTPS frontend.
-Direct Blob static hosting does not provide HTTPS for a custom hostname
-without another edge service. The Free plan has no SLA; Standard should be
-chosen only if that changes from a personal operational site to an
-availability commitment.
-
-Pricing references:
-
-- [Azure Static Web Apps plans](https://learn.microsoft.com/azure/static-web-apps/plans)
-- [Azure Functions pricing](https://azure.microsoft.com/pricing/details/functions/)
-- [Azure Blob Storage pricing](https://azure.microsoft.com/pricing/details/storage/blobs/)
-- [Azure Communication Services SMS pricing](https://learn.microsoft.com/azure/communication-services/concepts/sms-pricing)
-- [Azure Front Door pricing](https://azure.microsoft.com/pricing/details/frontdoor/)
-
-Compute and storage capacity are not the important unknowns. The existing
-11.4-GB seed costs about $0.21/month in Hot LRS, and each new 0.5-GB month adds
-less than one cent to subsequent monthly capacity cost. Functions and Event
-Grid remain inside their free grants at this scale.
-
-Azure storage transactions are the uncertainty. The repository records about
-1,100-1,600 physical provider requests for an ordinary mature push and a
-worst-case rate near 38,000 requests/day at the current hourly cadence. If the
-same fixed work occurs four times as often:
-
-| Producer cadence | Approximate requests/month | Cost bound from current Azure operation prices |
-|---|---:|---:|
-| Hourly worst case | 1.14 million | $0.46-$5.70 |
-| Every 15 minutes | 4.56 million | $1.82-$22.80 |
-
-The range is wide because Azure prices read/other operations at approximately
-$0.004 per 10,000 and write/list operations at approximately $0.05 per 10,000.
-One aggregate `ops` counter cannot select the correct price.
-
-### 12.4 Observation period
-
-Deployment selection and any move from hourly to 15-minute full pond pushes
-are paused for at least 90 days of representative measurements. Selfmon
-materializes one event per completed Azure storage-meter scope at:
+For every consecutive measurement interval, the monitor finds the latest
+condition sample at or before the interval start. The interval is usable only
+when both the condition age and measurement interval length are within the
+configured tolerance. This attributes the delta ending at `t` to the state
+during the preceding interval rather than the state observed at `t`.
+Qualifying elapsed seconds and positive deltas are summed separately:
 
 ```text
-/metrics/azure-access.series
+rate = 3600 * accumulated_positive_change / active_seconds
+
+active_seconds < minimum_active_time -> unknown
+rate < alarm.value                   -> alarm
+otherwise                            -> healthy
 ```
 
-Each row retains:
+Actual elapsed time is used; row counts are never treated as minutes. The
+status evidence includes active time, required active time, accumulated
+change, rate, and aligned/unaligned interval counts.
 
-- timestamp, pond, and non-sensitive remote label;
-- inherited ungoverned operation and byte arrears;
-- total operations and bytes;
-- GET, HEAD, LIST, PUT, multipart, delete, and copy operations and bytes; and
-- operation counts by storage path class, including Delta metadata, content
-  objects, receipts, publications, packs, blobs, recovery, and fallback.
+The water threshold was calibrated from 90 days of raw half-minute chlorine
+observations and canonical one-minute pump state. Across 2,140 rolling
+24-hour windows having at least 30 pump-active minutes, the median positive
+rate was 3.82 sensor units per pump-hour. A 2.5 threshold isolated one
+continuous 42-hour low-response period on July 15-16, 2026 and no other
+period in that history. This is intentionally conservative relative to the
+normal distribution rather than a guessed constant.
 
-This complements the metrics already retained by selfmon:
+## 7. Publication protocol
 
-- limiter charged and independently observed operations and bytes;
-- pond timer health, last-run age, and actual run duration;
-- transaction rate, local pond size, Parquet count, and Delta-log count;
-- producer and sitegen peak RSS; and
-- selfmon step failures.
+Each run produces:
 
-The access events come from Watertown's existing
-`storage_access_summary` journal record at the physical `ObjectStore`
-boundary. Selfmon ingests that journal once and incrementally materializes a
-typed physical series. It does not poll Azure or introduce a competing
-counter.
-
-A first monthly query can preserve the categories needed to apply Azure's
-prices at decision time:
-
-```sql
-SELECT
-  date_trunc('month', timestamp) AS month,
-  pond,
-  COUNT(*) AS remote_scopes,
-  SUM(get_ops) AS get_ops,
-  SUM(head_ops) AS head_ops,
-  SUM(list_ops) AS list_ops,
-  SUM(put_ops) AS put_ops,
-  SUM(multipart_ops) AS multipart_ops,
-  SUM(delete_ops) AS delete_ops,
-  SUM(copy_ops) AS copy_ops,
-  SUM(get_bytes) AS downloaded_bytes,
-  SUM(put_bytes + multipart_bytes) AS uploaded_bytes
-FROM source
-GROUP BY date_trunc('month', timestamp), pond
-ORDER BY month, pond
+```text
+/var/www/monitor/<pond>/
+  index.html
+  status.json
 ```
 
-Run it against `series:///metrics/azure-access.series`. Do not collapse these
-columns into read/write billing classes in storage: Azure can change meter
-definitions and prices, while the physical operation facts remain valid.
+`status.json` is versioned with `schema_version: 2` and contains:
 
-At the end of the observation period, group the series by calendar month,
-pond, and operation category. Reconcile those totals with Azure Cost
-Management meters for read, write, list/create, other operations, capacity,
-and egress. The decision requires:
+- pond and report title;
+- generation time and committed transaction sequence;
+- overall `healthy`, `alarm`, or `unknown` state; and
+- per-check rule, source, unit, threshold, window, sample count, time bounds,
+  latest value, minimum, and maximum. Rate checks additionally include their
+  condition source, active and required evidence time, accumulated change,
+  calculated rate, and alignment counts.
 
-1. p50, p95, and maximum operations per successful producer push;
-2. operation mix and bytes by pond and storage path class;
-3. actual pushes, failures, retries, and no-op pushes per month;
-4. retained Azure capacity growth;
-5. measured producer, monitor-query, service, and sitegen duration and peak
-   RSS;
-6. status API traffic and Application Insights ingestion; and
-7. actual recurring ACS number, carrier, and message charges.
+The HTML is self-contained and refreshes once per minute. It does not fetch
+the JSON file, so a reader cannot observe a partially updated asset graph.
+Each artifact is written to a unique temporary sibling, flushed with
+`sync_all`, and renamed over its destination. JSON is published first and
+HTML last; the HTML rename is the page-publication boundary. The output
+directory is synced after both renames.
 
-Do not extrapolate a 15-minute Azure bill solely by multiplying the current
-aggregate limiter value by four. After the hourly baseline is stable, trial
-one producer at 15 minutes and compare its measured category mix before
-changing the other ponds.
+## 8. Watershop deployment
 
-## 13. Implementation plan
+Terraform creates `/var/www/monitor/<instance>` owned by the Watertown user
+and writes these per-instance environment values:
 
-### Parallel track: Measure Azure traffic
+```text
+POND_INSTANCE=<instance>
+MONITOR_OUTPUT_DIR=/var/www/monitor/<instance>
+```
 
-- Keep production producer timers hourly.
-- Retain at least 90 days of access, limiter, runtime, memory, and size data.
-- Reconcile application counts with Azure billing meters monthly.
-- Run a bounded 15-minute trial on one producer only after the hourly baseline
-  is trustworthy.
+For containerized ponds, `pond.sh` bind-mounts the host output directory at
+`/monitor` and overrides `MONITOR_OUTPUT_DIR=/monitor` inside the container.
+The monitor therefore has write access only to its own publication directory,
+while pond input data remains under the normal pond mount.
 
-**Acceptance:** every production Azure push or pull produces a typed access
-row per remote scope, category totals sum to `total_ops`, and monthly
-aggregates reconcile with Azure billing categories.
+Caddy serves the common root with path stripping:
 
-### Phase 0: Transaction/query coherence — implemented
+```caddyfile
+handle_path /monitor/* {
+    root * /var/www/monitor
+    header Cache-Control "no-cache"
+    file_server
+}
+```
 
-- Transaction-global writer guards reject duplicate writers across distinct
-  handles and reject commit while any writer remains unfinished.
-- A shared mutation generation versions `ProviderContext` cache entries and
-  invalidates physical providers and plans built before a later mutation.
-- Physical providers enumerate exact live version URLs for all, bounded,
-  latest, and specific-version reads, bypassing mutable wildcard listings.
-- Provider execution holds transaction-read guards; commit cannot drain
-  pending state while an underlying provider stream is reading it.
-- Commit, abort, and guard drop close the shared state. Old physical providers
-  and TinyFS persistence operations return a closed-state error.
-- Version loads include `pond_id`, and latest-version selection uses the
-  highest live version number.
+The initial pages are consequently available on Watershop's local HTTP
+listener at:
 
-**Acceptance:** the regression matrix covers provider-before-write,
-provider-after-write in the same context, multiple pending appends, bounded
-and unbounded reads, unfinished writers, active transaction reads,
-latest-version selection, commit, and old-context use. Each case sees the
-complete selected snapshot or returns a specific stale/closed error; none
-silently returns the previously observed stale subset.
+```text
+/monitor/water-staging/
+/monitor/water-prod/
+```
 
-### Phase 1: Define physical monitor records
+Resetting an instance removes and recreates its monitor directory so an old
+status page cannot survive a pond reset.
 
-- Define schemas for evaluations, condition transitions, and notification
-  events.
-- Include source transaction identity and monitor definition version in every
-  row.
-- Add helpers that batch rows and append each series at most once per producer
-  update.
-- Add DataFusion queries that reconstruct current condition and notification
-  state.
+## 9. Failure and audit policy
 
-**Acceptance:** state reconstructed from append-only Parquet is identical
-before and after process restart.
+The primary data commit is already durable before monitoring starts and cannot
+be rolled back by a post-commit error.
 
-### Phase 2: Define and validate monitors
+For every discovered factory, Steward records a pending post-commit record.
+A read-only factory records only a parent `PostPushCompleted` or
+`PostPushFailed` terminal record because it has no child data transaction.
+Read-write factories retain their existing child transaction lifecycle.
 
-- Add explicit raw physical-series table declarations.
-- Parse and validate read-only SQL.
-- Reject dynamic, external, and missing inputs.
-- Derive version bounds from window and lateness.
-- Enforce query deadlines, memory limits, and result limits.
+Failures are accumulated rather than short-circuiting:
 
-**Acceptance:** a representative temporal aggregation scans only eligible
-versions, applies the exact row predicate, and produces deterministic
-condition keys.
+- one factory failure does not prevent later factories;
+- factory discovery, environment expansion, execution, publication, and audit
+  failures are all surfaced;
+- remote backup is attempted after the factory queue even when monitoring
+  failed; and
+- the command returns an error after backup when either phase failed, joining
+  both errors when necessary.
 
-### Phase 3: Integrate the transaction evaluator
+This preserves backup availability without allowing an unattended command to
+report success after a failed status publication.
 
-- Add an evaluator that receives the existing Steward transaction after all
-  source writers finish.
-- Enter the enforced query phase and construct bounded explicit-version
-  providers from its fresh context.
-- Query prior condition state and current staged observations.
-- Fully collect and close all query streams.
-- Append evaluation, transition, and notification batches.
-- Finish all output writers.
-- Commit once through the existing producer transaction.
-- Keep monitor query failures distinct from failures to encode or persist
-  monitoring state.
+## 10. Deferred work
 
-**Acceptance:** one transaction writes observations, queries them, writes
-monitor state, and commits both; injected query failure commits observations
-with an error evaluation, while injected storage failure commits neither.
+The first slice intentionally does not provide:
 
-### Phase 4: Serve committed state
+- missing-data, freshness, or maximum-gap alarms;
+- a requirement for observations to cover the full three-hour window;
+- hysteresis or a sustained healthy period before recovery;
+- durable monitor evaluation and transition series in the pond;
+- push notifications;
+- a long-running status service;
+- authentication beyond Watershop's existing local-network Caddy exposure;
+- per-check deadlines, result-row limits, or memory budgets beyond existing
+  DataFusion and process limits; or
+- periodic reevaluation when a producer run makes no data commit.
 
-- Add a local service that reconstructs status from the monitoring series on
-  startup.
-- Accept only committed-frontier notifications from local producers.
-- Atomically replace the in-memory status object.
-- Serve a read-only authenticated HTTPS status endpoint.
-- Expose commit, input, and evaluation freshness.
-
-**Acceptance:** a service restart reconstructs the same status; a notification
-sent for a failed commit is rejected; concurrent readers see either the old or
-new complete status.
-
-### Phase 5: Deliver alerts
-
-- Read durable notification intents after commit.
-- Send SMS through the selected ACS path.
-- Append attempted, delivered, and failed events.
-- Use stable idempotency keys and retry with bounded backoff.
-- Recover pending intents after restart.
-
-**Acceptance:** crash and retry tests demonstrate at-least-once delivery
-without losing an intent; repeated delivery attempts retain one stable event
-identity.
-
-### Phase 6: Publish compact cloud status
-
-- Publish only the compact committed status to Azure.
-- Add a scale-to-zero stale-publisher check if host-level outage alerts are
-  required.
-- Keep full pond backup and static-site publication independent.
-
-**Acceptance:** Watershop loss leaves the last status available and causes the
-cloud view to become explicitly stale without running Watertown in Azure.
-
-## 14. Non-goals
-
-The initial implementation does not:
-
-- build or publish a copied `MemoryPersistence` image;
-- introduce SQLite or another mutable state database;
-- require a second commit for monitor evaluation;
-- query dynamic factories or external sources;
-- materialize temporal aggregation before monitor SQL;
-- run network notification or Azure publication inside a pond transaction;
-- wait for Azure backup before evaluating a local update;
-- rebuild the static site at monitor cadence;
-- provide exactly-once SMS delivery; or
-- treat uncommitted observations as authoritative incidents.
-
-## 15. Open decisions
-
-The one-commit architecture has the required physical-series transaction
-coherence. Remaining product decisions are:
-
-1. Should a monitor definition error append one evaluation-error row on every
-   producer run, or be rate-limited after the first unchanged error?
-2. Which query time, memory, and result-row limits fit the measured water
-   workload?
-3. Should SMS delivery run directly on Watershop or through a small Azure
-   Function?
-4. What authentication and exposure model should the HTTPS status endpoint
-   use?
-5. Which producer should receive the first transactional monitor integration?
-
-These decisions do not change the core model: staged physical observations are
-queried through the current transaction, monitoring events are appended to
-TinyFS Parquet, and all authoritative state commits once.
+The last point matters for dead-man monitoring: a stopped source can also stop
+new commits, leaving the last static page in place. The generated timestamp
+makes that visible to a human, but automatic stale-data alerting requires a
+separate periodic evaluator or a freshness-aware self-monitor. Alert push
+should be added only after freshness and recovery semantics are chosen; it
+should consume the already-published status rather than evaluate a different
+rule.

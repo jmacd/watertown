@@ -109,12 +109,11 @@ impl<'a> TransactionGuard<'a> {
     /// This is the clean production API that Steward uses.
     ///
     /// Returns the commit outcome together with the underlying persistence
-    /// reference.  The steward layer needs post-commit access to the
-    /// persistence (to read the just-landed Delta state for the D5.7
-    /// partition-checksum snapshot recorded on `DataCommitted`), and the
-    /// reference is exactly what was owned by this guard.  Handing it back
-    /// after the embedded tinyfs guard has been dropped avoids a separate
-    /// `OpLogPersistence::open` round-trip.
+    /// reference. The steward layer uses it to open a fresh read-only snapshot
+    /// for post-commit discovery and host-side reporting. Handing it back after
+    /// the embedded TinyFS guard has been dropped preserves closure of the
+    /// original transaction and avoids a separate `OpLogPersistence::open`
+    /// round-trip.
     ///
     /// The embedded tinyfs::TransactionGuard will be dropped after commit, clearing the transaction state.
     pub async fn commit(self) -> TinyFSResult<(Option<i64>, &'a mut OpLogPersistence)> {

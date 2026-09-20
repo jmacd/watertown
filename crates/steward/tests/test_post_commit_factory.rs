@@ -42,7 +42,15 @@ async fn test_post_commit_factory_execution() -> Result<()> {
     // Create a test-executor factory config
     let config_yaml = r#"message: "Post-commit execution test"
 repeat_count: 3
+file_to_read: /data/just-committed.txt
+expected_content: visible after commit
 "#;
+
+    _ = root1.create_dir_path("/data").await?;
+    let mut observed = root1.async_writer_path("/data/just-committed.txt").await?;
+    use tokio::io::AsyncWriteExt;
+    observed.write_all(b"visible after commit").await?;
+    observed.shutdown().await?;
 
     // Create executable dynamic file using high-level path-based API
     // Note: Executable factories use FileDynamic, config is the file content
@@ -70,9 +78,15 @@ repeat_count: 3
 
     debug!("DEBUG: About to commit tx1...");
 
-    // Commit - this should NOT trigger post-commit yet (no data written)
+    let committed_seq = tx1.txn_meta().txn_seq;
+    // The read-only factory must see the file committed in this transaction.
     _ = tx1.commit().await?;
-    debug!("[OK] Post-commit config created (tx1 committed)");
+    assert_eq!(
+        ship.last_write_seq(),
+        committed_seq,
+        "a read-only post-commit factory must not allocate another write sequence"
+    );
+    debug!("[OK] Post-commit config created and executed from a committed read snapshot");
 
     // Verify the config was actually created by reading it back
     debug!("\n=== Verifying config was created ===");
@@ -131,34 +145,12 @@ repeat_count: 3
 
     _ = verify_tx.commit().await?;
 
-    // Transaction 2: Write some data to trigger post-commit factory execution
-    debug!("\n=== Triggering post-commit via data write ===");
-    let tx2 = ship
-        .begin_write(&PondUserMetadata::new(vec![
-            "test".to_string(),
-            "trigger-post-commit".to_string(),
-        ]))
-        .await?;
-
-    let root2 = tx2.root().await?;
-
-    // Write a simple file to trigger a real data commit
-    _ = root2.create_dir_path("/data").await?;
-    let mut writer = root2.async_writer_path("/data/trigger.txt").await?;
-    use tokio::io::AsyncWriteExt;
-    writer
-        .write_all(b"This triggers post-commit factory execution")
-        .await?;
-    writer.shutdown().await?;
-
-    // Commit - this SHOULD trigger post-commit factory execution
-    debug!("Committing transaction (should trigger post-commit)...");
-    _ = tx2.commit().await?;
-    debug!("[OK] Transaction committed, post-commit should have executed");
-
     // Verify the test factory was executed by checking the result file it creates
     // The test-executor factory writes to /tmp/test-executor-result-{factory_node_id}.txt
-    let result_path = format!("/tmp/test-executor-result-{}.txt", factory_node_id);
+    let result_path = format!(
+        "/tmp/test-executor-result-{}.txt",
+        factory_node_id.node_id()
+    );
 
     // Give a small delay for file write to complete
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -178,8 +170,8 @@ repeat_count: 3
                 "Should contain our message"
             );
             assert!(
-                content.contains("ControlWriter"),
-                "Should have run in ControlWriter mode"
+                content.contains("ControlReader"),
+                "Should have run in ControlReader mode"
             );
 
             debug!("[OK] Post-commit factory executed successfully!");

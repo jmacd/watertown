@@ -1138,6 +1138,7 @@ impl OpLogPersistence {
 }
 
 impl State {
+    #[must_use]
     pub fn coherence_state(&self) -> Arc<tinyfs::CoherenceState> {
         self.coherence.clone()
     }
@@ -4256,6 +4257,18 @@ impl InnerState {
             );
             // Create directory node directly - it exists in memory
             return node_factory::create_directory_node(id, state);
+        }
+
+        // A newly created file is inserted into its parent directory before
+        // its writer is shut down. Reconstruct it from the transaction's
+        // pending-file registry so a second TinyFS handle observes the same
+        // node and reaches the transaction-global writer guard.
+        if self.pending_files.contains_key(&id) {
+            debug!(
+                "load_node: found file {} in pending_files (not yet flushed to OpLog)",
+                id
+            );
+            return node_factory::create_file_node(id, state);
         }
 
         // [GO] OPTIMIZATION: Query only the latest record (O(1) instead of O(N))

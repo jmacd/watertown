@@ -1080,28 +1080,42 @@ auto-execution behavior:
 
 | Directory | Purpose | Post-commit | Examples |
 |-----------|---------|------------|----------|
-| `/system/run/` | Auto-executing factories | Yes (default: `push`) | (currently rare; see note) |
+| `/system/run/` | Auto-executing factories | Yes (default: `push`) | `monitor-report` |
 | `/system/etc/` | Manually triggered or passive | No | `hydrovu`, `sitegen`, `column-rename`, `logfile-ingest`, `journal-ingest` |
 | `/system/site/` | Static content (templates) | No | Markdown page templates |
 
 > **Note (D4+)**: the legacy `remote` factory used to live in
 > `/system/run/<N>-remote`; that pathway is gone.  Remote sync is now
 > handled by `/sys/remotes/<name>` + `pond push|pull` (see above).
-> `/system/run/` is still scanned post-commit for any future factories
-> that opt into auto-execution, but no in-tree factory currently uses it.
+> `/system/run/` remains the post-commit factory namespace; remote publication
+> is a separate phase that starts after this queue finishes.
 
 **Post-commit auto-execution:** After every write transaction, the
 steward scans `/system/run/*` and executes each factory with its
-configured mode (default: `push`).  Only factories that support the
-mode will succeed -- this is why `hydrovu` and `sitegen` must NOT be
-placed in `/system/run/`.  Separately, the steward iterates
-`/sys/remotes/*` and auto-pushes any `push`/`both`-mode remotes.
+configured mode (default: `push`) in lexical path order. Factories declare
+whether automatic execution needs a new write transaction or can share the
+fresh committed read snapshot. `monitor-report` is read-only; existing
+mutating factories remain read-write. Failures do not stop later factories or
+remote auto-push, but the command returns an error after backup so a failed
+post-commit action cannot look successful.
 
 **Short name resolution:** `pond run` resolves bare names (no leading
 `/`) by checking `/system/run/{name}` then `/system/etc/{name}`.
 
-**Naming convention:** Use numeric prefixes for ordering:
-`10-hrename`, `20-hydrovu`, `90-sitegen`.
+**Naming convention:** Use numeric prefixes for ordering. Monitoring uses
+`00-monitor` so host status is generated before other post-commit work.
+
+`monitor-report` supports the original all-observed-below check and a typed
+`rate-while` check. `rate-while` correlates a raw measurement with a condition
+series using previous-state alignment, sums `positive-deltas`, divides by
+actual active time, and returns `unknown` until `minimum_active_time` is met.
+Its DataFusion query uses
+`counter_delta(value) OVER (ORDER BY timestamp)`; decreases are treated as
+reset/refill events and contribute zero. The condition predicate currently
+supports `eq`, alignment supports `previous`, and the alarm comparison
+supports `lt`. See
+[live-monitoring-projection-design.md](live-monitoring-projection-design.md)
+for the complete configuration and evidence semantics.
 
 **Setup pattern:**
 ```bash
@@ -2267,6 +2281,7 @@ pond run 90-sitegen build ./dist            # build site (reduce is dynamic)
 | `temporal-reduce` | dynamic | `pond mknod` | `DynamicDirectory` of `TableDynamic` |
 | `column-rename` | transform | `pond mknod` | Wraps `TableProvider` |
 | `sitegen` | executable | `pond mknod` + `pond run ... build` | Static files on host |
+| `monitor-report` | read-only post-commit executable | `/system/run/00-monitor` | Atomic `index.html` and `status.json` on host |
 | `logfile-ingest` | executable | `pond mknod` + `pond run` | `data` entries in pond |
 | `journal-ingest` | executable | `pond mknod` + `pond run [status]` | `data:series` JSON Lines in pond |
 | `hydrovu` | executable | `pond mknod` + `pond run ... collect` | `table:series` in pond |

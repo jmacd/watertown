@@ -545,6 +545,32 @@ impl ControlTable {
         self.inner.write_records(records).await.map_err(map_err)
     }
 
+    /// Record the terminal outcome of a read-only post-commit factory.
+    ///
+    /// Read-only factories have no child data transaction, so their lifecycle
+    /// consists only of the parent transaction's `PostPushCompleted` or
+    /// `PostPushFailed` record.
+    pub async fn record_read_only_factory_terminal(
+        &mut self,
+        parent_meta: &PondTxnMetadata,
+        execution_seq: i64,
+        duration_ms: i64,
+        outcome: Result<(), String>,
+    ) -> Result<(), StewardError> {
+        let (kind, error_message) = match outcome {
+            Ok(()) => (RecordKind::PostPushCompleted, None),
+            Err(error) => (RecordKind::PostPushFailed, Some(error)),
+        };
+        let metadata = PostCommitMetadata {
+            execution_seq: Some(execution_seq),
+            factory_name: None,
+            config_path: None,
+            error_message,
+        };
+        let record = self.post_commit_record(kind, parent_meta, &metadata, Some(duration_ms));
+        self.inner.write_record(record).await.map_err(map_err)
+    }
+
     /// Record the terminal lifecycle of a post-commit factory execution in
     /// ONE control-table commit: the factory transaction's `DataCommitted`
     /// (omitted when `data_fs_version` is `None`, i.e. a write no-op) and

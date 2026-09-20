@@ -118,6 +118,23 @@ async fn test_memory_file_version_timestamps_are_microseconds() {
 }
 
 #[tokio::test]
+async fn test_memory_persistence_active_transaction_contract() {
+    use std::sync::Arc;
+
+    use crate::persistence::PersistenceLayer;
+
+    let persistence = crate::memory::MemoryPersistence::default();
+    let fs = crate::FS::new(persistence.clone()).await.unwrap();
+    let root = fs.root().await.unwrap();
+    let context =
+        crate::ProviderContext::new_for_testing(Arc::new(persistence) as Arc<dyn PersistenceLayer>);
+
+    _ = crate::testing::persistence_contract::assert_active_transaction_read_write(&root, &context)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn test_create_file() {
     let fs = new_fs().await;
     let root = fs.root().await.unwrap();

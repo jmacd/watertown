@@ -4739,6 +4739,7 @@ dependencies = [
  "clap",
  "datafusion",
  "datafusion-common",
+ "datafusion-expr",
  "env_logger",
  "futures",
  "gitpond",

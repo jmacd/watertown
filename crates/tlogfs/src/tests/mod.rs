@@ -5,6 +5,7 @@
 mod large_file_corruption;
 mod large_file_roundtrip;
 mod partition_cache;
+mod persistence_contract;
 
 use crate::TLogFSError;
 use crate::persistence::OpLogPersistence;

@@ -587,6 +587,7 @@ pub fn register_tinyfs_object_store<P: PersistenceLayer + Clone + 'static>(
     ctx: &datafusion::execution::context::SessionContext,
     persistence: P,
 ) -> Result<Arc<TinyFsObjectStore<P>>, Box<dyn std::error::Error + Send + Sync>> {
+    crate::register_datafusion_functions(ctx)?;
     let object_store = Arc::new(TinyFsObjectStore::new(persistence));
 
     let url =
