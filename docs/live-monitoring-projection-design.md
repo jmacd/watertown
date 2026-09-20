@@ -197,7 +197,8 @@ For each check, the factory:
 1. fixes `period_end` to the monitor execution time;
 2. calculates `period_start = period_end - window`;
 3. asks the provider for an event-time-bounded source beginning at
-   `period_start`;
+   `period_start`; wildcard sources apply the same bound independently to every
+   matched file and combine the retained rows by name;
 4. applies exact row predicates for
    `[period_start, period_end)` and non-null values in DataFusion;
 5. converts timestamps to UTC microseconds and values to `Float64`;
