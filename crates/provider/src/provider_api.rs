@@ -387,7 +387,21 @@ impl Provider {
     /// # Returns
     ///
     /// Number of files matched
-    pub async fn for_each_match<F, Fut>(&self, url_str: &str, mut callback: F) -> Result<usize>
+    pub async fn for_each_match<F, Fut>(&self, url_str: &str, callback: F) -> Result<usize>
+    where
+        F: FnMut(Arc<dyn datafusion::catalog::TableProvider>, String) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        self.for_each_match_bounded(url_str, tinyfs::SeriesReadBounds::NONE, callback)
+            .await
+    }
+
+    async fn for_each_match_bounded<F, Fut>(
+        &self,
+        url_str: &str,
+        bounds: tinyfs::SeriesReadBounds,
+        mut callback: F,
+    ) -> Result<usize>
     where
         F: FnMut(Arc<dyn datafusion::catalog::TableProvider>, String) -> Fut,
         Fut: Future<Output = Result<()>>,
@@ -410,9 +424,12 @@ impl Provider {
             let ctx = SessionContext::new();
             for (node_path, _captures) in &matches {
                 let file_path = node_path.path();
-                let file_url_str = format!("{}://{}", url.scheme(), file_path.display());
+                let file_url = url.with_path(&file_path.to_string_lossy());
+                let file_url_str = file_url.to_string();
 
-                let table_provider = self.create_table_provider(&file_url_str, &ctx).await?;
+                let table_provider = self
+                    .create_table_provider_bounded(&file_url_str, &ctx, bounds)
+                    .await?;
                 callback(table_provider, file_path.display().to_string()).await?;
             }
 
@@ -420,7 +437,9 @@ impl Provider {
         } else {
             // Single file
             let ctx = SessionContext::new();
-            let table_provider = self.create_table_provider(url_str, &ctx).await?;
+            let table_provider = self
+                .create_table_provider_bounded(url_str, &ctx, bounds)
+                .await?;
             callback(table_provider, path.to_string()).await?;
             Ok(1)
         }
@@ -731,13 +750,30 @@ impl Provider {
         url_str: &str,
         ctx: &SessionContext,
     ) -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
+        self.create_provider_for_url_bounded(url_str, ctx, tinyfs::SeriesReadBounds::NONE)
+            .await
+    }
+
+    /// As [`Provider::create_provider_for_url`], but applies the supplied
+    /// [`tinyfs::SeriesReadBounds`] to every file matched by the URL. Cached
+    /// external-format globs retain only matching source versions in their
+    /// `ListingTable`; fallback unions construct each member with the same
+    /// bounds.
+    pub async fn create_provider_for_url_bounded(
+        &self,
+        url_str: &str,
+        ctx: &SessionContext,
+        bounds: tinyfs::SeriesReadBounds,
+    ) -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
         let url = Url::parse(url_str)?;
         let path = url.path();
         let has_wildcards = path.contains('*') || path.contains('?');
 
         if !has_wildcards {
             // Single file -- delegate directly
-            return self.create_table_provider(url_str, ctx).await;
+            return self
+                .create_table_provider_bounded(url_str, ctx, bounds)
+                .await;
         }
 
         let scheme = url.scheme();
@@ -763,15 +799,16 @@ impl Provider {
             if matches.len() == 1 {
                 // Single match -- per-node ListingTable
                 let (node_path, _) = &matches[0];
-                let file_url_str = format!("{}://{}", scheme, node_path.path().display());
-                return self.create_table_provider(&file_url_str, ctx).await;
+                let file_url = url.with_path(&node_path.path().to_string_lossy());
+                return self
+                    .create_table_provider_bounded(&file_url.to_string(), ctx, bounds)
+                    .await;
             }
 
             // Multi-file: cache each, then scan every live version explicitly.
             let mut nodes = Vec::with_capacity(matches.len());
             for (node_path, _) in &matches {
-                let file_url_str = format!("{}://{}", scheme, node_path.path().display());
-                let file_url = Url::parse(&file_url_str)?;
+                let file_url = url.with_path(&node_path.path().to_string_lossy());
 
                 nodes.push(
                     self.ensure_url_cached(&file_url, format_provider.as_ref(), cache_dir)
@@ -779,9 +816,10 @@ impl Provider {
                 );
             }
 
-            let provider = crate::format_cache::glob_cached_set(cache_dir, scheme, &nodes)
-                .table_provider()
-                .await?;
+            let provider =
+                crate::format_cache::glob_cached_set_bounded(cache_dir, scheme, &nodes, &bounds)
+                    .table_provider()
+                    .await?;
 
             log::debug!(
                 "[OK] Glob cache ListingTable for {} files (pattern '{}')",
@@ -795,7 +833,7 @@ impl Provider {
         // Fallback: individual providers + UNION ALL BY NAME
         let mut table_providers = Vec::new();
         let _ = self
-            .for_each_match(url_str, |tp, file_path| {
+            .for_each_match_bounded(url_str, bounds, |tp, file_path| {
                 log::debug!("Matched file: {}", file_path);
                 table_providers.push(tp);
                 async { Ok(()) }
@@ -806,24 +844,14 @@ impl Provider {
             return Ok(table_providers.into_iter().next().expect("len == 1"));
         }
 
-        // Multiple files without cache -- materialize via UNION ALL BY NAME
-        let temp_ctx = SessionContext::new();
-        for (i, tp) in table_providers.iter().enumerate() {
-            let _ = temp_ctx
-                .register_table(format!("t{}", i), tp.clone())
-                .map_err(|e| {
-                    Error::SessionContext(format!("Failed to register table t{}: {}", i, e))
-                })?;
+        // Multiple files without cache -- materialize via UNION ALL BY NAME in
+        // the caller's runtime so providers can use its registered object stores.
+        let mut providers = table_providers.into_iter();
+        let first = providers.next().expect("multiple providers");
+        let mut df = ctx.read_table(first)?;
+        for table_provider in providers {
+            df = df.union_by_name(ctx.read_table(table_provider)?)?;
         }
-
-        let union_sql = (0..table_providers.len())
-            .map(|i| format!("SELECT * FROM t{}", i))
-            .collect::<Vec<_>>()
-            .join(" UNION ALL BY NAME ");
-
-        log::debug!("Executing fallback union query: {}", union_sql);
-
-        let df = temp_ctx.sql(&union_sql).await?;
         let batches = df.collect().await?;
         let schema = batches
             .first()

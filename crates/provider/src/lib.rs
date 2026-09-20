@@ -338,6 +338,12 @@ impl Url {
         self.inner.path()
     }
 
+    pub(crate) fn with_path(&self, path: &str) -> Self {
+        let mut url = self.clone();
+        url.inner.set_path(path);
+        url
+    }
+
     /// Parse query parameters into strongly-typed struct using serde_qs
     ///
     /// Example:

@@ -13,15 +13,16 @@
 mod dynamic_file_format_tests {
     use datafusion::prelude::*;
     use provider::Provider;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     /// Build a MemoryPersistence-backed FS with a dynamic directory at /data
-    /// containing a FileDynamic child "test.csv" with the given CSV content.
+    /// containing FileDynamic children with the given CSV content.
     ///
     /// This simulates what gitpond does: a DirectoryDynamic node whose children
     /// are FileDynamic nodes created on-the-fly (not written through the oplog).
-    async fn setup_fs_with_dynamic_csv(
-        csv_content: &str,
+    async fn setup_fs_with_dynamic_csvs(
+        csv_files: &[(&str, &str)],
     ) -> (
         Arc<tinyfs::FS>,
         Arc<dyn tinyfs::PersistenceLayer>,
@@ -37,23 +38,23 @@ mod dynamic_file_format_tests {
 
         struct TestDynamicDir {
             parent_file_id: tinyfs::FileID,
-            csv_content: String,
+            csv_files: BTreeMap<String, String>,
         }
 
         impl TestDynamicDir {
-            fn child_file_id(&self) -> tinyfs::FileID {
+            fn child_file_id(&self, name: &str) -> tinyfs::FileID {
                 let parent_part_id = tinyfs::PartID::from_node_id(self.parent_file_id.node_id());
                 tinyfs::FileID::from_content(
                     parent_part_id,
                     EntryType::FileDynamic,
-                    b"test.csv",
+                    name.as_bytes(),
                     self.parent_file_id.pond_id(),
                 )
             }
 
-            fn child_node(&self) -> Node {
-                let child_id = self.child_file_id();
-                let file = provider::ConfigFile::new(self.csv_content.clone().into_bytes());
+            fn child_node(&self, name: &str, csv_content: &str) -> Node {
+                let child_id = self.child_file_id(name);
+                let file = provider::ConfigFile::new(csv_content.as_bytes().to_vec());
                 Node::new(child_id, NodeType::File(file.create_handle()))
             }
         }
@@ -61,11 +62,10 @@ mod dynamic_file_format_tests {
         #[async_trait]
         impl Directory for TestDynamicDir {
             async fn get(&self, name: &str) -> tinyfs::Result<Option<Node>> {
-                if name == "test.csv" {
-                    Ok(Some(self.child_node()))
-                } else {
-                    Ok(None)
-                }
+                Ok(self
+                    .csv_files
+                    .get(name)
+                    .map(|csv_content| self.child_node(name, csv_content)))
             }
 
             async fn insert(&mut self, _name: String, _node: Node) -> tinyfs::Result<()> {
@@ -83,14 +83,19 @@ mod dynamic_file_format_tests {
                     Box<dyn futures::Stream<Item = tinyfs::Result<DirectoryEntry>> + Send>,
                 >,
             > {
-                let child_id = self.child_file_id();
-                let entry = DirectoryEntry::new(
-                    "test.csv".to_string(),
-                    child_id.node_id(),
-                    EntryType::FileDynamic,
-                    0,
-                );
-                Ok(Box::pin(stream::iter(vec![Ok(entry)])))
+                let entries = self
+                    .csv_files
+                    .keys()
+                    .map(|name| {
+                        Ok(DirectoryEntry::new(
+                            name.clone(),
+                            self.child_file_id(name).node_id(),
+                            EntryType::FileDynamic,
+                            0,
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                Ok(Box::pin(stream::iter(entries)))
             }
         }
 
@@ -126,7 +131,10 @@ mod dynamic_file_format_tests {
 
         let dynamic_dir = TestDynamicDir {
             parent_file_id: dir_id,
-            csv_content: csv_content.to_string(),
+            csv_files: csv_files
+                .iter()
+                .map(|(name, content)| ((*name).to_string(), (*content).to_string()))
+                .collect(),
         };
         let dir_handle = DirHandle::new(Arc::new(tokio::sync::Mutex::new(
             Box::new(dynamic_dir) as Box<dyn Directory>
@@ -138,6 +146,16 @@ mod dynamic_file_format_tests {
         let cache_dir = tempfile::tempdir().unwrap();
 
         (fs, persistence, cache_dir)
+    }
+
+    async fn setup_fs_with_dynamic_csv(
+        csv_content: &str,
+    ) -> (
+        Arc<tinyfs::FS>,
+        Arc<dyn tinyfs::PersistenceLayer>,
+        tempfile::TempDir,
+    ) {
+        setup_fs_with_dynamic_csvs(&[("test.csv", csv_content)]).await
     }
 
     #[tokio::test]
@@ -232,5 +250,51 @@ mod dynamic_file_format_tests {
             .unwrap()
             .value(0);
         assert_eq!(cnt2, 2);
+    }
+
+    #[tokio::test]
+    async fn bounded_wildcard_reads_every_cached_external_file() {
+        let (fs, persistence, cache_dir) = setup_fs_with_dynamic_csvs(&[
+            ("casparwater.csv", "name;value\nalpha;10\nbeta;20\n"),
+            ("casparwater-0002.csv", "name;value\ngamma;30\n"),
+        ])
+        .await;
+
+        let session = Arc::new(SessionContext::new());
+        let provider_context = tinyfs::ProviderContext::new_for_testing(persistence)
+            .with_cache_dir(cache_dir.path().to_path_buf());
+        let provider = Provider::with_context(fs, Arc::new(provider_context));
+
+        let table = provider
+            .create_provider_for_url_bounded(
+                "csv:///data/casparwater*.csv?delimiter=;",
+                &session,
+                tinyfs::SeriesReadBounds::from_event_time_lo(1),
+            )
+            .await
+            .expect("bounded wildcard should read every matching file");
+        let _ = session.register_table("water", table).unwrap();
+        let batches = session
+            .sql("SELECT COUNT(*) AS count, SUM(value) AS total FROM water")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let count = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+        let total = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+
+        assert_eq!(count, 3);
+        assert_eq!(total, 60);
     }
 }

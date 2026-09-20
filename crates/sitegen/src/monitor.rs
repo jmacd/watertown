@@ -616,18 +616,22 @@ async fn register_monitor_source(
         Arc::new(provider_context.clone()),
     )
     .with_root(root.clone());
-    let table_provider = provider
-        .create_table_provider_bounded(
+    let table_provider = match provider
+        .create_provider_for_url_bounded(
             source,
             &provider_context.datafusion_session,
             SeriesReadBounds::from_event_time_lo(period_start.timestamp_micros()),
         )
         .await
-        .map_err(|error| {
-            tinyfs::Error::Other(format!(
+    {
+        Ok(table_provider) => table_provider,
+        Err(provider::Error::NoFilesMatched(_)) => return Ok(None),
+        Err(error) => {
+            return Err(tinyfs::Error::Other(format!(
                 "monitor check '{check_id}' failed to open source '{source}': {error}"
-            ))
-        })?;
+            )));
+        }
+    };
 
     let query_id = MONITOR_QUERY_ID.fetch_add(1, Ordering::Relaxed);
     let table_name = format!("monitor_{query_id}");
@@ -1350,7 +1354,7 @@ mod tests {
             label: "Chlorine feed responds while well pump runs".to_string(),
             check_type: RateWhileType::RateWhile,
             measurement: MeasurementConfig {
-                source: "series:///chlorine".to_string(),
+                source: "series:///chlorine-*".to_string(),
                 timestamp: "timestamp".to_string(),
                 column: "chlorine_level".to_string(),
                 accumulation: Accumulation::PositiveDeltas,
@@ -1606,9 +1610,20 @@ checks:
             ],
         )
         .expect("measurement batch");
-        root.create_series_from_batch("/chlorine", &measurement_batch, Some("timestamp"))
-            .await
-            .expect("measurement series");
+        root.create_series_from_batch(
+            "/chlorine-0001",
+            &measurement_batch.slice(0, 3),
+            Some("timestamp"),
+        )
+        .await
+        .expect("first measurement series");
+        root.create_series_from_batch(
+            "/chlorine-0002",
+            &measurement_batch.slice(3, 2),
+            Some("timestamp"),
+        )
+        .await
+        .expect("second measurement series");
         let condition_batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new(
