@@ -62,6 +62,7 @@ timestamp_unit: nanoseconds
 EOF
 
 pond mkdir -p /system/run >/dev/null
+pond mkdir -p /system/etc >/dev/null
 pond mkdir -p /ingest >/dev/null
 pond mknod logfile-ingest /system/run/10-well --config-path /tmp/056-ingest.yaml >/dev/null
 
@@ -138,10 +139,10 @@ timestamp_unit: nanoseconds
 EOF
 
 pond mkdir -p /wrongfield >/dev/null
-pond mknod logfile-ingest /system/run/20-wrong --config-path /tmp/056-wrong.yaml >/dev/null
+pond mknod logfile-ingest /system/etc/20-wrong --config-path /tmp/056-wrong.yaml >/dev/null
 
 RUN_RC=0
-pond run /system/run/20-wrong > /tmp/056-wrong-out.txt 2>&1 || RUN_RC=$?
+pond run /system/etc/20-wrong > /tmp/056-wrong-out.txt 2>&1 || RUN_RC=$?
 
 check "[ '$RUN_RC' -ne 0 ]" \
   "declaring a field the records lack fails the run (rc=$RUN_RC)"
