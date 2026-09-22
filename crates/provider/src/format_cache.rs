@@ -221,10 +221,7 @@ pub fn glob_cached_set_bounded(
     nodes: &[(tinyfs::NodeID, Vec<FileVersionInfo>)],
     bounds: &tinyfs::SeriesReadBounds,
 ) -> crate::version_cache::CachedSet {
-    // Falls back to the cache root only for schema recovery when no member is
-    // cached yet, which is the same "no data to describe" case the glob
-    // directory reported as an error.
-    let mut set = crate::version_cache::CachedSet::empty_in(cache_dir.to_path_buf());
+    let mut set = crate::version_cache::CachedSet::empty();
     for (node_id, versions) in nodes {
         let live = LiveVersions::from_persistence(*node_id, versions.clone());
         set.extend(
@@ -726,8 +723,8 @@ mod tests {
 
         let node1 = test_node_id();
         let node2 = test_node_id();
-        let v1 = test_version(1, "hash_merge_a");
-        let v2 = test_version(1, "hash_merge_b");
+        let v1 = test_series_version(1, "hash_merge_a", 1000);
+        let v2 = test_series_version(1, "hash_merge_b", 1000);
 
         // Write file 1 with schema1
         let batch1 = RecordBatch::try_new(
@@ -821,5 +818,36 @@ mod tests {
             .unwrap();
         assert!(sb_col.is_null(0), "sensor_b should be NULL for file 1");
         assert_eq!(sb_col.value(1), "b2");
+
+        // If bounds prune every member, schema recovery must inspect each
+        // node-specific cache directory and return an empty merged table.
+        let empty = glob_cached_set_bounded(
+            cache_dir,
+            "csv",
+            &nodes,
+            &tinyfs::SeriesReadBounds::from_event_time_lo(9999),
+        )
+        .table_provider()
+        .await
+        .unwrap();
+        assert_eq!(empty.schema().fields().len(), 3);
+        let empty_ctx = SessionContext::new();
+        let _ = empty_ctx.register_table("source", empty).unwrap();
+        let empty_batches = empty_ctx
+            .sql("SELECT COUNT(*) FROM source")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            empty_batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            0
+        );
     }
 }

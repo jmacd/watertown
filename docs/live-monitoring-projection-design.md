@@ -140,7 +140,7 @@ spec:
     output_dir: "${env:MONITOR_OUTPUT_DIR}"
     checks:
       - id: well-depth-low
-        label: "Well depth below 40"
+        label: "Well depth above 40"
         source: "oteljson:///ingest/casparwater*.json"
         timestamp_column: timestamp
         value_column: well_depth_value
@@ -212,6 +212,11 @@ no observations                         -> unknown
 all observations have value < threshold -> alarm
 one or more values >= threshold          -> healthy
 ```
+
+The label names the healthy evidence: at least one observed well-depth sample
+must be 40 or above in each trailing three-hour query window. If a collection
+lapse misses that part of a pump cycle and every available sample is below 40,
+the check alarms by design.
 
 Equality at 40 m is healthy because the configured condition is strictly
 "below 40". Null values are not observations. Observation gaps do not affect

@@ -1331,7 +1331,7 @@ mod tests {
     fn config() -> BelowCheckConfig {
         BelowCheckConfig {
             id: "well-depth-low".to_string(),
-            label: "Well depth below 40".to_string(),
+            label: "Well depth above 40".to_string(),
             source: "series:///well-depth".to_string(),
             timestamp_column: "timestamp".to_string(),
             value_column: "well_depth_value".to_string(),
