@@ -292,7 +292,7 @@ impl SidecarDir {
         CachedSet {
             files,
             missing,
-            fallback_dir: self.dir.clone(),
+            fallback_dirs: vec![self.dir.clone()],
         }
     }
 
@@ -329,8 +329,8 @@ pub struct CachedSet {
     /// sidecar is not on disk. Silently reading fewer rows is never correct, so
     /// this is reported rather than dropped; see [`CachedSet::missing`].
     missing: Vec<PathBuf>,
-    /// Used only to recover a schema when no live sidecar is present yet.
-    fallback_dir: PathBuf,
+    /// Used only to recover a schema when bounds retain no live sidecar.
+    fallback_dirs: Vec<PathBuf>,
 }
 
 impl CachedSet {
@@ -358,7 +358,7 @@ impl CachedSet {
         &self.missing
     }
 
-    /// Absorb another node's cached set from the same directory.
+    /// Absorb another node's cached set.
     ///
     /// A [`SidecarNaming::NodeScoped`] directory is read as one table spanning
     /// every source node, so the read side unions the per-node sets rather than
@@ -367,15 +367,16 @@ impl CachedSet {
     pub fn extend(&mut self, other: CachedSet) {
         self.files.extend(other.files);
         self.missing.extend(other.missing);
+        self.fallback_dirs.extend(other.fallback_dirs);
     }
 
-    /// An empty set that falls back to `dir` for schema recovery.
+    /// An empty set with no schema-recovery directories yet.
     #[must_use]
-    pub fn empty_in(dir: PathBuf) -> Self {
+    pub fn empty() -> Self {
         Self {
             files: Vec::new(),
             missing: Vec::new(),
-            fallback_dir: dir,
+            fallback_dirs: Vec::new(),
         }
     }
 
@@ -386,7 +387,8 @@ impl CachedSet {
     /// older ones. The merge is scoped to the retained files for the same
     /// reason the scan is: a superseded version's schema must not shape the read.
     pub async fn table_provider(&self) -> Result<Arc<dyn TableProvider>> {
-        let merged_schema = merge_parquet_schemas(&self.files, &self.fallback_dir).await?;
+        let merged_schema =
+            merge_parquet_schemas_with_fallback_dirs(&self.files, &self.fallback_dirs).await?;
 
         if self.files.is_empty() {
             // Everything pruned, or nothing cached yet: an empty table over the
@@ -468,25 +470,45 @@ pub fn file_blake3(path: &Path) -> Result<String> {
 /// back to whatever `fallback_dir` holds -- the caller still needs a usable
 /// schema for an empty table.
 pub async fn merge_parquet_schemas(files: &[PathBuf], fallback_dir: &Path) -> Result<SchemaRef> {
+    let fallback_dirs = [fallback_dir.to_path_buf()];
+    merge_parquet_schemas_with_fallback_dirs(files, &fallback_dirs).await
+}
+
+async fn merge_parquet_schemas_with_fallback_dirs(
+    files: &[PathBuf],
+    fallback_dirs: &[PathBuf],
+) -> Result<SchemaRef> {
     let mut schemas = Vec::with_capacity(files.len());
     for path in files {
         schemas.push(read_parquet_schema(path).await?);
     }
     if schemas.is_empty() {
-        return merge_parquet_schemas_in_dir(fallback_dir).await;
+        for fallback_dir in fallback_dirs {
+            schemas.extend(read_parquet_schemas_in_dir(fallback_dir).await?);
+        }
+    }
+    if schemas.is_empty() {
+        return Err(crate::error::Error::Arrow(format!(
+            "No cached parquet files found in schema fallback directories: {}",
+            fallback_dirs
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
     }
     Ok(Arc::new(Schema::try_merge(schemas).map_err(|e| {
         crate::error::Error::Arrow(format!("Failed to merge parquet schemas: {e}"))
     })?))
 }
 
-/// Merge the schemas of every `.parquet` directly under `dir`.
+/// Read the schemas of every `.parquet` directly under `dir`.
 ///
 /// Private, and deliberately so: this is schema RECOVERY for the case where no
 /// live member exists to describe the data, never a way to decide which files a
 /// read scans. The last directory-shaped reader (the symlink glob dir) is gone;
 /// keeping this unexported is what stops another one appearing.
-async fn merge_parquet_schemas_in_dir(dir: &Path) -> Result<SchemaRef> {
+async fn read_parquet_schemas_in_dir(dir: &Path) -> Result<Vec<Schema>> {
     let mut schemas = Vec::new();
     if dir.exists() {
         let mut entries = tokio::fs::read_dir(dir).await?;
@@ -497,15 +519,7 @@ async fn merge_parquet_schemas_in_dir(dir: &Path) -> Result<SchemaRef> {
             }
         }
     }
-    if schemas.is_empty() {
-        return Err(crate::error::Error::Arrow(format!(
-            "No cached parquet files found in '{}'",
-            dir.display()
-        )));
-    }
-    Ok(Arc::new(Schema::try_merge(schemas).map_err(|e| {
-        crate::error::Error::Arrow(format!("Failed to merge parquet schemas: {e}"))
-    })?))
+    Ok(schemas)
 }
 
 async fn read_parquet_schema(path: &Path) -> Result<Schema> {
