@@ -141,6 +141,8 @@ spec:
     checks:
       - id: well-depth-low
         label: "Well depth above 40"
+        description: "At least one well-depth reading must reach 40 m in the trailing three hours."
+        href: "/data/well-depth.html"
         source: "oteljson:///ingest/casparwater*.json"
         timestamp_column: timestamp
         value_column: well_depth_value
@@ -149,6 +151,8 @@ spec:
         window: 3h
       - id: chlorine-feed-response
         label: "Chlorine feed responds while well pump runs"
+        description: "Chlorine level must increase while the well pump is running."
+        href: "/data/chlorine-level.html"
         type: rate-while
         measurement:
           source: "oteljson:///ingest/casparwater*.json"
@@ -276,30 +280,31 @@ normal distribution rather than a guessed constant.
 
 ## 7. Publication protocol
 
-Each run produces:
+Each run produces one authoritative artifact:
 
 ```text
 /var/www/monitor/<pond>/
-  index.html
   status.json
 ```
 
-`status.json` is versioned with `schema_version: 2` and contains:
+`status.json` is versioned with `schema_version: 3` and contains:
 
 - pond and report title;
 - generation time and committed transaction sequence;
 - overall `healthy`, `alarm`, or `unknown` state; and
-- per-check rule, source, unit, threshold, window, sample count, time bounds,
-  latest value, minimum, and maximum. Rate checks additionally include their
-  condition source, active and required evidence time, accumulated change,
-  calculated rate, and alignment counts.
+- per-check description and graph link, rule, source, unit, threshold, window,
+  sample count, time bounds, latest value, minimum, and maximum. Rate checks
+  additionally include their condition source, active and required evidence
+  time, accumulated change, calculated rate, and alignment counts.
 
-The HTML is self-contained and refreshes once per minute. It does not fetch
-the JSON file, so a reader cannot observe a partially updated asset graph.
-Each artifact is written to a unique temporary sibling, flushed with
-`sync_all`, and renamed over its destination. JSON is published first and
-HTML last; the HTML rename is the page-publication boundary. The output
-directory is synced after both renames.
+A pond with no domain checks may still publish a reporting heartbeat. Its
+overall state is `unknown` and its empty `checks` array explicitly distinguishes
+"reporting" from health evidence.
+
+The JSON is written to a unique temporary sibling, flushed with `sync_all`, and
+renamed over its destination. The output directory is synced after the rename.
+Legacy generated `index.html` files are removed; site pages render the JSON
+client-side instead of maintaining a second representation.
 
 ## 8. Watershop deployment
 
@@ -326,16 +331,32 @@ handle_path /monitor/* {
 }
 ```
 
-The initial pages are consequently available on Watershop's local HTTP
+The authoritative reports are consequently available on Watershop's local HTTP
 listener at:
 
 ```text
-/monitor/water-staging/
-/monitor/water-prod/
+/monitor/water-staging/status.json
+/monitor/water-prod/status.json
 ```
 
 Resetting an instance removes and recreates its monitor directory so an old
-status page cannot survive a pond reset.
+status report cannot survive a pond reset.
+
+Each staging or production site build copies the exact four environment-local
+reports into its atomic build:
+
+```text
+/pond-status/water/status.json
+/pond-status/septic/status.json
+/pond-status/noyo/status.json
+/pond-status/site/status.json
+```
+
+The public browser reads these same-origin copies and never connects to
+Watershop. The operations page renders all four ponds; the water monitoring
+page renders the water checks and their graph links. Because reports are
+published with the site, public freshness follows the site build cadence and
+the client marks reports older than six hours as stale.
 
 ## 9. Failure and audit policy
 

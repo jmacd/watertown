@@ -83,6 +83,8 @@ async fn rate_while_monitor_reads_committed_snapshot_after_commit() -> Result<()
         "checks": [{
             "id": "chlorine-feed-response",
             "label": "Chlorine feed responds while well pump runs",
+            "description": "Chlorine level must increase while the well pump is running.",
+            "href": "/data/chlorine-level.html",
             "type": "rate-while",
             "measurement": {
                 "source": "series:///chlorine",
@@ -138,7 +140,7 @@ async fn rate_while_monitor_reads_committed_snapshot_after_commit() -> Result<()
 
     let status: serde_json::Value =
         serde_json::from_slice(&std::fs::read(output_path.join("status.json"))?)?;
-    assert_eq!(status["schema_version"], 2);
+    assert_eq!(status["schema_version"], 3);
     assert_eq!(status["transaction_sequence"], committed_sequence);
     assert_eq!(status["state"], "healthy");
     assert_eq!(status["checks"][0]["rule"], "rate-while");
@@ -147,9 +149,7 @@ async fn rate_while_monitor_reads_committed_snapshot_after_commit() -> Result<()
     assert_eq!(status["checks"][0]["rate"], 45.0);
     assert_eq!(status["checks"][0]["aligned_interval_count"], 4);
     assert_eq!(status["checks"][0]["unaligned_interval_count"], 0);
-
-    let html = std::fs::read_to_string(output_path.join("index.html"))?;
-    assert!(html.contains("Chlorine feed responds while well pump runs"));
-    assert!(html.contains("45.000 sensor-units-per-pump-hour"));
+    assert_eq!(status["checks"][0]["href"], "/data/chlorine-level.html");
+    assert!(!output_path.join("index.html").exists());
     Ok(())
 }
