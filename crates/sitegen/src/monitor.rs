@@ -7,7 +7,6 @@ use datafusion::arrow::array::{Array, Float64Array, StringArray, TimestampMicros
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::sql::TableReference;
-use maud::{DOCTYPE, Markup, html};
 use provider::{ExecutionContext, ExecutionMode, FactoryContext, register_executable_factory};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -43,6 +42,8 @@ enum CheckConfig {
 struct BelowCheckConfig {
     id: String,
     label: String,
+    description: String,
+    href: String,
     source: String,
     #[serde(default = "default_timestamp_column")]
     timestamp_column: String,
@@ -68,6 +69,8 @@ enum RateWhileType {
 struct RateWhileCheckConfig {
     id: String,
     label: String,
+    description: String,
+    href: String,
     #[serde(rename = "type")]
     check_type: RateWhileType,
     measurement: MeasurementConfig,
@@ -186,6 +189,8 @@ struct ConditionSample {
 struct CheckStatus {
     id: String,
     label: String,
+    description: String,
+    href: String,
     state: CheckState,
     rule: &'static str,
     source: String,
@@ -254,12 +259,6 @@ fn validate(config: &MonitorConfig) -> tinyfs::Result<()> {
             "monitor-report output_dir must be absolute".to_string(),
         ));
     }
-    if config.checks.is_empty() {
-        return Err(tinyfs::Error::Other(
-            "monitor-report requires at least one check".to_string(),
-        ));
-    }
-
     let mut ids = HashSet::new();
     for check in &config.checks {
         if check.id().is_empty()
@@ -297,15 +296,18 @@ impl CheckConfig {
 
 fn validate_below_check(check: &BelowCheckConfig) -> tinyfs::Result<()> {
     if check.label.trim().is_empty()
+        || check.description.trim().is_empty()
+        || check.href.trim().is_empty()
         || check.source.trim().is_empty()
         || check.timestamp_column.trim().is_empty()
         || check.value_column.trim().is_empty()
     {
         return Err(tinyfs::Error::Other(format!(
-            "monitor-report check '{}' has an empty label, source, timestamp_column, or value_column",
+            "monitor-report check '{}' has an empty label, description, href, source, timestamp_column, or value_column",
             check.id
         )));
     }
+    validate_href(&check.id, &check.href)?;
     if !check.threshold.is_finite() {
         return Err(tinyfs::Error::Other(format!(
             "monitor-report check '{}' threshold must be finite",
@@ -318,6 +320,8 @@ fn validate_below_check(check: &BelowCheckConfig) -> tinyfs::Result<()> {
 
 fn validate_rate_while_check(check: &RateWhileCheckConfig) -> tinyfs::Result<()> {
     if check.label.trim().is_empty()
+        || check.description.trim().is_empty()
+        || check.href.trim().is_empty()
         || check.measurement.source.trim().is_empty()
         || check.measurement.timestamp.trim().is_empty()
         || check.measurement.column.trim().is_empty()
@@ -327,10 +331,11 @@ fn validate_rate_while_check(check: &RateWhileCheckConfig) -> tinyfs::Result<()>
         || check.condition.predicate.value.trim().is_empty()
     {
         return Err(tinyfs::Error::Other(format!(
-            "monitor-report rate-while check '{}' has an empty label, source, timestamp, column, or predicate value",
+            "monitor-report rate-while check '{}' has an empty label, description, href, source, timestamp, column, or predicate value",
             check.id
         )));
     }
+    validate_href(&check.id, &check.href)?;
     if !check.alarm.value.is_finite() {
         return Err(tinyfs::Error::Other(format!(
             "monitor-report check '{}' alarm value must be finite",
@@ -345,6 +350,15 @@ fn validate_rate_while_check(check: &RateWhileCheckConfig) -> tinyfs::Result<()>
         return Err(tinyfs::Error::Other(format!(
             "monitor-report check '{}' minimum_active_time cannot exceed its window",
             check.id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_href(check_id: &str, href: &str) -> tinyfs::Result<()> {
+    if !href.starts_with('/') || href.starts_with("//") {
+        return Err(tinyfs::Error::Other(format!(
+            "monitor-report check '{check_id}' href must be an absolute same-origin site path beginning with one '/'"
         )));
     }
     Ok(())
@@ -407,7 +421,7 @@ async fn execute(
 
     let state = overall_state(&checks);
     let status = MonitorStatus {
-        schema_version: 2,
+        schema_version: 3,
         pond: config.pond,
         title: config.title,
         generated_at: format_timestamp(generated_at),
@@ -946,6 +960,8 @@ fn classify_check(
     CheckStatus {
         id: config.id.clone(),
         label: config.label.clone(),
+        description: config.description.clone(),
+        href: config.href.clone(),
         state,
         rule: "all-observed-below",
         source: config.source.clone(),
@@ -1073,6 +1089,8 @@ fn classify_rate_while(
     Ok(CheckStatus {
         id: config.id.clone(),
         label: config.label.clone(),
+        description: config.description.clone(),
+        href: config.href.clone(),
         state,
         rule: "rate-while",
         source: config.measurement.source.clone(),
@@ -1101,7 +1119,9 @@ fn classify_rate_while(
 }
 
 fn overall_state(checks: &[CheckStatus]) -> CheckState {
-    if checks.iter().any(|check| check.state == CheckState::Alarm) {
+    if checks.is_empty() {
+        CheckState::Unknown
+    } else if checks.iter().any(|check| check.state == CheckState::Alarm) {
         CheckState::Alarm
     } else if checks
         .iter()
@@ -1124,11 +1144,15 @@ fn publish(status: &MonitorStatus, output_dir: &Path) -> tinyfs::Result<()> {
         .map_other_context("Failed to serialize monitor status")?;
     json.push(b'\n');
     write_atomic(output_dir, "status.json", &json)?;
-    write_atomic(
-        output_dir,
-        "index.html",
-        render_html(status).into_string().as_bytes(),
-    )?;
+    let legacy_html = output_dir.join("index.html");
+    if let Err(error) = std::fs::remove_file(&legacy_html)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(tinyfs::Error::Other(format!(
+            "failed to remove legacy monitor artifact '{}': {error}",
+            legacy_html.display()
+        )));
+    }
     File::open(output_dir)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| {
@@ -1163,145 +1187,6 @@ fn write_atomic(output_dir: &Path, filename: &str, bytes: &[u8]) -> tinyfs::Resu
     Ok(())
 }
 
-fn render_html(status: &MonitorStatus) -> Markup {
-    let state = status.state.as_str();
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                meta http-equiv="refresh" content="60";
-                title { (status.title) " - " (state) }
-                style {
-                    "body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;color:#17202a}"
-                    "header{display:flex;align-items:baseline;justify-content:space-between;gap:1rem}"
-                    ".state{font-weight:700;text-transform:uppercase}.healthy{color:#18753c}.alarm{color:#b42318}.unknown{color:#667085}"
-                    ".check{border:1px solid #d0d5dd;border-left-width:.5rem;border-radius:.4rem;padding:1rem;margin:1rem 0}"
-                    "dl{display:grid;grid-template-columns:max-content 1fr;gap:.35rem 1rem}dt{font-weight:600}dd{margin:0}"
-                    "footer{margin-top:2rem;color:#667085;font-size:.9rem}"
-                }
-            }
-            body {
-                header {
-                    h1 { (status.title) }
-                    strong class={"state " (state)} { (state) }
-                }
-                p { "Pond: " code { (status.pond) } }
-                @for check in &status.checks {
-                    article class={"check " (check.state.as_str())} id=(check.id) {
-                        h2 {
-                            (check.label) " "
-                            span class={"state " (check.state.as_str())} {
-                                (check.state.as_str())
-                            }
-                        }
-                        @if check.rule == "rate-while" {
-                            p {
-                                "Alarm when accumulated positive changes in "
-                                code { (check.value_column) }
-                                " per active hour in the trailing "
-                                (format_duration(check.window_seconds))
-                                " are below "
-                                (check.threshold)
-                                @if !check.unit.is_empty() {
-                                    " " (check.unit)
-                                }
-                                "."
-                            }
-                        } @else {
-                            p {
-                                "Alarm when every observed "
-                                code { (check.value_column) }
-                                " value in the trailing "
-                                (format_duration(check.window_seconds))
-                                " is strictly below "
-                                (check.threshold)
-                                @if !check.unit.is_empty() {
-                                    " " (check.unit)
-                                }
-                                "."
-                            }
-                        }
-                        dl {
-                            dt { "Samples" } dd { (check.sample_count) }
-                            @if check.rule == "rate-while" {
-                                dt { "Latest measurement" }
-                                dd { (display_value(check.latest_value, "")) }
-                                dt { "Minimum measurement" }
-                                dd { (display_value(check.minimum, "")) }
-                                dt { "Maximum measurement" }
-                                dd { (display_value(check.maximum, "")) }
-                                dt { "Active time" }
-                                dd { (format_optional_duration(check.active_seconds)) }
-                                dt { "Required active time" }
-                                dd {
-                                    (check.minimum_active_seconds.map_or_else(
-                                        || "none".to_string(),
-                                        format_duration,
-                                    ))
-                                }
-                                dt { "Accumulated change" }
-                                dd { (display_value(check.accumulated_change, "")) }
-                                dt { "Change per active hour" }
-                                dd { (display_value(check.rate, &check.unit)) }
-                                dt { "Aligned intervals" }
-                                dd { (check.aligned_interval_count.unwrap_or(0)) }
-                                dt { "Unaligned intervals" }
-                                dd { (check.unaligned_interval_count.unwrap_or(0)) }
-                            } @else {
-                                dt { "Latest" }
-                                dd { (display_value(check.latest_value, &check.unit)) }
-                                dt { "Minimum" }
-                                dd { (display_value(check.minimum, &check.unit)) }
-                                dt { "Maximum" }
-                                dd { (display_value(check.maximum, &check.unit)) }
-                            }
-                            dt { "First observation" }
-                            dd { (check.observed_start.as_deref().unwrap_or("none")) }
-                            dt { "Last observation" }
-                            dd { (check.observed_end.as_deref().unwrap_or("none")) }
-                        }
-                    }
-                }
-                footer {
-                    p {
-                        "Generated " (status.generated_at)
-                        " from committed transaction " (status.transaction_sequence) ". "
-                        a href="status.json" { "JSON status" }
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn display_value(value: Option<f64>, unit: &str) -> String {
-    value.map_or_else(
-        || "none".to_string(),
-        |value| {
-            if unit.is_empty() {
-                format!("{value:.3}")
-            } else {
-                format!("{value:.3} {unit}")
-            }
-        },
-    )
-}
-
-fn format_duration(seconds: u64) -> String {
-    humantime::format_duration(std::time::Duration::from_secs(seconds)).to_string()
-}
-
-fn format_optional_duration(seconds: Option<f64>) -> String {
-    seconds.map_or_else(
-        || "none".to_string(),
-        |seconds| {
-            humantime::format_duration(std::time::Duration::from_secs_f64(seconds)).to_string()
-        },
-    )
-}
-
 fn format_timestamp(timestamp: DateTime<Utc>) -> String {
     timestamp.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
@@ -1332,6 +1217,10 @@ mod tests {
         BelowCheckConfig {
             id: "well-depth-low".to_string(),
             label: "Well depth above 40".to_string(),
+            description:
+                "At least one well-depth reading must reach 40 m in the trailing three hours."
+                    .to_string(),
+            href: "/data/well-depth.html".to_string(),
             source: "series:///well-depth".to_string(),
             timestamp_column: "timestamp".to_string(),
             value_column: "well_depth_value".to_string(),
@@ -1352,6 +1241,8 @@ mod tests {
         RateWhileCheckConfig {
             id: "chlorine-feed-response".to_string(),
             label: "Chlorine feed responds while well pump runs".to_string(),
+            description: "Chlorine level must increase while the well pump is running.".to_string(),
+            href: "/data/chlorine-level.html".to_string(),
             check_type: RateWhileType::RateWhile,
             measurement: MeasurementConfig {
                 source: "series:///chlorine-*".to_string(),
@@ -1467,6 +1358,8 @@ output_dir: /monitor
 checks:
   - id: chlorine-feed-response
     label: Chlorine feed responds while well pump runs
+    description: Chlorine level must increase while the well pump is running.
+    href: /data/chlorine-level.html
     type: rate-while
     measurement:
       source: oteljson:///ingest/casparwater*.json
@@ -1496,10 +1389,11 @@ checks:
     }
 
     #[test]
-    fn publish_writes_complete_html_and_json() {
+    fn publish_writes_authoritative_json_and_removes_legacy_html() {
         let output = tempfile::tempdir().expect("tempdir");
+        std::fs::write(output.path().join("index.html"), "legacy").expect("legacy html");
         let status = MonitorStatus {
-            schema_version: 2,
+            schema_version: 3,
             pond: "water-staging".to_string(),
             title: "Water status".to_string(),
             generated_at: "2026-09-01T00:00:00Z".to_string(),
@@ -1514,12 +1408,24 @@ checks:
 
         publish(&status, output.path()).expect("publish");
 
-        let html = std::fs::read_to_string(output.path().join("index.html")).expect("html");
         let json = std::fs::read_to_string(output.path().join("status.json")).expect("json");
-        assert!(html.contains("Water status"));
-        assert!(html.contains("alarm"));
+        assert!(!output.path().join("index.html").exists());
         assert!(json.contains("\"transaction_sequence\": 42"));
         assert!(json.contains("\"state\": \"alarm\""));
+        assert!(json.contains("\"href\": \"/data/well-depth.html\""));
+    }
+
+    #[test]
+    fn no_checks_is_a_valid_unknown_status() {
+        let config = MonitorConfig {
+            pond: "site-staging".to_string(),
+            title: "Site pond status".to_string(),
+            output_dir: "/monitor".to_string(),
+            checks: vec![],
+        };
+
+        validate(&config).expect("no-check reporting config");
+        assert_eq!(overall_state(&[]), CheckState::Unknown);
     }
 
     #[tokio::test]
