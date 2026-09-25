@@ -76,8 +76,8 @@ The cross-persistence contracts remain the underlying correctness baseline:
   allocate another write sequence.
 - `crates/cmd/tests/monitor_post_commit.rs` commits measurement, condition, and
   monitor-factory nodes through a real TLogFS `Ship`, then verifies post-commit
-  `rate-while` JSON/HTML output and confirms that monitoring allocates no
-  second write sequence.
+  `rate-while` JSON output and confirms that monitoring allocates no second
+  write sequence.
 
 ## 3. Post-commit dispatch
 
@@ -149,6 +149,28 @@ spec:
         unit: m
         threshold: 40
         window: 3h
+      - id: tank-level-low
+        label: "Tank level stays above 3 m"
+        description: "Every tank-level measurement in the trailing three hours must remain at or above 3 m."
+        href: "/data/tank-level.html"
+        type: any-observed-below
+        source: "oteljson:///ingest/casparwater*.json"
+        timestamp_column: timestamp
+        value_column: concrete_tank_level_value
+        unit: m
+        threshold: 3
+        window: 3h
+      - id: system-pressure-range
+        label: "System pressure stays within its operating range"
+        description: "The trailing one-hour average must remain between 1.2 and 2.2, inclusive."
+        href: "/data/system-pressure.html"
+        type: average-range
+        source: "oteljson:///ingest/casparwater*.json"
+        timestamp_column: timestamp
+        value_column: system_pressure_value
+        lower_bound: 1.2
+        upper_bound: 2.2
+        window: 1h
       - id: chlorine-feed-response
         label: "Chlorine feed responds while well pump runs"
         description: "Chlorine level must increase while the well pump is running."
@@ -228,6 +250,37 @@ the first rule, as explicitly selected; the page still displays sample count,
 first and last observation times, latest value, minimum, and maximum so an
 operator can see sparse coverage.
 
+### Any-observed-below
+
+`any-observed-below` uses the same bounded scalar query but alarms if one or
+more observations are strictly below the threshold:
+
+```text
+no observations                         -> unknown
+any observation has value < threshold   -> alarm
+all observations have value >= threshold -> healthy
+```
+
+The tank-level rule therefore treats one reading below 3 m in the trailing
+three hours as an alarm. Equality at 3 m is healthy; measurements are never
+averaged for this rule.
+
+### Average-range
+
+`average-range` calculates the arithmetic mean of all non-null measurements in
+the bounded window and compares it with inclusive bounds:
+
+```text
+no observations                                  -> unknown
+average < lower_bound or average > upper_bound   -> alarm
+lower_bound <= average <= upper_bound             -> healthy
+```
+
+The system-pressure rule evaluates a trailing one-hour mean against
+`[1.2, 2.2]`. Its JSON evidence includes the observed average and both bounds,
+as well as the common sample count, time bounds, latest value, minimum, and
+maximum.
+
 ## 6. Rate-while rules
 
 `rate-while` is a typed monitor, not user-supplied SQL. Its current vocabulary
@@ -287,15 +340,17 @@ Each run produces one authoritative artifact:
   status.json
 ```
 
-`status.json` is versioned with `schema_version: 3` and contains:
+`status.json` is versioned with `schema_version: 4` and contains:
 
 - pond and report title;
 - generation time and committed transaction sequence;
 - overall `healthy`, `alarm`, or `unknown` state; and
-- per-check description and graph link, rule, source, unit, threshold, window,
-  sample count, time bounds, latest value, minimum, and maximum. Rate checks
-  additionally include their condition source, active and required evidence
-  time, accumulated change, calculated rate, and alignment counts.
+- per-check description and graph link, rule, source, unit, window, sample
+  count, time bounds, latest value, minimum, and maximum. Threshold rules
+  include `threshold`; average-range rules include `average`, `lower_bound`,
+  and `upper_bound`; rate checks additionally include their condition source,
+  active and required evidence time, accumulated change, calculated rate, and
+  alignment counts.
 
 A pond with no domain checks may still publish a reporting heartbeat. Its
 overall state is `unknown` and its empty `checks` array explicitly distinguishes

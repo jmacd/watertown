@@ -34,6 +34,8 @@ struct MonitorConfig {
 #[serde(untagged)]
 enum CheckConfig {
     RateWhile(RateWhileCheckConfig),
+    AnyObservedBelow(AnyObservedBelowCheckConfig),
+    AverageRange(AverageRangeCheckConfig),
     AllObservedBelow(BelowCheckConfig),
 }
 
@@ -53,6 +55,110 @@ struct BelowCheckConfig {
     threshold: f64,
     window: String,
 }
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+enum AnyObservedBelowType {
+    #[serde(rename = "any-observed-below")]
+    AnyObservedBelow,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AnyObservedBelowCheckConfig {
+    id: String,
+    label: String,
+    description: String,
+    href: String,
+    #[serde(rename = "type")]
+    check_type: AnyObservedBelowType,
+    source: String,
+    #[serde(default = "default_timestamp_column")]
+    timestamp_column: String,
+    value_column: String,
+    #[serde(default)]
+    unit: String,
+    threshold: f64,
+    window: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+enum AverageRangeType {
+    #[serde(rename = "average-range")]
+    AverageRange,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AverageRangeCheckConfig {
+    id: String,
+    label: String,
+    description: String,
+    href: String,
+    #[serde(rename = "type")]
+    check_type: AverageRangeType,
+    source: String,
+    #[serde(default = "default_timestamp_column")]
+    timestamp_column: String,
+    value_column: String,
+    #[serde(default)]
+    unit: String,
+    lower_bound: f64,
+    upper_bound: f64,
+    window: String,
+}
+
+trait ScalarCheck {
+    fn id(&self) -> &str;
+    fn label(&self) -> &str;
+    fn description(&self) -> &str;
+    fn href(&self) -> &str;
+    fn source(&self) -> &str;
+    fn timestamp_column(&self) -> &str;
+    fn value_column(&self) -> &str;
+    fn window(&self) -> &str;
+}
+
+macro_rules! impl_scalar_check {
+    ($type:ty) => {
+        impl ScalarCheck for $type {
+            fn id(&self) -> &str {
+                &self.id
+            }
+
+            fn label(&self) -> &str {
+                &self.label
+            }
+
+            fn description(&self) -> &str {
+                &self.description
+            }
+
+            fn href(&self) -> &str {
+                &self.href
+            }
+
+            fn source(&self) -> &str {
+                &self.source
+            }
+
+            fn timestamp_column(&self) -> &str {
+                &self.timestamp_column
+            }
+
+            fn value_column(&self) -> &str {
+                &self.value_column
+            }
+
+            fn window(&self) -> &str {
+                &self.window
+            }
+        }
+    };
+}
+
+impl_scalar_check!(BelowCheckConfig);
+impl_scalar_check!(AnyObservedBelowCheckConfig);
+impl_scalar_check!(AverageRangeCheckConfig);
 
 fn default_timestamp_column() -> String {
     "timestamp".to_string()
@@ -196,7 +302,12 @@ struct CheckStatus {
     source: String,
     value_column: String,
     unit: String,
-    threshold: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    threshold: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lower_bound: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upper_bound: Option<f64>,
     window_seconds: u64,
     sample_count: usize,
     observed_start: Option<String>,
@@ -204,6 +315,8 @@ struct CheckStatus {
     latest_value: Option<f64>,
     minimum: Option<f64>,
     maximum: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    average: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     condition_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -279,6 +392,8 @@ fn validate(config: &MonitorConfig) -> tinyfs::Result<()> {
         }
         match check {
             CheckConfig::AllObservedBelow(check) => validate_below_check(check)?,
+            CheckConfig::AnyObservedBelow(check) => validate_any_observed_below_check(check)?,
+            CheckConfig::AverageRange(check) => validate_average_range_check(check)?,
             CheckConfig::RateWhile(check) => validate_rate_while_check(check)?,
         }
     }
@@ -289,32 +404,67 @@ impl CheckConfig {
     fn id(&self) -> &str {
         match self {
             Self::AllObservedBelow(check) => &check.id,
+            Self::AnyObservedBelow(check) => &check.id,
+            Self::AverageRange(check) => &check.id,
             Self::RateWhile(check) => &check.id,
         }
     }
 }
 
 fn validate_below_check(check: &BelowCheckConfig) -> tinyfs::Result<()> {
-    if check.label.trim().is_empty()
-        || check.description.trim().is_empty()
-        || check.href.trim().is_empty()
-        || check.source.trim().is_empty()
-        || check.timestamp_column.trim().is_empty()
-        || check.value_column.trim().is_empty()
-    {
-        return Err(tinyfs::Error::Other(format!(
-            "monitor-report check '{}' has an empty label, description, href, source, timestamp_column, or value_column",
-            check.id
-        )));
-    }
-    validate_href(&check.id, &check.href)?;
+    validate_scalar_check(check)?;
     if !check.threshold.is_finite() {
         return Err(tinyfs::Error::Other(format!(
             "monitor-report check '{}' threshold must be finite",
             check.id
         )));
     }
-    let _ = validate_duration(&check.id, "window", &check.window)?;
+    Ok(())
+}
+
+fn validate_any_observed_below_check(check: &AnyObservedBelowCheckConfig) -> tinyfs::Result<()> {
+    validate_scalar_check(check)?;
+    if !check.threshold.is_finite() {
+        return Err(tinyfs::Error::Other(format!(
+            "monitor-report check '{}' threshold must be finite",
+            check.id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_average_range_check(check: &AverageRangeCheckConfig) -> tinyfs::Result<()> {
+    validate_scalar_check(check)?;
+    if !check.lower_bound.is_finite() || !check.upper_bound.is_finite() {
+        return Err(tinyfs::Error::Other(format!(
+            "monitor-report check '{}' range bounds must be finite",
+            check.id
+        )));
+    }
+    if check.lower_bound > check.upper_bound {
+        return Err(tinyfs::Error::Other(format!(
+            "monitor-report check '{}' lower_bound cannot exceed upper_bound",
+            check.id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_scalar_check(check: &impl ScalarCheck) -> tinyfs::Result<()> {
+    if check.label().trim().is_empty()
+        || check.description().trim().is_empty()
+        || check.href().trim().is_empty()
+        || check.source().trim().is_empty()
+        || check.timestamp_column().trim().is_empty()
+        || check.value_column().trim().is_empty()
+    {
+        return Err(tinyfs::Error::Other(format!(
+            "monitor-report check '{}' has an empty label, description, href, source, timestamp_column, or value_column",
+            check.id()
+        )));
+    }
+    validate_href(check.id(), check.href())?;
+    let _ = validate_duration(check.id(), "window", check.window())?;
     Ok(())
 }
 
@@ -421,7 +571,7 @@ async fn execute(
 
     let state = overall_state(&checks);
     let status = MonitorStatus {
-        schema_version: 3,
+        schema_version: 4,
         pond: config.pond,
         title: config.title,
         generated_at: format_timestamp(generated_at),
@@ -449,6 +599,12 @@ async fn evaluate_check(
         CheckConfig::AllObservedBelow(config) => {
             evaluate_below_check(config, root, provider_context, period_end).await
         }
+        CheckConfig::AnyObservedBelow(config) => {
+            evaluate_any_observed_below_check(config, root, provider_context, period_end).await
+        }
+        CheckConfig::AverageRange(config) => {
+            evaluate_average_range_check(config, root, provider_context, period_end).await
+        }
         CheckConfig::RateWhile(config) => {
             evaluate_rate_while_check(config, root, provider_context, period_end).await
         }
@@ -461,11 +617,50 @@ async fn evaluate_below_check(
     provider_context: &tinyfs::ProviderContext,
     period_end: DateTime<Utc>,
 ) -> tinyfs::Result<CheckStatus> {
-    let window = humantime::parse_duration(&config.window).map_err(|error| {
-        tinyfs::Error::Other(format!(
-            "invalid monitor window '{}': {error}",
-            config.window
-        ))
+    let (window_seconds, samples) =
+        collect_scalar_window(config, root, provider_context, period_end).await?;
+    Ok(classify_all_observed_below(
+        config,
+        window_seconds,
+        &samples,
+    ))
+}
+
+async fn evaluate_any_observed_below_check(
+    config: &AnyObservedBelowCheckConfig,
+    root: &tinyfs::WD,
+    provider_context: &tinyfs::ProviderContext,
+    period_end: DateTime<Utc>,
+) -> tinyfs::Result<CheckStatus> {
+    let (window_seconds, samples) =
+        collect_scalar_window(config, root, provider_context, period_end).await?;
+    Ok(classify_any_observed_below(
+        config,
+        window_seconds,
+        &samples,
+    ))
+}
+
+async fn evaluate_average_range_check(
+    config: &AverageRangeCheckConfig,
+    root: &tinyfs::WD,
+    provider_context: &tinyfs::ProviderContext,
+    period_end: DateTime<Utc>,
+) -> tinyfs::Result<CheckStatus> {
+    let (window_seconds, samples) =
+        collect_scalar_window(config, root, provider_context, period_end).await?;
+    classify_average_range(config, window_seconds, &samples)
+}
+
+async fn collect_scalar_window(
+    config: &impl ScalarCheck,
+    root: &tinyfs::WD,
+    provider_context: &tinyfs::ProviderContext,
+    period_end: DateTime<Utc>,
+) -> tinyfs::Result<(u64, Vec<Sample>)> {
+    let window_text = config.window();
+    let window = humantime::parse_duration(window_text).map_err(|error| {
+        tinyfs::Error::Other(format!("invalid monitor window '{window_text}': {error}"))
     })?;
     let chrono_window = chrono::Duration::from_std(window)
         .map_err(|error| tinyfs::Error::Other(format!("monitor window is too large: {error}")))?;
@@ -473,12 +668,11 @@ async fn evaluate_below_check(
         .checked_sub_signed(chrono_window)
         .ok_or_else(|| {
             tinyfs::Error::Other(format!(
-                "monitor window '{}' exceeds the timestamp range",
-                config.window
+                "monitor window '{window_text}' exceeds the timestamp range"
             ))
         })?;
     let samples = collect_samples(config, root, provider_context, period_start, period_end).await?;
-    Ok(classify_check(config, window.as_secs(), &samples))
+    Ok((window.as_secs(), samples))
 }
 
 async fn evaluate_rate_while_check(
@@ -684,15 +878,15 @@ fn finish_monitor_query<T>(
 }
 
 async fn collect_samples(
-    config: &BelowCheckConfig,
+    config: &impl ScalarCheck,
     root: &tinyfs::WD,
     provider_context: &tinyfs::ProviderContext,
     period_start: DateTime<Utc>,
     period_end: DateTime<Utc>,
 ) -> tinyfs::Result<Vec<Sample>> {
     let Some((table_name, table_ref)) = register_monitor_source(
-        &config.id,
-        &config.source,
+        config.id(),
+        config.source(),
         root,
         provider_context,
         period_start,
@@ -704,14 +898,14 @@ async fn collect_samples(
     let result = query_samples(
         &provider_context.datafusion_session,
         &table_name,
-        &config.timestamp_column,
-        &config.value_column,
+        config.timestamp_column(),
+        config.value_column(),
         period_start,
         period_end,
     )
     .await;
     finish_monitor_query(
-        &config.id,
+        config.id(),
         result,
         provider_context
             .datafusion_session
@@ -943,7 +1137,7 @@ fn decode_condition_samples(
     Ok(samples)
 }
 
-fn classify_check(
+fn classify_all_observed_below(
     config: &BelowCheckConfig,
     window_seconds: u64,
     samples: &[Sample],
@@ -967,7 +1161,9 @@ fn classify_check(
         source: config.source.clone(),
         value_column: config.value_column.clone(),
         unit: config.unit.clone(),
-        threshold: config.threshold,
+        threshold: Some(config.threshold),
+        lower_bound: None,
+        upper_bound: None,
         window_seconds,
         sample_count: samples.len(),
         observed_start: samples
@@ -979,6 +1175,7 @@ fn classify_check(
         latest_value: samples.last().map(|sample| sample.value),
         minimum,
         maximum,
+        average: None,
         condition_source: None,
         active_seconds: None,
         minimum_active_seconds: None,
@@ -987,6 +1184,121 @@ fn classify_check(
         aligned_interval_count: None,
         unaligned_interval_count: None,
     }
+}
+
+fn classify_any_observed_below(
+    config: &AnyObservedBelowCheckConfig,
+    window_seconds: u64,
+    samples: &[Sample],
+) -> CheckStatus {
+    let state = if samples.is_empty() {
+        CheckState::Unknown
+    } else if samples.iter().any(|sample| sample.value < config.threshold) {
+        CheckState::Alarm
+    } else {
+        CheckState::Healthy
+    };
+    let minimum = samples.iter().map(|sample| sample.value).reduce(f64::min);
+    let maximum = samples.iter().map(|sample| sample.value).reduce(f64::max);
+    CheckStatus {
+        id: config.id.clone(),
+        label: config.label.clone(),
+        description: config.description.clone(),
+        href: config.href.clone(),
+        state,
+        rule: "any-observed-below",
+        source: config.source.clone(),
+        value_column: config.value_column.clone(),
+        unit: config.unit.clone(),
+        threshold: Some(config.threshold),
+        lower_bound: None,
+        upper_bound: None,
+        window_seconds,
+        sample_count: samples.len(),
+        observed_start: samples
+            .first()
+            .map(|sample| format_timestamp(sample.timestamp)),
+        observed_end: samples
+            .last()
+            .map(|sample| format_timestamp(sample.timestamp)),
+        latest_value: samples.last().map(|sample| sample.value),
+        minimum,
+        maximum,
+        average: None,
+        condition_source: None,
+        active_seconds: None,
+        minimum_active_seconds: None,
+        accumulated_change: None,
+        rate: None,
+        aligned_interval_count: None,
+        unaligned_interval_count: None,
+    }
+}
+
+fn classify_average_range(
+    config: &AverageRangeCheckConfig,
+    window_seconds: u64,
+    samples: &[Sample],
+) -> tinyfs::Result<CheckStatus> {
+    let average = if samples.is_empty() {
+        None
+    } else {
+        let average = samples
+            .iter()
+            .enumerate()
+            .fold(0.0, |average, (index, sample)| {
+                average + (sample.value - average) / (index + 1) as f64
+            });
+        if !average.is_finite() {
+            return Err(tinyfs::Error::Other(format!(
+                "monitor check '{}' produced a non-finite average",
+                config.id
+            )));
+        }
+        Some(average)
+    };
+    let state = match average {
+        None => CheckState::Unknown,
+        Some(average) if average < config.lower_bound || average > config.upper_bound => {
+            CheckState::Alarm
+        }
+        Some(_) => CheckState::Healthy,
+    };
+    let minimum = samples.iter().map(|sample| sample.value).reduce(f64::min);
+    let maximum = samples.iter().map(|sample| sample.value).reduce(f64::max);
+    Ok(CheckStatus {
+        id: config.id.clone(),
+        label: config.label.clone(),
+        description: config.description.clone(),
+        href: config.href.clone(),
+        state,
+        rule: "average-range",
+        source: config.source.clone(),
+        value_column: config.value_column.clone(),
+        unit: config.unit.clone(),
+        threshold: None,
+        lower_bound: Some(config.lower_bound),
+        upper_bound: Some(config.upper_bound),
+        window_seconds,
+        sample_count: samples.len(),
+        observed_start: samples
+            .first()
+            .map(|sample| format_timestamp(sample.timestamp)),
+        observed_end: samples
+            .last()
+            .map(|sample| format_timestamp(sample.timestamp)),
+        latest_value: samples.last().map(|sample| sample.value),
+        minimum,
+        maximum,
+        average,
+        condition_source: None,
+        active_seconds: None,
+        minimum_active_seconds: None,
+        accumulated_change: None,
+        rate: None,
+        aligned_interval_count: None,
+        unaligned_interval_count: None,
+    })
 }
 
 fn classify_rate_while(
@@ -1096,7 +1408,9 @@ fn classify_rate_while(
         source: config.measurement.source.clone(),
         value_column: config.measurement.column.clone(),
         unit: config.alarm.unit.clone(),
-        threshold: config.alarm.value,
+        threshold: Some(config.alarm.value),
+        lower_bound: None,
+        upper_bound: None,
         window_seconds,
         sample_count: measurements.len(),
         observed_start: measurements
@@ -1108,6 +1422,7 @@ fn classify_rate_while(
         latest_value: measurements.last().map(|sample| sample.value),
         minimum,
         maximum,
+        average: None,
         condition_source: Some(config.condition.source.clone()),
         active_seconds: Some(active_seconds),
         minimum_active_seconds: Some(minimum_active_time.as_secs()),
@@ -1273,6 +1588,39 @@ mod tests {
         }
     }
 
+    fn any_below_config() -> AnyObservedBelowCheckConfig {
+        AnyObservedBelowCheckConfig {
+            id: "tank-level-low".to_string(),
+            label: "Tank level stays above 3 m".to_string(),
+            description: "Every tank-level reading must remain at or above 3 m.".to_string(),
+            href: "/data/tank-level.html".to_string(),
+            check_type: AnyObservedBelowType::AnyObservedBelow,
+            source: "series:///tank-level".to_string(),
+            timestamp_column: "timestamp".to_string(),
+            value_column: "tank_level_value".to_string(),
+            unit: "m".to_string(),
+            threshold: 3.0,
+            window: "3h".to_string(),
+        }
+    }
+
+    fn average_range_config() -> AverageRangeCheckConfig {
+        AverageRangeCheckConfig {
+            id: "system-pressure-range".to_string(),
+            label: "System pressure stays within its operating range".to_string(),
+            description: "The one-hour average must remain between 1.2 and 2.2.".to_string(),
+            href: "/data/system-pressure.html".to_string(),
+            check_type: AverageRangeType::AverageRange,
+            source: "series:///system-pressure".to_string(),
+            timestamp_column: "timestamp".to_string(),
+            value_column: "system_pressure_value".to_string(),
+            unit: "bar".to_string(),
+            lower_bound: 1.2,
+            upper_bound: 2.2,
+            window: "1h".to_string(),
+        }
+    }
+
     fn rate_sample(seconds: i64, value: f64, positive_delta: Option<f64>) -> RateSample {
         RateSample {
             timestamp: DateTime::from_timestamp(seconds, 0).expect("valid timestamp"),
@@ -1292,17 +1640,81 @@ mod tests {
     fn all_observed_below_requires_at_least_one_sample() {
         let check = config();
         assert_eq!(
-            classify_check(&check, 10_800, &[]).state,
+            classify_all_observed_below(&check, 10_800, &[]).state,
             CheckState::Unknown
         );
         assert_eq!(
-            classify_check(&check, 10_800, &[sample(1, 39.9), sample(10_000, 20.0)]).state,
+            classify_all_observed_below(&check, 10_800, &[sample(1, 39.9), sample(10_000, 20.0)])
+                .state,
             CheckState::Alarm
         );
         assert_eq!(
-            classify_check(&check, 10_800, &[sample(1, 39.9), sample(2, 40.0)]).state,
+            classify_all_observed_below(&check, 10_800, &[sample(1, 39.9), sample(2, 40.0)]).state,
             CheckState::Healthy
         );
+    }
+
+    #[test]
+    fn any_observed_below_alarms_on_one_low_sample() {
+        let check = any_below_config();
+        assert_eq!(
+            classify_any_observed_below(&check, 10_800, &[]).state,
+            CheckState::Unknown
+        );
+        assert_eq!(
+            classify_any_observed_below(
+                &check,
+                10_800,
+                &[sample(1, 3.1), sample(2, 2.99), sample(3, 3.2)]
+            )
+            .state,
+            CheckState::Alarm
+        );
+        assert_eq!(
+            classify_any_observed_below(&check, 10_800, &[sample(1, 3.0), sample(2, 3.2)]).state,
+            CheckState::Healthy
+        );
+    }
+
+    #[test]
+    fn average_range_is_inclusive_and_requires_samples() {
+        let check = average_range_config();
+        assert_eq!(
+            classify_average_range(&check, 3_600, &[])
+                .expect("empty classification")
+                .state,
+            CheckState::Unknown
+        );
+        let lower = classify_average_range(&check, 3_600, &[sample(1, 1.0), sample(2, 1.4)])
+            .expect("lower bound");
+        assert_eq!(lower.state, CheckState::Healthy);
+        assert_eq!(lower.average, Some(1.2));
+        let upper = classify_average_range(&check, 3_600, &[sample(1, 2.0), sample(2, 2.4)])
+            .expect("upper bound");
+        assert_eq!(upper.state, CheckState::Healthy);
+        assert_eq!(upper.average, Some(2.2));
+        assert_eq!(
+            classify_average_range(&check, 3_600, &[sample(1, 1.0), sample(2, 1.3)])
+                .expect("below range")
+                .state,
+            CheckState::Alarm
+        );
+        assert_eq!(
+            classify_average_range(&check, 3_600, &[sample(1, 2.2), sample(2, 2.3)])
+                .expect("above range")
+                .state,
+            CheckState::Alarm
+        );
+    }
+
+    #[test]
+    fn average_range_rejects_reversed_bounds() {
+        let mut check = average_range_config();
+        check.lower_bound = 2.2;
+        check.upper_bound = 1.2;
+
+        let error = validate_average_range_check(&check).expect_err("reversed bounds");
+        assert!(error.to_string().contains("lower_bound cannot exceed"));
     }
 
     #[test]
@@ -1350,12 +1762,35 @@ mod tests {
     }
 
     #[test]
-    fn rate_while_yaml_is_strictly_typed() {
+    fn monitor_yaml_is_strictly_typed() {
         let yaml = br#"
 pond: water-staging
 title: Water status
 output_dir: /monitor
 checks:
+  - id: tank-level-low
+    label: Tank level stays above 3 m
+    description: Every tank-level reading must remain at or above 3 m.
+    href: /data/tank-level.html
+    type: any-observed-below
+    source: oteljson:///ingest/casparwater*.json
+    timestamp_column: timestamp
+    value_column: tank_level_value
+    unit: m
+    threshold: 3
+    window: 3h
+  - id: system-pressure-range
+    label: System pressure stays within its operating range
+    description: The one-hour average must remain between 1.2 and 2.2.
+    href: /data/system-pressure.html
+    type: average-range
+    source: oteljson:///ingest/casparwater*.json
+    timestamp_column: timestamp
+    value_column: system_pressure_value
+    unit: bar
+    lower_bound: 1.2
+    upper_bound: 2.2
+    window: 1h
   - id: chlorine-feed-response
     label: Chlorine feed responds while well pump runs
     description: Chlorine level must increase while the well pump is running.
@@ -1385,7 +1820,9 @@ checks:
 "#;
         let config: MonitorConfig = serde_yaml::from_slice(yaml).expect("rate-while config");
         validate(&config).expect("valid config");
-        assert!(matches!(config.checks[0], CheckConfig::RateWhile(_)));
+        assert!(matches!(config.checks[0], CheckConfig::AnyObservedBelow(_)));
+        assert!(matches!(config.checks[1], CheckConfig::AverageRange(_)));
+        assert!(matches!(config.checks[2], CheckConfig::RateWhile(_)));
     }
 
     #[test]
@@ -1393,13 +1830,13 @@ checks:
         let output = tempfile::tempdir().expect("tempdir");
         std::fs::write(output.path().join("index.html"), "legacy").expect("legacy html");
         let status = MonitorStatus {
-            schema_version: 3,
+            schema_version: 4,
             pond: "water-staging".to_string(),
             title: "Water status".to_string(),
             generated_at: "2026-09-01T00:00:00Z".to_string(),
             transaction_sequence: 42,
             state: CheckState::Alarm,
-            checks: vec![classify_check(
+            checks: vec![classify_all_observed_below(
                 &config(),
                 10_800,
                 &[sample(1, 39.0), sample(2, 38.0)],
@@ -1483,6 +1920,78 @@ checks:
         assert_eq!(value["transaction_sequence"], 7);
         assert_eq!(value["checks"][0]["sample_count"], 2);
         assert_eq!(value["checks"][0]["maximum"], 39.5);
+    }
+
+    #[tokio::test]
+    async fn factory_evaluates_any_below_and_average_range() {
+        let output = tempfile::tempdir().expect("tempdir");
+        let persistence = tinyfs::MemoryPersistence::default();
+        let filesystem = tinyfs::FS::new(persistence.clone())
+            .await
+            .expect("filesystem");
+        let session = Arc::new(SessionContext::new());
+        provider::register_tinyfs_object_store(&session, persistence.clone())
+            .expect("object store");
+        let provider_context = tinyfs::ProviderContext::new(session, Arc::new(persistence.clone()));
+        let root = filesystem.root().await.expect("root");
+        let now = Utc::now();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new(
+                    "timestamp",
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    false,
+                ),
+                Field::new("tank_level_value", DataType::Float64, false),
+                Field::new("system_pressure_value", DataType::Float64, false),
+            ])),
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    (now - chrono::Duration::minutes(30)).timestamp_micros(),
+                    (now - chrono::Duration::minutes(1)).timestamp_micros(),
+                ])),
+                Arc::new(Float64Array::from(vec![3.2, 2.9])),
+                Arc::new(Float64Array::from(vec![1.0, 1.4])),
+            ],
+        )
+        .expect("batch");
+        root.create_series_from_batch("/measurements", &batch, Some("timestamp"))
+            .await
+            .expect("series");
+
+        let mut any_below = any_below_config();
+        any_below.source = "series:///measurements".to_string();
+        let mut average_range = average_range_config();
+        average_range.source = "series:///measurements".to_string();
+        let config = MonitorConfig {
+            pond: "water-staging".to_string(),
+            title: "Water status".to_string(),
+            output_dir: output.path().to_string_lossy().into_owned(),
+            checks: vec![
+                CheckConfig::AnyObservedBelow(any_below),
+                CheckConfig::AverageRange(average_range),
+            ],
+        };
+        execute(
+            serde_json::to_value(config).expect("config"),
+            FactoryContext::new(provider_context, tinyfs::FileID::root()).with_txn_seq(8),
+            ExecutionContext::control_reader(vec!["push".to_string()]),
+        )
+        .await
+        .expect("execute monitor");
+
+        let json = std::fs::read_to_string(output.path().join("status.json")).expect("json");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("status json");
+        assert_eq!(value["schema_version"], 4);
+        assert_eq!(value["state"], "alarm");
+        assert_eq!(value["checks"][0]["rule"], "any-observed-below");
+        assert_eq!(value["checks"][0]["state"], "alarm");
+        assert_eq!(value["checks"][0]["minimum"], 2.9);
+        assert_eq!(value["checks"][1]["rule"], "average-range");
+        assert_eq!(value["checks"][1]["state"], "healthy");
+        assert_eq!(value["checks"][1]["average"], 1.2);
+        assert_eq!(value["checks"][1]["lower_bound"], 1.2);
+        assert_eq!(value["checks"][1]["upper_bound"], 2.2);
     }
 
     #[tokio::test]
