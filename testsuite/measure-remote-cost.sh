@@ -26,6 +26,7 @@ ENDPOINT="${MINIO_ENDPOINT:-http://localhost:9000}"
 BUCKET="${BUCKET:-measure-$(date +%s)}"
 TICKS="${TICKS:-40}"
 WORK="${WORK:-/tmp/wt-measure}"
+MC_IMAGE="${MC_IMAGE:-watertown-test:latest}"
 
 export MINIO_ROOT_USER=minioadmin
 export MINIO_ROOT_PASSWORD=minioadmin
@@ -35,7 +36,7 @@ export RUST_LOG=warn
 mc() {
     podman run --rm --network=host --entrypoint mc \
         -e MC_HOST_local="http://minioadmin:minioadmin@localhost:9000" \
-        quay.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 "$@"
+        "$MC_IMAGE" "$@"
 }
 
 rm -rf "$WORK"
@@ -65,7 +66,7 @@ fi
 # client believed it asked for.
 podman run --rm --network=host --entrypoint mc \
     -e MC_HOST_local="http://minioadmin:minioadmin@localhost:9000" \
-    quay.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 admin trace --no-color local >"$WORK/trace.log" 2>&1 &
+    "$MC_IMAGE" admin trace --no-color local >"$WORK/trace.log" 2>&1 &
 TRACE_JOB=$!
 trap 'kill "$TRACE_JOB" 2>/dev/null || true' EXIT
 sleep 4

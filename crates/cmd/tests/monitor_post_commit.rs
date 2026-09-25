@@ -140,7 +140,7 @@ async fn rate_while_monitor_reads_committed_snapshot_after_commit() -> Result<()
 
     let status: serde_json::Value =
         serde_json::from_slice(&std::fs::read(output_path.join("status.json"))?)?;
-    assert_eq!(status["schema_version"], 3);
+    assert_eq!(status["schema_version"], 4);
     assert_eq!(status["transaction_sequence"], committed_sequence);
     assert_eq!(status["state"], "healthy");
     assert_eq!(status["checks"][0]["rule"], "rate-while");
