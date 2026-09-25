@@ -16,8 +16,6 @@ WORKDIR /vendor
 COPY vendor-download.sh download.sh
 RUN bash download.sh
 
-FROM quay.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 AS minio-client
-
 FROM debian:bookworm-slim
 
 # Install runtime dependencies and useful debugging tools
@@ -55,9 +53,21 @@ RUN apt-get update && \
         git \
     && rm -rf /var/lib/apt/lists/*
 
-# The legacy dl.min.io binary endpoint is gone. Copy the multi-arch client
-# from its immutable official image instead.
-COPY --from=minio-client /usr/bin/mc /usr/local/bin/mc
+# Install the last open-source MinIO client release from its immutable GitHub
+# release asset. MinIO's former public container image is no longer pullable.
+ARG MC_RELEASE=RELEASE.2025-08-13T08-35-41Z
+RUN ARCH=$(dpkg --print-architecture) && \
+    case "$ARCH" in \
+        amd64) MC_ARCH="amd64"; MC_SHA256="01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891" ;; \
+        arm64) MC_ARCH="arm64"; MC_SHA256="14c8c9616cfce4636add161304353244e8de383b2e2752c0e9dad01d4c27c12c" ;; \
+        *) echo "Unsupported architecture for MinIO client: $ARCH" >&2; exit 1 ;; \
+    esac && \
+    MC_BINARY="mc.linux-${MC_ARCH}.${MC_RELEASE}" && \
+    curl -fsSL --retry 5 \
+        "https://github.com/minio/mc/releases/download/${MC_RELEASE}/${MC_BINARY}" \
+        -o /usr/local/bin/mc && \
+    echo "${MC_SHA256}  /usr/local/bin/mc" | sha256sum -c - && \
+    chmod +x /usr/local/bin/mc
 
 # Install DuckDB for backup verification and emergency recovery
 # Detect architecture and download appropriate version
