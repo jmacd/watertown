@@ -153,6 +153,14 @@ ${CONTAINER_RT} build \
     -t watertown-test:latest \
     .
 
+echo ""
+echo "=== Building MinIO test image ==="
+${CONTAINER_RT} build \
+    -f Dockerfile \
+    --target minio-server \
+    -t watertown-minio-test:latest \
+    .
+
 # Clean up copied binary and scripts
 rm -f "${SCRIPT_DIR}/pond"
 rm -f "${SCRIPT_DIR}/vendor-download.sh"
@@ -160,6 +168,7 @@ rm -f "${SCRIPT_DIR}/vendor-download.sh"
 echo ""
 echo "=== Build complete ==="
 echo "Image: watertown-test:latest"
+echo "Image: watertown-minio-test:latest"
 echo ""
 echo "Test with:"
 echo "  ${CONTAINER_RT} run --rm -it watertown-test:latest"

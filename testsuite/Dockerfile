@@ -16,7 +16,36 @@ WORKDIR /vendor
 COPY vendor-download.sh download.sh
 RUN bash download.sh
 
-FROM debian:bookworm-slim
+FROM golang:1.24.8-bookworm AS minio-builder
+ARG MINIO_COMMIT=9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a
+ARG MINIO_SOURCE_SHA256=45521908307306e925c98d629e1c17d78c8b72b6ee242b1bfb1409f7d8ee5841
+ARG MINIO_RELEASE=RELEASE.2025-10-15T17-29-55Z
+WORKDIR /src
+RUN curl -fsSL --retry 5 \
+        "https://github.com/minio/minio/archive/${MINIO_COMMIT}.tar.gz" \
+        -o /tmp/minio.tar.gz && \
+    echo "${MINIO_SOURCE_SHA256}  /tmp/minio.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/minio.tar.gz --strip-components=1 && \
+    rm /tmp/minio.tar.gz
+RUN CGO_ENABLED=0 go build -tags kqueue -trimpath \
+    -ldflags "-s -w \
+        -X github.com/minio/minio/cmd.Version=2025-10-15T17:29:55Z \
+        -X github.com/minio/minio/cmd.CopyrightYear=2025 \
+        -X github.com/minio/minio/cmd.ReleaseTag=${MINIO_RELEASE} \
+        -X github.com/minio/minio/cmd.CommitID=${MINIO_COMMIT} \
+        -X github.com/minio/minio/cmd.ShortCommitID=9e49d5e7a648" \
+    -o /usr/local/bin/minio .
+
+FROM debian:bookworm-slim AS minio-server
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/*
+COPY --from=minio-builder /usr/local/bin/minio /usr/local/bin/minio
+VOLUME ["/data"]
+ENTRYPOINT ["/usr/local/bin/minio"]
+CMD ["server", "/data"]
+
+FROM debian:bookworm-slim AS watertown-test
 
 # Install runtime dependencies and useful debugging tools
 RUN apt-get update && \
