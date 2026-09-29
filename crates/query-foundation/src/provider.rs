@@ -101,6 +101,11 @@ impl TableProvider for ChunkTableProvider {
                 .await;
         }
 
+        for object in &selected {
+            let store = state.runtime_env().object_store(object.object_store())?;
+            _ = store.head(object.prefix()).await?;
+        }
+
         let format = ParquetFormat::default().with_enable_pruning(true);
         let options = ListingOptions::new(Arc::new(format));
         let config = ListingTableConfig::new_with_multi_paths(selected)

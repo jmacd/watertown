@@ -161,6 +161,15 @@ impl FoundationFixture {
         batches: &[RecordBatch],
         max_row_group_size: usize,
     ) -> Result<u64> {
+        let schema = batches
+            .first()
+            .map(RecordBatch::schema)
+            .ok_or_else(|| DataFusionError::Plan("Parquet fixture requires a batch".to_owned()))?;
+        if batches.iter().any(|batch| batch.schema() != schema) {
+            return Err(DataFusionError::Plan(
+                "all batches in one Parquet fixture must share a schema".to_owned(),
+            ));
+        }
         let properties = WriterProperties::builder()
             .set_max_row_group_size(max_row_group_size)
             .set_compression(Compression::UNCOMPRESSED)
@@ -168,8 +177,7 @@ impl FoundationFixture {
             .build();
         let mut bytes = Vec::new();
         {
-            let mut writer =
-                ArrowWriter::try_new(&mut bytes, Arc::clone(&self.schema), Some(properties))?;
+            let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(properties))?;
             for batch in batches {
                 writer.write(batch)?;
             }
@@ -181,26 +189,22 @@ impl FoundationFixture {
     }
 
     /// Capture exact current membership without consulting later store listings.
-    pub fn snapshot(&self, snapshot_id: &str, paths: &[&str]) -> Result<DatasetSnapshot> {
-        let chunks = paths
+    pub fn snapshot(&self, snapshot_id: &str, chunks: &[(&str, u64)]) -> Result<DatasetSnapshot> {
+        let chunks = chunks
             .iter()
             .enumerate()
-            .map(|(sequence, path)| {
+            .map(|(sequence, (path, logical_count))| {
                 Ok(ChunkDescriptor::new(
                     *path,
                     sequence as u64,
                     ObjectDescriptor::new(self.object_url(path)?),
-                    0,
+                    Arc::clone(&self.schema),
+                    *logical_count,
                     None,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(DatasetSnapshot::new(
-            snapshot_id,
-            Arc::clone(&self.schema),
-            chunks,
-            None,
-        ))
+        DatasetSnapshot::try_new(snapshot_id, Arc::clone(&self.schema), chunks, None)
     }
 
     /// Capture exact timeseries membership with per-chunk event-time statistics.
@@ -218,17 +222,23 @@ impl FoundationFixture {
                     *path,
                     sequence as u64,
                     ObjectDescriptor::new(self.object_url(path)?),
+                    Arc::clone(&self.schema),
                     *logical_count,
                     *bounds,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(DatasetSnapshot::new(
+        DatasetSnapshot::try_new(
             snapshot_id,
             Arc::clone(&self.schema),
             chunks,
             Some(EventTimeContract::new(event_time_column)),
-        ))
+        )
+    }
+
+    /// Construct an exact descriptor for an object in this fixture.
+    pub fn object_descriptor(&self, path: &str) -> Result<ObjectDescriptor> {
+        Ok(ObjectDescriptor::new(self.object_url(path)?))
     }
 
     fn object_url(&self, path: &str) -> Result<datafusion::datasource::listing::ListingTableUrl> {

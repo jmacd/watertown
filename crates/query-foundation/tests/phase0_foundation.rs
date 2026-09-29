@@ -74,7 +74,7 @@ async fn proves_projection_predicate_pruning_and_bounded_range_reads() -> Result
             4,
         )
         .await?;
-    let snapshot = fixture.snapshot("snapshot-0001", &["chunks/two-row-groups.parquet"])?;
+    let snapshot = fixture.snapshot("snapshot-0001", &[("chunks/two-row-groups.parquet", 8)])?;
 
     let context = fixture.context()?;
     register_snapshot(&context, "series", &snapshot)?;
@@ -167,7 +167,7 @@ async fn snapshot_membership_is_immutable_after_new_chunk_publication() -> Resul
     _ = fixture
         .put_parquet("chunks/chunk-0001.parquet", &[batch(0)?], 4)
         .await?;
-    let first_snapshot = fixture.snapshot("snapshot-0001", &["chunks/chunk-0001.parquet"])?;
+    let first_snapshot = fixture.snapshot("snapshot-0001", &[("chunks/chunk-0001.parquet", 4)])?;
 
     _ = fixture
         .put_parquet("chunks/chunk-0002.parquet", &[batch(100)?], 4)
@@ -184,7 +184,10 @@ async fn snapshot_membership_is_immutable_after_new_chunk_publication() -> Resul
 
     let second_snapshot = fixture.snapshot(
         "snapshot-0002",
-        &["chunks/chunk-0001.parquet", "chunks/chunk-0002.parquet"],
+        &[
+            ("chunks/chunk-0001.parquet", 4),
+            ("chunks/chunk-0002.parquet", 4),
+        ],
     )?;
     let second_context = fixture.context()?;
     register_snapshot(&second_context, "series", &second_snapshot)?;
