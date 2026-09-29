@@ -6,6 +6,7 @@
 
 pub mod frontier;
 pub mod locality;
+pub mod materialize;
 pub mod metrics;
 pub mod orchestration;
 pub mod overlap;
