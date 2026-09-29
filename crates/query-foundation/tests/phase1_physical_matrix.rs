@@ -11,6 +11,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion::error::Result;
 use datafusion::logical_expr::{col, lit};
 use query_foundation::metrics::ChunkPruningMetrics;
+use query_foundation::overlap::OverlapPolicy;
 use query_foundation::snapshot::{ChunkDescriptor, DatasetSnapshot, EventTimeContract};
 use query_foundation::testkit::FoundationFixture;
 
@@ -140,8 +141,13 @@ async fn nullable_schema_evolution_reads_old_and_new_chunks() -> Result<()> {
             None,
         ),
     ];
-    let snapshot =
-        DatasetSnapshot::try_new("snapshot-0001", Arc::clone(&merged_schema), chunks, None)?;
+    let snapshot = DatasetSnapshot::try_new(
+        "snapshot-0001",
+        Arc::clone(&merged_schema),
+        chunks,
+        None,
+        OverlapPolicy::PreserveAll,
+    )?;
     let context = fixture.context()?;
     _ = context.register_table("ordinary", snapshot.table_provider()?)?;
 
@@ -179,6 +185,7 @@ fn invalid_snapshot_metadata_fails_before_planning() -> Result<()> {
         base_schema(),
         vec![chunk("duplicate", 0)?, chunk("duplicate", 1)?],
         None,
+        OverlapPolicy::PreserveAll,
     )
     .expect_err("duplicate chunk identity must fail");
     assert!(error.to_string().contains("duplicate chunk identity"));
@@ -188,6 +195,7 @@ fn invalid_snapshot_metadata_fails_before_planning() -> Result<()> {
         base_schema(),
         vec![chunk("later", 1)?, chunk("earlier", 0)?],
         None,
+        OverlapPolicy::PreserveAll,
     )
     .expect_err("unordered chunk sequence must fail");
     assert!(error.to_string().contains("not strictly greater"));
@@ -197,6 +205,7 @@ fn invalid_snapshot_metadata_fails_before_planning() -> Result<()> {
         base_schema(),
         vec![chunk("chunk", 0)?],
         Some(EventTimeContract::new("missing")),
+        OverlapPolicy::PreserveAll,
     )
     .expect_err("missing event-time column must fail");
     assert!(
@@ -217,6 +226,7 @@ fn invalid_snapshot_metadata_fails_before_planning() -> Result<()> {
             None,
         )],
         None,
+        OverlapPolicy::PreserveAll,
     )
     .expect_err("collection membership must fail");
     assert!(error.to_string().contains("exact object"));

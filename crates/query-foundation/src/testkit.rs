@@ -25,6 +25,7 @@ use parquet::file::properties::WriterProperties;
 use url::Url;
 
 use crate::metrics::ObjectStoreMetrics;
+use crate::overlap::OverlapPolicy;
 use crate::snapshot::{ChunkDescriptor, DatasetSnapshot, EventTimeContract, ObjectDescriptor};
 use crate::statistics::TimeInterval;
 
@@ -204,7 +205,13 @@ impl FoundationFixture {
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
-        DatasetSnapshot::try_new(snapshot_id, Arc::clone(&self.schema), chunks, None)
+        DatasetSnapshot::try_new(
+            snapshot_id,
+            Arc::clone(&self.schema),
+            chunks,
+            None,
+            OverlapPolicy::PreserveAll,
+        )
     }
 
     /// Capture exact timeseries membership with per-chunk event-time statistics.
@@ -233,6 +240,7 @@ impl FoundationFixture {
             Arc::clone(&self.schema),
             chunks,
             Some(EventTimeContract::new(event_time_column)),
+            OverlapPolicy::PreserveAll,
         )
     }
 

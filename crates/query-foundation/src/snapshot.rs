@@ -14,6 +14,7 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::SortExpr;
 
 use crate::metrics::ChunkPruningMetrics;
+use crate::overlap::OverlapPolicy;
 use crate::provider::ChunkTableProvider;
 use crate::statistics::TimeInterval;
 
@@ -150,6 +151,7 @@ pub struct DatasetSnapshot {
     schema: SchemaRef,
     chunks: Arc<[ChunkDescriptor]>,
     event_time: Option<EventTimeContract>,
+    overlap: OverlapPolicy,
 }
 
 impl DatasetSnapshot {
@@ -164,6 +166,7 @@ impl DatasetSnapshot {
         schema: SchemaRef,
         chunks: Vec<ChunkDescriptor>,
         event_time: Option<EventTimeContract>,
+        overlap: OverlapPolicy,
     ) -> Result<Self> {
         let snapshot_id = snapshot_id.into();
         if snapshot_id.is_empty() {
@@ -173,11 +176,13 @@ impl DatasetSnapshot {
         }
         validate_event_time(&schema, event_time.as_ref())?;
         validate_chunks(&schema, &chunks, event_time.as_ref())?;
+        overlap.validate(&schema, &chunks, event_time.as_ref())?;
         Ok(Self {
             snapshot_id,
             schema,
             chunks: chunks.into(),
             event_time,
+            overlap,
         })
     }
 
@@ -203,6 +208,12 @@ impl DatasetSnapshot {
     #[must_use]
     pub fn event_time(&self) -> Option<&EventTimeContract> {
         self.event_time.as_ref()
+    }
+
+    /// Declared overlap and row-identity behavior.
+    #[must_use]
+    pub fn overlap(&self) -> &OverlapPolicy {
+        &self.overlap
     }
 
     /// Build a chunk-aware DataFusion provider with fresh pruning counters.

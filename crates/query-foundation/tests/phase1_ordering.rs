@@ -10,6 +10,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion::error::Result;
 use datafusion::logical_expr::{col, lit};
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
+use query_foundation::overlap::OverlapPolicy;
 use query_foundation::snapshot::{ChunkDescriptor, DatasetSnapshot, EventTimeContract};
 use query_foundation::statistics::TimeInterval;
 use query_foundation::testkit::FoundationFixture;
@@ -72,6 +73,7 @@ async fn ordered_snapshot(
         schema(),
         vec![first, second],
         Some(EventTimeContract::new("ts")),
+        OverlapPolicy::PreserveAll,
     )?;
     Ok((fixture, snapshot))
 }

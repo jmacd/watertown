@@ -2,9 +2,9 @@
 
 > **Status:** accepted design and implementation plan as of 2026-09-28.
 >
-> **Implementation:** Phase 0 passed in `477292a8`; the Phase 1 gate and Phase 2
-> logical projection transforms are implemented on the current development
-> branch.
+> **Implementation:** Phase 0 passed in `477292a8`; the Phase 1 gate, Phase 2
+> logical projection transforms, and overlap metadata contracts are implemented
+> on the current development branch.
 >
 > **Historical baseline:** `b6913e2f9ca68eb0a1cad27970fca2f6e8487833`.
 >
