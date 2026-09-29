@@ -223,6 +223,37 @@ fn one_bucket_append_work_is_constant_at_every_retained_history_scale() -> Resul
 }
 
 #[test]
+fn one_bucket_repair_work_is_constant_at_every_retained_history_scale() -> Result<()> {
+    for bucket_count in [1, 100, 1_000] {
+        let mut store = PartialStateStore::default();
+        store.publish(manifest(bucket_count)?);
+        let replacement = AggregatePartial::empty().with_value(Some(999.0));
+        let work = store.apply_patch(
+            "recipe-1",
+            "source-state-1",
+            "source-state-2",
+            10,
+            BTreeMap::from([(PartialKey::new(0, ["site-a"]), Some(replacement))]),
+            PartialPatchReason::RetroactiveRepair,
+            1,
+        )?;
+        assert_eq!(
+            work,
+            PartialPatchWork {
+                reason: PartialPatchReason::RetroactiveRepair,
+                raw_rows_scanned: 1,
+                buckets_touched: 1,
+                buckets_upserted: 1,
+                buckets_removed: 0,
+                invalidated_resolutions: 0,
+            }
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn dirty_patch_invalidates_stale_coarse_state_and_names_rebuild_reason() -> Result<()> {
     let mut store = PartialStateStore::default();
     store.publish(manifest(100)?);

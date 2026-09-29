@@ -313,6 +313,12 @@ impl LocalityContract {
         self.class
     }
 
+    /// Whether this recipe consumes the named logical source.
+    #[must_use]
+    pub fn depends_on(&self, source: &str) -> bool {
+        self.inputs.iter().any(|input| input.as_ref() == source)
+    }
+
     /// Persistent-state requirement.
     #[must_use]
     pub fn state_contract(&self) -> StateContract {

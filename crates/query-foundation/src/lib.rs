@@ -7,6 +7,7 @@
 pub mod frontier;
 pub mod locality;
 pub mod metrics;
+pub mod orchestration;
 pub mod overlap;
 pub mod partial;
 pub mod plans;
