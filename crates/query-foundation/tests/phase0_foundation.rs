@@ -190,8 +190,8 @@ async fn snapshot_membership_is_immutable_after_new_chunk_publication() -> Resul
     register_snapshot(&second_context, "series", &second_snapshot)?;
     assert_eq!(row_count(&second_context, "series").await?, 8);
     assert_eq!(first_snapshot.snapshot_id(), "snapshot-0001");
-    assert_eq!(first_snapshot.objects().len(), 1);
-    assert_eq!(second_snapshot.objects().len(), 2);
+    assert_eq!(first_snapshot.chunks().len(), 1);
+    assert_eq!(second_snapshot.chunks().len(), 2);
 
     Ok(())
 }

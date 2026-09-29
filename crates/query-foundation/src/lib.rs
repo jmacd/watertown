@@ -5,5 +5,7 @@
 //! Executable correctness and performance contracts for Watertown queries.
 
 pub mod metrics;
+pub mod provider;
 pub mod snapshot;
+pub mod statistics;
 pub mod testkit;

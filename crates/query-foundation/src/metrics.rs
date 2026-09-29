@@ -101,3 +101,72 @@ impl ObjectStoreMetrics {
             .clear();
     }
 }
+
+/// A stable snapshot of conservative chunk-pruning decisions.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ChunkPruningMetricsSnapshot {
+    /// Provider scans planned.
+    pub scans: u64,
+    /// Snapshot chunks considered across all scans.
+    pub candidate_chunks: u64,
+    /// Chunks retained for Parquet planning.
+    pub retained_chunks: u64,
+    /// Chunks excluded because metadata proved non-overlap.
+    pub pruned_chunks: u64,
+    /// Retained chunks lacking event-time statistics.
+    pub missing_statistics: u64,
+}
+
+/// Concurrent counters for provider-level pruning work.
+#[derive(Debug, Default)]
+pub struct ChunkPruningMetrics {
+    scans: AtomicU64,
+    candidate_chunks: AtomicU64,
+    retained_chunks: AtomicU64,
+    pruned_chunks: AtomicU64,
+    missing_statistics: AtomicU64,
+}
+
+impl ChunkPruningMetrics {
+    pub(crate) fn record_scan(
+        &self,
+        candidate_chunks: u64,
+        retained_chunks: u64,
+        missing_statistics: u64,
+    ) {
+        _ = self.scans.fetch_add(1, Ordering::Relaxed);
+        _ = self
+            .candidate_chunks
+            .fetch_add(candidate_chunks, Ordering::Relaxed);
+        _ = self
+            .retained_chunks
+            .fetch_add(retained_chunks, Ordering::Relaxed);
+        _ = self
+            .pruned_chunks
+            .fetch_add(candidate_chunks - retained_chunks, Ordering::Relaxed);
+        _ = self
+            .missing_statistics
+            .fetch_add(missing_statistics, Ordering::Relaxed);
+    }
+
+    /// Capture all counters at one instant.
+    #[must_use]
+    pub fn snapshot(&self) -> ChunkPruningMetricsSnapshot {
+        ChunkPruningMetricsSnapshot {
+            scans: self.scans.load(Ordering::Relaxed),
+            candidate_chunks: self.candidate_chunks.load(Ordering::Relaxed),
+            retained_chunks: self.retained_chunks.load(Ordering::Relaxed),
+            pruned_chunks: self.pruned_chunks.load(Ordering::Relaxed),
+            missing_statistics: self.missing_statistics.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Reset all counters before a distinct measured planning operation.
+    pub fn reset(&self) {
+        self.scans.store(0, Ordering::Relaxed);
+        self.candidate_chunks.store(0, Ordering::Relaxed);
+        self.retained_chunks.store(0, Ordering::Relaxed);
+        self.pruned_chunks.store(0, Ordering::Relaxed);
+        self.missing_statistics.store(0, Ordering::Relaxed);
+    }
+}

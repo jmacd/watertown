@@ -25,7 +25,8 @@ use parquet::file::properties::WriterProperties;
 use url::Url;
 
 use crate::metrics::ObjectStoreMetrics;
-use crate::snapshot::DatasetSnapshot;
+use crate::snapshot::{ChunkDescriptor, DatasetSnapshot, EventTimeContract, ObjectDescriptor};
+use crate::statistics::TimeInterval;
 
 const STORE_URL: &str = "memory://query-foundation";
 
@@ -181,18 +182,56 @@ impl FoundationFixture {
 
     /// Capture exact current membership without consulting later store listings.
     pub fn snapshot(&self, snapshot_id: &str, paths: &[&str]) -> Result<DatasetSnapshot> {
-        let objects = paths
+        let chunks = paths
             .iter()
-            .map(|path| {
-                datafusion::datasource::listing::ListingTableUrl::parse(format!(
-                    "{STORE_URL}/{path}"
+            .enumerate()
+            .map(|(sequence, path)| {
+                Ok(ChunkDescriptor::new(
+                    *path,
+                    sequence as u64,
+                    ObjectDescriptor::new(self.object_url(path)?),
+                    0,
+                    None,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(DatasetSnapshot::new(
             snapshot_id,
             Arc::clone(&self.schema),
-            objects,
+            chunks,
+            None,
         ))
+    }
+
+    /// Capture exact timeseries membership with per-chunk event-time statistics.
+    pub fn timeseries_snapshot(
+        &self,
+        snapshot_id: &str,
+        event_time_column: &str,
+        chunks: &[(&str, u64, Option<TimeInterval>)],
+    ) -> Result<DatasetSnapshot> {
+        let chunks = chunks
+            .iter()
+            .enumerate()
+            .map(|(sequence, (path, logical_count, bounds))| {
+                Ok(ChunkDescriptor::new(
+                    *path,
+                    sequence as u64,
+                    ObjectDescriptor::new(self.object_url(path)?),
+                    *logical_count,
+                    *bounds,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(DatasetSnapshot::new(
+            snapshot_id,
+            Arc::clone(&self.schema),
+            chunks,
+            Some(EventTimeContract::new(event_time_column)),
+        ))
+    }
+
+    fn object_url(&self, path: &str) -> Result<datafusion::datasource::listing::ListingTableUrl> {
+        datafusion::datasource::listing::ListingTableUrl::parse(format!("{STORE_URL}/{path}"))
     }
 }
