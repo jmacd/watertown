@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: 2026 Caspar Water Company
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "query-foundation"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+categories.workspace = true
+keywords.workspace = true
+description = "Executable DataFusion correctness and performance foundation for Watertown queries"
+
+[dependencies]
+arrow.workspace = true
+async-trait.workspace = true
+datafusion.workspace = true
+futures.workspace = true
+object_store.workspace = true
+parquet.workspace = true
+tokio.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true

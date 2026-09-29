@@ -743,6 +743,15 @@ not pass until its narrowest measurable efficiency regressions pass.
 4. Add the instrumented object store and metrics vocabulary.
 5. Record DataFusion and Parquet versions used by every baseline.
 
+The initial Phase 0 baseline uses the versions locked on 2026-09-28:
+
+| Component | Version |
+|---|---:|
+| DataFusion | 51.0.0 |
+| Arrow | 57.3.0 |
+| Parquet | 57.3.0 |
+| `object_store` | 0.12.4 |
+
 **Gate:** the crate builds independently and can prove projection, predicate,
 row-group pruning, byte-range reads, and snapshot isolation over real Parquet.
 

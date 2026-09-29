@@ -4877,6 +4877,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "query-foundation"
+version = "0.52.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "datafusion",
+ "futures",
+ "object_store",
+ "parquet",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "quick-xml"
 version = "0.37.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
