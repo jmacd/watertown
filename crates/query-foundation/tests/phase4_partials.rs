@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 
 use datafusion::error::Result;
 use query_foundation::partial::{
-    AggregatePartial, PartialKey, PartialManifest, PartialResolution, PartialStateStore,
-    PartialWork, RawRebuildReason,
+    AggregatePartial, PartialKey, PartialManifest, PartialPatchReason, PartialPatchWork,
+    PartialResolution, PartialStateStore, PartialWork, RawRebuildReason,
 };
 
 fn manifest(bucket_count: usize) -> Result<PartialManifest> {
@@ -177,4 +177,179 @@ fn manifests_validate_identity_resolution_and_bucket_alignment() {
     )
     .expect_err("unaligned bucket must fail");
     assert!(error.to_string().contains("not aligned"), "{error}");
+}
+
+#[test]
+fn one_bucket_append_work_is_constant_at_every_retained_history_scale() -> Result<()> {
+    for bucket_count in [1, 100, 1_000] {
+        let mut store = PartialStateStore::default();
+        store.publish(manifest(bucket_count)?);
+        let key = PartialKey::new(bucket_count as i64 * 10, ["site-a"]);
+        let value = AggregatePartial::empty()
+            .with_value(Some(bucket_count as f64))
+            .with_value(None);
+        let work = store.apply_patch(
+            "recipe-1",
+            "source-state-1",
+            "source-state-2",
+            10,
+            BTreeMap::from([(key, Some(value))]),
+            PartialPatchReason::Append,
+            2,
+        )?;
+        assert_eq!(
+            work,
+            PartialPatchWork {
+                reason: PartialPatchReason::Append,
+                raw_rows_scanned: 2,
+                buckets_touched: 1,
+                buckets_upserted: 1,
+                buckets_removed: 0,
+                invalidated_resolutions: 0,
+            }
+        );
+        let PartialResolution::Exact {
+            manifest: updated,
+            work,
+        } = store.resolve("recipe-1", "source-state-2", 10, 0)?
+        else {
+            panic!("updated fine state must be exact");
+        };
+        assert_eq!(updated.partials().len(), bucket_count + 1);
+        assert_eq!(work, PartialWork::default());
+    }
+
+    Ok(())
+}
+
+#[test]
+fn dirty_patch_invalidates_stale_coarse_state_and_names_rebuild_reason() -> Result<()> {
+    let mut store = PartialStateStore::default();
+    store.publish(manifest(100)?);
+    assert!(matches!(
+        store.resolve("recipe-1", "source-state-1", 100, 0)?,
+        PartialResolution::Folded { .. }
+    ));
+
+    let replacement = AggregatePartial::empty().with_value(Some(999.0));
+    let work = store.apply_patch(
+        "recipe-1",
+        "source-state-1",
+        "source-state-2",
+        10,
+        BTreeMap::from([(PartialKey::new(0, ["site-a"]), Some(replacement))]),
+        PartialPatchReason::RetroactiveRepair,
+        1,
+    )?;
+    assert_eq!(work.reason, PartialPatchReason::RetroactiveRepair);
+    assert_eq!(work.buckets_touched, 1);
+    assert_eq!(work.invalidated_resolutions, 1);
+
+    let rebuilt = store.resolve("recipe-1", "source-state-2", 100, 0)?;
+    let PartialResolution::Folded { manifest, work, .. } = rebuilt else {
+        panic!("stale coarse state must be rebuilt from updated fine partials");
+    };
+    assert_eq!(work.raw_rows_scanned, 0);
+    assert_eq!(work.partials_read, 100);
+    assert_eq!(
+        manifest
+            .partials()
+            .get(&PartialKey::new(0, ["site-a"]))
+            .expect("coarse bucket must exist")
+            .max(),
+        Some(999.0)
+    );
+
+    Ok(())
+}
+
+#[test]
+fn no_data_frontier_advance_retags_all_resolutions_with_zero_bucket_work() -> Result<()> {
+    let mut store = PartialStateStore::default();
+    store.publish(manifest(100)?);
+    _ = store.resolve("recipe-1", "source-state-1", 100, 0)?;
+
+    let work = store.apply_patch(
+        "recipe-1",
+        "source-state-1",
+        "source-state-2",
+        10,
+        BTreeMap::new(),
+        PartialPatchReason::Append,
+        0,
+    )?;
+    assert_eq!(
+        work,
+        PartialPatchWork {
+            reason: PartialPatchReason::Append,
+            raw_rows_scanned: 0,
+            buckets_touched: 0,
+            buckets_upserted: 0,
+            buckets_removed: 0,
+            invalidated_resolutions: 0,
+        }
+    );
+    assert!(matches!(
+        store.resolve("recipe-1", "source-state-2", 10, 0)?,
+        PartialResolution::Exact {
+            work: PartialWork {
+                raw_rows_scanned: 0,
+                partials_read: 0,
+                partials_written: 0,
+            },
+            ..
+        }
+    ));
+    assert!(matches!(
+        store.resolve("recipe-1", "source-state-2", 100, 0)?,
+        PartialResolution::Exact {
+            work: PartialWork {
+                raw_rows_scanned: 0,
+                partials_read: 0,
+                partials_written: 0,
+            },
+            ..
+        }
+    ));
+
+    Ok(())
+}
+
+#[test]
+fn invalid_patch_identity_and_work_fail_explicitly() -> Result<()> {
+    let mut store = PartialStateStore::default();
+    store.publish(manifest(1)?);
+    let error = store
+        .apply_patch(
+            "recipe-1",
+            "source-state-1",
+            "source-state-1",
+            10,
+            BTreeMap::new(),
+            PartialPatchReason::Append,
+            0,
+        )
+        .expect_err("patch must advance source identity");
+    assert!(
+        error.to_string().contains("must advance source-state"),
+        "{error}"
+    );
+
+    let error = store
+        .apply_patch(
+            "recipe-1",
+            "source-state-1",
+            "source-state-2",
+            10,
+            BTreeMap::new(),
+            PartialPatchReason::Append,
+            1,
+        )
+        .expect_err("zero-bucket patch cannot scan rows");
+    assert!(
+        error.to_string().contains("must not report raw rows"),
+        "{error}"
+    );
+
+    Ok(())
 }

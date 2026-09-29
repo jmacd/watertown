@@ -181,15 +181,7 @@ impl PartialManifest {
             )));
         }
         for key in partials.keys() {
-            let delta = key.bucket_start().checked_sub(origin).ok_or_else(|| {
-                DataFusionError::Plan("partial bucket alignment overflowed".to_owned())
-            })?;
-            if delta.rem_euclid(width) != 0 {
-                return Err(DataFusionError::Plan(format!(
-                    "partial bucket start {} is not aligned to width {width} and origin {origin}",
-                    key.bucket_start()
-                )));
-            }
+            validate_bucket_alignment(key, width, origin)?;
         }
         Ok(Self {
             recipe_id,
@@ -301,6 +293,36 @@ pub struct PartialWork {
     pub partials_written: u64,
 }
 
+/// Why fine partial state changed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PartialPatchReason {
+    /// New event time strictly beyond previously observed input.
+    Append,
+    /// Out-of-order input inside the unsealed region.
+    UnsealedDisorder,
+    /// Explicitly permitted repair at or behind the settled frontier.
+    RetroactiveRepair,
+    /// Wildcard or other source membership changed.
+    MembershipChange,
+}
+
+/// Measured bounded work for one fine-state patch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PartialPatchWork {
+    /// Explicit reason for rebuilding these buckets.
+    pub reason: PartialPatchReason,
+    /// Raw rows used to rebuild dirty partials.
+    pub raw_rows_scanned: u64,
+    /// Dirty bucket/group keys examined.
+    pub buckets_touched: u64,
+    /// Bucket/group partials inserted or replaced.
+    pub buckets_upserted: u64,
+    /// Bucket/group partials removed.
+    pub buckets_removed: u64,
+    /// Stale derived resolutions discarded.
+    pub invalidated_resolutions: u64,
+}
+
 /// How a requested aggregate state was resolved.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PartialResolution {
@@ -339,6 +361,114 @@ impl PartialStateStore {
         _ = self.manifests.insert(manifest.width(), manifest);
     }
 
+    /// Apply an explicit dirty-bucket patch to one authoritative fine
+    /// resolution and invalidate stale derived resolutions.
+    pub fn apply_patch(
+        &mut self,
+        recipe_id: &str,
+        prior_source_state_id: &str,
+        new_source_state_id: &str,
+        width: i64,
+        updates: BTreeMap<PartialKey, Option<AggregatePartial>>,
+        reason: PartialPatchReason,
+        raw_rows_scanned: u64,
+    ) -> Result<PartialPatchWork> {
+        if new_source_state_id.is_empty() {
+            return Err(DataFusionError::Plan(
+                "new partial source-state identity must not be empty".to_owned(),
+            ));
+        }
+        if new_source_state_id == prior_source_state_id {
+            return Err(DataFusionError::Plan(
+                "partial patch must advance source-state identity".to_owned(),
+            ));
+        }
+        if updates.is_empty() && raw_rows_scanned != 0 {
+            return Err(DataFusionError::Plan(
+                "zero-bucket partial patch must not report raw rows scanned".to_owned(),
+            ));
+        }
+        let manifest = self.manifests.get(&width).ok_or_else(|| {
+            DataFusionError::Plan(format!("cannot patch missing partial resolution {width}"))
+        })?;
+        if manifest.recipe_id() != recipe_id {
+            return Err(DataFusionError::Plan(format!(
+                "cannot patch recipe '{recipe_id}' from manifest recipe '{}'",
+                manifest.recipe_id()
+            )));
+        }
+        if manifest.source_state_id() != prior_source_state_id {
+            return Err(DataFusionError::Plan(format!(
+                "cannot patch source state '{prior_source_state_id}' from manifest source state '{}'",
+                manifest.source_state_id()
+            )));
+        }
+        for key in updates.keys() {
+            validate_bucket_alignment(key, manifest.width(), manifest.origin())?;
+        }
+
+        if updates.is_empty() {
+            for manifest in self.manifests.values_mut().filter(|manifest| {
+                manifest.recipe_id() == recipe_id
+                    && manifest.source_state_id() == prior_source_state_id
+            }) {
+                manifest.source_state_id = Arc::from(new_source_state_id);
+            }
+            return Ok(PartialPatchWork {
+                reason,
+                raw_rows_scanned,
+                buckets_touched: 0,
+                buckets_upserted: 0,
+                buckets_removed: 0,
+                invalidated_resolutions: 0,
+            });
+        }
+
+        let stale_resolutions = self
+            .manifests
+            .iter()
+            .filter_map(|(resolution, manifest)| {
+                (*resolution != width
+                    && manifest.recipe_id() == recipe_id
+                    && manifest.source_state_id() == prior_source_state_id)
+                    .then_some(*resolution)
+            })
+            .collect::<Vec<_>>();
+        for resolution in &stale_resolutions {
+            _ = self.manifests.remove(resolution);
+        }
+
+        let buckets_touched = updates.len() as u64;
+        let mut buckets_upserted = 0;
+        let mut buckets_removed = 0;
+        let manifest = self
+            .manifests
+            .get_mut(&width)
+            .expect("validated manifest remains");
+        for (key, value) in updates {
+            match value {
+                Some(value) => {
+                    _ = manifest.partials.insert(key, value);
+                    buckets_upserted += 1;
+                }
+                None => {
+                    if manifest.partials.remove(&key).is_some() {
+                        buckets_removed += 1;
+                    }
+                }
+            }
+        }
+        manifest.source_state_id = Arc::from(new_source_state_id);
+        Ok(PartialPatchWork {
+            reason,
+            raw_rows_scanned,
+            buckets_touched,
+            buckets_upserted,
+            buckets_removed,
+            invalidated_resolutions: stale_resolutions.len() as u64,
+        })
+    }
+
     /// Resolve exact state or fold the closest compatible finer resolution.
     pub fn resolve(
         &mut self,
@@ -352,6 +482,7 @@ impl PartialStateStore {
                 "requested partial width must be positive, got {width}"
             )));
         }
+
         if let Some(manifest) = self.manifests.get(&width)
             && manifest.recipe_id() == recipe_id
             && manifest.source_state_id() == source_state_id
@@ -410,4 +541,18 @@ impl PartialStateStore {
         };
         Ok(PartialResolution::NeedsRaw { reason })
     }
+}
+
+fn validate_bucket_alignment(key: &PartialKey, width: i64, origin: i64) -> Result<()> {
+    let delta = key
+        .bucket_start()
+        .checked_sub(origin)
+        .ok_or_else(|| DataFusionError::Plan("partial bucket alignment overflowed".to_owned()))?;
+    if delta.rem_euclid(width) != 0 {
+        return Err(DataFusionError::Plan(format!(
+            "partial bucket start {} is not aligned to width {width} and origin {origin}",
+            key.bucket_start()
+        )));
+    }
+    Ok(())
 }
