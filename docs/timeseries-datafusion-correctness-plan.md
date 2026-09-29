@@ -1,1160 +1,1161 @@
-# Time-Series DataFusion Correctness and Performance Plan
+# DataFusion Query Foundation Correctness and Performance Plan
 
-> **Status:** implementation plan following the September 2026 audit; Steps 1
-> through 3 are complete.
+> **Status:** accepted design and implementation plan as of 2026-09-28.
 >
-> **Baseline commit:** `ccba84e0` (`provider: optimize dynamic timeseries rollups`).
+> **Historical baseline:** `b6913e2f9ca68eb0a1cad27970fca2f6e8487833`.
 >
-> **Scope:** TinyFS/TLogFS table providers, SQL-derived series, time-series
-> join and pivot, temporal reduction, table transforms, materialization,
-> synthetic sources, and site/export consumers.
+> **Research commits:** `ccba84e0`, `4f28e44b`, `a0b117b3`, and `cbf62ddb`.
+> These commits contain useful regressions and experiments, but they are not the
+> architectural starting point for this plan.
+>
+> **First delivery gate:** prove every Watertown query shape in a fresh
+> workspace crate before integrating production TinyFS, TLogFS, provider
+> factories, or backup.
 
-## 1. Purpose
+## 1. Decision
 
-Watertown's time-series layer should behave like a composable DataFusion system,
-not like a sequence of hidden materialization boundaries. A consumer should be
-able to request a time range and a subset of columns, and those requirements
-should reach the physical Parquet leaves whenever the intervening operations
-make that safe.
+Watertown will build a fresh executable foundation for its DataFusion
+integration instead of continuing to repair join, pivot, combine, reduce, and
+materialize behavior independently.
 
-The target architecture has five rules:
+The foundation will:
 
-1. Physical and externally backed data are exposed as lazy, range-readable
-   `TableProvider`s.
-2. Schema transforms are represented as DataFusion expressions whenever
-   possible, so DataFusion owns column mapping, type coercion, ordering, and
-   predicate safety.
-3. Timestamp-local derived factories propagate conservative read bounds to
-   every input and retain an exact row predicate in the logical plan.
-4. Persistent caches avoid repeated work across executions, but never
-   compensate for an inefficient plan within one execution.
-5. Every optimization preserves transactional visibility, fails loudly on
-   stale or incomplete data, and behaves identically across memory and TLogFS
-   persistence.
+1. live in a new Watertown workspace crate;
+2. initially depend on Arrow, DataFusion, Parquet, and `object_store`, not
+   TinyFS, TLogFS, `provider`, `steward`, or `sync-store`;
+3. model immutable query snapshots and chunks explicitly;
+4. construct built-in operations as typed DataFusion logical plans and
+   expressions;
+5. reserve SQL text for user-authored SQL;
+6. prove all current timeseries and non-timeseries query shapes before
+   production storage integration;
+7. treat measured work, I/O, and memory as correctness requirements;
+8. tolerate bounded out-of-order arrival through a settled frontier and an
+   efficiently queryable unsealed region;
+9. declare overlap and row-identity semantics per dataset or composition; and
+10. integrate upward through TinyFS, TLogFS/Delta, provider factories, site
+    consumers, and native-v2 incremental backup only after the isolated model
+    passes its gates.
 
-This document records what is already correct, the remaining defects, and an
-ordered implementation and validation plan.
+The working crate name in this document is `query-foundation`. The name may
+change before scaffolding, but the dependency boundary and gates may not be
+weakened by a rename.
 
-## 2. Scope and inventory
+## 2. Why the previous approach is insufficient
 
-### 2.1 Queryable files
+The immediate production symptom was a Noyo pond run taking far longer than
+the amount of source data could justify. The graph repeatedly evaluated
+dynamic sources across parameters and resolutions, and some paths
+re-materialized equivalent work many times in one run.
 
-| Component | Role | Current execution model |
-|---|---|---|
-| Physical table/series | Durable Parquet leaves | Explicit-version `ListingTable` over the TinyFS object store |
-| `sql-derived-table` | Arbitrary SQL over table inputs | Cached `ViewTable` logical plan |
-| `sql-derived-series` | Arbitrary SQL over series inputs | Cached `ViewTable` logical plan |
-| `timeseries-join` | Timestamp-aligned, scoped union/join | Generated SQL over lazy input providers |
-| `timeseries-pivot` | Select the same measurements across sites | Generated full-outer-join SQL over lazy inputs |
-| `temporal-reduce` | Multi-resolution aggregation | Incremental sealed-run/hot-window cache when eligible; single-pass SQL fallback |
-| `synthetic-timeseries` | Generated test/source data | `StreamingTable` over a custom `PartitionStream` |
+That incident exposed a broader pattern:
 
-### 2.2 Transforms
+- time bounds sometimes selected versions without filtering rows;
+- projections or predicates stopped at custom provider and execution wrappers;
+- generated SQL obscured the intended operator and locality contracts;
+- materialization could evaluate complete history to produce a small suffix;
+- materialization collected and copied the complete result before writing;
+- late data was conflated with append progress and could be omitted silently;
+- same-scope archive/live composition had no explicit overlap semantics;
+- cache identity, query identity, source freshness, and wildcard membership
+  were mixed together;
+- per-execution optimization and cross-execution reuse were treated as one
+  problem; and
+- fixes were made inside production factory implementations before a small
+  executable model proved that the underlying DataFusion abstractions compose
+  correctly and efficiently.
 
-| Component | Role | Current implementation |
-|---|---|---|
-| `column-rename` | Rename, normalize, and optionally cast columns | Logical `ViewTable` projection |
-| Scope prefix | Prefix non-time columns per source | Logical alias projection |
-| Null padding | Add missing nullable columns before union/pivot | Logical typed-null projection |
-| `CoherentTableProvider` | Enforce transaction generation validity | Transparent provider and execution wrapper |
+The result was a game of whack-a-mole: fixing one plan shape could expose or
+reintroduce a defect in another because the system lacked shared contracts for
+snapshot visibility, bounds, locality, row identity, change impact, and
+physical work.
 
-### 2.3 Consumers
+The earlier plan correctly identified many concrete defects. Its mistake was
+to continue sequencing production factory changes before establishing this
+shared foundation.
 
-| Component | Read behavior |
+## 3. Architectural principles
+
+### 3.1 Separate five independent concepts
+
+The foundation must not conflate:
+
+| Concept | Meaning |
 |---|---|
-| `materialize-series` | Reads a derived source after a target watermark and appends one physical version |
-| Site export | Writes deterministic, time-partitioned Parquet |
-| Site reports | Read bounded windows and project timestamp plus one value column |
-| Monitoring/status | Reads bounded recent windows, with durable summaries where configured |
-
-### 2.4 Noyo production graph
-
-The Noyo graph is:
-
-```text
-git HydroVu archives ----\
-live HydroVu series ------- timeseries-join (/combined/<site>)
-legacy Excel/HTML --------/
-                                   |
-                                   +--> temporal-reduce (/reduced/single_site)
-                                   |
-                                   +--> timeseries-pivot (/singled/<parameter>)
-                                              |
-                                              +--> temporal-reduce
-                                                   (/reduced/single_param)
-```
-
-As observed in the paired checkout on 2026-09-26, the source repository
-contains seven Git-backed archive Parquets totaling about 7.46 MiB compressed
-and eight legacy HydroVu HTML files totaling about 11.94 MiB. Those sizes are
-not intrinsically large enough to justify a multi-hour build. The historical
-cost came from repeatedly evaluating the dynamic graph across parameters and
-resolutions, combined with source and adapter boundaries that prevented normal
-pushdown.
-
-## 3. What commit `ccba84e0` corrected
-
-The baseline commit made the following structural improvements:
-
-- `timeseries-join` and `timeseries-pivot` expose recursive incremental lineage.
-- Semantic graph identity is separated from physical leaf versions for ordinary
-  append-only series updates.
-- `SeriesReadBounds` reaches dynamic join/pivot inputs.
-- Every bounded dynamic input also receives a real event-time predicate before
-  union and join construction.
-- Source providers are combined with lazy `ViewTable` unions rather than
-  collected into intermediate `MemTable`s.
-- `CoherentExec` participates in DataFusion's physical filter-pushdown traversal.
-- Pivot uses one coalesced full-outer-join chain instead of a distinct timestamp
-  spine followed by a second scan of every source.
-- Multiway joins compare each later source with the accumulated coalesced
-  timestamp, preserving timestamps absent from the first source.
-- Temporal-reduce can cache eligible dynamic graphs, repair late data, and fold
-  coarser resolutions from finer cached partials.
-- Reduced cache reads use explicit manifest members and declared timestamp
-  ordering, allowing `SortPreservingMergeExec` instead of a full-history sort.
-
-The corresponding plan tests establish the important local invariant:
-
-```text
-consumer time predicate
-  -> dynamic input predicate
-    -> DataSourceExec predicate / Parquet pruning predicate
-
-consumer projection
-  -> join or pivot projection
-    -> narrow DataSourceExec projection
-```
-
-These changes are the correct foundation. The remaining work should preserve
-this structure rather than adding a second materialized Noyo pipeline.
-
-## 4. Required invariants
-
-The implementation work below should be judged against these invariants.
-
-### 4.1 Correctness
-
-1. A pushed predicate has exactly the same meaning before and after a transform.
-2. `supports_filters_pushdown` returns one result per input expression in the
-   same order.
-3. A provider reports `Exact` only when its scan enforces the complete
-   predicate.
-4. Late or backfilled source rows are either incorporated or rejected by an
-   explicit monotonicity contract; they are never silently ignored.
-5. A cache manifest is authoritative. Missing named members are errors and
-   unreferenced files are ignored.
-6. A provider created for one transaction generation cannot read after a
-   mutation or transaction close.
-7. Adding or replacing physical data invalidates data freshness without
-   unnecessarily changing the semantic identity of an otherwise unchanged
-   query.
-
-### 4.2 Per-execution efficiency
-
-1. Time bounds appear as row predicates in the logical plan, not only as
-   version-selection hints.
-2. Projections reach leaf scans unless an operator semantically requires the
-   omitted columns.
-3. A source appears once in the physical plan unless repeated evaluation is
-   mathematically necessary.
-4. Streaming operators do not collect or concatenate an unbounded result.
-5. Sorts exist only where output ordering is part of the contract or required
-   by a downstream operator.
-6. Custom execution wrappers preserve valid ordering, equivalence, and
-   partitioning metadata, or conservatively discard it without advertising
-   incorrect properties.
-
-### 4.3 Cross-execution efficiency
-
-1. Immutable source decoding is cached by content identity.
-2. Unchanged aggregate buckets are not recomputed.
-3. Coarser reductions fold finer partials instead of rescanning raw history.
-4. A no-change run performs metadata validation but no source-row scan.
-5. One append costs work proportional to the new version plus the bounded hot
-   window, independent of total retained history.
-
-## 5. Findings
-
-### 5.1 Critical: null-padding returns filter support in the wrong order
-
-**Status:** corrected by Steps 1 and 2.
-
-Location:
-
-- `crates/provider/src/transform/null_padding.rs:107-154`
-
-The provider separates filters into two collections:
-
-- predicates referencing padded columns immediately append `Unsupported` to
-  `results`;
-- predicates referencing only inner columns are sent to the inner provider;
-- the returned inner statuses are appended afterward.
-
-That does not preserve the positions of the input filters. For input filters
-`[inner_column_filter, padded_column_filter]`, a provider returning `Exact` for
-the first filter produces:
-
-```text
-actual:   [Unsupported, Exact]
-required: [Exact, Unsupported]
-```
-
-This was reproduced with a temporary audit test. It is a correctness defect,
-not merely a missed optimization. DataFusion can believe the padded-column
-predicate was enforced exactly, remove the outer filter, and then receive
-unfiltered rows because `NullPaddingTableProvider::scan` deliberately excludes
-padded-column predicates from the inner scan.
-
-#### Implementation
-
-Immediate surgical correction:
-
-1. Allocate a result vector with one slot per input filter.
-2. Record `(original_index, filter)` for each inner predicate.
-3. Fill padded-column positions with `Unsupported`.
-4. Ask the inner provider about only the inner predicates.
-5. Copy each returned status back to its recorded original index.
-6. Validate that the inner provider returned exactly one status per delegated
-   expression; otherwise return an internal error.
-
-Preferred architectural correction:
-
-1. Replace `NullPaddingTableProvider` with a logical projection:
-
-   ```sql
-   SELECT
-     existing_columns,
-     CAST(NULL AS expected_type) AS missing_column
-   FROM source
-   ```
-
-2. Store that plan in a `ViewTable`.
-3. Let DataFusion perform projection pruning and predicate simplification.
-4. Remove `NullPaddingExec` once all callers use the logical projection.
-
-#### Required tests
-
-- Mixed filter order: inner then padded.
-- Mixed filter order: padded then inner.
-- Several interleaved filters with distinct `Exact`, `Inexact`, and
-  `Unsupported` inner responses.
-- Query result where a padded-column predicate would remove all rows.
-- Projection containing only padded columns.
-- Projection that interleaves padded and inner columns.
-- Physical plan proving an inner-column predicate reaches the leaf scan.
-
-### 5.2 Critical: type-changing column rename has an unsound pushdown contract
-
-**Status:** corrected by Steps 1 and 2.
-
-Locations:
-
-- `crates/provider/src/transform/column_rename.rs:112-160`
-- `crates/provider/src/transform/column_rename.rs:181-229`
-- `crates/provider/src/transform/column_rename.rs:233-370`
-- `caspar.water/config/noyo.yaml:124-146`
-
-`ColumnRenameTableProvider` rewrites a predicate by changing column names only.
-The actual type cast occurs later in `ColumnRenameExec`.
-
-For Noyo, the transform declares:
-
-```yaml
-from: "Date Time"
-to: "timestamp"
-cast: timestamp
-```
-
-A predicate over the output timestamp therefore has this semantic form:
-
-```text
-CAST("Date Time" AS TIMESTAMP) >= timestamp_literal
-```
-
-The delegated expression currently has this different form:
-
-```text
-"Date Time" >= timestamp_literal
-```
-
-An audit probe established both consequences:
-
-- With a normal Parquet `ListingTable`, DataFusion retains an outer
-  `FilterExec`, so the answer is correct, but the physical plan contains no
-  Parquet predicate. Every selected legacy row is decoded and cast before the
-  time filter is evaluated.
-- With an inner provider claiming `Exact`, DataFusion removes the outer filter.
-  The probe returned two rows instead of one, demonstrating that the generic
-  provider contract can produce wrong results.
-
-#### Implementation
-
-The preferred correction is to stop implementing rename/cast as an opaque
-physical wrapper.
-
-1. Build a logical projection over the inner provider.
-2. For unchanged columns, emit the source column.
-3. For renamed columns, emit `source_column.alias(new_name)`.
-4. For cast columns, emit
-   `cast(source_column, target_type).alias(new_name)`.
-5. Wrap the resulting logical plan in a `ViewTable`.
-6. Let DataFusion decide which predicates can cross the projection and cast.
-7. Remove `ColumnRenameExec` and its manually synthesized plan properties.
-
-If this migration must be staged, the safe intermediate behavior is:
-
-- type-preserving renames may delegate rewritten filters;
-- any filter referencing a type-changing column returns `Unsupported`;
-- `scan` must not send such a predicate to the inner provider;
-- the outer filter remains above the cast.
-
-Do not mark a casted predicate `Exact` merely because the inner provider accepts
-the renamed expression.
-
-#### Required tests
-
-- Exact inner provider plus a casted filter must retain correct filtering.
-- Inexact Parquet provider must keep the outer post-cast filter.
-- Type-preserving timestamp rename should still reach the Parquet scan.
-- Mixed predicates over casted and untouched columns.
-- Invalid source values must retain the current visible cast error.
-- Projection must decode only requested columns plus columns needed by filters.
-- Plan properties must preserve timestamp ordering only when the projection or
-  cast makes that statement valid.
-
-### 5.3 High: custom transform execution nodes obscure optimizer properties
-
-**Status:** corrected by Step 2.
-
-Locations:
-
-- `crates/provider/src/transform/column_rename.rs:248-268`
-- `crates/provider/src/transform/null_padding.rs:218-337`
-- `crates/tinyfs/src/coherence.rs:314-348`
-
-`CoherentExec` is correctly transparent: it returns its child's properties and
-explicitly forwards physical filters.
-
-The transform nodes do not:
-
-- `ColumnRenameExec` replaces all equivalence properties with an empty set and
-  changes partitioning to `UnknownPartitioning`. A type-preserving scope prefix
-  therefore loses valid timestamp ordering and partitioning information.
-- `NullPaddingExec` creates empty equivalence properties but copies the inner
-  partitioning expression unchanged. If a projection inserts a padded column
-  before an inner column, the copied physical column index can describe the
-  wrong output column.
-- Neither node implements physical filter-pushdown traversal, so filters
-  introduced or refined after physical planning cannot cross the wrapper.
-
-The projection-based replacement in sections 5.1 and 5.2 solves these problems
-using DataFusion's native expression and property machinery. Hand-maintaining
-equivalence and partitioning rewrites should be the fallback, not the target.
-
-### 5.4 High: Git-backed Parquet casts eagerly load and decode complete files
-
-Locations:
-
-- `crates/gitpond/src/tree.rs:312-358`
-- `crates/provider/src/provider_api.rs:865-910`
-- `crates/provider/src/factory/sql_derived.rs:963-979`
-- `crates/provider/src/factory/sql_derived.rs:1202-1308`
-- `crates/hydrovu/src/lib.rs:558-564`
-
-The current path is:
-
-```text
-GitBlobFile::metadata
-  -> read complete Git blob to determine size
-
-GitBlobFile::async_reader
-  -> read complete Git blob into Vec
-
-read_pond_node_as_parquet
-  -> read_to_end into another Vec
-  -> ParquetRecordBatchReaderBuilder
-  -> decode every batch
-  -> MemTable
-
-DataFusion query
-  -> apply projection and predicate to already-decoded arrays
-```
+| Snapshot identity | Exact immutable chunk membership visible to one query |
+| Event time | Domain time used for bounds, joins, windows, and reduction |
+| Chunk sequence | Deterministic arrival/publication order |
+| Row identity | Dataset-specific duplicate or revision semantics |
+| Physical packing | Parquet objects, row groups, compression, and backup packs |
 
 Consequences:
 
-- no Parquet footer-only schema read;
-- no row-group pruning;
-- no page/index pruning;
-- no late materialization;
-- no source projection;
-- no bounded I/O;
-- multiple complete compressed and decoded representations can coexist;
-- the resulting `MemTable` is retained by cached derived plans for the
-  transaction lifetime.
+- event time need not be ordered by chunk arrival;
+- chunk sequence does not imply last-write-wins unless a dataset declares that
+  policy;
+- a timestamp is not automatically a unique row key;
+- replacing a physical Parquet layout without changing logical rows must not
+  change logical content identity; and
+- a query snapshot names exact logical input membership without relying on
+  object-store directory listing.
 
-#### Target design
+### 3.2 Standard DataFusion operators first
 
-Expose a data-archetype Parquet cast as a normal Parquet scan.
+The foundation should use ordinary DataFusion logical and physical operators
+wherever their semantics suffice:
 
-1. Give the Git blob a stable content identity without reading it. The Git blob
-   OID is already a content identity and contributes to the dynamic node ID.
-2. Expose length and range reads for the blob.
-3. Register a read-only object-store URL whose object maps to that immutable
-   blob, or copy the unchanged compressed Parquet bytes once into a
-   content-addressed local file cache.
-4. Construct a `ListingTable` over the resulting object URL.
-5. Keep the cast provider cache separate from consumer transforms, so multiple
-   joins and pivots share one raw Parquet provider.
-6. Include blob identity in the cache key.
-7. Fail if the Git reference changes while a provider is being built; never
-   combine metadata from one blob with bytes from another.
+- projection;
+- filter;
+- union;
+- join;
+- aggregate;
+- sort only when semantically required; and
+- standard Parquet scans.
 
-The direct object-store implementation is preferable because it avoids a copy.
-A compressed-byte cache is still acceptable because it preserves Parquet as
-Parquet; it is not a materialized derived series.
+Aliases, casts, scope prefixes, and typed null padding are projection
+expressions. Built-in join, pivot, combine, and reduce operations are typed
+logical plans, not generated SQL strings.
 
-#### Required tests
+A custom optimizer rule or execution node is permitted only after a regression
+demonstrates that standard DataFusion cannot satisfy a measured requirement.
+The custom component must then preserve or conservatively discard projection,
+predicate, ordering, equivalence, partitioning, memory, and metric properties.
 
-- Schema inference reads only footer ranges.
-- A timestamp filter reads only matching row groups.
-- A narrow projection does not decode unrelated value columns.
-- Two consumers of the same blob reuse one provider/source identity.
-- A changed Git blob invalidates the provider.
-- A stale provider fails rather than reading a mixture of Git revisions.
-- Invalid Parquet fails with the source path and blob identity.
+### 3.3 Per-execution efficiency and cross-execution reuse are different
 
-### 5.5 High: same-scope join uses full-row distinct union
+Within one execution:
 
-Location:
+- requirements must reach physical leaves;
+- a source must not be scanned repeatedly unless the operation requires it;
+- streaming operators must not collect unbounded output;
+- unnecessary global sorts and distinct operations are defects; and
+- peak memory must be bounded by active execution state.
 
-- `crates/provider/src/factory/timeseries_join.rs:398-468`
+Across executions:
 
-Inputs with the same scope are combined using:
+- immutable decoding may be cached by content identity;
+- unchanged aggregate buckets may be reused;
+- coarser reductions may fold finer partials;
+- a no-change run must scan zero source rows; and
+- an append or bounded late repair must cost work independent of retained
+  history.
 
-```sql
-SELECT * FROM filtered0
-UNION BY NAME
-SELECT * FROM filtered1
+A persistent cache cannot compensate for an inefficient plan within one
+execution.
+
+### 3.4 No silent fallback
+
+Watertown must not silently:
+
+- drop late rows;
+- change overlap semantics;
+- treat an unsupported local query as incremental;
+- fall back from an incremental path to a full-history path;
+- use incomplete cache directory contents as authoritative;
+- weaken transaction-generation checks;
+- collect a stream because a streaming sink failed; or
+- perform a full backup inventory because an incremental baseline is unknown.
+
+Unsupported or invalid states return an actionable error. An intentionally
+global plan must be visible in plans and metrics.
+
+## 4. Foundation data model
+
+The isolated crate will model exact query snapshots over immutable chunks.
+Names below are illustrative; behavior is normative.
+
+```rust
+struct DatasetSnapshot {
+    snapshot_id: SnapshotId,
+    schema: SchemaRef,
+    chunks: Arc<[ChunkDescriptor]>,
+    event_time: Option<EventTimeContract>,
+    overlap: OverlapPolicy,
+}
+
+struct ChunkDescriptor {
+    chunk_id: ContentId,
+    sequence: u64,
+    object: ObjectDescriptor,
+    schema: SchemaRef,
+    logical_count: u64,
+    event_time_bounds: Option<TimeInterval>,
+    column_statistics: ChunkStatistics,
+    ordering: Vec<SortExpr>,
+    uniqueness: UniquenessContract,
+}
 ```
 
-`UNION` is distinct. DataFusion must compare complete rows before it can discard
-duplicates. That has two consequences:
+Required properties:
 
-1. a global distinct/hash operation is added before the timestamp join;
-2. an outer projection cannot safely remove unused columns below the distinct,
-   because every column participates in row identity.
+1. Chunks are immutable.
+2. A snapshot names the exact ordered chunk set.
+3. A query captures one snapshot before planning.
+4. Publishing a later snapshot cannot change an existing query.
+5. Missing statistics reduce pruning but never remove data.
+6. Known statistics may prune only when non-overlap is proven.
+7. Logical content identity is independent of physical Parquet packing.
+8. Timeseries metadata is optional; ordinary tables use the same provider
+   boundary.
+9. Schema evolution is explicit and tested.
+10. Object access is range-readable and instrumented.
 
-This is directly relevant to Noyo, where archive and live sources for one
-instrument share a scope. A parameter pivot that needs one measurement may
-still require every source column to establish full-row distinctness.
+The initial model uses opaque test identities. It must not import current
+`sync-store` wire types merely to share hashes. Production identity adapters
+will be added after the query contracts are stable, avoiding a dependency
+cycle between query, filesystem, and replication crates.
 
-Full-row distinct also does not establish the semantic property the join
-actually needs: at most one row per timestamp per scope. Two rows with the same
-timestamp and different values survive and can multiply rows in a later
-full-outer join.
+## 5. Overlap and row identity
 
-#### Required design decision
+There is no universal duplicate policy. Every dataset or same-scope
+composition declares one of the following classes:
 
-Choose and document one same-scope contract:
-
-1. **Non-overlapping segments:** source ranges must not overlap. Validate this
-   from metadata and use `UNION ALL BY NAME`.
-2. **Identical overlap allowed:** use `UNION ALL BY NAME`, then deduplicate by a
-   declared key with an explicit equality/conflict check.
-3. **Source precedence:** define archive/live priority and choose one row per
-   timestamp deterministically.
-
-For the current HydroVu layout, the preferred contract is non-overlapping
-append/archive segments with a hard validation error on conflicting overlap.
-This permits `UNION ALL BY NAME`, full projection pushdown, and no global
-full-row distinct.
-
-#### Required tests
-
-- Non-overlapping archive and live inputs use `UnionExec`, not a distinct
-  aggregate.
-- Only columns required by the downstream pivot reach each Parquet scan.
-- Identical boundary rows follow the documented policy.
-- Conflicting same-timestamp rows fail or resolve by explicit precedence.
-- Duplicate timestamps cannot create a many-to-many join explosion.
-
-### 5.6 High: bounded physical/cache providers prune versions, not rows
-
-**Status:** corrected by Step 3.
-
-Locations:
-
-- `crates/provider/src/table_provider_options.rs:13-27`
-- `crates/provider/src/table_creation.rs:176-295`
-- `crates/provider/src/factory/temporal_reduce.rs:1320-1368`
-- `crates/provider/src/factory/temporal_reduce.rs:3047-3173`
-
-`SeriesReadBounds` deliberately defines a conservative version-selection
-optimization. A version is excluded only when metadata proves it cannot
-overlap the requested interval. A retained version can still contain rows
-before the bound.
-
-The SQL-derived dynamic path adds the required exact row predicate in
-`SqlDerivedFile::apply_event_time_bound`. The direct physical and format-cache
-paths used by temporal-reduce do not add an equally explicit source predicate;
-they rely on version granularity and any optimizer movement of later bucket
-filters.
-
-This remains correct because downstream bucket-range predicates reject
-irrelevant output. It is not the ideal scan plan: one large version overlapping
-the hot window can be decoded and aggregated from its beginning on every
-incremental rebuild.
-
-#### Implementation
-
-1. Add a shared helper that wraps any source provider with an event-time
-   predicate represented as a `ViewTable`.
-2. Use it after version pruning in:
-   - physical-series providers used by temporal-reduce;
-   - format-cache `CachedSet` providers;
-   - dynamic source unions;
-   - materialize-series.
-3. Keep the exact predicate even when version metadata prunes every earlier
-   version. The two layers have different purposes.
-4. Ensure timestamp unit conversion uses the existing ceil semantics from
-   `SqlDerivedFile::event_time_lower_bound`.
-5. Avoid duplicating this conversion logic across factories.
-
-#### Required tests
-
-- One retained Parquet version spans both sides of the bound.
-- The physical plan contains a leaf `DataSourceExec` predicate.
-- The physical plan retains any residual `FilterExec` required by the
-  provider's exactness classification; it removes one only when the scan or
-  physical pushdown enforces an equivalent predicate.
-- Rows before the bound never enter the aggregate.
-- Unknown version bounds retain the file but still apply the row predicate.
-
-### 5.7 High: materialize-series is unbounded, non-streaming, and late-data blind
-
-Locations:
-
-- `crates/provider/src/factory/materialize_series.rs:122-175`
-- `crates/provider/src/factory/materialize_series.rs:197-270`
-- `crates/tinyfs/src/arrow/parquet.rs:469-504`
-
-The current algorithm:
-
-1. obtains the target watermark;
-2. creates an unbounded source provider;
-3. applies `time > watermark` above the entire derived source;
-4. globally sorts the delta;
-5. collects every output batch;
-6. concatenates the batches into one `RecordBatch`;
-7. serializes that complete batch into another in-memory Parquet buffer;
-8. appends the buffer as one series version.
-
-For a full-outer-join source, DataFusion is not required to infer that a
-predicate on the final coalesced timestamp can be distributed to every input.
-The first four steps can therefore evaluate all source history to produce a
-small delta. The last four use memory proportional to the complete delta, with
-multiple simultaneous copies.
-
-The watermark algorithm also silently excludes newly arrived rows whose event
-time is less than or equal to the existing maximum. That is acceptable only
-under an explicit, enforced monotonic-source contract.
-
-#### Implementation
-
-1. Convert the watermark to a conservative inclusive `SeriesReadBounds`
-   event-time lower bound.
-2. Call `create_table_provider_bounded`.
-3. Retain the exact outer `time > watermark` filter to exclude the already
-   stored boundary row.
-4. Add `write_series_from_stream` to TinyFS:
-   - accept a `SendableRecordBatchStream`;
-   - write through `AsyncArrowWriter`;
-   - compute min/max event time and row count incrementally;
-   - publish exactly one series version after successful close;
-   - leave no visible version after a failed stream or writer.
-5. Feed the sorted DataFusion execution stream directly into that writer.
-6. Avoid `collect`, `concat_batches`, and a complete serialized buffer.
-7. Add a source-progress record containing lineage/version identity.
-8. Either:
-   - reject a source version whose minimum time is at or below the committed
-     watermark, under a declared monotonic contract; or
-   - configure allowed lateness and rebuild/replace the affected target range
-     using an explicit deduplication key.
-
-Do not continue silently dropping late data.
-
-#### Required tests
-
-- Initial materialization uses bounded memory across many batches.
-- A no-change run writes no target version.
-- One append scans only the bounded source tail.
-- The watermark row is not duplicated.
-- A late row is handled by the configured policy.
-- Failure after several streamed batches publishes no partial version.
-- Memory and TLogFS produce identical target rows and temporal metadata.
-
-### 5.8 Medium: arbitrary SQL-derived series have no timestamp-local contract
-
-Locations:
-
-- `crates/provider/src/factory/sql_derived.rs:1654-1796`
-- `crates/provider/src/factory/lazy_sql_file.rs:117-218`
-
-`sql-derived-series` correctly remains conservative. Arbitrary SQL can contain
-global windows, cumulative calculations, non-local joins, and final ordering;
-blindly pushing an output time bound into its inputs would change results.
-
-The downside is that simple timestamp-local SQL has no way to advertise that
-property. It cannot expose incremental lineage and its default
-`QueryableFile::as_table_provider_bounded` behavior is effectively unbounded.
-
-#### Implementation
-
-Add an explicit, declarative mode rather than SQL-text heuristics:
-
-```yaml
-incremental:
-  mode: timestamp-local
-  output_time_column: timestamp
-  input_time_columns:
-    source: timestamp
+```rust
+enum OverlapPolicy {
+    PreserveAll,
+    RequireDisjoint,
+    RejectDuplicateKey { key: Vec<ColumnId> },
+    PreferBySequence { key: Vec<ColumnId> },
+}
 ```
 
-For this mode:
+The exact API may evolve, but these semantic choices must remain distinct.
 
-1. include the declaration in semantic identity;
-2. apply exact row bounds to declared inputs;
-3. expose recursive lineage;
-4. validate that every named input and output time column exists;
-5. reject unsupported constructs unless correctness can be proven;
-6. keep ordinary `sql-derived-series` unchanged and conservative.
-
-Queries containing cumulative windows, rank over all history, or cross-time
-joins must remain non-local unless they define the preceding context needed to
-compute a bounded output.
-
-### 5.9 Medium: wildcard membership is mixed into semantic identity
-
-Locations:
+### 5.1 Preserve all
 
-- `crates/provider/src/factory/lineage.rs:121-205`
-- `crates/provider/src/factory/timeseries_join.rs:285-349`
-- `crates/provider/src/factory/timeseries_pivot.rs:273-316`
+All rows are events. Equal timestamps or equal values do not imply
+duplication. Joins and pivots must account explicitly for multiplicity and
+tests must cover many-to-many results.
 
-The lineage builder correctly keeps changing versions out of the recipe hash
-for a stable physical node. However, it includes every resolved source path and
-`FileID` in the canonical semantic bytes.
+### 5.2 Require disjoint
 
-Adding a new file under an unchanged wildcard therefore changes semantic
-identity and invalidates all aggregate levels. That is conservative and
-correct, but it treats a data-set membership change as a query-definition
-change.
+Chunk event-time ranges or declared logical keys may not overlap. The
+foundation validates the contract and returns an error on violation. This is
+appropriate when archive and live sources have an operational handoff that
+must be clean.
 
-#### Implementation
+### 5.3 Reject duplicate key
 
-1. Hash configured edges: factory kind, pattern URL, ranges, scopes, requested
-   columns, and transforms.
-2. For nested dynamic sources, hash their semantic recipe identities.
-3. Keep resolved durable leaf IDs and versions only in the freshness leaf set.
-4. Adding a physical leaf under an unchanged wildcard should mark the
-   appropriate event-time range dirty, not invalidate the cache namespace.
-5. Adding a dynamic child with a genuinely different nested recipe must still
-   invalidate semantic identity.
-6. Preserve deterministic ordering and cycle detection.
+Overlapping ranges are allowed, but duplicate logical keys are invalid. The
+error must identify the conflicting sources and key.
 
-#### Required tests
+### 5.4 Prefer by sequence
 
-- Appending a version changes freshness but not semantic identity.
-- Adding a physical file under a wildcard changes leaves but not semantics.
-- Removing a physical file changes leaves and triggers the required repair.
-- Changing a transform changes semantics.
-- Changing a nested dynamic recipe changes semantics.
-- Reordering directory enumeration changes neither semantics nor freshness.
+A declared key identifies revisions, and a deterministic chunk sequence
+selects the winner. Predicates that could change winner selection must remain
+above reconciliation. This is an optional dataset policy, not Watertown's
+universal timeseries model.
 
-### 5.10 Medium: synthetic-timeseries ignores filters and projected generation
+### 5.5 Same-scope combine
 
-Locations:
+The existing use of a full-row distinct union does not establish any of these
+semantics and blocks normal projection. The foundation will represent
+same-scope composition explicitly:
 
-- `crates/provider/src/factory/synthetic_timeseries.rs:229-320`
-- `crates/provider/src/factory/synthetic_timeseries.rs:460-500`
+- disjoint or preserve-all composition uses `UNION ALL BY NAME`;
+- duplicate rejection performs only the key validation required by the
+  contract;
+- precedence performs key-based reconciliation with explicit ordering; and
+- no implementation may use global full-row distinct as an undocumented
+  approximation.
 
-The source streams batches and therefore has bounded memory, which is good.
-However, `StreamingTable` does not translate timestamp filters into generator
-bounds. `SyntheticBatchStream` also computes every configured point column for
-every generated row, even when the scan projects only one point.
+## 6. Event time, lateness, and the settled frontier
 
-#### Implementation
+Slightly out-of-order data is expected. The foundation therefore models:
 
-Replace `StreamingTable` with a small custom `TableProvider` that:
+```text
+settled history | efficiently queryable unsealed region | future
+```
 
-1. recognizes supported lower and upper predicates on the configured time
-   column;
-2. intersects them with the configured generation interval;
-3. maps projection indices to the requested waveform definitions;
-4. generates only required timestamps and values;
-5. reports exact support for predicates fully enforced by generation;
-6. retains unsupported predicates above the scan.
+The settled frontier is a progress and cost promise, not a claim that
+retroactive data is physically impossible.
 
-This is lower production priority but should embody the same provider contract
-used everywhere else.
+Required behavior:
 
-### 5.11 Medium: export performs avoidable repeated scans
+1. Immutable chunks may arrive out of event-time order.
+2. Disorder inside the unsealed region is ordinary.
+3. A source supplies or explicitly derives `settled_through`.
+4. The engine does not invent a frontier from wall-clock time without a
+   declared source policy.
+5. Unsealed queries prune chunks and retain only bounded active state.
+6. Ordinary appends do not rescan settled history.
+7. A new chunk at or before the settled frontier is a retroactive change.
+8. A retroactive change either repairs the affected output interval or returns
+   an explicit policy error.
+9. No watermark comparison may silently omit a retroactive row.
+10. Frontier advancement and output publication are atomic where progress is
+    persisted.
 
-Locations:
+Tests must distinguish:
 
-- `crates/provider/src/export.rs:420-538`
-- `crates/provider/src/export.rs:611-714`
-- `crates/provider/src/export.rs:723-930`
+- normal append;
+- normal disorder inside the unsealed region;
+- a row exactly at the frontier;
+- a row behind the frontier but within supported repair;
+- a row beyond the supported repair policy; and
+- a no-data frontier advance.
 
-A full rewrite first runs `SELECT DISTINCT` to enumerate partitions and then
-runs `COPY`. If the number of partitions exceeds the writer budget, it runs one
-additional source query per partition chunk. Incremental reconcile scans the
-source to enumerate every partition and then issues one filtered query per
-changed partition.
+## 7. Transform locality and change impact
+
+The term "incremental lineage" is too broad. Each derived operation must
+separately describe:
 
-For temporal-reduce output this is usually acceptable because the provider is
-the compact cached rollup, not the raw dynamic graph. For arbitrary derived
-series it can repeat expensive computation.
+1. the input ranges required for a requested output range;
+2. the output ranges affected by an input change; and
+3. any persistent state needed across executions.
 
-#### Implementation
+An illustrative contract is:
 
-1. For the common case below the writer limit, run one partitioned `COPY`
-   without a preliminary distinct-partition scan.
-2. Discover and normalize produced files afterward.
-3. For incremental reconcile, derive reusable historical partitions from the
-   seed manifest and enumerate only timestamps at or after `changed_since`.
-4. Preserve deletion handling by comparing the changed-tail result with seeded
-   partitions at or after that boundary.
-5. For large partition counts, retain chunking but ensure every chunk predicate
-   reaches physical leaves.
-6. Verify whether global `ORDER BY timestamp` is required by the output
-   contract. If ordering is per partition, use partition-aware ordering rather
-   than a global pre-partition sort.
+```rust
+trait IncrementalRecipe {
+    fn required_input_ranges(
+        &self,
+        requested_output: TimeInterval,
+    ) -> InputRanges;
+
+    fn affected_output_ranges(
+        &self,
+        changes: &ChangeSet,
+    ) -> OutputRanges;
+
+    fn state_contract(&self) -> StateContract;
+}
+```
+
+### 7.1 Locality classes
 
-### 5.12 Low: obsolete join SQL remains in validation
+| Class | Examples | Range behavior |
+|---|---|---|
+| Row-local | projection, rename, cast, null padding | same input/output interval |
+| Timestamp-local | timestamp join, pivot, declared combine | same interval on each input |
+| Window-local | bucketed reduce, finite rolling window | expand to bucket/window boundaries |
+| Stateful append | cumulative operation with checkpointable state | prior state plus suffix |
+| Global | rank over all history, unrestricted SQL | complete input unless separately proven |
 
-Locations:
+Join, pivot, and combine are timestamp-local only after their overlap policy
+and row-identity semantics are known.
 
-- `crates/provider/src/factory/timeseries_join.rs:138-230`
-- `crates/provider/src/factory/timeseries_join.rs:590-603`
+### 7.2 Change sets
 
-`generate_timeseries_join_sql` is no longer the execution path, but validation
-still calls it. It contains the previous `USING` join and terminal `ORDER BY`
-shape, while execution uses `generate_union_join_sql`.
+A `ChangeSet` must identify at least:
 
-This is not currently an execution cost, but duplicate SQL generation can let
-validation and execution semantics drift. Validation should inspect the
-configuration directly and, where planning validation is desired, plan the
-same SQL generator used at execution.
+- added immutable chunks;
+- removed membership, where the source permits it;
+- changed event-time intervals;
+- wildcard member additions or removals;
+- source recipe changes;
+- schema changes; and
+- settled-frontier movement.
 
-## 6. Factory-by-factory disposition
+Semantic recipe identity and physical freshness are separate:
 
-### Physical table and series providers
-
-**Assessment:** sound foundation.
-
-- Explicit live-version URLs prevent stale or superseded files from reappearing
-  through directory listing.
-- Cache keys include version selection and bounds.
-- `CoherentTableProvider` rejects stale providers after mutation.
-- The TinyFS object store supports ranged reads and Parquet can perform
-  projection and row-group pruning.
-- Memory and TLogFS implement the same bounded queryable-file interface.
-
-**Remaining work:** add the exact row predicate described in section 5.6 and
-retain plan tests across both persistence backends.
-
-### Format providers and format cache
-
-**Assessment:** good once cached.
-
-- Source parsing streams into immutable Parquet sidecars.
-- Sidecars are content/version keyed.
-- Reads use an explicit live file set.
-- Missing live sidecars fail instead of silently omitting rows.
-
-**Remaining work:** exact row bounds after conservative sidecar selection, and
-plan/I/O tests proving row-group and projection pruning.
-
-### SQL-derived table and series
-
-**Assessment:** correct conservative abstraction, incomplete optimization
-contract.
-
-- `ViewTable` preserves composability.
-- Source unions are lazy.
-- Arbitrary SQL must not claim timestamp locality.
-
-**Remaining work:** add the explicit timestamp-local mode, remove unnecessary
-terminal ordering from configurations where ordering is only presentational,
-and ensure transient table registration does not retain redundant raw
-providers for the lifetime of a large build.
-
-### Time-series join
-
-**Assessment:** the full-outer-join correction is sound.
-
-- Inputs are scanned once per execution path.
-- Later joins use accumulated coalesced time.
-- Bounds are injected into each input before the join.
-- No terminal sort exists in the active generator.
-
-**Remaining work:** define same-scope overlap semantics and remove full-row
-distinct when possible; retire the obsolete validation generator; migrate scope
-prefixing to a logical projection.
-
-### Time-series pivot
-
-**Assessment:** the new single-scan algorithm is sound.
-
-- It no longer builds a separate distinct timestamp spine.
-- It projects only configured measurements.
-- Bounds recurse through the source joins.
-
-**Remaining work:** replace null-padding and scope-prefix wrappers with logical
-projections. The null-padding filter-order bug must be fixed before treating the
-provider as generally safe.
-
-### Temporal reduce
-
-**Assessment:** strongest part of the system.
-
-- Immutable leaves and semantic recipe identity are separated for stable
-  source nodes.
-- The finest level scans source data; coarser levels fold finer partials.
-- Sealed segments and a bounded hot window prevent history-sized aggregation.
-- Late data unseals and repairs affected ranges.
-- Cache corruption is surfaced.
-- Reads use explicit manifest members and declared ordering.
-- Export hints avoid rewriting unchanged site partitions.
-
-**Remaining work:** exact source row predicates, wildcard-membership identity,
-and an explicit timestamp-local contract for eligible SQL-derived sources.
-
-The single-pass fallback is correct but intentionally O(history). It should
-remain visible in logs/metrics so a configuration change cannot silently move a
-production graph off the incremental path.
-
-### Materialize series
-
-**Assessment:** useful boundary with an incomplete incremental contract.
-
-It should be retained for cases where a durable typed series is a genuine
-product, such as self-monitoring. It should not be used as the remedy for an
-inefficient Noyo dynamic graph.
-
-**Remaining work:** bounded source construction, streaming writes, and explicit
-late-data behavior.
-
-### Synthetic timeseries
-
-**Assessment:** bounded-memory but optimizer-opaque.
-
-**Remaining work:** filter-aware and projection-aware generation.
-
-### Site reports and monitoring
-
-**Assessment:** generally correct consumer behavior.
-
-`sitegen::report::collect_samples` constructs a bounded provider and queries
-only the timestamp and requested value columns. Monitoring uses bounded windows
-for recent status. These consumers demonstrate the desired API shape.
-
-### Site export
-
-**Assessment:** correct and deterministic, but can repeat scans.
-
-Temporal-reduce's export hints substantially reduce steady-state cost. Generic
-derived exports still need the improvements in section 5.11.
-
-## 7. Step-by-step implementation sequence
-
-Each step should be a separately reviewable commit. Do not combine behavior
-changes with unrelated cleanup.
-
-Every step must also add or run the narrowest relevant efficiency regression.
-Depending on the path, that means plan-shape assertions, hard upper bounds on
-I/O or work counters, bounded-memory checks, or an instrumented Noyo benchmark.
-Correct results alone do not satisfy a step's exit condition. Record a
-before/after baseline when the step changes execution work; do not defer
-performance validation until the end of the sequence.
-
-### Step 1 (complete): lock down transform correctness
-
-1. Add permanent regressions reproducing:
-   - null-padding mixed filter ordering;
-   - exact pushdown through a type-changing rename returning wrong rows;
-   - current inexact Parquet behavior retaining a post-cast filter.
-2. Apply the positional null-padding fix.
-3. Make casted-column predicates unsupported as the immediate safety fix.
-4. Assert that unaffected conjuncts are still delegated and unused Parquet
-   columns remain projected out.
-5. Run provider tests and strict workspace clippy.
-
-**Exit condition:** no custom provider can report `Exact` for a predicate it
-does not enforce, and the safety fix does not disable independent predicate or
-projection pushdown.
-
-### Step 2 (complete): replace custom transforms with logical projections
-
-1. Introduce a helper that builds a projection `ViewTable` over a provider.
-2. Migrate scope prefixing.
-3. Migrate type-preserving column rename.
-4. Migrate type-changing casts.
-5. Migrate null padding.
-6. Remove custom execution nodes after plan/result parity is established.
-
-**Exit condition:** aliases, casts, and typed nulls appear as ordinary DataFusion
-projection expressions; no transform manually synthesizes optimizer metadata.
-
-### Step 3 (complete): centralize exact event-time bounds
-
-1. Extract timestamp-unit conversion from `SqlDerivedFile`.
-2. Add a shared `bounded_table_provider(provider, column, bounds)` helper.
-3. Apply it after version pruning for physical and cached-format sources.
-4. Use it in dynamic SQL-derived construction.
-5. Use it in temporal-reduce source construction.
-6. Add explain-plan assertions for each source kind.
-
-**Exit condition:** every bounded source plan has both conservative file
-selection and an exact row predicate.
-
-### Step 4: make materialization genuinely incremental
-
-1. Pass a conservative source bound derived from the target watermark.
-2. Keep the strict outer predicate.
-3. Add streaming series-version writing.
-4. Remove result collection and concatenation.
-5. Record source lineage/progress.
-6. Implement and document the late-data policy.
-7. Enroll memory and TLogFS in the same materialization contract.
-
-**Exit condition:** one append has memory bounded by execution batch and Parquet
-writer buffers, and a late row cannot disappear silently.
-
-### Step 5: expose Git Parquet lazily
-
-1. Expose Git blob identity and length without loading its contents.
-2. Implement immutable range reads.
-3. Build a Parquet `ListingTable` over the blob object.
-4. Cache the raw provider by blob identity.
-5. Remove `read_pond_node_as_parquet` from query paths.
-6. Keep a focused helper only if a non-query use truly needs full decoding.
-
-**Exit condition:** querying one projected column and a narrow time range does
-not read or decode the complete Git archive.
-
-### Step 6: establish same-scope union semantics
-
-1. Document the required archive/live overlap rule.
-2. Add overlap and duplicate-timestamp fixtures.
-3. Implement validation or deterministic precedence.
-4. Change the common non-overlap path to `UNION ALL BY NAME`.
-5. Assert narrow leaf projections beneath the union.
-
-**Exit condition:** same-scope composition is both semantically explicit and
-free of unnecessary full-row distinct work.
-
-### Step 7: stabilize wildcard lineage
-
-1. Separate configured edge identity from resolved leaf membership.
-2. Keep nested semantic identities in the recipe.
-3. Move physical node IDs and versions into the freshness set.
-4. Verify append, add, remove, transform-change, and cycle cases.
-
-**Exit condition:** adding ordinary data under an unchanged wildcard repairs
-only the affected time range.
-
-### Step 8: add timestamp-local SQL-derived mode
-
-1. Define the configuration schema.
-2. Validate declared input/output time columns.
-3. Propagate bounds.
-4. expose recursive lineage.
-5. Reject unsupported SQL shapes rather than guessing.
-6. Convert only demonstrably local existing configurations.
-
-**Exit condition:** simple projections and row-local calculations can
-participate in incremental reduction without weakening arbitrary SQL
-correctness.
-
-### Step 9: improve synthetic and export providers
-
-1. Make synthetic generation honor time filters and projections.
-2. Remove unnecessary export partition-enumeration scans.
-3. Bound incremental partition discovery to `changed_since`.
-4. Verify partition predicates reach source scans.
-5. Revisit global output sorting based on the actual exported-file ordering
-   contract.
-
-**Exit condition:** test sources follow the production provider contract and
-exports do not reevaluate an expensive source merely to discover output paths.
-
-### Step 10: remove obsolete paths and document the contract
-
-1. Delete `generate_timeseries_join_sql` after validation uses the active
-   generator or direct config checks.
-2. Remove obsolete custom execution wrappers.
-3. Update `cli-reference.md` for timestamp-local SQL and materializer late-data
-   behavior.
-4. Update `temporal-reduce-bounded-memory-design.md` with the shared exact-bound
-   helper and wildcard-lineage rules.
-
-## 8. Validation framework
-
-Result tests alone are insufficient. Every important path needs four forms of
+- changing a transform changes recipe identity;
+- appending an ordinary source chunk changes freshness and affected ranges;
+- adding a wildcard member changes membership and affected ranges;
+- repacking the same logical content changes neither recipe nor logical
+  freshness; and
+- caches use explicit manifests, never directory listing as authority.
+
+### 7.3 Arbitrary SQL
+
+User SQL remains conservative by default. It may contain global windows,
+cumulative calculations, non-local joins, or ordering requirements.
+
+An explicitly declared local SQL mode may be added only after the typed
+built-in workloads pass. It must:
+
+- declare output and input event-time columns;
+- declare locality or required context;
+- validate supported plan shapes after SQL planning;
+- include the declaration in recipe identity;
+- reject unsupported constructs; and
+- preserve an exact output predicate.
+
+The implementation must not infer locality from SQL text.
+
+## 8. DataFusion provider boundary
+
+The intended plan shape is:
+
+```text
+DatasetSnapshot
+    -> ChunkTableProvider
+        -> typed DataFusion logical plan
+            -> standard DataFusion physical operators
+                -> Parquet DataSourceExec
+```
+
+`ChunkTableProvider` is the principal custom provider boundary. It must:
+
+1. capture an immutable `DatasetSnapshot`;
+2. expose the snapshot schema;
+3. receive projection, filters, and limit through `TableProvider::scan`;
+4. use filters to prune candidate chunks conservatively;
+5. retain exact residual predicates in the logical plan;
+6. build ordinary Parquet sources with per-object statistics;
+7. expose valid ordering only when every selected chunk supports it;
+8. report `Exact` only when the complete expression is enforced;
+9. remain correct when statistics are absent; and
+10. publish detailed physical-work metrics.
+
+The provider may report filter support as `Inexact` while using an expression
+for chunk pruning. Correctness is established by the retained filter, not by
+the pruning decision.
+
+### 8.1 Typed plans
+
+Built-in operations use DataFusion expressions and logical plan builders:
+
+- column transforms are projections;
+- same-scope combination is a policy-aware union/reconciliation plan;
+- timeseries join is a typed full outer join over declared keys;
+- pivot is a typed composition of projections and joins;
+- reduction is a typed aggregate plan;
+- materialization consumes an execution stream; and
+- user SQL is planned through DataFusion's SQL frontend and then classified
+  conservatively.
+
+The foundation must not carry both a generated-SQL and typed implementation of
+the same built-in operation. One implementation and one set of semantics are
+easier to reason about and test.
+
+### 8.2 Projection, filters, and bounds
+
+Every bounded timeseries path must have both:
+
+1. conservative chunk or file selection using metadata; and
+2. an exact row predicate in the logical plan.
+
+A version or chunk whose metadata overlaps a requested interval is retained,
+but rows outside the interval are still filtered. A narrow projection reaches
+the Parquet scan unless an intervening operation semantically requires another
+column.
+
+### 8.3 Ordering
+
+Ordering is evidence, not an assumption:
+
+- chunk ordering must be declared and validated;
+- union ordering is preserved only when compatible;
+- reconciliation may require key ordering;
+- cached reduced runs may use sort-preserving merge when their manifests prove
+  compatible ranges;
+- a global sort is added only when required by the output or downstream
+  operator; and
+- plan tests reject false ordering claims.
+
+## 9. Fresh-crate module plan
+
+The exact module names may evolve, but responsibilities should begin as:
+
+```text
+query-foundation/
+  src/
+    snapshot.rs       immutable datasets, chunks, membership
+    statistics.rs     event-time and column pruning metadata
+    overlap.rs        dataset row-identity and overlap contracts
+    locality.rs       required-input and affected-output intervals
+    provider.rs       ChunkTableProvider
+    plans/
+      transform.rs
+      combine.rs
+      join.rs
+      pivot.rs
+      reduce.rs
+    materialize.rs    abstract atomic streaming sink and progress
+    metrics.rs        physical work and memory observations
+    testkit.rs        instrumented object store and fixture builders
+```
+
+Initial dependencies:
+
+- Arrow;
+- DataFusion;
+- Parquet;
+- `object_store`;
+- Tokio/futures as required by those APIs; and
+- test-only utilities.
+
+The crate must not initially depend on:
+
+- `tinyfs`;
+- `tlogfs`;
+- `provider`;
+- `steward`;
+- `sync-store`;
+- site generation;
+- Noyo configuration; or
+- production Delta tables.
+
+Tests will use real Parquet and an instrumented in-memory object store.
+`MemTable` is acceptable for small semantic fixtures but cannot satisfy an
+I/O, projection, pruning, or memory gate.
+
+## 10. Query-shape inventory
+
+The first delivery gate is complete only when every shape below has result,
+plan, I/O/work, memory, and failure evidence where applicable.
+
+### 10.1 Physical tables and series
+
+- one immutable Parquet object;
+- multiple immutable chunks as one dataset;
+- explicit snapshot membership;
+- time-bounded and unbounded scans;
+- ordinary non-timeseries filters;
+- narrow projection;
+- limit;
+- absent statistics;
+- versions spanning both sides of a bound;
+- differing schemas;
+- snapshot isolation while a later snapshot is published; and
+- invalid or missing physical objects.
+
+### 10.2 Logical transforms
+
+- alias and rename;
+- type-preserving cast;
+- type-changing cast;
+- cast failure;
+- scope prefix;
+- typed null padding;
+- mixed predicates over inner and padded columns;
+- timestamp-unit changes;
+- projection pruning through every transform; and
+- correct residual filters after every transform.
+
+### 10.3 Same-scope combine
+
+- disjoint archive/live ranges;
+- overlapping ranges under every policy;
+- duplicate timestamps with distinct rows;
+- duplicate logical keys;
+- deterministic precedence;
+- schema-aligned union;
+- missing columns;
+- wildcard member addition/removal; and
+- narrow downstream projection.
+
+### 10.4 Timeseries join
+
+- two-way full outer timestamp join;
+- three-way accumulated timestamp join;
+- timestamps absent from the first input;
+- sparse inputs;
+- empty input;
+- equal timestamps with multiple rows;
+- different scopes;
+- same-scope composition before join;
+- independently bounded inputs;
+- projection through join;
+- join followed by filter;
+- join followed by reduction; and
+- one physical scan per source occurrence.
+
+### 10.5 Timeseries pivot
+
+- one and multiple selected measurements;
+- missing measurements;
+- missing sites;
+- sparse timestamps;
+- padded columns;
+- multiple rows at one timestamp under declared policy;
+- independently bounded source joins;
+- adding one parameter reads only that parameter's columns;
+- pivot followed by reduction; and
+- no separate timestamp-spine rescan.
+
+### 10.6 Reduce and downsample
+
+- fixed-width buckets;
+- calendar buckets where supported;
+- multiple group keys;
+- null values;
+- multiple resolutions;
+- coarser levels folded from finer partials;
+- open buckets in the unsealed region;
+- sealed buckets;
+- ordinary append;
+- out-of-order input within the unsealed region;
+- retroactive repair;
+- repair rejection when unsupported;
+- no-change reuse;
+- source membership changes; and
+- exact dirty-bucket accounting.
+
+### 10.7 Derived composition
+
+- transform over physical source;
+- derived source over derived source;
+- combine followed by join;
+- join followed by pivot;
+- pivot followed by reduce;
+- timeseries joined with a dimension table;
+- declared timestamp-local SQL;
+- unrestricted global SQL;
+- window functions;
+- finite-lookback calculations;
+- cumulative calculations; and
+- empty and fully pruned inputs.
+
+### 10.8 Materialization model
+
+Before TinyFS integration, the crate will provide an abstract transactional
+stream sink proving:
+
+- bounded streaming write;
+- exactly one visible output on success;
+- no visible output after a stream failure;
+- no visible output after writer close failure;
+- no `collect` or complete-result concatenation;
+- exact temporal metadata and row count computed incrementally;
+- no-change writes no output;
+- progress and output publish atomically;
+- strict boundary predicates avoid duplicate watermark rows;
+- unsealed changes are included;
+- retroactive changes repair or fail explicitly; and
+- memory is bounded by DataFusion batches and writer buffers.
+
+This sink is a test contract, not a substitute for the later TinyFS adapter.
+
+## 11. Validation framework
+
+Correct rows alone do not satisfy any delivery gate.
+
+### 11.1 Result correctness
+
+Each workload must assert complete rows, schemas, ordering where promised, and
+errors where required. Property tests should vary:
+
+- chunk boundaries;
+- row-group boundaries;
+- projection sets;
+- predicate forms;
+- input ordering;
+- empty chunks;
+- missing statistics;
+- overlap patterns;
+- event-time disorder; and
+- batch sizes.
+
+Equivalent logical data with different physical packing must produce identical
+query results and logical identities.
+
+### 11.2 Plan shape
+
+Normalize plans and assert structural properties:
+
+- expected `DataSourceExec` count;
+- expected leaf projection;
+- expected Parquet predicate;
+- retained exact row predicate;
+- no `MemoryExec` beneath a Parquet query path;
+- no full-row distinct for a policy that does not require it;
+- no duplicate timestamp-spine scan;
+- no unnecessary global sort;
+- sort-preserving merge only with proven ordering;
+- no scan for pruned chunks; and
+- no filter removed because of a false `Exact` declaration.
+
+Assertions must avoid unstable generated identifiers and cosmetic formatting.
+
+### 11.3 I/O and work counters
+
+The test object store and provider must record:
+
+- candidate chunks;
+- chunks retained and pruned;
+- object metadata calls;
+- objects opened;
+- range requests;
+- bytes requested and returned;
+- Parquet row groups considered and decoded;
+- available and projected columns;
+- input batches and rows;
+- rows entering reconciliation, join, and aggregate operators;
+- duplicate or conflict counts;
+- scans per source;
+- partial states reused and rebuilt;
+- output batches and bytes; and
+- reasons for every cache miss or rebuild.
+
+Tests assert upper bounds. Logging a number without an assertion is not
 evidence.
 
-### 8.1 Result correctness
+### 11.4 Memory
 
-Run the same fixtures against memory and TLogFS:
+Use DataFusion's memory pool plus test-specific writer observations to assert:
 
-| Scenario | Memory | TLogFS |
-|---|---:|---:|
-| Unbounded physical series | required | required |
-| Bounded physical series | required | required |
-| Same-transaction append visibility | required | required |
-| Stale provider after append | required | required |
-| Join with missing timestamps | required | required |
-| Three-way accumulated timestamp join | required | required |
-| Pivot with missing columns | required | required |
-| Mixed inner/padded predicates | required | required |
-| Casted timestamp predicate | required | required |
-| Late materializer input | required | required |
-| Late temporal-reduce input | required | required |
-| Wildcard member add/remove | required | required |
+- peak reserved execution memory;
+- peak buffered writer memory;
+- no result-sized concatenation;
+- join state bounded by the active requested range;
+- reduce state bounded by open buckets and configured grouping;
+- no full decoded Parquet table retained; and
+- no retained-history growth in one-append materialization.
 
-### 8.2 Plan shape
-
-Normalize physical-plan text and assert structural properties:
-
-- one `DataSourceExec` per physical source occurrence;
-- expected leaf `projection=[...]`;
-- expected Parquet `predicate=...`;
-- no residual global `SortExec` when existing ordering suffices;
-- `SortPreservingMergeExec` for cached reduced runs;
-- no `DataSourceExec` for pruned versions;
-- no `MemoryExec` beneath Git-backed Parquet scans;
-- no distinct aggregate for validated non-overlapping same-scope unions;
-- no `FilterExec` removed on the basis of a false `Exact` declaration.
-
-Avoid assertions tied to unstable generated IDs or cosmetic explain formatting.
-
-### 8.3 I/O and work counters
-
-Instrument the TinyFS object store and format cache in tests:
-
-- object metadata calls;
-- byte ranges requested;
-- total bytes returned;
-- source versions opened;
-- Parquet row groups decoded;
-- format files parsed;
-- synthetic rows and point values generated;
-- aggregate cache levels rebuilt;
-- export source executions.
-
-The tests should assert upper bounds, not only log these values.
-
-### 8.4 Memory behavior
-
-Use bounded fixtures large enough to produce many record batches:
-
-- materialization peak memory must not scale with delta row count;
-- temporal-reduce peak memory must scale with hot-window bucket count, not
-  retained history;
-- Git Parquet scans must not retain a full decoded table;
-- export memory must remain bounded by writer and execution batches.
-
-### 8.5 Failure behavior
+### 11.5 Failure behavior
 
 Inject failures at:
 
-- source range read;
-- format-cache write;
+- object metadata read;
+- object range read;
+- Parquet decode;
 - transform evaluation;
+- reconciliation;
 - DataFusion stream after several batches;
-- series writer close;
-- manifest write and rename;
-- transaction commit.
+- state or cache write;
+- stream writer close;
+- progress publication; and
+- snapshot publication.
 
-Every failure must be returned. No partial version, cache manifest, or export
-may become authoritative.
+Every failure must be returned. No partial result, state manifest, output
+version, or progress record may become authoritative.
 
-## 9. Noyo benchmark protocol
+### 11.6 Scale invariance
 
-Functional tests prove correctness; they do not prove that the production graph
-is fast. Measure the deployed Noyo graph in four modes:
+Run representative no-change, append, and late-change cases after 1, 100, and
+1,000 prior chunks or logical leaves.
+
+Required asymptotic behavior:
+
+- warm no-change scans zero source rows;
+- one append costs the new chunks plus the bounded unsealed region;
+- late repair costs intersecting chunks and dirty windows;
+- adding a reduction resolution does not rescan raw history;
+- adding a pivot parameter reads only required columns;
+- peak memory is independent of retained history; and
+- source scan count is independent of unrelated consumers.
+
+Absolute wall-clock targets come after structural and physical-work tests are
+stable.
+
+## 12. Implementation phases and gates
+
+Each phase should be a separately reviewable sequence of commits. A phase does
+not pass until its narrowest measurable efficiency regressions pass.
+
+### Phase 0: preserve evidence and establish the crate
+
+1. Scaffold the fresh workspace crate.
+2. Copy no production factory implementation.
+3. Reproduce prior bugs as black-box result, plan, or work regressions.
+4. Add the instrumented object store and metrics vocabulary.
+5. Record DataFusion and Parquet versions used by every baseline.
+
+**Gate:** the crate builds independently and can prove projection, predicate,
+row-group pruning, byte-range reads, and snapshot isolation over real Parquet.
+
+### Phase 1: physical snapshot provider
+
+1. Implement snapshot and chunk descriptors.
+2. Implement conservative statistics pruning.
+3. Implement `ChunkTableProvider`.
+4. Retain exact residual predicates.
+5. Preserve valid ordering and discard unsupported claims.
+6. Complete the physical table/series matrix.
+
+**Gate:** bounded and projected scans have correct results and hard I/O bounds;
+missing statistics cannot cause data loss.
+
+### Phase 2: transforms and overlap semantics
+
+1. Implement logical projection transforms.
+2. Implement each overlap policy.
+3. Implement typed same-scope combine.
+4. Prove safe predicate and projection movement.
+5. Prove conflict and duplicate errors.
+
+**Gate:** no transform manually synthesizes physical optimizer metadata, and
+same-scope composition performs only work required by its declared policy.
+
+### Phase 3: typed join and pivot
+
+1. Implement accumulated full outer timestamp join.
+2. Implement typed pivot.
+3. Propagate bounds independently to every input.
+4. Prove leaf projection through each plan.
+5. Cover sparse, duplicate, empty, and wildcard cases.
+
+**Gate:** every source appears once per required plan occurrence, and no
+timestamp spine or full-row distinct creates repeated or global work.
+
+### Phase 4: reduce, downsample, and change impact
+
+1. Implement locality and `ChangeSet` contracts.
+2. Implement window-local dirty-range calculation.
+3. Implement fine-to-coarse reusable partial state.
+4. Implement settled and unsealed behavior.
+5. Implement late repair and explicit rejection.
+6. Cover scale invariance after 1, 100, and 1,000 chunks.
+
+**Gate:** no-change, append, and repair costs are independent of settled
+history, and every rebuild has an asserted reason and range.
+
+### Phase 5: derived composition and SQL boundary
+
+1. Compose every built-in query shape.
+2. Add user SQL planning.
+3. Keep arbitrary SQL global.
+4. Add an explicit local SQL declaration only if needed by a demonstrated
+   Watertown workload.
+5. Validate declared locality against planned operators.
+
+**Gate:** all current query shapes pass result, plan, work, memory, and failure
+tests without production storage dependencies.
+
+### Phase 6: abstract materialization
+
+1. Implement the transactional streaming sink contract.
+2. Couple progress and output atomically.
+3. Exercise ordinary disorder and retroactive changes.
+4. Prove bounded memory and failure atomicity.
+
+**Gate:** every materialization scenario passes without `collect`, silent row
+loss, or partial publication.
+
+Phase 6 completes the first delivery gate. Production integration must not
+begin earlier merely because one factory-shaped example works.
+
+### Phase 7: TinyFS integration
+
+1. Adapt exact TinyFS version membership to foundation snapshots.
+2. Adapt TinyFS/object-store range reads to foundation chunks.
+3. Preserve transaction-generation coherence.
+4. Implement TinyFS atomic streaming series writing.
+5. Map logical leaf metadata without making Parquet layout part of identity.
+6. Run the full foundation contract against memory persistence.
+
+**Gate:** memory TinyFS matches the isolated model for results and measured
+work, and failed writes expose no version.
+
+### Phase 8: TLogFS and Delta integration
+
+1. Capture one coherent TLogFS/Delta snapshot for planning.
+2. Map committed immutable versions to chunk descriptors.
+3. Preserve same-transaction visibility and stale-provider rejection.
+4. Avoid eager decoding or `MemTable` conversion.
+5. Run the complete cross-persistence matrix.
+6. Prove Delta age does not increase small-query planning or scan work.
+
+**Gate:** memory and TLogFS produce identical semantics, while TLogFS physical
+work remains bounded by selected chunks and row groups.
+
+### Phase 9: provider and factory integration
+
+1. Make provider construction adapt TinyFS/TLogFS snapshots to the foundation.
+2. Convert built-in factory configurations to typed recipes.
+3. Integrate combine before join and pivot.
+4. Integrate join and pivot before temporal reduction.
+5. Integrate reduction and reusable partial manifests.
+6. Integrate materialization last.
+7. Remove superseded generated SQL and custom execution paths.
+8. Make global and non-incremental paths visible in logs and metrics.
+
+**Gate:** the production factories satisfy the same tests and counters as the
+foundation; there is no behavior-only adapter that loses the plan contract.
+
+### Phase 10: consumers and Noyo qualification
+
+1. Integrate reports and monitoring bounded reads.
+2. Integrate deterministic site export.
+3. Remove avoidable partition-enumeration scans.
+4. Run the Noyo benchmark protocol in Section 14.
+5. Qualify water and septic graphs for the same invariants.
+
+**Gate:** production graphs satisfy the asymptotic requirements without
+materialized intermediate series added to conceal plan defects.
+
+### Phase 11: native-v2 backup and restore verification
+
+1. Map query-visible immutable logical leaves to current
+   `watertown.series.v3` identities.
+2. Preserve per-leaf count, event-time bounds, schema fingerprint, and logical
+   attributes in `watertown.series-pack.v4` descriptors.
+3. Prove an append supplies a suffix pack without rereading retained history.
+4. Prove repacking changes physical layout but not logical identity.
+5. Prove query compaction cannot alter backup semantics.
+6. Re-run publication no-op, append, retry, pull, and capsule verification.
+
+**Gate:** query and replication planes share immutable identities and metadata
+without backup executing a query or query planning from backup advertisements.
+
+## 13. Production integration boundaries
+
+### 13.1 TinyFS
+
+TinyFS will supply:
+
+- immutable version membership;
+- transaction-coherent visibility;
+- object length and range reads;
+- logical leaf metadata;
+- atomic streamed append; and
+- failure atomicity.
+
+It should not implement factory-specific query planning.
+
+### 13.2 TLogFS and Delta
+
+Delta remains a transactional visibility and concurrency mechanism. It should
+not require eager full-table decoding to expose a queryable Parquet snapshot.
+
+TLogFS must prove:
+
+- exact snapshot capture;
+- same-transaction visibility;
+- stale-provider failure;
+- bounded latest-state lookup;
+- selected-version and row-group pruning; and
+- query cost independent of unrelated Delta history.
+
+### 13.3 Provider
+
+The provider package will translate Watertown URLs and factory configuration
+into:
+
+- exact source snapshots;
+- typed logical recipes;
+- locality declarations;
+- overlap policies;
+- bounds;
+- cache/state manifests; and
+- instrumented execution.
+
+It should not create hidden materialization boundaries or carry alternative
+implementations of foundation operators.
+
+### 13.4 Factories
+
+Factories become declarative recipes and persistent-state coordinators:
+
+- combine declares overlap behavior;
+- join and pivot declare keys and output shape;
+- reduce declares windows and reusable state;
+- materialize declares sink progress and repair policy;
+- SQL-derived factories declare no locality unless validated; and
+- synthetic sources implement the same projection, filter, and metric
+  contracts as physical sources.
+
+### 13.5 Replication and backup
+
+Backup remains a separate execution plane:
+
+```text
+shared immutable snapshot and logical-series metadata
+        /                                      \
+DataFusion query plane                  replication plane
+chunk pruning and typed plans           Merkle diff and suffix packs
+```
+
+Backup must not discover changes by:
+
+- executing a `TableProvider`;
+- scanning logical series rows;
+- listing all remote objects or packs;
+- folding all retained leaves; or
+- materializing a factory output.
+
+Query planning must not:
+
+- depend on remote publication advertisements;
+- treat a backup pack as semantic query identity;
+- change results when a physically equivalent pack is selected; or
+- weaken snapshot coherence to reuse remote objects.
+
+The current native-v2 invariants remain requirements:
+
+- BLAKE3 logical series identity over canonical logical content;
+- packing-independent ordered leaves;
+- bounded Merkle append frontier;
+- suffix packs for ordinary append;
+- immutable objects before packs before visible publication state;
+- fixed-size active publication state;
+- acknowledged no-change return before remote open; and
+- `pondcapsule.4` as the explicit verified reset boundary.
+
+## 14. Noyo benchmark protocol
+
+The Noyo graph remains the principal production performance qualification:
+
+```text
+git HydroVu archives ----\
+live HydroVu series ------- typed same-scope combine and join
+legacy Excel/HTML --------/
+                                   |
+                                   +--> temporal reduce by site
+                                   |
+                                   +--> typed pivot by parameter
+                                              |
+                                              +--> temporal reduce by parameter
+```
+
+Run at least:
 
 1. **Cold cache**
-   - empty format and aggregate caches;
-   - complete site generation;
+   - no format or aggregate state;
    - establishes unavoidable historical work.
-2. **Warm, no changes**
-   - identical source identities and versions;
-   - should perform metadata validation and export reuse only;
+2. **Warm no-change**
+   - identical snapshot and recipes;
    - expected source row scans: zero.
 3. **One normal append**
-   - one new live HydroVu version;
-   - work should be proportional to that version plus allowed-lateness windows;
-   - unchanged sites/parameters/resolutions should reuse caches.
-4. **One late append**
-   - one row behind the sealed frontier but within the supported repair model;
-   - only affected segments and export partitions should be rebuilt.
+   - one new live HydroVu chunk;
+   - work proportional to that chunk and the unsealed region.
+4. **One ordinary out-of-order append**
+   - data inside the unsealed region;
+   - only open windows and affected outputs change.
+5. **One retroactive append**
+   - data behind the settled frontier;
+   - only declared repair intervals rebuild, or the run fails explicitly.
+6. **Wildcard membership change**
+   - one source added or removed;
+   - only affected recipes and intervals change.
 
-Record for each run:
+Record:
 
-- wall-clock time by factory and export stage;
-- peak RSS;
-- source files and versions opened;
-- bytes read;
-- Parquet row groups decoded;
-- rows entering each join, pivot, and aggregate;
-- cache hit/miss/rebuild reason;
-- output partitions reused and rewritten.
+- wall-clock time by stage;
+- peak RSS and DataFusion memory reservation;
+- chunks and objects considered/opened;
+- range requests and bytes;
+- row groups and columns decoded;
+- rows entering combine, join, pivot, and aggregate;
+- reconciliation conflicts or duplicates;
+- partial-state hit/miss/rebuild reason;
+- output partitions reused and rewritten;
+- factory source execution counts; and
+- backup operations and bytes caused by the resulting commit.
 
-The important acceptance criteria are asymptotic:
+Required asymptotic outcomes:
 
 - warm no-change cost is independent of history;
 - one-append cost is independent of history;
-- peak memory is bounded by batches, join state for the active range, and the
-  configured hot window;
-- adding another output resolution does not rescan raw history;
-- adding another pivot parameter reads only that parameter's columns.
+- ordinary disorder costs no more than the bounded unsealed region;
+- retroactive repair is bounded by declared affected intervals;
+- each source is scanned once per mathematically required occurrence;
+- another resolution does not rescan raw history;
+- another pivot parameter reads only required columns;
+- site export does not reevaluate an expensive source merely to enumerate
+  partitions; and
+- backup publishes only objects and suffix packs introduced by the commit.
 
-Absolute timing targets should be set after the first instrumented run on
-Watershop hardware.
+## 15. InfluxDB/IOx lessons
 
-## 10. Definition of done
+InfluxDB/IOx is useful prior art, not an implementation template.
 
-The review is complete only when:
+Relevant lessons:
 
-1. the two transform correctness defects have permanent regressions and fixes;
-2. all bounded paths show both file pruning and row predicates;
-3. materialization is streaming and has explicit late-data semantics;
-4. Git-backed Parquet remains lazy through DataFusion;
-5. same-scope union semantics are explicit and plan-tested;
-6. wildcard data changes do not unnecessarily invalidate query semantics;
-7. the cross-persistence matrix passes for memory and TLogFS;
-8. `cargo clippy --workspace --all-features -- -D warnings` passes;
-9. cold, warm, append, and late Noyo benchmarks satisfy the asymptotic
-   invariants above; and
-10. documentation describes the implemented behavior rather than a proposed
-    behavior.
+- DataFusion can remain the ordinary relational engine while a storage-facing
+  chunk abstraction exposes statistics, ordering, and duplicate guarantees.
+- Mutable and persisted membership must be captured consistently so rows are
+  not omitted or exposed twice during a tier transition.
+- Pruning occurs at catalog/chunk, file, row-group, and row levels; each level
+  requires separate metrics.
+- Domain-specific deduplication belongs in an explicit semantic operator, and
+  predicates that could change winner selection must remain above it.
+- Late data can be represented by immutable overlapping chunks, with
+  compaction as a later physical operation.
+- Custom optimizer rules are justified for demonstrated domain requirements,
+  not merely because the workload is timeseries.
+- Query logs should expose planned files, rows, bytes, duplicate counts, and
+  peak memory.
 
-## 11. Non-goals
+Watertown differs in important ways:
 
-- Do not add materialized intermediate Noyo series merely to hide inefficient
-  dynamic plans.
-- Do not infer timestamp locality from arbitrary SQL text.
-- Do not weaken stale-provider or transaction-generation checks for speed.
-- Do not silently fall back from a failed incremental path to a full-history
-  path.
-- Do not use cache directory listing as authority for readable members.
-- Do not optimize by dropping late or conflicting data.
+- not every dataset has InfluxDB last-write-wins semantics;
+- logical series leaves and native-v2 backup identities already have explicit
+  packing-independent meaning;
+- Watertown needs bounded settled/unsealed behavior for small industrial
+  deployments; and
+- backup efficiency and query efficiency share immutable identities but remain
+  separate execution planes.
 
-The intended end state is simple: DataFusion performs ordinary local
-optimization through transparent logical plans, TinyFS provides coherent and
-range-readable leaves, and temporal-reduce supplies the separate persistent
-reuse needed across builds.
+The foundation should therefore adopt the explicit chunk/provider and metrics
+lessons without imposing IOx's universal primary-key reconciliation model.
+
+## 16. Disposition of previous findings
+
+The earlier audit findings remain mandatory regressions:
+
+| Previous finding | Foundation disposition |
+|---|---|
+| Null-padding filter support order | mixed-filter transform regression |
+| Type-changing rename pushdown | cast predicate and residual-filter regression |
+| Custom transform execution nodes | logical projection requirement |
+| Git Parquet eager load | real range-readable Parquet source gate |
+| Same-scope full-row distinct | explicit overlap-policy combine |
+| Version pruning without row bounds | metadata pruning plus exact row predicate |
+| Unbounded materialize | abstract streaming sink and later TinyFS adapter |
+| SQL-derived locality ambiguity | global default and validated explicit locality |
+| Wildcard membership identity | separate recipe identity and change set |
+| Synthetic ignores filters/projection | common provider contract |
+| Export repeated scans | consumer execution-count gate |
+| Obsolete join SQL | typed plan only; remove generated built-in SQL |
+
+The fixes in `a0b117b3` and `cbf62ddb` demonstrate useful directions:
+logical projections and exact event-time filters. They should be compared with
+the foundation results during integration, not copied automatically.
+
+The dynamic rollup work in `ccba84e0` also provides valuable regressions for
+recursive bounds, accumulated timestamp joins, fine-to-coarse partials, late
+repair, and manifest-authoritative caches. Those behaviors must be reproduced
+through the new contracts before production adoption.
+
+## 17. Definition of done
+
+The program is complete only when:
+
+1. the fresh crate proves every query shape in Section 10;
+2. every gate includes result, plan, physical-work, memory, and failure
+   evidence where applicable;
+3. typed built-in plans replace generated SQL;
+4. overlap behavior is declared per dataset or composition;
+5. ordinary out-of-order input is efficient inside an explicit unsealed
+   region;
+6. retroactive input repairs or fails visibly;
+7. bounded paths perform metadata pruning and retain exact row predicates;
+8. projections reach physical Parquet leaves;
+9. materialization is streaming and failure-atomic;
+10. no-change and one-append work are independent of retained history;
+11. memory and TLogFS satisfy the same contracts;
+12. production factories are adapters to the proven foundation;
+13. Noyo satisfies cold, warm, append, disorder, repair, and membership-change
+    asymptotic gates;
+14. query and native-v2 backup share immutable identities without coupling
+    their execution;
+15. backup no-op, suffix-only append, pull, retry, and capsule verification
+    remain bounded and correct;
+16. `cargo clippy --workspace --all-features -- -D warnings` passes; and
+17. operator and design documentation describe implemented behavior rather
+    than aspirational behavior.
+
+## 18. Non-goals
+
+- Do not add materialized intermediate Noyo series to hide inefficient plans.
+- Do not reproduce TinyFS, TLogFS, Delta, or native-v2 backup inside the fresh
+  crate.
+- Do not copy current factory implementations before their abstractions are
+  proven.
+- Do not infer locality from arbitrary SQL text.
+- Do not impose universal last-write-wins or universal deduplication.
+- Do not assume timestamp uniqueness.
+- Do not make physical Parquet packing part of logical identity.
+- Do not use cache or object-store directory listing as authoritative
+  membership.
+- Do not optimize by dropping late, conflicting, or inconvenient data.
+- Do not treat wall-clock benchmarks as substitutes for physical-work
+  assertions.
+- Do not add custom DataFusion operators without a demonstrated requirement.
+- Do not weaken transaction coherence, publication atomicity, or visible error
+  handling for performance.
+
+The intended end state is one coherent system:
+
+- immutable storage snapshots expose range-readable chunks;
+- DataFusion performs ordinary optimization over typed logical plans;
+- explicit locality and overlap contracts govern incremental behavior;
+- persistent state reuses work across executions without hiding inefficient
+  plans;
+- TinyFS and TLogFS adapt their transactional storage to the same query
+  contracts; and
+- native-v2 backup transfers only new immutable content without executing the
+  query plane.
