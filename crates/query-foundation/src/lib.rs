@@ -4,6 +4,7 @@
 
 //! Executable correctness and performance contracts for Watertown queries.
 
+pub mod frontier;
 pub mod locality;
 pub mod metrics;
 pub mod overlap;
