@@ -7,7 +7,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use arrow::array::{Array, Float64Array, Int64Array};
+use arrow::record_batch::RecordBatch;
+use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::physical_plan::SendableRecordBatchStream;
+use futures::StreamExt;
 
 /// Mergeable statistics for one aggregate bucket and group.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -92,6 +97,43 @@ impl AggregatePartial {
     pub fn mean(self) -> Option<f64> {
         (self.non_null != 0).then(|| self.sum / self.non_null as f64)
     }
+
+    fn try_from_aggregate(
+        rows: u64,
+        non_null: u64,
+        sum: Option<f64>,
+        min: Option<f64>,
+        max: Option<f64>,
+    ) -> Result<Self> {
+        if non_null > rows {
+            return Err(DataFusionError::Execution(format!(
+                "partial non-null count {non_null} exceeds row count {rows}"
+            )));
+        }
+        if non_null == 0 {
+            if sum.is_some() || min.is_some() || max.is_some() {
+                return Err(DataFusionError::Execution(
+                    "empty partial must have null sum, min, and max".to_owned(),
+                ));
+            }
+            return Ok(Self {
+                rows,
+                ..Self::empty()
+            });
+        }
+        let (Some(sum), Some(min), Some(max)) = (sum, min, max) else {
+            return Err(DataFusionError::Execution(
+                "non-empty partial must have sum, min, and max".to_owned(),
+            ));
+        };
+        Ok(Self {
+            rows,
+            non_null,
+            sum,
+            min: Some(min),
+            max: Some(max),
+        })
+    }
 }
 
 fn merge_min(left: Option<f64>, right: Option<f64>) -> Option<f64> {
@@ -152,6 +194,174 @@ pub struct PartialManifest {
     width: i64,
     origin: i64,
     partials: BTreeMap<PartialKey, AggregatePartial>,
+}
+
+/// Bounded observations while consuming reduced batches.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PartialStreamMetrics {
+    /// Record batches consumed.
+    pub batches: u64,
+    /// Aggregate rows consumed.
+    pub aggregate_rows: u64,
+    /// Largest individual input batch.
+    pub peak_batch_rows: u64,
+    /// Final bucket/group partial count.
+    pub retained_partials: u64,
+}
+
+/// Incremental builder for an authoritative partial manifest.
+pub struct PartialManifestBuilder {
+    recipe_id: Arc<str>,
+    source_state_id: Arc<str>,
+    width: i64,
+    origin: i64,
+    groups: Arc<[Arc<str>]>,
+    partials: BTreeMap<PartialKey, AggregatePartial>,
+    metrics: PartialStreamMetrics,
+}
+
+impl PartialManifestBuilder {
+    /// Construct a streaming builder for the fixed reduction output schema.
+    pub fn try_new<I, S>(
+        recipe_id: impl Into<Arc<str>>,
+        source_state_id: impl Into<Arc<str>>,
+        width: i64,
+        origin: i64,
+        groups: I,
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<Arc<str>>,
+    {
+        let recipe_id = recipe_id.into();
+        let source_state_id = source_state_id.into();
+        _ = PartialManifest::try_new(
+            Arc::clone(&recipe_id),
+            Arc::clone(&source_state_id),
+            width,
+            origin,
+            BTreeMap::new(),
+        )?;
+        Ok(Self {
+            recipe_id,
+            source_state_id,
+            width,
+            origin,
+            groups: groups.into_iter().map(Into::into).collect(),
+            partials: BTreeMap::new(),
+            metrics: PartialStreamMetrics::default(),
+        })
+    }
+
+    /// Consume one reduced batch without retaining the batch.
+    pub fn push(&mut self, batch: &RecordBatch) -> Result<()> {
+        let bucket = required_int64(batch, "bucket_start")?;
+        let rows = required_int64(batch, "rows")?;
+        let non_null = required_int64(batch, "non_null")?;
+        let sum = required_float64(batch, "sum")?;
+        let min = required_float64(batch, "min")?;
+        let max = required_float64(batch, "max")?;
+        let group_columns = self
+            .groups
+            .iter()
+            .map(|name| {
+                batch.column_by_name(name).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "partial batch is missing group column '{name}'"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut staged = BTreeMap::new();
+        for index in 0..batch.num_rows() {
+            let row_count = u64::try_from(rows.value(index)).map_err(|_| {
+                DataFusionError::Execution("partial row count must not be negative".to_owned())
+            })?;
+            let non_null_count = u64::try_from(non_null.value(index)).map_err(|_| {
+                DataFusionError::Execution("partial non-null count must not be negative".to_owned())
+            })?;
+            let partial = AggregatePartial::try_from_aggregate(
+                row_count,
+                non_null_count,
+                (!sum.is_null(index)).then(|| sum.value(index)),
+                (!min.is_null(index)).then(|| min.value(index)),
+                (!max.is_null(index)).then(|| max.value(index)),
+            )?;
+            let group = group_columns
+                .iter()
+                .map(|column| {
+                    ScalarValue::try_from_array(column.as_ref(), index)
+                        .map(|value| Arc::<str>::from(format!("{value:?}")))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let key = PartialKey::new(bucket.value(index), group);
+            validate_bucket_alignment(&key, self.width, self.origin)?;
+            _ = staged
+                .entry(key)
+                .and_modify(|value: &mut AggregatePartial| *value = value.merge(partial))
+                .or_insert(partial);
+        }
+        for (key, partial) in staged {
+            _ = self
+                .partials
+                .entry(key)
+                .and_modify(|value| *value = value.merge(partial))
+                .or_insert(partial);
+        }
+        self.metrics.batches += 1;
+        self.metrics.aggregate_rows += batch.num_rows() as u64;
+        self.metrics.peak_batch_rows = self.metrics.peak_batch_rows.max(batch.num_rows() as u64);
+        Ok(())
+    }
+
+    /// Finish the manifest and its bounded stream observations.
+    pub fn finish(mut self) -> Result<(PartialManifest, PartialStreamMetrics)> {
+        self.metrics.retained_partials = self.partials.len() as u64;
+        let manifest = PartialManifest::try_new(
+            self.recipe_id,
+            self.source_state_id,
+            self.width,
+            self.origin,
+            self.partials,
+        )?;
+        Ok((manifest, self.metrics))
+    }
+}
+
+/// Consume a DataFusion stream incrementally into reusable partial state.
+pub async fn manifest_from_stream(
+    mut stream: SendableRecordBatchStream,
+    mut builder: PartialManifestBuilder,
+) -> Result<(PartialManifest, PartialStreamMetrics)> {
+    while let Some(batch) = stream.next().await {
+        builder.push(&batch?)?;
+    }
+    builder.finish()
+}
+
+fn required_int64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!("partial batch is missing column '{name}'"))
+        })?
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| DataFusionError::Execution(format!("partial column '{name}' must be Int64")))
+}
+
+fn required_float64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Float64Array> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!("partial batch is missing column '{name}'"))
+        })?
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!("partial column '{name}' must be Float64"))
+        })
 }
 
 impl PartialManifest {
