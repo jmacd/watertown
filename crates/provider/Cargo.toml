@@ -29,6 +29,7 @@ async-compression.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tinyfs.workspace = true
+query-foundation.workspace = true
 datafusion.workspace = true
 datafusion-expr.workspace = true
 futures.workspace = true

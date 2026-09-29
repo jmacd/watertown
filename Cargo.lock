@@ -4751,6 +4751,7 @@ dependencies = [
  "parquet",
  "paste",
  "percent-encoding",
+ "query-foundation",
  "regex",
  "serde",
  "serde_json",

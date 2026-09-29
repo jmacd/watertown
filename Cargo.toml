@@ -34,6 +34,7 @@ tlogfs = { path = "crates/tlogfs" }
 hydrovu = { path = "crates/hydrovu" }
 gitpond = { path = "crates/gitpond" }
 provider = { path = "crates/provider" }
+query-foundation = { path = "crates/query-foundation" }
 utilities = { path = "crates/utilities" }
 sitegen = { path = "crates/sitegen" }
 billing = { path = "crates/billing" }
