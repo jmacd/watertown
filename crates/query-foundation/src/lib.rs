@@ -13,5 +13,6 @@ pub mod partial;
 pub mod plans;
 pub mod provider;
 pub mod snapshot;
+pub mod sql;
 pub mod statistics;
 pub mod testkit;
