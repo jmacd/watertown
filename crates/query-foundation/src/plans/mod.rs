@@ -4,4 +4,5 @@
 
 //! Typed logical plans for built-in query operations.
 
+pub mod combine;
 pub mod transform;
