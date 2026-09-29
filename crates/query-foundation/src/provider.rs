@@ -14,11 +14,11 @@ use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result;
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::logical_expr::{Expr, SortExpr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 
 use crate::metrics::ChunkPruningMetrics;
-use crate::snapshot::DatasetSnapshot;
+use crate::snapshot::{ChunkDescriptor, DatasetSnapshot};
 use crate::statistics::event_time_bounds;
 
 /// Provider that prunes exact snapshot membership using conservative metadata.
@@ -87,7 +87,6 @@ impl TableProvider for ChunkTableProvider {
                 }
                 (None, _) => true,
             })
-            .map(|chunk| chunk.object().url().clone())
             .collect::<Vec<_>>();
         self.metrics.record_scan(
             self.snapshot.chunks().len() as u64,
@@ -101,18 +100,66 @@ impl TableProvider for ChunkTableProvider {
                 .await;
         }
 
-        for object in &selected {
+        for chunk in &selected {
+            let object = chunk.object().url();
             let store = state.runtime_env().object_store(object.object_store())?;
             _ = store.head(object.prefix()).await?;
         }
 
         let format = ParquetFormat::default().with_enable_pruning(true);
-        let options = ListingOptions::new(Arc::new(format));
-        let config = ListingTableConfig::new_with_multi_paths(selected)
+        let mut options = ListingOptions::new(Arc::new(format));
+        if let Some(ordering) = common_ordering(&self.snapshot, &selected) {
+            options = options.with_file_sort_order(vec![ordering]);
+        }
+        let objects = selected
+            .iter()
+            .map(|chunk| chunk.object().url().clone())
+            .collect();
+        let config = ListingTableConfig::new_with_multi_paths(objects)
             .with_listing_options(options)
             .with_schema(self.schema());
         ListingTable::try_new(config)?
             .scan(state, projection, filters, limit)
             .await
     }
+}
+
+fn common_ordering(
+    snapshot: &DatasetSnapshot,
+    selected: &[&ChunkDescriptor],
+) -> Option<Vec<SortExpr>> {
+    let first = selected.first()?.ordering();
+    if first.is_empty()
+        || selected
+            .iter()
+            .skip(1)
+            .any(|chunk| chunk.ordering() != first)
+    {
+        return None;
+    }
+    if selected.len() == 1 {
+        return Some(first.to_vec());
+    }
+
+    let event_time = snapshot.event_time()?.column();
+    let leading = first.first()?;
+    if !leading
+        .expr
+        .try_as_col()
+        .is_some_and(|column| column.name == event_time)
+    {
+        return None;
+    }
+    let intervals = selected
+        .iter()
+        .map(|chunk| chunk.event_time_bounds())
+        .collect::<Option<Vec<_>>>()?;
+    let monotonic = intervals.windows(2).all(|pair| {
+        if leading.asc {
+            pair[0].max() <= pair[1].min()
+        } else {
+            pair[0].min() >= pair[1].max()
+        }
+    });
+    monotonic.then(|| first.to_vec())
 }

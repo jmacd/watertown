@@ -11,6 +11,7 @@ use arrow::datatypes::{DataType, SchemaRef};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::logical_expr::SortExpr;
 
 use crate::metrics::ChunkPruningMetrics;
 use crate::provider::ChunkTableProvider;
@@ -67,6 +68,7 @@ pub struct ChunkDescriptor {
     schema: SchemaRef,
     logical_count: u64,
     event_time_bounds: Option<TimeInterval>,
+    ordering: Vec<SortExpr>,
 }
 
 impl ChunkDescriptor {
@@ -87,7 +89,15 @@ impl ChunkDescriptor {
             schema,
             logical_count,
             event_time_bounds,
+            ordering: Vec::new(),
         }
+    }
+
+    /// Declare physical ordering proven for this chunk.
+    #[must_use]
+    pub fn with_ordering(mut self, ordering: Vec<SortExpr>) -> Self {
+        self.ordering = ordering;
+        self
     }
 
     /// Stable logical chunk identity.
@@ -124,6 +134,12 @@ impl ChunkDescriptor {
     #[must_use]
     pub fn event_time_bounds(&self) -> Option<TimeInterval> {
         self.event_time_bounds
+    }
+
+    /// Physical ordering proven for this chunk.
+    #[must_use]
+    pub fn ordering(&self) -> &[SortExpr] {
+        &self.ordering
     }
 }
 
@@ -327,6 +343,21 @@ fn validate_chunk_schema(
             chunk.chunk_id(),
             event_time.column()
         )));
+    }
+    for sort in chunk.ordering() {
+        let Some(column) = sort.expr.try_as_col() else {
+            return Err(DataFusionError::Plan(format!(
+                "chunk '{}' ordering must use direct column expressions",
+                chunk.chunk_id()
+            )));
+        };
+        if chunk.schema().field_with_name(&column.name).is_err() {
+            return Err(DataFusionError::Plan(format!(
+                "chunk '{}' ordering references missing column '{}'",
+                chunk.chunk_id(),
+                column.name
+            )));
+        }
     }
     Ok(())
 }
