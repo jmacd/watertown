@@ -7,13 +7,18 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array};
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use datafusion::common::Column;
+use datafusion::dataframe::DataFrame;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::logical_expr::{col, lit};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
 
-use crate::frontier::SettledState;
+use crate::frontier::{ChangeDisposition, SettledState};
+use crate::locality::ChangeExtent;
 use crate::statistics::TimeInterval;
 
 /// Progress made authoritative with one materialized output.
@@ -97,11 +102,41 @@ impl MaterializedOutput {
     }
 }
 
+/// Why existing output intervals must be replaced.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaterializationReplaceReason {
+    /// New rows arrived inside the active unsealed region.
+    UnsealedDisorder,
+    /// New rows arrived at or behind the settled frontier.
+    RetroactiveRepair,
+}
+
+/// Atomic visibility operation for one materialization.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MaterializationPublication {
+    /// Advance progress without publishing output.
+    NoOutput,
+    /// Add output strictly after the prior observed event time.
+    Append {
+        /// Previous inclusive observed position, absent for first output.
+        after: Option<i64>,
+    },
+    /// Replace complete affected output intervals.
+    Replace {
+        /// Normalized intervals replaced by this output.
+        ranges: Vec<TimeInterval>,
+        /// Why replacement rather than append is required.
+        reason: MaterializationReplaceReason,
+    },
+}
+
 /// One atomic output/progress publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaterializationCommit {
     /// Output metadata, absent for a no-row run.
     pub output: Option<MaterializedOutput>,
+    /// Visibility operation applied atomically with progress.
+    pub publication: MaterializationPublication,
     /// Progress that becomes authoritative in the same transaction.
     pub progress: MaterializationProgress,
 }
@@ -122,8 +157,126 @@ pub struct MaterializationMetrics {
 pub struct MaterializationOutcome {
     /// Published output metadata, absent when the stream contained no rows.
     pub output: Option<MaterializedOutput>,
+    /// Visibility operation committed with progress.
+    pub publication: MaterializationPublication,
     /// Bounded streaming work.
     pub metrics: MaterializationMetrics,
+}
+
+/// Exact raw-input predicate for one materialization execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaterializationInput {
+    lower: i64,
+    lower_inclusive: bool,
+    upper_inclusive: i64,
+}
+
+impl MaterializationInput {
+    /// Lower event-time boundary.
+    #[must_use]
+    pub fn lower(self) -> i64 {
+        self.lower
+    }
+
+    /// Whether the lower event-time boundary is inclusive.
+    #[must_use]
+    pub fn lower_inclusive(self) -> bool {
+        self.lower_inclusive
+    }
+
+    /// Inclusive upper event-time boundary.
+    #[must_use]
+    pub fn upper_inclusive(self) -> i64 {
+        self.upper_inclusive
+    }
+}
+
+/// Classified bounded work and atomic publication intent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializationPlan {
+    input: Option<MaterializationInput>,
+    publication: MaterializationPublication,
+}
+
+impl MaterializationPlan {
+    /// Exact input predicate, absent when no source execution is needed.
+    #[must_use]
+    pub fn input(&self) -> Option<MaterializationInput> {
+        self.input
+    }
+
+    /// Atomic visibility operation.
+    #[must_use]
+    pub fn publication(&self) -> &MaterializationPublication {
+        &self.publication
+    }
+
+    /// Apply the exact input predicate to an Int64 event-time frame.
+    ///
+    /// Returns `None` when progress can advance without source execution.
+    pub fn filter(&self, frame: DataFrame, event_time: &str) -> Result<Option<DataFrame>> {
+        let Some(input) = self.input else {
+            return Ok(None);
+        };
+        let field = frame
+            .schema()
+            .field_with_unqualified_name(event_time)
+            .map_err(|_| {
+                DataFusionError::Plan(format!(
+                    "materialization input is missing event-time column '{event_time}'"
+                ))
+            })?;
+        if field.data_type() != &DataType::Int64 {
+            return Err(DataFusionError::Plan(format!(
+                "materialization event-time column '{event_time}' must be Int64, got {}",
+                field.data_type()
+            )));
+        }
+        let event_time = col(Column::from_name(event_time));
+        let lower = if input.lower_inclusive {
+            event_time.clone().gt_eq(lit(input.lower))
+        } else {
+            event_time.clone().gt(lit(input.lower))
+        };
+        Ok(Some(frame.filter(
+            lower.and(event_time.lt_eq(lit(input.upper_inclusive))),
+        )?))
+    }
+}
+
+/// Classify one logical change into exact input and publication work.
+pub fn plan_materialization_change(
+    prior: SettledState,
+    extent: ChangeExtent,
+) -> Result<MaterializationPlan> {
+    let disposition = prior.classify(extent)?;
+    let (input, publication) = match disposition {
+        ChangeDisposition::NoRows => (None, MaterializationPublication::NoOutput),
+        ChangeDisposition::Append { changed } => {
+            let after = prior.observed_through();
+            let input = MaterializationInput {
+                lower: after.unwrap_or(changed.min()),
+                lower_inclusive: after.is_none(),
+                upper_inclusive: changed.max(),
+            };
+            (Some(input), MaterializationPublication::Append { after })
+        }
+        ChangeDisposition::UnsealedDisorder { changed } => (
+            Some(inclusive_input(changed)),
+            MaterializationPublication::Replace {
+                ranges: vec![changed],
+                reason: MaterializationReplaceReason::UnsealedDisorder,
+            },
+        ),
+        ChangeDisposition::Repair { changed, .. } => (
+            Some(inclusive_input(changed)),
+            MaterializationPublication::Replace {
+                ranges: vec![changed],
+                reason: MaterializationReplaceReason::RetroactiveRepair,
+            },
+        ),
+    };
+    Ok(MaterializationPlan { input, publication })
 }
 
 /// One hidden staged writer.
@@ -159,6 +312,7 @@ pub async fn materialize_stream(
     output_id: impl Into<Arc<str>>,
     event_time: &str,
     progress: MaterializationProgress,
+    publication: MaterializationPublication,
     mut stream: SendableRecordBatchStream,
 ) -> Result<MaterializationOutcome> {
     let output_id = output_id.into();
@@ -172,6 +326,7 @@ pub async fn materialize_stream(
             "materialization event-time column must not be empty".to_owned(),
         ));
     }
+    validate_publication(&publication)?;
     let mut writer = sink.begin(&output_id).await?;
     let mut metrics = MaterializationMetrics::default();
     let mut bounds = None;
@@ -188,6 +343,9 @@ pub async fn materialize_stream(
             Ok(bounds) => bounds,
             Err(error) => return abort_after(writer, error).await,
         };
+        if let Err(error) = validate_batch_publication(&batch, event_time, &publication) {
+            return abort_after(writer, error).await;
+        }
         let next_bounds = match bounds {
             Some(current) => match union_bounds(current, batch_bounds) {
                 Ok(bounds) => bounds,
@@ -212,13 +370,93 @@ pub async fn materialize_stream(
         rows: metrics.rows_written,
         event_time_bounds,
     });
+    let publication = match (output.is_some(), publication) {
+        (true, MaterializationPublication::NoOutput) => {
+            return abort_after(
+                writer,
+                DataFusionError::Plan(
+                    "non-empty materialization cannot use NoOutput publication".to_owned(),
+                ),
+            )
+            .await;
+        }
+        (false, MaterializationPublication::Append { .. }) => MaterializationPublication::NoOutput,
+        (_, publication) => publication,
+    };
     writer
         .commit(MaterializationCommit {
             output: output.clone(),
+            publication: publication.clone(),
             progress,
         })
         .await?;
-    Ok(MaterializationOutcome { output, metrics })
+    Ok(MaterializationOutcome {
+        output,
+        publication,
+        metrics,
+    })
+}
+
+fn inclusive_input(interval: TimeInterval) -> MaterializationInput {
+    MaterializationInput {
+        lower: interval.min(),
+        lower_inclusive: true,
+        upper_inclusive: interval.max(),
+    }
+}
+
+fn validate_publication(publication: &MaterializationPublication) -> Result<()> {
+    if let MaterializationPublication::Replace { ranges, .. } = publication {
+        if ranges.is_empty() {
+            return Err(DataFusionError::Plan(
+                "replacement publication requires at least one output interval".to_owned(),
+            ));
+        }
+        for pair in ranges.windows(2) {
+            let touches_or_overlaps = pair[0]
+                .max()
+                .checked_add(1)
+                .is_none_or(|next| pair[1].min() <= next);
+            if touches_or_overlaps {
+                return Err(DataFusionError::Plan(
+                    "replacement publication intervals must be ordered, disjoint, and normalized"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_batch_publication(
+    batch: &RecordBatch,
+    event_time: &str,
+    publication: &MaterializationPublication,
+) -> Result<()> {
+    let column = batch
+        .column_by_name(event_time)
+        .expect("event-time bounds validated column presence")
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("event-time bounds validated Int64 type");
+    for index in 0..column.len() {
+        let value = column.value(index);
+        let valid = match publication {
+            MaterializationPublication::NoOutput => false,
+            MaterializationPublication::Append { after } => {
+                after.is_none_or(|boundary| value > boundary)
+            }
+            MaterializationPublication::Replace { ranges, .. } => ranges
+                .iter()
+                .any(|range| value >= range.min() && value <= range.max()),
+        };
+        if !valid {
+            return Err(DataFusionError::Execution(format!(
+                "materialization event time {value} falls outside declared publication boundaries {publication:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn event_time_bounds(batch: &RecordBatch, event_time: &str) -> Result<TimeInterval> {

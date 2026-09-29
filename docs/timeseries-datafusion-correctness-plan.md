@@ -2,7 +2,7 @@
 
 > **Status:** accepted design and implementation plan as of 2026-09-28.
 >
-> **Implementation:** Phase 0 passed in `477292a8`; the Phase 1 through Phase 5
+> **Implementation:** Phase 0 passed in `477292a8`; the Phase 1 through Phase 6
 > gates are implemented on the current development branch.
 >
 > **Historical baseline:** `b6913e2f9ca68eb0a1cad27970fca2f6e8487833`.

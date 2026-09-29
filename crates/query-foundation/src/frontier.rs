@@ -103,6 +103,12 @@ impl SettledState {
         self.settled_through
     }
 
+    /// Greatest event time observed in the represented source state.
+    #[must_use]
+    pub fn observed_through(self) -> Option<i64> {
+        self.observed_through
+    }
+
     /// Classify one exact logical change without silently treating unknown or
     /// retroactive data as an ordinary append.
     pub fn classify(self, extent: ChangeExtent) -> Result<ChangeDisposition> {
