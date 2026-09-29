@@ -8,6 +8,7 @@ pub mod frontier;
 pub mod locality;
 pub mod metrics;
 pub mod overlap;
+pub mod partial;
 pub mod plans;
 pub mod provider;
 pub mod snapshot;
