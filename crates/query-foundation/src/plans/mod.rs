@@ -6,4 +6,5 @@
 
 pub mod combine;
 pub mod join;
+pub mod pivot;
 pub mod transform;

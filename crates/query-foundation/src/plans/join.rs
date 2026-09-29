@@ -191,14 +191,9 @@ fn prepare_input(
 ) -> Result<PreparedInput> {
     let key = format!("{INPUT_TIME_PREFIX}{index}");
     let frame = match input.bounds {
-        Some(bounds) => input.frame.filter(
-            col(Column::from_name(input.event_time.as_ref()))
-                .gt_eq(event_literal(bounds.min(), event_type)?)
-                .and(
-                    col(Column::from_name(input.event_time.as_ref()))
-                        .lt_eq(event_literal(bounds.max(), event_type)?),
-                ),
-        )?,
+        Some(bounds) => {
+            exact_event_time_filter(input.frame, input.event_time.as_ref(), bounds, event_type)?
+        }
         None => input.frame,
     };
     let columns = frame
@@ -216,6 +211,21 @@ fn prepare_input(
         key,
         columns,
     })
+}
+
+pub(crate) fn exact_event_time_filter(
+    frame: DataFrame,
+    event_time: &str,
+    bounds: TimeInterval,
+    event_type: &DataType,
+) -> Result<DataFrame> {
+    frame.filter(
+        col(Column::from_name(event_time))
+            .gt_eq(event_literal(bounds.min(), event_type)?)
+            .and(
+                col(Column::from_name(event_time)).lt_eq(event_literal(bounds.max(), event_type)?),
+            ),
+    )
 }
 
 fn named_columns(names: &[String]) -> impl Iterator<Item = Expr> + '_ {
