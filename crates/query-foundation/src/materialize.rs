@@ -6,7 +6,10 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, Int64Array};
+use arrow::array::{
+    Array, Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray,
+};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -345,11 +348,15 @@ pub async fn materialize_stream(
         if batch.num_rows() == 0 {
             continue;
         }
-        let batch_bounds = match event_time_bounds(&batch, event_time) {
+        let event_times = match normalized_event_times(&batch, event_time) {
+            Ok(values) => values,
+            Err(error) => return abort_after(writer, error).await,
+        };
+        let batch_bounds = match event_time_bounds(&event_times) {
             Ok(bounds) => bounds,
             Err(error) => return abort_after(writer, error).await,
         };
-        if let Err(error) = validate_batch_publication(&batch, event_time, &publication) {
+        if let Err(error) = validate_batch_publication(&event_times, &publication) {
             return abort_after(writer, error).await;
         }
         let next_bounds = match bounds {
@@ -435,26 +442,18 @@ fn validate_publication(publication: &MaterializationPublication) -> Result<()> 
 }
 
 fn validate_batch_publication(
-    batch: &RecordBatch,
-    event_time: &str,
+    event_times: &[i64],
     publication: &MaterializationPublication,
 ) -> Result<()> {
-    let column = batch
-        .column_by_name(event_time)
-        .expect("event-time bounds validated column presence")
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("event-time bounds validated Int64 type");
-    for index in 0..column.len() {
-        let value = column.value(index);
+    for value in event_times {
         let valid = match publication {
             MaterializationPublication::NoOutput => false,
             MaterializationPublication::Append { after } => {
-                after.is_none_or(|boundary| value > boundary)
+                after.is_none_or(|boundary| *value > boundary)
             }
             MaterializationPublication::Replace { ranges, .. } => ranges
                 .iter()
-                .any(|range| value >= range.min() && value <= range.max()),
+                .any(|range| *value >= range.min() && *value <= range.max()),
         };
         if !valid {
             return Err(DataFusionError::Execution(format!(
@@ -465,31 +464,56 @@ fn validate_batch_publication(
     Ok(())
 }
 
-fn event_time_bounds(batch: &RecordBatch, event_time: &str) -> Result<TimeInterval> {
-    let column = batch
-        .column_by_name(event_time)
-        .ok_or_else(|| {
-            DataFusionError::Execution(format!(
-                "materialization batch is missing event-time column '{event_time}'"
-            ))
-        })?
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| {
-            DataFusionError::Execution(format!(
-                "materialization event-time column '{event_time}' must be Int64"
-            ))
-        })?;
+fn normalized_event_times(batch: &RecordBatch, event_time: &str) -> Result<Vec<i64>> {
+    let column = batch.column_by_name(event_time).ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "materialization batch is missing event-time column '{event_time}'"
+        ))
+    })?;
     if column.null_count() != 0 {
         return Err(DataFusionError::Execution(format!(
             "materialization event-time column '{event_time}' must not contain nulls"
         )));
     }
+    macro_rules! normalized {
+        ($array:ty, $convert:expr) => {
+            if let Some(values) = column.as_any().downcast_ref::<$array>() {
+                return values
+                    .values()
+                    .iter()
+                    .copied()
+                    .map($convert)
+                    .collect::<Result<Vec<_>>>();
+            }
+        };
+    }
+    normalized!(Int64Array, |value: i64| Ok(value));
+    normalized!(TimestampMicrosecondArray, |value: i64| Ok(value));
+    normalized!(TimestampSecondArray, |value: i64| value
+        .checked_mul(1_000_000)
+        .ok_or_else(|| DataFusionError::Execution(
+            "materialization second timestamp overflows microseconds".to_owned()
+        )));
+    normalized!(TimestampMillisecondArray, |value: i64| value
+        .checked_mul(1_000)
+        .ok_or_else(|| DataFusionError::Execution(
+            "materialization millisecond timestamp overflows microseconds".to_owned()
+        )));
+    normalized!(TimestampNanosecondArray, |value: i64| Ok(
+        value.div_euclid(1_000)
+    ));
+    Err(DataFusionError::Execution(format!(
+        "materialization event-time column '{event_time}' must be Int64 or Timestamp, got {}",
+        column.data_type()
+    )))
+}
+
+fn event_time_bounds(event_times: &[i64]) -> Result<TimeInterval> {
     let mut minimum = i64::MAX;
     let mut maximum = i64::MIN;
-    for index in 0..column.len() {
-        minimum = minimum.min(column.value(index));
-        maximum = maximum.max(column.value(index));
+    for value in event_times {
+        minimum = minimum.min(*value);
+        maximum = maximum.max(*value);
     }
     TimeInterval::try_new(minimum, maximum)
 }

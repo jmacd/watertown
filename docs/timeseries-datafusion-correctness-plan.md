@@ -897,8 +897,12 @@ plan has neither `MemoryExec` nor a global `SortExec`. The watermark frontier
 is a typed one-row maximum over aligned buckets and does not allocate
 per-bucket state. The non-cache single-pass path uses the same typed source
 registration, partial recipe, and reconstruction; generated reduction SQL
-remains only as a test oracle. Materialization and visibility of intentionally
-global/non-incremental paths remain before this phase is complete.
+remains only as a test oracle. Production `materialize-series` streams the
+ordered suffix into the transactional TinyFS sink, atomically publishing exact
+output metadata and recipe/source/frontier progress; it does not collect or
+concatenate the result, and a no-row run publishes progress without an empty
+series version. Visibility of intentionally global/non-incremental paths
+remains before this phase is complete.
 
 ### Phase 10: consumers and Noyo qualification
 

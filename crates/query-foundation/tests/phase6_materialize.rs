@@ -4,8 +4,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{Float64Array, Int64Array};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::array::{Float64Array, Int64Array, TimestampMillisecondArray};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result};
@@ -233,6 +233,44 @@ async fn streams_many_batches_with_bounded_active_memory_and_exact_metadata() ->
         "source-state-1"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn timestamp_event_time_is_normalized_to_microseconds() -> Result<()> {
+    let sink = RecordingSink::default();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
+        Field::new("value", DataType::Float64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(TimestampMillisecondArray::from(vec![1_000, 2_000])),
+            Arc::new(Float64Array::from(vec![1.0, 2.0])),
+        ],
+    )?;
+    let outcome = materialize_stream(
+        &sink,
+        "output-0001",
+        "ts",
+        progress("source-state-timestamp")?,
+        MaterializationPublication::Append {
+            after: Some(999_999),
+        },
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(vec![Ok(batch)]),
+        )),
+    )
+    .await?;
+    let output = outcome.output.expect("timestamp output");
+    assert_eq!(output.event_time_bounds().min(), 1_000_000);
+    assert_eq!(output.event_time_bounds().max(), 2_000_000);
     Ok(())
 }
 
