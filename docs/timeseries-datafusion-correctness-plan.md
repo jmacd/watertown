@@ -934,7 +934,9 @@ across provider contexts, while discovered dynamic schemas are persisted only
 for an exact physical-lineage match. A TLogFS-backed join → pivot → reduce
 regression proves cold state creation, byte-identical no-change reuse in a fresh
 transaction, and manifest advancement after a physical-leaf append without a
-global or non-incremental planning decision.
+global or non-incremental planning decision. Shared planning counters also prove
+the warm run executes no dynamic source and the append executes it exactly once
+with an event-time lower bound that excludes the oldest retained history.
 
 A retained warm no-change run over the 20 parameter/resolution outputs completed
 site generation in 2.813 seconds (3.47 seconds total wall time, 130.6 MB process

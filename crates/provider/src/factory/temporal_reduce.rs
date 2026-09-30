@@ -1419,6 +1419,7 @@ impl TemporalReduceSqlFile {
         // what `seal_and_recompute` folds, so it plays exactly the role the
         // partials directory used to -- as a query, not as a file population.
         let provider = if let Some(pattern) = derived_pattern {
+            provider_context.record_dynamic_source_execution(read_lo_us);
             let bounds = read_lo_us.map_or(tinyfs::SeriesReadBounds::NONE, |lo| {
                 tinyfs::SeriesReadBounds::from_event_time_lo(lo)
             });

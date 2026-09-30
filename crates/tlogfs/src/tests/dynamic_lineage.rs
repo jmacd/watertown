@@ -32,6 +32,24 @@ fn source_batch(timestamp: i64, value: f64) -> RecordBatch {
     .unwrap()
 }
 
+fn source_history(values: &[f64]) -> RecordBatch {
+    RecordBatch::try_from_iter([
+        (
+            "timestamp",
+            Arc::new(TimestampMicrosecondArray::from(
+                (1..=values.len() as i64)
+                    .map(|hour| hour * 3_600_000_000)
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ),
+        (
+            "value",
+            Arc::new(Float64Array::from(values.to_vec())) as ArrayRef,
+        ),
+    ])
+    .unwrap()
+}
+
 fn yaml<T: serde::Serialize>(config: &T) -> Vec<u8> {
     serde_yaml::to_string(config).unwrap().into_bytes()
 }
@@ -138,7 +156,7 @@ async fn dynamic_join_pivot_reuses_persistent_reduction_lineage() {
         _ = root
             .create_series_from_batch(
                 "/sources/a.series",
-                &source_batch(3_600_000_000, 10.0),
+                &source_history(&[10.0, 11.0, 12.0]),
                 Some("timestamp"),
             )
             .await
@@ -146,7 +164,7 @@ async fn dynamic_join_pivot_reuses_persistent_reduction_lineage() {
         _ = root
             .create_series_from_batch(
                 "/sources/b.series",
-                &source_batch(3_600_000_000, 20.0),
+                &source_history(&[20.0, 21.0, 22.0]),
                 Some("timestamp"),
             )
             .await
@@ -222,9 +240,11 @@ async fn dynamic_join_pivot_reuses_persistent_reduction_lineage() {
     }
 
     let (cold_rows, cold_metrics) = query_reduced(&mut persistence).await;
-    assert_eq!(cold_rows, 1);
+    assert_eq!(cold_rows, 3);
     assert_eq!(cold_metrics.global_plans, 0);
     assert_eq!(cold_metrics.non_incremental_plans, 0);
+    assert_eq!(cold_metrics.dynamic_source_executions, 1);
+    assert_eq!(cold_metrics.bounded_dynamic_source_executions, 0);
 
     let cache_dir = Path::new(&store_path).parent().unwrap().join("cache");
     let cold_cache = cache_snapshot(&cache_dir);
@@ -238,6 +258,8 @@ async fn dynamic_join_pivot_reuses_persistent_reduction_lineage() {
     assert_eq!(warm_rows, cold_rows);
     assert_eq!(warm_metrics.global_plans, 0);
     assert_eq!(warm_metrics.non_incremental_plans, 0);
+    assert_eq!(warm_metrics.dynamic_source_executions, 0);
+    assert_eq!(warm_metrics.bounded_dynamic_source_executions, 0);
     assert_eq!(
         cache_snapshot(&cache_dir),
         cold_cache,
@@ -247,14 +269,23 @@ async fn dynamic_join_pivot_reuses_persistent_reduction_lineage() {
     {
         let tx = persistence.begin_test().await.unwrap();
         let root = tx.root().await.unwrap();
-        append_source(&root, "/sources/a.series", 7_200_000_000, 30.0).await;
+        append_source(&root, "/sources/a.series", 14_400_000_000, 30.0).await;
         tx.commit_test().await.unwrap();
     }
 
     let (append_rows, append_metrics) = query_reduced(&mut persistence).await;
-    assert_eq!(append_rows, 2);
+    assert_eq!(append_rows, 4);
     assert_eq!(append_metrics.global_plans, 0);
     assert_eq!(append_metrics.non_incremental_plans, 0);
+    assert_eq!(append_metrics.dynamic_source_executions, 1);
+    assert_eq!(append_metrics.bounded_dynamic_source_executions, 1);
+    let read_lo = append_metrics
+        .minimum_dynamic_event_time_lo
+        .expect("append source execution must carry an event-time lower bound");
+    assert!(
+        read_lo > 3_600_000_000 && read_lo <= 14_400_000_000,
+        "append read bound {read_lo} must exclude oldest history and include the append"
+    );
     let append_cache = cache_snapshot(&cache_dir);
     assert_ne!(
         segment_manifests(&append_cache),

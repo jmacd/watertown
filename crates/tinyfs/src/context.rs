@@ -12,7 +12,7 @@ use crate::{FileID, PersistenceLayer};
 use datafusion::execution::context::SessionContext;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 type CachedTableProvider = (Option<u64>, Arc<dyn datafusion::catalog::TableProvider>);
 
@@ -39,17 +39,35 @@ pub struct ExportHint {
     pub changed_since: Option<i64>,
 }
 
-/// Visible counts of plans that cannot use bounded incremental execution.
+/// Visible counts of fallback plans and dynamic-source executions.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PlanVisibilityMetricsSnapshot {
     pub global_plans: u64,
     pub non_incremental_plans: u64,
+    pub dynamic_source_executions: u64,
+    pub bounded_dynamic_source_executions: u64,
+    pub minimum_dynamic_event_time_lo: Option<i64>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PlanVisibilityMetrics {
     global_plans: AtomicU64,
     non_incremental_plans: AtomicU64,
+    dynamic_source_executions: AtomicU64,
+    bounded_dynamic_source_executions: AtomicU64,
+    minimum_dynamic_event_time_lo: AtomicI64,
+}
+
+impl Default for PlanVisibilityMetrics {
+    fn default() -> Self {
+        Self {
+            global_plans: AtomicU64::new(0),
+            non_incremental_plans: AtomicU64::new(0),
+            dynamic_source_executions: AtomicU64::new(0),
+            bounded_dynamic_source_executions: AtomicU64::new(0),
+            minimum_dynamic_event_time_lo: AtomicI64::new(i64::MAX),
+        }
+    }
 }
 
 /// Provider context - holds tinyfs Persistence for transaction management
@@ -262,7 +280,25 @@ impl ProviderContext {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Snapshot global and non-incremental planning decisions.
+    /// Record one recursive dynamic-source execution and its optional lower bound.
+    pub fn record_dynamic_source_execution(&self, event_time_lo: Option<i64>) {
+        _ = self
+            .plan_visibility_metrics
+            .dynamic_source_executions
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(event_time_lo) = event_time_lo {
+            _ = self
+                .plan_visibility_metrics
+                .bounded_dynamic_source_executions
+                .fetch_add(1, Ordering::Relaxed);
+            _ = self
+                .plan_visibility_metrics
+                .minimum_dynamic_event_time_lo
+                .fetch_min(event_time_lo, Ordering::Relaxed);
+        }
+    }
+
+    /// Snapshot fallback decisions and dynamic-source execution bounds.
     #[must_use]
     pub fn plan_visibility_metrics(&self) -> PlanVisibilityMetricsSnapshot {
         PlanVisibilityMetricsSnapshot {
@@ -274,6 +310,22 @@ impl ProviderContext {
                 .plan_visibility_metrics
                 .non_incremental_plans
                 .load(Ordering::Relaxed),
+            dynamic_source_executions: self
+                .plan_visibility_metrics
+                .dynamic_source_executions
+                .load(Ordering::Relaxed),
+            bounded_dynamic_source_executions: self
+                .plan_visibility_metrics
+                .bounded_dynamic_source_executions
+                .load(Ordering::Relaxed),
+            minimum_dynamic_event_time_lo: match self
+                .plan_visibility_metrics
+                .minimum_dynamic_event_time_lo
+                .load(Ordering::Relaxed)
+            {
+                i64::MAX => None,
+                value => Some(value),
+            },
         }
     }
 

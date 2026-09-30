@@ -2246,6 +2246,7 @@ query: ""
             tinyfs::PlanVisibilityMetricsSnapshot {
                 global_plans: 1,
                 non_incremental_plans: 1,
+                ..Default::default()
             },
             "arbitrary SQL must be visible as global and non-incremental"
         );
