@@ -135,6 +135,19 @@ pub trait PersistenceLayer: Send + Sync {
     /// Returns versions in chronological order (oldest to newest)
     async fn list_file_versions(&self, id: FileID) -> Result<Vec<FileVersionInfo>>;
 
+    /// Point-read metadata for one exact immutable file version.
+    ///
+    /// Backends should override this when they can avoid enumerating retained
+    /// history. The default preserves compatibility but is not suitable for
+    /// history-independent query execution.
+    async fn file_version_info(&self, id: FileID, version: u64) -> Result<Option<FileVersionInfo>> {
+        Ok(self
+            .list_file_versions(id)
+            .await?
+            .into_iter()
+            .find(|info| info.version == version))
+    }
+
     /// Read content of a specific version of a file
     /// If version is None, reads the latest version
     async fn read_file_version(&self, id: FileID, version: u64) -> Result<Vec<u8>>;

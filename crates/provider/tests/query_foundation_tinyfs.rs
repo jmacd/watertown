@@ -8,6 +8,7 @@ use arrow::array::{Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::logical_expr::col;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -20,6 +21,11 @@ use query_foundation::materialize::{
     materialize_stream,
 };
 use query_foundation::overlap::OverlapPolicy;
+use query_foundation::plans::combine::{CombineInput, combine_same_scope};
+use query_foundation::plans::join::{TimestampJoinInput, accumulated_full_outer_join};
+use query_foundation::plans::pivot::{PivotInput, pivot_measurements};
+use query_foundation::plans::reduce::{FixedWindowReduce, reduce_fixed_windows};
+use query_foundation::plans::transform::scope_prefix;
 use query_foundation::snapshot::EventTimeContract;
 use tinyfs::arrow::ParquetExt;
 use tinyfs::arrow::parquet::StreamingSeriesWriter;
@@ -73,6 +79,28 @@ async fn row_count(context: &SessionContext, table: &str) -> Result<i64> {
         .downcast_ref::<Int64Array>()
         .expect("COUNT must return Int64")
         .value(0))
+}
+
+async fn captured_frame(
+    context: &ProviderContext,
+    root: &tinyfs::WD,
+    path: &str,
+    table: &str,
+) -> Result<datafusion::dataframe::DataFrame> {
+    let file_id = root.get_node_path(path).await.expect("series node").id();
+    let snapshot = capture_tinyfs_snapshot(
+        context,
+        file_id,
+        format!("{table}-snapshot"),
+        schema(),
+        Some(EventTimeContract::new("ts")),
+        OverlapPolicy::PreserveAll,
+    )
+    .await?;
+    _ = context
+        .datafusion_session
+        .register_table(table, snapshot.table_provider()?)?;
+    context.datafusion_session.table(table).await
 }
 
 #[tokio::test]
@@ -445,5 +473,184 @@ async fn logical_chunk_identity_survives_physical_parquet_repacking() -> Result<
         chunk_ids.push(snapshot.snapshot().chunks()[0].chunk_id().to_owned());
     }
     assert_eq!(chunk_ids, vec![logical_hash.clone(), logical_hash]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn memory_snapshots_run_composed_foundation_plans_with_measured_io() -> Result<()> {
+    let persistence = MemoryPersistence::default();
+    let filesystem = FS::new(persistence.clone())
+        .await
+        .expect("memory filesystem");
+    let session = Arc::new(SessionContext::new());
+    _ = provider::register_tinyfs_object_store(&session, persistence.clone())
+        .expect("register TinyFS object store");
+    let context = ProviderContext::new(session, Arc::new(persistence.clone()));
+    let root = filesystem.root().await.expect("memory root");
+    for (path, timestamps, values) in [
+        ("/temperature-archive.series", vec![1], vec![10.0]),
+        ("/temperature-live.series", vec![11], vec![20.0]),
+        ("/pressure.series", vec![1, 11], vec![1.0, 2.0]),
+    ] {
+        _ = root
+            .create_series_from_batch(path, &batch(timestamps, values)?, Some("ts"))
+            .await
+            .expect("foundation source");
+    }
+
+    let archive = captured_frame(
+        &context,
+        &root,
+        "/temperature-archive.series",
+        "temperature_archive",
+    )
+    .await?;
+    let live = captured_frame(
+        &context,
+        &root,
+        "/temperature-live.series",
+        "temperature_live",
+    )
+    .await?;
+    let pressure = captured_frame(&context, &root, "/pressure.series", "pressure").await?;
+    persistence.reset_metrics();
+
+    let temperature = combine_same_scope(
+        vec![
+            CombineInput::new("archive", 1, archive),
+            CombineInput::new("live", 2, live),
+        ],
+        &OverlapPolicy::PreserveAll,
+    )
+    .await?;
+    let joined = accumulated_full_outer_join(
+        vec![
+            TimestampJoinInput::new(scope_prefix(temperature, "temperature", "ts")?, "ts"),
+            TimestampJoinInput::new(scope_prefix(pressure, "pressure", "ts")?, "ts"),
+        ],
+        "ts",
+    )?;
+    let pivoted = pivot_measurements(
+        vec![PivotInput::new(
+            joined,
+            "ts",
+            "temperature.value",
+            "temperature",
+        )],
+        vec![],
+        "ts",
+    )?;
+    let reduced = reduce_fixed_windows(
+        pivoted,
+        &FixedWindowReduce::try_new("ts", "temperature", Vec::<&str>::new(), 10, 0)?,
+    )?
+    .select(vec![col("bucket_start"), col("sum")])?;
+    let plan = reduced.clone().create_physical_plan().await?;
+    let display = DisplayableExecutionPlan::new(plan.as_ref())
+        .indent(true)
+        .to_string();
+    assert_eq!(display.matches("DataSourceExec").count(), 3, "{display}");
+    assert_eq!(display.matches("HashJoinExec").count(), 1, "{display}");
+    assert!(display.contains("AggregateExec"), "{display}");
+    assert_eq!(
+        reduced
+            .collect()
+            .await?
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        2
+    );
+    let sql_rows = context
+        .datafusion_session
+        .sql("SELECT ts, value FROM pressure WHERE ts >= 11")
+        .await?
+        .collect()
+        .await?
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+    assert_eq!(sql_rows, 1);
+
+    let metrics = persistence.metrics();
+    assert_eq!(metrics.version_lists, 0, "{metrics:?}");
+    assert!(metrics.version_info_reads >= 3, "{metrics:?}");
+    assert_eq!(metrics.version_reads, 0, "{metrics:?}");
+    assert_eq!(metrics.version_opens, 0, "{metrics:?}");
+    assert!(metrics.range_reads >= 3, "{metrics:?}");
+    assert!(metrics.bytes_read > 0, "{metrics:?}");
+
+    let pruned = captured_frame(&context, &root, "/pressure.series", "pressure_pruned").await?;
+    persistence.reset_metrics();
+    let empty = reduce_fixed_windows(
+        pruned,
+        &FixedWindowReduce::try_new("ts", "value", Vec::<&str>::new(), 10, 0)?.with_bounds(
+            query_foundation::statistics::TimeInterval::try_new(100, 110)?,
+        ),
+    )?
+    .collect()
+    .await?;
+    assert!(empty.is_empty());
+    assert_eq!(persistence.metrics(), Default::default());
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_append_work_is_bounded_across_retained_history() -> Result<()> {
+    let persistence = MemoryPersistence::default();
+    let filesystem = FS::new(persistence.clone())
+        .await
+        .expect("memory filesystem");
+    let context = ProviderContext::new(
+        Arc::new(SessionContext::new()),
+        Arc::new(persistence.clone()),
+    );
+    let root = filesystem.root().await.expect("memory root");
+    _ = root
+        .create_series_from_batch("/history.series", &batch(vec![1], vec![1.0])?, Some("ts"))
+        .await
+        .expect("initial history");
+    let sink = TinyFsMaterializationSink::new(root.clone(), &context, "ts");
+    let mut retained = 1u64;
+
+    for target in [1u64, 100, 1_000] {
+        while retained < target {
+            retained += 1;
+            _ = root
+                .write_series_from_batch(
+                    "/history.series",
+                    &batch(vec![retained as i64], vec![retained as f64])?,
+                    Some("ts"),
+                )
+                .await
+                .expect("retained history append");
+        }
+
+        persistence.reset_metrics();
+        let next = retained + 1;
+        let outcome = materialize_stream(
+            &sink,
+            "/history.series",
+            "ts",
+            progress(&format!("source-{next:04}"), Some(next as i64))?,
+            MaterializationPublication::Append {
+                after: Some(retained as i64),
+            },
+            record_stream(vec![batch(vec![next as i64], vec![next as f64])]),
+        )
+        .await?;
+        assert_eq!(outcome.metrics.rows_written, 1);
+        retained = next;
+
+        let metrics = persistence.metrics();
+        assert_eq!(metrics.version_lists, 0, "retained={target}: {metrics:?}");
+        assert_eq!(metrics.version_reads, 0, "retained={target}: {metrics:?}");
+        assert_eq!(metrics.version_opens, 0, "retained={target}: {metrics:?}");
+        assert!(metrics.tail_reads <= 1, "retained={target}: {metrics:?}");
+        assert!(
+            metrics.tail_bytes < utilities::bao_outboard::BLOCK_SIZE as u64,
+            "retained={target}: {metrics:?}"
+        );
+    }
     Ok(())
 }

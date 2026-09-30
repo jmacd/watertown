@@ -202,15 +202,26 @@ impl<P: PersistenceLayer + Clone + 'static> ObjectStore for TinyFsObjectStore<P>
                 source: err.into(),
             })?;
 
-        // Query persistence layer dynamically for file versions
-        let versions = self
-            .persistence
-            .list_file_versions(parsed_path.file_id)
-            .await
-            .map_err(|e| object_store::Error::Generic {
-                store: "TinyFS",
-                source: format!("Failed to list file versions: {}", e).into(),
-            })?;
+        let versions = match version_num {
+            Some(version) => self
+                .persistence
+                .file_version_info(parsed_path.file_id, version)
+                .await
+                .map_err(|e| object_store::Error::Generic {
+                    store: "TinyFS",
+                    source: format!("Failed to read file version {version} metadata: {e}").into(),
+                })?
+                .into_iter()
+                .collect(),
+            None => self
+                .persistence
+                .list_file_versions(parsed_path.file_id)
+                .await
+                .map_err(|e| object_store::Error::Generic {
+                    store: "TinyFS",
+                    source: format!("Failed to list file versions: {e}").into(),
+                })?,
+        };
 
         if versions.is_empty() {
             return Err(object_store::Error::NotFound {

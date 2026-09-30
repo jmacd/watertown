@@ -2,7 +2,7 @@
 
 > **Status:** accepted design and implementation plan as of 2026-09-28.
 >
-> **Implementation:** Phase 0 passed in `477292a8`; the Phase 1 through Phase 6
+> **Implementation:** Phase 0 passed in `477292a8`; the Phase 1 through Phase 7
 > gates are implemented on the current development branch.
 >
 > **Historical baseline:** `b6913e2f9ca68eb0a1cad27970fca2f6e8487833`.
@@ -840,6 +840,14 @@ begin earlier merely because one factory-shaped example works.
 
 **Gate:** memory TinyFS matches the isolated model for results and measured
 work, and failed writes expose no version.
+
+The Phase 7 contract runs typed transform, combine, join, pivot, reduce, SQL,
+and materialization paths over exact MemoryPersistence versions. It measures
+range and metadata operations, proves zero reads for fully pruned input,
+proves one-append work remains bounded at 1, 100, and 1,000 retained versions,
+and verifies that failed or aborted staged writes expose no version. Logical
+chunk identity comes from validated native-v2 leaf metadata and is unchanged
+when identical rows are repacked into different Parquet row-group layouts.
 
 ### Phase 8: TLogFS and Delta integration
 

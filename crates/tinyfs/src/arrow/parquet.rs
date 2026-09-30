@@ -387,8 +387,8 @@ impl StreamingSeriesWriter {
             ));
         }
         let timestamp_column = timestamp_column.into();
-        let (_, mut tinyfs_writer) = root
-            .create_file_path_streaming_with_type(path, EntryType::TablePhysicalSeries)
+        let mut tinyfs_writer = root
+            .async_writer_path_with_type(path, EntryType::TablePhysicalSeries)
             .await?;
         tinyfs_writer.require_temporal_metadata(timestamp_column.clone());
         let metadata = Arc::new(Mutex::new(WriterMetadata::default()));

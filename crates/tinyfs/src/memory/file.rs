@@ -512,52 +512,10 @@ impl AsyncWrite for MemoryFileWriter {
                                     % utilities::bao_outboard::BLOCK_SIZE as u64)
                                     as usize;
 
-                                // Efficiently read only the pending bytes we need
-                                // Read versions from newest to oldest until we have enough bytes
                                 let pending_bytes = if pending_size > 0 {
-                                    let versions = persistence.list_file_versions(id).await?;
-
-                                    // Collect bytes from tail, reading only necessary versions
-                                    let mut tail_bytes = Vec::with_capacity(pending_size);
-
-                                    // Iterate versions in reverse (newest first)
-                                    for v in versions.iter().rev() {
-                                        if tail_bytes.len() >= pending_size {
-                                            break;
-                                        }
-
-                                        let bytes_still_needed = pending_size - tail_bytes.len();
-
-                                        if v.size as usize >= bytes_still_needed {
-                                            // This version has enough bytes - read only the tail we need
-                                            let version_content = persistence
-                                                .read_file_version(id, v.version)
-                                                .await?;
-                                            let start = version_content
-                                                .len()
-                                                .saturating_sub(bytes_still_needed);
-                                            // Prepend to tail_bytes (since we're going backwards)
-                                            let mut new_tail = version_content[start..].to_vec();
-                                            new_tail.append(&mut tail_bytes);
-                                            tail_bytes = new_tail;
-                                        } else {
-                                            // Need entire version - prepend it
-                                            let version_content = persistence
-                                                .read_file_version(id, v.version)
-                                                .await?;
-                                            let mut new_tail = version_content;
-                                            new_tail.append(&mut tail_bytes);
-                                            tail_bytes = new_tail;
-                                        }
-                                    }
-
-                                    // Trim to exact pending size (should already be correct, but safety)
-                                    if tail_bytes.len() > pending_size {
-                                        tail_bytes =
-                                            tail_bytes[tail_bytes.len() - pending_size..].to_vec();
-                                    }
-
-                                    tail_bytes
+                                    persistence
+                                        .read_file_tail_before(id, allocated_version, pending_size)
+                                        .await?
                                 } else {
                                     Vec::new()
                                 };
