@@ -41,15 +41,16 @@
 //! - `res=6h.series` - 6 hour aggregated data  
 //! - `res=1d.series` - 1 day aggregated data
 //!
-//! Each file contains time-bucketed aggregations using SQL GROUP BY operations.
+//! Each file contains time-bucketed aggregations built as typed logical plans.
 //!
 //! ## Multi-file glob patterns
 //!
 //! When `in_pattern` contains a glob (e.g., `oteljson:///ingest/casparwater*.json`)
 //! that matches multiple files all mapping to the same `out_pattern`, the factory
-//! delegates to `SqlDerivedFile` which expands the glob and creates a UNION ALL
-//! across all matching files.  This allows temporal-reduce to aggregate across
-//! many rotated log files or ingested data fragments in a single pass.
+//! reuses `SqlDerivedFile` source registration to expand and combine all matching
+//! files, then applies the typed reduction recipe. This allows temporal-reduce
+//! to aggregate across many rotated log files or ingested data fragments in a
+//! single pass.
 //!
 //! **Caveat -- schema inference shortcut:** The column schema is discovered from
 //! the lexicographically last matching file (the newest for timestamped names).
@@ -326,6 +327,15 @@ pub struct TemporalReduceSqlFile {
 }
 
 impl TemporalReduceSqlFile {
+    fn pattern_name(&self) -> String {
+        let sanitized: String = self
+            .source_path
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        format!("source_{sanitized}").to_lowercase()
+    }
+
     #[must_use]
     pub fn new(
         config: TemporalReduceConfig,
@@ -436,30 +446,6 @@ impl TemporalReduceSqlFile {
         );
 
         Ok(columns)
-    }
-
-    /// Generate SQL with discovered schema
-    async fn generate_sql_with_discovered_schema(
-        &self,
-        pattern_name: &str,
-    ) -> TinyFSResult<String> {
-        let modified_config = self.filled_config().await?;
-
-        // Now call the existing generate_temporal_sql function with filled-in columns
-        let sql = generate_temporal_sql(
-            &modified_config,
-            self.duration,
-            &self.source_path,
-            &self.context,
-            pattern_name,
-        )
-        .await?;
-        log::debug!(
-            "[SEARCH] TEMPORAL-REDUCE SQL for {}: \n{}",
-            self.source_path,
-            sql
-        );
-        Ok(sql)
     }
 
     /// Resolve the config's aggregation column patterns against the discovered
@@ -1663,25 +1649,7 @@ impl TemporalReduceSqlFile {
             // CRITICAL: Lowercase to match DataFusion's case-insensitive table name handling
             // Replace ALL non-alphanumeric characters with underscore so the name is
             // a valid unquoted SQL identifier (spaces, parens, slashes, etc.).
-            let sanitized: String = self
-                .source_path
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                .collect();
-            let pattern_name = format!("source_{}", sanitized).to_lowercase();
-
-            // Generate the SQL query with schema discovery, using the unique pattern name
-            log::debug!(
-                "[SEARCH] TEMPORAL-REDUCE: Generating SQL query for source path: {}",
-                self.source_path
-            );
-            let sql_query = self
-                .generate_sql_with_discovered_schema(&pattern_name)
-                .await?;
-            log::debug!(
-                "[SEARCH] TEMPORAL-REDUCE: Generated SQL query: {}",
-                sql_query
-            );
+            let pattern_name = self.pattern_name();
 
             // Use the pattern_url for the SqlDerived source.  When the in_pattern
             // glob matched multiple files mapping to the same output, pattern_url
@@ -1696,19 +1664,59 @@ impl TemporalReduceSqlFile {
                     _ = patterns.insert(pattern_name.clone(), source_url);
                     patterns
                 },
-                Some(sql_query.clone()),
+                None,
             )
             .with_transforms(self.config.transforms.clone());
-
-            log::debug!(
-                "[SEARCH] TEMPORAL-REDUCE SqlDerivedConfig for '{}': query=\n{}",
-                self.source_path,
-                sql_query
-            );
 
             Ok(sql_config)
         })
         .await
+    }
+
+    async fn typed_single_pass_provider(
+        &self,
+        id: tinyfs::FileID,
+        context: &tinyfs::ProviderContext,
+    ) -> TinyFSResult<Arc<dyn datafusion::catalog::TableProvider>> {
+        self.ensure_inner().await?;
+        let filled = self.filled_config().await?;
+        let pieces = AggSqlPieces::build(&filled)?;
+        let pattern_name = self.pattern_name();
+        let inner = self.inner.lock().await;
+        let (source_tables, _) = inner
+            .as_ref()
+            .expect("inner initialized by ensure_inner")
+            .register_source_tables(id, context)
+            .await?;
+        let table_name = source_tables.get(&pattern_name).ok_or_else(|| {
+            tinyfs::Error::Other(format!(
+                "temporal-reduce source table is missing for pattern '{pattern_name}'"
+            ))
+        })?;
+        let source = context
+            .datafusion_session
+            .table(table_name)
+            .await
+            .map_other_context("failed to open temporal-reduce source")?;
+        let partials = query_foundation::plans::reduce::reduce_timestamp_windows(
+            source,
+            &pieces
+                .timestamp_recipe(self.duration, &filled.time_column)
+                .map_other_context("temporal-reduce single-pass recipe")?,
+        )
+        .map_other_context("temporal-reduce single-pass partial planning")?;
+        let output = pieces
+            .reconstruct_bucketed_frame(partials, &filled.time_column)
+            .map_other_context("temporal-reduce single-pass reconstruction")?;
+        let provider: Arc<dyn datafusion::catalog::TableProvider> =
+            Arc::new(datafusion::catalog::view::ViewTable::new(
+                output.logical_plan().clone(),
+                Some("typed temporal-reduce single-pass".to_owned()),
+            ));
+        let cache_key = crate::TableProviderKey::new(id, crate::VersionSelection::LatestVersion)
+            .to_cache_string();
+        context.set_table_provider_cache(cache_key, Arc::clone(&provider))?;
+        Ok(provider)
     }
 
     #[must_use]
@@ -1739,16 +1747,8 @@ impl tinyfs::QueryableFile for TemporalReduceSqlFile {
             return Ok(provider);
         }
 
-        log::debug!(
-            "DELEGATING TemporalReduceSqlFile to inner SqlDerivedFile: id={}",
-            id
-        );
-        self.ensure_inner().await?;
-        let inner_guard = self.inner.lock().await;
-        let inner = inner_guard
-            .as_ref()
-            .expect("inner initialized by ensure_inner");
-        inner.as_table_provider(id, context).await
+        log::debug!("planning typed single-pass temporal-reduce: id={id}");
+        self.typed_single_pass_provider(id, context).await
     }
 }
 
@@ -1828,6 +1828,7 @@ fn parse_nesting_resolutions(resolutions: &[String]) -> TinyFSResult<Vec<Duratio
     Ok(durations)
 }
 
+#[cfg(test)]
 fn duration_to_sql_interval(duration: Duration) -> String {
     let total_seconds = duration.as_secs();
 
@@ -1930,6 +1931,7 @@ impl PartialKind {
 
     /// SQL expression computing this partial over raw source rows, grouped into
     /// a time bucket. Aliased to the partial's internal column name.
+    #[cfg(test)]
     fn raw_expr(self, column: &str, alias: &str) -> String {
         match self {
             PartialKind::Sum => format!("SUM(\"{column}\") AS \"{alias}\""),
@@ -2024,6 +2026,7 @@ enum Reconstruction {
 }
 
 impl Reconstruction {
+    #[cfg(test)]
     fn sql_expr(&self) -> String {
         match self {
             Self::Direct { partial, output } => format!("\"{partial}\" AS \"{output}\""),
@@ -2140,6 +2143,7 @@ impl AggSqlPieces {
     }
 
     /// Partial expressions computed over raw source rows (one row per bucket).
+    #[cfg(test)]
     fn raw_partial_exprs(&self) -> Vec<String> {
         self.partials
             .iter()
@@ -2175,6 +2179,7 @@ impl AggSqlPieces {
 /// DATE_TRUNC only supports single calendar units and discards the multiplier,
 /// so DATE_TRUNC('hour', ts) is the same whether the config says 1h or 4h.
 /// date_bin() properly handles multi-unit intervals like INTERVAL '4 HOUR'.
+#[cfg(test)]
 fn date_bin_expr(interval: &str, ts: &str) -> String {
     format!("date_bin({interval}, {ts}, TIMESTAMP '1970-01-01T00:00:00')")
 }
@@ -2186,6 +2191,7 @@ fn date_bin_expr(interval: &str, ts: &str) -> String {
 /// requested output columns, including `Avg = Sum / Count`. Output column
 /// names, ordering, and values are identical to a direct `AVG/MIN/MAX/...`
 /// GROUP BY. This form is used when no partial-aggregate cache is available.
+#[cfg(test)]
 async fn generate_temporal_sql(
     config: &TemporalReduceConfig,
     interval: Duration,
@@ -2302,6 +2308,7 @@ impl AggSqlPieces {
 
     /// Single-pass query: group raw rows into buckets, compute partials, and
     /// reconstruct the output columns in one statement.
+    #[cfg(test)]
     fn full_sql(&self, interval: Duration, ts: &str, table: &str) -> String {
         let interval = duration_to_sql_interval(interval);
         let bin = date_bin_expr(&interval, ts);
@@ -2430,6 +2437,7 @@ impl AggSqlPieces {
         )
     }
 
+    #[cfg(test)]
     fn reconstruction_sql_exprs(&self) -> Vec<String> {
         self.reconstructions
             .iter()
@@ -2444,8 +2452,41 @@ impl AggSqlPieces {
         ts: &str,
     ) -> datafusion::error::Result<datafusion::dataframe::DataFrame> {
         let mut projection = vec![col(Column::from_name(ts))];
-        for reconstruction in &self.reconstructions {
-            projection.push(match reconstruction {
+        projection.extend(self.reconstruction_expressions());
+        frame.select(projection)
+    }
+
+    fn reconstruct_bucketed_frame(
+        &self,
+        frame: datafusion::dataframe::DataFrame,
+        ts: &str,
+    ) -> datafusion::error::Result<datafusion::dataframe::DataFrame> {
+        let mut projection = vec![
+            coalesce(vec![
+                cast(
+                    col(Column::from_name("time_bucket")),
+                    arrow::datatypes::DataType::Timestamp(
+                        arrow::datatypes::TimeUnit::Microsecond,
+                        None,
+                    ),
+                ),
+                lit(datafusion::common::ScalarValue::TimestampMicrosecond(
+                    Some(0),
+                    None,
+                )),
+            ])
+            .alias(ts),
+        ];
+        projection.extend(self.reconstruction_expressions());
+        frame
+            .select(projection)?
+            .sort(vec![col(Column::from_name(ts)).sort(true, true)])
+    }
+
+    fn reconstruction_expressions(&self) -> Vec<datafusion::logical_expr::Expr> {
+        self.reconstructions
+            .iter()
+            .map(|reconstruction| match reconstruction {
                 Reconstruction::Direct { partial, output } => {
                     col(Column::from_name(partial)).alias(output)
                 }
@@ -2457,9 +2498,8 @@ impl AggSqlPieces {
                     arrow::datatypes::DataType::Float64,
                 ))
                 .alias(output),
-            });
-        }
-        frame.select(projection)
+            })
+            .collect()
     }
 }
 pub struct TemporalReduceDirectory {
@@ -4229,6 +4269,20 @@ mod tests {
 
             let ctx = &provider_context.datafusion_session;
             _ = ctx.register_table("reduced", table_provider).unwrap();
+            let plan = ctx
+                .table("reduced")
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap();
+            let plan = datafusion::physical_plan::displayable(plan.as_ref())
+                .indent(true)
+                .to_string();
+            assert!(
+                !plan.contains("MemoryExec"),
+                "temporal-reduce must preserve its source scan without materialization:\n{plan}"
+            );
             let batches = ctx
                 .sql("SELECT \"temperature.avg\", \"humidity.avg\", \"temperature.min\", \"temperature.max\" FROM reduced ORDER BY timestamp")
                 .await
