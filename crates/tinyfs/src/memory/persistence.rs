@@ -356,6 +356,33 @@ impl MemoryPersistence {
         Ok(())
     }
 
+    /// Store a file version with both integrity data and extended metadata.
+    pub async fn store_file_version_with_bao_and_metadata(
+        &self,
+        id: FileID,
+        version: u64,
+        content: Vec<u8>,
+        bao_outboard: Vec<u8>,
+        extended_metadata: Option<HashMap<String, String>>,
+    ) -> Result<()> {
+        #[cfg(test)]
+        self.take_store_failure()?;
+        let _mutation = self.coherence.begin_mutation()?;
+        self.state
+            .lock()
+            .await
+            .store_file_version_with_bao_and_metadata(
+                id,
+                version,
+                content,
+                bao_outboard,
+                extended_metadata,
+            )
+            .await?;
+        _ = self.coherence.advance()?;
+        Ok(())
+    }
+
     /// Allocate next version number for a file write
     /// This ensures proper version sequencing for FilePhysicalSeries
     pub async fn allocate_version_for_write(&self, id: FileID) -> Result<u64> {
@@ -460,6 +487,18 @@ impl State {
         content: Vec<u8>,
         bao_outboard: Vec<u8>,
     ) -> Result<()> {
+        self.store_file_version_with_bao_and_metadata(id, version, content, bao_outboard, None)
+            .await
+    }
+
+    async fn store_file_version_with_bao_and_metadata(
+        &mut self,
+        id: FileID,
+        version: u64,
+        content: Vec<u8>,
+        bao_outboard: Vec<u8>,
+        extended_metadata: Option<HashMap<String, String>>,
+    ) -> Result<()> {
         // For series types, extract cumulative_blake3 from SeriesOutboard
         // For version types, extract root hash from VersionOutboard
         // This avoids hashing the content twice
@@ -471,7 +510,7 @@ impl State {
             version,
             content,
             id.entry_type(),
-            None,
+            extended_metadata,
             Some(bao_outboard),
             blake3_from_outboard,
         )

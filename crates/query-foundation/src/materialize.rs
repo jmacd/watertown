@@ -301,8 +301,14 @@ pub trait TransactionalBatchWriter: Send {
 /// Factory for one hidden transactional output stage.
 #[async_trait]
 pub trait TransactionalMaterializationSink: Sync {
-    /// Begin staging one stable output identity.
-    async fn begin(&self, output_id: &str) -> Result<Box<dyn TransactionalBatchWriter>>;
+    /// Begin staging one stable output identity for a validated publication
+    /// operation. Implementations must reject unsupported publication modes
+    /// before opening a writer.
+    async fn begin(
+        &self,
+        output_id: &str,
+        publication: &MaterializationPublication,
+    ) -> Result<Box<dyn TransactionalBatchWriter>>;
 }
 
 /// Consume a DataFusion stream without collecting, then atomically publish its
@@ -327,7 +333,7 @@ pub async fn materialize_stream(
         ));
     }
     validate_publication(&publication)?;
-    let mut writer = sink.begin(&output_id).await?;
+    let mut writer = sink.begin(&output_id, &publication).await?;
     let mut metrics = MaterializationMetrics::default();
     let mut bounds = None;
 

@@ -11,6 +11,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use tinyfs::arrow::ParquetExt;
+use tinyfs::arrow::parquet::StreamingSeriesWriter;
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new(
@@ -120,5 +121,74 @@ async fn empty_batches_do_not_create_empty_versions_or_break_bounds() {
         !root
             .exists(std::path::Path::new("/only-empty.series"))
             .await
+    );
+}
+
+#[tokio::test]
+async fn staged_writer_stays_hidden_until_finish_and_persists_metadata() {
+    let filesystem = tinyfs::memory::new_fs().await;
+    let root = filesystem.root().await.expect("memory root");
+    let mut writer = StreamingSeriesWriter::try_new(&root, "/staged.series", schema(), "timestamp")
+        .await
+        .expect("open staged writer");
+    writer
+        .write(&batch(20, 3).expect("batch"))
+        .await
+        .expect("write");
+    writer.flush().await.expect("flush");
+    assert!(
+        root.list_file_versions("/staged.series")
+            .await
+            .expect("staged versions")
+            .is_empty()
+    );
+
+    writer
+        .set_exact_logical_attributes(br#"{"progress":"frontier-23"}"#.to_vec())
+        .expect("set exact attributes");
+    assert_eq!(writer.finish().await.expect("finish"), (20, 22, 3));
+
+    let versions = root
+        .list_file_versions("/staged.series")
+        .await
+        .expect("published versions");
+    assert_eq!(versions.len(), 1);
+    let metadata = versions[0]
+        .extended_metadata
+        .as_ref()
+        .expect("extended metadata");
+    assert_eq!(
+        metadata.get("min_event_time").map(String::as_str),
+        Some("20")
+    );
+    assert_eq!(
+        metadata.get("max_event_time").map(String::as_str),
+        Some("22")
+    );
+    assert_eq!(
+        metadata.get("extended_attributes").map(String::as_str),
+        Some(r#"{"progress":"frontier-23"}"#)
+    );
+}
+
+#[tokio::test]
+async fn dropping_staged_writer_publishes_no_version() {
+    let filesystem = tinyfs::memory::new_fs().await;
+    let root = filesystem.root().await.expect("memory root");
+    let mut writer =
+        StreamingSeriesWriter::try_new(&root, "/aborted.series", schema(), "timestamp")
+            .await
+            .expect("open staged writer");
+    writer
+        .write(&batch(0, 2).expect("batch"))
+        .await
+        .expect("write");
+    drop(writer);
+
+    assert!(
+        root.list_file_versions("/aborted.series")
+            .await
+            .expect("aborted versions")
+            .is_empty()
     );
 }

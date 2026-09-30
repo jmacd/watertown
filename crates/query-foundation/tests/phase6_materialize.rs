@@ -27,6 +27,7 @@ use query_foundation::testkit::FoundationFixture;
 enum FailurePoint {
     #[default]
     None,
+    Begin,
     Write(u64),
     Close,
     ProgressPublication,
@@ -68,7 +69,16 @@ struct RecordingWriter {
 
 #[async_trait]
 impl TransactionalMaterializationSink for RecordingSink {
-    async fn begin(&self, _output_id: &str) -> Result<Box<dyn TransactionalBatchWriter>> {
+    async fn begin(
+        &self,
+        _output_id: &str,
+        _publication: &MaterializationPublication,
+    ) -> Result<Box<dyn TransactionalBatchWriter>> {
+        if matches!(self.failure, FailurePoint::Begin) {
+            return Err(DataFusionError::Plan(
+                "injected unsupported publication".to_owned(),
+            ));
+        }
         self.state
             .lock()
             .expect("sink state lock poisoned")
@@ -265,6 +275,11 @@ async fn no_rows_publish_progress_without_an_output_write() -> Result<()> {
 #[tokio::test]
 async fn every_streaming_and_publication_failure_is_atomic() -> Result<()> {
     let scenarios = [
+        (
+            RecordingSink::failing(FailurePoint::Begin),
+            stream_from(vec![batch(0, 2)]),
+            "unsupported publication",
+        ),
         (
             RecordingSink::default(),
             stream_from(vec![
