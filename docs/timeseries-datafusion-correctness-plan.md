@@ -966,6 +966,27 @@ placeholder. Septic required no compatibility fix. These empty-input runs
 validate every configured factory and the fresh-pond behavior, but they are not
 substitutes for data-bearing performance qualification.
 
+Data-bearing isolated runs now cover every configured water and septic output
+without deployment state or credentials. The repository's sanitized septic
+fixture produced all 24 direct temporal-reduce outputs in 3.43 seconds cold and
+2.71 seconds warm (109.6 MiB and 86.2 MiB maximum RSS); neither pass recorded a
+global, non-incremental, or cache-unavailable decision. A synthetic four-hour
+water fixture produced all 25 direct reduction outputs in 3.10 seconds cold and
+2.89 seconds warm (90.9 MiB and 87.3 MiB maximum RSS), and the complete monitor
+run succeeded. This run exposed and fixed a planning-boundary defect: DataFusion
+expands a registered typed `ViewTable` to anonymous internal scans, so user-SQL
+source validation now checks the parsed SQL relations before provider expansion
+while continuing to reject undeclared sources.
+
+Water's eight downstream pump-state, drawdown, Horner, calibration, usage, leak,
+and annotation outputs also execute successfully. They remain explicitly global
+and non-incremental: both cold and warm traversals recorded eight
+`arbitrary-user-sql` decisions and took 1.77 and 1.74 seconds (99.6 MiB and
+99.3 MiB maximum RSS). This is a measured Phase 10 gate blocker, not a silent
+fallback. Those windowed and aggregate SQL graphs require an explicit
+incremental design or an accepted global-work policy before water satisfies the
+same asymptotic invariant as the direct reductions.
+
 ### Phase 11: native-v2 backup and restore verification
 
 1. Map query-visible immutable logical leaves to current

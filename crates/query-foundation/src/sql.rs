@@ -5,6 +5,7 @@
 //! Conservative planning boundary for user-authored SQL.
 
 use std::collections::BTreeSet;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
@@ -12,6 +13,9 @@ use datafusion::dataframe::DataFrame;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::{SQLOptions, SessionContext};
 use datafusion::logical_expr::{Expr, LogicalPlan, Volatility};
+use datafusion::sql::parser::{DFParser, Statement as DFStatement};
+use datafusion::sql::sqlparser::ast::{Ident, ObjectName, ObjectNamePart, Query, Visit, Visitor};
+use datafusion::sql::sqlparser::dialect::GenericDialect;
 
 use crate::locality::{LocalityClass, LocalityContract};
 
@@ -101,7 +105,7 @@ pub async fn plan_user_sql(
         .with_allow_dml(false)
         .with_allow_statements(false);
     let frame = context.sql_with_options(sql, options).await?;
-    validate_sources(frame.logical_plan(), &declaration.sources)?;
+    validate_sources(sql, &declaration.sources)?;
     if declaration.locality.class() == LocalityClass::TimestampLocal {
         validate_timestamp_local(frame.logical_plan())?;
         let event_time = declaration
@@ -123,20 +127,96 @@ pub async fn plan_user_sql(
     })
 }
 
-fn validate_sources(plan: &LogicalPlan, declared: &BTreeSet<Arc<str>>) -> Result<()> {
-    let mut planned = BTreeSet::new();
-    _ = plan.apply(|node| {
-        if let LogicalPlan::TableScan(scan) = node {
-            _ = planned.insert(Arc::<str>::from(scan.table_name.to_string()));
-        }
-        Ok(TreeNodeRecursion::Continue)
-    })?;
+fn validate_sources(sql: &str, declared: &BTreeSet<Arc<str>>) -> Result<()> {
+    let dialect = GenericDialect {};
+    let mut statements = DFParser::parse_sql_with_dialect(sql, &dialect)
+        .map_err(|error| DataFusionError::Plan(format!("failed to inspect user SQL: {error}")))?;
+    if statements.len() != 1 {
+        return Err(DataFusionError::Plan(
+            "user SQL must contain exactly one query".to_owned(),
+        ));
+    }
+    let Some(DFStatement::Statement(statement)) = statements.pop_front() else {
+        return Err(DataFusionError::Plan(
+            "user SQL must be a standard query".to_owned(),
+        ));
+    };
+    let datafusion::sql::sqlparser::ast::Statement::Query(query) = statement.as_ref() else {
+        return Err(DataFusionError::Plan("user SQL must be a query".to_owned()));
+    };
+
+    let mut visitor = SourceVisitor::default();
+    if query.visit(&mut visitor).is_break() {
+        return Err(DataFusionError::Internal(
+            "user SQL source inspection ended unexpectedly".to_owned(),
+        ));
+    }
+    let planned = visitor.sources;
     if &planned != declared {
         return Err(DataFusionError::Plan(format!(
             "user SQL source set {planned:?} does not match declared sources {declared:?}"
         )));
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct SourceVisitor {
+    sources: BTreeSet<Arc<str>>,
+    cte_scopes: Vec<BTreeSet<String>>,
+}
+
+impl Visitor for SourceVisitor {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+        let aliases = query
+            .with
+            .iter()
+            .flat_map(|with| &with.cte_tables)
+            .map(|cte| normalize_ident(&cte.alias.name))
+            .collect();
+        self.cte_scopes.push(aliases);
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+        _ = self.cte_scopes.pop();
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<Self::Break> {
+        let name = normalize_object_name(relation);
+        let is_cte = !name.contains('.')
+            && self
+                .cte_scopes
+                .iter()
+                .rev()
+                .any(|scope| scope.contains(&name));
+        if !is_cte {
+            _ = self.sources.insert(name.into());
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+fn normalize_object_name(name: &ObjectName) -> String {
+    name.0
+        .iter()
+        .map(|part| match part {
+            ObjectNamePart::Identifier(ident) => normalize_ident(ident),
+            ObjectNamePart::Function(function) => function.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn normalize_ident(ident: &Ident) -> String {
+    if ident.quote_style.is_some() {
+        ident.value.clone()
+    } else {
+        ident.value.to_ascii_lowercase()
+    }
 }
 
 fn validate_timestamp_local(plan: &LogicalPlan) -> Result<()> {
@@ -218,5 +298,71 @@ fn logical_operator_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::DescribeTable(_) => "DescribeTable",
         LogicalPlan::Unnest(_) => "Unnest",
         LogicalPlan::RecursiveQuery(_) => "RecursiveQuery",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::catalog::view::ViewTable;
+    use datafusion::datasource::MemTable;
+
+    fn empty_table() -> Arc<MemTable> {
+        Arc::new(
+            MemTable::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "value",
+                    DataType::Int64,
+                    true,
+                )])),
+                vec![vec![]],
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn declared_view_source_ignores_internal_anonymous_scan() {
+        let context = SessionContext::new();
+        _ = context.register_table("inner", empty_table()).unwrap();
+        let inner = context.table("inner").await.unwrap();
+        let view = Arc::new(ViewTable::new(
+            inner.logical_plan().clone(),
+            Some("nested typed plan".to_owned()),
+        ));
+        _ = context.register_table("declared", view).unwrap();
+
+        _ = plan_user_sql(
+            &context,
+            "WITH filtered AS (SELECT value FROM declared) SELECT * FROM filtered",
+            UserSqlDeclaration::global(["declared"]).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn undeclared_source_is_rejected_before_provider_expansion() {
+        let context = SessionContext::new();
+        _ = context.register_table("declared", empty_table()).unwrap();
+        _ = context.register_table("other", empty_table()).unwrap();
+
+        let error = match plan_user_sql(
+            &context,
+            "SELECT value FROM other",
+            UserSqlDeclaration::global(["declared"]).unwrap(),
+        )
+        .await
+        {
+            Ok(_) => panic!("undeclared source must fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("user SQL source set {\"other\"} does not match declared sources")
+        );
     }
 }
