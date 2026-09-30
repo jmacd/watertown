@@ -54,6 +54,26 @@ fn yaml<T: serde::Serialize>(config: &T) -> Vec<u8> {
     serde_yaml::to_string(config).unwrap().into_bytes()
 }
 
+fn join_config() -> TimeseriesJoinConfig {
+    TimeseriesJoinConfig {
+        time_column: "timestamp".to_owned(),
+        inputs: vec![
+            TimeseriesInput {
+                pattern: provider::Url::parse("series:///sources/a.series").unwrap(),
+                range: None,
+                scope: Some("A".to_owned()),
+                transforms: None,
+            },
+            TimeseriesInput {
+                pattern: provider::Url::parse("series:///sources/b.series").unwrap(),
+                range: None,
+                scope: Some("B".to_owned()),
+                transforms: None,
+            },
+        ],
+    }
+}
+
 async fn append_source(root: &tinyfs::WD, path: &str, timestamp: i64, value: f64) {
     let batch = source_batch(timestamp, value);
     let mut bytes = Vec::new();
@@ -109,7 +129,7 @@ fn segment_manifests(snapshot: &BTreeMap<PathBuf, Vec<u8>>) -> BTreeMap<PathBuf,
 
 async fn query_reduced(
     persistence: &mut OpLogPersistence,
-) -> (usize, tinyfs::PlanVisibilityMetricsSnapshot) {
+) -> (usize, usize, tinyfs::PlanVisibilityMetricsSnapshot) {
     let tx = persistence.begin_test().await.unwrap();
     let root = tx.root().await.unwrap();
     let node = root
@@ -127,19 +147,18 @@ async fn query_reduced(
         .await
         .unwrap();
     drop(guard);
-    let rows = context
+    let batches = context
         .datafusion_session
         .read_table(table)
         .unwrap()
         .collect()
         .await
-        .unwrap()
-        .iter()
-        .map(RecordBatch::num_rows)
-        .sum();
+        .unwrap();
+    let rows = batches.iter().map(RecordBatch::num_rows).sum();
+    let columns = batches.first().map_or(0, RecordBatch::num_columns);
     let metrics = context.plan_visibility_metrics();
     tx.commit_test().await.unwrap();
-    (rows, metrics)
+    (rows, columns, metrics)
 }
 
 #[tokio::test]
@@ -170,29 +189,12 @@ async fn dynamic_join_pivot_reuses_persistent_reduction_lineage() {
             .await
             .unwrap();
 
-        let join = TimeseriesJoinConfig {
-            time_column: "timestamp".to_owned(),
-            inputs: vec![
-                TimeseriesInput {
-                    pattern: provider::Url::parse("series:///sources/a.series").unwrap(),
-                    range: None,
-                    scope: Some("A".to_owned()),
-                    transforms: None,
-                },
-                TimeseriesInput {
-                    pattern: provider::Url::parse("series:///sources/b.series").unwrap(),
-                    range: None,
-                    scope: Some("B".to_owned()),
-                    transforms: None,
-                },
-            ],
-        };
         _ = root
             .create_dynamic_path(
                 "/combined/site",
                 tinyfs::EntryType::TableDynamic,
                 "timeseries-join",
-                yaml(&join),
+                yaml(&join_config()),
             )
             .await
             .unwrap();
@@ -239,8 +241,9 @@ async fn dynamic_join_pivot_reuses_persistent_reduction_lineage() {
         tx.commit_test().await.unwrap();
     }
 
-    let (cold_rows, cold_metrics) = query_reduced(&mut persistence).await;
+    let (cold_rows, cold_columns, cold_metrics) = query_reduced(&mut persistence).await;
     assert_eq!(cold_rows, 3);
+    assert_eq!(cold_columns, 3);
     assert_eq!(cold_metrics.global_plans, 0);
     assert_eq!(cold_metrics.non_incremental_plans, 0);
     assert_eq!(cold_metrics.dynamic_source_executions, 1);
@@ -254,8 +257,9 @@ async fn dynamic_join_pivot_reuses_persistent_reduction_lineage() {
         "cold query must create persistent segment state"
     );
 
-    let (warm_rows, warm_metrics) = query_reduced(&mut persistence).await;
+    let (warm_rows, warm_columns, warm_metrics) = query_reduced(&mut persistence).await;
     assert_eq!(warm_rows, cold_rows);
+    assert_eq!(warm_columns, cold_columns);
     assert_eq!(warm_metrics.global_plans, 0);
     assert_eq!(warm_metrics.non_incremental_plans, 0);
     assert_eq!(warm_metrics.dynamic_source_executions, 0);
@@ -273,8 +277,9 @@ async fn dynamic_join_pivot_reuses_persistent_reduction_lineage() {
         tx.commit_test().await.unwrap();
     }
 
-    let (append_rows, append_metrics) = query_reduced(&mut persistence).await;
+    let (append_rows, append_columns, append_metrics) = query_reduced(&mut persistence).await;
     assert_eq!(append_rows, 4);
+    assert_eq!(append_columns, cold_columns);
     assert_eq!(append_metrics.global_plans, 0);
     assert_eq!(append_metrics.non_incremental_plans, 0);
     assert_eq!(append_metrics.dynamic_source_executions, 1);
@@ -304,8 +309,9 @@ async fn dynamic_join_pivot_reuses_persistent_reduction_lineage() {
         tx.commit_test().await.unwrap();
     }
 
-    let (disorder_rows, disorder_metrics) = query_reduced(&mut persistence).await;
+    let (disorder_rows, disorder_columns, disorder_metrics) = query_reduced(&mut persistence).await;
     assert_eq!(disorder_rows, 4);
+    assert_eq!(disorder_columns, cold_columns);
     assert_eq!(disorder_metrics.global_plans, 0);
     assert_eq!(disorder_metrics.non_incremental_plans, 0);
     assert_eq!(disorder_metrics.dynamic_source_executions, 1);
@@ -331,8 +337,9 @@ async fn dynamic_join_pivot_reuses_persistent_reduction_lineage() {
         tx.commit_test().await.unwrap();
     }
 
-    let (advance_rows, advance_metrics) = query_reduced(&mut persistence).await;
+    let (advance_rows, advance_columns, advance_metrics) = query_reduced(&mut persistence).await;
     assert_eq!(advance_rows, 5);
+    assert_eq!(advance_columns, cold_columns);
     assert_eq!(advance_metrics.global_plans, 0);
     assert_eq!(advance_metrics.non_incremental_plans, 0);
     assert_eq!(advance_metrics.dynamic_source_executions, 1);
@@ -346,8 +353,9 @@ async fn dynamic_join_pivot_reuses_persistent_reduction_lineage() {
         tx.commit_test().await.unwrap();
     }
 
-    let (retro_rows, retro_metrics) = query_reduced(&mut persistence).await;
+    let (retro_rows, retro_columns, retro_metrics) = query_reduced(&mut persistence).await;
     assert_eq!(retro_rows, 5);
+    assert_eq!(retro_columns, cold_columns);
     assert_eq!(retro_metrics.global_plans, 0);
     assert_eq!(retro_metrics.non_incremental_plans, 0);
     assert_eq!(retro_metrics.dynamic_source_executions, 1);
@@ -363,5 +371,39 @@ async fn dynamic_join_pivot_reuses_persistent_reduction_lineage() {
         segment_manifests(&cache_snapshot(&cache_dir)),
         segment_manifests(&advanced_cache),
         "retroactive repair must advance the affected manifest"
+    );
+
+    let pre_membership_cache = cache_snapshot(&cache_dir);
+    {
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        _ = root
+            .create_dynamic_path(
+                "/combined/site2",
+                tinyfs::EntryType::TableDynamic,
+                "timeseries-join",
+                yaml(&join_config()),
+            )
+            .await
+            .unwrap();
+        tx.commit_test().await.unwrap();
+    }
+
+    let (membership_rows, membership_columns, membership_metrics) =
+        query_reduced(&mut persistence).await;
+    assert_eq!(membership_rows, retro_rows);
+    assert!(
+        membership_columns > retro_columns,
+        "new wildcard member must expand the pivoted output schema"
+    );
+    assert_eq!(membership_metrics.global_plans, 0);
+    assert_eq!(membership_metrics.non_incremental_plans, 0);
+    assert_eq!(membership_metrics.dynamic_source_executions, 1);
+    assert_eq!(membership_metrics.bounded_dynamic_source_executions, 0);
+    assert_eq!(membership_metrics.minimum_dynamic_event_time_lo, None);
+    assert!(
+        segment_manifests(&cache_snapshot(&cache_dir)).len()
+            > segment_manifests(&pre_membership_cache).len(),
+        "wildcard membership change must build a distinct aggregate namespace"
     );
 }

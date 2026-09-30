@@ -939,7 +939,9 @@ the warm run executes no dynamic source and the append executes it exactly once
 with an event-time lower bound that excludes the oldest retained history.
 Ordinary disorder inside the hot window and retroactive data in a later sealed
 segment each execute one bounded repair, advance only affected aggregate state,
-and avoid fallback.
+and avoid fallback. Adding a join output under the pivot wildcard expands the
+output schema and builds a distinct aggregate namespace without reusing stale
+state or taking a non-incremental path.
 
 A retained warm no-change run over the 20 parameter/resolution outputs completed
 site generation in 2.813 seconds (3.47 seconds total wall time, 130.6 MB process
@@ -948,9 +950,9 @@ max RSS, 12.01 MB CLI-reported peak). It recorded 20 schema-lineage cache hits,
 export queries, and zero `temporal-reduce-cache-unavailable` decisions. This
 qualifies warm dynamic-graph cache selection and improves substantially on the
 12.025-second pre-lineage site-generation baseline. Append, disorder,
-retroactive, and wildcard-membership scenarios; history-independent export
-verification; required detailed counters; and water/septic qualification remain
-before the Phase 10 gate is complete.
+retroactive, and wildcard-membership replays against the full production Noyo
+dataset; history-independent export verification; remaining detailed counters;
+and water/septic qualification remain before the Phase 10 gate is complete.
 
 ### Phase 11: native-v2 backup and restore verification
 
