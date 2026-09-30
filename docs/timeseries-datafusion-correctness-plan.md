@@ -949,7 +949,10 @@ max RSS, 12.01 MB CLI-reported peak). It recorded 20 schema-lineage cache hits,
 20 deterministic-export reuses, zero schema reconstructions, zero full-rewrite
 export queries, and zero `temporal-reduce-cache-unavailable` decisions. This
 qualifies warm dynamic-graph cache selection and improves substantially on the
-12.025-second pre-lineage site-generation baseline. Append, disorder,
+12.025-second pre-lineage site-generation baseline. A subsequent instrumented
+run reported 2.930 seconds for site generation, zero global/non-incremental
+plans, zero dynamic/export source executions, 128 reused export partitions, and
+zero written partitions in one summary record. Append, disorder,
 retroactive, and wildcard-membership replays against the full production Noyo
 dataset; history-independent export verification; remaining detailed counters;
 and water/septic qualification remain before the Phase 10 gate is complete.

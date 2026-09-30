@@ -47,6 +47,9 @@ pub struct PlanVisibilityMetricsSnapshot {
     pub dynamic_source_executions: u64,
     pub bounded_dynamic_source_executions: u64,
     pub minimum_dynamic_event_time_lo: Option<i64>,
+    pub export_source_executions: u64,
+    pub export_partitions_reused: u64,
+    pub export_partitions_written: u64,
 }
 
 #[derive(Debug)]
@@ -56,6 +59,9 @@ struct PlanVisibilityMetrics {
     dynamic_source_executions: AtomicU64,
     bounded_dynamic_source_executions: AtomicU64,
     minimum_dynamic_event_time_lo: AtomicI64,
+    export_source_executions: AtomicU64,
+    export_partitions_reused: AtomicU64,
+    export_partitions_written: AtomicU64,
 }
 
 impl Default for PlanVisibilityMetrics {
@@ -66,6 +72,9 @@ impl Default for PlanVisibilityMetrics {
             dynamic_source_executions: AtomicU64::new(0),
             bounded_dynamic_source_executions: AtomicU64::new(0),
             minimum_dynamic_event_time_lo: AtomicI64::new(i64::MAX),
+            export_source_executions: AtomicU64::new(0),
+            export_partitions_reused: AtomicU64::new(0),
+            export_partitions_written: AtomicU64::new(0),
         }
     }
 }
@@ -298,6 +307,27 @@ impl ProviderContext {
         }
     }
 
+    /// Record export work after one source completes.
+    pub fn record_export_outcome(
+        &self,
+        source_executions: u64,
+        partitions_reused: usize,
+        partitions_written: usize,
+    ) {
+        _ = self
+            .plan_visibility_metrics
+            .export_source_executions
+            .fetch_add(source_executions, Ordering::Relaxed);
+        _ = self
+            .plan_visibility_metrics
+            .export_partitions_reused
+            .fetch_add(partitions_reused as u64, Ordering::Relaxed);
+        _ = self
+            .plan_visibility_metrics
+            .export_partitions_written
+            .fetch_add(partitions_written as u64, Ordering::Relaxed);
+    }
+
     /// Snapshot fallback decisions and dynamic-source execution bounds.
     #[must_use]
     pub fn plan_visibility_metrics(&self) -> PlanVisibilityMetricsSnapshot {
@@ -326,6 +356,18 @@ impl ProviderContext {
                 i64::MAX => None,
                 value => Some(value),
             },
+            export_source_executions: self
+                .plan_visibility_metrics
+                .export_source_executions
+                .load(Ordering::Relaxed),
+            export_partitions_reused: self
+                .plan_visibility_metrics
+                .export_partitions_reused
+                .load(Ordering::Relaxed),
+            export_partitions_written: self
+                .plan_visibility_metrics
+                .export_partitions_written
+                .load(Ordering::Relaxed),
         }
     }
 

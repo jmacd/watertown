@@ -348,6 +348,7 @@ pub async fn export_table_provider_to_parquet(
             results.len(),
             source_label
         );
+        provider_ctx.record_export_outcome(0, results.len(), 0);
         return Ok((results, schema));
     }
 
@@ -411,6 +412,7 @@ pub async fn export_table_provider_to_parquet(
             unique_table_name.as_str(),
         ));
         write_series_manifest(&manifest_path, &manifest)?;
+        provider_ctx.record_export_outcome(1, 0, results.len());
 
         if results.is_empty() {
             return Err(anyhow::anyhow!(
@@ -445,6 +447,7 @@ pub async fn export_table_provider_to_parquet(
     ));
 
     write_series_manifest(&manifest_path, &manifest)?;
+    provider_ctx.record_export_outcome(1, reused, written);
 
     log::debug!(
         "export {}: {} partitions ({} reused, {} written)",
@@ -1730,6 +1733,10 @@ mod tests {
             0,
             "unchanged export must not plan a source scan"
         );
+        let metrics = ctx.plan_visibility_metrics();
+        assert_eq!(metrics.export_source_executions, 1);
+        assert_eq!(metrics.export_partitions_reused, 2);
+        assert_eq!(metrics.export_partitions_written, 2);
 
         std::fs::write(&jul, b"corrupt").unwrap();
         let err = export_table_provider_to_parquet(
@@ -1837,5 +1844,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(manifest.digest.as_deref(), Some("D2"));
+        let metrics = ctx.plan_visibility_metrics();
+        assert_eq!(metrics.export_source_executions, 2);
+        assert_eq!(metrics.export_partitions_reused, 1);
+        assert_eq!(metrics.export_partitions_written, 3);
     }
 }
