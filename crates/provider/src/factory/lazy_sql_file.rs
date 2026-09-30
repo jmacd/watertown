@@ -5,8 +5,8 @@
 //! Shared delegation for dynamic factory files that lazily build an inner
 //! [`SqlDerivedFile`](crate::factory::sql_derived::SqlDerivedFile).
 //!
-//! Factories like `temporal-reduce` and `timeseries-join` generate SQL on first
-//! access and delegate all file/query behavior to an inner `SqlDerivedFile`.
+//! Factories use an inner `SqlDerivedFile` for shared source resolution and,
+//! where applicable, generated user-facing SQL execution.
 //! They share byte-identical `File`, `Metadata`, and `QueryableFile`
 //! implementations; this macro generates them.
 

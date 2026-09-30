@@ -4,17 +4,26 @@
 
 //! Timeseries Join Factory for TLogFS
 //!
-//! This factory simplifies the common pattern of joining multiple time series sources
-//! by timestamp, automatically generating the COALESCE + FULL OUTER JOIN + EXCLUDE SQL.
+//! This factory composes same-scope sources and joins distinct scopes by
+//! timestamp using typed query-foundation plans.
 
 use crate::factory::sql_derived::{SqlDerivedConfig, SqlDerivedFile};
 use crate::register_dynamic_factory;
+use arrow::datatypes::{DataType, TimeUnit};
 use chrono::{DateTime, Utc};
+use datafusion::catalog::TableProvider;
+use datafusion::catalog::view::ViewTable;
+use datafusion::common::{Column, ScalarValue};
+use datafusion::logical_expr::{col, lit};
+use query_foundation::overlap::OverlapPolicy;
+use query_foundation::plans::combine::{CombineInput, combine_same_scope};
+use query_foundation::plans::join::{TimestampJoinInput, accumulated_full_outer_join};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tinyfs::{FileHandle, Result as TinyFSResult};
+use tinyfs::{FileHandle, FileID, Result as TinyFSResult};
 
 /// Time range bounds for filtering
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,113 +144,12 @@ fn validate_timestamp(ts_str: &str) -> TinyFSResult<DateTime<Utc>> {
         })
 }
 
-/// Generate SQL query for timeseries join with per-input time ranges
-///
-/// Strategy: Use FULL OUTER JOIN on timestamp to preserve all unique timestamps.
-/// To handle duplicate column names (when multiple inputs have same scope), we use
-/// explicit STRUCT() to group each input's columns, then unnest with unique names.
-fn generate_timeseries_join_sql(
-    config: &TimeseriesJoinConfig,
-) -> TinyFSResult<(String, HashMap<String, crate::Url>)> {
-    if config.inputs.is_empty() {
-        return Err(tinyfs::Error::Other(
-            "At least one input must be specified".to_string(),
-        ));
-    }
-
-    if config.inputs.len() == 1 {
-        return Err(tinyfs::Error::Other(
-            "Timeseries join requires at least 2 inputs. Use sql-derived-series for single sources.".to_string(),
-        ));
-    }
-
-    // Generate table aliases and patterns map
-    let mut patterns = HashMap::new();
-    let table_names: Vec<String> = config
-        .inputs
-        .iter()
-        .enumerate()
-        .map(|(i, input)| {
-            let alias = format!("input{}", i);
-            _ = patterns.insert(alias.clone(), input.pattern.clone());
-            alias
-        })
-        .collect();
-
-    // Build CTEs for each input with optional time range filtering
-    let mut ctes = Vec::new();
-
-    for (i, (table_name, input)) in table_names.iter().zip(config.inputs.iter()).enumerate() {
-        let cte_name = format!("filtered{}", i);
-
-        if let Some(range) = &input.range {
-            let mut conditions = Vec::new();
-            if let Some(begin) = &range.begin {
-                let _validated = validate_timestamp(begin)?;
-                conditions.push(format!("{} >= '{}'", config.time_column, begin));
-            }
-            if let Some(end) = &range.end {
-                let _validated = validate_timestamp(end)?;
-                conditions.push(format!("{} <= '{}'", config.time_column, end));
-            }
-            if !conditions.is_empty() {
-                ctes.push(format!(
-                    "{} AS (SELECT * FROM {} WHERE {})",
-                    cte_name,
-                    table_name,
-                    conditions.join(" AND ")
-                ));
-            } else {
-                ctes.push(format!("{} AS (SELECT * FROM {})", cte_name, table_name));
-            }
-        } else {
-            ctes.push(format!("{} AS (SELECT * FROM {})", cte_name, table_name));
-        }
-    }
-
-    // Build FULL OUTER JOIN chain for all inputs
-    let first_cte = "filtered0";
-    let mut join_sql = format!("FROM {}", first_cte);
-
-    for i in 1..config.inputs.len() {
-        let cte_name = format!("filtered{}", i);
-        join_sql.push_str(&format!(
-            "\nFULL OUTER JOIN {} USING ({})",
-            cte_name, config.time_column
-        ));
-    }
-
-    // Build column selections - use * with proper deduplication via USING clause
-    // USING clause merges the join columns, giving us a single timestamp column in the result
-    // Select it from the first table to avoid ambiguity, then select other columns from each
-    let mut column_selections = vec![format!("filtered0.{}", config.time_column)];
-    for i in 0..config.inputs.len() {
-        column_selections.push(format!("filtered{}.* EXCLUDE ({})", i, config.time_column));
-    }
-
-    let with_clause = if !ctes.is_empty() {
-        format!("WITH\n{}\n", ctes.join(",\n"))
-    } else {
-        String::new()
-    };
-
-    let sql = format!(
-        "{}SELECT\n  {}\n{}\nORDER BY {}",
-        with_clause,
-        column_selections.join(",\n  "),
-        join_sql,
-        config.time_column
-    );
-
-    Ok((sql, patterns))
-}
-
 /// Timeseries join file implementation
-/// Wraps SqlDerivedFile with auto-generated join SQL
+/// Uses SqlDerivedFile only for source resolution, transforms, and scoping.
 pub struct TimeseriesJoinFile {
     config: TimeseriesJoinConfig,
     context: crate::FactoryContext,
-    // Lazy-initialized SqlDerivedFile
+    // Lazy-initialized source resolver.
     inner: Arc<tokio::sync::Mutex<Option<SqlDerivedFile>>>,
 }
 
@@ -264,245 +172,226 @@ impl TimeseriesJoinFile {
     /// Ensure the inner SqlDerivedFile is created
     async fn ensure_inner(&self) -> TinyFSResult<()> {
         crate::factory::lazy_sql_file::ensure_inner_series(&self.inner, &self.context, || async {
-            log::debug!(
-                "[SEARCH] TIMESERIES-JOIN: Generating schema-aware SQL for {} inputs",
-                self.config.inputs.len()
-            );
-
-            // Generate SQL using UNION BY NAME for same-scope inputs, then FULL OUTER JOIN
-            let (sql_query, patterns, scope_prefixes, pattern_transforms) =
-                self.generate_union_join_sql().await?;
-
-            log::debug!("[SEARCH] Generated SQL:\n{}", sql_query);
-
-            // Create SqlDerivedConfig with scope prefixes and pattern transforms
-            Ok(SqlDerivedConfig::new(patterns, Some(sql_query))
+            let mut patterns = HashMap::new();
+            let mut scope_prefixes = HashMap::new();
+            let mut pattern_transforms = HashMap::new();
+            for (index, input) in self.config.inputs.iter().enumerate() {
+                let table_name = format!("input{index}");
+                _ = patterns.insert(table_name.clone(), input.pattern.clone());
+                if let Some(scope) = &input.scope {
+                    _ = scope_prefixes.insert(
+                        table_name.clone(),
+                        (scope.clone(), self.config.time_column.clone()),
+                    );
+                }
+                if let Some(transforms) = &input.transforms {
+                    _ = pattern_transforms.insert(table_name, transforms.clone());
+                }
+            }
+            Ok(SqlDerivedConfig::new(patterns, None)
                 .with_scope_prefixes(scope_prefixes)
                 .with_pattern_transforms(pattern_transforms))
         })
         .await
     }
 
-    /// Generate SQL using UNION BY NAME for same-scope inputs, then FULL OUTER JOIN different scopes
-    /// Returns: (sql_query, patterns, scope_prefixes, pattern_transforms)
-    ///
-    /// Strategy:
-    /// 1. Group inputs by scope
-    /// 2. Create CTEs that UNION BY NAME inputs with the same scope
-    /// 3. FULL OUTER JOIN the scope CTEs
-    /// 4. Let ScopePrefixTableProvider (via SqlDerivedConfig) apply the scope prefixes to inputN tables
-    async fn generate_union_join_sql(
-        &self,
-    ) -> TinyFSResult<(
-        String,
-        HashMap<String, crate::Url>,
-        HashMap<String, (String, String)>,
-        HashMap<String, Vec<String>>,
-    )> {
-        use std::collections::BTreeMap;
-
-        // Build patterns map - one URL per input (already validated in config)
-        // AND build scope_prefixes map - one entry per input that has a scope
-        // AND build pattern_transforms map - one entry per input that has transforms
-        let mut patterns = HashMap::new();
-        let mut scope_prefixes = HashMap::new();
-        let mut pattern_transforms = HashMap::new();
-
-        for (i, input) in self.config.inputs.iter().enumerate() {
-            let table_name = format!("input{}", i);
-
-            // Pattern is already a Url (validated during deserialization)
-            _ = patterns.insert(table_name.clone(), input.pattern.clone());
-
-            // Register scope prefix for this input's table
-            if let Some(ref scope) = input.scope {
-                let _ = scope_prefixes.insert(
-                    table_name.clone(),
-                    (scope.clone(), self.config.time_column.clone()),
-                );
-            }
-
-            // Register transforms for this input's table
-            if let Some(ref transforms) = input.transforms {
-                let _ = pattern_transforms.insert(table_name.clone(), transforms.clone());
-            }
-        }
-
-        // Group inputs by scope for UNION BY NAME
-        let mut scope_groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-
-        for (i, input) in self.config.inputs.iter().enumerate() {
-            // Use scope as key, or generate unique key for None scopes
-            let scope_key = input
-                .scope
-                .clone()
-                .unwrap_or_else(|| format!("_none_{}", i));
-            scope_groups.entry(scope_key).or_default().push(i);
-        }
-
-        log::debug!(
-            "[SEARCH] TIMESERIES-JOIN: Grouped {} inputs into {} scope groups",
-            self.config.inputs.len(),
-            scope_groups.len()
-        );
-        for (scope, indices) in &scope_groups {
-            log::debug!("  Scope '{}': inputs {:?}", scope, indices);
-        }
-
-        // Build CTEs:
-        // 1. Filtered CTEs for each input (with range filters)
-        // 2. Combined CTEs for each scope group (UNION BY NAME if multiple inputs)
-        let mut ctes = Vec::new();
-
-        // Step 1: Create filtered CTEs for each input
-        for (i, input) in self.config.inputs.iter().enumerate() {
-            let table_name = format!("input{}", i);
-            let filtered_name = format!("filtered{}", i);
-
-            if let Some(range) = &input.range {
-                let mut conditions = Vec::new();
-                if let Some(begin) = &range.begin {
-                    let _validated = validate_timestamp(begin)?;
-                    conditions.push(format!("{} >= '{}'", self.config.time_column, begin));
-                }
-                if let Some(end) = &range.end {
-                    let _validated = validate_timestamp(end)?;
-                    conditions.push(format!("{} <= '{}'", self.config.time_column, end));
-                }
-                if !conditions.is_empty() {
-                    ctes.push(format!(
-                        "{} AS (SELECT * FROM {} WHERE {})",
-                        filtered_name,
-                        table_name,
-                        conditions.join(" AND ")
-                    ));
-                } else {
-                    ctes.push(format!(
-                        "{} AS (SELECT * FROM {})",
-                        filtered_name, table_name
-                    ));
-                }
-            } else {
-                ctes.push(format!(
-                    "{} AS (SELECT * FROM {})",
-                    filtered_name, table_name
-                ));
-            }
-        }
-
-        // Step 2: Create combined CTEs for each scope group using UNION BY NAME
-        let mut scope_table_names: Vec<String> = Vec::new();
-
-        for (scope_idx, (_scope, input_indices)) in scope_groups.iter().enumerate() {
-            let scope_table = format!("scope_combined{}", scope_idx);
-            scope_table_names.push(scope_table.clone());
-
-            if input_indices.len() == 1 {
-                // Single input in this scope - just select from it
-                let input_idx = input_indices[0];
-                ctes.push(format!(
-                    "{} AS (SELECT * FROM filtered{})",
-                    scope_table, input_idx
-                ));
-            } else {
-                // Multiple inputs - UNION BY NAME
-                let union_parts: Vec<String> = input_indices
-                    .iter()
-                    .map(|idx| format!("SELECT * FROM filtered{}", idx))
-                    .collect();
-                ctes.push(format!(
-                    "{} AS ({})",
-                    scope_table,
-                    union_parts.join("\nUNION BY NAME\n")
-                ));
-            }
-        }
-
-        log::debug!(
-            "[SEARCH] TIMESERIES-JOIN: Created {} combined scope tables",
-            scope_table_names.len()
-        );
-
-        // Step 3: FULL OUTER JOIN all scope tables
-        let mut join_sql = format!("FROM {}", scope_table_names[0]);
-        if scope_table_names.len() > 1 {
-            for i in 1..scope_table_names.len() {
-                join_sql.push_str(&format!(
-                    "\nFULL OUTER JOIN {} ON {}.{} = {}.{}",
-                    scope_table_names[i],
-                    scope_table_names[0],
-                    self.config.time_column,
-                    scope_table_names[i],
-                    self.config.time_column
-                ));
-            }
-        }
-
-        // Step 4: SELECT all columns
-        // Let ScopePrefixTableProvider handle the prefixing for inputN tables
-        let mut select_parts = Vec::new();
-
-        // COALESCE timestamp
-        if scope_table_names.len() > 1 {
-            let timestamp_coalesce: Vec<String> = scope_table_names
-                .iter()
-                .map(|t| format!("{}.{}", t, self.config.time_column))
-                .collect();
-            select_parts.push(format!(
-                "COALESCE({}) AS {}",
-                timestamp_coalesce.join(", "),
-                self.config.time_column
-            ));
-
-            // Select all other columns from each scope table (excluding timestamp)
-            for table_name in &scope_table_names {
-                select_parts.push(format!(
-                    "{}.* EXCLUDE ({})",
-                    table_name, self.config.time_column
-                ));
-            }
-        } else {
-            // Only one scope - just select everything
-            select_parts.push("*".to_string());
-        }
-
-        let with_clause = if !ctes.is_empty() {
-            format!("WITH\n{}\n", ctes.join(",\n"))
-        } else {
-            String::new()
-        };
-
-        let sql = format!(
-            "{}SELECT\n  {}\n{}\nORDER BY {}",
-            with_clause,
-            select_parts.join(",\n  "),
-            join_sql,
-            self.config.time_column
-        );
-
-        log::debug!("[SEARCH] TIMESERIES-JOIN: Generated SQL:\n{}", sql);
-        log::debug!(
-            "[SEARCH] TIMESERIES-JOIN: Scope prefixes: {:?}",
-            scope_prefixes
-        );
-        log::debug!(
-            "[SEARCH] TIMESERIES-JOIN: Pattern transforms: {:?}",
-            pattern_transforms
-        );
-
-        Ok((sql, patterns, scope_prefixes, pattern_transforms))
-    }
-
     #[must_use]
     pub fn create_handle(self) -> FileHandle {
         FileHandle::new(Arc::new(tokio::sync::Mutex::new(Box::new(self))))
     }
+
+    async fn typed_join_provider(
+        &self,
+        id: FileID,
+        context: &tinyfs::ProviderContext,
+    ) -> TinyFSResult<Arc<dyn TableProvider>> {
+        let cache_key = crate::TableProviderKey::new(id, crate::VersionSelection::LatestVersion)
+            .to_cache_string();
+        if let Some(cached) = context.get_table_provider_cache(&cache_key) {
+            return Ok(cached);
+        }
+
+        self.ensure_inner().await?;
+        let inner = self.inner.lock().await;
+        let (source_tables, empty_sources) = inner
+            .as_ref()
+            .expect("inner initialized by ensure_inner")
+            .register_source_tables(id, context)
+            .await?;
+
+        let mut scope_groups: BTreeMap<String, Vec<(usize, datafusion::dataframe::DataFrame)>> =
+            BTreeMap::new();
+        let mut empty_fallback = None;
+        for (index, input) in self.config.inputs.iter().enumerate() {
+            let pattern_name = format!("input{index}");
+            let table_name = source_tables.get(&pattern_name).ok_or_else(|| {
+                tinyfs::Error::Other(format!(
+                    "timeseries-join source table is missing for pattern '{pattern_name}'"
+                ))
+            })?;
+            let frame = context
+                .datafusion_session
+                .table(table_name)
+                .await
+                .map_err(|error| {
+                    tinyfs::Error::Other(format!(
+                        "failed to open timeseries-join source '{pattern_name}': {error}"
+                    ))
+                })?;
+            let frame = apply_time_range(frame, &self.config.time_column, input.range.as_ref())?;
+            if empty_sources.contains(&pattern_name) {
+                if empty_fallback.is_none() {
+                    empty_fallback = Some(frame);
+                }
+                continue;
+            }
+            let scope = input
+                .scope
+                .clone()
+                .unwrap_or_else(|| format!("_none_{index}"));
+            scope_groups.entry(scope).or_default().push((index, frame));
+        }
+
+        let mut scopes = Vec::with_capacity(scope_groups.len());
+        for (scope, frames) in scope_groups {
+            let combined = combine_same_scope(
+                frames
+                    .into_iter()
+                    .map(|(sequence, frame)| {
+                        CombineInput::new(
+                            format!("{scope}:input{sequence}"),
+                            sequence as u64,
+                            frame,
+                        )
+                    })
+                    .collect(),
+                &OverlapPolicy::PreserveAll,
+            )
+            .await
+            .map_err(|error| {
+                tinyfs::Error::Other(format!(
+                    "failed to combine timeseries-join scope '{scope}': {error}"
+                ))
+            })?;
+            scopes.push(combined);
+        }
+
+        let joined = if scopes.is_empty() {
+            empty_fallback.ok_or_else(|| {
+                tinyfs::Error::Other(
+                    "timeseries-join produced no source scopes or empty fallback".to_owned(),
+                )
+            })?
+        } else if scopes.len() == 1 {
+            scopes.pop().expect("one scope")
+        } else {
+            accumulated_full_outer_join(
+                scopes
+                    .into_iter()
+                    .map(|frame| TimestampJoinInput::new(frame, self.config.time_column.as_str()))
+                    .collect(),
+                &self.config.time_column,
+            )
+            .map_err(|error| {
+                tinyfs::Error::Other(format!("failed to plan timeseries join: {error}"))
+            })?
+        };
+        let ordered = joined
+            .sort(vec![
+                col(Column::from_name(&self.config.time_column)).sort(true, true),
+            ])
+            .map_err(|error| {
+                tinyfs::Error::Other(format!("failed to order timeseries join: {error}"))
+            })?;
+        let provider: Arc<dyn TableProvider> = Arc::new(ViewTable::new(
+            ordered.logical_plan().clone(),
+            Some("typed timeseries-join".to_owned()),
+        ));
+        context.set_table_provider_cache(cache_key, Arc::clone(&provider))?;
+        Ok(provider)
+    }
 }
 
-crate::factory::lazy_sql_file::impl_lazy_sql_derived_delegation!(
-    TimeseriesJoinFile,
-    "TimeseriesJoinFile"
-);
+crate::factory::lazy_sql_file::impl_lazy_sql_derived_file_metadata!(TimeseriesJoinFile);
+
+#[async_trait::async_trait]
+impl tinyfs::QueryableFile for TimeseriesJoinFile {
+    async fn as_table_provider(
+        &self,
+        id: FileID,
+        context: &tinyfs::ProviderContext,
+    ) -> TinyFSResult<Arc<dyn TableProvider>> {
+        self.typed_join_provider(id, context).await
+    }
+}
+
+fn apply_time_range(
+    frame: datafusion::dataframe::DataFrame,
+    time_column: &str,
+    range: Option<&TimeRange>,
+) -> TinyFSResult<datafusion::dataframe::DataFrame> {
+    let Some(range) = range else {
+        return Ok(frame);
+    };
+    let data_type = frame
+        .schema()
+        .field_with_unqualified_name(time_column)
+        .map_err(|_| {
+            tinyfs::Error::Other(format!(
+                "timeseries-join input is missing time column '{time_column}'"
+            ))
+        })?
+        .data_type()
+        .clone();
+    let lower = range
+        .begin
+        .as_deref()
+        .map(|value| timestamp_scalar(value, &data_type))
+        .transpose()?;
+    let upper = range
+        .end
+        .as_deref()
+        .map(|value| timestamp_scalar(value, &data_type))
+        .transpose()?;
+    let time = col(Column::from_name(time_column));
+    let predicate = match (lower, upper) {
+        (Some(lower), Some(upper)) => time.clone().gt_eq(lit(lower)).and(time.lt_eq(lit(upper))),
+        (Some(lower), None) => time.gt_eq(lit(lower)),
+        (None, Some(upper)) => time.lt_eq(lit(upper)),
+        (None, None) => return Ok(frame),
+    };
+    frame
+        .filter(predicate)
+        .map_err(|error| tinyfs::Error::Other(format!("invalid timeseries-join range: {error}")))
+}
+
+fn timestamp_scalar(value: &str, data_type: &DataType) -> TinyFSResult<ScalarValue> {
+    let timestamp = validate_timestamp(value)?;
+    let scalar = match data_type {
+        DataType::Date64 => ScalarValue::Date64(Some(timestamp.timestamp_millis())),
+        DataType::Timestamp(TimeUnit::Second, timezone) => {
+            ScalarValue::TimestampSecond(Some(timestamp.timestamp()), timezone.clone())
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, timezone) => {
+            ScalarValue::TimestampMillisecond(Some(timestamp.timestamp_millis()), timezone.clone())
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, timezone) => {
+            ScalarValue::TimestampMicrosecond(Some(timestamp.timestamp_micros()), timezone.clone())
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, timezone) => ScalarValue::TimestampNanosecond(
+            Some(timestamp.timestamp_nanos_opt().ok_or_else(|| {
+                tinyfs::Error::Other(format!("timestamp '{value}' is outside nanosecond range"))
+            })?),
+            timezone.clone(),
+        ),
+        _ => {
+            return Err(tinyfs::Error::Other(format!(
+                "timeseries-join range requires a date or timestamp time column, found {data_type}"
+            )));
+        }
+    };
+    Ok(scalar)
+}
 
 // Factory functions
 
@@ -523,8 +412,7 @@ fn validate_timeseries_join_config(config: &[u8]) -> TinyFSResult<Value> {
         "Invalid timeseries-join config",
     )?;
 
-    // Additional validation: generate SQL to catch errors early
-    let (_sql, _patterns) = generate_timeseries_join_sql(&cfg)?;
+    cfg.validate()?;
 
     Ok(config_value)
 }
@@ -545,6 +433,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use arrow::record_batch::RecordBatch;
     use datafusion::execution::context::SessionContext;
+    use datafusion::physical_plan::display::DisplayableExecutionPlan;
     use parquet::arrow::ArrowWriter;
     use std::io::Cursor;
     use std::sync::Arc;
@@ -561,7 +450,7 @@ mod tests {
             time_column: "timestamp".to_string(),
             inputs: vec![],
         };
-        assert!(generate_timeseries_join_sql(&config_empty).is_err());
+        assert!(config_empty.validate().is_err());
 
         // Single input
         let config_single = TimeseriesJoinConfig {
@@ -573,7 +462,7 @@ mod tests {
                 transforms: None,
             }],
         };
-        assert!(generate_timeseries_join_sql(&config_single).is_err());
+        assert!(config_single.validate().is_err());
 
         // Invalid timestamp format
         let config_bad_time = TimeseriesJoinConfig {
@@ -596,7 +485,7 @@ mod tests {
                 },
             ],
         };
-        assert!(generate_timeseries_join_sql(&config_bad_time).is_err());
+        assert!(config_bad_time.validate().is_err());
     }
 
     #[tokio::test]
@@ -710,6 +599,15 @@ mod tests {
             .sql("SELECT * FROM joined ORDER BY timestamp")
             .await
             .unwrap();
+        let physical = df.clone().create_physical_plan().await.unwrap();
+        let plan = DisplayableExecutionPlan::new(physical.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(plan.contains("join_type=Full"), "{plan}");
+        assert!(
+            !plan.contains("MemoryExec"),
+            "typed timeseries join materialized its inputs:\n{plan}"
+        );
         let batches = df.collect().await.unwrap();
 
         assert!(!batches.is_empty());
@@ -944,6 +842,12 @@ mod tests {
                 TimeseriesInput {
                     pattern: crate::Url::parse("series:///field_live.series").unwrap(),
                     scope: Some("Field".to_string()),
+                    range: None,
+                    transforms: None,
+                },
+                TimeseriesInput {
+                    pattern: crate::Url::parse("series:///absent_scope_*.series").unwrap(),
+                    scope: Some("Absent".to_string()),
                     range: None,
                     transforms: None,
                 },
@@ -1203,8 +1107,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_timeseries_join_csv_different_schemas() {
-        // Test CSV format provider with multiple files having different schemas
-        // This validates the UNION BY NAME logic in sql_derived.rs
+        // Test typed joins over CSV inputs with different schemas.
         let (fs, provider_context) = create_test_environment().await;
 
         // Create sensor1.csv with timestamp, temp, humidity
@@ -1260,7 +1163,7 @@ mod tests {
 
         let join_file = TimeseriesJoinFile::new(config, factory_context).unwrap();
 
-        // Create table provider - this should succeed with UNION BY NAME handling schema differences
+        // Typed join planning must handle schema differences.
         let table_provider = join_file
             .as_table_provider(FileID::root(), &provider_context)
             .await
@@ -1304,7 +1207,7 @@ mod tests {
         // Verify we have all timestamps from both sensors (4 unique: 00:00, 01:00, 02:00, 03:00)
         assert_eq!(batch.num_rows(), 4, "Should have 4 unique timestamps");
 
-        // Verify UNION BY NAME filled NULLs correctly
+        // Verify full-outer alignment filled NULLs correctly.
         // At 00:00: sensor1 has data, sensor2 should be NULL
         // At 01:00: both have data
         // At 02:00: both have data

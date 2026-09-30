@@ -1391,11 +1391,9 @@ impl SqlDerivedFile {
 
     /// Register an empty placeholder table for a pattern that matched no files.
     ///
-    /// The generated SQL (notably from `timeseries-join`) references every
-    /// configured input by its `inputN` alias, so an unmatched input must still
-    /// resolve to a table or planning fails with "table 'inputN' not found".
-    /// The placeholder contributes zero rows, so `UNION BY NAME` / `FULL JOIN`
-    /// simply ignore it.
+    /// SQL-derived queries and typed built-in recipes reference every configured
+    /// input by name, so an unmatched input must still resolve to a table. The
+    /// placeholder contributes zero rows to composition and joins.
     ///
     /// The placeholder schema is cloned from a sibling input that shares the
     /// same scope (and therefore the same post-scope-prefix columns), so the
@@ -1503,6 +1501,34 @@ impl SqlDerivedFile {
         }
         None
     }
+
+    /// Resolve, transform, and register every configured source pattern.
+    ///
+    /// The returned map preserves factory-facing pattern names while its
+    /// values identify internal session tables; the accompanying set names
+    /// empty placeholders. Typed built-in factories use this distinction to
+    /// omit empty inputs without guessing from schemas or table names.
+    pub(crate) async fn register_source_tables(
+        &self,
+        id: FileID,
+        context: &tinyfs::ProviderContext,
+    ) -> TinyFSResult<(HashMap<String, String>, std::collections::HashSet<String>)> {
+        let mut table_mappings = HashMap::new();
+        let mut empty_patterns = Vec::new();
+        for (pattern_name, pattern) in &self.get_config().patterns {
+            let registered = self
+                .register_pattern_source(id, context, pattern_name, pattern, &mut table_mappings)
+                .await?;
+            if !registered {
+                empty_patterns.push(pattern_name.clone());
+            }
+        }
+        for pattern_name in &empty_patterns {
+            self.register_empty_pattern_table(id, context, pattern_name, &mut table_mappings)
+                .await?;
+        }
+        Ok((table_mappings, empty_patterns.into_iter().collect()))
+    }
 }
 
 // QueryableFile trait implementation - follows anti-duplication principles
@@ -1531,28 +1557,13 @@ impl tinyfs::QueryableFile for SqlDerivedFile {
         // Get SessionContext directly from ProviderContext
         let ctx = &context.datafusion_session;
 
-        // Create mapping from user pattern names to unique internal table names
-        let mut table_mappings = HashMap::new();
-
         // Register each pattern as a table in the session context.  Patterns
         // that match no files are collected and handled in a second pass: the
         // generated SQL references every input by name, so an unmatched input
         // must still resolve to an (empty) table or planning fails.  The second
         // pass runs after all real tables are registered so empty placeholders
         // can borrow a same-scope sibling's schema.
-        let mut empty_patterns = Vec::new();
-        for (pattern_name, pattern) in &self.get_config().patterns {
-            let registered = self
-                .register_pattern_source(id, context, pattern_name, pattern, &mut table_mappings)
-                .await?;
-            if !registered {
-                empty_patterns.push(pattern_name.clone());
-            }
-        }
-        for pattern_name in &empty_patterns {
-            self.register_empty_pattern_table(id, context, pattern_name, &mut table_mappings)
-                .await?;
-        }
+        let (table_mappings, _) = self.register_source_tables(id, context).await?;
 
         // Get the effective SQL query with table name substitutions using our unique internal names
         debug!(
