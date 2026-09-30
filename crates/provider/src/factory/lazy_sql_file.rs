@@ -7,8 +7,8 @@
 //!
 //! Factories use an inner `SqlDerivedFile` for shared source resolution and,
 //! where applicable, generated user-facing SQL execution.
-//! They share byte-identical `File`, `Metadata`, and `QueryableFile`
-//! implementations; this macro generates them.
+//! They share byte-identical `File` and `Metadata` implementations; this
+//! module generates those while each built-in owns its typed query plan.
 
 use crate::FactoryContext;
 use crate::factory::sql_derived::{SqlDerivedConfig, SqlDerivedFile, SqlDerivedMode};
@@ -107,47 +107,4 @@ macro_rules! impl_lazy_sql_derived_file_metadata {
     };
 }
 
-/// Generate a `tinyfs::QueryableFile` implementation that delegates
-/// `as_table_provider` to the lazily-built inner `SqlDerivedFile`.
-///
-/// Requirements are the same as [`impl_lazy_sql_derived_file_metadata`].
-/// `$label` is a short string used only in delegation debug logging.
-macro_rules! impl_lazy_sql_derived_queryable {
-    ($ty:ty, $label:literal) => {
-        #[async_trait::async_trait]
-        impl tinyfs::QueryableFile for $ty {
-            async fn as_table_provider(
-                &self,
-                id: tinyfs::FileID,
-                context: &tinyfs::ProviderContext,
-            ) -> tinyfs::Result<std::sync::Arc<dyn datafusion::catalog::TableProvider>> {
-                log::debug!(
-                    concat!("DELEGATING ", $label, " to inner SqlDerivedFile: id={}"),
-                    id
-                );
-                self.ensure_inner().await?;
-                let inner_guard = self.inner.lock().await;
-                let inner = inner_guard
-                    .as_ref()
-                    .expect("inner initialized by ensure_inner");
-                inner.as_table_provider(id, context).await
-            }
-        }
-    };
-}
-
-/// Generate `File`, `Metadata`, and `QueryableFile` implementations that
-/// delegate to a lazily-built inner `SqlDerivedFile`. Convenience combination
-/// of [`impl_lazy_sql_derived_file_metadata`] and
-/// [`impl_lazy_sql_derived_queryable`] for factories that need no custom
-/// query behavior.
-macro_rules! impl_lazy_sql_derived_delegation {
-    ($ty:ty, $label:literal) => {
-        crate::factory::lazy_sql_file::impl_lazy_sql_derived_file_metadata!($ty);
-        crate::factory::lazy_sql_file::impl_lazy_sql_derived_queryable!($ty, $label);
-    };
-}
-
-pub(crate) use impl_lazy_sql_derived_delegation;
 pub(crate) use impl_lazy_sql_derived_file_metadata;
-pub(crate) use impl_lazy_sql_derived_queryable;

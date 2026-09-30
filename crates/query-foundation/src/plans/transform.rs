@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 
 use arrow::datatypes::DataType;
-use datafusion::common::ScalarValue;
+use datafusion::common::{Column, ScalarValue};
 use datafusion::dataframe::DataFrame;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{Expr, cast, col, lit};
@@ -109,8 +109,8 @@ pub fn project(frame: DataFrame, columns: Vec<ProjectionColumn>) -> Result<DataF
                 output,
                 data_type,
             } => Ok(match data_type {
-                Some(data_type) => cast(col(&source), data_type).alias(output),
-                None => alias_when_needed(col(&source), &source, &output),
+                Some(data_type) => cast(col(Column::from_name(&source)), data_type).alias(output),
+                None => alias_when_needed(col(Column::from_name(&source)), &source, &output),
             }),
             ProjectionColumn::Null { output, data_type } => {
                 let value = ScalarValue::try_new_null(&data_type)?;

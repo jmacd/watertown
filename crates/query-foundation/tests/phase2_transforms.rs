@@ -132,6 +132,22 @@ async fn null_padding_is_typed_and_mixed_predicates_stay_correct() -> Result<()>
 }
 
 #[tokio::test]
+async fn null_padding_preserves_scoped_column_names() -> Result<()> {
+    let (_fixture, frame) = fixture_frame().await?;
+    let frame = scope_prefix(frame, "Station", "ts")?;
+    let frame =
+        null_pad(frame, vec![("Station.quality".to_owned(), DataType::Utf8)])?.select(vec![
+            col(Column::from_name("Station.raw")),
+            col(Column::from_name("Station.quality")),
+        ])?;
+    let batches = frame.collect().await?;
+    assert_eq!(batches[0].schema().field(0).name(), "Station.raw");
+    assert_eq!(batches[0].schema().field(1).name(), "Station.quality");
+    assert_eq!(batches[0].column(1).null_count(), 4);
+    Ok(())
+}
+
+#[tokio::test]
 async fn timestamp_unit_cast_uses_projection_and_invalid_padding_fails() -> Result<()> {
     let (_fixture, frame) = fixture_frame().await?;
     let frame = cast_column(
