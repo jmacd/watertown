@@ -580,7 +580,11 @@ impl TemporalReduceSqlFile {
     /// the rollup partial/merge SQL.
     async fn filled_config(&self) -> TinyFSResult<TemporalReduceConfig> {
         // Discover available columns
-        let discovered_columns = self.discover_source_columns().await?;
+        let discovered_columns = if self.resolve_source_files().await?.is_empty() {
+            self.configured_empty_source_columns()?
+        } else {
+            self.discover_source_columns().await?
+        };
         log::debug!(
             "TemporalReduceFile: discovered {} columns: {:?}",
             discovered_columns.len(),
@@ -638,6 +642,34 @@ impl TemporalReduceSqlFile {
         }
 
         Ok(modified_config)
+    }
+
+    fn configured_empty_source_columns(&self) -> TinyFSResult<Vec<String>> {
+        let mut columns = std::collections::BTreeSet::new();
+        for aggregation in &self.config.aggregations {
+            let configured = aggregation.columns.as_ref().ok_or_else(|| {
+                tinyfs::Error::Other(format!(
+                    "temporal-reduce source '{}' matched no files and aggregation {} \
+                     does not declare columns; an empty output schema cannot be inferred",
+                    self.pattern_url,
+                    aggregation.agg_type.to_sql()
+                ))
+            })?;
+            for column in configured {
+                if column == "*" {
+                    continue;
+                }
+                if column.contains(['*', '?', '[']) {
+                    return Err(tinyfs::Error::Other(format!(
+                        "temporal-reduce source '{}' matched no files and configured column \
+                         pattern '{}' cannot be resolved without a source schema",
+                        self.pattern_url, column
+                    )));
+                }
+                _ = columns.insert(column.clone());
+            }
+        }
+        Ok(columns.into_iter().collect())
     }
 
     /// Attempt to serve this resolution from the incremental partial-aggregate
@@ -1859,26 +1891,58 @@ impl TemporalReduceSqlFile {
         log::info!(
             "query-plan visibility: node={id} locality=timestamp-local incremental=false reason=temporal-reduce-cache-unavailable"
         );
-        self.ensure_inner().await?;
         let filled = self.filled_config().await?;
         let pieces = AggSqlPieces::build(&filled)?;
-        let pattern_name = self.pattern_name();
-        let inner = self.inner.lock().await;
-        let (source_tables, _) = inner
-            .as_ref()
-            .expect("inner initialized by ensure_inner")
-            .register_source_tables(id, context)
-            .await?;
-        let table_name = source_tables.get(&pattern_name).ok_or_else(|| {
-            tinyfs::Error::Other(format!(
-                "temporal-reduce source table is missing for pattern '{pattern_name}'"
-            ))
-        })?;
-        let source = context
-            .datafusion_session
-            .table(table_name)
-            .await
-            .map_other_context("failed to open temporal-reduce source")?;
+        let empty_source = self.resolve_source_files().await?.is_empty();
+        let source = if empty_source {
+            let mut fields = vec![arrow::datatypes::Field::new(
+                &filled.time_column,
+                arrow::datatypes::DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Microsecond,
+                    Some("UTC".into()),
+                ),
+                true,
+            )];
+            fields.extend(
+                self.configured_empty_source_columns()?
+                    .into_iter()
+                    .map(|column| {
+                        arrow::datatypes::Field::new(
+                            column,
+                            arrow::datatypes::DataType::Float64,
+                            true,
+                        )
+                    }),
+            );
+            let empty = datafusion::datasource::MemTable::try_new(
+                Arc::new(arrow::datatypes::Schema::new(fields)),
+                vec![vec![]],
+            )
+            .map_other_context("create empty temporal-reduce source")?;
+            context
+                .datafusion_session
+                .read_table(Arc::new(empty))
+                .map_other_context("open empty temporal-reduce source")?
+        } else {
+            self.ensure_inner().await?;
+            let pattern_name = self.pattern_name();
+            let inner = self.inner.lock().await;
+            let (source_tables, _) = inner
+                .as_ref()
+                .expect("inner initialized by ensure_inner")
+                .register_source_tables(id, context)
+                .await?;
+            let table_name = source_tables.get(&pattern_name).ok_or_else(|| {
+                tinyfs::Error::Other(format!(
+                    "temporal-reduce source table is missing for pattern '{pattern_name}'"
+                ))
+            })?;
+            context
+                .datafusion_session
+                .table(table_name)
+                .await
+                .map_other_context("failed to open temporal-reduce source")?
+        };
         let partials = query_foundation::plans::reduce::reduce_timestamp_windows(
             source,
             &pieces
@@ -1889,11 +1953,20 @@ impl TemporalReduceSqlFile {
         let output = pieces
             .reconstruct_bucketed_frame(partials, &filled.time_column)
             .map_other_context("temporal-reduce single-pass reconstruction")?;
-        let provider: Arc<dyn datafusion::catalog::TableProvider> =
+        let provider: Arc<dyn datafusion::catalog::TableProvider> = if empty_source {
+            Arc::new(
+                datafusion::datasource::MemTable::try_new(
+                    Arc::new(output.schema().as_arrow().clone()),
+                    vec![vec![]],
+                )
+                .map_other_context("create empty temporal-reduce output")?,
+            )
+        } else {
             Arc::new(datafusion::catalog::view::ViewTable::new(
                 output.logical_plan().clone(),
                 Some("typed temporal-reduce single-pass".to_owned()),
-            ));
+            ))
+        };
         let cache_key = crate::TableProviderKey::new(id, crate::VersionSelection::LatestVersion)
             .to_cache_string();
         context.set_table_provider_cache(cache_key, Arc::clone(&provider))?;
@@ -2885,6 +2958,19 @@ impl Directory for TemporalReduceDirectory {
             return Ok(Some(node_ref));
         }
 
+        if sites.is_empty()
+            && !self.config.out_pattern.contains('$')
+            && name == self.config.out_pattern
+        {
+            let root = self.context.root().await?;
+            return Ok(Some(self.create_site_directory_node(
+                name.to_owned(),
+                self.config.in_pattern.path().to_owned(),
+                root.node_path().node,
+                self.config.in_pattern.to_string(),
+            )));
+        }
+
         Ok(None)
     }
 
@@ -3570,6 +3656,61 @@ mod tests {
                 .unwrap()
         );
         assert!(stale.discovered_columns.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_source_with_explicit_columns_preserves_output_schema() {
+        let (fs, provider_context) = create_test_environment().await;
+        let root_node = fs.root().await.unwrap().node_path().node;
+        let config = TemporalReduceConfig {
+            in_pattern: crate::Url::parse("series:///missing/*.series").unwrap(),
+            out_pattern: "data".to_owned(),
+            time_column: "timestamp".to_owned(),
+            resolutions: vec!["1h".to_owned()],
+            aggregations: vec![
+                agg(AggregationType::Avg, &["temperature"]),
+                agg(AggregationType::Min, &["temperature"]),
+                agg(AggregationType::Max, &["temperature"]),
+            ],
+            transforms: None,
+            allowed_lateness: None,
+            seal_target_bytes: None,
+            max_live_segments: None,
+        };
+        let file = TemporalReduceSqlFile::new(
+            config,
+            Duration::from_secs(3600),
+            root_node,
+            "/missing/source.series".to_owned(),
+            "series:///missing/*.series".to_owned(),
+            test_context(&provider_context, FileID::root()),
+        );
+        let provider =
+            tinyfs::QueryableFile::as_table_provider(&file, FileID::root(), &provider_context)
+                .await
+                .unwrap();
+        assert_eq!(
+            provider
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "timestamp",
+                "temperature.avg",
+                "temperature.min",
+                "temperature.max"
+            ]
+        );
+        let batches = provider_context
+            .datafusion_session
+            .read_table(provider)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
     }
 
     /// Phase 1: Avg must be lowered to decomposable Sum/Count partials and

@@ -955,7 +955,16 @@ plans, zero dynamic/export source executions, 128 reused export partitions, and
 zero written partitions in one summary record. Append, disorder,
 retroactive, and wildcard-membership replays against the full production Noyo
 dataset; history-independent export verification; remaining detailed counters;
-and water/septic qualification remain before the Phase 10 gate is complete.
+and data-bearing water/septic qualification remain before the Phase 10 gate is
+complete.
+
+The complete water and septic production configurations also apply successfully
+to isolated fresh ponds. Empty temporal inputs with explicit aggregation columns
+now expose their configured output schema, allowing downstream water SQL and
+monitoring to report unknown rather than fail planning on a timestamp-only
+placeholder. Septic required no compatibility fix. These empty-input runs
+validate every configured factory and the fresh-pond behavior, but they are not
+substitutes for data-bearing performance qualification.
 
 ### Phase 11: native-v2 backup and restore verification
 
