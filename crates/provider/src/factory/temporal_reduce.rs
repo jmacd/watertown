@@ -1678,6 +1678,10 @@ impl TemporalReduceSqlFile {
         id: tinyfs::FileID,
         context: &tinyfs::ProviderContext,
     ) -> TinyFSResult<Arc<dyn datafusion::catalog::TableProvider>> {
+        context.record_non_incremental_plan();
+        log::info!(
+            "query-plan visibility: node={id} locality=timestamp-local incremental=false reason=temporal-reduce-cache-unavailable"
+        );
         self.ensure_inner().await?;
         let filled = self.filled_config().await?;
         let pieces = AggSqlPieces::build(&filled)?;
@@ -4355,6 +4359,16 @@ mod tests {
         // Single-pass path (no cache) for the same config.
         let nocache_ctx = make_ctx(None);
         let single_rows = collect_daily(&fs, &nocache_ctx, config()).await;
+        assert_eq!(
+            cache_ctx.plan_visibility_metrics().non_incremental_plans,
+            0,
+            "incremental rollup must not be classified as a fallback"
+        );
+        assert_eq!(
+            nocache_ctx.plan_visibility_metrics().non_incremental_plans,
+            1,
+            "cacheless temporal reduction must be visible in metrics"
+        );
 
         assert_eq!(rollup_rows.len(), 2, "two daily rows");
         assert_eq!(

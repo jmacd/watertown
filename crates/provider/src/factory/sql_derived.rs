@@ -40,7 +40,7 @@ use tinyfs::ResultExt;
 use crate::transform::scope_prefix::scope_prefix_table_provider;
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
-use log::debug;
+use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -1605,8 +1605,10 @@ impl tinyfs::QueryableFile for SqlDerivedFile {
             debug!("[SEARCH] SQL-DERIVED: Could not access 'datafusion' catalog");
         }
 
-        let logical_plan = ctx
-            .sql(&effective_sql)
+        let declaration =
+            query_foundation::sql::UserSqlDeclaration::global(table_mappings.values().cloned())
+                .map_other_context("SQL-derived global locality declaration failed")?;
+        let planned = query_foundation::sql::plan_user_sql(ctx, &effective_sql, declaration)
             .await
             .map_err(|e| {
                 log::error!(
@@ -1615,9 +1617,13 @@ impl tinyfs::QueryableFile for SqlDerivedFile {
                 );
                 log::error!("[ERR] SQL-DERIVED: Failed SQL was: {}", effective_sql);
                 tinyfs::Error::Other(format!("Failed to parse SQL into LogicalPlan: {}", e))
-            })?
-            .logical_plan()
-            .clone();
+            })?;
+        let logical_plan = planned.into_frame().logical_plan().clone();
+        context.record_global_plan();
+        context.record_non_incremental_plan();
+        info!(
+            "query-plan visibility: node={id} locality=global incremental=false reason=arbitrary-user-sql"
+        );
         debug!("[OK] SQL-DERIVED: Successfully created logical plan");
 
         use datafusion::catalog::view::ViewTable;
@@ -2204,6 +2210,14 @@ query: ""
         assert_eq!(schema.field(0).name(), "sensor_id");
         assert_eq!(schema.field(1).name(), "location");
         assert_eq!(schema.field(2).name(), "reading");
+        assert_eq!(
+            provider_context.plan_visibility_metrics(),
+            tinyfs::PlanVisibilityMetricsSnapshot {
+                global_plans: 1,
+                non_incremental_plans: 1,
+            },
+            "arbitrary SQL must be visible as global and non-incremental"
+        );
     }
 
     #[tokio::test]

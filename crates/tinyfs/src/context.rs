@@ -12,6 +12,7 @@ use crate::{FileID, PersistenceLayer};
 use datafusion::execution::context::SessionContext;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 type CachedTableProvider = (Option<u64>, Arc<dyn datafusion::catalog::TableProvider>);
 
@@ -32,6 +33,19 @@ pub type Result<T> = std::result::Result<T, crate::Error>;
 pub struct ExportHint {
     pub digest: String,
     pub changed_since: Option<i64>,
+}
+
+/// Visible counts of plans that cannot use bounded incremental execution.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PlanVisibilityMetricsSnapshot {
+    pub global_plans: u64,
+    pub non_incremental_plans: u64,
+}
+
+#[derive(Debug, Default)]
+struct PlanVisibilityMetrics {
+    global_plans: AtomicU64,
+    non_incremental_plans: AtomicU64,
 }
 
 /// Provider context - holds tinyfs Persistence for transaction management
@@ -67,6 +81,8 @@ pub struct ProviderContext {
     /// export layer reads these immediately after obtaining the table provider
     /// to decide which output partitions are unchanged.
     pub export_hints: Arc<std::sync::Mutex<std::collections::HashMap<String, ExportHint>>>,
+
+    plan_visibility_metrics: Arc<PlanVisibilityMetrics>,
 }
 
 impl ProviderContext {
@@ -82,6 +98,7 @@ impl ProviderContext {
             cache_dir: None,
             pond_path: None,
             export_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            plan_visibility_metrics: Arc::new(PlanVisibilityMetrics::default()),
         }
     }
 
@@ -175,6 +192,37 @@ impl ProviderContext {
     #[must_use]
     pub fn get_export_hint(&self, id: &FileID) -> Option<ExportHint> {
         self.export_hints.lock().ok()?.get(&id.to_string()).cloned()
+    }
+
+    /// Record one intentionally global plan.
+    pub fn record_global_plan(&self) {
+        _ = self
+            .plan_visibility_metrics
+            .global_plans
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one execution that cannot reuse bounded incremental state.
+    pub fn record_non_incremental_plan(&self) {
+        _ = self
+            .plan_visibility_metrics
+            .non_incremental_plans
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Snapshot global and non-incremental planning decisions.
+    #[must_use]
+    pub fn plan_visibility_metrics(&self) -> PlanVisibilityMetricsSnapshot {
+        PlanVisibilityMetricsSnapshot {
+            global_plans: self
+                .plan_visibility_metrics
+                .global_plans
+                .load(Ordering::Relaxed),
+            non_incremental_plans: self
+                .plan_visibility_metrics
+                .non_incremental_plans
+                .load(Ordering::Relaxed),
+        }
     }
 
     /// Create a filesystem from the persistence layer

@@ -204,6 +204,13 @@ pub async fn execute(
     }
 
     let watermark = read_watermark(&context, &config).await?;
+    if watermark.is_none() {
+        context.context.record_non_incremental_plan();
+        info!(
+            "query-plan visibility: node={} locality=timestamp-local incremental=false reason=materialization-bootstrap",
+            context.file_id
+        );
+    }
 
     let session = &context.context.datafusion_session;
     let source = table_for(&context, &config.source.to_string(), session).await?;
@@ -384,6 +391,13 @@ mod tests {
                 .len(),
             1
         );
+        assert_eq!(
+            provider_context
+                .plan_visibility_metrics()
+                .non_incremental_plans,
+            1,
+            "first-run full-history materialization must be visible"
+        );
 
         execute(
             config,
@@ -405,6 +419,13 @@ mod tests {
                 "/target.series.materialization-progress"
             ))
             .await
+        );
+        assert_eq!(
+            provider_context
+                .plan_visibility_metrics()
+                .non_incremental_plans,
+            1,
+            "incremental no-op must not add another non-incremental plan"
         );
     }
 }

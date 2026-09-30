@@ -902,7 +902,10 @@ ordered suffix into the transactional TinyFS sink, atomically publishing exact
 output metadata and recipe/source/frontier progress; it does not collect or
 concatenate the result, and a no-row run publishes progress without an empty
 series version. Visibility of intentionally global/non-incremental paths
-remains before this phase is complete.
+is explicit: arbitrary SQL is conservatively declared global, cacheless
+temporal reduction and first-run materialization are declared
+non-incremental, and each decision emits an info log plus shared provider
+counters. Phase 9 is complete.
 
 ### Phase 10: consumers and Noyo qualification
 

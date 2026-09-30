@@ -27,7 +27,9 @@ pub mod tree_format;
 mod wd;
 
 // Public exports - Core filesystem API
-pub use context::{ExportHint, FactoryContext, PondMetadata, ProviderContext};
+pub use context::{
+    ExportHint, FactoryContext, PlanVisibilityMetricsSnapshot, PondMetadata, ProviderContext,
+};
 pub use dir::{Directory, DirectoryEntry, Handle as DirHandle, Pathed};
 pub use file::{
     AsyncReadSeek, File, FileMetadataWriter, Handle as FileHandle, QueryableFile, SeriesReadBounds,
