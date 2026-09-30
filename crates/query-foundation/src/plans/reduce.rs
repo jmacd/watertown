@@ -68,6 +68,8 @@ pub struct TimestampWindowReduce {
     event_time: String,
     width: Duration,
     aggregates: Vec<TimestampPartialAggregate>,
+    lower_bound_secs: Option<i64>,
+    upper_bound_secs: Option<i64>,
 }
 
 impl TimestampWindowReduce {
@@ -115,7 +117,17 @@ impl TimestampWindowReduce {
             event_time,
             width,
             aggregates,
+            lower_bound_secs: None,
+            upper_bound_secs: None,
         })
+    }
+
+    /// Restrict input to buckets in the half-open epoch-second range `[lo, hi)`.
+    #[must_use]
+    pub fn with_epoch_second_bounds(mut self, lo: Option<i64>, hi: Option<i64>) -> Self {
+        self.lower_bound_secs = lo;
+        self.upper_bound_secs = hi;
+        self
     }
 }
 
@@ -326,8 +338,7 @@ pub fn reduce_timestamp_windows(
         lit(ScalarValue::new_interval_mdn(0, 0, nanos)),
         event_time.clone(),
         lit(origin),
-    )
-    .alias("time_bucket");
+    );
     let aggregates = recipe
         .aggregates
         .iter()
@@ -347,9 +358,50 @@ pub fn reduce_timestamp_windows(
             }
         })
         .collect();
+    let mut predicate = event_time.is_not_null();
+    if let Some(lower) = recipe.lower_bound_secs {
+        predicate = predicate.and(
+            bucket
+                .clone()
+                .gt_eq(lit(timestamp_from_epoch_seconds(unit, timezone, lower)?)),
+        );
+    }
+    if let Some(upper) = recipe.upper_bound_secs {
+        predicate = predicate.and(
+            bucket
+                .clone()
+                .lt(lit(timestamp_from_epoch_seconds(unit, timezone, upper)?)),
+        );
+    }
     frame
-        .filter(event_time.is_not_null())?
-        .aggregate(vec![bucket], aggregates)
+        .filter(predicate)?
+        .aggregate(vec![bucket.alias("time_bucket")], aggregates)
+}
+
+fn timestamp_from_epoch_seconds(
+    unit: &TimeUnit,
+    timezone: &Option<Arc<str>>,
+    seconds: i64,
+) -> Result<ScalarValue> {
+    let scaled = |factor| {
+        seconds.checked_mul(factor).ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "epoch-second reduce bound {seconds} overflows {unit:?} timestamp"
+            ))
+        })
+    };
+    Ok(match unit {
+        TimeUnit::Second => ScalarValue::TimestampSecond(Some(seconds), timezone.clone()),
+        TimeUnit::Millisecond => {
+            ScalarValue::TimestampMillisecond(Some(scaled(1_000)?), timezone.clone())
+        }
+        TimeUnit::Microsecond => {
+            ScalarValue::TimestampMicrosecond(Some(scaled(1_000_000)?), timezone.clone())
+        }
+        TimeUnit::Nanosecond => {
+            ScalarValue::TimestampNanosecond(Some(scaled(1_000_000_000)?), timezone.clone())
+        }
+    })
 }
 
 fn bucket_start_expression(event_time: Expr, width: i64, origin: i64) -> Expr {

@@ -229,7 +229,7 @@ async fn timestamp_windows_emit_multiple_mergeable_partials() -> Result<()> {
             },
         ],
     )?;
-    let batches = reduce_timestamp_windows(context.read_table(source)?, &recipe)?
+    let batches = reduce_timestamp_windows(context.read_table(source.clone())?, &recipe)?
         .sort(vec![
             datafusion::logical_expr::col("time_bucket").sort(true, true),
         ])?
@@ -245,6 +245,18 @@ async fn timestamp_windows_emit_multiple_mergeable_partials() -> Result<()> {
          | 1970-01-01T00:01:00 | 2    | 2        | 12.0 | 4.0 | 8.0 |\n\
          +---------------------+------+----------+------+-----+-----+"
     );
+
+    let bounded = reduce_timestamp_windows(
+        context.read_table(source)?,
+        &recipe.clone().with_epoch_second_bounds(Some(60), Some(120)),
+    )?;
+    let plan = bounded.clone().create_physical_plan().await?;
+    let display = DisplayableExecutionPlan::new(plan.as_ref())
+        .indent(true)
+        .to_string();
+    assert!(display.contains("FilterExec"), "{display}");
+    let bounded = bounded.collect().await?;
+    assert_eq!(bounded.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
     Ok(())
 }
 

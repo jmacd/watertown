@@ -63,7 +63,7 @@ use crate::factory::sql_derived::{SqlDerivedConfig, SqlDerivedFile};
 use crate::register_dynamic_factory;
 use async_trait::async_trait;
 use datafusion::common::Column;
-use datafusion::functions::core::expr_fn::nullif;
+use datafusion::functions::core::expr_fn::{coalesce, nullif};
 use datafusion::logical_expr::{cast, col, lit};
 use futures::StreamExt;
 use futures::stream::{self, Stream};
@@ -957,17 +957,19 @@ impl TemporalReduceSqlFile {
             && m.sealed_hi_secs.is_none_or(|sh| wm > sh)
             && m.hot_bytes >= policy.target_bytes
         {
-            let seal_sql = pieces.merge_partials_sql(
-                output_interval,
-                ts,
-                input_table,
-                in_bucket_col,
-                m.sealed_hi_secs,
-                Some(wm),
-            );
+            let seal = pieces
+                .merge_partials_frame(
+                    ctx.table(input_table).await.map_other()?,
+                    output_interval,
+                    ts,
+                    in_bucket_col,
+                    m.sealed_hi_secs,
+                    Some(wm),
+                )
+                .map_other_context("rollup sealed segment planning failed")?;
             let name = format!("seg-{:08}.parquet", m.next_seq);
             let seg_file = crate::partial_aggregate_cache::segment_path(res_dir, &name);
-            let (seg_digest, rows) = self.write_merge_to(ctx, &seal_sql, &seg_file).await?;
+            let (seg_digest, rows) = self.write_merge_to(seal, &seg_file).await?;
             if rows > 0 {
                 let bytes = tokio::fs::metadata(&seg_file).await.map_other()?.len();
                 m.segments.push(crate::partial_aggregate_cache::Segment {
@@ -989,16 +991,18 @@ impl TemporalReduceSqlFile {
         // Recompute the open hot window [sealed_hi, inf) from the current input --
         // where new appends and within-window late data land. Bounded to
         // ~allowed_lateness worth of buckets.
-        let hot_sql = pieces.merge_partials_sql(
-            output_interval,
-            ts,
-            input_table,
-            in_bucket_col,
-            m.sealed_hi_secs,
-            None,
-        );
+        let hot = pieces
+            .merge_partials_frame(
+                ctx.table(input_table).await.map_other()?,
+                output_interval,
+                ts,
+                in_bucket_col,
+                m.sealed_hi_secs,
+                None,
+            )
+            .map_other_context("rollup hot-window planning failed")?;
         let hot_file = crate::partial_aggregate_cache::hot_path(res_dir);
-        let (hot_digest, _rows) = self.write_merge_to(ctx, &hot_sql, &hot_file).await?;
+        let (hot_digest, _rows) = self.write_merge_to(hot, &hot_file).await?;
         m.hot_digest = Some(hot_digest);
         // Fatal, like the identical stat on a just-sealed segment above.
         // `write_merge_to` has just written this path atomically and a zero-row
@@ -1064,14 +1068,19 @@ impl TemporalReduceSqlFile {
             // associative, so folding a window of segments into one gives exactly
             // what folding the original inputs would have; this is the same
             // property that lets a coarser resolution be built from a finer one.
-            let table_name = format!("__rollup_compact_{}", m.next_seq);
-            _ = ctx.register_table(&table_name, table).map_other()?;
-            let sql = pieces.merge_partials_sql(output_interval, ts, &table_name, ts, None, None);
+            let merged_frame = pieces
+                .merge_partials_frame(
+                    ctx.read_table(table).map_other()?,
+                    output_interval,
+                    ts,
+                    ts,
+                    None,
+                    None,
+                )
+                .map_other_context("rollup compaction planning failed")?;
             let name = format!("seg-{:08}.parquet", m.next_seq);
             let out = crate::partial_aggregate_cache::segment_path(res_dir, &name);
-            let merged = self.write_merge_to(ctx, &sql, &out).await;
-            _ = ctx.deregister_table(&table_name).map_other()?;
-            let (digest, rows) = merged?;
+            let (digest, rows) = self.write_merge_to(merged_frame, &out).await?;
 
             if rows == 0 {
                 // Cannot happen for non-empty segments (an empty segment is never
@@ -1201,7 +1210,7 @@ impl TemporalReduceSqlFile {
                 let mut m = manifest.expect("incremental implies a manifest");
                 // Floor to the BUCKET, not just to the second. `sealed_hi_secs`
                 // is a bucket boundary everywhere else, and every consumer
-                // compares it against a bucket START (`merge_partials_sql`
+                // compares it against a bucket START (`merge_partials_frame`
                 // filters `date_bin(...) >= lo`). An unaligned watermark would
                 // leave the bucket containing the dirty point in neither a
                 // segment (they stop at the aligned edge below it) nor the hot
@@ -1555,23 +1564,19 @@ impl TemporalReduceSqlFile {
         })
     }
 
-    /// Plan and execute `sql`, streaming the result to `path` atomically. Returns
+    /// Execute `frame`, streaming the result to `path` atomically. Returns
     /// the written file's blake3 digest and its row count. The row count lets the
     /// caller drop empty segments (gaps with no data) rather than record an
     /// empty segment file, while still advancing the watermark.
     async fn write_merge_to(
         &self,
-        ctx: &datafusion::prelude::SessionContext,
-        sql: &str,
+        frame: datafusion::dataframe::DataFrame,
         path: &std::path::Path,
     ) -> TinyFSResult<(String, u64)> {
-        let stream = ctx
-            .sql(sql)
-            .await
-            .map_other_context("rollup sealed-cache SQL planning failed")?
+        let stream = frame
             .execute_stream()
             .await
-            .map_other_context("rollup sealed-cache SQL execution failed")?;
+            .map_other_context("rollup sealed-cache plan execution failed")?;
         let schema = stream.schema();
         let rows = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let rows_w = rows.clone();
@@ -1961,6 +1966,7 @@ impl PartialKind {
     /// is associative: sums and counts add, mins/maxes extend. The result keeps
     /// the same alias so the reconstruction SELECT is identical whether it runs
     /// over raw-grouped or merged partials.
+    #[cfg(test)]
     fn merge_expr(self, alias: &str) -> String {
         match self {
             // SUM is nullable in DataFusion; COUNT is not. Single-pass COUNT
@@ -2151,6 +2157,7 @@ impl AggSqlPieces {
     }
 
     /// Partial expressions merging cached partials across partitions.
+    #[cfg(test)]
     fn merge_partial_exprs(&self) -> Vec<String> {
         self.partials
             .iter()
@@ -2220,6 +2227,73 @@ impl AggSqlPieces {
             })
             .collect();
         query_foundation::plans::reduce::TimestampWindowReduce::try_new(ts, interval, aggregates)
+    }
+
+    fn merge_partials_frame(
+        &self,
+        frame: datafusion::dataframe::DataFrame,
+        output_interval: Duration,
+        ts: &str,
+        in_bucket_col: &str,
+        lower_bound: Option<i64>,
+        upper_bound: Option<i64>,
+    ) -> datafusion::error::Result<datafusion::dataframe::DataFrame> {
+        use query_foundation::plans::reduce::TimestampPartialAggregate;
+
+        let aggregates = self
+            .partials
+            .iter()
+            .map(|partial| match partial.kind {
+                PartialKind::Sum | PartialKind::Count | PartialKind::CountStar => {
+                    TimestampPartialAggregate::Sum {
+                        value: partial.alias.clone(),
+                        output: partial.alias.clone(),
+                    }
+                }
+                PartialKind::Min => TimestampPartialAggregate::Min {
+                    value: partial.alias.clone(),
+                    output: partial.alias.clone(),
+                },
+                PartialKind::Max => TimestampPartialAggregate::Max {
+                    value: partial.alias.clone(),
+                    output: partial.alias.clone(),
+                },
+            })
+            .collect();
+        let recipe = query_foundation::plans::reduce::TimestampWindowReduce::try_new(
+            in_bucket_col,
+            output_interval,
+            aggregates,
+        )?
+        .with_epoch_second_bounds(lower_bound, upper_bound);
+        let merged = query_foundation::plans::reduce::reduce_timestamp_windows(frame, &recipe)?;
+        let output_timestamp =
+            arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None);
+        let mut projection = vec![
+            coalesce(vec![
+                cast(
+                    col(Column::from_name("time_bucket")),
+                    output_timestamp.clone(),
+                ),
+                lit(datafusion::common::ScalarValue::TimestampMicrosecond(
+                    Some(0),
+                    None,
+                )),
+            ])
+            .alias(ts),
+        ];
+        projection.extend(self.partials.iter().map(|partial| {
+            let value = col(Column::from_name(&partial.alias));
+            match partial.kind {
+                PartialKind::Count | PartialKind::CountStar => {
+                    coalesce(vec![value, lit(0_i64)]).alias(&partial.alias)
+                }
+                _ => value,
+            }
+        }));
+        merged
+            .select(projection)?
+            .sort(vec![col(Column::from_name(ts)).sort(true, true)])
     }
 
     /// Single-pass query: group raw rows into buckets, compute partials, and
@@ -2306,7 +2380,7 @@ impl AggSqlPieces {
     ///
     /// Retained as the reference definition of the reconstructed output and as
     /// the equivalence oracle in tests; production now writes mergeable partials
-    /// via [`merge_partials_sql`] and reconstructs at read time via
+    /// via [`merge_partials_frame`] and reconstructs at read time via
     /// [`reconstruct_frame`], whose composition is exactly this query.
     #[cfg(test)]
     fn merge_sql(
@@ -2352,82 +2426,11 @@ impl AggSqlPieces {
         )
     }
 
-    /// Comma-separated list of the stored partial columns (`__p_*` aliases), in
-    /// declaration order. This is the on-disk column set of a segment / hot
-    /// file under [`crate::partial_aggregate_cache::SEALED_FORMAT`] = `partials-v1`, and the
-    /// input columns the read-time reconstruction ([`reconstruct_frame`]) consumes.
-    fn partial_column_list(&self) -> String {
-        self.partials
-            .iter()
-            .map(|p| format!("\"{}\"", p.alias))
-            .collect::<Vec<_>>()
-            .join(",\n          ")
-    }
-
     fn reconstruction_sql_exprs(&self) -> Vec<String> {
         self.reconstructions
             .iter()
             .map(Reconstruction::sql_expr)
             .collect()
-    }
-
-    /// Like [`merge_sql`], but the final projection emits the *merged partial*
-    /// columns instead of the reconstructed output columns. This is what the
-    /// Phase 2 segments and hot file store (design §3 / Phase 3 step 1): keeping
-    /// the mergeable partials (sum/count/min/max) on disk — rather than a
-    /// reconstructed, non-associative `Avg` — lets a coarser resolution correctly
-    /// fold a finer resolution's segments (Phase 3 step 2) and preserves exact
-    /// cross-version/cross-segment merge semantics. Output columns are rebuilt at read
-    /// time by [`reconstruct_frame`]. Bounds behave exactly as in [`merge_sql`].
-    ///
-    /// `in_bucket_col` is the input table's bucket-timestamp column: `time_bucket`
-    /// when folding the shared finest partials (finest resolution), or the output
-    /// timestamp column (`ts`) when folding a finer resolution's segments+hot, whose
-    /// stored bucket column is that `ts`. Both are TIMESTAMP-typed and already
-    /// aligned to the finer interval, so `date_bin` re-buckets them exactly into
-    /// the coarser output interval (nesting guarantees no split).
-    fn merge_partials_sql(
-        &self,
-        output_interval: Duration,
-        ts: &str,
-        partials_table: &str,
-        in_bucket_col: &str,
-        lower_bound: Option<i64>,
-        upper_bound: Option<i64>,
-    ) -> String {
-        let interval = duration_to_sql_interval(output_interval);
-        let bin = date_bin_expr(&interval, in_bucket_col);
-        let mut preds: Vec<String> = Vec::new();
-        if let Some(lo) = lower_bound {
-            preds.push(format!("CAST(EXTRACT(EPOCH FROM {bin}) AS BIGINT) >= {lo}"));
-        }
-        if let Some(hi) = upper_bound {
-            preds.push(format!("CAST(EXTRACT(EPOCH FROM {bin}) AS BIGINT) < {hi}"));
-        }
-        let where_clause = if preds.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", preds.join(" AND "))
-        };
-        format!(
-            r#"
-        WITH merged AS (
-          SELECT 
-            {bin} AS time_bucket,
-            {merge_exprs}
-          FROM {partials_table}
-          {where_clause}
-          GROUP BY {bin}
-        )
-        SELECT 
-          COALESCE(CAST(time_bucket AS TIMESTAMP), CAST(0 AS TIMESTAMP)) AS {ts},
-          {partial_cols}
-        FROM merged
-        ORDER BY time_bucket
-        "#,
-            merge_exprs = self.merge_partial_exprs().join(",\n            "),
-            partial_cols = self.partial_column_list(),
-        )
     }
 
     /// Reconstruct user-visible aggregates from stored mergeable partials.

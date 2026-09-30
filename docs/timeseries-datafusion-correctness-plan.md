@@ -890,9 +890,12 @@ timeseries pivots as typed logical plans. Temporal reduction retains its
 incremental segment/hot cache and reconstructs user-visible aggregates from
 stored mergeable partials with typed expressions over the ordered file scan;
 its bounded source scan also builds multi-column mergeable partials through a
-typed timestamp-window recipe. The production plan has neither `MemoryExec`
-nor a global `SortExec`. Typed construction of the remaining partial-merge
-operations is still required before this phase is complete.
+typed timestamp-window recipe. Segment sealing, hot-window recomputation,
+coarser folding, and segment compaction reuse that recipe with typed
+half-open event-time bounds and associative partial merges. The production
+plan has neither `MemoryExec` nor a global `SortExec`. The non-cache
+single-pass fallback and frontier scalar query still require typed
+construction before this phase is complete.
 
 ### Phase 10: consumers and Noyo qualification
 
