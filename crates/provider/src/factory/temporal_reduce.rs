@@ -62,6 +62,9 @@
 use crate::factory::sql_derived::{SqlDerivedConfig, SqlDerivedFile};
 use crate::register_dynamic_factory;
 use async_trait::async_trait;
+use datafusion::common::Column;
+use datafusion::functions::core::expr_fn::nullif;
+use datafusion::logical_expr::{cast, col, lit};
 use futures::StreamExt;
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
@@ -828,37 +831,22 @@ impl TemporalReduceSqlFile {
         // time so consumers see identical output (same names, order, values,
         // including Avg = Sum / Count) while the on-disk segments stay associatively
         // foldable for the coarser-from-finer rollup (design §3 / Phase 3). The
-        // reconstruction is a passthrough-projection view over the partials
+        // reconstruction is a passthrough typed projection over the partials
         // listing table: the timestamp column flows through unchanged so the
         // scan's declared ordering (the streaming, O(1)-memory read path) is
-        // preserved. The listing provider is embedded in the view's logical plan,
-        // so the view resolves in any consumer session, then deregistered here to
-        // avoid leaking a table into the shared session.
-        let read_name = format!(
-            "__rollup_reconstruct_{}_{}_{}",
-            cfg_hash,
-            sanitized_id,
-            self.duration.as_secs()
-        );
-        let _ = ctx
-            .register_table(read_name.as_str(), table_provider)
-            .map_other()?;
-        let recon_sql = pieces.reconstruct_sql(&ts, &read_name);
-        // Deregister before propagating: read_name is deterministic in
-        // cfg_hash/node/resolution, so leaving it behind on the shared session
-        // turns one transient planning failure into a permanent duplicate-name
-        // error for this resolution.
-        let recon_plan = {
-            let out = ctx
-                .sql(&recon_sql)
-                .await
-                .map_other_context("rollup reconstruction planning failed");
-            let _ = ctx.deregister_table(read_name.as_str()).map_other()?;
-            out?.logical_plan().clone()
-        };
-        let table_provider: Arc<dyn datafusion::catalog::TableProvider> = Arc::new(
-            datafusion::catalog::view::ViewTable::new(recon_plan, Some(recon_sql)),
-        );
+        // preserved. Embedding the provider directly also avoids transient
+        // session table names and generated built-in SQL.
+        let partials = ctx.read_table(table_provider).map_other()?;
+        let recon_plan = pieces
+            .reconstruct_frame(partials, &ts)
+            .map_other_context("rollup reconstruction planning failed")?
+            .logical_plan()
+            .clone();
+        let table_provider: Arc<dyn datafusion::catalog::TableProvider> =
+            Arc::new(datafusion::catalog::view::ViewTable::new(
+                recon_plan,
+                Some("typed temporal-reduce partial reconstruction".to_owned()),
+            ));
 
         let cache_key = crate::TableProviderKey::new(id, crate::VersionSelection::LatestVersion)
             .to_cache_string();
@@ -1973,9 +1961,30 @@ struct PartialDef {
 ///   cached partials back into the final output.
 struct AggSqlPieces {
     partials: Vec<PartialDef>,
-    /// Output column expressions, in the original aggregation/column order,
-    /// each referencing one or more partial aliases.
-    reconstruct_exprs: Vec<String>,
+    reconstructions: Vec<Reconstruction>,
+}
+
+enum Reconstruction {
+    Direct {
+        partial: String,
+        output: String,
+    },
+    Average {
+        sum: String,
+        count: String,
+        output: String,
+    },
+}
+
+impl Reconstruction {
+    fn sql_expr(&self) -> String {
+        match self {
+            Self::Direct { partial, output } => format!("\"{partial}\" AS \"{output}\""),
+            Self::Average { sum, count, output } => {
+                format!("CAST(\"{sum}\" AS DOUBLE) / NULLIF(\"{count}\", 0) AS \"{output}\"")
+            }
+        }
+    }
 }
 
 impl AggSqlPieces {
@@ -1983,7 +1992,7 @@ impl AggSqlPieces {
     fn build(config: &TemporalReduceConfig) -> TinyFSResult<Self> {
         let mut aliases: HashMap<(PartialKind, String), String> = HashMap::new();
         let mut partials: Vec<PartialDef> = Vec::new();
-        let mut reconstruct_exprs: Vec<String> = Vec::new();
+        let mut reconstructions = Vec::new();
 
         // Register a partial for (kind, column), deduplicating so e.g. Avg and
         // Sum on the same column share a single SUM partial. Returns its alias.
@@ -2022,13 +2031,16 @@ impl AggSqlPieces {
                     // Special case: count(*) becomes "timestamp.count".
                     let out_alias = "timestamp.count";
                     let p = register(PartialKind::CountStar, "*", &mut aliases, &mut partials);
-                    reconstruct_exprs.push(format!("\"{p}\" AS \"{out_alias}\""));
+                    reconstructions.push(Reconstruction::Direct {
+                        partial: p,
+                        output: out_alias.to_owned(),
+                    });
                     continue;
                 }
 
                 // Generate alias in format: scope.parameter.unit.agg
                 let out_alias = format!("{}.{}", column, agg.agg_type.to_sql().to_lowercase());
-                let expr = match agg.agg_type {
+                match agg.agg_type {
                     AggregationType::Avg => {
                         // Avg is not associative; store Sum and Count partials
                         // and reconstruct Avg = Sum / Count. NULLIF guards the
@@ -2036,34 +2048,47 @@ impl AggSqlPieces {
                         let sum = register(PartialKind::Sum, column, &mut aliases, &mut partials);
                         let count =
                             register(PartialKind::Count, column, &mut aliases, &mut partials);
-                        format!(
-                            "CAST(\"{sum}\" AS DOUBLE) / NULLIF(\"{count}\", 0) AS \"{out_alias}\""
-                        )
+                        reconstructions.push(Reconstruction::Average {
+                            sum: sum.clone(),
+                            count: count.clone(),
+                            output: out_alias.clone(),
+                        });
                     }
                     AggregationType::Sum => {
                         let p = register(PartialKind::Sum, column, &mut aliases, &mut partials);
-                        format!("\"{p}\" AS \"{out_alias}\"")
+                        reconstructions.push(Reconstruction::Direct {
+                            partial: p.clone(),
+                            output: out_alias.clone(),
+                        });
                     }
                     AggregationType::Count => {
                         let p = register(PartialKind::Count, column, &mut aliases, &mut partials);
-                        format!("\"{p}\" AS \"{out_alias}\"")
+                        reconstructions.push(Reconstruction::Direct {
+                            partial: p.clone(),
+                            output: out_alias.clone(),
+                        });
                     }
                     AggregationType::Min => {
                         let p = register(PartialKind::Min, column, &mut aliases, &mut partials);
-                        format!("\"{p}\" AS \"{out_alias}\"")
+                        reconstructions.push(Reconstruction::Direct {
+                            partial: p.clone(),
+                            output: out_alias.clone(),
+                        });
                     }
                     AggregationType::Max => {
                         let p = register(PartialKind::Max, column, &mut aliases, &mut partials);
-                        format!("\"{p}\" AS \"{out_alias}\"")
+                        reconstructions.push(Reconstruction::Direct {
+                            partial: p.clone(),
+                            output: out_alias.clone(),
+                        });
                     }
-                };
-                reconstruct_exprs.push(expr);
+                }
             }
         }
 
         Ok(Self {
             partials,
-            reconstruct_exprs,
+            reconstructions,
         })
     }
 
@@ -2148,7 +2173,7 @@ impl AggSqlPieces {
         ORDER BY time_bucket
         "#,
             partial_exprs = self.raw_partial_exprs().join(",\n            "),
-            select_exprs = self.reconstruct_exprs.join(",\n          "),
+            select_exprs = self.reconstruction_sql_exprs().join(",\n          "),
         )
     }
 
@@ -2208,7 +2233,7 @@ impl AggSqlPieces {
     /// Retained as the reference definition of the reconstructed output and as
     /// the equivalence oracle in tests; production now writes mergeable partials
     /// via [`merge_partials_sql`] and reconstructs at read time via
-    /// [`reconstruct_sql`], whose composition is exactly this query.
+    /// [`reconstruct_frame`], whose composition is exactly this query.
     #[cfg(test)]
     fn merge_sql(
         &self,
@@ -2249,20 +2274,27 @@ impl AggSqlPieces {
         ORDER BY time_bucket
         "#,
             merge_exprs = self.merge_partial_exprs().join(",\n            "),
-            select_exprs = self.reconstruct_exprs.join(",\n          "),
+            select_exprs = self.reconstruction_sql_exprs().join(",\n          "),
         )
     }
 
     /// Comma-separated list of the stored partial columns (`__p_*` aliases), in
     /// declaration order. This is the on-disk column set of a segment / hot
     /// file under [`crate::partial_aggregate_cache::SEALED_FORMAT`] = `partials-v1`, and the
-    /// input columns the read-time reconstruction ([`reconstruct_sql`]) consumes.
+    /// input columns the read-time reconstruction ([`reconstruct_frame`]) consumes.
     fn partial_column_list(&self) -> String {
         self.partials
             .iter()
             .map(|p| format!("\"{}\"", p.alias))
             .collect::<Vec<_>>()
             .join(",\n          ")
+    }
+
+    fn reconstruction_sql_exprs(&self) -> Vec<String> {
+        self.reconstructions
+            .iter()
+            .map(Reconstruction::sql_expr)
+            .collect()
     }
 
     /// Like [`merge_sql`], but the final projection emits the *merged partial*
@@ -2272,7 +2304,7 @@ impl AggSqlPieces {
     /// reconstructed, non-associative `Avg` — lets a coarser resolution correctly
     /// fold a finer resolution's segments (Phase 3 step 2) and preserves exact
     /// cross-version/cross-segment merge semantics. Output columns are rebuilt at read
-    /// time by [`reconstruct_sql`]. Bounds behave exactly as in [`merge_sql`].
+    /// time by [`reconstruct_frame`]. Bounds behave exactly as in [`merge_sql`].
     ///
     /// `in_bucket_col` is the input table's bucket-timestamp column: `time_bucket`
     /// when folding the shared finest partials (finest resolution), or the output
@@ -2324,23 +2356,29 @@ impl AggSqlPieces {
         )
     }
 
-    /// Read-time reconstruction over a table of stored partials: reproduce the
-    /// output columns (identical names, order, and values to [`merge_sql`]'s
-    /// projection, including `Avg = Sum / Count`) from the merged partial columns
-    /// written by [`merge_partials_sql`]. `partials_table` is the registered
-    /// listing table over the segments + hot file; `ts` passes the timestamp
-    /// column through unchanged so the scan's declared ordering (the streaming
-    /// read path) is preserved.
-    fn reconstruct_sql(&self, ts: &str, partials_table: &str) -> String {
-        format!(
-            r#"
-        SELECT 
-          "{ts}",
-          {select_exprs}
-        FROM {partials_table}
-        "#,
-            select_exprs = self.reconstruct_exprs.join(",\n          "),
-        )
+    /// Reconstruct user-visible aggregates from stored mergeable partials.
+    fn reconstruct_frame(
+        &self,
+        frame: datafusion::dataframe::DataFrame,
+        ts: &str,
+    ) -> datafusion::error::Result<datafusion::dataframe::DataFrame> {
+        let mut projection = vec![col(Column::from_name(ts))];
+        for reconstruction in &self.reconstructions {
+            projection.push(match reconstruction {
+                Reconstruction::Direct { partial, output } => {
+                    col(Column::from_name(partial)).alias(output)
+                }
+                Reconstruction::Average { sum, count, output } => (cast(
+                    col(Column::from_name(sum)),
+                    arrow::datatypes::DataType::Float64,
+                ) / cast(
+                    nullif(col(Column::from_name(count)), lit(0_i64)),
+                    arrow::datatypes::DataType::Float64,
+                ))
+                .alias(output),
+            });
+        }
+        frame.select(projection)
     }
 }
 pub struct TemporalReduceDirectory {
@@ -6463,6 +6501,10 @@ mod tests {
         assert!(
             !plan_str.contains("SortExec"),
             "full-history ORDER BY must NOT buffer via a global SortExec; plan was:\n{plan_str}"
+        );
+        assert!(
+            !plan_str.contains("MemoryExec"),
+            "typed reconstruction must retain the bounded file scan instead of materializing; plan was:\n{plan_str}"
         );
         // The ORDER BY must be satisfied by streaming: either a k-way
         // `SortPreservingMergeExec` across per-file partitions, or directly by the
