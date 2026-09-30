@@ -8,11 +8,19 @@ use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use futures::stream;
+use query_foundation::frontier::{RepairPolicy, SettledState};
+use query_foundation::materialize::{
+    MaterializationProgress, MaterializationPublication, materialize_stream,
+};
 use tinyfs::arrow::ParquetExt;
 
+use crate::query_foundation_adapter::TinyFsMaterializationSink;
 use crate::{TableProviderOptions, create_table_provider};
 
 pub const TABLE_SERIES_PATH: &str = "/provider-contract/events.series";
+pub const MATERIALIZED_SERIES_PATH: &str = "/provider-contract/materialized.series";
 
 fn timestamp_batch(timestamps: Vec<i64>) -> RecordBatch {
     RecordBatch::try_new(
@@ -153,5 +161,64 @@ pub async fn assert_series_row_count(
             .await
             .expect("query persisted contract series"),
         expected_rows
+    );
+}
+
+/// Assert append publication and progress metadata on any TinyFS backend.
+pub async fn assert_materialization_append(root: &tinyfs::WD, context: &tinyfs::ProviderContext) {
+    let sink = TinyFsMaterializationSink::new(root.clone(), context, "timestamp");
+    let progress = MaterializationProgress::try_new(
+        "contract-recipe-0001",
+        "contract-source-0001",
+        SettledState::try_new(Some(3), Some(3), RepairPolicy::reject())
+            .expect("contract settled state"),
+    )
+    .expect("contract progress");
+    let stream = Box::pin(RecordBatchStreamAdapter::new(
+        timestamp_batch(Vec::new()).schema(),
+        stream::iter(vec![
+            Ok(timestamp_batch(vec![1, 2])),
+            Ok(timestamp_batch(vec![3])),
+        ]),
+    ));
+    let outcome = materialize_stream(
+        &sink,
+        MATERIALIZED_SERIES_PATH,
+        "timestamp",
+        progress,
+        MaterializationPublication::Append { after: None },
+        stream,
+    )
+    .await
+    .expect("materialize append");
+    assert_eq!(outcome.metrics.rows_written, 3);
+
+    let versions = root
+        .list_file_versions(MATERIALIZED_SERIES_PATH)
+        .await
+        .expect("materialized versions");
+    assert_eq!(versions.len(), 1);
+    let attributes = versions[0]
+        .extended_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("extended_attributes"))
+        .expect("materialization attributes");
+    let attributes: serde_json::Value =
+        serde_json::from_str(attributes).expect("materialization attributes JSON");
+    assert_eq!(
+        attributes["watertown.materialization.recipe_id"],
+        "contract-recipe-0001"
+    );
+    assert_eq!(
+        attributes["watertown.materialization.source_state_id"],
+        "contract-source-0001"
+    );
+    assert_eq!(attributes["watertown.timestamp_column"], "timestamp");
+    assert_eq!(
+        root.read_table_as_batch(MATERIALIZED_SERIES_PATH)
+            .await
+            .expect("materialized batch")
+            .num_rows(),
+        3
     );
 }

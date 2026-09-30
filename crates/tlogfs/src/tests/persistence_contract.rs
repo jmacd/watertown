@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::persistence::OpLogPersistence;
+use tinyfs::arrow::ParquetExt;
 use tinyfs::testing::persistence_contract::{
     BYTE_SERIES_PATH, FIRST_VERSION_CONTENT, SECOND_VERSION_CONTENT,
     assert_active_transaction_read_write,
@@ -24,6 +25,7 @@ async fn active_transaction_matches_tinyfs_persistence_contract() {
         .await
         .expect("active transaction contract");
     provider::testing::assert_series_read_after_write(&root, &context).await;
+    provider::testing::assert_materialization_append(&root, &context).await;
     tx.commit_test().await.expect("commit contract writes");
 
     provider::testing::assert_registered_provider_closed(&context).await;
@@ -64,6 +66,13 @@ async fn active_transaction_matches_tinyfs_persistence_contract() {
         vec![artifact.first_version, artifact.second_version]
     );
     provider::testing::assert_series_row_count(&root, &context, 3).await;
+    assert_eq!(
+        root.read_table_as_batch(provider::testing::MATERIALIZED_SERIES_PATH)
+            .await
+            .expect("read persisted materialization")
+            .num_rows(),
+        3
+    );
 }
 
 #[tokio::test]

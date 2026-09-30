@@ -416,6 +416,18 @@ impl StreamingSeriesWriter {
         Ok(())
     }
 
+    /// Exact row count and temporal bounds accumulated so far.
+    pub fn output_metadata(&self) -> Result<Option<(i64, i64, u64)>> {
+        let metadata = self
+            .metadata
+            .lock()
+            .map_err(|_| crate::Error::Other("stream writer metadata lock poisoned".to_string()))?;
+        Ok(metadata
+            .temporal
+            .as_ref()
+            .map(|(minimum, maximum, _)| (*minimum, *maximum, self.rows)))
+    }
+
     /// Finalize and publish this TinyFS series version.
     pub async fn finish(self) -> Result<(i64, i64, u64)> {
         if self.rows == 0 {
