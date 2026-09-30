@@ -19,8 +19,14 @@ use parquet::file::properties::WriterProperties;
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use std::path::Path;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio_util::bytes::Bytes;
+
+const STREAMING_MAX_ROW_GROUP_ROWS: usize = 8_192;
 
 // ============================================================================
 // Temporal Bounds Extraction
@@ -244,6 +250,70 @@ fn parse_parquet_to_batch(data: Vec<u8>) -> Result<RecordBatch> {
         let batch_refs: Vec<&RecordBatch> = batches.iter().collect();
         arrow::compute::concat_batches(&schema, batch_refs)
             .map_other_context("Concat batches error")
+    }
+}
+
+type TemporalMetadata = (i64, i64, String);
+
+struct MetadataWriterProxy {
+    inner: Pin<Box<dyn crate::file::FileMetadataWriter>>,
+    temporal: Arc<Mutex<Option<TemporalMetadata>>>,
+    metadata_applied: bool,
+}
+
+impl MetadataWriterProxy {
+    fn new(
+        inner: Pin<Box<dyn crate::file::FileMetadataWriter>>,
+        temporal: Arc<Mutex<Option<TemporalMetadata>>>,
+    ) -> Self {
+        Self {
+            inner,
+            temporal,
+            metadata_applied: false,
+        }
+    }
+
+    fn apply_metadata(&mut self) -> std::io::Result<()> {
+        if self.metadata_applied {
+            return Ok(());
+        }
+        let (min, max, column) = self
+            .temporal
+            .lock()
+            .map_err(|_| std::io::Error::other("temporal metadata lock poisoned"))?
+            .clone()
+            .ok_or_else(|| std::io::Error::other("stream has no temporal metadata"))?;
+        self.inner
+            .as_mut()
+            .get_mut()
+            .set_temporal_metadata(min, max, column);
+        self.metadata_applied = true;
+        Ok(())
+    }
+}
+
+impl AsyncWrite for MetadataWriterProxy {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.inner.as_mut().poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.inner.as_mut().poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.apply_metadata()?;
+        self.inner.as_mut().poll_shutdown(context)
     }
 }
 
@@ -534,71 +604,74 @@ impl ParquetExt for WD {
 
         let ts_col = timestamp_column.unwrap_or("timestamp");
 
-        // Get first batch to determine schema
-        let first_batch = match stream.next().await {
-            Some(Ok(batch)) => batch,
-            Some(Err(e)) => {
-                return Err(crate::Error::Other(format!(
-                    "Failed to read first batch: {}",
-                    e
-                )));
-            }
-            None => {
-                return Err(crate::Error::Other(
-                    "Empty stream -- no data to write".to_string(),
-                ));
+        // Get first non-empty batch to determine schema.
+        let first_batch = loop {
+            match stream.next().await {
+                Some(Ok(batch)) if batch.num_rows() != 0 => break batch,
+                Some(Ok(_)) => {}
+                Some(Err(e)) => {
+                    return Err(crate::Error::Other(format!(
+                        "Failed to read first batch: {e}"
+                    )));
+                }
+                None => {
+                    return Err(crate::Error::Other(
+                        "Empty stream -- no data to write".to_string(),
+                    ));
+                }
             }
         };
 
         let schema = first_batch.schema();
-
-        // Stream batches through ArrowWriter into an owned Vec<u8>
-        let cursor = Cursor::new(Vec::new());
-        let props = WriterProperties::builder().build();
-        let mut writer = ArrowWriter::try_new(cursor, schema, Some(props))
+        let (min_time, max_time) = extract_temporal_bounds_from_batch(&first_batch, ts_col)?;
+        let temporal = Arc::new(Mutex::new(Some((min_time, max_time, ts_col.to_string()))));
+        let (_, mut tinyfs_writer) = self
+            .create_file_path_streaming_with_type(&path, EntryType::TablePhysicalSeries)
+            .await?;
+        tinyfs_writer.require_temporal_metadata(ts_col.to_string());
+        let proxy = MetadataWriterProxy::new(tinyfs_writer, Arc::clone(&temporal));
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(STREAMING_MAX_ROW_GROUP_ROWS)
+            .build();
+        let mut writer = parquet::arrow::AsyncArrowWriter::try_new(proxy, schema, Some(props))
             .map_other_context("Arrow writer error")?;
 
         writer
             .write(&first_batch)
+            .await
             .map_other_context("Write batch error")?;
 
         while let Some(batch_result) = stream.next().await {
             let batch = batch_result.map_other_context("Read batch error")?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let (batch_min, batch_max) = extract_temporal_bounds_from_batch(&batch, ts_col)?;
+            {
+                let mut metadata = temporal.lock().map_err(|_| {
+                    crate::Error::Other("temporal metadata lock poisoned".to_string())
+                })?;
+                let (min, max, _) = metadata
+                    .as_mut()
+                    .expect("first batch initialized temporal metadata");
+                *min = (*min).min(batch_min);
+                *max = (*max).max(batch_max);
+            }
             writer
                 .write(&batch)
+                .await
                 .map_other_context("Write batch error")?;
         }
 
-        // Flush any buffered row group, finalize footer, and recover the buffer
-        let cursor = writer.into_inner().map_other_context("into_inner error")?;
-        let buffer = cursor.into_inner();
-
-        // Extract temporal bounds from the completed parquet metadata
-        let bytes = Bytes::from(buffer);
-        let reader_builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
-            .map_other_context("Parquet reader error")?;
-        let parquet_meta = reader_builder.metadata();
-        let arrow_schema = reader_builder.schema();
-
-        let (min_time, max_time) =
-            extract_temporal_bounds_from_parquet_metadata(parquet_meta, arrow_schema, ts_col)?;
-
-        // Write the compacted parquet bytes to TinyFS as a new series
-        let (_, mut tinyfs_writer) = self
-            .create_file_path_streaming_with_type(&path, EntryType::TablePhysicalSeries)
-            .await?;
-
-        tinyfs_writer
-            .write_all(&bytes)
+        _ = writer
+            .close()
             .await
-            .map_other_context("Write to TinyFS error")?;
-
-        tinyfs_writer.set_temporal_metadata(min_time, max_time, ts_col.to_string());
-
-        tinyfs_writer
-            .shutdown()
-            .await
-            .map_other_context("Shutdown writer error")?;
+            .map_other_context("Close Arrow writer error")?;
+        let (min_time, max_time, _) = temporal
+            .lock()
+            .map_err(|_| crate::Error::Other("temporal metadata lock poisoned".to_string()))?
+            .clone()
+            .expect("stream temporal metadata");
 
         Ok((min_time, max_time))
     }
