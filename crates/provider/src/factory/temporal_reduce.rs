@@ -326,6 +326,30 @@ pub struct TemporalReduceSqlFile {
     discovered_columns: Arc<tokio::sync::Mutex<Option<Vec<String>>>>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LineageSchemaCache {
+    format: String,
+    leaves: Vec<tinyfs::QuerySourceLeaf>,
+    columns: Vec<String>,
+}
+
+fn update_schema_hash(hasher: &mut blake3::Hasher, value: &[u8]) {
+    _ = hasher.update(&(value.len() as u64).to_le_bytes());
+    _ = hasher.update(value);
+}
+
+fn sorted_lineage_leaves(mut leaves: Vec<tinyfs::QuerySourceLeaf>) -> Vec<tinyfs::QuerySourceLeaf> {
+    leaves.sort_by(|left, right| {
+        (&left.identity, left.min_event_time, left.max_event_time).cmp(&(
+            &right.identity,
+            right.min_event_time,
+            right.max_event_time,
+        ))
+    });
+    leaves
+}
+
 impl TemporalReduceSqlFile {
     fn pattern_name(&self) -> String {
         let sanitized: String = self
@@ -371,6 +395,108 @@ impl TemporalReduceSqlFile {
         } else {
             format!("{}:///{}", scheme, self.source_path)
         }
+    }
+
+    fn lineage_schema_cache_path(
+        &self,
+        cache_dir: &std::path::Path,
+        lineage: &tinyfs::QueryLineage,
+    ) -> std::path::PathBuf {
+        let mut hasher = blake3::Hasher::new();
+        _ = hasher.update(b"watertown:temporal-reduce-schema:v1");
+        update_schema_hash(&mut hasher, self.source_url().as_bytes());
+        update_schema_hash(&mut hasher, self.config.time_column.as_bytes());
+        update_schema_hash(&mut hasher, lineage.recipe_identity.as_bytes());
+        cache_dir
+            .join("temporal-reduce-schema")
+            .join(format!("{}.json", hasher.finalize().to_hex()))
+    }
+
+    async fn load_lineage_schema_cache(
+        &self,
+        path: &std::path::Path,
+        lineage: &tinyfs::QueryLineage,
+    ) -> TinyFSResult<bool> {
+        if !tokio::fs::try_exists(path)
+            .await
+            .map_other_context(format!("check lineage schema cache '{}'", path.display()))?
+        {
+            return Ok(false);
+        }
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_other_context(format!("read lineage schema cache '{}'", path.display()))?;
+        let record: LineageSchemaCache = serde_json::from_slice(&bytes)
+            .map_other_context(format!("parse lineage schema cache '{}'", path.display()))?;
+        if record.format != "lineage-schema-v1" {
+            return Err(tinyfs::Error::Other(format!(
+                "unsupported lineage schema cache format '{}' in '{}'",
+                record.format,
+                path.display()
+            )));
+        }
+        if record.columns.is_empty() {
+            return Err(tinyfs::Error::Other(format!(
+                "lineage schema cache '{}' contains no columns",
+                path.display()
+            )));
+        }
+        if sorted_lineage_leaves(record.leaves) != sorted_lineage_leaves(lineage.leaves.clone()) {
+            return Ok(false);
+        }
+        *self.discovered_columns.lock().await = Some(record.columns);
+        log::debug!(
+            "temporal-reduce lineage schema cache hit for '{}'",
+            self.source_path
+        );
+        Ok(true)
+    }
+
+    async fn write_lineage_schema_cache(
+        &self,
+        path: &std::path::Path,
+        lineage: &tinyfs::QueryLineage,
+    ) -> TinyFSResult<()> {
+        let columns = self
+            .discovered_columns
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| {
+                tinyfs::Error::Other(
+                    "cannot persist lineage schema before column discovery".to_owned(),
+                )
+            })?;
+        let record = LineageSchemaCache {
+            format: "lineage-schema-v1".to_owned(),
+            leaves: sorted_lineage_leaves(lineage.leaves.clone()),
+            columns,
+        };
+        let bytes = serde_json::to_vec_pretty(&record)
+            .map_other_context("serialize lineage schema cache")?;
+        let parent = path.parent().ok_or_else(|| {
+            tinyfs::Error::Other(format!(
+                "lineage schema cache path '{}' has no parent",
+                path.display()
+            ))
+        })?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_other_context(format!(
+                "create lineage schema cache directory '{}'",
+                parent.display()
+            ))?;
+        let tmp = std::path::PathBuf::from(format!("{}.tmp-{}", path.display(), uuid7::uuid7()));
+        tokio::fs::write(&tmp, bytes)
+            .await
+            .map_other_context(format!(
+                "write lineage schema cache temporary file '{}'",
+                tmp.display()
+            ))?;
+        tokio::fs::rename(&tmp, path)
+            .await
+            .map_other_context(format!("publish lineage schema cache '{}'", path.display()))?;
+        Ok(())
     }
 
     /// Discover source columns by accessing the source node directly
@@ -566,28 +692,38 @@ impl TemporalReduceSqlFile {
             return Ok(None);
         }
 
+        let fs = self.context.context.filesystem();
+        let mut provider_api =
+            crate::Provider::with_context(Arc::new(fs), Arc::new(self.context.context.clone()));
+        if let Ok(root) = self.context.root().await {
+            provider_api = provider_api.with_root(root);
+        }
+
         // A builtin source must actually be Parquet to be read without a format
-        // provider. Anything else (a raw byte series, a directory) has no
-        // columnar leaves to aggregate, so fall back to the single-pass
-        // delegate rather than failing.
-        //
-        // It must also be durable. A dynamic node is Parquet-shaped but
-        // ephemeral: it has no oplog records, so it has no versions to enumerate
-        // and nothing stable to key a cache on. Materializing it once per level
-        // would recompute it every pass, so the delegate's single pass is
-        // strictly better.
-        if format_provider.is_none()
-            && !source_files.iter().all(|np| {
+        // provider. A dynamic query is eligible only when it declares recursive
+        // immutable lineage and bounded execution; otherwise there is no stable
+        // freshness key and the conservative single-pass delegate remains the
+        // only correct option.
+        let builtin_sources = format_provider.is_none()
+            && source_files.iter().all(|np| {
                 let et = np.id().entry_type();
                 et.is_parquet_file() && !et.is_dynamic()
-            })
-        {
+            });
+        let derived_lineage = if format_provider.is_none() && !builtin_sources {
+            provider_api
+                .query_lineage_for_url(&self.pattern_url)
+                .await
+                .map_other()?
+        } else {
+            None
+        };
+        if format_provider.is_none() && !builtin_sources && derived_lineage.is_none() {
             return Ok(None);
         }
 
         // Non-`None` selects the pond-native route: these nodes' own version
         // files are the leaves the partials are computed from.
-        let builtin_source_ids: Option<Vec<tinyfs::FileID>> = if format_provider.is_none() {
+        let builtin_source_ids: Option<Vec<tinyfs::FileID>> = if builtin_sources {
             Some(source_files.iter().map(tinyfs::NodePath::id).collect())
         } else {
             None
@@ -602,7 +738,19 @@ impl TemporalReduceSqlFile {
             return Ok(None);
         };
 
+        let lineage_schema_path = derived_lineage
+            .as_ref()
+            .map(|lineage| self.lineage_schema_cache_path(&cache_dir, lineage));
+        let lineage_schema_hit = match (&lineage_schema_path, &derived_lineage) {
+            (Some(path), Some(lineage)) => self.load_lineage_schema_cache(path, lineage).await?,
+            _ => false,
+        };
         let filled = self.filled_config().await?;
+        if !lineage_schema_hit
+            && let (Some(path), Some(lineage)) = (&lineage_schema_path, &derived_lineage)
+        {
+            self.write_lineage_schema_cache(path, lineage).await?;
+        }
         let pieces = AggSqlPieces::build(&filled)?;
         let cfg_hash = crate::partial_aggregate_cache::cfg_hash(&partial_aggregate_cfg_canonical(
             &filled,
@@ -614,13 +762,6 @@ impl TemporalReduceSqlFile {
         // resolution file of this site, so all resolutions share one namespace.
         let site_node_id = id.part_id().to_node_id();
 
-        let fs = self.context.context.filesystem();
-        let mut provider_api =
-            crate::Provider::with_context(Arc::new(fs), Arc::new(self.context.context.clone()));
-        if let Ok(root) = self.context.root().await {
-            provider_api = provider_api.with_root(root);
-        }
-
         // Collect every source node's LIVE versions, plus the content identity
         // of the set: blake3 -> event-time range. That map is the freshness key
         // (design §5.3); nothing here is keyed by a version number or filename.
@@ -631,58 +772,74 @@ impl TemporalReduceSqlFile {
             crate::partial_aggregate_cache::SourceRange,
         > = std::collections::BTreeMap::new();
 
-        for node_path in &source_files {
-            let file_url_str = node_file_url(scheme, node_path);
-            let file_url = crate::Url::parse(&file_url_str).map_other()?;
-
-            let (source_node_id, versions) = match format_provider.as_ref() {
-                Some(fp) => provider_api
-                    .ensure_url_cached(&file_url, fp.as_ref(), &cache_dir)
-                    .await
-                    .map_other()?,
-                // Pond-native Parquet: the node's own version files are already
-                // the leaves, so only the version list is needed.
-                None => provider_api
-                    .list_url_versions(&file_url)
-                    .await
-                    .map_other()?,
-            };
-
-            // The rollup sums every live version of a source. Series entry types
-            // (FilePhysicalSeries, TablePhysicalSeries) store append-only deltas
-            // that are concatenated on read, so their versions are disjoint and
-            // summing them is exactly a single-pass GROUP BY over the whole
-            // series. A non-series file stores a full RE-SNAPSHOT per version,
-            // so two live versions share rows and summing them double-counts.
-            //
-            // This used to be defended by a per-source "sequentiality frontier":
-            // scan each new version's bucket span, persist the high-water mark,
-            // and fail if a later version reached below it. That is a
-            // data-dependent test for a condition fixed by the entry type -- and
-            // for a re-snapshot it fires on the second version regardless, since
-            // every snapshot re-covers all of history. Testing the structure
-            // says the same thing without the scan, the sidecar file, or the
-            // chance of a stale frontier disagreeing with the data.
-            let is_series = matches!(
-                node_path.id().entry_type(),
-                EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries
+        if let Some(lineage) = &derived_lineage {
+            let _ = now.insert(
+                format!("recipe:{}", lineage.recipe_identity),
+                crate::partial_aggregate_cache::SourceRange::UNKNOWN,
             );
-            if !is_series && versions.len() > 1 {
-                return Err(tinyfs::Error::Other(format!(
-                    "temporal-reduce rollup: source '{}' is a non-series file with \
+            for leaf in &lineage.leaves {
+                let range = match (leaf.min_event_time, leaf.max_event_time) {
+                    (Some(min_us), Some(max_us)) => {
+                        crate::partial_aggregate_cache::SourceRange { min_us, max_us }
+                    }
+                    _ => crate::partial_aggregate_cache::SourceRange::UNKNOWN,
+                };
+                let _ = now.insert(leaf.identity.clone(), range);
+            }
+        } else {
+            for node_path in &source_files {
+                let file_url_str = node_file_url(scheme, node_path);
+                let file_url = crate::Url::parse(&file_url_str).map_other()?;
+
+                let (source_node_id, versions) = match format_provider.as_ref() {
+                    Some(fp) => provider_api
+                        .ensure_url_cached(&file_url, fp.as_ref(), &cache_dir)
+                        .await
+                        .map_other()?,
+                    // Pond-native Parquet: the node's own version files are already
+                    // the leaves, so only the version list is needed.
+                    None => provider_api
+                        .list_url_versions(&file_url)
+                        .await
+                        .map_other()?,
+                };
+
+                // The rollup sums every live version of a source. Series entry types
+                // (FilePhysicalSeries, TablePhysicalSeries) store append-only deltas
+                // that are concatenated on read, so their versions are disjoint and
+                // summing them is exactly a single-pass GROUP BY over the whole
+                // series. A non-series file stores a full RE-SNAPSHOT per version,
+                // so two live versions share rows and summing them double-counts.
+                //
+                // This used to be defended by a per-source "sequentiality frontier":
+                // scan each new version's bucket span, persist the high-water mark,
+                // and fail if a later version reached below it. That is a
+                // data-dependent test for a condition fixed by the entry type -- and
+                // for a re-snapshot it fires on the second version regardless, since
+                // every snapshot re-covers all of history. Testing the structure
+                // says the same thing without the scan, the sidecar file, or the
+                // chance of a stale frontier disagreeing with the data.
+                let is_series = matches!(
+                    node_path.id().entry_type(),
+                    EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries
+                );
+                if !is_series && versions.len() > 1 {
+                    return Err(tinyfs::Error::Other(format!(
+                        "temporal-reduce rollup: source '{}' is a non-series file with \
                      {} live versions. Each version is a full re-snapshot, so they \
                      overlap and cannot be aggregated together without \
                      double-counting. Use a series entry type for incrementally \
                      appended data, or reduce a single-version source.",
-                    node_path.path().display(),
-                    versions.len()
-                )));
-            }
+                        node_path.path().display(),
+                        versions.len()
+                    )));
+                }
 
-            for v in &versions {
-                let _ = now.insert(source_version_key(&source_node_id, v), source_range(v));
+                for v in &versions {
+                    let _ = now.insert(source_version_key(&source_node_id, v), source_range(v));
+                }
+                source_nodes.push((source_node_id, versions));
             }
-            source_nodes.push((source_node_id, versions));
         }
 
         let ctx = &context.datafusion_session;
@@ -762,6 +919,7 @@ impl TemporalReduceSqlFile {
                     scheme,
                     &source_nodes,
                     builtin_source_ids.as_deref(),
+                    derived_lineage.as_ref().map(|_| self.pattern_url.as_str()),
                     context,
                     &now,
                     &source_table,
@@ -1135,6 +1293,7 @@ impl TemporalReduceSqlFile {
         scheme: &str,
         source_nodes: &[(tinyfs::NodeID, Vec<tinyfs::FileVersionInfo>)],
         builtin_sources: Option<&[tinyfs::FileID]>,
+        derived_pattern: Option<&str>,
         provider_context: &tinyfs::ProviderContext,
         now: &std::collections::BTreeMap<String, crate::partial_aggregate_cache::SourceRange>,
         source_table: &str,
@@ -1259,15 +1418,32 @@ impl TemporalReduceSqlFile {
         // Aggregate the sources into partial columns on the fly. This view is
         // what `seal_and_recompute` folds, so it plays exactly the role the
         // partials directory used to -- as a query, not as a file population.
-        let provider = match builtin_sources {
-            None => {
-                let source_set = bounded_source_set(cache_dir, scheme, source_nodes, read_lo_us);
-                require_complete_coverage(&source_set)?;
-                source_set.table_provider().await.map_other()?
+        let provider = if let Some(pattern) = derived_pattern {
+            let bounds = read_lo_us.map_or(tinyfs::SeriesReadBounds::NONE, |lo| {
+                tinyfs::SeriesReadBounds::from_event_time_lo(lo)
+            });
+            let fs = self.context.context.filesystem();
+            let mut provider_api =
+                crate::Provider::with_context(Arc::new(fs), Arc::new(provider_context.clone()));
+            if let Ok(root) = self.context.root().await {
+                provider_api = provider_api.with_root(root);
             }
-            // Pond-native Parquet has no sidecars to be missing, so there is no
-            // coverage race to defend against here.
-            Some(ids) => builtin_source_provider(provider_context, ids, read_lo_us).await?,
+            provider_api
+                .create_provider_for_url_bounded(pattern, ctx, bounds)
+                .await
+                .map_other()?
+        } else {
+            match builtin_sources {
+                None => {
+                    let source_set =
+                        bounded_source_set(cache_dir, scheme, source_nodes, read_lo_us);
+                    require_complete_coverage(&source_set)?;
+                    source_set.table_provider().await.map_other()?
+                }
+                // Pond-native Parquet has no sidecars to be missing, so there is no
+                // coverage race to defend against here.
+                Some(ids) => builtin_source_provider(provider_context, ids, read_lo_us).await?,
+            }
         };
         let available: std::collections::HashSet<String> = provider
             .schema()
@@ -3315,6 +3491,84 @@ mod tests {
         // generate_temporal_sql does not read the context; any valid one works.
         let provider_context = crate::factory::test_support::create_provider_context();
         test_context(&provider_context, FileID::root())
+    }
+
+    #[tokio::test]
+    async fn lineage_schema_cache_requires_exact_physical_lineage() {
+        let (fs, provider_context) = create_test_environment().await;
+        let root_node = fs.root().await.unwrap().node_path().node;
+        let context = test_context(&provider_context, FileID::root());
+        let config = cfg_with_aggs(vec![AggregationConfig {
+            agg_type: AggregationType::Avg,
+            columns: None,
+        }]);
+        let file = TemporalReduceSqlFile::new(
+            config.clone(),
+            Duration::from_secs(3600),
+            root_node.clone(),
+            "/sources/site.series".to_owned(),
+            "series:///sources/site.series".to_owned(),
+            context.clone(),
+        );
+        *file.discovered_columns.lock().await =
+            Some(vec!["temperature".to_owned(), "salinity".to_owned()]);
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let lineage = tinyfs::QueryLineage {
+            recipe_identity: "pivot-recipe".to_owned(),
+            leaves: vec![tinyfs::QuerySourceLeaf {
+                identity: "source:content-a".to_owned(),
+                min_event_time: Some(10),
+                max_event_time: Some(20),
+            }],
+        };
+        let path = file.lineage_schema_cache_path(cache_dir.path(), &lineage);
+        file.write_lineage_schema_cache(&path, &lineage)
+            .await
+            .unwrap();
+
+        let restored = TemporalReduceSqlFile::new(
+            config.clone(),
+            Duration::from_secs(3600),
+            root_node.clone(),
+            "/sources/site.series".to_owned(),
+            "series:///sources/site.series".to_owned(),
+            context.clone(),
+        );
+        assert!(
+            restored
+                .load_lineage_schema_cache(&path, &lineage)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            *restored.discovered_columns.lock().await,
+            Some(vec!["temperature".to_owned(), "salinity".to_owned()])
+        );
+
+        let changed = tinyfs::QueryLineage {
+            recipe_identity: lineage.recipe_identity.clone(),
+            leaves: vec![tinyfs::QuerySourceLeaf {
+                identity: "source:content-b".to_owned(),
+                min_event_time: Some(21),
+                max_event_time: Some(30),
+            }],
+        };
+        let stale = TemporalReduceSqlFile::new(
+            config,
+            Duration::from_secs(3600),
+            root_node,
+            "/sources/site.series".to_owned(),
+            "series:///sources/site.series".to_owned(),
+            context,
+        );
+        assert!(
+            !stale
+                .load_lineage_schema_cache(&path, &changed)
+                .await
+                .unwrap()
+        );
+        assert!(stale.discovered_columns.lock().await.is_none());
     }
 
     /// Phase 1: Avg must be lowered to decomposable Sum/Count partials and

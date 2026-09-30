@@ -16,6 +16,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 type CachedTableProvider = (Option<u64>, Arc<dyn datafusion::catalog::TableProvider>);
 
+pub type QueryLineageCache = Arc<
+    std::sync::Mutex<std::collections::HashMap<String, (Option<u64>, Option<crate::QueryLineage>)>>,
+>;
+
 /// Result type for tinyfs context operations
 pub type Result<T> = std::result::Result<T, crate::Error>;
 
@@ -65,6 +69,8 @@ pub struct ProviderContext {
     pub table_provider_cache:
         Arc<std::sync::Mutex<std::collections::HashMap<String, CachedTableProvider>>>,
 
+    query_lineage_cache: QueryLineageCache,
+
     /// TinyFS persistence layer for transaction management
     pub persistence: Arc<dyn PersistenceLayer>,
 
@@ -94,6 +100,7 @@ impl ProviderContext {
         Self {
             datafusion_session,
             table_provider_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            query_lineage_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             persistence,
             cache_dir: None,
             pond_path: None,
@@ -113,6 +120,12 @@ impl ProviderContext {
     #[must_use]
     pub fn with_pond_path(mut self, pond_path: PathBuf) -> Self {
         self.pond_path = Some(pond_path);
+        self
+    }
+
+    #[must_use]
+    pub fn with_query_lineage_cache(mut self, cache: QueryLineageCache) -> Self {
+        self.query_lineage_cache = cache;
         self
     }
 
@@ -175,6 +188,45 @@ impl ProviderContext {
             .lock()
             .map_other_context("Mutex poisoned")?
             .insert(key, (generation, provider));
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn get_query_lineage_cache(&self, key: &str) -> Option<Option<crate::QueryLineage>> {
+        let generation = match self.persistence.coherence_state() {
+            Some(state) => {
+                state.ensure_open().ok()?;
+                Some(state.generation())
+            }
+            None => None,
+        };
+        let mut cache = self.query_lineage_cache.lock().ok()?;
+        let (cached_generation, lineage) = cache.get(key)?;
+        if *cached_generation == generation {
+            Some(lineage.clone())
+        } else {
+            _ = cache.remove(key);
+            None
+        }
+    }
+
+    pub fn set_query_lineage_cache(
+        &self,
+        key: String,
+        lineage: Option<crate::QueryLineage>,
+    ) -> Result<()> {
+        let generation = match self.persistence.coherence_state() {
+            Some(state) => {
+                state.ensure_open()?;
+                Some(state.generation())
+            }
+            None => None,
+        };
+        _ = self
+            .query_lineage_cache
+            .lock()
+            .map_other_context("query lineage cache mutex poisoned")?
+            .insert(key, (generation, lineage));
         Ok(())
     }
 
@@ -474,6 +526,26 @@ mod tests {
         let root = fs.root().await.expect("Should get root");
 
         assert_eq!(root.node_path().path, PathBuf::from("/"));
+    }
+
+    #[test]
+    fn query_lineage_cache_is_shared_across_provider_contexts() {
+        let persistence: Arc<dyn crate::PersistenceLayer> = Arc::new(MemoryPersistence::default());
+        let cache: super::QueryLineageCache = Default::default();
+        let first = ProviderContext::new(Arc::new(SessionContext::new()), Arc::clone(&persistence))
+            .with_query_lineage_cache(cache.clone());
+        let _guard = first.begin_transaction().expect("begin transaction");
+        let lineage = crate::QueryLineage::new("recipe".to_owned());
+        first
+            .set_query_lineage_cache("source".to_owned(), Some(lineage.clone()))
+            .unwrap();
+
+        let second = ProviderContext::new(Arc::new(SessionContext::new()), persistence)
+            .with_query_lineage_cache(cache);
+        assert_eq!(
+            second.get_query_lineage_cache("source"),
+            Some(Some(lineage))
+        );
     }
 
     #[tokio::test]

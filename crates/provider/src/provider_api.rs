@@ -870,6 +870,111 @@ impl Provider {
             )),
         )))
     }
+
+    /// Resolve the immutable physical lineage of a URL pattern.
+    ///
+    /// Dynamic query nodes must explicitly expose recursive lineage and bounded
+    /// planning. A dynamic node without that contract returns `None`, forcing
+    /// callers onto their conservative non-incremental path.
+    pub(crate) async fn query_lineage_for_url(
+        &self,
+        url_str: &str,
+    ) -> Result<Option<tinyfs::QueryLineage>> {
+        let Some(context) = self.provider_context.as_ref() else {
+            return self.query_lineage_for_url_uncached(url_str).await;
+        };
+        let root_id = self.root().await?.node_path().id();
+        let cache_key = format!("{root_id}:{url_str}");
+        if let Some(lineage) = context.get_query_lineage_cache(&cache_key) {
+            return Ok(lineage);
+        }
+        let lineage = self.query_lineage_for_url_uncached(url_str).await?;
+        context.set_query_lineage_cache(cache_key, lineage.clone())?;
+        Ok(lineage)
+    }
+
+    async fn query_lineage_for_url_uncached(
+        &self,
+        url_str: &str,
+    ) -> Result<Option<tinyfs::QueryLineage>> {
+        let url = Url::parse(url_str)?;
+        let root = self.root().await?;
+        let mut matches = if url.path().contains('*') || url.path().contains('?') {
+            root.collect_matches(url.path()).await.map_err(|error| {
+                Error::InvalidUrl(format!(
+                    "Lineage pattern expansion failed for '{}': {error}",
+                    url.path()
+                ))
+            })?
+        } else {
+            vec![(self.resolve_url_node(&url).await?, Vec::new())]
+        };
+        matches.sort_by_key(|(node, _)| node.path());
+        matches.dedup_by_key(|(node, _)| node.id());
+
+        let mut lineage = tinyfs::QueryLineage::new(format!("pattern:{url}"));
+        for (node_path, _) in matches {
+            let file_id = node_path.id();
+            if file_id.entry_type().is_dynamic() {
+                let file_node = node_path.as_file().await.map_err(|error| {
+                    Error::InvalidUrl(format!(
+                        "Dynamic lineage node '{}' is not a file: {error}",
+                        node_path.path().display()
+                    ))
+                })?;
+                let file = file_node.handle.get_file().await;
+                let guard = file.lock().await;
+                if let Some(queryable) = guard.as_queryable() {
+                    let context = self
+                        .provider_context
+                        .as_ref()
+                        .expect("dynamic lineage requires ProviderContext");
+                    let Some(nested) = queryable.query_lineage(file_id, context).await? else {
+                        log::debug!(
+                            "query lineage unavailable for dynamic source '{}'",
+                            node_path.path().display()
+                        );
+                        return Ok(None);
+                    };
+                    lineage.extend(nested);
+                    continue;
+                }
+            }
+
+            let matched_url = url.with_path(&node_path.path().to_string_lossy());
+            let (node_id, versions) =
+                if let Some(format_provider) = FormatRegistry::get_provider(url.scheme()) {
+                    let Some(cache_dir) = self
+                        .provider_context
+                        .as_ref()
+                        .and_then(|context| context.cache_dir())
+                    else {
+                        return Ok(None);
+                    };
+                    self.ensure_url_cached(&matched_url, format_provider.as_ref(), cache_dir)
+                        .await?
+                } else {
+                    self.list_url_versions(&matched_url).await?
+                };
+            for version in versions {
+                let metadata = version.extended_metadata.as_ref();
+                let parse = |name: &str| {
+                    metadata
+                        .and_then(|values| values.get(name))
+                        .and_then(|value| value.parse::<i64>().ok())
+                };
+                lineage.leaves.push(tinyfs::QuerySourceLeaf {
+                    identity: match version.blake3 {
+                        Some(hash) => format!("{node_id}:{hash}"),
+                        None => format!("{node_id}:v{}", version.version),
+                    },
+                    min_event_time: parse("min_event_time"),
+                    max_event_time: parse("max_event_time"),
+                });
+            }
+        }
+        Ok(Some(lineage))
+    }
 }
 
 /// Read a non-queryable data-archetype node (e.g. a git-ingested `FileDynamic`

@@ -33,6 +33,48 @@ pub struct SeriesReadBounds {
     pub version_gt: Option<i64>,
 }
 
+/// One immutable leaf contributing to a derived query result.
+///
+/// `identity` is content-addressed when the backend supplies a logical/content
+/// hash and otherwise includes the backend version identity. Missing temporal
+/// bounds are explicit: consumers must treat such a leaf as spanning all time.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QuerySourceLeaf {
+    pub identity: String,
+    pub min_event_time: Option<i64>,
+    pub max_event_time: Option<i64>,
+}
+
+/// Recursive source identity for a timestamp-local derived query.
+///
+/// `recipe_identity` changes when the derived operation changes. `leaves`
+/// contains the immutable physical inputs reached through any nested derived
+/// operations.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QueryLineage {
+    pub recipe_identity: String,
+    pub leaves: Vec<QuerySourceLeaf>,
+}
+
+impl QueryLineage {
+    #[must_use]
+    pub fn new(recipe_identity: String) -> Self {
+        Self {
+            recipe_identity,
+            leaves: Vec::new(),
+        }
+    }
+
+    pub fn extend(&mut self, nested: Self) {
+        self.leaves.push(QuerySourceLeaf {
+            identity: format!("recipe:{}", nested.recipe_identity),
+            min_event_time: None,
+            max_event_time: None,
+        });
+        self.leaves.extend(nested.leaves);
+    }
+}
+
 impl SeriesReadBounds {
     /// No bounds: read the full series (equivalent to the unbounded reader).
     pub const NONE: Self = Self {
@@ -255,6 +297,19 @@ pub trait QueryableFile: File {
         _bounds: SeriesReadBounds,
     ) -> error::Result<Arc<dyn datafusion::catalog::TableProvider>> {
         self.as_table_provider(id, context).await
+    }
+
+    /// Return recursive immutable source identity when this derived query can be
+    /// evaluated with [`Self::as_table_provider_bounded`].
+    ///
+    /// `None` means locality is not declared and callers must use the
+    /// conservative non-incremental path.
+    async fn query_lineage(
+        &self,
+        _id: crate::FileID,
+        _context: &crate::ProviderContext,
+    ) -> error::Result<Option<QueryLineage>> {
+        Ok(None)
     }
 }
 

@@ -915,6 +915,7 @@ impl SqlDerivedFile {
         pattern_name: &str,
         scheme: &str,
         queryable_files: &[tinyfs::NodePath],
+        bounds: tinyfs::SeriesReadBounds,
     ) -> TinyFSResult<Arc<dyn TableProvider>> {
         debug!(
             "[SEARCH] SQL-DERIVED: Pattern '{}' uses format provider '{}' with {} files",
@@ -937,7 +938,7 @@ impl SqlDerivedFile {
             let file_url = Self::node_file_url(scheme, node_path);
 
             match provider_api
-                .create_table_provider(&file_url, &datafusion_ctx)
+                .create_table_provider_bounded(&file_url, &datafusion_ctx, bounds)
                 .await
             {
                 Ok(table_provider) => {
@@ -982,10 +983,12 @@ impl SqlDerivedFile {
                     );
                 }
 
-                let provider = crate::format_cache::glob_cached_set(cache_dir, scheme, &nodes)
-                    .table_provider()
-                    .await
-                    .map_other()?;
+                let provider = crate::format_cache::glob_cached_set_bounded(
+                    cache_dir, scheme, &nodes, &bounds,
+                )
+                .table_provider()
+                .await
+                .map_other()?;
 
                 debug!(
                     "[OK] SQL-DERIVED: Glob cache ListingTable for {} files (pattern '{}')",
@@ -1000,7 +1003,7 @@ impl SqlDerivedFile {
                 for node_path in queryable_files {
                     let file_url = Self::node_file_url(scheme, node_path);
                     match provider_api
-                        .create_table_provider(&file_url, &datafusion_ctx)
+                        .create_table_provider_bounded(&file_url, &datafusion_ctx, bounds)
                         .await
                     {
                         Ok(tp) => table_providers.push(tp),
@@ -1032,6 +1035,7 @@ impl SqlDerivedFile {
         pattern_name: &str,
         node_path: &tinyfs::NodePath,
         context: &tinyfs::ProviderContext,
+        bounds: tinyfs::SeriesReadBounds,
     ) -> TinyFSResult<Arc<dyn TableProvider>> {
         let file_id = node_path.id();
         debug!(
@@ -1048,7 +1052,10 @@ impl SqlDerivedFile {
             debug!(
                 "[SEARCH] SQL-DERIVED: File implements QueryableFile trait, calling as_table_provider..."
             );
-            match queryable_file.as_table_provider(file_id, context).await {
+            match queryable_file
+                .as_table_provider_bounded(file_id, context, bounds)
+                .await
+            {
                 Ok(provider) => {
                     debug!(
                         "[OK] SQL-DERIVED: Successfully created table provider for file_id={}",
@@ -1088,6 +1095,7 @@ impl SqlDerivedFile {
         pattern_name: &str,
         queryable_files: &[tinyfs::NodePath],
         context: &tinyfs::ProviderContext,
+        bounds: tinyfs::SeriesReadBounds,
     ) -> TinyFSResult<Arc<dyn TableProvider>> {
         let mut urls = Vec::new();
         let mut file_ids = Vec::new();
@@ -1138,6 +1146,7 @@ impl SqlDerivedFile {
             // at the Parquet reader level, not here at the factory level.
             let options = crate::TableProviderOptions {
                 additional_urls: urls.clone(),
+                bounds,
                 ..Default::default()
             };
 
@@ -1194,6 +1203,7 @@ impl SqlDerivedFile {
         pattern_name: &str,
         pattern: &crate::Url,
         table_mappings: &mut HashMap<String, String>,
+        bounds: tinyfs::SeriesReadBounds,
     ) -> TinyFSResult<bool> {
         let ctx = &context.datafusion_session;
 
@@ -1263,13 +1273,17 @@ impl SqlDerivedFile {
         let data_table_name = Self::generate_data_table_name(pattern, &queryable_files);
         let has_per_consumer_wrapping =
             self.config.provider_wrapper.is_some() || self.config.scope_prefixes.is_some();
-        let unique_table_name = if has_per_consumer_wrapping {
+        let mut unique_table_name = if has_per_consumer_wrapping {
             // Strip hyphens so the table name is a valid bare SQL identifier.
             let node_id_hex = id.node_id().to_string().replace('-', "");
             format!("{}_{}", data_table_name, node_id_hex)
         } else {
             data_table_name
         };
+        if bounds != tinyfs::SeriesReadBounds::NONE {
+            let suffix = blake3::hash(format!("{bounds:?}").as_bytes()).to_hex();
+            unique_table_name.push_str(&format!("_b{suffix}"));
+        }
         debug!(
             "Generated data table name: '{}' for pattern '{}' (per-consumer wrapping: {})",
             unique_table_name, pattern, has_per_consumer_wrapping
@@ -1302,13 +1316,13 @@ impl SqlDerivedFile {
         let is_format_provider = crate::FormatRegistry::get_provider(scheme).is_some();
 
         let listing_table_provider = if is_format_provider {
-            self.build_format_provider_table(pattern_name, scheme, &queryable_files)
+            self.build_format_provider_table(pattern_name, scheme, &queryable_files, bounds)
                 .await?
         } else if queryable_files.len() == 1 {
-            self.build_single_file_provider(pattern_name, &queryable_files[0], context)
+            self.build_single_file_provider(pattern_name, &queryable_files[0], context, bounds)
                 .await?
         } else {
-            self.build_multi_file_provider(pattern_name, &queryable_files, context)
+            self.build_multi_file_provider(pattern_name, &queryable_files, context, bounds)
                 .await?
         };
 
@@ -1513,11 +1527,28 @@ impl SqlDerivedFile {
         id: FileID,
         context: &tinyfs::ProviderContext,
     ) -> TinyFSResult<(HashMap<String, String>, std::collections::HashSet<String>)> {
+        self.register_source_tables_bounded(id, context, tinyfs::SeriesReadBounds::NONE)
+            .await
+    }
+
+    pub(crate) async fn register_source_tables_bounded(
+        &self,
+        id: FileID,
+        context: &tinyfs::ProviderContext,
+        bounds: tinyfs::SeriesReadBounds,
+    ) -> TinyFSResult<(HashMap<String, String>, std::collections::HashSet<String>)> {
         let mut table_mappings = HashMap::new();
         let mut empty_patterns = Vec::new();
         for (pattern_name, pattern) in &self.get_config().patterns {
             let registered = self
-                .register_pattern_source(id, context, pattern_name, pattern, &mut table_mappings)
+                .register_pattern_source(
+                    id,
+                    context,
+                    pattern_name,
+                    pattern,
+                    &mut table_mappings,
+                    bounds,
+                )
                 .await?;
             if !registered {
                 empty_patterns.push(pattern_name.clone());

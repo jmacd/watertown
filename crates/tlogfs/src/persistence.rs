@@ -148,6 +148,7 @@ pub struct State {
     table_provider_cache: Arc<
         std::sync::Mutex<HashMap<TableProviderKey, Arc<dyn datafusion::catalog::TableProvider>>>,
     >,
+    query_lineage_cache: tinyfs::QueryLineageCache,
     /// Transaction state for enforcing single-writer pattern (shared with tinyfs)
     txn_state: Arc<TinyFsTransactionState>,
     /// Shared transaction lifecycle and provider-cache generation.
@@ -950,6 +951,7 @@ impl OpLogPersistence {
             object_store: Arc::new(tokio::sync::OnceCell::new()),
             session_context,
             table_provider_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            query_lineage_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             txn_state: self.txn_state.clone(),
             coherence: Arc::new(tinyfs::CoherenceState::default()),
             large_file_options: self.large_file_options.clone(),
@@ -1943,7 +1945,7 @@ impl State {
         if let Some(ref pond_path) = self.pond_path {
             ctx = ctx.with_pond_path(pond_path.clone());
         }
-        ctx
+        ctx.with_query_lineage_cache(self.query_lineage_cache.clone())
     }
 }
 

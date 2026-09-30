@@ -924,8 +924,25 @@ initial seeding and version watermarks thereafter. Deterministic site export
 verifies and reuses an unchanged manifest prefix, performs zero source scans
 for a no-change build, and streams a dirty tail or full rewrite from one ordered
 source execution with one Parquet writer open at a time. It no longer executes
-the source solely to enumerate partitions. The Noyo benchmark protocol and
-water/septic qualification remain before the Phase 10 gate is complete.
+the source solely to enumerate partitions.
+
+The production Noyo join/pivot graph now declares recursive immutable lineage
+and propagates event-time bounds through every derived layer. Transform factory
+configuration participates in recipe identity, so changing a transform cannot
+reuse stale aggregate state. Query lineage is shared transaction-coherently
+across provider contexts, while discovered dynamic schemas are persisted only
+for an exact physical-lineage match.
+
+A retained warm no-change run over the 20 parameter/resolution outputs completed
+site generation in 2.813 seconds (3.47 seconds total wall time, 130.6 MB process
+max RSS, 12.01 MB CLI-reported peak). It recorded 20 schema-lineage cache hits,
+20 deterministic-export reuses, zero schema reconstructions, zero full-rewrite
+export queries, and zero `temporal-reduce-cache-unavailable` decisions. This
+qualifies warm dynamic-graph cache selection and improves substantially on the
+12.025-second pre-lineage site-generation baseline. Append, disorder,
+retroactive, and wildcard-membership scenarios; history-independent export
+verification; required detailed counters; and water/septic qualification remain
+before the Phase 10 gate is complete.
 
 ### Phase 11: native-v2 backup and restore verification
 

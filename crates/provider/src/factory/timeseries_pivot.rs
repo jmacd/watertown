@@ -189,9 +189,14 @@ impl TimeseriesPivotFile {
         &self,
         id: FileID,
         context: &tinyfs::ProviderContext,
+        bounds: tinyfs::SeriesReadBounds,
     ) -> TinyFSResult<Arc<dyn TableProvider>> {
-        let cache_key = crate::TableProviderKey::new(id, crate::VersionSelection::LatestVersion)
-            .to_cache_string();
+        let cache_key = crate::TableProviderKey::with_bounds(
+            id,
+            crate::VersionSelection::LatestVersion,
+            bounds,
+        )
+        .to_cache_string();
         if let Some(cached) = context.get_table_provider_cache(&cache_key) {
             return Ok(cached);
         }
@@ -206,7 +211,7 @@ impl TimeseriesPivotFile {
         let (source_tables, empty_sources) = inner
             .as_ref()
             .expect("inner initialized by ensure_inner")
-            .register_source_tables(id, context)
+            .register_source_tables_bounded(id, context, bounds)
             .await?;
         if !empty_sources.is_empty() {
             return Err(tinyfs::Error::Other(format!(
@@ -293,8 +298,78 @@ impl tinyfs::QueryableFile for TimeseriesPivotFile {
         id: FileID,
         context: &tinyfs::ProviderContext,
     ) -> TinyFSResult<Arc<dyn TableProvider>> {
-        self.typed_pivot_provider(id, context).await
+        self.typed_pivot_provider(id, context, tinyfs::SeriesReadBounds::NONE)
+            .await
     }
+
+    async fn as_table_provider_bounded(
+        &self,
+        id: FileID,
+        context: &tinyfs::ProviderContext,
+        bounds: tinyfs::SeriesReadBounds,
+    ) -> TinyFSResult<Arc<dyn TableProvider>> {
+        self.typed_pivot_provider(id, context, bounds).await
+    }
+
+    async fn query_lineage(
+        &self,
+        _id: FileID,
+        context: &tinyfs::ProviderContext,
+    ) -> TinyFSResult<Option<tinyfs::QueryLineage>> {
+        let recipe = serde_json::to_vec(&self.config)
+            .map_err(|error| tinyfs::Error::Other(format!("pivot lineage recipe: {error}")))?;
+        let mut recipe_hasher = blake3::Hasher::new();
+        _ = recipe_hasher.update(b"watertown:timeseries-pivot-lineage:v1");
+        update_lineage_hash(&mut recipe_hasher, &recipe);
+
+        let root = self.context.root().await?;
+        for transform_path in self.config.transforms.iter().flatten() {
+            let (_, lookup) = root.resolve_path(transform_path).await.map_err(|error| {
+                tinyfs::Error::Other(format!(
+                    "pivot lineage could not resolve transform '{transform_path}': {error}"
+                ))
+            })?;
+            let transform_node = match lookup {
+                tinyfs::Lookup::Found(node) => node,
+                _ => {
+                    return Err(tinyfs::Error::Other(format!(
+                        "pivot lineage transform '{transform_path}' was not found"
+                    )));
+                }
+            };
+            let (factory_name, config_bytes) = context
+                .persistence
+                .get_dynamic_node_config(transform_node.id())
+                .await?
+                .ok_or_else(|| {
+                    tinyfs::Error::Other(format!(
+                        "pivot lineage transform '{transform_path}' has no factory config"
+                    ))
+                })?;
+            update_lineage_hash(&mut recipe_hasher, transform_path.as_bytes());
+            update_lineage_hash(&mut recipe_hasher, factory_name.as_bytes());
+            update_lineage_hash(&mut recipe_hasher, &config_bytes);
+        }
+
+        let mut lineage = tinyfs::QueryLineage::new(recipe_hasher.finalize().to_hex().to_string());
+        let fs = self.context.context.filesystem();
+        let mut provider = crate::Provider::with_context(Arc::new(fs), Arc::new(context.clone()));
+        provider = provider.with_root(root);
+        let Some(nested) = provider
+            .query_lineage_for_url(&self.config.pattern.to_string())
+            .await
+            .map_err(|error| tinyfs::Error::Other(format!("pivot lineage: {error}")))?
+        else {
+            return Ok(None);
+        };
+        lineage.extend(nested);
+        Ok(Some(lineage))
+    }
+}
+
+fn update_lineage_hash(hasher: &mut blake3::Hasher, value: &[u8]) {
+    _ = hasher.update(&(value.len() as u64).to_le_bytes());
+    _ = hasher.update(value);
 }
 
 impl std::fmt::Debug for TimeseriesPivotFile {
@@ -438,6 +513,19 @@ mod tests {
                 transforms: None,
             },
             test_context(&provider_context, FileID::root()),
+        );
+        let lineage = file
+            .query_lineage(FileID::root(), &provider_context)
+            .await
+            .unwrap()
+            .expect("typed pivot declares recursive lineage");
+        assert_eq!(
+            lineage
+                .leaves
+                .iter()
+                .filter(|leaf| !leaf.identity.starts_with("recipe:"))
+                .count(),
+            2
         );
         let table = file
             .as_table_provider(FileID::root(), &provider_context)

@@ -29,10 +29,12 @@ mod wd;
 // Public exports - Core filesystem API
 pub use context::{
     ExportHint, FactoryContext, PlanVisibilityMetricsSnapshot, PondMetadata, ProviderContext,
+    QueryLineageCache,
 };
 pub use dir::{Directory, DirectoryEntry, Handle as DirHandle, Pathed};
 pub use file::{
-    AsyncReadSeek, File, FileMetadataWriter, Handle as FileHandle, QueryableFile, SeriesReadBounds,
+    AsyncReadSeek, File, FileMetadataWriter, Handle as FileHandle, QueryLineage, QuerySourceLeaf,
+    QueryableFile, SeriesReadBounds,
 };
 pub use fs::FS;
 pub use node::{
