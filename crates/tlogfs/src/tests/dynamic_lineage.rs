@@ -296,4 +296,72 @@ async fn dynamic_join_pivot_reuses_persistent_reduction_lineage() {
         append_cache, cold_cache,
         "append must advance persistent segment state"
     );
+
+    {
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        append_source(&root, "/sources/a.series", 13_500_000_000, 40.0).await;
+        tx.commit_test().await.unwrap();
+    }
+
+    let (disorder_rows, disorder_metrics) = query_reduced(&mut persistence).await;
+    assert_eq!(disorder_rows, 4);
+    assert_eq!(disorder_metrics.global_plans, 0);
+    assert_eq!(disorder_metrics.non_incremental_plans, 0);
+    assert_eq!(disorder_metrics.dynamic_source_executions, 1);
+    assert_eq!(disorder_metrics.bounded_dynamic_source_executions, 1);
+    let disorder_lo = disorder_metrics
+        .minimum_dynamic_event_time_lo
+        .expect("ordinary disorder must carry an event-time lower bound");
+    assert!(
+        disorder_lo > 3_600_000_000 && disorder_lo <= 13_500_000_000,
+        "ordinary-disorder bound {disorder_lo} must exclude sealed history and include the sample"
+    );
+    let disorder_cache = cache_snapshot(&cache_dir);
+    assert_ne!(
+        segment_manifests(&disorder_cache),
+        segment_manifests(&append_cache),
+        "ordinary disorder must advance the affected manifest"
+    );
+
+    {
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        append_source(&root, "/sources/a.series", 18_000_000_000, 50.0).await;
+        tx.commit_test().await.unwrap();
+    }
+
+    let (advance_rows, advance_metrics) = query_reduced(&mut persistence).await;
+    assert_eq!(advance_rows, 5);
+    assert_eq!(advance_metrics.global_plans, 0);
+    assert_eq!(advance_metrics.non_incremental_plans, 0);
+    assert_eq!(advance_metrics.dynamic_source_executions, 1);
+    assert_eq!(advance_metrics.bounded_dynamic_source_executions, 1);
+    let advanced_cache = cache_snapshot(&cache_dir);
+
+    {
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        append_source(&root, "/sources/a.series", 12_600_000_000, 60.0).await;
+        tx.commit_test().await.unwrap();
+    }
+
+    let (retro_rows, retro_metrics) = query_reduced(&mut persistence).await;
+    assert_eq!(retro_rows, 5);
+    assert_eq!(retro_metrics.global_plans, 0);
+    assert_eq!(retro_metrics.non_incremental_plans, 0);
+    assert_eq!(retro_metrics.dynamic_source_executions, 1);
+    assert_eq!(retro_metrics.bounded_dynamic_source_executions, 1);
+    let retro_lo = retro_metrics
+        .minimum_dynamic_event_time_lo
+        .expect("retroactive repair must carry an event-time lower bound");
+    assert!(
+        retro_lo > 3_600_000_000 && retro_lo <= 12_600_000_000,
+        "retroactive bound {retro_lo} must include the late sample"
+    );
+    assert_ne!(
+        segment_manifests(&cache_snapshot(&cache_dir)),
+        segment_manifests(&advanced_cache),
+        "retroactive repair must advance the affected manifest"
+    );
 }
