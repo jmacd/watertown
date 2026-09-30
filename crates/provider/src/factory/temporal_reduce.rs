@@ -881,33 +881,37 @@ impl TemporalReduceSqlFile {
         bucket_col: &str,
         output_interval: Duration,
     ) -> TinyFSResult<Option<i64>> {
-        let interval = duration_to_sql_interval(output_interval);
-        let bin = date_bin_expr(&interval, bucket_col);
-        let sql = format!(
-            "SELECT CAST(MAX(EXTRACT(EPOCH FROM {bin})) AS BIGINT) AS hi_secs \
-             FROM {table}"
-        );
-        let batches = ctx
-            .sql(&sql)
-            .await
-            .map_other_context("max-output-bucket SQL planning failed")?
+        let frame = query_foundation::plans::reduce::max_timestamp_bucket(
+            ctx.table(table).await.map_other()?,
+            bucket_col,
+            output_interval,
+        )
+        .map_other_context("max-output-bucket planning failed")?;
+        let batches = frame
             .collect()
             .await
-            .map_other_context("max-output-bucket SQL execution failed")?;
+            .map_other_context("max-output-bucket execution failed")?;
         for batch in &batches {
             if batch.num_rows() == 0 {
                 continue;
             }
-            if let Some(hi) = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-            {
-                use arrow::array::Array;
-                if !hi.is_null(0) {
-                    return Ok(Some(hi.value(0)));
+            let value =
+                datafusion::common::ScalarValue::try_from_array(batch.column(0), 0).map_other()?;
+            return match value {
+                datafusion::common::ScalarValue::TimestampSecond(value, _) => Ok(value),
+                datafusion::common::ScalarValue::TimestampMillisecond(value, _) => {
+                    Ok(value.map(|value| value.div_euclid(1_000)))
                 }
-            }
+                datafusion::common::ScalarValue::TimestampMicrosecond(value, _) => {
+                    Ok(value.map(|value| value.div_euclid(1_000_000)))
+                }
+                datafusion::common::ScalarValue::TimestampNanosecond(value, _) => {
+                    Ok(value.map(|value| value.div_euclid(1_000_000_000)))
+                }
+                other => Err(tinyfs::Error::Other(format!(
+                    "max-output-bucket produced non-timestamp value {other:?}"
+                ))),
+            };
         }
         Ok(None)
     }

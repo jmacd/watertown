@@ -894,8 +894,9 @@ typed timestamp-window recipe. Segment sealing, hot-window recomputation,
 coarser folding, and segment compaction reuse that recipe with typed
 half-open event-time bounds and associative partial merges. The production
 plan has neither `MemoryExec` nor a global `SortExec`. The non-cache
-single-pass fallback and frontier scalar query still require typed
-construction before this phase is complete.
+single-pass fallback still requires typed construction before this phase is
+complete; the watermark frontier is a typed one-row maximum over aligned
+buckets and does not allocate per-bucket state.
 
 ### Phase 10: consumers and Noyo qualification
 

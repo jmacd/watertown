@@ -13,8 +13,8 @@ use datafusion::error::Result;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::prelude::SessionContext;
 use query_foundation::plans::reduce::{
-    FixedWindowReduce, TimestampPartialAggregate, TimestampWindowReduce, reduce_fixed_windows,
-    reduce_timestamp_windows,
+    FixedWindowReduce, TimestampPartialAggregate, TimestampWindowReduce, max_timestamp_bucket,
+    reduce_fixed_windows, reduce_timestamp_windows,
 };
 use query_foundation::statistics::TimeInterval;
 use query_foundation::testkit::FoundationFixture;
@@ -247,7 +247,7 @@ async fn timestamp_windows_emit_multiple_mergeable_partials() -> Result<()> {
     );
 
     let bounded = reduce_timestamp_windows(
-        context.read_table(source)?,
+        context.read_table(source.clone())?,
         &recipe.clone().with_epoch_second_bounds(Some(60), Some(120)),
     )?;
     let plan = bounded.clone().create_physical_plan().await?;
@@ -257,6 +257,17 @@ async fn timestamp_windows_emit_multiple_mergeable_partials() -> Result<()> {
     assert!(display.contains("FilterExec"), "{display}");
     let bounded = bounded.collect().await?;
     assert_eq!(bounded.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    let maximum = max_timestamp_bucket(
+        context.read_table(source)?,
+        "timestamp",
+        Duration::from_secs(60),
+    )?
+    .collect()
+    .await?;
+    assert_eq!(
+        datafusion::common::ScalarValue::try_from_array(maximum[0].column(0), 0)?,
+        datafusion::common::ScalarValue::TimestampNanosecond(Some(60_000_000_000), None)
+    );
     Ok(())
 }
 

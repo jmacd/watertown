@@ -292,22 +292,8 @@ pub fn reduce_timestamp_windows(
     frame: DataFrame,
     recipe: &TimestampWindowReduce,
 ) -> Result<DataFrame> {
-    let event_field = frame
-        .schema()
-        .field_with_unqualified_name(&recipe.event_time)
-        .map_err(|_| {
-            DataFusionError::Plan(format!(
-                "reduce input is missing event-time column '{}'",
-                recipe.event_time
-            ))
-        })?;
-    let DataType::Timestamp(unit, timezone) = event_field.data_type() else {
-        return Err(DataFusionError::Plan(format!(
-            "reduce event-time column '{}' must be a timestamp, got {}",
-            recipe.event_time,
-            event_field.data_type()
-        )));
-    };
+    let (bucket, unit, timezone) =
+        timestamp_bucket_expression(&frame, &recipe.event_time, recipe.width)?;
     for aggregate in &recipe.aggregates {
         if let Some(value) = aggregate.value() {
             _ = frame
@@ -321,24 +307,7 @@ pub fn reduce_timestamp_windows(
         }
     }
 
-    let nanos = i64::try_from(recipe.width.as_nanos()).map_err(|_| {
-        DataFusionError::Plan(format!(
-            "reduce window width is too large: {:?}",
-            recipe.width
-        ))
-    })?;
-    let origin = match unit {
-        TimeUnit::Second => ScalarValue::TimestampSecond(Some(0), timezone.clone()),
-        TimeUnit::Millisecond => ScalarValue::TimestampMillisecond(Some(0), timezone.clone()),
-        TimeUnit::Microsecond => ScalarValue::TimestampMicrosecond(Some(0), timezone.clone()),
-        TimeUnit::Nanosecond => ScalarValue::TimestampNanosecond(Some(0), timezone.clone()),
-    };
     let event_time = col(Column::from_name(&recipe.event_time));
-    let bucket = date_bin(
-        lit(ScalarValue::new_interval_mdn(0, 0, nanos)),
-        event_time.clone(),
-        lit(origin),
-    );
     let aggregates = recipe
         .aggregates
         .iter()
@@ -363,19 +332,75 @@ pub fn reduce_timestamp_windows(
         predicate = predicate.and(
             bucket
                 .clone()
-                .gt_eq(lit(timestamp_from_epoch_seconds(unit, timezone, lower)?)),
+                .gt_eq(lit(timestamp_from_epoch_seconds(&unit, &timezone, lower)?)),
         );
     }
     if let Some(upper) = recipe.upper_bound_secs {
         predicate = predicate.and(
             bucket
                 .clone()
-                .lt(lit(timestamp_from_epoch_seconds(unit, timezone, upper)?)),
+                .lt(lit(timestamp_from_epoch_seconds(&unit, &timezone, upper)?)),
         );
     }
     frame
         .filter(predicate)?
         .aggregate(vec![bucket.alias("time_bucket")], aggregates)
+}
+
+/// Build a one-row aggregate containing the newest aligned timestamp bucket.
+pub fn max_timestamp_bucket(
+    frame: DataFrame,
+    event_time: &str,
+    width: Duration,
+) -> Result<DataFrame> {
+    let (bucket, _, _) = timestamp_bucket_expression(&frame, event_time, width)?;
+    frame
+        .filter(col(Column::from_name(event_time)).is_not_null())?
+        .aggregate(vec![], vec![max(bucket).alias("hi_bucket")])
+}
+
+fn timestamp_bucket_expression(
+    frame: &DataFrame,
+    event_time: &str,
+    width: Duration,
+) -> Result<(Expr, TimeUnit, Option<Arc<str>>)> {
+    let event_field = frame
+        .schema()
+        .field_with_unqualified_name(event_time)
+        .map_err(|_| {
+            DataFusionError::Plan(format!(
+                "reduce input is missing event-time column '{event_time}'"
+            ))
+        })?;
+    let DataType::Timestamp(unit, timezone) = event_field.data_type() else {
+        return Err(DataFusionError::Plan(format!(
+            "reduce event-time column '{event_time}' must be a timestamp, got {}",
+            event_field.data_type()
+        )));
+    };
+    if width.is_zero() {
+        return Err(DataFusionError::Plan(
+            "reduce window width must be positive".to_owned(),
+        ));
+    }
+    let nanos = i64::try_from(width.as_nanos()).map_err(|_| {
+        DataFusionError::Plan(format!("reduce window width is too large: {width:?}"))
+    })?;
+    let origin = match unit {
+        TimeUnit::Second => ScalarValue::TimestampSecond(Some(0), timezone.clone()),
+        TimeUnit::Millisecond => ScalarValue::TimestampMillisecond(Some(0), timezone.clone()),
+        TimeUnit::Microsecond => ScalarValue::TimestampMicrosecond(Some(0), timezone.clone()),
+        TimeUnit::Nanosecond => ScalarValue::TimestampNanosecond(Some(0), timezone.clone()),
+    };
+    Ok((
+        date_bin(
+            lit(ScalarValue::new_interval_mdn(0, 0, nanos)),
+            col(Column::from_name(event_time)),
+            lit(origin),
+        ),
+        *unit,
+        timezone.clone(),
+    ))
 }
 
 fn timestamp_from_epoch_seconds(
