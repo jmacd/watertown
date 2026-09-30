@@ -155,4 +155,5 @@ async fn memory_matches_datafusion_persistence_contract() {
     let root = fs.root().await.expect("root");
     provider::testing::assert_series_read_after_write(&root, &context).await;
     provider::testing::assert_foundation_snapshot(&root, &context).await;
+    provider::testing::assert_materialization_failure_contract(&root, &context).await;
 }

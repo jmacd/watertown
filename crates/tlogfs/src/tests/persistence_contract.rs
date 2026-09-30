@@ -27,6 +27,7 @@ async fn active_transaction_matches_tinyfs_persistence_contract() {
     provider::testing::assert_series_read_after_write(&root, &context).await;
     provider::testing::assert_foundation_snapshot(&root, &context).await;
     provider::testing::assert_materialization_append(&root, &context).await;
+    provider::testing::assert_materialization_failure_contract(&root, &context).await;
     let materialized_versions = root
         .list_file_versions(provider::testing::MATERIALIZED_SERIES_PATH)
         .await
@@ -91,6 +92,16 @@ async fn active_transaction_matches_tinyfs_persistence_contract() {
             .expect("read persisted materialization")
             .num_rows(),
         3
+    );
+    assert_eq!(
+        root.list_file_versions(format!(
+            "{}.materialization-progress",
+            provider::testing::EMPTY_MATERIALIZED_SERIES_PATH
+        ))
+        .await
+        .expect("persisted no-output progress")
+        .len(),
+        1
     );
 }
 
