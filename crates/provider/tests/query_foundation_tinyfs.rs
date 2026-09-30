@@ -205,6 +205,57 @@ async fn captures_exact_versions_and_rejects_stale_generation_execution() -> Res
 }
 
 #[tokio::test]
+async fn production_wildcard_uses_typed_combine_without_materializing() -> Result<()> {
+    let persistence = MemoryPersistence::default();
+    let filesystem = Arc::new(
+        FS::new(persistence.clone())
+            .await
+            .expect("memory filesystem"),
+    );
+    let session = Arc::new(SessionContext::new());
+    _ = provider::register_tinyfs_object_store(&session, persistence.clone())
+        .expect("register TinyFS object store");
+    let context = ProviderContext::new(session.clone(), Arc::new(persistence));
+    let root = filesystem.root().await.expect("memory root");
+    _ = root
+        .create_series_from_batch(
+            "/input-a.series",
+            &batch(vec![1, 2], vec![10.0, 20.0])?,
+            Some("ts"),
+        )
+        .await
+        .expect("first input");
+    _ = root
+        .create_series_from_batch("/input-b.series", &batch(vec![3], vec![30.0])?, Some("ts"))
+        .await
+        .expect("second input");
+
+    let provider = provider::Provider::with_context(filesystem, Arc::new(context.clone()));
+    let table = provider
+        .create_provider_for_url("series:///input-*.series", &session)
+        .await
+        .expect("production wildcard provider");
+    _ = session.register_table("combined_inputs", table)?;
+    let frame = session
+        .sql("SELECT ts, value FROM combined_inputs WHERE ts >= 2 ORDER BY ts")
+        .await?;
+    let physical = frame.clone().create_physical_plan().await?;
+    let plan = DisplayableExecutionPlan::new(physical.as_ref())
+        .indent(true)
+        .to_string();
+    assert!(plan.contains("UnionExec"), "{plan}");
+    assert!(
+        !plan.contains("MemoryExec"),
+        "wildcard combine materialized its sources:\n{plan}"
+    );
+
+    let batches = frame.collect().await?;
+    let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+    assert_eq!(rows, 2);
+    Ok(())
+}
+
+#[tokio::test]
 async fn appends_output_and_progress_in_one_tinyfs_version() -> Result<()> {
     let persistence = MemoryPersistence::default();
     let filesystem = FS::new(persistence.clone())

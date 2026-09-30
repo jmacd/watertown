@@ -14,9 +14,12 @@
 //! This enables using `csv:///path/*.csv` in factory configs like timeseries_join.
 
 use crate::{Error, FileProvider, FormatProvider, FormatRegistry, Result, Url};
+use datafusion::catalog::view::ViewTable;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
+use query_foundation::overlap::OverlapPolicy;
+use query_foundation::plans::combine::{CombineInput, combine_same_scope};
 use std::future::Future;
 use std::sync::Arc;
 
@@ -744,7 +747,7 @@ impl Provider {
     /// materialization.
     ///
     /// For builtin types (`file`/`series`/`table`) or when no cache is
-    /// available, falls back to UNION ALL BY NAME (which materializes).
+    /// available, falls back to a typed, non-materializing same-scope combine.
     pub async fn create_provider_for_url(
         &self,
         url_str: &str,
@@ -830,35 +833,42 @@ impl Provider {
             return Ok(provider);
         }
 
-        // Fallback: individual providers + UNION ALL BY NAME
+        // Fallback: individual providers + typed same-scope combine.
         let mut table_providers = Vec::new();
         let _ = self
             .for_each_match_bounded(url_str, bounds, |tp, file_path| {
                 log::debug!("Matched file: {}", file_path);
-                table_providers.push(tp);
+                table_providers.push((file_path, tp));
                 async { Ok(()) }
             })
             .await?;
 
         if table_providers.len() == 1 {
-            return Ok(table_providers.into_iter().next().expect("len == 1"));
+            return Ok(table_providers.into_iter().next().expect("len == 1").1);
         }
 
-        // Multiple files without cache -- materialize via UNION ALL BY NAME in
-        // the caller's runtime so providers can use its registered object stores.
-        let mut providers = table_providers.into_iter();
-        let first = providers.next().expect("multiple providers");
-        let mut df = ctx.read_table(first)?;
-        for table_provider in providers {
-            df = df.union_by_name(ctx.read_table(table_provider)?)?;
-        }
-        let batches = df.collect().await?;
-        let schema = batches
-            .first()
-            .map(|b| b.schema())
-            .ok_or_else(|| Error::SessionContext("No batches in union result".to_string()))?;
-        let mem_table = MemTable::try_new(schema, vec![batches])?;
-        Ok(Arc::new(mem_table))
+        let inputs = table_providers
+            .into_iter()
+            .enumerate()
+            .map(|(sequence, (path, table_provider))| {
+                Ok(CombineInput::new(
+                    path,
+                    u64::try_from(sequence).map_err(|_| {
+                        Error::SessionContext(
+                            "wildcard source count exceeds supported sequence range".to_owned(),
+                        )
+                    })?,
+                    ctx.read_table(table_provider)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let combined = combine_same_scope(inputs, &OverlapPolicy::PreserveAll).await?;
+        Ok(Arc::new(ViewTable::new(
+            combined.logical_plan().clone(),
+            Some(format!(
+                "typed PreserveAll combine for wildcard source {url_str}"
+            )),
+        )))
     }
 }
 
