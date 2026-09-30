@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+mod dynamic_lineage;
 mod large_file_corruption;
 mod large_file_roundtrip;
 mod node_query_visibility;
