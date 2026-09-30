@@ -167,6 +167,45 @@ pub struct State {
     pond_id: String,
 }
 
+fn file_version_info_from_record(record: OplogEntry) -> FileVersionInfo {
+    let size = if record.is_large_file() {
+        record.size.unwrap_or(0)
+    } else {
+        record.content.as_ref().map(|c| c.len() as i64).unwrap_or(0)
+    };
+    let extended_metadata =
+        if record.file_type.is_series_file() || record.file_type == EntryType::FilePhysicalSeries {
+            let mut metadata = HashMap::new();
+            if let (Some(minimum), Some(maximum)) = (record.min_event_time, record.max_event_time) {
+                _ = metadata.insert("min_event_time".to_string(), minimum.to_string());
+                _ = metadata.insert("max_event_time".to_string(), maximum.to_string());
+            }
+            if let Some(attributes) = &record.extended_attributes {
+                _ = metadata.insert("extended_attributes".to_string(), attributes.clone());
+            }
+            if let Some(fingerprint) = &record.series_schema_fingerprint {
+                _ = metadata.insert("series_schema_fingerprint".to_string(), fingerprint.clone());
+            }
+            if let Some(hash) = &record.logical_leaf_hash {
+                _ = metadata.insert("logical_leaf_hash".to_string(), hash.clone());
+            }
+            if let Some(count) = record.logical_count {
+                _ = metadata.insert("logical_count".to_string(), count.to_string());
+            }
+            Some(metadata)
+        } else {
+            None
+        };
+    FileVersionInfo {
+        version: record.version as u64,
+        timestamp: record.timestamp,
+        size: size as u64,
+        blake3: record.blake3,
+        entry_type: record.file_type,
+        extended_metadata,
+    }
+}
+
 // Re-export TableProviderKey from provider for backward compatibility
 pub use provider::TableProviderKey;
 
@@ -2043,6 +2082,15 @@ impl PersistenceLayer for State {
     async fn list_file_versions(&self, id: FileID) -> TinyFSResult<Vec<FileVersionInfo>> {
         self.coherence.ensure_open()?;
         self.inner.lock().await.list_file_versions(id).await
+    }
+
+    async fn file_version_info(
+        &self,
+        id: FileID,
+        version: u64,
+    ) -> TinyFSResult<Option<FileVersionInfo>> {
+        self.coherence.ensure_open()?;
+        self.inner.lock().await.file_version_info(id, version).await
     }
 
     async fn read_file_version(&self, id: FileID, version: u64) -> TinyFSResult<Vec<u8>> {
@@ -4555,64 +4603,22 @@ impl InnerState {
         let version_infos = records
             .into_iter()
             .filter(|record| live.contains(&record.version))
-            .map(|record| {
-                // Use the actual database version number, not a re-enumerated logical version
-                let version = record.version as u64;
-
-                // For large files, size represents the ORIGINAL content size (before chunking)
-                // The actual parquet file on disk will be different due to compression
-                // but DataFusion needs to know the reconstructed size
-                let size = if record.is_large_file() {
-                    record.size.unwrap_or(0)
-                } else {
-                    record.content.as_ref().map(|c| c.len() as i64).unwrap_or(0)
-                };
-
-                // Extract extended metadata for series files. Both TablePhysical
-                // series (is_series_file) and FilePhysicalSeries (e.g. jsonlogs
-                // journals) record per-version min/max_event_time via
-                // new_file_series; expose it so bounded consumers (the cached
-                // ListingTable prune) can skip versions outside the hot window.
-                let extended_metadata = if record.file_type.is_series_file()
-                    || record.file_type == EntryType::FilePhysicalSeries
-                {
-                    let mut metadata = HashMap::new();
-                    if let (Some(min_time), Some(max_time)) =
-                        (record.min_event_time, record.max_event_time)
-                    {
-                        _ = metadata.insert("min_event_time".to_string(), min_time.to_string());
-                        _ = metadata.insert("max_event_time".to_string(), max_time.to_string());
-                    }
-                    if let Some(attrs) = &record.extended_attributes {
-                        _ = metadata.insert("extended_attributes".to_string(), attrs.clone());
-                    }
-                    if let Some(fingerprint) = &record.series_schema_fingerprint {
-                        _ = metadata
-                            .insert("series_schema_fingerprint".to_string(), fingerprint.clone());
-                    }
-                    if let Some(hash) = &record.logical_leaf_hash {
-                        _ = metadata.insert("logical_leaf_hash".to_string(), hash.clone());
-                    }
-                    if let Some(count) = record.logical_count {
-                        _ = metadata.insert("logical_count".to_string(), count.to_string());
-                    }
-                    Some(metadata)
-                } else {
-                    None
-                };
-
-                FileVersionInfo {
-                    version,
-                    timestamp: record.timestamp,
-                    size: size as u64, // Cast back to u64 for tinyfs interface
-                    blake3: record.blake3.clone(),
-                    entry_type: record.file_type,
-                    extended_metadata,
-                }
-            })
+            .map(file_version_info_from_record)
             .collect();
 
         Ok(version_infos)
+    }
+
+    async fn file_version_info(
+        &self,
+        id: FileID,
+        version: u64,
+    ) -> TinyFSResult<Option<FileVersionInfo>> {
+        match self.load_file_version_record(id, version).await {
+            Ok(record) => Ok(Some(file_version_info_from_record(record))),
+            Err(tinyfs::Error::NotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     async fn load_file_version_record(&self, id: FileID, version: u64) -> TinyFSResult<OplogEntry> {

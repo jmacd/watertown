@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
+use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use query_foundation::frontier::{RepairPolicy, SettledState};
@@ -17,6 +18,7 @@ use query_foundation::materialize::{
 use tinyfs::arrow::ParquetExt;
 
 use crate::query_foundation_adapter::TinyFsMaterializationSink;
+use crate::query_foundation_adapter::capture_tinyfs_snapshot;
 use crate::{TableProviderOptions, create_table_provider};
 
 pub const TABLE_SERIES_PATH: &str = "/provider-contract/events.series";
@@ -220,5 +222,86 @@ pub async fn assert_materialization_append(root: &tinyfs::WD, context: &tinyfs::
             .expect("materialized batch")
             .num_rows(),
         3
+    );
+}
+
+/// Assert exact foundation snapshot planning over a persistence backend.
+pub async fn assert_foundation_snapshot(root: &tinyfs::WD, context: &tinyfs::ProviderContext) {
+    let id = root
+        .get_node_path(TABLE_SERIES_PATH)
+        .await
+        .expect("foundation contract series")
+        .id();
+    let snapshot = capture_tinyfs_snapshot(
+        context,
+        id,
+        "persistence-contract-snapshot",
+        timestamp_batch(Vec::new()).schema(),
+        Some(query_foundation::snapshot::EventTimeContract::new(
+            "timestamp",
+        )),
+        query_foundation::overlap::OverlapPolicy::PreserveAll,
+    )
+    .await
+    .expect("capture foundation snapshot");
+    assert_eq!(snapshot.snapshot().chunks().len(), 2);
+    assert_eq!(
+        snapshot
+            .snapshot()
+            .chunks()
+            .iter()
+            .map(query_foundation::snapshot::ChunkDescriptor::logical_count)
+            .sum::<u64>(),
+        3
+    );
+    _ = context
+        .datafusion_session
+        .register_table(
+            "foundation_persistence_contract",
+            snapshot.table_provider().expect("provider"),
+        )
+        .expect("register foundation contract");
+    let frame = context
+        .datafusion_session
+        .sql("SELECT timestamp FROM foundation_persistence_contract WHERE timestamp >= 2")
+        .await
+        .expect("plan foundation query");
+    let physical = frame
+        .clone()
+        .create_physical_plan()
+        .await
+        .expect("foundation physical plan");
+    let display = DisplayableExecutionPlan::new(physical.as_ref())
+        .indent(true)
+        .to_string();
+    assert_eq!(display.matches("DataSourceExec").count(), 1, "{display}");
+    assert!(display.contains("projection=[timestamp]"), "{display}");
+    assert!(display.contains("timestamp@0 >= 2"), "{display}");
+    assert!(!display.contains("MemoryExec"), "{display}");
+    assert_eq!(
+        frame
+            .collect()
+            .await
+            .expect("execute foundation query")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        2
+    );
+}
+
+/// Assert a registered foundation provider rejects a closed transaction.
+pub async fn assert_foundation_provider_closed(context: &tinyfs::ProviderContext) {
+    let error = context
+        .datafusion_session
+        .sql("SELECT COUNT(*) FROM foundation_persistence_contract")
+        .await
+        .expect("closed-provider SQL planning")
+        .collect()
+        .await
+        .expect_err("foundation provider from a closed transaction must fail");
+    assert!(
+        error.to_string().contains("closed"),
+        "unexpected closed foundation-provider error: {error}"
     );
 }

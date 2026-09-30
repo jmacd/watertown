@@ -25,6 +25,7 @@ async fn active_transaction_matches_tinyfs_persistence_contract() {
         .await
         .expect("active transaction contract");
     provider::testing::assert_series_read_after_write(&root, &context).await;
+    provider::testing::assert_foundation_snapshot(&root, &context).await;
     provider::testing::assert_materialization_append(&root, &context).await;
     let materialized_versions = root
         .list_file_versions(provider::testing::MATERIALIZED_SERIES_PATH)
@@ -45,6 +46,7 @@ async fn active_transaction_matches_tinyfs_persistence_contract() {
     tx.commit_test().await.expect("commit contract writes");
 
     provider::testing::assert_registered_provider_closed(&context).await;
+    provider::testing::assert_foundation_provider_closed(&context).await;
     let closed_error = context
         .persistence
         .read_file_version(artifact.file_id, artifact.first_version)
@@ -82,6 +84,7 @@ async fn active_transaction_matches_tinyfs_persistence_contract() {
         vec![artifact.first_version, artifact.second_version]
     );
     provider::testing::assert_series_row_count(&root, &context, 3).await;
+    provider::testing::assert_foundation_snapshot(&root, &context).await;
     assert_eq!(
         root.read_table_as_batch(provider::testing::MATERIALIZED_SERIES_PATH)
             .await
