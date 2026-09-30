@@ -2,7 +2,7 @@
 
 > **Status:** accepted design and implementation plan as of 2026-09-28.
 >
-> **Implementation:** Phase 0 passed in `477292a8`; the Phase 1 through Phase 7
+> **Implementation:** Phase 0 passed in `477292a8`; the Phase 1 through Phase 8
 > gates are implemented on the current development branch.
 >
 > **Historical baseline:** `b6913e2f9ca68eb0a1cad27970fca2f6e8487833`.
@@ -860,6 +860,16 @@ when identical rows are repacked into different Parquet row-group layouts.
 
 **Gate:** memory and TLogFS produce identical semantics, while TLogFS physical
 work remains bounded by selected chunks and row groups.
+
+The Phase 8 cross-persistence contract runs exact snapshot, projected scan,
+append, no-output progress, repair rejection, stream failure, commit, abort,
+and stale-context cases on both memory and TLogFS. TLogFS committed lookups
+are scoped by pond, partition, and node rather than loading a whole directory.
+Delta commits write node-isolated Parquet objects with node and version
+statistics; an exact-version physical plan is unchanged after 16 additional
+commits containing both selected-node history and unrelated nodes.
+Existing Delta objects without these statistics remain readable, but require
+a maintenance rewrite before they provide the same pruning bound.
 
 ### Phase 9: provider and factory integration
 

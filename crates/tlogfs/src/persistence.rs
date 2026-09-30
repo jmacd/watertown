@@ -114,11 +114,6 @@ pub struct InnerState {
     txn_seq: i64,
     /// Options for large file storage (compression, etc.)
     large_file_options: crate::large_files::LargeFileOptions,
-    /// Cache of committed oplog records by partition, keyed by
-    /// (part_id -> (node_id -> records sorted by timestamp desc)).
-    /// Populated on first access per partition via a single SQL query,
-    /// avoiding per-file queries when listing directories.
-    partition_records_cache: HashMap<tinyfs::PartID, HashMap<tinyfs::NodeID, Vec<OplogEntry>>>,
     /// External parquet files to include as Delta Add actions at commit time.
     /// Used by cross-pond import to register imported files in the same
     /// Delta commit as the normal OpLog records. Each entry is (path, size, part_id).
@@ -2511,7 +2506,6 @@ impl InnerState {
             session_context: ctx,
             txn_seq,
             large_file_options,
-            partition_records_cache: HashMap::new(),
             external_add_actions: Vec::new(),
         })
     }
@@ -3166,7 +3160,10 @@ impl InnerState {
 
             let store = table.object_store();
 
-            // Group by (pond_id, part_id) for partitioned writes.
+            // Write one physical object per node within each Delta partition.
+            // The table remains partitioned by (pond_id, part_id), while
+            // single-node file statistics let exact-node queries prune every
+            // unrelated commit in the same directory.
             let part_id_col = batch.column_by_name("part_id").expect("part_id column");
             let part_id_arr = part_id_col
                 .as_any()
@@ -3177,23 +3174,27 @@ impl InnerState {
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .expect("pond_id is StringArray");
+            let node_id_col = batch.column_by_name("node_id").expect("node_id column");
+            let node_id_arr = node_id_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("node_id is StringArray");
 
-            let mut groups: Vec<(String, String)> = Vec::new();
+            let mut groups = std::collections::BTreeSet::new();
             for i in 0..batch.num_rows() {
                 let pond = pond_id_arr.value(i).to_string();
                 let part = part_id_arr.value(i).to_string();
-                let key = (pond, part);
-                if !groups.contains(&key) {
-                    groups.push(key);
-                }
+                let node = node_id_arr.value(i).to_string();
+                _ = groups.insert((pond, part, node));
             }
 
-            for (pond, part) in &groups {
+            for (pond, part, node) in &groups {
                 let mask: arrow::array::BooleanArray = (0..batch.num_rows())
                     .map(|i| {
                         Some(
                             pond_id_arr.value(i) == pond.as_str()
-                                && part_id_arr.value(i) == part.as_str(),
+                                && part_id_arr.value(i) == part.as_str()
+                                && node_id_arr.value(i) == node.as_str(),
                         )
                     })
                     .collect();
@@ -3209,6 +3210,20 @@ impl InnerState {
                     .map(|(i, _)| i)
                     .collect();
                 let filtered = filtered.project(&indices)?;
+                let versions = filtered
+                    .column_by_name("version")
+                    .expect("version column")
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("version is Int64Array");
+                let minimum_version = (0..versions.len())
+                    .map(|index| versions.value(index))
+                    .min()
+                    .expect("node group is non-empty");
+                let maximum_version = (0..versions.len())
+                    .map(|index| versions.value(index))
+                    .max()
+                    .expect("node group is non-empty");
 
                 let mut parquet_buf = Vec::new();
                 let mut writer = parquet::arrow::ArrowWriter::try_new(
@@ -3220,12 +3235,29 @@ impl InnerState {
                 let _file_metadata = writer.close()?;
 
                 let file_name = format!(
-                    "pond_id={}/part_id={}/part-00000-{}-c000.snappy.parquet",
+                    "pond_id={}/part_id={}/node-{}-{}-c000.snappy.parquet",
                     pond,
                     part,
+                    node,
                     uuid7::uuid7()
                 );
                 let file_size = parquet_buf.len() as i64;
+                let stats = serde_json::json!({
+                    "numRecords": filtered.num_rows(),
+                    "minValues": {
+                        "node_id": node,
+                        "version": minimum_version
+                    },
+                    "maxValues": {
+                        "node_id": node,
+                        "version": maximum_version
+                    },
+                    "nullCount": {
+                        "node_id": 0,
+                        "version": 0
+                    }
+                })
+                .to_string();
 
                 let obj_path = object_store::path::Path::from(file_name.as_str());
                 _ = store
@@ -3244,7 +3276,7 @@ impl InnerState {
                     size: file_size,
                     modification_time: now_ms,
                     data_change: true,
-                    stats: None,
+                    stats: Some(stats),
                     tags: None,
                     deletion_vector: None,
                     base_row_id: None,
@@ -4094,46 +4126,15 @@ impl InnerState {
             return Ok(pending);
         }
 
-        // Step 2: Use the partition cache to get the latest committed record.
-        // Filter by pond_id to isolate records from different ponds that
-        // share the same partition (e.g., root partition in cross-pond import).
-        self.ensure_partition_cached(id.part_id()).await?;
-
-        match self
-            .partition_records_cache
-            .get(&id.part_id())
-            .and_then(|by_node| by_node.get(&id.node_id()))
-            .and_then(|records| records.iter().find(|r| r.pond_id == pond_id_str).cloned())
-        {
-            Some(record) => Ok(record),
-            None => {
-                // Distinguish "partition has no data" (foreign partition not imported)
-                // from "node not found within a populated partition"
-                let partition_has_data = self
-                    .partition_records_cache
-                    .get(&id.part_id())
-                    .map(|by_node| !by_node.is_empty())
-                    .unwrap_or(false);
-
-                if partition_has_data {
-                    Err(TLogFSError::PartitionNotFound {
-                        part_id: id.part_id().to_string(),
-                        node_id: id.node_id().to_string(),
-                        hint: "Node not found in this partition.".to_string(),
-                    })
-                } else {
-                    Err(TLogFSError::PartitionNotFound {
-                        part_id: id.part_id().to_string(),
-                        node_id: id.node_id().to_string(),
-                        hint: "This partition contains no data. If this is an imported \
-                               directory from a foreign pond, the partition may not have \
-                               been included in the import. Use source_path with /** \
-                               to import recursively."
-                            .to_string(),
-                    })
-                }
-            }
-        }
+        self.query_committed_node_records(id)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| TLogFSError::PartitionNotFound {
+                part_id: id.part_id().to_string(),
+                node_id: id.node_id().to_string(),
+                hint: "Node not found in this partition.".to_string(),
+            })
     }
 
     /// Query for ONLY the latest directory record (O(1) performance)
@@ -4160,19 +4161,11 @@ impl InnerState {
             .max_by_key(|r| r.version)
             .cloned();
 
-        // Step 2: Use partition cache for committed records, scoped by pond_id
-        self.ensure_partition_cached(id.part_id()).await?;
-
         let committed_record = self
-            .partition_records_cache
-            .get(&id.part_id())
-            .and_then(|by_node| by_node.get(&id.node_id()))
-            .and_then(|records| {
-                records
-                    .iter()
-                    .find(|r| r.pond_id == pond_id_str && r.file_type.is_directory())
-                    .cloned()
-            });
+            .query_committed_node_records(id)
+            .await?
+            .into_iter()
+            .find(|record| record.file_type.is_directory());
 
         // Step 3: Return the latest between committed and pending (pending wins if both exist)
         match (committed_record, pending_record) {
@@ -4183,23 +4176,18 @@ impl InnerState {
         }
     }
 
-    /// Load all committed records for a partition into the cache with a
-    /// single SQL query.  Subsequent `query_records()` calls for any node
-    /// in this partition will hit the cache instead of running SQL.
-    async fn ensure_partition_cached(
-        &mut self,
-        part_id: tinyfs::PartID,
-    ) -> Result<(), TLogFSError> {
-        if self.partition_records_cache.contains_key(&part_id) {
-            return Ok(());
-        }
-
+    /// Query committed records for one exact node using Delta predicates.
+    async fn query_committed_node_records(
+        &self,
+        id: FileID,
+    ) -> Result<Vec<OplogEntry>, TLogFSError> {
         let sql = format!(
-            "SELECT * FROM delta_table WHERE part_id = '{}' ORDER BY timestamp DESC",
-            part_id
+            "SELECT * FROM delta_table WHERE pond_id = '{}' AND part_id = '{}' AND node_id = '{}' \
+             ORDER BY version DESC, timestamp DESC",
+            id.pond_id(),
+            id.part_id(),
+            id.node_id()
         );
-
-        let query_start = std::time::Instant::now();
         let batches = self
             .session_context
             .sql(&sql)
@@ -4208,23 +4196,12 @@ impl InnerState {
             .collect()
             .await
             .map_err(TLogFSError::DataFusion)?;
-
-        let mut by_node: HashMap<tinyfs::NodeID, Vec<OplogEntry>> = HashMap::new();
+        let mut records: Vec<OplogEntry> = Vec::new();
         for batch in batches {
-            let records: Vec<OplogEntry> = serde_arrow::from_record_batch(&batch)?;
-            for record in records {
-                by_node.entry(record.node_id).or_default().push(record);
-            }
+            let batch_records: Vec<OplogEntry> = serde_arrow::from_record_batch(&batch)?;
+            records.extend(batch_records);
         }
-
-        let node_count = by_node.len();
-        let elapsed = query_start.elapsed().as_millis();
-        debug!(
-            "ensure_partition_cached: loaded {node_count} nodes for part_id={part_id} in {elapsed}ms"
-        );
-
-        _ = self.partition_records_cache.insert(part_id, by_node);
-        Ok(())
+        Ok(records)
     }
 
     /// Query records from both committed (Delta Lake) and pending (in-memory) data
@@ -4246,20 +4223,7 @@ impl InnerState {
         // Step 1: Get committed records, scoped by pond_id
         let query_start = std::time::Instant::now();
 
-        self.ensure_partition_cached(id.part_id()).await?;
-
-        let committed_records: Vec<OplogEntry> = self
-            .partition_records_cache
-            .get(&id.part_id())
-            .and_then(|by_node| by_node.get(&id.node_id()))
-            .map(|records| {
-                records
-                    .iter()
-                    .filter(|r| r.pond_id == pond_id_str)
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
+        let committed_records = self.query_committed_node_records(id).await?;
 
         trace.metric("query_ms", query_start.elapsed().as_millis() as u64);
         trace.metric("committed_count", committed_records.len() as u64);
