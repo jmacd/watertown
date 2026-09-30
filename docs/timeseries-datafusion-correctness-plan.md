@@ -889,9 +889,10 @@ Phase 9 integration now constructs wildcard combines, timeseries joins, and
 timeseries pivots as typed logical plans. Temporal reduction retains its
 incremental segment/hot cache and reconstructs user-visible aggregates from
 stored mergeable partials with typed expressions over the ordered file scan;
-the production plan has neither `MemoryExec` nor a global `SortExec`. Typed
-construction of the remaining raw-partial and partial-merge operations is
-still required before this phase is complete.
+its bounded source scan also builds multi-column mergeable partials through a
+typed timestamp-window recipe. The production plan has neither `MemoryExec`
+nor a global `SortExec`. Typed construction of the remaining partial-merge
+operations is still required before this phase is complete.
 
 ### Phase 10: consumers and Noyo qualification
 

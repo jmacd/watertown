@@ -1279,16 +1279,43 @@ impl TemporalReduceSqlFile {
         if ctx.table_exist(source_table).unwrap_or(false) {
             _ = ctx.deregister_table(source_table).map_other()?;
         }
-        _ = ctx.register_table(source_table, provider).map_other()?;
+        _ = ctx
+            .register_table(source_table, provider.clone())
+            .map_other()?;
 
         let partials_view = format!("{}_partials", source_table);
-        let partial_sql = pieces.partial_sql(output_interval, ts, source_table, &available);
+        let missing = pieces
+            .partials
+            .iter()
+            .filter(|partial| partial.column != "*" && !available.contains(&partial.column))
+            .map(|partial| partial.column.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|column| (column, arrow::datatypes::DataType::Float64))
+            .collect();
+        let source = query_foundation::plans::transform::null_pad(
+            ctx.read_table(provider).map_other()?,
+            missing,
+        )
+        .map_other_context("rollup source partial padding")?;
+        let partials = query_foundation::plans::reduce::reduce_timestamp_windows(
+            source,
+            &pieces
+                .timestamp_recipe(output_interval, ts)
+                .map_other_context("rollup source partial recipe")?,
+        )
+        .map_other_context("rollup source partial planning")?;
+        let partials_provider: Arc<dyn datafusion::catalog::TableProvider> =
+            Arc::new(datafusion::catalog::view::ViewTable::new(
+                partials.logical_plan().clone(),
+                Some("typed temporal-reduce source partials".to_owned()),
+            ));
+        if ctx.table_exist(&partials_view).unwrap_or(false) {
+            _ = ctx.deregister_table(&partials_view).map_other()?;
+        }
         let build = async {
             _ = ctx
-                .sql(&format!(
-                    "CREATE OR REPLACE VIEW {partials_view} AS {partial_sql}"
-                ))
-                .await
+                .register_table(&partials_view, partials_provider)
                 .map_other_context("rollup source partial view")?;
             self.seal_and_recompute(
                 ctx,
@@ -1304,10 +1331,19 @@ impl TemporalReduceSqlFile {
             .await
         }
         .await;
-        _ = ctx
-            .sql(&format!("DROP VIEW IF EXISTS {partials_view}"))
-            .await;
-        let superseded = build?;
+        let cleanup = ctx
+            .deregister_table(&partials_view)
+            .map_other_context("rollup source partial view cleanup");
+        let superseded = match (build, cleanup) {
+            (Ok(superseded), Ok(_)) => superseded,
+            (Err(build_error), Ok(_)) => return Err(build_error),
+            (Ok(_), Err(cleanup_error)) => return Err(cleanup_error),
+            (Err(build_error), Err(cleanup_error)) => {
+                return Err(tinyfs::Error::Other(format!(
+                    "{build_error}; additionally failed to clean up partial view: {cleanup_error}"
+                )));
+            }
+        };
 
         m.sources = now.clone();
         m.source_digest = None;
@@ -1906,6 +1942,7 @@ impl PartialKind {
     /// which the cross-version merge listing table requires, and contributes
     /// nothing on merge: NULL sums/mins/maxes are ignored and a zero count adds
     /// nothing.
+    #[cfg(test)]
     fn raw_expr_or_absent(self, column: &str, alias: &str, present: bool) -> String {
         if present || matches!(self, PartialKind::CountStar) {
             return self.raw_expr(column, alias);
@@ -2102,6 +2139,7 @@ impl AggSqlPieces {
 
     /// Partial expressions for one input version, substituting typed
     /// placeholders for source columns absent from that version's schema.
+    #[cfg(test)]
     fn raw_partial_exprs_for(&self, available: &std::collections::HashSet<String>) -> Vec<String> {
         self.partials
             .iter()
@@ -2149,6 +2187,41 @@ async fn generate_temporal_sql(
 }
 
 impl AggSqlPieces {
+    fn timestamp_recipe(
+        &self,
+        interval: Duration,
+        ts: &str,
+    ) -> datafusion::error::Result<query_foundation::plans::reduce::TimestampWindowReduce> {
+        use query_foundation::plans::reduce::TimestampPartialAggregate;
+
+        let aggregates = self
+            .partials
+            .iter()
+            .map(|partial| match partial.kind {
+                PartialKind::Sum => TimestampPartialAggregate::Sum {
+                    value: partial.column.clone(),
+                    output: partial.alias.clone(),
+                },
+                PartialKind::Count => TimestampPartialAggregate::Count {
+                    value: partial.column.clone(),
+                    output: partial.alias.clone(),
+                },
+                PartialKind::Min => TimestampPartialAggregate::Min {
+                    value: partial.column.clone(),
+                    output: partial.alias.clone(),
+                },
+                PartialKind::Max => TimestampPartialAggregate::Max {
+                    value: partial.column.clone(),
+                    output: partial.alias.clone(),
+                },
+                PartialKind::CountStar => TimestampPartialAggregate::CountStar {
+                    output: partial.alias.clone(),
+                },
+            })
+            .collect();
+        query_foundation::plans::reduce::TimestampWindowReduce::try_new(ts, interval, aggregates)
+    }
+
     /// Single-pass query: group raw rows into buckets, compute partials, and
     /// reconstruct the output columns in one statement.
     fn full_sql(&self, interval: Duration, ts: &str, table: &str) -> String {
@@ -2181,6 +2254,7 @@ impl AggSqlPieces {
     /// buckets and emit `time_bucket` plus the partial columns. The output is
     /// cached once per version; it carries no reconstruction so the partials
     /// stay mergeable across versions.
+    #[cfg(test)]
     fn partial_sql(
         &self,
         interval: Duration,

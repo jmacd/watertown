@@ -3,13 +3,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use arrow::array::{Float64Array, Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::array::{Float64Array, Int64Array, StringArray, TimestampMillisecondArray};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
+use datafusion::datasource::MemTable;
 use datafusion::error::Result;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
-use query_foundation::plans::reduce::{FixedWindowReduce, reduce_fixed_windows};
+use datafusion::prelude::SessionContext;
+use query_foundation::plans::reduce::{
+    FixedWindowReduce, TimestampPartialAggregate, TimestampWindowReduce, reduce_fixed_windows,
+    reduce_timestamp_windows,
+};
 use query_foundation::statistics::TimeInterval;
 use query_foundation::testkit::FoundationFixture;
 
@@ -169,6 +175,76 @@ async fn fixed_windows_handle_boundaries_negative_time_groups_and_nulls() -> Res
     assert!(!display.contains("unused"), "{display}");
     assert!(!display.contains("MemoryExec"), "{display}");
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn timestamp_windows_emit_multiple_mergeable_partials() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
+        Field::new("temperature", DataType::Float64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(TimestampMillisecondArray::from(vec![
+                0, 30_000, 60_000, 90_000,
+            ])),
+            Arc::new(Float64Array::from(vec![
+                Some(2.0),
+                None,
+                Some(4.0),
+                Some(8.0),
+            ])),
+        ],
+    )?;
+    let context = SessionContext::new();
+    let source = Arc::new(MemTable::try_new(schema, vec![vec![batch]])?);
+    let recipe = TimestampWindowReduce::try_new(
+        "timestamp",
+        Duration::from_secs(60),
+        vec![
+            TimestampPartialAggregate::CountStar {
+                output: "rows".to_owned(),
+            },
+            TimestampPartialAggregate::Count {
+                value: "temperature".to_owned(),
+                output: "non_null".to_owned(),
+            },
+            TimestampPartialAggregate::Sum {
+                value: "temperature".to_owned(),
+                output: "sum".to_owned(),
+            },
+            TimestampPartialAggregate::Min {
+                value: "temperature".to_owned(),
+                output: "min".to_owned(),
+            },
+            TimestampPartialAggregate::Max {
+                value: "temperature".to_owned(),
+                output: "max".to_owned(),
+            },
+        ],
+    )?;
+    let batches = reduce_timestamp_windows(context.read_table(source)?, &recipe)?
+        .sort(vec![
+            datafusion::logical_expr::col("time_bucket").sort(true, true),
+        ])?
+        .collect()
+        .await?;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    assert_eq!(
+        arrow::util::pretty::pretty_format_batches(&batches)?.to_string(),
+        "+---------------------+------+----------+------+-----+-----+\n\
+         | time_bucket         | rows | non_null | sum  | min | max |\n\
+         +---------------------+------+----------+------+-----+-----+\n\
+         | 1970-01-01T00:00:00 | 2    | 1        | 2.0  | 2.0 | 2.0 |\n\
+         | 1970-01-01T00:01:00 | 2    | 2        | 12.0 | 4.0 | 8.0 |\n\
+         +---------------------+------+----------+------+-----+-----+"
+    );
     Ok(())
 }
 

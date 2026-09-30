@@ -6,11 +6,13 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
-use arrow::datatypes::DataType;
-use datafusion::common::Column;
+use arrow::datatypes::{DataType, TimeUnit};
+use datafusion::common::{Column, ScalarValue};
 use datafusion::dataframe::DataFrame;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::functions::datetime::expr_fn::date_bin;
 use datafusion::functions_aggregate::expr_fn::{count, max, min, sum};
 use datafusion::logical_expr::{Expr, Operator, binary_expr, col, lit};
 
@@ -26,6 +28,95 @@ pub struct FixedWindowReduce {
     width: i64,
     origin: i64,
     bounds: Option<TimeInterval>,
+}
+
+/// One mergeable aggregate emitted by a timestamp-window reduction.
+#[derive(Clone, Debug)]
+pub enum TimestampPartialAggregate {
+    CountStar { output: String },
+    Count { value: String, output: String },
+    Sum { value: String, output: String },
+    Min { value: String, output: String },
+    Max { value: String, output: String },
+}
+
+impl TimestampPartialAggregate {
+    fn output(&self) -> &str {
+        match self {
+            Self::CountStar { output }
+            | Self::Count { output, .. }
+            | Self::Sum { output, .. }
+            | Self::Min { output, .. }
+            | Self::Max { output, .. } => output,
+        }
+    }
+
+    fn value(&self) -> Option<&str> {
+        match self {
+            Self::CountStar { .. } => None,
+            Self::Count { value, .. }
+            | Self::Sum { value, .. }
+            | Self::Min { value, .. }
+            | Self::Max { value, .. } => Some(value),
+        }
+    }
+}
+
+/// Typed recipe for mergeable partials over fixed timestamp windows.
+#[derive(Clone, Debug)]
+pub struct TimestampWindowReduce {
+    event_time: String,
+    width: Duration,
+    aggregates: Vec<TimestampPartialAggregate>,
+}
+
+impl TimestampWindowReduce {
+    pub fn try_new(
+        event_time: impl Into<String>,
+        width: Duration,
+        aggregates: Vec<TimestampPartialAggregate>,
+    ) -> Result<Self> {
+        let event_time = event_time.into();
+        if event_time.is_empty() {
+            return Err(DataFusionError::Plan(
+                "reduce event-time column must not be empty".to_owned(),
+            ));
+        }
+        if width.is_zero() {
+            return Err(DataFusionError::Plan(
+                "reduce window width must be positive".to_owned(),
+            ));
+        }
+        if aggregates.is_empty() {
+            return Err(DataFusionError::Plan(
+                "reduce must contain at least one aggregate".to_owned(),
+            ));
+        }
+        let mut outputs = BTreeSet::new();
+        for aggregate in &aggregates {
+            if aggregate.output().is_empty() {
+                return Err(DataFusionError::Plan(
+                    "reduce aggregate output must not be empty".to_owned(),
+                ));
+            }
+            if !outputs.insert(aggregate.output()) {
+                return Err(DataFusionError::Plan(format!(
+                    "duplicate reduce aggregate output '{}'",
+                    aggregate.output()
+                )));
+            }
+            if aggregate.value().is_some_and(str::is_empty) {
+                return Err(DataFusionError::Plan(
+                    "reduce aggregate input must not be empty".to_owned(),
+                ));
+            }
+        }
+        Ok(Self {
+            event_time,
+            width,
+            aggregates,
+        })
+    }
 }
 
 impl FixedWindowReduce {
@@ -182,6 +273,83 @@ pub fn reduce_fixed_windows(frame: DataFrame, recipe: &FixedWindowReduce) -> Res
             max(col(Column::from_name(recipe.value.as_ref()))).alias("max"),
         ],
     )
+}
+
+/// Build mergeable partial aggregates over fixed-width timestamp buckets.
+pub fn reduce_timestamp_windows(
+    frame: DataFrame,
+    recipe: &TimestampWindowReduce,
+) -> Result<DataFrame> {
+    let event_field = frame
+        .schema()
+        .field_with_unqualified_name(&recipe.event_time)
+        .map_err(|_| {
+            DataFusionError::Plan(format!(
+                "reduce input is missing event-time column '{}'",
+                recipe.event_time
+            ))
+        })?;
+    let DataType::Timestamp(unit, timezone) = event_field.data_type() else {
+        return Err(DataFusionError::Plan(format!(
+            "reduce event-time column '{}' must be a timestamp, got {}",
+            recipe.event_time,
+            event_field.data_type()
+        )));
+    };
+    for aggregate in &recipe.aggregates {
+        if let Some(value) = aggregate.value() {
+            _ = frame
+                .schema()
+                .field_with_unqualified_name(value)
+                .map_err(|_| {
+                    DataFusionError::Plan(format!(
+                        "reduce input is missing aggregate column '{value}'"
+                    ))
+                })?;
+        }
+    }
+
+    let nanos = i64::try_from(recipe.width.as_nanos()).map_err(|_| {
+        DataFusionError::Plan(format!(
+            "reduce window width is too large: {:?}",
+            recipe.width
+        ))
+    })?;
+    let origin = match unit {
+        TimeUnit::Second => ScalarValue::TimestampSecond(Some(0), timezone.clone()),
+        TimeUnit::Millisecond => ScalarValue::TimestampMillisecond(Some(0), timezone.clone()),
+        TimeUnit::Microsecond => ScalarValue::TimestampMicrosecond(Some(0), timezone.clone()),
+        TimeUnit::Nanosecond => ScalarValue::TimestampNanosecond(Some(0), timezone.clone()),
+    };
+    let event_time = col(Column::from_name(&recipe.event_time));
+    let bucket = date_bin(
+        lit(ScalarValue::new_interval_mdn(0, 0, nanos)),
+        event_time.clone(),
+        lit(origin),
+    )
+    .alias("time_bucket");
+    let aggregates = recipe
+        .aggregates
+        .iter()
+        .map(|aggregate| match aggregate {
+            TimestampPartialAggregate::CountStar { output } => count(lit(1_i64)).alias(output),
+            TimestampPartialAggregate::Count { value, output } => {
+                count(col(Column::from_name(value))).alias(output)
+            }
+            TimestampPartialAggregate::Sum { value, output } => {
+                sum(col(Column::from_name(value))).alias(output)
+            }
+            TimestampPartialAggregate::Min { value, output } => {
+                min(col(Column::from_name(value))).alias(output)
+            }
+            TimestampPartialAggregate::Max { value, output } => {
+                max(col(Column::from_name(value))).alias(output)
+            }
+        })
+        .collect();
+    frame
+        .filter(event_time.is_not_null())?
+        .aggregate(vec![bucket], aggregates)
 }
 
 fn bucket_start_expression(event_time: Expr, width: i64, origin: i64) -> Expr {
