@@ -153,6 +153,21 @@ pub trait FileMetadataWriter: AsyncWrite + Send + Unpin {
     /// `set_temporal_metadata`'s single-key reconstruction).
     fn set_exact_logical_attributes(&mut self, _canonical_attrs: Vec<u8>) {}
 
+    /// Persist a precomputed logical leaf descriptor for backends that do not
+    /// derive native-v2 identity themselves.
+    ///
+    /// TLogFS computes and validates this metadata from the completed logical
+    /// content. Simpler persistence backends may adopt caller-supplied values
+    /// so query adapters can retain logical identity without using physical
+    /// object bytes, Parquet layout, or version numbers as identity.
+    fn set_logical_leaf_metadata(
+        &mut self,
+        _logical_leaf_hash: String,
+        _logical_count: u64,
+        _series_schema_fingerprint: String,
+    ) {
+    }
+
     /// Infer temporal bounds from the written parquet file by reading only the footer.
     /// After calling this, further writes will fail. Calls shutdown() internally.
     /// Returns (min_timestamp, max_timestamp, timestamp_column_name)

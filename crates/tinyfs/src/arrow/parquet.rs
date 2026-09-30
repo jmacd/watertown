@@ -259,6 +259,7 @@ type TemporalMetadata = (i64, i64, String);
 struct WriterMetadata {
     temporal: Option<TemporalMetadata>,
     exact_attributes: Option<Vec<u8>>,
+    logical_leaf: Option<(String, u64, String)>,
 }
 
 struct MetadataWriterProxy {
@@ -300,6 +301,12 @@ impl MetadataWriterProxy {
                 .as_mut()
                 .get_mut()
                 .set_exact_logical_attributes(attributes);
+        }
+        if let Some((hash, count, fingerprint)) = metadata.logical_leaf.clone() {
+            self.inner
+                .as_mut()
+                .get_mut()
+                .set_logical_leaf_metadata(hash, count, fingerprint);
         }
         self.metadata_applied = true;
         Ok(())
@@ -350,6 +357,35 @@ impl StreamingSeriesWriter {
     where
         P: AsRef<Path> + Send + Sync,
     {
+        Self::try_new_with_max_row_group_rows(
+            root,
+            path,
+            schema,
+            timestamp_column,
+            STREAMING_MAX_ROW_GROUP_ROWS,
+        )
+        .await
+    }
+
+    /// Open a staged writer with an explicit physical row-group limit.
+    ///
+    /// Logical identity must remain unchanged when this physical setting
+    /// changes.
+    pub async fn try_new_with_max_row_group_rows<P>(
+        root: &WD,
+        path: P,
+        schema: arrow_schema::SchemaRef,
+        timestamp_column: impl Into<String>,
+        max_row_group_rows: usize,
+    ) -> Result<Self>
+    where
+        P: AsRef<Path> + Send + Sync,
+    {
+        if max_row_group_rows == 0 {
+            return Err(crate::Error::Other(
+                "maximum row-group rows must be positive".to_string(),
+            ));
+        }
         let timestamp_column = timestamp_column.into();
         let (_, mut tinyfs_writer) = root
             .create_file_path_streaming_with_type(path, EntryType::TablePhysicalSeries)
@@ -358,7 +394,7 @@ impl StreamingSeriesWriter {
         let metadata = Arc::new(Mutex::new(WriterMetadata::default()));
         let proxy = MetadataWriterProxy::new(tinyfs_writer, Arc::clone(&metadata));
         let props = WriterProperties::builder()
-            .set_max_row_group_size(STREAMING_MAX_ROW_GROUP_ROWS)
+            .set_max_row_group_size(max_row_group_rows)
             .build();
         let writer = parquet::arrow::AsyncArrowWriter::try_new(proxy, schema, Some(props))
             .map_other_context("Arrow writer error")?;
@@ -413,6 +449,26 @@ impl StreamingSeriesWriter {
             .lock()
             .map_err(|_| crate::Error::Other("stream writer metadata lock poisoned".to_string()))?
             .exact_attributes = Some(attributes);
+        Ok(())
+    }
+
+    /// Attach precomputed logical identity independent of Parquet layout.
+    pub fn set_logical_leaf_metadata(
+        &mut self,
+        logical_leaf_hash: String,
+        logical_count: u64,
+        series_schema_fingerprint: String,
+    ) -> Result<()> {
+        if logical_count != self.rows {
+            return Err(crate::Error::Other(format!(
+                "logical leaf count {logical_count} does not match {} staged rows",
+                self.rows
+            )));
+        }
+        self.metadata
+            .lock()
+            .map_err(|_| crate::Error::Other("stream writer metadata lock poisoned".to_string()))?
+            .logical_leaf = Some((logical_leaf_hash, logical_count, series_schema_fingerprint));
         Ok(())
     }
 

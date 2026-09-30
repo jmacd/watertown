@@ -26,6 +26,22 @@ async fn active_transaction_matches_tinyfs_persistence_contract() {
         .expect("active transaction contract");
     provider::testing::assert_series_read_after_write(&root, &context).await;
     provider::testing::assert_materialization_append(&root, &context).await;
+    let materialized_versions = root
+        .list_file_versions(provider::testing::MATERIALIZED_SERIES_PATH)
+        .await
+        .expect("materialized version metadata");
+    let materialized_metadata = materialized_versions[0]
+        .extended_metadata
+        .as_ref()
+        .expect("materialized extended metadata");
+    assert!(materialized_metadata.contains_key("logical_leaf_hash"));
+    assert_eq!(
+        materialized_metadata
+            .get("logical_count")
+            .map(String::as_str),
+        Some("3")
+    );
+    assert!(materialized_metadata.contains_key("series_schema_fingerprint"));
     tx.commit_test().await.expect("commit contract writes");
 
     provider::testing::assert_registered_provider_closed(&context).await;

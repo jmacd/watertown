@@ -4590,6 +4590,12 @@ impl InnerState {
                         _ = metadata
                             .insert("series_schema_fingerprint".to_string(), fingerprint.clone());
                     }
+                    if let Some(hash) = &record.logical_leaf_hash {
+                        _ = metadata.insert("logical_leaf_hash".to_string(), hash.clone());
+                    }
+                    if let Some(count) = record.logical_count {
+                        _ = metadata.insert("logical_count".to_string(), count.to_string());
+                    }
                     Some(metadata)
                 } else {
                     None

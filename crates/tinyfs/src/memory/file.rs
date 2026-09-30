@@ -316,6 +316,7 @@ struct MemoryFileWriter {
     temporal_metadata: Option<(i64, i64, String)>,
     required_timestamp_column: Option<String>,
     exact_logical_attributes: Option<Vec<u8>>,
+    logical_leaf_metadata: Option<(String, u64, String)>,
 }
 
 impl MemoryFileWriter {
@@ -343,6 +344,7 @@ impl MemoryFileWriter {
             temporal_metadata: None,
             required_timestamp_column: None,
             exact_logical_attributes: None,
+            logical_leaf_metadata: None,
         }
     }
 }
@@ -359,6 +361,16 @@ impl crate::file::FileMetadataWriter for MemoryFileWriter {
 
     fn set_exact_logical_attributes(&mut self, canonical_attrs: Vec<u8>) {
         self.exact_logical_attributes = Some(canonical_attrs);
+    }
+
+    fn set_logical_leaf_metadata(
+        &mut self,
+        logical_leaf_hash: String,
+        logical_count: u64,
+        series_schema_fingerprint: String,
+    ) {
+        self.logical_leaf_metadata =
+            Some((logical_leaf_hash, logical_count, series_schema_fingerprint));
     }
 
     async fn infer_temporal_bounds(&mut self) -> error::Result<(i64, i64, String)> {
@@ -431,6 +443,7 @@ impl AsyncWrite for MemoryFileWriter {
             let temporal_metadata = self.temporal_metadata.clone();
             let required_timestamp_column = self.required_timestamp_column.clone();
             let exact_logical_attributes = self.exact_logical_attributes.clone();
+            let logical_leaf_metadata = self.logical_leaf_metadata.clone();
 
             let future = Box::pin(async move {
                 let result: error::Result<()> = async {
@@ -457,6 +470,18 @@ impl AsyncWrite for MemoryFileWriter {
                             ))
                         })?;
                         _ = extended_metadata.insert("extended_attributes".to_string(), attributes);
+                    }
+                    if let Some((hash, count, fingerprint)) = logical_leaf_metadata {
+                        if count == 0 {
+                            return Err(crate::Error::Other(
+                                "logical leaf metadata requires a positive row count".to_string(),
+                            ));
+                        }
+                        _ = extended_metadata.insert("logical_leaf_hash".to_string(), hash);
+                        _ = extended_metadata
+                            .insert("logical_count".to_string(), count.to_string());
+                        _ = extended_metadata
+                            .insert("series_schema_fingerprint".to_string(), fingerprint);
                     }
                     let extended_metadata =
                         (!extended_metadata.is_empty()).then_some(extended_metadata);

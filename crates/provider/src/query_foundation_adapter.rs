@@ -377,12 +377,7 @@ async fn version_chunk(
         }
         _ => None,
     };
-    let chunk_id = version
-        .extended_metadata
-        .as_ref()
-        .and_then(|metadata| metadata.get("logical_leaf_hash"))
-        .cloned()
-        .unwrap_or_else(|| format!("{file_id}@{}", version.version));
+    let chunk_id = logical_chunk_id(&version, file_id, logical_count)?;
     let url = ListingTableUrl::parse(TinyFsPathBuilder::url_specific_version(
         &file_id,
         version.version,
@@ -395,6 +390,60 @@ async fn version_chunk(
         logical_count,
         event_time_bounds,
     ))
+}
+
+fn logical_chunk_id(
+    version: &FileVersionInfo,
+    file_id: FileID,
+    footer_count: u64,
+) -> Result<String> {
+    let metadata = version.extended_metadata.as_ref();
+    let hash = metadata.and_then(|values| values.get("logical_leaf_hash"));
+    let count = metadata.and_then(|values| values.get("logical_count"));
+    let fingerprint = metadata.and_then(|values| values.get("series_schema_fingerprint"));
+    match (hash, count, fingerprint) {
+        (Some(hash), Some(count), Some(fingerprint)) => {
+            if !is_blake3_hex(hash) {
+                return Err(DataFusionError::Plan(format!(
+                    "TinyFS version {} for {file_id} has invalid logical leaf hash {hash:?}",
+                    version.version
+                )));
+            }
+            if !is_blake3_hex(fingerprint) {
+                return Err(DataFusionError::Plan(format!(
+                    "TinyFS version {} for {file_id} has invalid series schema fingerprint \
+                     {fingerprint:?}",
+                    version.version
+                )));
+            }
+            let count = count.parse::<u64>().map_err(|error| {
+                DataFusionError::Plan(format!(
+                    "TinyFS version {} for {file_id} has invalid logical count {count:?}: {error}",
+                    version.version
+                ))
+            })?;
+            if count != footer_count {
+                return Err(DataFusionError::Plan(format!(
+                    "TinyFS version {} for {file_id} declares logical count {count}, but its \
+                     Parquet footer contains {footer_count} rows",
+                    version.version
+                )));
+            }
+            Ok(hash.clone())
+        }
+        (None, None, None) => Ok(format!("legacy:{file_id}@{}", version.version)),
+        _ => Err(DataFusionError::Plan(format!(
+            "TinyFS version {} for {file_id} has incomplete native-v2 logical leaf metadata",
+            version.version
+        ))),
+    }
+}
+
+fn is_blake3_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 async fn read_metadata(

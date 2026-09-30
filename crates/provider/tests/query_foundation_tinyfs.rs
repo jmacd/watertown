@@ -22,6 +22,7 @@ use query_foundation::materialize::{
 use query_foundation::overlap::OverlapPolicy;
 use query_foundation::snapshot::EventTimeContract;
 use tinyfs::arrow::ParquetExt;
+use tinyfs::arrow::parquet::StreamingSeriesWriter;
 use tinyfs::{FS, MemoryPersistence, ProviderContext};
 
 fn schema() -> SchemaRef {
@@ -375,5 +376,74 @@ async fn stream_failure_and_stale_context_publish_no_version() -> Result<()> {
             .exists(std::path::Path::new("/stale-materialized.series"))
             .await
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn logical_chunk_identity_survives_physical_parquet_repacking() -> Result<()> {
+    let persistence = MemoryPersistence::default();
+    let filesystem = FS::new(persistence.clone())
+        .await
+        .expect("memory filesystem");
+    let session = Arc::new(SessionContext::new());
+    let context = ProviderContext::new(session, Arc::new(persistence));
+    let root = filesystem.root().await.expect("memory root");
+    let logical_hash = "ab".repeat(32);
+    let schema_fingerprint = "cd".repeat(32);
+
+    for (path, row_group_rows) in [
+        ("/packed-small.series", 1usize),
+        ("/packed-large.series", 8_192usize),
+    ] {
+        let mut writer = StreamingSeriesWriter::try_new_with_max_row_group_rows(
+            &root,
+            path,
+            schema(),
+            "ts",
+            row_group_rows,
+        )
+        .await
+        .expect("open packed writer");
+        writer
+            .write(&batch(vec![1, 2, 3], vec![10.0, 20.0, 30.0])?)
+            .await
+            .expect("write packed rows");
+        writer
+            .set_logical_leaf_metadata(logical_hash.clone(), 3, schema_fingerprint.clone())
+            .expect("logical leaf metadata");
+        _ = writer.finish().await.expect("finish packed writer");
+    }
+
+    let small_versions = root
+        .list_file_versions("/packed-small.series")
+        .await
+        .expect("small versions");
+    let large_versions = root
+        .list_file_versions("/packed-large.series")
+        .await
+        .expect("large versions");
+    assert_ne!(
+        small_versions[0].blake3, large_versions[0].blake3,
+        "test requires physically distinct Parquet objects"
+    );
+
+    let mut chunk_ids = Vec::new();
+    for (path, snapshot_id) in [
+        ("/packed-small.series", "packed-small"),
+        ("/packed-large.series", "packed-large"),
+    ] {
+        let file_id = root.get_node_path(path).await.expect("packed node").id();
+        let snapshot = capture_tinyfs_snapshot(
+            &context,
+            file_id,
+            snapshot_id,
+            schema(),
+            Some(EventTimeContract::new("ts")),
+            OverlapPolicy::PreserveAll,
+        )
+        .await?;
+        chunk_ids.push(snapshot.snapshot().chunks()[0].chunk_id().to_owned());
+    }
+    assert_eq!(chunk_ids, vec![logical_hash.clone(), logical_hash]);
     Ok(())
 }
