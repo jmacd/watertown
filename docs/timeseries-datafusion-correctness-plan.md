@@ -918,6 +918,15 @@ counters. Phase 9 is complete.
 **Gate:** production graphs satisfy the asymptotic requirements without
 materialized intermediate series added to conceal plan defects.
 
+Reports and monitoring now construct event-time-bounded providers and retain
+exact row predicates. Status-grid journal reads use event-time bounds for
+initial seeding and version watermarks thereafter. Deterministic site export
+verifies and reuses an unchanged manifest prefix, performs zero source scans
+for a no-change build, and streams a dirty tail or full rewrite from one ordered
+source execution with one Parquet writer open at a time. It no longer executes
+the source solely to enumerate partitions. The Noyo benchmark protocol and
+water/septic qualification remain before the Phase 10 gate is complete.
+
 ### Phase 11: native-v2 backup and restore verification
 
 1. Map query-visible immutable logical leaves to current
