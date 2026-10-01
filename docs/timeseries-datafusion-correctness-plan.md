@@ -1067,8 +1067,24 @@ accepted and the stream is polled to successful completion; cancellation after
 that batch leaves the prior manifest untouched. Corrupt manifest JSON fails
 loudly rather than silently rebuilding.
 
-Production `/pump-state/well-pump-state` and daily-usage migration remains
-pending the isolated water replay and public-schema verification.
+Production `/pump-state/well-pump-state` now uses the typed provider,
+`/usage/well-usage-rate` exposes `pump_minutes`, and
+`/usage/well-usage-daily` uses the direct one-day reducer with a 14-day hot
+window and aggressively sealed partials. A data-bearing isolated four-hour
+water replay preserved the public pump (`timestamp`, `depth`, `phase`), rate
+(`timestamp`, `depth`, `usage_gpm`, `pump_minutes`), and daily (`timestamp`,
+`gallons`, `pump_minutes`) schemas. All eight downstream outputs completed a
+warm traversal in 3.276 seconds; daily usage reused its persistent state
+without executing the dynamic source or recording a global/non-incremental
+decision. The migration removes daily usage from the global set, leaving six
+distinct stateful nodes: typed pump state plus drawdown, Horner, calibration,
+leak, and overlay.
+
+That replay also covered aggregate pushdown into the custom physical operator:
+zero-column projections now construct Arrow batches with an explicit row count,
+so `COUNT(*)` over pump state returns all 241 fixture rows instead of failing
+batch construction. The fixture classified 6 pumping, 4 recovering, and 231
+static samples and produced one daily row with 6 pump minutes.
 
 ### Phase 11: native-v2 backup and restore verification
 

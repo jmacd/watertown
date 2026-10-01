@@ -11,7 +11,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Float64Array, StringArray, TimestampMicrosecondArray};
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::Column;
@@ -788,8 +788,12 @@ fn rows_to_batch(
             .collect(),
         None => full_columns,
     };
-    RecordBatch::try_new(output_schema, columns)
-        .map_err(|error| DataFusionError::ArrowError(Box::new(error), None))
+    RecordBatch::try_new_with_options(
+        output_schema,
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(rows.len())),
+    )
+    .map_err(|error| DataFusionError::ArrowError(Box::new(error), None))
 }
 
 fn validate_config(config: &[u8]) -> TinyFSResult<Value> {
@@ -899,6 +903,19 @@ mod tests {
             ),
         ])
         .unwrap()
+    }
+
+    #[test]
+    fn zero_column_projection_preserves_row_count() {
+        let rows = [PumpStateRow {
+            event_time: 0,
+            minute: 0,
+            depth: 45.0,
+            phase: PumpPhase::Static,
+        }];
+        let batch = rows_to_batch(&rows, Some(&[]), Arc::new(Schema::empty())).unwrap();
+        assert_eq!(batch.num_columns(), 0);
+        assert_eq!(batch.num_rows(), 1);
     }
 
     #[tokio::test]
