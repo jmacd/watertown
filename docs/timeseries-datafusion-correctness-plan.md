@@ -1033,9 +1033,8 @@ episode and retroactive suffix repair; source reads include only the required
 ceiling context before that anchor. Tests prove that a later trough revises the
 whole provisional episode, a changed static boundary can rejoin the preceding
 episode, malformed ordering fails, and closed-episode append work is independent
-of retained history. Production provider/cache integration and comparison
-against the existing SQL output remain before `/pump-state/well-pump-state` can
-adopt the recipe.
+of retained history. Durable boundary-cache integration remains before
+`/pump-state/well-pump-state` can declare bounded lineage.
 
 Temporal-reduce outputs now satisfy the prerequisite source contract for that
 integration: cache-backed reductions expose recursive physical lineage and
@@ -1045,6 +1044,16 @@ bounded lineage after cold creation, no-change reuse, and append repair. The
 contract remains unavailable when the reduction cache or recursive source
 lineage is unavailable, so a cacheless single-pass reduction is never
 misdeclared incremental.
+
+The recipe is now wired into `pump-state-series` as a streaming physical
+operator over an ordered, filtered depth source. It emits bounded record
+batches, preserves the public `timestamp`, `depth`, and `phase` schema, and
+matches the complete existing production window SQL row-for-row on a
+disturbance/recovery fixture. Until durable open-episode and repair-index state
+is published, the factory deliberately records a global/non-incremental
+decision and exposes no lineage; replacing the production SQL before that
+state exists would improve memory behavior but would not satisfy the Phase 10
+asymptotic gate.
 
 ### Phase 11: native-v2 backup and restore verification
 

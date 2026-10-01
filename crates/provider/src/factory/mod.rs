@@ -9,6 +9,7 @@ pub mod journal_ingest;
 mod lazy_sql_file;
 pub mod logfile_ingest;
 pub mod materialize_series;
+pub mod pump_state;
 pub mod rate_limit;
 pub mod sql_derived;
 pub mod storage_azure;
