@@ -48,117 +48,60 @@ impl PumpStateRecipe {
     /// move its pumping/recovering split. [`PumpStateBoundary`] records that
     /// island so the next append replaces it rather than treating it as final.
     pub fn classify(self, samples: &[DepthSample]) -> Result<PumpStateClassification> {
-        validate_samples(samples)?;
-        let mut ceiling = VecDeque::<(usize, i64, f64)>::new();
-        let mut phases = vec![PumpPhase::Static; samples.len()];
-        let mut episode_start = None;
-        let mut episodes = Vec::new();
-        let mut largest_episode_rows = 0;
-        let mut maximum_lookback_rows = 0;
-
-        for (index, sample) in samples.iter().enumerate() {
-            let oldest = sample
-                .minute
-                .checked_sub(self.lookback_minutes)
-                .unwrap_or(i64::MIN);
-            while ceiling
-                .front()
-                .is_some_and(|(_, minute, _)| *minute < oldest)
-            {
-                _ = ceiling.pop_front();
-            }
-            while ceiling
-                .back()
-                .is_some_and(|(_, _, depth)| *depth <= sample.depth)
-            {
-                _ = ceiling.pop_back();
-            }
-            ceiling.push_back((index, sample.minute, sample.depth));
-            maximum_lookback_rows = maximum_lookback_rows.max(ceiling.len());
-            let trailing_ceiling = ceiling
-                .front()
-                .map(|(_, _, depth)| *depth)
-                .expect("current sample is always present in trailing ceiling");
-            let disturbed = sample.depth < trailing_ceiling - self.disturbance_drop;
-            let continues_episode = episode_start.is_some()
-                && index > 0
-                && samples[index - 1].minute.checked_add(1) == Some(sample.minute);
-
-            match (disturbed, continues_episode, episode_start) {
-                (true, true, Some(_)) => {}
-                (true, _, Some(start)) => {
-                    classify_episode(samples, &mut phases, start, index);
-                    episodes.push(PumpEpisodeSpan {
-                        start: samples[start].minute,
-                        end: samples[index - 1].minute,
-                        open: false,
-                    });
-                    largest_episode_rows = largest_episode_rows.max(index - start);
-                    episode_start = Some(index);
-                }
-                (true, _, None) => episode_start = Some(index),
-                (false, _, Some(start)) => {
-                    classify_episode(samples, &mut phases, start, index);
-                    episodes.push(PumpEpisodeSpan {
-                        start: samples[start].minute,
-                        end: samples[index - 1].minute,
-                        open: false,
-                    });
-                    largest_episode_rows = largest_episode_rows.max(index - start);
-                    episode_start = None;
-                }
-                (false, _, None) => {}
-            }
+        let mut machine = PumpStateMachine::new(self);
+        let mut rows = Vec::with_capacity(samples.len());
+        for sample in samples {
+            rows.extend(machine.push(*sample)?);
         }
-
-        if let Some(start) = episode_start {
-            classify_episode(samples, &mut phases, start, samples.len());
-            episodes.push(PumpEpisodeSpan {
-                start: samples[start].minute,
-                end: samples
-                    .last()
-                    .expect("open episode requires a final sample")
-                    .minute,
-                open: true,
-            });
-            largest_episode_rows = largest_episode_rows.max(samples.len() - start);
-        }
-
-        let rows = samples
-            .iter()
-            .zip(phases)
-            .map(|(sample, phase)| PumpStateRow {
-                event_time: sample.event_time,
-                minute: sample.minute,
-                depth: sample.depth,
-                phase,
-            })
-            .collect();
+        let mut finish = machine.finish();
+        rows.append(&mut finish.provisional_rows);
         Ok(PumpStateClassification {
             rows,
-            episodes,
-            boundary: PumpStateBoundary {
-                observed_through: samples.last().map(|sample| sample.minute),
-                open_episode_start: episode_start.map(|start| samples[start].minute),
-            },
-            metrics: PumpStateMetrics {
-                source_rows: samples.len() as u64,
-                maximum_lookback_rows: maximum_lookback_rows as u64,
-                largest_episode_rows: largest_episode_rows as u64,
-            },
+            episodes: finish.episodes,
+            boundary: finish.boundary,
+            metrics: finish.metrics,
         })
     }
 }
 
-fn validate_samples(samples: &[DepthSample]) -> Result<()> {
-    for (index, sample) in samples.iter().enumerate() {
+/// Streaming classifier that retains only ceiling candidates and one open
+/// disturbed episode.
+pub struct PumpStateMachine {
+    recipe: PumpStateRecipe,
+    ceiling: VecDeque<(i64, f64)>,
+    open_episode: Vec<DepthSample>,
+    previous: Option<DepthSample>,
+    episodes: Vec<PumpEpisodeSpan>,
+    metrics: PumpStateMetrics,
+}
+
+impl PumpStateMachine {
+    /// Start a classifier with no retained history.
+    #[must_use]
+    pub fn new(recipe: PumpStateRecipe) -> Self {
+        Self {
+            recipe,
+            ceiling: VecDeque::new(),
+            open_episode: Vec::new(),
+            previous: None,
+            episodes: Vec::new(),
+            metrics: PumpStateMetrics::default(),
+        }
+    }
+
+    /// Consume one ordered observation and return newly stable output rows.
+    ///
+    /// An open disturbed episode returns no rows until a static sample or
+    /// minute gap closes it, because a future trough can revise every phase in
+    /// that episode.
+    pub fn push(&mut self, sample: DepthSample) -> Result<Vec<PumpStateRow>> {
         if !sample.depth.is_finite() {
             return Err(DataFusionError::Execution(format!(
                 "pump-state depth at minute {} is not finite",
                 sample.minute
             )));
         }
-        if let Some(previous) = index.checked_sub(1).map(|previous| samples[previous]) {
+        if let Some(previous) = self.previous {
             if sample.minute <= previous.minute {
                 return Err(DataFusionError::Execution(format!(
                     "pump-state input minutes must be strictly increasing; {} follows {}",
@@ -172,12 +115,93 @@ fn validate_samples(samples: &[DepthSample]) -> Result<()> {
                 )));
             }
         }
+
+        let oldest = sample
+            .minute
+            .checked_sub(self.recipe.lookback_minutes)
+            .unwrap_or(i64::MIN);
+        while self
+            .ceiling
+            .front()
+            .is_some_and(|(minute, _)| *minute < oldest)
+        {
+            _ = self.ceiling.pop_front();
+        }
+        while self
+            .ceiling
+            .back()
+            .is_some_and(|(_, depth)| *depth <= sample.depth)
+        {
+            _ = self.ceiling.pop_back();
+        }
+        self.ceiling.push_back((sample.minute, sample.depth));
+        self.metrics.source_rows += 1;
+        self.metrics.maximum_lookback_rows = self
+            .metrics
+            .maximum_lookback_rows
+            .max(self.ceiling.len() as u64);
+
+        let trailing_ceiling = self
+            .ceiling
+            .front()
+            .map(|(_, depth)| *depth)
+            .expect("current sample is always present in trailing ceiling");
+        let disturbed = sample.depth < trailing_ceiling - self.recipe.disturbance_drop;
+        let continues_episode = !self.open_episode.is_empty()
+            && self
+                .previous
+                .is_some_and(|previous| previous.minute.checked_add(1) == Some(sample.minute));
+
+        let mut stable = Vec::new();
+        if disturbed {
+            if !continues_episode && !self.open_episode.is_empty() {
+                stable.extend(self.close_episode(false));
+            }
+            self.open_episode.push(sample);
+        } else {
+            stable.extend(self.close_episode(false));
+            stable.push(PumpStateRow::from_sample(sample, PumpPhase::Static));
+        }
+        self.previous = Some(sample);
+        Ok(stable)
     }
-    Ok(())
+
+    /// Finish the current slice, returning its provisional suffix and resumable
+    /// boundary. Closed rows have already been emitted by [`Self::push`].
+    #[must_use]
+    pub fn finish(mut self) -> PumpStateStreamFinish {
+        let open_episode_start = self.open_episode.first().map(|sample| sample.minute);
+        let provisional_rows = self.close_episode(true);
+        PumpStateStreamFinish {
+            provisional_rows,
+            episodes: self.episodes,
+            boundary: PumpStateBoundary {
+                observed_through: self.previous.map(|sample| sample.minute),
+                open_episode_start,
+            },
+            metrics: self.metrics,
+        }
+    }
+
+    fn close_episode(&mut self, open: bool) -> Vec<PumpStateRow> {
+        if self.open_episode.is_empty() {
+            return Vec::new();
+        }
+        self.metrics.largest_episode_rows = self
+            .metrics
+            .largest_episode_rows
+            .max(self.open_episode.len() as u64);
+        self.episodes.push(PumpEpisodeSpan {
+            start: self.open_episode.first().expect("non-empty episode").minute,
+            end: self.open_episode.last().expect("non-empty episode").minute,
+            open,
+        });
+        classify_episode(&std::mem::take(&mut self.open_episode))
+    }
 }
 
-fn classify_episode(samples: &[DepthSample], phases: &mut [PumpPhase], start: usize, end: usize) {
-    let trough = (start..end)
+fn classify_episode(samples: &[DepthSample]) -> Vec<PumpStateRow> {
+    let trough = (0..samples.len())
         .min_by(|left, right| {
             samples[*left]
                 .depth
@@ -185,13 +209,18 @@ fn classify_episode(samples: &[DepthSample], phases: &mut [PumpPhase], start: us
                 .then_with(|| samples[*left].minute.cmp(&samples[*right].minute))
         })
         .expect("episode always contains at least one row");
-    for (index, phase) in phases.iter_mut().enumerate().take(end).skip(start) {
-        *phase = if index <= trough {
-            PumpPhase::Pumping
-        } else {
-            PumpPhase::Recovering
-        };
-    }
+    samples
+        .iter()
+        .enumerate()
+        .map(|(index, sample)| {
+            let phase = if index <= trough {
+                PumpPhase::Pumping
+            } else {
+                PumpPhase::Recovering
+            };
+            PumpStateRow::from_sample(*sample, phase)
+        })
+        .collect()
 }
 
 /// One validated depth observation.
@@ -227,6 +256,17 @@ pub struct PumpStateRow {
     pub depth: f64,
     /// Classified phase.
     pub phase: PumpPhase,
+}
+
+impl PumpStateRow {
+    fn from_sample(sample: DepthSample, phase: PumpPhase) -> Self {
+        Self {
+            event_time: sample.event_time,
+            minute: sample.minute,
+            depth: sample.depth,
+            phase,
+        }
+    }
 }
 
 /// Persistent boundary needed to plan the next append.
@@ -427,6 +467,19 @@ pub struct PumpStateMetrics {
     pub maximum_lookback_rows: u64,
     /// Largest disturbed episode in the supplied slice.
     pub largest_episode_rows: u64,
+}
+
+/// Final state from a streaming classification slice.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PumpStateStreamFinish {
+    /// Provisional rows from the still-open final episode.
+    pub provisional_rows: Vec<PumpStateRow>,
+    /// Closed episodes plus the optional final open episode.
+    pub episodes: Vec<PumpEpisodeSpan>,
+    /// Boundary state for the next append.
+    pub boundary: PumpStateBoundary,
+    /// Physical work and retained-state observations.
+    pub metrics: PumpStateMetrics,
 }
 
 /// Classified rows, resumable boundary, and measurable work.

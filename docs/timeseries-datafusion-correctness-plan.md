@@ -1024,6 +1024,10 @@ That prerequisite now has an executable foundation contract. The typed
 pump-state recipe computes the 60-minute trailing ceiling with a bounded
 monotonic deque, preserves minute-gap island semantics, splits each disturbed
 island at its earliest minimum, and marks the final island provisional.
+Its streaming state machine emits static rows and closed episodes immediately,
+retaining only ceiling candidates and the one semantically unavoidable open
+episode; a 100,000-row static-history regression retains no history-sized
+buffer.
 Persisted disturbed-island spans anchor both append replacement of an open
 episode and retroactive suffix repair; source reads include only the required
 ceiling context before that anchor. Tests prove that a later trough revises the

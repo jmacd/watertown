@@ -4,7 +4,7 @@
 
 use datafusion::error::Result;
 use query_foundation::plans::pump_state::{
-    DepthSample, PumpEpisodeSpan, PumpPhase, PumpStateBoundary, PumpStateRecipe,
+    DepthSample, PumpEpisodeSpan, PumpPhase, PumpStateBoundary, PumpStateMachine, PumpStateRecipe,
 };
 use query_foundation::statistics::TimeInterval;
 
@@ -197,6 +197,24 @@ fn closed_append_work_is_independent_of_retained_history() -> Result<()> {
     );
     assert_eq!(short_plan.replace_from(), 101);
     assert_eq!(long_plan.replace_from(), 10_001);
+    Ok(())
+}
+
+#[test]
+fn cold_static_history_streams_without_retaining_history() -> Result<()> {
+    let recipe = PumpStateRecipe::try_new(60, 0.3)?;
+    let mut machine = PumpStateMachine::new(recipe);
+    let mut largest_emission = 0;
+    for minute in 0..100_000 {
+        largest_emission = largest_emission.max(machine.push(sample(minute, 45.0))?.len());
+    }
+    let finish = machine.finish();
+    assert_eq!(largest_emission, 1);
+    assert!(finish.provisional_rows.is_empty());
+    assert!(finish.episodes.is_empty());
+    assert_eq!(finish.metrics.source_rows, 100_000);
+    assert_eq!(finish.metrics.maximum_lookback_rows, 1);
+    assert_eq!(finish.metrics.largest_episode_rows, 0);
     Ok(())
 }
 
