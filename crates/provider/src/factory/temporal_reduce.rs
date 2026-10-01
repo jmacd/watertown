@@ -2056,6 +2056,72 @@ impl tinyfs::QueryableFile for TemporalReduceSqlFile {
         log::debug!("planning typed single-pass temporal-reduce: id={id}");
         self.typed_single_pass_provider(id, context).await
     }
+
+    async fn as_table_provider_bounded(
+        &self,
+        id: tinyfs::FileID,
+        context: &tinyfs::ProviderContext,
+        bounds: tinyfs::SeriesReadBounds,
+    ) -> tinyfs::Result<Arc<dyn datafusion::catalog::TableProvider>> {
+        let provider = self.as_table_provider(id, context).await?;
+        let Some(event_time_lo) = bounds.event_time_lo else {
+            return Ok(provider);
+        };
+        let frame = context
+            .datafusion_session
+            .read_table(provider)
+            .map_other_context("read temporal-reduce output for bounded plan")?
+            .filter(col(Column::from_name(&self.config.time_column)).gt_eq(lit(
+                datafusion::scalar::ScalarValue::TimestampMicrosecond(Some(event_time_lo), None),
+            )))
+            .map_other_context("apply temporal-reduce output bound")?;
+        Ok(Arc::new(datafusion::catalog::view::ViewTable::new(
+            frame.logical_plan().clone(),
+            Some("bounded typed temporal-reduce output".to_owned()),
+        )))
+    }
+
+    async fn query_lineage(
+        &self,
+        _id: tinyfs::FileID,
+        context: &tinyfs::ProviderContext,
+    ) -> TinyFSResult<Option<tinyfs::QueryLineage>> {
+        if context.cache_dir().is_none()
+            || self
+                .config
+                .transforms
+                .as_ref()
+                .is_some_and(|transforms| !transforms.is_empty())
+        {
+            return Ok(None);
+        }
+
+        let config = serde_json::to_value(&self.config)
+            .map_other_context("temporal-reduce lineage config")?;
+        let recipe =
+            serde_json::to_vec(&config).map_other_context("temporal-reduce lineage recipe")?;
+        let mut recipe_hasher = blake3::Hasher::new();
+        _ = recipe_hasher.update(b"watertown:temporal-reduce-lineage:v1");
+        update_schema_hash(&mut recipe_hasher, &recipe);
+        update_schema_hash(&mut recipe_hasher, &self.duration.as_micros().to_le_bytes());
+        update_schema_hash(&mut recipe_hasher, self.source_path.as_bytes());
+        update_schema_hash(&mut recipe_hasher, self.pattern_url.as_bytes());
+
+        let root = self.context.root().await?;
+        let fs = self.context.context.filesystem();
+        let provider =
+            crate::Provider::with_context(Arc::new(fs), Arc::new(context.clone())).with_root(root);
+        let Some(nested) = provider
+            .query_lineage_for_url(&self.pattern_url)
+            .await
+            .map_other_context("temporal-reduce lineage source")?
+        else {
+            return Ok(None);
+        };
+        let mut lineage = tinyfs::QueryLineage::new(recipe_hasher.finalize().to_hex().to_string());
+        lineage.extend(nested);
+        Ok(Some(lineage))
+    }
 }
 
 /// Build the full source URL string for a matched source file under a format

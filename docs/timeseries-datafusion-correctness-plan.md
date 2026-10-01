@@ -1037,6 +1037,15 @@ of retained history. Production provider/cache integration and comparison
 against the existing SQL output remain before `/pump-state/well-pump-state` can
 adopt the recipe.
 
+Temporal-reduce outputs now satisfy the prerequisite source contract for that
+integration: cache-backed reductions expose recursive physical lineage and
+apply event-time lower bounds to their reconstructed output. A persistent
+TLogFS regression proves a direct reduction can itself be consumed through
+bounded lineage after cold creation, no-change reuse, and append repair. The
+contract remains unavailable when the reduction cache or recursive source
+lineage is unavailable, so a cacheless single-pass reduction is never
+misdeclared incremental.
+
 ### Phase 11: native-v2 backup and restore verification
 
 1. Map query-visible immutable logical leaves to current

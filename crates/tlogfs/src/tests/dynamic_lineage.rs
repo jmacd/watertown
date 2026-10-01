@@ -368,6 +368,51 @@ async fn direct_reduction_reuses_and_repairs_timestamp_local_dynamic_source() {
         segment_manifests(&cold_cache),
         "bounded append repair must advance the direct reducer manifest"
     );
+
+    let tx = persistence.begin_test().await.unwrap();
+    let root = tx.root().await.unwrap();
+    let node = root.get_node_path(Path::new("/usage/daily")).await.unwrap();
+    let file = node.as_file().await.unwrap();
+    let handle = file.handle.get_file().await;
+    let guard = handle.lock().await;
+    let queryable = guard.as_queryable().unwrap();
+    let context = tx.state().unwrap().as_provider_context();
+    let lineage = queryable
+        .query_lineage(node.id(), &context)
+        .await
+        .unwrap()
+        .expect("direct reduction must expose recursive bounded lineage");
+    assert!(
+        lineage
+            .leaves
+            .iter()
+            .any(|leaf| leaf.max_event_time == Some(97 * 3_600_000_000))
+    );
+    let bounded = queryable
+        .as_table_provider_bounded(
+            node.id(),
+            &context,
+            tinyfs::SeriesReadBounds::from_event_time_lo(90 * 3_600_000_000),
+        )
+        .await
+        .unwrap();
+    drop(guard);
+    let bounded_batches = context
+        .datafusion_session
+        .read_table(bounded)
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        bounded_batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        1,
+        "bounded direct-reduction output must exclude retained daily history"
+    );
+    tx.commit_test().await.unwrap();
 }
 
 #[tokio::test]
