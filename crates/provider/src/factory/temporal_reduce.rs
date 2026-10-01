@@ -323,13 +323,11 @@ impl LevelChange {
         }
     }
 
-    /// The export hint's `changed_since`, where `None` means "rewrite every
-    /// partition". Unchanged levels are reported as `None` as well; the hint's
-    /// digest is what lets the exporter skip them.
-    fn export_hint(self) -> Option<i64> {
+    fn export_change(self) -> tinyfs::ExportChange {
         match self {
-            LevelChange::Since(s) => Some(s),
-            LevelChange::Nothing | LevelChange::Everything => None,
+            LevelChange::Nothing => tinyfs::ExportChange::Unchanged,
+            LevelChange::Since(s) => tinyfs::ExportChange::Since(s),
+            LevelChange::Everything => tinyfs::ExportChange::Everything,
         }
     }
 
@@ -1067,10 +1065,10 @@ impl TemporalReduceSqlFile {
         }
 
         let final_level = final_level.expect("at least the finest level is always built");
-        let (table_provider, digest, changed_since) = (
+        let (table_provider, digest, export_change) = (
             final_level.provider,
             final_level.digest,
-            final_level.changed.export_hint(),
+            final_level.changed.export_change(),
         );
 
         // The segments + hot file store mergeable partials
@@ -1102,13 +1100,16 @@ impl TemporalReduceSqlFile {
         // Publish an export hint so the sitegen export layer can skip rewriting
         // output partitions whose buckets did not change this build. The digest
         // is the manifest digest (stable when content is unchanged); the export
-        // reuses partitions strictly before `changed_since`, or rewrites all when
-        // it is None (full rebuild or unchanged reuse).
+        // reuses partitions strictly before a bounded dirty watermark, skips a
+        // recipe-only change, or rewrites all after a full rebuild.
+        log::debug!(
+            "temporal-reduce export hint: node={id} digest={digest} change={export_change:?}"
+        );
         context.set_export_hint(
             &id,
             tinyfs::ExportHint {
                 digest,
-                changed_since,
+                change: export_change,
             },
         )?;
 
@@ -6100,10 +6101,13 @@ output_aliases:
         let (rows1, hint1) = collect_daily(&make_ctx(Some(cache_dir.clone())), config()).await;
         assert_eq!(rows1.len(), 1, "one daily bucket after build 1");
         assert!(approx(rows1[0].0, 232.0), "day2 avg wrong: {:?}", rows1);
-        // First build is a cache miss: the hint carries a digest but no
-        // changed_since watermark, so the export does a full deterministic write.
+        // First build is a cache miss, so the export does a full deterministic write.
         let hint1 = hint1.expect("build 1 publishes an export hint");
-        assert!(hint1.changed_since.is_none(), "build 1 is a full rebuild");
+        assert_eq!(
+            hint1.change,
+            tinyfs::ExportChange::Everything,
+            "build 1 is a full rebuild"
+        );
 
         // Build 2 (APPEND): add day 3 -> splice cached day2 prefix + fresh day3.
         {
@@ -6122,24 +6126,23 @@ output_aliases:
             "append splice values wrong: {:?}",
             rows2
         );
-        // Append splice changes buckets from day 3 onward, so the hint reports a
-        // changed_since watermark at day 3 (epoch seconds) and a new digest.
+        // Append splice changes buckets from day 3 onward and publishes a new digest.
         let hint2 = hint2.expect("build 2 publishes an export hint");
         assert_ne!(
             hint1.digest, hint2.digest,
             "append changes the merged digest"
         );
-        // `changed_since` is derived from the event-time range tlogfs records on
+        // The bounded change is derived from the event-time range tlogfs records on
         // each source version. MemoryPersistence records none, so every version
         // reports an unknown range and the dirty range is the whole axis -- the
         // export rewrites everything. Correct, merely unoptimized; `dirty_lo_us`
         // is unit-tested directly on known ranges. What matters here is that the
         // unknown case degrades to MORE work, never to stale output.
         assert!(
-            hint2.changed_since.is_none(),
+            hint2.change == tinyfs::ExportChange::Everything,
             "sources with no recorded event range must widen the dirty range, \
              not narrow it: {:?}",
-            hint2.changed_since
+            hint2.change
         );
 
         // Build 3 (BACKFILL): add day 1, older than everything already built and

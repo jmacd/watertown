@@ -352,11 +352,42 @@ pub async fn export_table_provider_to_parquet(
         return Ok((results, schema));
     }
 
+    // A reducer may prove that a wildcard/version recipe change produced no
+    // output changes for this series. Adopt the new recipe digest without
+    // scanning the source or rewriting byte-identical partitions.
+    if let (Some(h), Some(seed)) = (hint, seed_manifest.as_ref())
+        && h.change == tinyfs::ExportChange::Unchanged
+        && !seed.partitions.is_empty()
+    {
+        let mut results = Vec::new();
+        for p in &seed.partitions {
+            let abs = base_output_dir.join(&p.file);
+            verify_partition_digest(&abs, &p.digest, source_label)?;
+            results.push((
+                captures.to_vec(),
+                ExportOutput {
+                    file: p.file.clone(),
+                    start_time: p.start_time,
+                    end_time: p.end_time,
+                },
+            ));
+        }
+        let mut manifest = seed.clone();
+        manifest.digest = Some(h.digest.clone());
+        write_series_manifest(&manifest_path, &manifest)?;
+        let schema = read_parquet_schema(export_dir)?;
+        provider_ctx.record_export_outcome(0, results.len(), 0);
+        return Ok((results, schema));
+    }
+
     // Reconcile mode reuses partitions strictly before the changed-bucket
-    // watermark; it requires both a seed manifest and a Some(lo) watermark.
+    // watermark; it requires both a seed manifest and a bounded change.
     // Otherwise the output is fully rebuilt with deterministic file names.
     let reuse_before: Option<i64> = match (hint, seed_manifest.as_ref()) {
-        (Some(h), Some(_)) => h.changed_since,
+        (Some(h), Some(_)) => match h.change {
+            tinyfs::ExportChange::Since(lo) => Some(lo),
+            tinyfs::ExportChange::Unchanged | tinyfs::ExportChange::Everything => None,
+        },
         _ => None,
     };
     let can_reuse = reuse_before.is_some() && seed_manifest.is_some();
@@ -1693,7 +1724,7 @@ mod tests {
         let rows = [(ts(2025, 6, 15), 1.0), (ts(2025, 7, 10), 2.0)];
         let hint = tinyfs::ExportHint {
             digest: "DIGEST-A".into(),
-            changed_since: None,
+            change: tinyfs::ExportChange::Everything,
         };
 
         let (_r, _s) = export_table_provider_to_parquet(
@@ -1760,6 +1791,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_export_recipe_only_change_adopts_digest_without_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let export_dir = base.join("WellDepth/res=1m");
+        let ctx = create_provider_context();
+        let parts = vec!["year".to_string(), "month".to_string()];
+        let rows = [(ts(2025, 6, 15), 1.0), (ts(2025, 7, 10), 2.0)];
+
+        let (_r, _s) = export_table_provider_to_parquet(
+            mem_table(&rows),
+            "wd",
+            &export_dir,
+            &parts,
+            &["x".into()],
+            base,
+            &ctx,
+            "timestamp",
+            Some(&tinyfs::ExportHint {
+                digest: "D1".into(),
+                change: tinyfs::ExportChange::Everything,
+            }),
+        )
+        .await
+        .unwrap();
+        let jun = export_dir.join("year=2025/month=6/data.parquet");
+        let jul = export_dir.join("year=2025/month=7/data.parquet");
+        let jun_ino = inode(&jun);
+        let jul_ino = inode(&jul);
+
+        let (table, scans) = scan_counting_table(mem_table(&rows));
+        let (results, _s) = export_table_provider_to_parquet(
+            table,
+            "wd",
+            &export_dir,
+            &parts,
+            &["x".into()],
+            base,
+            &ctx,
+            "timestamp",
+            Some(&tinyfs::ExportHint {
+                digest: "D2".into(),
+                change: tinyfs::ExportChange::Unchanged,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(scans.load(Ordering::Relaxed), 0);
+        assert_eq!(inode(&jun), jun_ino);
+        assert_eq!(inode(&jul), jul_ino);
+        let manifest = read_series_manifest(&export_dir.join(MANIFEST_FILE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(manifest.digest.as_deref(), Some("D2"));
+        let metrics = ctx.plan_visibility_metrics();
+        assert_eq!(metrics.export_source_executions, 1);
+        assert_eq!(metrics.export_partitions_reused, 2);
+        assert_eq!(metrics.export_partitions_written, 2);
+    }
+
+    #[tokio::test]
     async fn test_export_partial_reconcile_reuses_unchanged_partitions() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
@@ -1778,7 +1871,7 @@ mod tests {
             "timestamp",
             Some(&tinyfs::ExportHint {
                 digest: "D1".into(),
-                changed_since: None,
+                change: tinyfs::ExportChange::Everything,
             }),
         )
         .await
@@ -1808,7 +1901,7 @@ mod tests {
             "timestamp",
             Some(&tinyfs::ExportHint {
                 digest: "D2".into(),
-                changed_since: Some(lo),
+                change: tinyfs::ExportChange::Since(lo),
             }),
         )
         .await

@@ -27,16 +27,21 @@ pub type Result<T> = std::result::Result<T, crate::Error>;
 /// table provider, consumed by the sitegen export layer to skip rewriting
 /// unchanged output partitions.
 ///
-/// `digest` identifies the current merged output content. When it equals the
-/// digest recorded in the seed manifest, the entire series output is unchanged
-/// and every partition file can be reused. `changed_since` bounds which output
-/// buckets changed when the digest differs: buckets with a timestamp strictly
-/// below it are unchanged, so their partitions can be reused. `None` means the
-/// output was fully rebuilt and every partition must be rewritten.
+/// `digest` identifies the current merged output recipe. When it equals the
+/// digest recorded in the seed manifest, every partition file can be reused.
+/// `change` distinguishes a recipe-only change from a bounded output change and
+/// a full rebuild, so unrelated wildcard members do not force a source scan.
 #[derive(Clone, Debug)]
 pub struct ExportHint {
     pub digest: String,
-    pub changed_since: Option<i64>,
+    pub change: ExportChange,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExportChange {
+    Unchanged,
+    Since(i64),
+    Everything,
 }
 
 /// Visible counts of fallback plans and dynamic-source executions.
