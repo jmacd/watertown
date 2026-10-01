@@ -7,5 +7,6 @@
 pub mod combine;
 pub mod join;
 pub mod pivot;
+pub mod pump_state;
 pub mod reduce;
 pub mod transform;

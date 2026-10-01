@@ -1020,6 +1020,19 @@ configuration was not migrated because that would only relabel a retained
 history scan. A typed pump-state recipe with persisted open-episode and repair
 boundary state is now a prerequisite for incrementally reducing daily usage.
 
+That prerequisite now has an executable foundation contract. The typed
+pump-state recipe computes the 60-minute trailing ceiling with a bounded
+monotonic deque, preserves minute-gap island semantics, splits each disturbed
+island at its earliest minimum, and marks the final island provisional.
+Persisted disturbed-island spans anchor both append replacement of an open
+episode and retroactive suffix repair; source reads include only the required
+ceiling context before that anchor. Tests prove that a later trough revises the
+whole provisional episode, a changed static boundary can rejoin the preceding
+episode, malformed ordering fails, and closed-episode append work is independent
+of retained history. Production provider/cache integration and comparison
+against the existing SQL output remain before `/pump-state/well-pump-state` can
+adopt the recipe.
+
 ### Phase 11: native-v2 backup and restore verification
 
 1. Map query-visible immutable logical leaves to current
