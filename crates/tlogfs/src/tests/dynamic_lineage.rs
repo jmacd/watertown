@@ -4,6 +4,7 @@
 
 use crate::persistence::OpLogPersistence;
 use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, TimestampMicrosecondArray};
+use provider::factory::pump_state::PumpStateConfig;
 use provider::factory::sql_derived::{SqlDerivedConfig, SqlDerivedLocality};
 use provider::factory::temporal_reduce::{
     AggregationConfig, AggregationType, TemporalReduceConfig, TemporalReduceSeriesConfig,
@@ -235,6 +236,158 @@ async fn query_direct_reduced(
     let metrics = context.plan_visibility_metrics();
     tx.commit_test().await.unwrap();
     (rows, metrics)
+}
+
+#[tokio::test]
+async fn pump_state_manifest_bounds_incremental_daily_usage() {
+    let store_path = test_dir();
+    let mut persistence = OpLogPersistence::create_test(&store_path).await.unwrap();
+
+    {
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        _ = root.create_dir_path("/sources").await.unwrap();
+        _ = root.create_dir_path("/pump").await.unwrap();
+        _ = root.create_dir_path("/usage").await.unwrap();
+        let mut samples = (0..=60)
+            .map(|minute| (minute * 60_000_000, 45.0))
+            .collect::<Vec<_>>();
+        samples.extend([
+            (61 * 60_000_000, 44.5),
+            (62 * 60_000_000, 44.0),
+            (63 * 60_000_000, 43.5),
+            (64 * 60_000_000, 43.8),
+            (65 * 60_000_000, 44.2),
+            (66 * 60_000_000, 44.8),
+            (1_440 * 60_000_000, 45.0),
+            (2_880 * 60_000_000, 45.0),
+        ]);
+        _ = root
+            .create_series_from_batch(
+                "/sources/depth.series",
+                &source_samples(&samples),
+                Some("timestamp"),
+            )
+            .await
+            .unwrap();
+
+        let pump = PumpStateConfig {
+            source: provider::Url::parse("series:///sources/depth.series").unwrap(),
+            time_column: "timestamp".to_owned(),
+            depth_column: "value".to_owned(),
+            lookback: "60m".to_owned(),
+            disturbance_drop: 0.3,
+            valid_depth_min: 10.0,
+            valid_depth_max: 60.0,
+        };
+        _ = root
+            .create_dynamic_path(
+                "/pump/state",
+                tinyfs::EntryType::FileDynamic,
+                "pump-state-series",
+                yaml(&pump),
+            )
+            .await
+            .unwrap();
+
+        let rate = SqlDerivedConfig {
+            patterns: HashMap::from([(
+                "state".to_owned(),
+                provider::Url::parse("series:///pump/state").unwrap(),
+            )]),
+            query: Some(
+                "SELECT timestamp, \
+                 CASE WHEN phase = 'pumping' THEN depth ELSE 0.0 END AS usage_gpm, \
+                 CASE WHEN phase = 'pumping' THEN 1 ELSE 0 END AS pump_minutes \
+                 FROM state"
+                    .to_owned(),
+            ),
+            locality: SqlDerivedLocality::TimestampLocal {
+                event_time: "timestamp".to_owned(),
+            },
+            transforms: None,
+            pattern_transforms: None,
+            scope_prefixes: None,
+            provider_wrapper: None,
+        };
+        _ = root
+            .create_dynamic_path(
+                "/usage/rate",
+                tinyfs::EntryType::FileDynamic,
+                "sql-derived-series",
+                yaml(&rate),
+            )
+            .await
+            .unwrap();
+
+        let daily = TemporalReduceSeriesConfig {
+            in_pattern: provider::Url::parse("series:///usage/rate").unwrap(),
+            time_column: "timestamp".to_owned(),
+            resolution: "1d".to_owned(),
+            aggregations: vec![AggregationConfig {
+                agg_type: AggregationType::Sum,
+                columns: Some(vec!["usage_gpm".to_owned(), "pump_minutes".to_owned()]),
+            }],
+            output_aliases: Some(HashMap::from([
+                ("usage_gpm.sum".to_owned(), "gallons".to_owned()),
+                ("pump_minutes.sum".to_owned(), "pump_minutes".to_owned()),
+            ])),
+            transforms: None,
+            allowed_lateness: Some("1h".to_owned()),
+            seal_target_bytes: Some(0),
+            max_live_segments: None,
+        };
+        _ = root
+            .create_dynamic_path(
+                "/usage/daily",
+                tinyfs::EntryType::FileDynamic,
+                "temporal-reduce-series",
+                yaml(&daily),
+            )
+            .await
+            .unwrap();
+        tx.commit_test().await.unwrap();
+    }
+
+    let (cold_rows, cold_metrics) = query_direct_reduced(&mut persistence).await;
+    assert_eq!(cold_rows, vec![(132.0, 3), (0.0, 0), (0.0, 0)]);
+    assert_eq!(cold_metrics.global_plans, 1);
+    assert_eq!(cold_metrics.non_incremental_plans, 1);
+    assert_eq!(cold_metrics.dynamic_source_executions, 1);
+
+    let cache_dir = Path::new(&store_path).parent().unwrap().join("cache");
+    let cold_cache = cache_snapshot(&cache_dir);
+    assert!(
+        cold_cache
+            .keys()
+            .any(|path| path.to_string_lossy().contains("pump_state_")),
+        "cold traversal must persist pump-state boundary state"
+    );
+
+    let (warm_rows, warm_metrics) = query_direct_reduced(&mut persistence).await;
+    assert_eq!(warm_rows, cold_rows);
+    assert_eq!(warm_metrics.non_incremental_plans, 0);
+    assert_eq!(warm_metrics.dynamic_source_executions, 0);
+    assert_eq!(cache_snapshot(&cache_dir), cold_cache);
+
+    {
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        append_source(&root, "/sources/depth.series", 5_760 * 60_000_000, 44.0).await;
+        tx.commit_test().await.unwrap();
+    }
+
+    let (append_rows, append_metrics) = query_direct_reduced(&mut persistence).await;
+    assert_eq!(append_rows, vec![(132.0, 3), (0.0, 0), (0.0, 0), (0.0, 0)]);
+    assert_eq!(append_metrics.global_plans, 0);
+    assert_eq!(append_metrics.non_incremental_plans, 0);
+    assert!(append_metrics.bounded_dynamic_source_executions >= 1);
+    assert!(
+        append_metrics
+            .minimum_dynamic_event_time_lo
+            .is_some_and(|read_lo| read_lo > 0),
+        "append must exclude the oldest retained depth history"
+    );
 }
 
 #[tokio::test]

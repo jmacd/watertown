@@ -578,12 +578,31 @@ impl TemporalReduceSqlFile {
         );
 
         let fs = self.context.context.filesystem();
-        let mut provider =
-            crate::Provider::with_context(Arc::new(fs), Arc::new(self.context.context.clone()));
+        let datafusion_ctx = Arc::new(datafusion::prelude::SessionContext::new_with_config_rt(
+            datafusion::prelude::SessionConfig::new(),
+            Arc::clone(&self.context.context.datafusion_session.runtime_env()),
+        ));
+        crate::register_datafusion_functions(&datafusion_ctx)
+            .map_other_context("register functions for temporal-reduce schema discovery")?;
+        let mut discovery_context = tinyfs::ProviderContext::new(
+            Arc::clone(&datafusion_ctx),
+            Arc::clone(&self.context.context.persistence),
+        );
+        if let Some(cache_dir) = self
+            .context
+            .context
+            .cache_dir()
+            .map(std::path::Path::to_path_buf)
+        {
+            discovery_context = discovery_context.with_cache_dir(cache_dir);
+        }
+        if let Some(pond_path) = self.context.context.pond_path.clone() {
+            discovery_context = discovery_context.with_pond_path(pond_path);
+        }
+        let mut provider = crate::Provider::with_context(Arc::new(fs), Arc::new(discovery_context));
         if let Ok(root) = self.context.root().await {
             provider = provider.with_root(root);
         }
-        let datafusion_ctx = datafusion::prelude::SessionContext::new();
 
         let table_provider = provider
             .create_table_provider(&source_url, &datafusion_ctx)

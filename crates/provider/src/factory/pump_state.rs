@@ -9,6 +9,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Float64Array, StringArray, TimestampMicrosecondArray};
+use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -19,6 +20,11 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Expr, cast, col, lit};
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::expressions::Column as PhysicalColumn;
+use datafusion::physical_expr_common::sort_expr::{
+    LexRequirement, OrderingRequirements, PhysicalSortRequirement,
+};
+use datafusion::physical_plan::Distribution;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -26,7 +32,8 @@ use datafusion::physical_plan::{
 };
 use futures::StreamExt;
 use query_foundation::plans::pump_state::{
-    DepthSample, PumpPhase, PumpStateMachine, PumpStateRecipe, PumpStateRow,
+    DepthSample, PumpEpisodeSpan, PumpPhase, PumpStateBoundary, PumpStateMachine, PumpStateRecipe,
+    PumpStateRow,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -57,6 +64,17 @@ pub struct PumpStateConfig {
 }
 
 impl PumpStateConfig {
+    fn recipe_identity(&self) -> TinyFSResult<String> {
+        let value = serde_json::to_value(self).map_other_context("pump-state recipe identity")?;
+        let bytes = serde_json::to_vec(&value)
+            .map_other_context("pump-state recipe identity serialization")?;
+        let mut hasher = blake3::Hasher::new();
+        _ = hasher.update(b"watertown:pump-state-series:v1");
+        _ = hasher.update(&(bytes.len() as u64).to_le_bytes());
+        _ = hasher.update(&bytes);
+        Ok(hasher.finalize().to_hex().to_string())
+    }
+
     fn recipe(&self) -> TinyFSResult<PumpStateRecipe> {
         let lookback =
             humantime::parse_duration(&self.lookback).map_other_context("pump-state lookback")?;
@@ -106,16 +124,243 @@ impl PumpStateFile {
     async fn source_provider(
         &self,
         context: &tinyfs::ProviderContext,
+        bounds: tinyfs::SeriesReadBounds,
     ) -> TinyFSResult<Arc<dyn TableProvider>> {
-        let root = self.context.root().await?;
-        let fs = self.context.context.filesystem();
+        let fs = context.filesystem();
+        let root = fs.root().await?;
         let provider =
             crate::Provider::with_context(Arc::new(fs), Arc::new(context.clone())).with_root(root);
         provider
-            .create_provider_for_url(&self.config.source.to_string(), &context.datafusion_session)
+            .create_provider_for_url_bounded(
+                &self.config.source.to_string(),
+                &context.datafusion_session,
+                bounds,
+            )
             .await
             .map_other_context("pump-state source provider")
     }
+
+    async fn planned_provider(
+        &self,
+        id: FileID,
+        context: &tinyfs::ProviderContext,
+        bounds: tinyfs::SeriesReadBounds,
+    ) -> TinyFSResult<Arc<dyn TableProvider>> {
+        let recipe = self.config.recipe()?;
+        let recipe_identity = self.config.recipe_identity()?;
+        let path = manifest_path(context, id, &recipe_identity);
+        let prior = match &path {
+            Some(path) => read_manifest(path, &recipe_identity).await?,
+            None => None,
+        };
+        let mut source_bounds = tinyfs::SeriesReadBounds::NONE;
+        let mut replace_from = None;
+
+        match (bounds.event_time_lo, prior.as_ref()) {
+            (Some(event_time_lo), Some(manifest)) => {
+                let changed_minute = event_time_lo.div_euclid(60_000_000);
+                let boundary = PumpStateBoundary::try_new(
+                    manifest.observed_through,
+                    manifest.open_episode_start,
+                )
+                .map_err(|error| tinyfs::Error::Other(error.to_string()))?;
+                let episodes = manifest
+                    .episodes
+                    .iter()
+                    .copied()
+                    .map(Into::into)
+                    .collect::<Vec<PumpEpisodeSpan>>();
+                let changed = query_foundation::statistics::TimeInterval::try_new(
+                    changed_minute,
+                    changed_minute,
+                )
+                .map_err(|error| tinyfs::Error::Other(error.to_string()))?;
+                let plan = boundary
+                    .plan_repair(recipe, changed, &episodes)
+                    .map_err(|error| tinyfs::Error::Other(error.to_string()))?;
+                let read_from = plan
+                    .source()
+                    .min()
+                    .checked_mul(60_000_000)
+                    .unwrap_or(i64::MIN);
+                source_bounds = tinyfs::SeriesReadBounds::from_event_time_lo(read_from);
+                replace_from = Some(plan.replace_from());
+                log::debug!(
+                    "pump-state bounded repair: consumer_lo={event_time_lo} changed_minute={changed_minute} source_lo={read_from} replace_from={}",
+                    plan.replace_from()
+                );
+            }
+            (Some(_), None) => {
+                context.record_non_incremental_plan();
+                log::info!(
+                    "query-plan visibility: node={} locality=timestamp-local incremental=false reason=pump-state-boundary-bootstrap",
+                    self.context.file_id
+                );
+            }
+            (None, _) => {
+                context.record_global_plan();
+                context.record_non_incremental_plan();
+                log::info!(
+                    "query-plan visibility: node={} locality=global incremental=false reason=unbounded-pump-state-read",
+                    self.context.file_id
+                );
+            }
+        }
+
+        let source = self.source_provider(context, source_bounds).await?;
+        let source_schema = source.schema();
+        _ = source_schema
+            .field_with_name(&self.config.time_column)
+            .map_other_context("pump-state time column")?;
+        _ = source_schema
+            .field_with_name(&self.config.depth_column)
+            .map_other_context("pump-state depth column")?;
+        let time = col(Column::from_name(&self.config.time_column));
+        let depth = col(Column::from_name(&self.config.depth_column));
+        let frame = context
+            .datafusion_session
+            .read_table(source)
+            .map_other_context("read pump-state source")?
+            .filter(
+                time.clone()
+                    .is_not_null()
+                    .and(depth.clone().is_not_null())
+                    .and(depth.clone().gt_eq(lit(self.config.valid_depth_min)))
+                    .and(depth.clone().lt_eq(lit(self.config.valid_depth_max))),
+            )
+            .map_other_context("filter pump-state source")?
+            .select(vec![
+                cast(
+                    time.clone(),
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                )
+                .alias("timestamp"),
+                cast(depth, DataType::Float64).alias("depth"),
+            ])
+            .map_other_context("project pump-state source")?
+            .sort(vec![col("timestamp").sort(true, true)])
+            .map_other_context("order pump-state source")?;
+        let ordered: Arc<dyn TableProvider> = Arc::new(datafusion::catalog::view::ViewTable::new(
+            frame.logical_plan().clone(),
+            Some("ordered typed pump-state source".to_owned()),
+        ));
+        let publication = path.map(|path| ManifestPublication {
+            path,
+            recipe_identity,
+            prior_episodes: prior.map_or_else(Vec::new, |manifest| manifest.episodes),
+            replace_from,
+        });
+        Ok(Arc::new(PumpStateTableProvider::new(
+            ordered,
+            recipe,
+            publication,
+        )))
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PumpStateManifest {
+    format: String,
+    recipe_identity: String,
+    observed_through: Option<i64>,
+    open_episode_start: Option<i64>,
+    episodes: Vec<PersistedEpisode>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedEpisode {
+    start: i64,
+    end: i64,
+    open: bool,
+}
+
+impl From<PersistedEpisode> for PumpEpisodeSpan {
+    fn from(value: PersistedEpisode) -> Self {
+        Self {
+            start: value.start,
+            end: value.end,
+            open: value.open,
+        }
+    }
+}
+
+impl From<PumpEpisodeSpan> for PersistedEpisode {
+    fn from(value: PumpEpisodeSpan) -> Self {
+        Self {
+            start: value.start,
+            end: value.end,
+            open: value.open,
+        }
+    }
+}
+
+fn manifest_path(
+    context: &tinyfs::ProviderContext,
+    id: FileID,
+    recipe_identity: &str,
+) -> Option<std::path::PathBuf> {
+    context.cache_dir().map(|cache| {
+        cache
+            .join(format!(
+                "pump_state_{}_{}",
+                &recipe_identity[..16],
+                id.node_id()
+            ))
+            .join("manifest.json")
+    })
+}
+
+async fn read_manifest(
+    path: &std::path::Path,
+    recipe_identity: &str,
+) -> TinyFSResult<Option<PumpStateManifest>> {
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(tinyfs::Error::Other(format!(
+                "read pump-state manifest {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let manifest: PumpStateManifest = serde_json::from_slice(&bytes)
+        .map_other_context(format!("read pump-state manifest {}", path.display()))?;
+    if manifest.format != "watertown.pump-state-boundary.v1"
+        || manifest.recipe_identity != recipe_identity
+    {
+        return Ok(None);
+    }
+    Ok(Some(manifest))
+}
+
+async fn write_manifest(
+    path: &std::path::Path,
+    manifest: &PumpStateManifest,
+) -> DataFusionResult<()> {
+    let parent = path.parent().ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "pump-state manifest has no parent: {}",
+            path.display()
+        ))
+    })?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(DataFusionError::IoError)?;
+    let bytes = serde_json::to_vec(manifest).map_err(|error| {
+        DataFusionError::Execution(format!("serialize pump-state manifest: {error}"))
+    })?;
+    let temp = path.with_extension(format!("tmp-{}", uuid7::uuid7()));
+    tokio::fs::write(&temp, bytes)
+        .await
+        .map_err(DataFusionError::IoError)?;
+    if let Err(error) = tokio::fs::rename(&temp, path).await {
+        _ = tokio::fs::remove_file(&temp).await;
+        return Err(DataFusionError::IoError(error));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -159,58 +404,53 @@ impl tinyfs::Metadata for PumpStateFile {
 impl tinyfs::QueryableFile for PumpStateFile {
     async fn as_table_provider(
         &self,
-        _id: FileID,
+        id: FileID,
         context: &tinyfs::ProviderContext,
     ) -> TinyFSResult<Arc<dyn TableProvider>> {
-        context.record_global_plan();
-        context.record_non_incremental_plan();
-        log::info!(
-            "query-plan visibility: node={} locality=global incremental=false reason=pump-state-boundary-cache-unavailable",
-            self.context.file_id
-        );
-
-        let source = self.source_provider(context).await?;
-        let source_schema = source.schema();
-        _ = source_schema
-            .field_with_name(&self.config.time_column)
-            .map_other_context("pump-state time column")?;
-        _ = source_schema
-            .field_with_name(&self.config.depth_column)
-            .map_other_context("pump-state depth column")?;
-        let time = col(Column::from_name(&self.config.time_column));
-        let depth = col(Column::from_name(&self.config.depth_column));
-        let frame = context
-            .datafusion_session
-            .read_table(source)
-            .map_other_context("read pump-state source")?
-            .filter(
-                time.clone()
-                    .is_not_null()
-                    .and(depth.clone().is_not_null())
-                    .and(depth.clone().gt_eq(lit(self.config.valid_depth_min)))
-                    .and(depth.clone().lt_eq(lit(self.config.valid_depth_max))),
-            )
-            .map_other_context("filter pump-state source")?
-            .select(vec![
-                cast(
-                    time.clone(),
-                    DataType::Timestamp(TimeUnit::Microsecond, None),
-                )
-                .alias("timestamp"),
-                cast(depth, DataType::Float64).alias("depth"),
-            ])
-            .map_other_context("project pump-state source")?
-            .sort(vec![col("timestamp").sort(true, true)])
-            .map_other_context("order pump-state source")?;
-        let ordered: Arc<dyn TableProvider> = Arc::new(datafusion::catalog::view::ViewTable::new(
-            frame.logical_plan().clone(),
-            Some("ordered typed pump-state source".to_owned()),
-        ));
-        Ok(Arc::new(PumpStateTableProvider::new(
-            ordered,
-            self.config.recipe()?,
-        )))
+        self.planned_provider(id, context, tinyfs::SeriesReadBounds::NONE)
+            .await
     }
+
+    async fn as_table_provider_bounded(
+        &self,
+        id: FileID,
+        context: &tinyfs::ProviderContext,
+        bounds: tinyfs::SeriesReadBounds,
+    ) -> TinyFSResult<Arc<dyn TableProvider>> {
+        self.planned_provider(id, context, bounds).await
+    }
+
+    async fn query_lineage(
+        &self,
+        _id: FileID,
+        context: &tinyfs::ProviderContext,
+    ) -> TinyFSResult<Option<tinyfs::QueryLineage>> {
+        if context.cache_dir().is_none() {
+            return Ok(None);
+        }
+        let fs = context.filesystem();
+        let root = fs.root().await?;
+        let provider =
+            crate::Provider::with_context(Arc::new(fs), Arc::new(context.clone())).with_root(root);
+        let Some(nested) = provider
+            .query_lineage_for_url(&self.config.source.to_string())
+            .await
+            .map_other_context("pump-state lineage source")?
+        else {
+            return Ok(None);
+        };
+        let mut lineage = tinyfs::QueryLineage::new(self.config.recipe_identity()?);
+        lineage.extend(nested);
+        Ok(Some(lineage))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ManifestPublication {
+    path: std::path::PathBuf,
+    recipe_identity: String,
+    prior_episodes: Vec<PersistedEpisode>,
+    replace_from: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -218,14 +458,20 @@ struct PumpStateTableProvider {
     source: Arc<dyn TableProvider>,
     recipe: PumpStateRecipe,
     schema: SchemaRef,
+    publication: Option<ManifestPublication>,
 }
 
 impl PumpStateTableProvider {
-    fn new(source: Arc<dyn TableProvider>, recipe: PumpStateRecipe) -> Self {
+    fn new(
+        source: Arc<dyn TableProvider>,
+        recipe: PumpStateRecipe,
+        publication: Option<ManifestPublication>,
+    ) -> Self {
         Self {
             source,
             recipe,
             schema: pump_state_schema(),
+            publication,
         }
     }
 }
@@ -262,6 +508,7 @@ impl TableProvider for PumpStateTableProvider {
             source,
             self.recipe,
             projection.cloned(),
+            self.publication.clone(),
         )?))
     }
 }
@@ -272,6 +519,7 @@ struct PumpStateExec {
     projection: Option<Vec<usize>>,
     schema: SchemaRef,
     properties: PlanProperties,
+    publication: Option<ManifestPublication>,
 }
 
 impl PumpStateExec {
@@ -279,6 +527,7 @@ impl PumpStateExec {
         source: Arc<dyn ExecutionPlan>,
         recipe: PumpStateRecipe,
         projection: Option<Vec<usize>>,
+        publication: Option<ManifestPublication>,
     ) -> DataFusionResult<Self> {
         let full_schema = pump_state_schema();
         let schema = match &projection {
@@ -297,6 +546,7 @@ impl PumpStateExec {
             projection,
             schema,
             properties,
+            publication,
         })
     }
 }
@@ -334,6 +584,22 @@ impl ExecutionPlan for PumpStateExec {
         vec![&self.source]
     }
 
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::SinglePartition]
+    }
+
+    fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
+        let timestamp = Arc::new(PhysicalColumn::new("timestamp", 0));
+        let requirement = PhysicalSortRequirement::new(
+            timestamp,
+            Some(SortOptions {
+                descending: false,
+                nulls_first: true,
+            }),
+        );
+        vec![LexRequirement::new(vec![requirement]).map(OrderingRequirements::new)]
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -347,6 +613,7 @@ impl ExecutionPlan for PumpStateExec {
             Arc::clone(&children[0]),
             self.recipe,
             self.projection.clone(),
+            self.publication.clone(),
         )?))
     }
 
@@ -363,6 +630,7 @@ impl ExecutionPlan for PumpStateExec {
         let mut source = self.source.execute(0, context)?;
         let recipe = self.recipe;
         let projection = self.projection.clone();
+        let publication = self.publication.clone();
         let output_schema = Arc::clone(&self.schema);
         let stream_schema = Arc::clone(&output_schema);
         let stream = async_stream::try_stream! {
@@ -392,11 +660,21 @@ impl ExecutionPlan for PumpStateExec {
                     ))?;
                 for row in 0..batch.num_rows() {
                     let event_time = timestamps.value(row);
-                    pending.extend(machine.push(DepthSample {
-                        event_time,
-                        minute: event_time.div_euclid(60_000_000),
-                        depth: depths.value(row),
-                    })?);
+                    pending.extend(
+                        machine
+                            .push(DepthSample {
+                                event_time,
+                                minute: event_time.div_euclid(60_000_000),
+                                depth: depths.value(row),
+                            })?
+                            .into_iter()
+                            .filter(|row| {
+                                publication
+                                    .as_ref()
+                                    .and_then(|publication| publication.replace_from)
+                                    .is_none_or(|replace_from| row.minute >= replace_from)
+                            }),
+                    );
                     while pending.len() >= OUTPUT_BATCH_ROWS {
                         let remainder = pending.split_off(OUTPUT_BATCH_ROWS);
                         let emitted = std::mem::replace(&mut pending, remainder);
@@ -408,9 +686,60 @@ impl ExecutionPlan for PumpStateExec {
                     }
                 }
             }
-            pending.extend(machine.finish().provisional_rows);
+            let finish = machine.finish();
+            pending.extend(
+                finish
+                    .provisional_rows
+                    .iter()
+                    .copied()
+                    .filter(|row| {
+                        publication
+                            .as_ref()
+                            .and_then(|publication| publication.replace_from)
+                            .is_none_or(|replace_from| row.minute >= replace_from)
+                    }),
+            );
+            let manifest = publication.as_ref().map(|publication| {
+                let mut episodes = match publication.replace_from {
+                    Some(replace_from) => publication
+                        .prior_episodes
+                        .iter()
+                        .copied()
+                        .filter(|episode| episode.end < replace_from)
+                        .collect::<Vec<_>>(),
+                    None => Vec::new(),
+                };
+                episodes.extend(
+                    finish
+                        .episodes
+                        .iter()
+                        .copied()
+                        .filter(|episode| {
+                            publication
+                                .replace_from
+                                .is_none_or(|replace_from| episode.end >= replace_from)
+                        })
+                        .map(PersistedEpisode::from),
+                );
+                PumpStateManifest {
+                    format: "watertown.pump-state-boundary.v1".to_owned(),
+                    recipe_identity: publication.recipe_identity.clone(),
+                    observed_through: finish.boundary.observed_through(),
+                    open_episode_start: finish.boundary.open_episode_start(),
+                    episodes,
+                }
+            });
             if !pending.is_empty() {
                 yield rows_to_batch(&pending, projection.as_deref(), output_schema)?;
+            }
+            if let (Some(publication), Some(manifest)) = (&publication, manifest.as_ref()) {
+                log::debug!(
+                    "pump-state completed: observed_through={:?} open_episode_start={:?} episodes={}",
+                    manifest.observed_through,
+                    manifest.open_episode_start,
+                    manifest.episodes.len()
+                );
+                write_manifest(&publication.path, manifest).await?;
             }
         };
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -491,6 +820,7 @@ register_dynamic_factory!(
 mod tests {
     use super::*;
     use arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
     use tinyfs::arrow::parquet::ParquetExt;
 
     fn source_batch() -> RecordBatch {
@@ -554,6 +884,21 @@ mod tests {
             }));
         }
         rows
+    }
+
+    fn pump_input_batch() -> RecordBatch {
+        let source = source_batch();
+        RecordBatch::try_from_iter([
+            (
+                "timestamp",
+                Arc::clone(source.column_by_name("timestamp").unwrap()),
+            ),
+            (
+                "depth",
+                Arc::clone(source.column_by_name("well_depth_value.avg").unwrap()),
+            ),
+        ])
+        .unwrap()
     }
 
     #[tokio::test]
@@ -669,6 +1014,79 @@ ORDER BY d.ts
                 .plan_visibility_metrics()
                 .non_incremental_plans,
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn publishes_boundary_only_after_stream_completion() {
+        let cache = tempfile::tempdir().unwrap();
+        let path = cache.path().join("pump-state/manifest.json");
+        let publication = ManifestPublication {
+            path: path.clone(),
+            recipe_identity: "recipe".to_owned(),
+            prior_episodes: Vec::new(),
+            replace_from: None,
+        };
+        let batch = pump_input_batch();
+        let source: Arc<dyn TableProvider> =
+            Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap());
+        let session = datafusion::prelude::SessionContext::new();
+        let source_exec = source
+            .scan(&session.state(), None, &[], None)
+            .await
+            .unwrap();
+        let exec = PumpStateExec::new(
+            source_exec,
+            PumpStateRecipe::try_new(60, 0.3).unwrap(),
+            None,
+            Some(publication.clone()),
+        )
+        .unwrap();
+        let mut cancelled = exec.execute(0, session.task_ctx()).unwrap();
+        assert!(cancelled.next().await.unwrap().unwrap().num_rows() > 0);
+        assert!(
+            !path.exists(),
+            "yielding the final batch must not publish boundary state"
+        );
+        drop(cancelled);
+        assert!(
+            !path.exists(),
+            "cancelling after the final batch must retain the prior boundary"
+        );
+
+        let batch = pump_input_batch();
+        let source: Arc<dyn TableProvider> =
+            Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap());
+        let source_exec = source
+            .scan(&session.state(), None, &[], None)
+            .await
+            .unwrap();
+        let exec = PumpStateExec::new(
+            source_exec,
+            PumpStateRecipe::try_new(60, 0.3).unwrap(),
+            None,
+            Some(publication),
+        )
+        .unwrap();
+        let mut completed = exec.execute(0, session.task_ctx()).unwrap();
+        while let Some(batch) = completed.next().await {
+            _ = batch.unwrap();
+        }
+        assert!(
+            path.exists(),
+            "successful completion must publish boundary state"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_boundary_manifest_fails_loudly() {
+        let cache = tempfile::tempdir().unwrap();
+        let path = cache.path().join("manifest.json");
+        tokio::fs::write(&path, b"{not-json").await.unwrap();
+        let error = read_manifest(&path, "recipe").await.unwrap_err();
+        assert!(
+            error.to_string().contains("read pump-state manifest"),
+            "unexpected error: {error}"
         );
     }
 

@@ -1033,8 +1033,7 @@ episode and retroactive suffix repair; source reads include only the required
 ceiling context before that anchor. Tests prove that a later trough revises the
 whole provisional episode, a changed static boundary can rejoin the preceding
 episode, malformed ordering fails, and closed-episode append work is independent
-of retained history. Durable boundary-cache integration remains before
-`/pump-state/well-pump-state` can declare bounded lineage.
+of retained history.
 
 Temporal-reduce outputs now satisfy the prerequisite source contract for that
 integration: cache-backed reductions expose recursive physical lineage and
@@ -1049,11 +1048,27 @@ The recipe is now wired into `pump-state-series` as a streaming physical
 operator over an ordered, filtered depth source. It emits bounded record
 batches, preserves the public `timestamp`, `depth`, and `phase` schema, and
 matches the complete existing production window SQL row-for-row on a
-disturbance/recovery fixture. Until durable open-episode and repair-index state
-is published, the factory deliberately records a global/non-incremental
-decision and exposes no lineage; replacing the production SQL before that
-state exists would improve memory behavior but would not satisfy the Phase 10
-asymptotic gate.
+disturbance/recovery fixture.
+
+The provider now persists recipe-keyed boundary manifests containing the
+observed frontier, provisional episode start, and episode spans. Recursive
+lineage makes the typed pump output available to timestamp-local SQL and direct
+reductions; a persistent TLogFS regression proves cold bootstrap, byte-identical
+no-change reuse, and a closed append that produces the new daily bucket through
+a bounded dynamic-source execution excluding the oldest retained depth history.
+Cold bootstrap remains visibly global/non-incremental, while warm reuse executes
+no dynamic source and append records no global/non-incremental decision.
+
+The physical operator declares both single-partition and timestamp-order input
+requirements. This prevents DataFusion repartitioning from either dropping
+files by executing only partition zero or presenting partitions out of event
+order. Boundary publication occurs only after the final output batch has been
+accepted and the stream is polled to successful completion; cancellation after
+that batch leaves the prior manifest untouched. Corrupt manifest JSON fails
+loudly rather than silently rebuilding.
+
+Production `/pump-state/well-pump-state` and daily-usage migration remains
+pending the isolated water replay and public-schema verification.
 
 ### Phase 11: native-v2 backup and restore verification
 
