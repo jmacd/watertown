@@ -943,20 +943,44 @@ and avoid fallback. Adding a join output under the pivot wildcard expands the
 output schema and builds a distinct aggregate namespace without reusing stale
 state or taking a non-incremental path.
 
-A retained warm no-change run over the 20 parameter/resolution outputs completed
-site generation in 2.813 seconds (3.47 seconds total wall time, 130.6 MB process
-max RSS, 12.01 MB CLI-reported peak). It recorded 20 schema-lineage cache hits,
-20 deterministic-export reuses, zero schema reconstructions, zero full-rewrite
-export queries, and zero `temporal-reduce-cache-unavailable` decisions. This
-qualifies warm dynamic-graph cache selection and improves substantially on the
-12.025-second pre-lineage site-generation baseline. A subsequent instrumented
-run reported 2.930 seconds for site generation, zero global/non-incremental
-plans, zero dynamic/export source executions, 128 reused export partitions, and
-zero written partitions in one summary record. Append, disorder,
-retroactive, and wildcard-membership replays against the full production Noyo
-dataset; history-independent export verification; remaining detailed counters;
-and data-bearing water/septic qualification remain before the Phase 10 gate is
-complete.
+A fresh production Noyo pond now passes the complete mutation matrix. Each
+mutation used an exact HydroVu AT500 Parquet schema and changed the exported
+Parquet byte digest; each immediately following no-change run executed zero
+dynamic and export sources and rewrote zero partitions.
+
+| Scenario | Seconds | Peak MiB | Dynamic (bounded) | Minimum source event time (µs) | Export executions | Reused / written partitions |
+|---|---:|---:|---:|---:|---:|---:|
+| Cold | 31.952 | 119.21 | 4 (0) | none | 20 | 0 / 128 |
+| Warm no-change | 3.224 | 11.44 | 0 (0) | none | 0 | 128 / 0 |
+| Wildcard membership | 17.249 | 41.25 | 4 (0) | none | 20 | 108 / 20 |
+| Normal append | 16.180 | 42.12 | 4 (4) | 1770523200000000 | 20 | 108 / 20 |
+| Hot-window disorder | 17.572 | 42.65 | 4 (4) | 1770523200000000 | 20 | 108 / 20 |
+| Sealed retroactive repair | 24.868 | 43.37 | 4 (4) | 1736946000000000 | 20 | 64 / 64 |
+
+Every scenario recorded zero global and non-incremental plans. Membership
+necessarily bootstraps the newly visible leaf, while append and disorder bound
+all four dynamic executions to the unsealed tail. Retroactive repair bounds all
+four executions to the changed 2025 interval and preserves the 64 older export
+partitions.
+
+This qualification exposed two distinct history-sized export/repair defects.
+First, `None` in the export hint had represented both an unchanged output and a
+full rebuild, while the reduction digest included source-freshness bookkeeping.
+A wildcard or source-version change therefore rebuilt unrelated exports.
+Export hints now carry explicit unchanged/bounded/everything states, aggregate
+digests identify output artifacts rather than freshness metadata, and bounded
+changes propagate through unsealed coarse levels. A current append or disorder
+now rewrites one current partition for each of the 20 outputs instead of 92
+historical partitions.
+
+Second, a cold build can create one sealed aggregate segment spanning retained
+history. A retroactive point inside that segment previously dropped the whole
+segment and forced an unbounded raw-source scan. Repair now copies the clean
+prefix directly from its already-aggregated partials into a replacement segment
+and rebuilds raw data only from the dirty bucket. The production replay changed
+the expected output, published the bounded lower source time above, and its
+subsequent warm run completed in 3.951 seconds with all 128 partitions reused
+and zero source executions.
 
 The complete water and septic production configurations also apply successfully
 to isolated fresh ponds. Empty temporal inputs with explicit aggregation columns

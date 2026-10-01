@@ -279,8 +279,9 @@ impl TemporalReduceConfig {
 /// Result of building one resolution level of the segment cache. The
 /// `provider` is the `ListingTable` over that level's segments + hot (in
 /// mergeable-partials form), which the next-coarser level folds and which the
-/// final level wraps in a read-time reconstruction view. `digest` is the level's
-/// manifest digest (the coarser level records it as its `source_digest`);
+/// final level wraps in a read-time reconstruction view. `digest` identifies
+/// the level's output artifacts (the coarser level records it as its
+/// `source_digest`);
 /// `changed` feeds the export hint and the coarser level's unsealing;
 /// `rebuilt` is true when this level was
 /// wiped and rebuilt from scratch (a non-append change), which forces the next
@@ -1418,6 +1419,11 @@ impl TemporalReduceSqlFile {
             }
             None => None,
         };
+        let previous_output_digest = manifest
+            .as_ref()
+            .map(crate::partial_aggregate_cache::segment_manifest_digest)
+            .transpose()
+            .map_other()?;
 
         enum Plan {
             Reuse,
@@ -1458,7 +1464,7 @@ impl TemporalReduceSqlFile {
         }
 
         let rebuilt = matches!(plan, Plan::Rebuild);
-        let (mut m, mut unsealed, changed) = match plan {
+        let (mut m, mut unsealed, mut changed) = match plan {
             Plan::Incremental { dirty_lo_us } => {
                 let mut m = manifest.expect("incremental implies a manifest");
                 // Floor to the BUCKET, not just to the second. `sealed_hi_secs`
@@ -1486,7 +1492,10 @@ impl TemporalReduceSqlFile {
                 // they cover, so "which segments hold this instant" is a lookup.
                 // Under the old version-keyed layout there was no way to find
                 // them again, which is exactly why it had to error instead.
-                let unsealed = unseal_from(&mut m, dirty_lo_secs, res_dir)?;
+                let mut unsealed = self
+                    .preserve_segment_prefix(ctx, &mut m, dirty_lo_secs, res_dir, ts)
+                    .await?;
+                unsealed.extend(unseal_from(&mut m, dirty_lo_secs, res_dir)?);
                 let changed = match dirty_lo_secs {
                     Some(lo) => LevelChange::Since(lo),
                     // An unbounded dirty range is the whole axis, not "nothing".
@@ -1631,6 +1640,9 @@ impl TemporalReduceSqlFile {
         let digest = crate::partial_aggregate_cache::write_segment_manifest(res_dir, &m)
             .await
             .map_other()?;
+        if !rebuilt && previous_output_digest.as_ref() == Some(&digest) {
+            changed = LevelChange::Nothing;
+        }
         // Only now that the manifest naming the merged segments is durable.
         unsealed.extend(superseded);
         crate::partial_aggregate_cache::remove_superseded(&unsealed).await;
@@ -1700,17 +1712,25 @@ impl TemporalReduceSqlFile {
             None => None,
         };
 
-        // Reuse: the finer level was reused (not rebuilt) and its digest matches
-        // what this level last folded, so nothing downstream changed.
+        // Reuse: the finer output artifacts are unchanged. Adopt newer source
+        // bookkeeping so an irrelevant wildcard member does not keep widening
+        // a later, genuinely dirty range.
         if !finer_rebuilt
-            && let Some(m) = &manifest
+            && let Some(mut m) = manifest.clone()
             && m.source_digest.as_deref() == Some(finer_digest)
         {
+            let digest = if m.sources == *now {
+                crate::partial_aggregate_cache::segment_manifest_digest(&m).map_other()?
+            } else {
+                m.sources = now.clone();
+                crate::partial_aggregate_cache::write_segment_manifest(res_dir, &m)
+                    .await
+                    .map_other()?
+            };
             let provider =
-                crate::partial_aggregate_cache::listing_table_for_res_dir(res_dir, m, ts)
+                crate::partial_aggregate_cache::listing_table_for_res_dir(res_dir, &m, ts)
                     .await
                     .map_other()?;
-            let digest = crate::partial_aggregate_cache::segment_manifest_digest(m).map_other()?;
             return Ok(LevelBuild {
                 provider,
                 digest,
@@ -1777,16 +1797,21 @@ impl TemporalReduceSqlFile {
             let unsealed = match dirty {
                 // Nothing below our watermark moved, so our segments stand.
                 LevelChange::Nothing => Vec::new(),
-                LevelChange::Since(lo) => unseal_from(&mut m, Some(lo), res_dir)?,
+                LevelChange::Since(lo) => {
+                    let mut stale = self
+                        .preserve_segment_prefix(ctx, &mut m, Some(lo), res_dir, ts)
+                        .await?;
+                    stale.extend(unseal_from(&mut m, Some(lo), res_dir)?);
+                    stale
+                }
                 // Unbounded: unseal everything.
                 LevelChange::Everything => unseal_from(&mut m, None, res_dir)?,
             };
-            // Post-unseal, so it already reflects any segments folded back in.
-            // No watermark left means the whole axis is hot.
-            let changed = match m.sealed_hi_secs {
-                Some(hi) => LevelChange::Since(hi),
-                None => LevelChange::Everything,
-            };
+            // `sealed_hi_secs` bounds the physical cache scan, not the logical
+            // output change. An unsealed level may recompute its whole hot file,
+            // but buckets before `dirty` remain byte-for-byte equivalent and
+            // downstream exports can still reuse their historical partitions.
+            let changed = dirty;
             (m, unsealed, changed, false)
         } else {
             crate::partial_aggregate_cache::wipe_segment_res_dir(res_dir).map_other()?;
@@ -1864,6 +1889,69 @@ impl TemporalReduceSqlFile {
             .await
             .map_other()?;
         Ok((digest, rows.load(std::sync::atomic::Ordering::Relaxed)))
+    }
+
+    /// Preserve the clean prefix of the one sealed segment straddling a bounded
+    /// dirty point. The suffix is rebuilt from source; the prefix is copied from
+    /// already-aggregated partials, so retroactive repair never has to rescan raw
+    /// history merely because a cold build created one large segment.
+    async fn preserve_segment_prefix(
+        &self,
+        ctx: &datafusion::prelude::SessionContext,
+        manifest: &mut crate::partial_aggregate_cache::SegmentManifest,
+        dirty_lo_secs: Option<i64>,
+        res_dir: &std::path::Path,
+        ts: &str,
+    ) -> TinyFSResult<Vec<std::path::PathBuf>> {
+        let Some(dirty_lo_secs) = dirty_lo_secs else {
+            return Ok(Vec::new());
+        };
+        let Some(index) = manifest.segments.iter().position(|segment| {
+            segment.lo_secs.is_none_or(|lo| lo < dirty_lo_secs) && segment.hi_secs > dirty_lo_secs
+        }) else {
+            return Ok(Vec::new());
+        };
+
+        let old = manifest.segments[index].clone();
+        let old_path = crate::partial_aggregate_cache::segment_path(res_dir, &old.name);
+        let table = crate::partial_aggregate_cache::listing_table_for_files(
+            std::slice::from_ref(&old_path),
+            res_dir,
+            ts,
+        )
+        .await
+        .map_other()?;
+        let prefix = ctx
+            .read_table(table)
+            .map_other()?
+            .filter(col(Column::from_name(ts)).lt(lit(
+                datafusion::common::ScalarValue::TimestampMicrosecond(
+                    Some(secs_to_us(dirty_lo_secs)),
+                    None,
+                ),
+            )))
+            .map_other_context("rollup segment-prefix planning failed")?;
+        let name = format!("seg-{:08}.parquet", manifest.next_seq);
+        let path = crate::partial_aggregate_cache::segment_path(res_dir, &name);
+        let (digest, rows) = self.write_merge_to(prefix, &path).await?;
+        if rows == 0 {
+            tokio::fs::remove_file(&path).await.map_other()?;
+            return Ok(Vec::new());
+        }
+
+        let bytes = tokio::fs::metadata(&path).await.map_other()?.len();
+        manifest.segments[index] = crate::partial_aggregate_cache::Segment {
+            name,
+            lo_secs: old.lo_secs,
+            hi_secs: dirty_lo_secs,
+            digest,
+            bytes,
+        };
+        manifest.next_seq += 1;
+        // Conservative: the discarded suffix cannot be larger than the old
+        // segment, and overestimating only makes the next seal happen sooner.
+        manifest.hot_bytes = manifest.hot_bytes.saturating_add(old.bytes);
+        Ok(vec![old_path])
     }
 
     /// Resolve this partition's `pattern_url` to concrete source file
