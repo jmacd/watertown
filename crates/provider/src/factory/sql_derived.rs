@@ -62,6 +62,20 @@ pub enum SqlDerivedMode {
     Series,
 }
 
+/// Explicit locality contract for user-authored SQL.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum SqlDerivedLocality {
+    /// Unrestricted SQL. The query is visible as global and non-incremental.
+    #[default]
+    Global,
+    /// A single-source immutable projection/filter that preserves event time.
+    TimestampLocal {
+        /// Event-time column retained by the output.
+        event_time: String,
+    },
+}
+
 /// Options for SQL transformation and table name replacement
 #[derive(Default, Clone, Debug)]
 pub struct SqlTransformOptions {
@@ -89,6 +103,10 @@ pub struct SqlDerivedConfig {
     /// SQL query to execute on the source data. Defaults to "SELECT * FROM source" if not specified
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
+
+    /// Declared query locality. Defaults to conservative global execution.
+    #[serde(default)]
+    pub locality: SqlDerivedLocality,
 
     /// Optional list of table transform factory paths to apply to each pattern's TableProvider.
     /// Transforms are applied in order before scope prefixes and SQL execution.
@@ -129,6 +147,7 @@ impl SqlDerivedConfig {
         Self {
             patterns,
             query,
+            locality: SqlDerivedLocality::Global,
             transforms: None,
             pattern_transforms: None,
             scope_prefixes: None,
@@ -146,6 +165,7 @@ impl SqlDerivedConfig {
         Self {
             patterns,
             query,
+            locality: SqlDerivedLocality::Global,
             transforms: None,
             pattern_transforms: None,
             scope_prefixes: Some(scope_prefixes),
@@ -198,12 +218,33 @@ impl SqlDerivedConfig {
         self
     }
 
+    /// Declare this SQL as a single-source timestamp-local projection/filter.
+    #[must_use]
+    pub fn with_timestamp_local(mut self, event_time: impl Into<String>) -> Self {
+        self.locality = SqlDerivedLocality::TimestampLocal {
+            event_time: event_time.into(),
+        };
+        self
+    }
+
     /// Validate that all patterns are valid URLs with appropriate schemes for the given mode
     pub fn validate(&self, _mode: &SqlDerivedMode) -> TinyFSResult<()> {
         if self.patterns.is_empty() {
             return Err(tinyfs::Error::Other(
                 "At least one pattern must be specified".to_string(),
             ));
+        }
+        if let SqlDerivedLocality::TimestampLocal { event_time } = &self.locality {
+            if self.patterns.len() != 1 {
+                return Err(tinyfs::Error::Other(
+                    "timestamp-local SQL requires exactly one source pattern".to_owned(),
+                ));
+            }
+            if event_time.is_empty() {
+                return Err(tinyfs::Error::Other(
+                    "timestamp-local SQL event_time must not be empty".to_owned(),
+                ));
+            }
         }
 
         // All schemes are valid - builtin types (series/table/file) or format providers (csv/excelhtml/oteljson)
@@ -1516,6 +1557,93 @@ impl SqlDerivedFile {
         None
     }
 
+    async fn planned_table_provider(
+        &self,
+        id: FileID,
+        context: &tinyfs::ProviderContext,
+        requested_bounds: tinyfs::SeriesReadBounds,
+    ) -> TinyFSResult<Arc<dyn TableProvider>> {
+        let bounds = match self.config.locality {
+            SqlDerivedLocality::Global => tinyfs::SeriesReadBounds::NONE,
+            SqlDerivedLocality::TimestampLocal { .. } => requested_bounds,
+        };
+        let cache_key = crate::TableProviderKey::with_bounds(
+            id,
+            crate::VersionSelection::LatestVersion,
+            bounds,
+        )
+        .to_cache_string();
+        if let Some(cached_provider) = context.get_table_provider_cache(&cache_key) {
+            debug!("[GO] CACHE HIT: Returning cached ViewTable for node_id: {id}");
+            return Ok(cached_provider);
+        }
+
+        debug!("[SAVE] CACHE MISS: Creating new ViewTable for node_id: {id}");
+        let ctx = &context.datafusion_session;
+        let (table_mappings, _) = self
+            .register_source_tables_bounded(id, context, bounds)
+            .await?;
+        let effective_sql = self.get_effective_sql(&SqlTransformOptions {
+            table_mappings: Some(table_mappings.clone()),
+            source_replacement: None,
+        });
+
+        debug!(
+            "[OK] SQL-DERIVED: Effective SQL after table mapping ({} mappings): {}",
+            table_mappings.len(),
+            effective_sql
+        );
+        let declaration = match &self.config.locality {
+            SqlDerivedLocality::Global => {
+                query_foundation::sql::UserSqlDeclaration::global(table_mappings.values().cloned())
+                    .map_other_context("SQL-derived global locality declaration failed")?
+            }
+            SqlDerivedLocality::TimestampLocal { event_time } => {
+                let source = table_mappings.values().next().ok_or_else(|| {
+                    tinyfs::Error::Other(
+                        "timestamp-local SQL source registration returned no table".to_owned(),
+                    )
+                })?;
+                query_foundation::sql::UserSqlDeclaration::timestamp_local(
+                    source.clone(),
+                    event_time.clone(),
+                )
+                .map_other_context("SQL-derived timestamp-local declaration failed")?
+            }
+        };
+        let planned = query_foundation::sql::plan_user_sql(ctx, &effective_sql, declaration)
+            .await
+            .map_err(|error| {
+                log::error!(
+                    "[ERR] SQL-DERIVED: Failed to parse SQL into LogicalPlan: {}",
+                    error
+                );
+                log::error!("[ERR] SQL-DERIVED: Failed SQL was: {}", effective_sql);
+                tinyfs::Error::Other(format!("Failed to parse SQL into LogicalPlan: {error}"))
+            })?;
+        let logical_plan = planned.into_frame().logical_plan().clone();
+        match self.config.locality {
+            SqlDerivedLocality::Global => {
+                context.record_global_plan();
+                context.record_non_incremental_plan();
+                info!(
+                    "query-plan visibility: node={id} locality=global incremental=false reason=arbitrary-user-sql"
+                );
+            }
+            SqlDerivedLocality::TimestampLocal { .. } => {
+                info!(
+                    "query-plan visibility: node={id} locality=timestamp-local incremental=true reason=declared-user-sql"
+                );
+            }
+        }
+
+        let table_provider: Arc<dyn TableProvider> = Arc::new(
+            datafusion::catalog::view::ViewTable::new(logical_plan, Some(effective_sql)),
+        );
+        context.set_table_provider_cache(cache_key, table_provider.clone())?;
+        Ok(table_provider)
+    }
+
     /// Resolve, transform, and register every configured source pattern.
     ///
     /// The returned map preserves factory-facing pattern names while its
@@ -1574,100 +1702,84 @@ impl tinyfs::QueryableFile for SqlDerivedFile {
         id: FileID,
         context: &tinyfs::ProviderContext,
     ) -> tinyfs::Result<Arc<dyn TableProvider>> {
-        // Check cache first for SqlDerivedFile ViewTable
-        let cache_key = crate::TableProviderKey::new(id, crate::VersionSelection::LatestVersion)
-            .to_cache_string();
-
-        if let Some(cached_provider) = context.get_table_provider_cache(&cache_key) {
-            debug!("[GO] CACHE HIT: Returning cached ViewTable for node_id: {id}");
-            return Ok(cached_provider);
-        }
-
-        debug!("[SAVE] CACHE MISS: Creating new ViewTable for node_id: {id}");
-
-        // Get SessionContext directly from ProviderContext
-        let ctx = &context.datafusion_session;
-
-        // Register each pattern as a table in the session context.  Patterns
-        // that match no files are collected and handled in a second pass: the
-        // generated SQL references every input by name, so an unmatched input
-        // must still resolve to an (empty) table or planning fails.  The second
-        // pass runs after all real tables are registered so empty placeholders
-        // can borrow a same-scope sibling's schema.
-        let (table_mappings, _) = self.register_source_tables(id, context).await?;
-
-        // Get the effective SQL query with table name substitutions using our unique internal names
-        debug!(
-            "[SEARCH] SQL-DERIVED: Original query: {:?}",
-            self.config.query
-        );
-        debug!("[SEARCH] SQL-DERIVED: Table mappings: {:?}", table_mappings);
-        let effective_sql = self.get_effective_sql(&SqlTransformOptions {
-            table_mappings: Some(table_mappings.clone()),
-            source_replacement: None,
-        });
-
-        let mapping_count = table_mappings.len();
-        debug!(
-            "[OK] SQL-DERIVED: Effective SQL after table mapping ({} mappings): {}",
-            mapping_count, effective_sql
-        );
-        debug!(
-            "[SEARCH] SQL-DERIVED: Table mappings details: {:?}",
-            table_mappings
-        );
-
-        // Parse the SQL into a LogicalPlan
-        debug!(
-            "[SEARCH] SQL-DERIVED: Executing SQL with DataFusion: {}",
-            effective_sql
-        );
-
-        // Debug: List all registered tables in the context
-        debug!("[SEARCH] SQL-DERIVED: Available tables in DataFusion context:");
-        if let Some(catalog) = ctx.catalog("datafusion") {
-            if let Some(schema) = catalog.schema("public") {
-                let table_names: Vec<String> = schema.table_names();
-                debug!("[SEARCH] SQL-DERIVED: Registered tables: {:?}", table_names);
-            } else {
-                debug!("[SEARCH] SQL-DERIVED: Could not access 'public' schema");
-            }
-        } else {
-            debug!("[SEARCH] SQL-DERIVED: Could not access 'datafusion' catalog");
-        }
-
-        let declaration =
-            query_foundation::sql::UserSqlDeclaration::global(table_mappings.values().cloned())
-                .map_other_context("SQL-derived global locality declaration failed")?;
-        let planned = query_foundation::sql::plan_user_sql(ctx, &effective_sql, declaration)
+        self.planned_table_provider(id, context, tinyfs::SeriesReadBounds::NONE)
             .await
-            .map_err(|e| {
-                log::error!(
-                    "[ERR] SQL-DERIVED: Failed to parse SQL into LogicalPlan: {}",
-                    e
-                );
-                log::error!("[ERR] SQL-DERIVED: Failed SQL was: {}", effective_sql);
-                tinyfs::Error::Other(format!("Failed to parse SQL into LogicalPlan: {}", e))
-            })?;
-        let logical_plan = planned.into_frame().logical_plan().clone();
-        context.record_global_plan();
-        context.record_non_incremental_plan();
-        info!(
-            "query-plan visibility: node={id} locality=global incremental=false reason=arbitrary-user-sql"
-        );
-        debug!("[OK] SQL-DERIVED: Successfully created logical plan");
-
-        use datafusion::catalog::view::ViewTable;
-
-        let view_table = ViewTable::new(logical_plan, Some(effective_sql));
-        let table_provider = Arc::new(view_table);
-
-        // Cache the ViewTable for future reuse
-        context.set_table_provider_cache(cache_key, table_provider.clone())?;
-        debug!("[SAVE] CACHED: Stored ViewTable for node_id: {id}");
-
-        Ok(table_provider)
     }
+
+    async fn as_table_provider_bounded(
+        &self,
+        id: FileID,
+        context: &tinyfs::ProviderContext,
+        bounds: tinyfs::SeriesReadBounds,
+    ) -> tinyfs::Result<Arc<dyn TableProvider>> {
+        self.planned_table_provider(id, context, bounds).await
+    }
+
+    async fn query_lineage(
+        &self,
+        _id: FileID,
+        context: &tinyfs::ProviderContext,
+    ) -> TinyFSResult<Option<tinyfs::QueryLineage>> {
+        if self.config.locality == SqlDerivedLocality::Global {
+            return Ok(None);
+        }
+
+        let recipe = serde_json::to_vec(&self.config)
+            .map_err(|error| tinyfs::Error::Other(format!("SQL lineage recipe: {error}")))?;
+        let mut recipe_hasher = blake3::Hasher::new();
+        _ = recipe_hasher.update(b"watertown:timestamp-local-sql-lineage:v1");
+        update_lineage_hash(&mut recipe_hasher, &recipe);
+
+        let root = self.context.root().await?;
+        for transform_path in self.config.transforms.iter().flatten() {
+            let (_, lookup) = root.resolve_path(transform_path).await.map_err(|error| {
+                tinyfs::Error::Other(format!(
+                    "SQL lineage could not resolve transform '{transform_path}': {error}"
+                ))
+            })?;
+            let transform_node = match lookup {
+                tinyfs::Lookup::Found(node) => node,
+                _ => {
+                    return Err(tinyfs::Error::Other(format!(
+                        "SQL lineage transform '{transform_path}' was not found"
+                    )));
+                }
+            };
+            let (factory_name, config_bytes) = context
+                .persistence
+                .get_dynamic_node_config(transform_node.id())
+                .await?
+                .ok_or_else(|| {
+                    tinyfs::Error::Other(format!(
+                        "SQL lineage transform '{transform_path}' has no factory config"
+                    ))
+                })?;
+            update_lineage_hash(&mut recipe_hasher, transform_path.as_bytes());
+            update_lineage_hash(&mut recipe_hasher, factory_name.as_bytes());
+            update_lineage_hash(&mut recipe_hasher, &config_bytes);
+        }
+
+        let mut lineage = tinyfs::QueryLineage::new(recipe_hasher.finalize().to_hex().to_string());
+        let fs = self.context.context.filesystem();
+        let mut provider = crate::Provider::with_context(Arc::new(fs), Arc::new(context.clone()));
+        provider = provider.with_root(root);
+        for pattern in self.config.patterns.values() {
+            let Some(nested) = provider
+                .query_lineage_for_url(&pattern.to_string())
+                .await
+                .map_err(|error| tinyfs::Error::Other(format!("SQL lineage: {error}")))?
+            else {
+                return Ok(None);
+            };
+            lineage.extend(nested);
+        }
+        Ok(Some(lineage))
+    }
+}
+
+fn update_lineage_hash(hasher: &mut blake3::Hasher, value: &[u8]) {
+    _ = hasher.update(&(value.len() as u64).to_le_bytes());
+    _ = hasher.update(value);
 }
 
 #[cfg(test)]
@@ -2249,6 +2361,98 @@ query: ""
                 ..Default::default()
             },
             "arbitrary SQL must be visible as global and non-incremental"
+        );
+    }
+
+    #[tokio::test]
+    async fn timestamp_local_sql_declares_lineage_without_fallback() {
+        let (fs, provider_context) = create_test_environment().await;
+        let batch = record_batch!(
+            ("timestamp", Int64, [1000_i64, 2000_i64, 3000_i64]),
+            ("reading", Float64, [1.0_f64, 2.0_f64, 3.0_f64])
+        )
+        .unwrap();
+        _ = create_parquet_from_batch(
+            &fs,
+            "/readings.series",
+            &batch,
+            EntryType::TablePhysicalSeries,
+        )
+        .await
+        .unwrap();
+
+        let config = SqlDerivedConfig {
+            patterns: test_patterns(&[("source", "series:///readings.series")]),
+            query: Some(
+                "SELECT timestamp, reading * 2 AS adjusted \
+                 FROM source WHERE reading IS NOT NULL"
+                    .to_owned(),
+            ),
+            locality: SqlDerivedLocality::TimestampLocal {
+                event_time: "timestamp".to_owned(),
+            },
+            ..Default::default()
+        };
+        let file = SqlDerivedFile::new(
+            config,
+            test_context(&provider_context, FileID::root()),
+            SqlDerivedMode::Series,
+        )
+        .unwrap();
+
+        let provider = file
+            .as_table_provider_bounded(
+                FileID::root(),
+                &provider_context,
+                tinyfs::SeriesReadBounds::from_event_time_lo(2000),
+            )
+            .await
+            .unwrap();
+        let batches = provider_context
+            .datafusion_session
+            .read_table(provider)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            3
+        );
+        assert_eq!(
+            provider_context.plan_visibility_metrics(),
+            tinyfs::PlanVisibilityMetricsSnapshot::default(),
+            "timestamp-local SQL must not record global fallback"
+        );
+        assert!(
+            file.query_lineage(FileID::root(), &provider_context)
+                .await
+                .unwrap()
+                .is_some(),
+            "timestamp-local SQL must expose recursive physical lineage"
+        );
+    }
+
+    #[test]
+    fn timestamp_local_sql_rejects_multiple_sources() {
+        let config = SqlDerivedConfig {
+            patterns: test_patterns(&[
+                ("left", "series:///left.series"),
+                ("right", "series:///right.series"),
+            ]),
+            locality: SqlDerivedLocality::TimestampLocal {
+                event_time: "timestamp".to_owned(),
+            },
+            ..Default::default()
+        };
+
+        assert!(
+            config
+                .validate(&SqlDerivedMode::Series)
+                .unwrap_err()
+                .to_string()
+                .contains("requires exactly one source pattern")
         );
     }
 
@@ -4296,6 +4500,7 @@ rules:
             )]
             .into(),
             query: Some("SELECT new_col, value FROM input".to_string()),
+            locality: SqlDerivedLocality::Global,
             pattern_transforms: None,
             scope_prefixes: None,
             provider_wrapper: None,

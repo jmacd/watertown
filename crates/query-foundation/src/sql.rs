@@ -105,9 +105,12 @@ pub async fn plan_user_sql(
         .with_allow_dml(false)
         .with_allow_statements(false);
     let frame = context.sql_with_options(sql, options).await?;
-    validate_sources(sql, &declaration.sources)?;
+    let parsed = parse_user_query(sql)?;
+    validate_sources(&parsed, &declaration.sources)?;
     if declaration.locality.class() == LocalityClass::TimestampLocal {
-        validate_timestamp_local(frame.logical_plan())?;
+        validate_timestamp_local_sql(context, sql, &declaration.sources).await?;
+    }
+    if declaration.locality.class() == LocalityClass::TimestampLocal {
         let event_time = declaration
             .event_time
             .as_deref()
@@ -127,7 +130,7 @@ pub async fn plan_user_sql(
     })
 }
 
-fn validate_sources(sql: &str, declared: &BTreeSet<Arc<str>>) -> Result<()> {
+fn parse_user_query(sql: &str) -> Result<Box<Query>> {
     let dialect = GenericDialect {};
     let mut statements = DFParser::parse_sql_with_dialect(sql, &dialect)
         .map_err(|error| DataFusionError::Plan(format!("failed to inspect user SQL: {error}")))?;
@@ -144,7 +147,10 @@ fn validate_sources(sql: &str, declared: &BTreeSet<Arc<str>>) -> Result<()> {
     let datafusion::sql::sqlparser::ast::Statement::Query(query) = statement.as_ref() else {
         return Err(DataFusionError::Plan("user SQL must be a query".to_owned()));
     };
+    Ok(query.clone())
+}
 
+fn validate_sources(query: &Query, declared: &BTreeSet<Arc<str>>) -> Result<()> {
     let mut visitor = SourceVisitor::default();
     if query.visit(&mut visitor).is_break() {
         return Err(DataFusionError::Internal(
@@ -219,7 +225,35 @@ fn normalize_ident(ident: &Ident) -> String {
     }
 }
 
-fn validate_timestamp_local(plan: &LogicalPlan) -> Result<()> {
+async fn validate_timestamp_local_sql(
+    context: &SessionContext,
+    sql: &str,
+    sources: &BTreeSet<Arc<str>>,
+) -> Result<()> {
+    let validation = SessionContext::new();
+    for source in sources {
+        let schema = context
+            .table(source.to_string())
+            .await?
+            .schema()
+            .as_arrow()
+            .clone();
+        _ = validation.register_table(
+            source.to_string(),
+            Arc::new(datafusion::datasource::empty::EmptyTable::new(Arc::new(
+                schema,
+            ))),
+        )?;
+    }
+    let options = SQLOptions::new()
+        .with_allow_ddl(false)
+        .with_allow_dml(false)
+        .with_allow_statements(false);
+    let frame = validation.sql_with_options(sql, options).await?;
+    validate_timestamp_local_plan(frame.logical_plan())
+}
+
+fn validate_timestamp_local_plan(plan: &LogicalPlan) -> Result<()> {
     _ = plan.apply(|node| {
         if !matches!(
             node,
@@ -364,5 +398,56 @@ mod tests {
                 .to_string()
                 .contains("user SQL source set {\"other\"} does not match declared sources")
         );
+    }
+
+    #[tokio::test]
+    async fn timestamp_local_validation_stops_at_declared_view_boundary() {
+        let context = SessionContext::new();
+        _ = context
+            .register_table("left_source", empty_table())
+            .unwrap();
+        _ = context
+            .register_table("right_source", empty_table())
+            .unwrap();
+        let joined = context
+            .sql(
+                "SELECT left_source.value \
+                 FROM left_source JOIN right_source \
+                 ON left_source.value = right_source.value",
+            )
+            .await
+            .unwrap();
+        let view = Arc::new(ViewTable::new(
+            joined.logical_plan().clone(),
+            Some("typed nested join".to_owned()),
+        ));
+        _ = context.register_table("declared", view).unwrap();
+
+        _ = plan_user_sql(
+            &context,
+            "SELECT value FROM declared WHERE value IS NOT NULL",
+            UserSqlDeclaration::timestamp_local("declared", "value").unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn timestamp_local_validation_rejects_aggregate_sql() {
+        let context = SessionContext::new();
+        _ = context.register_table("declared", empty_table()).unwrap();
+
+        let error = match plan_user_sql(
+            &context,
+            "SELECT value, SUM(value) AS total FROM declared GROUP BY value",
+            UserSqlDeclaration::timestamp_local("declared", "value").unwrap(),
+        )
+        .await
+        {
+            Ok(_) => panic!("aggregate SQL must not be timestamp-local"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("Aggregate"));
     }
 }

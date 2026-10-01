@@ -987,6 +987,17 @@ fallback. Those windowed and aggregate SQL graphs require an explicit
 incremental design or an accepted global-work policy before water satisfies the
 same asymptotic invariant as the direct reductions.
 
+The first typed migration removes `/usage/well-usage-rate` from that global
+set. `sql-derived-series` now accepts an explicit single-source
+`timestamp-local` contract for immutable projection/filter SQL, validates the
+user AST before DataFusion expands nested typed views, propagates read bounds,
+and exposes recursive physical lineage. Unannotated SQL remains global by
+default, and aggregate, join, window, sort, limit, subquery, and non-immutable
+function plans are rejected under the local contract. A complete eight-output water
+traversal now reports seven global/non-incremental plans and one
+timestamp-local incremental plan. The remaining seven stateful analytics still
+require typed window, fixed-window reduction, or bounded-repair recipes.
+
 ### Phase 11: native-v2 backup and restore verification
 
 1. Map query-visible immutable logical leaves to current
