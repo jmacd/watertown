@@ -3343,6 +3343,7 @@ query: ""
                     agg_type: AggregationType::Avg,
                     columns: Some(vec!["temperature".to_string(), "humidity".to_string()]),
                 }],
+                output_aliases: None,
                 transforms: None,
                 allowed_lateness: None,
                 // Seal on every advance, as before the size gate existed: these
@@ -3646,6 +3647,7 @@ query: ""
                     agg_type: AggregationType::Avg,
                     columns: None, // This should trigger automatic schema discovery!
                 }],
+                output_aliases: None,
                 transforms: None,
                 allowed_lateness: None,
                 // Seal on every advance, as before the size gate existed: these

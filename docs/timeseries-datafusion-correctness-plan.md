@@ -998,6 +998,28 @@ traversal now reports seven global/non-incremental plans and one
 timestamp-local incremental plan. The remaining seven stateful analytics still
 require typed window, fixed-window reduction, or bounded-repair recipes.
 
+The reusable fixed-window piece is now available as
+`temporal-reduce-series`, a directly addressable single-resolution file factory
+that uses the same lineage-keyed partial manifests, bounded repair, and
+associative folding as `temporal-reduce`. It requires one exact logical source
+URL and can map default aggregate names such as `usage_gpm.sum` to stable public
+columns such as `gallons`. A persistent TLogFS regression over a
+timestamp-local SQL source proves the direct file's public schema, cold state
+creation, byte-identical no-change reuse in a fresh transaction, and one
+bounded source execution after append.
+
+An attempted `/usage/well-usage-daily` migration exposed the next dependency
+rather than satisfying the gate. Although `/usage/well-usage-rate` is itself a
+timestamp-local projection, its source is the still-global
+`/pump-state/well-pump-state` window query. The complete recursive source
+therefore cannot provide bounded lineage, and the direct reducer correctly
+emitted `temporal-reduce-cache-unavailable` and used its visible single-pass
+path. The isolated four-hour fixture still produced the expected public daily
+schema (`timestamp`, `gallons`, `pump_minutes`) and values, but the production
+configuration was not migrated because that would only relabel a retained
+history scan. A typed pump-state recipe with persisted open-episode and repair
+boundary state is now a prerequisite for incrementally reducing daily usage.
+
 ### Phase 11: native-v2 backup and restore verification
 
 1. Map query-visible immutable logical leaves to current

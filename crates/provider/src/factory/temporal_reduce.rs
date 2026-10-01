@@ -118,6 +118,43 @@ pub struct AggregationConfig {
     pub columns: Option<Vec<String>>,
 }
 
+/// Configuration for a direct single-resolution temporal-reduce series.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemporalReduceSeriesConfig {
+    pub in_pattern: crate::Url,
+    pub time_column: String,
+    pub resolution: String,
+    pub aggregations: Vec<AggregationConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_aliases: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transforms: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_lateness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal_target_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_live_segments: Option<usize>,
+}
+
+impl TemporalReduceSeriesConfig {
+    fn into_temporal_config(self) -> TemporalReduceConfig {
+        TemporalReduceConfig {
+            in_pattern: self.in_pattern,
+            out_pattern: String::new(),
+            time_column: self.time_column,
+            resolutions: vec![self.resolution],
+            aggregations: self.aggregations,
+            output_aliases: self.output_aliases,
+            transforms: self.transforms,
+            allowed_lateness: self.allowed_lateness,
+            seal_target_bytes: self.seal_target_bytes,
+            max_live_segments: self.max_live_segments,
+        }
+    }
+}
+
 /// Configuration for the temporal-reduce factory
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -137,6 +174,10 @@ pub struct TemporalReduceConfig {
 
     /// Aggregation operations to perform
     pub aggregations: Vec<AggregationConfig>,
+
+    /// Optional final output aliases keyed by the default `<column>.<aggregate>` name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_aliases: Option<HashMap<String, String>>,
 
     /// Optional list of table transform factory paths to apply to input TableProvider.
     /// Transforms are applied in order before SQL execution.
@@ -365,6 +406,17 @@ impl TemporalReduceSqlFile {
         config: TemporalReduceConfig,
         duration: Duration,
         _source_node: Node,
+        source_path: String,
+        pattern_url: String,
+        context: crate::FactoryContext,
+    ) -> Self {
+        Self::new_direct(config, duration, source_path, pattern_url, context)
+    }
+
+    #[must_use]
+    fn new_direct(
+        config: TemporalReduceConfig,
+        duration: Duration,
         source_path: String,
         pattern_url: String,
         context: crate::FactoryContext,
@@ -2043,6 +2095,13 @@ fn partial_aggregate_cfg_canonical(
         }
         s.push(';');
     }
+    if let Some(aliases) = &filled.output_aliases {
+        let mut aliases = aliases.iter().collect::<Vec<_>>();
+        aliases.sort_unstable();
+        for (source, output) in aliases {
+            let _ = write!(s, "alias={source}:{output};");
+        }
+    }
     s
 }
 
@@ -2297,6 +2356,8 @@ impl AggSqlPieces {
         let mut aliases: HashMap<(PartialKind, String), String> = HashMap::new();
         let mut partials: Vec<PartialDef> = Vec::new();
         let mut reconstructions = Vec::new();
+        let mut used_aliases = std::collections::HashSet::new();
+        let mut output_names = std::collections::HashSet::from([config.time_column.clone()]);
 
         // Register a partial for (kind, column), deduplicating so e.g. Avg and
         // Sum on the same column share a single SUM partial. Returns its alias.
@@ -2320,6 +2381,30 @@ impl AggSqlPieces {
             alias
         }
 
+        fn output_name(
+            default: String,
+            configured: Option<&HashMap<String, String>>,
+            used_aliases: &mut std::collections::HashSet<String>,
+            output_names: &mut std::collections::HashSet<String>,
+        ) -> TinyFSResult<String> {
+            let output = configured
+                .and_then(|aliases| aliases.get(&default))
+                .cloned()
+                .unwrap_or_else(|| default.clone());
+            if output.is_empty() {
+                return Err(tinyfs::Error::Other(format!(
+                    "temporal-reduce output alias for '{default}' must not be empty"
+                )));
+            }
+            if !output_names.insert(output.clone()) {
+                return Err(tinyfs::Error::Other(format!(
+                    "duplicate temporal-reduce output column '{output}'"
+                )));
+            }
+            _ = used_aliases.insert(default);
+            Ok(output)
+        }
+
         for agg in &config.aggregations {
             let columns = agg.columns.as_ref().ok_or_else(|| {
                 // This should never happen since
@@ -2333,17 +2418,27 @@ impl AggSqlPieces {
             for column in columns {
                 if column == "*" && matches!(agg.agg_type, AggregationType::Count) {
                     // Special case: count(*) becomes "timestamp.count".
-                    let out_alias = "timestamp.count";
+                    let out_alias = output_name(
+                        "timestamp.count".to_owned(),
+                        config.output_aliases.as_ref(),
+                        &mut used_aliases,
+                        &mut output_names,
+                    )?;
                     let p = register(PartialKind::CountStar, "*", &mut aliases, &mut partials);
                     reconstructions.push(Reconstruction::Direct {
                         partial: p,
-                        output: out_alias.to_owned(),
+                        output: out_alias,
                     });
                     continue;
                 }
 
                 // Generate alias in format: scope.parameter.unit.agg
-                let out_alias = format!("{}.{}", column, agg.agg_type.to_sql().to_lowercase());
+                let out_alias = output_name(
+                    format!("{}.{}", column, agg.agg_type.to_sql().to_lowercase()),
+                    config.output_aliases.as_ref(),
+                    &mut used_aliases,
+                    &mut output_names,
+                )?;
                 match agg.agg_type {
                     AggregationType::Avg => {
                         // Avg is not associative; store Sum and Count partials
@@ -2388,6 +2483,14 @@ impl AggSqlPieces {
                     }
                 }
             }
+        }
+
+        if let Some(configured) = &config.output_aliases
+            && let Some(unknown) = configured.keys().find(|name| !used_aliases.contains(*name))
+        {
+            return Err(tinyfs::Error::Other(format!(
+                "temporal-reduce output alias references unknown aggregate '{unknown}'"
+            )));
         }
 
         Ok(Self {
@@ -3213,6 +3316,30 @@ fn create_temporal_reduce_directory(
     Ok(directory.create_handle())
 }
 
+fn create_temporal_reduce_series_handle(
+    config: Value,
+    context: crate::FactoryContext,
+) -> TinyFSResult<tinyfs::FileHandle> {
+    let series_config: TemporalReduceSeriesConfig = crate::factory::config_util::config_from_value(
+        config,
+        "Invalid temporal-reduce-series config",
+    )?;
+    let duration = humantime::parse_duration(&series_config.resolution)
+        .map_other_context("Invalid temporal-reduce-series resolution")?;
+    let source_path = series_config.in_pattern.path().to_owned();
+    let pattern_url = series_config.in_pattern.to_string();
+    let file = TemporalReduceSqlFile::new_direct(
+        series_config.into_temporal_config(),
+        duration,
+        source_path,
+        pattern_url,
+        context,
+    );
+    Ok(tinyfs::FileHandle::new(Arc::new(tokio::sync::Mutex::new(
+        Box::new(file),
+    ))))
+}
+
 /// Validate temporal reduce configuration
 fn validate_temporal_reduce_config(config: &[u8]) -> TinyFSResult<Value> {
     let (config_value, temporal_config) = crate::factory::config_util::parse_yaml_config::<
@@ -3230,12 +3357,59 @@ fn validate_temporal_reduce_config(config: &[u8]) -> TinyFSResult<Value> {
     Ok(config_value)
 }
 
+fn validate_temporal_reduce_series_config(config: &[u8]) -> TinyFSResult<Value> {
+    let (config_value, series_config) = crate::factory::config_util::parse_yaml_config::<
+        TemporalReduceSeriesConfig,
+    >(config, "Invalid temporal-reduce-series config")?;
+    if series_config.in_pattern.path().contains(['*', '?']) {
+        return Err(tinyfs::Error::Other(
+            "temporal-reduce-series requires one exact logical source URL".to_owned(),
+        ));
+    }
+    if series_config.aggregations.is_empty() {
+        return Err(tinyfs::Error::Other(
+            "temporal-reduce-series requires at least one aggregation".to_owned(),
+        ));
+    }
+    _ = parse_nesting_resolutions(std::slice::from_ref(&series_config.resolution))?;
+    let temporal_config = series_config.into_temporal_config();
+    _ = temporal_config.allowed_lateness_secs()?;
+    if let Some(aliases) = &temporal_config.output_aliases {
+        let mut outputs = std::collections::HashSet::new();
+        for (source, output) in aliases {
+            if source.is_empty() || output.is_empty() {
+                return Err(tinyfs::Error::Other(
+                    "temporal-reduce-series output aliases must not be empty".to_owned(),
+                ));
+            }
+            if !outputs.insert(output) {
+                return Err(tinyfs::Error::Other(format!(
+                    "duplicate temporal-reduce-series output alias '{output}'"
+                )));
+            }
+            if output == &temporal_config.time_column {
+                return Err(tinyfs::Error::Other(format!(
+                    "temporal-reduce-series output alias '{output}' conflicts with the time column"
+                )));
+            }
+        }
+    }
+    Ok(config_value)
+}
+
 // Register the temporal-reduce factory
 register_dynamic_factory!(
     name: "temporal-reduce",
     description: "Create temporal downsampling views with configurable resolutions and aggregations",
     directory: create_temporal_reduce_directory,
     validate: validate_temporal_reduce_config
+);
+
+register_dynamic_factory!(
+    name: "temporal-reduce-series",
+    description: "Create one directly addressable incrementally reduced time series",
+    file: create_temporal_reduce_series_handle,
+    validate: validate_temporal_reduce_series_config
 );
 
 /// Content identity of one live source version: its blake3, qualified by node so
@@ -3536,6 +3710,7 @@ mod tests {
             time_column: "timestamp".to_string(),
             resolutions: vec!["1d".to_string()],
             aggregations,
+            output_aliases: None,
             transforms: None,
             allowed_lateness: None,
             // Seal on every advance, as before the size gate existed: these
@@ -3571,6 +3746,63 @@ mod tests {
             partial_aggregate_cfg_canonical(&cfg, Duration::from_secs(3600), "series:///sources/*"),
             "src=series:///sources/*;finest=3600s;ts=timestamp;\
              agg=SUM:depth,temp,;agg=COUNT:depth,;"
+        );
+    }
+
+    #[test]
+    fn output_aliases_are_validated_and_participate_in_cache_identity() {
+        let mut cfg = cfg_with_aggs(vec![
+            agg(AggregationType::Sum, &["usage_gpm"]),
+            agg(AggregationType::Sum, &["pump_minutes"]),
+        ]);
+        cfg.output_aliases = Some(HashMap::from([
+            ("pump_minutes.sum".to_owned(), "pump_minutes".to_owned()),
+            ("usage_gpm.sum".to_owned(), "gallons".to_owned()),
+        ]));
+
+        let pieces = AggSqlPieces::build(&cfg).unwrap();
+        assert_eq!(
+            pieces
+                .reconstructions
+                .iter()
+                .map(Reconstruction::sql_expr)
+                .collect::<Vec<_>>(),
+            vec![
+                "\"__p_sum_0\" AS \"gallons\"",
+                "\"__p_sum_1\" AS \"pump_minutes\"",
+            ]
+        );
+        assert!(
+            partial_aggregate_cfg_canonical(
+                &cfg,
+                Duration::from_secs(86400),
+                "series:///usage/rate"
+            )
+            .ends_with("alias=pump_minutes.sum:pump_minutes;alias=usage_gpm.sum:gallons;")
+        );
+
+        cfg.output_aliases = Some(HashMap::from([(
+            "missing.sum".to_owned(),
+            "gallons".to_owned(),
+        )]));
+        assert!(
+            AggSqlPieces::build(&cfg)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("unknown aggregate 'missing.sum'")
+        );
+
+        cfg.output_aliases = Some(HashMap::from([
+            ("pump_minutes.sum".to_owned(), "value".to_owned()),
+            ("usage_gpm.sum".to_owned(), "value".to_owned()),
+        ]));
+        assert!(
+            AggSqlPieces::build(&cfg)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("duplicate temporal-reduce output column 'value'")
         );
     }
 
@@ -3672,6 +3904,7 @@ mod tests {
                 agg(AggregationType::Min, &["temperature"]),
                 agg(AggregationType::Max, &["temperature"]),
             ],
+            output_aliases: None,
             transforms: None,
             allowed_lateness: None,
             seal_target_bytes: None,
@@ -4105,6 +4338,7 @@ mod tests {
                         columns: Some(vec!["temperature".to_string()]),
                     },
                 ],
+                output_aliases: None,
                 transforms: None,
                 allowed_lateness: None,
                 // Seal on every advance, as before the size gate existed: these
@@ -4288,6 +4522,129 @@ mod tests {
         let factory = factory.unwrap();
         assert_eq!(factory.name, "temporal-reduce");
         assert!(factory.description.contains("temporal downsampling"));
+
+        let direct = FactoryRegistry::get_factory("temporal-reduce-series").unwrap();
+        assert!(direct.create_file.is_some());
+        assert!(direct.create_directory.is_none());
+    }
+
+    #[test]
+    fn direct_series_config_rejects_ambiguous_sources_and_aliases() {
+        let valid = br#"
+in_pattern: series:///usage/rate
+time_column: timestamp
+resolution: 1d
+aggregations:
+  - type: sum
+    columns: [usage_gpm, pump_minutes]
+output_aliases:
+  usage_gpm.sum: gallons
+  pump_minutes.sum: pump_minutes
+"#;
+        _ = FactoryRegistry::validate_config("temporal-reduce-series", valid).unwrap();
+
+        let wildcard = std::str::from_utf8(valid)
+            .unwrap()
+            .replace("series:///usage/rate", "series:///usage/*");
+        assert!(
+            FactoryRegistry::validate_config("temporal-reduce-series", wildcard.as_bytes())
+                .unwrap_err()
+                .to_string()
+                .contains("one exact logical source URL")
+        );
+
+        let duplicate = std::str::from_utf8(valid).unwrap().replace(
+            "pump_minutes.sum: pump_minutes",
+            "pump_minutes.sum: gallons",
+        );
+        assert!(
+            FactoryRegistry::validate_config("temporal-reduce-series", duplicate.as_bytes())
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate temporal-reduce-series output alias 'gallons'")
+        );
+
+        let time_collision = std::str::from_utf8(valid)
+            .unwrap()
+            .replace("usage_gpm.sum: gallons", "usage_gpm.sum: timestamp");
+        assert!(
+            FactoryRegistry::validate_config("temporal-reduce-series", time_collision.as_bytes())
+                .unwrap_err()
+                .to_string()
+                .contains("conflicts with the time column")
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_series_factory_preserves_public_output_schema() {
+        let (fs, provider_context) = create_test_environment().await;
+        let root = fs.root().await.unwrap();
+        _ = root.create_dir_path("/ingest").await.unwrap();
+        use tokio::io::AsyncWriteExt;
+        let mut writer = root
+            .async_writer_path_with_type("/ingest/usage.csv", EntryType::FilePhysicalVersion)
+            .await
+            .unwrap();
+        writer
+            .write_all(
+                b"timestamp,usage_gpm,pump_minutes\n\
+                  1970-01-01T00:00:00,2.0,1\n\
+                  1970-01-01T00:01:00,3.0,1\n",
+            )
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+
+        let config = br#"
+in_pattern: csv:///ingest/usage.csv
+time_column: timestamp
+resolution: 1d
+aggregations:
+  - type: sum
+    columns: [usage_gpm, pump_minutes]
+output_aliases:
+  usage_gpm.sum: gallons
+  pump_minutes.sum: pump_minutes
+"#;
+        let handle = FactoryRegistry::create_file(
+            "temporal-reduce-series",
+            config,
+            test_context(&provider_context, FileID::root()),
+        )
+        .await
+        .unwrap();
+        let file = handle.get_file().await;
+        let guard = file.lock().await;
+        let provider = guard
+            .as_queryable()
+            .unwrap()
+            .as_table_provider(FileID::root(), &provider_context)
+            .await
+            .unwrap();
+        assert_eq!(
+            provider
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["timestamp", "gallons", "pump_minutes"]
+        );
+        let batches = provider_context
+            .datafusion_session
+            .read_table(provider)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let gallons = batches[0]
+            .column_by_name("gallons")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(gallons.value(0), 5.0);
     }
 
     /// Test that source_url() preserves the URL scheme from in_pattern.
@@ -4319,6 +4676,7 @@ mod tests {
                 time_column: "timestamp".to_string(),
                 resolutions: vec!["1h".to_string()],
                 aggregations: vec![],
+                output_aliases: None,
                 transforms: None,
                 allowed_lateness: None,
                 // Seal on every advance, as before the size gate existed: these
@@ -4453,6 +4811,7 @@ mod tests {
                         columns: Some(vec!["temperature".to_string()]),
                     },
                 ],
+                output_aliases: None,
                 transforms: None,
                 allowed_lateness: None,
                 // Seal on every advance, as before the size gate existed: these
@@ -4617,6 +4976,7 @@ mod tests {
                 agg(AggregationType::Min, &["temperature"]),
                 agg(AggregationType::Max, &["temperature"]),
             ],
+            output_aliases: None,
             transforms: None,
             allowed_lateness: None,
             // Seal on every advance, as before the size gate existed: these
@@ -4853,6 +5213,7 @@ mod tests {
                 agg(AggregationType::Min, &["temperature"]),
                 agg(AggregationType::Max, &["temperature"]),
             ],
+            output_aliases: None,
             transforms: None,
             allowed_lateness: None,
             // Seal on every advance, as before the size gate existed: these
@@ -5036,6 +5397,7 @@ mod tests {
             time_column: "timestamp".to_string(),
             resolutions: vec!["1h".to_string(), "6h".to_string(), "1d".to_string()],
             aggregations: vec![agg(AggregationType::Max, &["temperature"])],
+            output_aliases: None,
             transforms: None,
             allowed_lateness: Some("1d".to_string()),
             // Seal on every advance, as before the size gate existed: these
@@ -5328,6 +5690,7 @@ mod tests {
             time_column: "timestamp".to_string(),
             resolutions: vec!["1d".to_string()],
             aggregations: vec![agg(AggregationType::Avg, &["temperature"])],
+            output_aliases: None,
             transforms: None,
             allowed_lateness: None,
             // Seal on every advance, as before the size gate existed: these
@@ -5430,6 +5793,7 @@ mod tests {
                 agg(AggregationType::Min, &["temperature"]),
                 agg(AggregationType::Max, &["temperature"]),
             ],
+            output_aliases: None,
             transforms: None,
             allowed_lateness: None,
             // Seal on every advance, as before the size gate existed: these
@@ -5566,6 +5930,7 @@ mod tests {
                 agg(AggregationType::Min, &["temperature"]),
                 agg(AggregationType::Max, &["temperature"]),
             ],
+            output_aliases: None,
             transforms: None,
             allowed_lateness: None,
             // Seal on every advance, as before the size gate existed: these
@@ -5757,6 +6122,7 @@ mod tests {
             time_column: "timestamp".to_string(),
             resolutions: vec!["1h".to_string(), "1d".to_string()],
             aggregations: vec![agg(AggregationType::Max, &["temperature"])],
+            output_aliases: None,
             transforms: None,
             allowed_lateness: None,
             // Seal on every advance, as before the size gate existed: these
@@ -5929,6 +6295,7 @@ mod tests {
                 agg(AggregationType::Max, &["temperature"]),
                 agg(AggregationType::Sum, &["temperature"]),
             ],
+            output_aliases: None,
             transforms: None,
             allowed_lateness: lateness.map(str::to_string),
             // Seal on every advance, as before the size gate existed: these
@@ -6247,6 +6614,7 @@ mod tests {
             time_column: "timestamp".to_string(),
             resolutions: vec!["1d".to_string()],
             aggregations: vec![agg(AggregationType::Avg, &["temperature"])],
+            output_aliases: None,
             transforms: None,
             allowed_lateness: Some("1d".to_string()),
             // Seal on every advance, as before the size gate existed: these

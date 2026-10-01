@@ -3,13 +3,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::persistence::OpLogPersistence;
-use arrow_array::{ArrayRef, Float64Array, RecordBatch, TimestampMicrosecondArray};
+use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, TimestampMicrosecondArray};
+use provider::factory::sql_derived::{SqlDerivedConfig, SqlDerivedLocality};
 use provider::factory::temporal_reduce::{
-    AggregationConfig, AggregationType, TemporalReduceConfig,
+    AggregationConfig, AggregationType, TemporalReduceConfig, TemporalReduceSeriesConfig,
 };
 use provider::factory::timeseries_join::{TimeseriesInput, TimeseriesJoinConfig};
 use provider::factory::timeseries_pivot::TimeseriesPivotConfig;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,6 +46,27 @@ fn source_history(values: &[f64]) -> RecordBatch {
         (
             "value",
             Arc::new(Float64Array::from(values.to_vec())) as ArrayRef,
+        ),
+    ])
+    .unwrap()
+}
+
+fn source_samples(samples: &[(i64, f64)]) -> RecordBatch {
+    RecordBatch::try_from_iter([
+        (
+            "timestamp",
+            Arc::new(TimestampMicrosecondArray::from(
+                samples
+                    .iter()
+                    .map(|(timestamp, _)| *timestamp)
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ),
+        (
+            "value",
+            Arc::new(Float64Array::from(
+                samples.iter().map(|(_, value)| *value).collect::<Vec<_>>(),
+            )) as ArrayRef,
         ),
     ])
     .unwrap()
@@ -161,6 +183,193 @@ async fn query_reduced(
     (rows, columns, metrics)
 }
 
+async fn query_direct_reduced(
+    persistence: &mut OpLogPersistence,
+) -> (Vec<(f64, i64)>, tinyfs::PlanVisibilityMetricsSnapshot) {
+    let tx = persistence.begin_test().await.unwrap();
+    let root = tx.root().await.unwrap();
+    let node = root.get_node_path(Path::new("/usage/daily")).await.unwrap();
+    let file = node.as_file().await.unwrap();
+    let handle = file.handle.get_file().await;
+    let guard = handle.lock().await;
+    let context = tx.state().unwrap().as_provider_context();
+    let table = guard
+        .as_queryable()
+        .expect("direct temporal-reduce output is queryable")
+        .as_table_provider(node.id(), &context)
+        .await
+        .unwrap();
+    assert_eq!(
+        table
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        vec!["timestamp", "gallons", "pump_minutes"]
+    );
+    drop(guard);
+    let batches = context
+        .datafusion_session
+        .read_table(table)
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    for batch in batches {
+        let gallons = batch
+            .column_by_name("gallons")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let pump_minutes = batch
+            .column_by_name("pump_minutes")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        rows.extend((0..batch.num_rows()).map(|row| (gallons.value(row), pump_minutes.value(row))));
+    }
+    let metrics = context.plan_visibility_metrics();
+    tx.commit_test().await.unwrap();
+    (rows, metrics)
+}
+
+#[tokio::test]
+async fn direct_reduction_reuses_and_repairs_timestamp_local_dynamic_source() {
+    let store_path = test_dir();
+    let mut persistence = OpLogPersistence::create_test(&store_path).await.unwrap();
+
+    {
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        _ = root.create_dir_path("/sources").await.unwrap();
+        _ = root.create_dir_path("/usage").await.unwrap();
+        _ = root
+            .create_series_from_batch(
+                "/sources/a.series",
+                &source_samples(&[
+                    (3_600_000_000, 10.0),
+                    (25 * 3_600_000_000, 11.0),
+                    (49 * 3_600_000_000, 12.0),
+                ]),
+                Some("timestamp"),
+            )
+            .await
+            .unwrap();
+
+        let rate = SqlDerivedConfig {
+            patterns: HashMap::from([(
+                "state".to_owned(),
+                provider::Url::parse("series:///sources/a.series").unwrap(),
+            )]),
+            query: Some(
+                "SELECT timestamp, value AS usage_gpm, \
+                 CAST(1 AS BIGINT) AS pump_minutes FROM state"
+                    .to_owned(),
+            ),
+            locality: SqlDerivedLocality::TimestampLocal {
+                event_time: "timestamp".to_owned(),
+            },
+            transforms: None,
+            pattern_transforms: None,
+            scope_prefixes: None,
+            provider_wrapper: None,
+        };
+        _ = root
+            .create_dynamic_path(
+                "/usage/rate",
+                tinyfs::EntryType::FileDynamic,
+                "sql-derived-series",
+                yaml(&rate),
+            )
+            .await
+            .unwrap();
+
+        let daily = TemporalReduceSeriesConfig {
+            in_pattern: provider::Url::parse("series:///usage/rate").unwrap(),
+            time_column: "timestamp".to_owned(),
+            resolution: "1d".to_owned(),
+            aggregations: vec![AggregationConfig {
+                agg_type: AggregationType::Sum,
+                columns: Some(vec!["usage_gpm".to_owned(), "pump_minutes".to_owned()]),
+            }],
+            output_aliases: Some(HashMap::from([
+                ("usage_gpm.sum".to_owned(), "gallons".to_owned()),
+                ("pump_minutes.sum".to_owned(), "pump_minutes".to_owned()),
+            ])),
+            transforms: None,
+            allowed_lateness: Some("1h".to_owned()),
+            seal_target_bytes: Some(0),
+            max_live_segments: None,
+        };
+        _ = root
+            .create_dynamic_path(
+                "/usage/daily",
+                tinyfs::EntryType::FileDynamic,
+                "temporal-reduce-series",
+                yaml(&daily),
+            )
+            .await
+            .unwrap();
+        tx.commit_test().await.unwrap();
+    }
+
+    let (cold_rows, cold_metrics) = query_direct_reduced(&mut persistence).await;
+    assert_eq!(cold_rows, vec![(10.0, 1), (11.0, 1), (12.0, 1)]);
+    assert_eq!(cold_metrics.global_plans, 0);
+    assert_eq!(cold_metrics.non_incremental_plans, 0);
+    assert_eq!(cold_metrics.dynamic_source_executions, 1);
+    assert_eq!(cold_metrics.bounded_dynamic_source_executions, 0);
+
+    let cache_dir = Path::new(&store_path).parent().unwrap().join("cache");
+    let cold_cache = cache_snapshot(&cache_dir);
+    assert!(!segment_manifests(&cold_cache).is_empty());
+
+    let (warm_rows, warm_metrics) = query_direct_reduced(&mut persistence).await;
+    assert_eq!(warm_rows, cold_rows);
+    assert_eq!(warm_metrics.global_plans, 0);
+    assert_eq!(warm_metrics.non_incremental_plans, 0);
+    assert_eq!(warm_metrics.dynamic_source_executions, 0);
+    assert_eq!(warm_metrics.bounded_dynamic_source_executions, 0);
+    assert_eq!(
+        cache_snapshot(&cache_dir),
+        cold_cache,
+        "fresh-context no-change read must reuse every cached byte"
+    );
+
+    {
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        append_source(&root, "/sources/a.series", 97 * 3_600_000_000, 30.0).await;
+        tx.commit_test().await.unwrap();
+    }
+
+    let (append_rows, append_metrics) = query_direct_reduced(&mut persistence).await;
+    assert_eq!(
+        append_rows,
+        vec![(10.0, 1), (11.0, 1), (12.0, 1), (30.0, 1)]
+    );
+    assert_eq!(append_metrics.global_plans, 0);
+    assert_eq!(append_metrics.non_incremental_plans, 0);
+    assert_eq!(append_metrics.dynamic_source_executions, 1);
+    assert_eq!(append_metrics.bounded_dynamic_source_executions, 1);
+    let read_lo = append_metrics
+        .minimum_dynamic_event_time_lo
+        .expect("append repair must carry an event-time lower bound");
+    assert!(
+        read_lo > 3_600_000_000 && read_lo <= 97 * 3_600_000_000,
+        "append repair bound {read_lo} must exclude old history and include the append"
+    );
+    assert_ne!(
+        segment_manifests(&cache_snapshot(&cache_dir)),
+        segment_manifests(&cold_cache),
+        "bounded append repair must advance the direct reducer manifest"
+    );
+}
+
 #[tokio::test]
 async fn dynamic_join_pivot_reuses_persistent_reduction_lineage() {
     let store_path = test_dir();
@@ -224,6 +433,7 @@ async fn dynamic_join_pivot_reuses_persistent_reduction_lineage() {
                 agg_type: AggregationType::Avg,
                 columns: None,
             }],
+            output_aliases: None,
             transforms: None,
             allowed_lateness: Some("1h".to_owned()),
             seal_target_bytes: Some(0),
