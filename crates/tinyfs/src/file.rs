@@ -83,6 +83,7 @@ impl SeriesReadBounds {
 /// Trait for writers that can accept file metadata (e.g., temporal bounds from parquet)
 /// This allows metadata extracted during serialization to be passed to the storage layer
 /// without re-reading the file
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait FileMetadataWriter: AsyncWrite + Send + Unpin {
     /// Set temporal metadata for series files (used when metadata is known at write time)
@@ -166,6 +167,7 @@ pub struct Handle(Arc<tokio::sync::Mutex<Box<dyn File>>>);
 /// Represents a file with binary content.
 /// This design uses streaming I/O as the fundamental operations.
 /// Implementations handle their own state management and write protection.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait File: Metadata + Send + Sync {
     /// Create a reader stream - implementation specific
@@ -214,6 +216,7 @@ pub trait File: Metadata + Send + Sync {
 }
 
 /// Trait for files that can be queried via DataFusion SQL
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait QueryableFile: File {
     /// Convert this file into a DataFusion TableProvider for SQL queries

@@ -14,6 +14,7 @@ use super::metadata::Metadata;
 pub const SYMLINK_LOOP_LIMIT: u32 = 10;
 
 /// Represents a symlink that points to another path
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Symlink: Metadata + Send + Sync {
     async fn readlink(&self) -> error::Result<PathBuf>;

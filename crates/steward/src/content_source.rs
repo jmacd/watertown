@@ -36,6 +36,7 @@ pub type BlobReader = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
 /// object closure and stream its external blobs.  Implemented by both
 /// [`ContentRemote`] (S3 / `file://` Delta store) and [`LocalPondSource`] (a
 /// producer clone on local disk).
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ContentSource: Send + Sync {
     /// The pond whose content this source holds.
