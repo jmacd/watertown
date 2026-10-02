@@ -21,12 +21,18 @@
 //!   advertisement, only harmless unreferenced objects, and the series
 //!   remains fully readable and re-repackable afterward.
 
+use provider::query_foundation_adapter::capture_tinyfs_snapshot;
+use query_foundation::overlap::OverlapPolicy;
+use query_foundation::snapshot::EventTimeContract;
 use std::path::Path;
 use steward::{
     ContentSource, LocalPondSource, Ship, compute_content_tree, fetch_object_graph,
-    fetch_object_graph_since, rebuild_pond,
+    fetch_object_graph_since, materialize_content_objects, rebuild_pond,
 };
-use sync_store::content::PackIndex;
+use sync_store::content::{
+    ContentObjectKind, MerkleFrontier, ObjectHash as ContentHash, PackIndex, SeriesManifest,
+    schema_fingerprint as fingerprint_schema,
+};
 use tempfile::tempdir;
 use tinyfs::EntryType;
 use tinyfs::ResultExt;
@@ -284,6 +290,199 @@ async fn maintained_pack_for_series(
         series_hash,
         PackIndex::decode(&pack_bytes).expect("decode maintained pack index"),
     )
+}
+
+async fn query_leaf_descriptors(
+    ship: &mut Ship,
+) -> Vec<(
+    ContentHash,
+    u64,
+    Option<(i64, i64)>,
+    ContentHash,
+    ContentHash,
+    Option<Vec<u8>>,
+)> {
+    let transaction = ship
+        .begin_read(&meta("capture-query-leaves"))
+        .await
+        .expect("begin query snapshot read");
+    let root = transaction.root().await.expect("query snapshot root");
+    let series = root
+        .get_node_path("/data/events.table")
+        .await
+        .expect("table series node");
+    let context = transaction
+        .provider_context()
+        .expect("query provider context");
+    let versions = context
+        .persistence
+        .list_file_versions(series.id())
+        .await
+        .expect("list persisted series versions");
+    let snapshot = capture_tinyfs_snapshot(
+        &context,
+        series.id(),
+        "backup-identity-snapshot",
+        table_batch(0, "schema").schema(),
+        Some(EventTimeContract::new("timestamp")),
+        OverlapPolicy::PreserveAll,
+    )
+    .await
+    .expect("capture query snapshot");
+    let descriptors = snapshot
+        .snapshot()
+        .chunks()
+        .iter()
+        .zip(versions)
+        .map(|(chunk, version)| {
+            let bounds = chunk
+                .event_time_bounds()
+                .map(|bounds| (bounds.min(), bounds.max()));
+            let attributes = version
+                .extended_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("extended_attributes"))
+                .map(|attributes| attributes.as_bytes().to_vec());
+            (
+                ContentHash::from_hex(chunk.chunk_id()).expect("chunk ID is a logical leaf hash"),
+                chunk.logical_count(),
+                bounds,
+                fingerprint_schema(chunk.schema().as_ref()).expect("fingerprint query schema"),
+                ContentHash::from_hex(version.blake3.as_deref().expect("persisted physical hash"))
+                    .expect("decode persisted physical hash"),
+                attributes,
+            )
+        })
+        .collect();
+    _ = transaction
+        .commit()
+        .await
+        .expect("commit query snapshot read");
+    descriptors
+}
+
+/// Query execution and native backup must consume one persisted logical-leaf
+/// identity, while pack-only maintenance may change only its physical layout.
+#[tokio::test]
+async fn query_chunk_ids_equal_backup_leaf_hashes_across_pack_maintenance() {
+    let temp_dir = tempdir().expect("tempdir");
+    let pond_path = temp_dir.path().join("query_backup_identity_pond");
+    let mut ship = Ship::create_pond(&pond_path, "test-host")
+        .await
+        .expect("create pond");
+
+    ship.write_transaction(&meta("table-series"), async move |fs| {
+        let root = fs.root().await?;
+        let _ = root.create_dir_path("data").await?;
+        for (timestamp, label) in [
+            (1_000_000i64, "a"),
+            (2_000_000i64, "b"),
+            (3_000_000i64, "c"),
+            (4_000_000i64, "d"),
+        ] {
+            let _ = root
+                .write_series_from_batch(
+                    "/data/events.table",
+                    &table_batch(timestamp, label),
+                    Some("timestamp"),
+                )
+                .await?;
+        }
+        Ok(())
+    })
+    .await
+    .expect("table series transaction");
+
+    let query_before = query_leaf_descriptors(&mut ship).await;
+    assert_eq!(query_before.len(), 4);
+    let leaf_hashes = query_before
+        .iter()
+        .map(|(hash, _, _, _, _, _)| *hash)
+        .collect::<Vec<_>>();
+    let physical_hashes_before = query_before
+        .iter()
+        .map(|(_, _, _, _, hash, _)| *hash)
+        .collect::<Vec<_>>();
+
+    let materialized = materialize_content_objects(&ship)
+        .await
+        .expect("materialize backup content");
+    let series_objects = materialized
+        .inline
+        .values()
+        .filter(|object| object.kinds.contains(&ContentObjectKind::SeriesManifest))
+        .collect::<Vec<_>>();
+    assert_eq!(series_objects.len(), 1, "one series manifest");
+    let manifest =
+        SeriesManifest::decode(&series_objects[0].bytes).expect("decode series manifest");
+    assert_eq!(
+        manifest.merkle_frontier(),
+        &MerkleFrontier::from_leaves(&leaf_hashes),
+        "backup manifest must fold the query-visible chunk IDs in query order"
+    );
+    assert_eq!(manifest.logical_count(), 4);
+    assert_eq!(manifest.min_event_time(), Some(1_000_000));
+    assert_eq!(manifest.max_event_time(), Some(4_000_000));
+
+    let root_before = compute_content_tree(&ship)
+        .await
+        .expect("root before maintenance")
+        .root_tree_hash;
+    let delta_version_before = ship.data_persistence().table().version();
+    let report = ship.collapse_versions(1).await.expect("pack maintenance");
+    assert_eq!(report.series_repacked, 1);
+    assert!(report.pack_objects_written > 0);
+    assert_eq!(
+        compute_content_tree(&ship)
+            .await
+            .expect("root after maintenance")
+            .root_tree_hash,
+        root_before
+    );
+    assert_eq!(
+        ship.data_persistence().table().version(),
+        delta_version_before
+    );
+
+    let query_after = query_leaf_descriptors(&mut ship).await;
+    assert_eq!(
+        query_after, query_before,
+        "pack-only maintenance must not alter query-visible leaf identity or metadata"
+    );
+
+    let source_after = LocalPondSource::open(&pond_path)
+        .await
+        .expect("open source after maintenance");
+    let (series_hash_after, pack_after) = maintained_pack_for_series(
+        &source_after,
+        &pond_path,
+        "events.table",
+        EntryType::TablePhysicalSeries,
+    )
+    .await;
+    assert_eq!(series_hash_after, manifest.hash());
+    assert_ne!(
+        pack_after.physical_object_hashes(),
+        physical_hashes_before,
+        "maintenance must exercise a genuinely different physical layout"
+    );
+    assert_eq!(pack_after.series_hash(), manifest.hash());
+    assert_eq!(pack_after.leaf_start(), 0);
+    assert_eq!(pack_after.leaf_end(), query_after.len() as u64);
+    assert_eq!(pack_after.logical_count(), manifest.logical_count());
+
+    for (pack_leaf, (query_hash, query_count, query_bounds, query_schema, _, query_attributes)) in
+        pack_after.leaf_descriptors().iter().zip(&query_after)
+    {
+        assert_eq!(pack_leaf.logical_leaf_hash(), *query_hash);
+        assert_eq!(pack_leaf.logical_count(), *query_count);
+        assert_eq!(
+            (pack_leaf.min_event_time(), pack_leaf.max_event_time()),
+            query_bounds.map_or((None, None), |(min, max)| (Some(min), Some(max)))
+        );
+        assert_eq!(pack_leaf.schema_fingerprint(), Some(*query_schema));
+        assert_eq!(pack_leaf.logical_attributes(), query_attributes.as_deref());
+    }
 }
 
 /// A `TablePhysicalSeries` with several live versions must be repacked

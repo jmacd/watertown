@@ -1124,6 +1124,34 @@ static samples and produced one daily row with 6 pump minutes.
 **Gate:** query and replication planes share immutable identities and metadata
 without backup executing a query or query planning from backup advertisements.
 
+Phase 11 is complete. TLogFS stamps each nonempty append once with its logical
+leaf hash, count, table schema fingerprint, bounds, and canonical attributes.
+The query adapter uses that persisted leaf hash as the immutable chunk ID,
+while Steward folds the same ordered hashes and metadata directly from the
+Oplog into `watertown.series.v3` and `watertown.series-pack.v4`; backup does
+not execute a query, and query planning does not inspect pack advertisements.
+
+`query_chunk_ids_equal_backup_leaf_hashes_across_pack_maintenance` is the
+cross-plane regression for this contract. It creates a real TLogFS table
+series, captures its query snapshot, materializes its native backup manifest,
+and proves that the ordered query chunk IDs produce the manifest's exact
+Merkle frontier. It then performs a real pack-only repack and proves that the
+content root, Delta version, query chunk IDs, counts, event-time bounds, schema
+fingerprints, and logical attributes are unchanged while the physical object
+layout changes. Every resulting pack descriptor is compared directly with the
+corresponding query-visible immutable leaf.
+
+The remaining gates are covered by the native-v2 publication suites. A one-leaf
+append publishes only the suffix and has bounded producer cost after 1, 100,
+and 1,000 retained leaves; alternate file and table pack layouts retain the
+same manifest and ordered leaf hashes; incremental file and table pulls read
+only their physical suffixes; interrupted publication and consolidation retry
+without duplicate canonical bytes or premature locators; and capsule
+build/import/resume/activation preserve the same logical inventory. The Phase
+11 qualification ran the seven focused Steward suites (98 tests), the Provider
+TinyFS query adapter suite (9 tests), and the complete Sync Store suite (404
+tests), all passing.
+
 ## 13. Production integration boundaries
 
 ### 13.1 TinyFS
