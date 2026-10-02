@@ -368,6 +368,7 @@ impl Url {
 }
 
 /// Trait for URL access to Tinyfs.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait FileProvider {
     /// Open a URL with optional decompression

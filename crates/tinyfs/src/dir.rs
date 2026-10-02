@@ -61,6 +61,7 @@ impl DirectoryEntry {
 }
 
 /// Represents a directory containing named entries.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Directory: Metadata + Send + Sync {
     async fn get(&self, name: &str) -> Result<Option<Node>>;

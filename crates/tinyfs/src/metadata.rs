@@ -30,6 +30,7 @@ pub struct NodeMetadata {
 
 /// Common metadata interface for all filesystem nodes
 /// This trait provides a uniform way to access metadata across different node types
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Metadata: Send + Sync {
     /// Get consolidated metadata for this node

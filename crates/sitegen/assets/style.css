@@ -346,6 +346,24 @@ main h3 {
   border-radius: 0;
 }
 
+.content-page .equation {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem 1.25rem;
+  margin: 1rem 0;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 0.95rem;
+  line-height: 1.6;
+  text-align: center;
+}
+
+.content-page .equation sub,
+.content-page .equation sup {
+  font-size: 0.7em;
+}
+
 .content-page hr {
   border: none;
   border-top: 1px solid var(--border);
