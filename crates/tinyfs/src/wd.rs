@@ -1489,6 +1489,7 @@ impl PartialEq<WD> for WD {
 }
 
 /// Trait for visiting filesystem nodes during glob traversal
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Visitor<T>: Send {
     /// Called for each matching node with the node path and captured wildcard groups

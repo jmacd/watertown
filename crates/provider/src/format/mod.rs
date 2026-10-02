@@ -32,6 +32,7 @@ pub mod weblog;
 /// Parquet and other random-access formats use existing TinyFS ObjectStore path.
 ///
 /// Uses arrow's native async Decoder pattern with AsyncBufRead.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait FormatProvider: Send + Sync {
     /// Provider name (matches URL scheme)

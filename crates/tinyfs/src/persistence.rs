@@ -52,6 +52,7 @@ pub fn validate_file_version_range(range: Range<u64>, size: u64) -> Result<Range
 }
 
 /// Pure persistence layer - no caching, no NodeRef management
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait PersistenceLayer: Send + Sync {
     /// Downcast support for accessing concrete implementation methods

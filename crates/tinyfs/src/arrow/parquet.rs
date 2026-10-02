@@ -512,6 +512,7 @@ impl StreamingSeriesWriter {
 // ParquetExt Trait - Clean API
 // ============================================================================
 
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait ParquetExt {
     /// Write items to a parquet file (high-level ForArrow API)
