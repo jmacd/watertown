@@ -680,10 +680,9 @@ impl Ship {
     /// factory execution or remote auto-push (see
     /// [`StewardTransactionGuard::suppressing_post_commit`]).
     ///
-    /// Restricted to the crate: used only by the staged capsule importer,
-    /// which recreates `/system/run/*` and `/sys/remotes/*` namespace content
-    /// verbatim from a capsule but must keep it inert until the operator
-    /// explicitly seals and unsuppresses the target pond.
+    /// Restricted to the crate: used by staged capsule import and restore
+    /// bootstrap, which recreate `/system/run/*` and `/sys/remotes/*`
+    /// namespace content but must keep it inert until the target is ready.
     pub(crate) async fn begin_write_suppressed(
         &mut self,
         meta: &PondUserMetadata,

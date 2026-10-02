@@ -1110,6 +1110,20 @@ so `COUNT(*)` over pump state returns all 241 fixture rows instead of failing
 batch construction. The fixture classified 6 pumping, 4 recovering, and 231
 static samples and produced one daily row with 6 pump minutes.
 
+Qualification against a read-only local restore of staging generation 460
+confirmed the same migration over retained production history. The typed pump
+preserved all 2,044,447 rows and the exact phase counts (174,070 pumping,
+59,623 recovering, and 1,810,754 static) while reducing peak memory for the
+phase query from 111.60 MiB to 19.96 MiB. The direct reducer preserved all 948
+daily rows and exact integer pump-minute values. Reassociated `Float64` sums
+differed from the prior global SQL by at most 2.3e-12 gallons (less than 8.9e-16
+relative) across the latest ten days. A fresh-process warm read executed no
+dynamic source and used 5.61 MiB. Applying the migrated graph also completed
+its automatic monitor successfully in the clone. An unchanged legacy
+drawdown query exhausted the 512 MiB DataFusion pool on the full history;
+that pre-existing global SQL limitation is outside the migrated pump and daily
+paths and remains visible rather than being hidden by this qualification.
+
 ### Phase 11: native-v2 backup and restore verification
 
 1. Map query-visible immutable logical leaves to current

@@ -189,7 +189,12 @@ $ POND=~/preview-mysite pond restore origin s3://my-bucket/mysite \
 publication record and `watertown.commit.v2` tip, traverses the requested
 persistent manifest map, and fetches the live snapshot objects. The first run
 therefore transfers the full live content. It does not scan a cumulative
-object or commit index.
+object or commit index. Automatic factories and remote pushes restored under
+`/system/run` and `/sys/remotes` are not dispatched by the bootstrap
+transaction; they resume on later ordinary writes, after the restore has
+completed and the target environment is available. If bootstrap fails,
+`restore` removes its `data`, `control`, and `tlog` paths; any cleanup failure
+is included in the reported error rather than ignored.
 
 A restored clone is a normal, fully queryable pond -- `pond list`,
 `pond cat <path> --sql "..."`, and factory runs all work against it with

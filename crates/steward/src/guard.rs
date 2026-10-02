@@ -159,8 +159,9 @@ impl<'a> StewardTransactionGuard<'a> {
     /// Suppress post-commit factory execution and remote auto-push for this
     /// transaction only (see [`Self::suppress_post_commit`] field docs).
     ///
-    /// Restricted to the crate: this is a narrow safety valve for the staged
-    /// capsule importer, not a general-purpose knob for ordinary writes.
+    /// Restricted to the crate: this is a narrow safety valve for staged
+    /// capsule import and restore bootstrap, not a general-purpose knob for
+    /// ordinary writes.
     #[must_use]
     pub(crate) fn suppressing_post_commit(mut self) -> Self {
         self.suppress_post_commit = true;

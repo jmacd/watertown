@@ -22,7 +22,7 @@
 //! `name` attachment is left configured as a mirror so later `pond pull <name>`
 //! tracks the upstream incrementally.
 
-use crate::commands::pull::pull_command;
+use crate::commands::pull::pull_command_suppressed;
 use crate::commands::remote::add_remote_command;
 use crate::common::ShipContext;
 use anyhow::{Result, anyhow};
@@ -46,9 +46,10 @@ pub async fn restore_command(
     let pond_path = ship_context.resolve_pond_path()?;
     let data_path = pond_path.join("data");
     let control_path = pond_path.join("control");
+    let tlog_path = pond_path.join("tlog");
 
     // Restore bootstraps a fresh replica; it must not clobber an existing pond.
-    if data_path.exists() || control_path.exists() {
+    if data_path.exists() || control_path.exists() || tlog_path.exists() {
         return Err(anyhow!(
             "refusing to restore over an existing pond at {}: `pond restore` bootstraps a \
              fresh replica. Remove the directory (or choose an empty target) and retry, or \
@@ -119,9 +120,22 @@ pub async fn restore_command(
             Ok(())
         }
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&data_path);
-            let _ = std::fs::remove_dir_all(&control_path);
-            Err(anyhow!("restore from {url} failed: {e}"))
+            let cleanup_errors = [&data_path, &control_path, &tlog_path]
+                .into_iter()
+                .filter_map(|path| match std::fs::remove_dir_all(path) {
+                    Ok(()) => None,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => Some(format!("{}: {error}", path.display())),
+                })
+                .collect::<Vec<_>>();
+            if cleanup_errors.is_empty() {
+                Err(anyhow!("restore from {url} failed: {e}"))
+            } else {
+                Err(anyhow!(
+                    "restore from {url} failed: {e}; cleanup also failed: {}",
+                    cleanup_errors.join("; ")
+                ))
+            }
         }
     }
 }
@@ -156,5 +170,5 @@ async fn wire_and_pull(
     )
     .await?;
 
-    pull_command(ship_context, Some(name.to_string())).await
+    pull_command_suppressed(ship_context, Some(name.to_string())).await
 }
