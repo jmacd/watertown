@@ -286,6 +286,7 @@ pub fn plan_materialization_change(
 ///
 /// `commit` must atomically publish its optional output and progress. If it
 /// returns an error, neither may be authoritative.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait TransactionalBatchWriter: Send {
     /// Write one non-empty batch to hidden staged state.
@@ -302,6 +303,7 @@ pub trait TransactionalBatchWriter: Send {
 }
 
 /// Factory for one hidden transactional output stage.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait TransactionalMaterializationSink: Sync {
     /// Begin staging one stable output identity for a validated publication
