@@ -310,13 +310,25 @@ duration, but unrelated to selfmon's own loop.
 ### 8. Selfmon tick duration on slow ponds
 
 `measure-pond.sh` shells out to `find` and `du` once per pond per
-tick. On `site-staging` (5 K parquet files, 950 MB) one probe takes
-several seconds; the full per-tick loop currently runs ~10-11 minutes
-end to end. With the selfmon timer's `OnUnitActiveSec=1min` the
-effective measurement cadence is ~12 minutes, not 1 minute. Acceptable
-for current goals (long-term growth visibility) but worth replacing
-the host-fs traversal with a dedicated `pond` subcommand if we ever
-want sub-minute cadence.
+tick. The earlier 10-11 minute observation no longer describes the mature
+stress pond. Pre-deployment measurements in October found:
+
+- `0.174.236` completed one tick in about 69 minutes;
+- `0.173.237`, containing the typed DataFusion migration, completed in about
+  95.5 minutes;
+- routine pack maintenance repacked 29 series and attributed 177-185 GB of
+  logical reads to a roughly 7 GB pond while writing about 100 MB; and
+- the three materializers took 81-278 seconds each. The typed build reduced
+  their peak memory by 41-49%, but a separate full-source `MAX(timestamp)`
+  execution increased their elapsed time and reads.
+
+The timer is a serialized oneshot, so `OnUnitActiveSec=1min` does not stack
+runs: effective cadence is the complete tick duration plus the timer delay.
+The follow-up repair derives materialization progress from the one streamed
+output execution and changes pack maintenance from one inline-content Delta
+execution per leaf/series to one disk-spooled execution shared by all repack
+candidates. A controlled selfmon run must confirm the expected I/O reduction
+before these numbers are replaced with a new steady-state baseline.
 
 ### 9. `last_run.seconds_ago == -1` while a service is running
 

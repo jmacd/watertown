@@ -31,7 +31,7 @@ use datafusion::scalar::ScalarValue;
 use log::{debug, info};
 use query_foundation::frontier::{RepairPolicy, SettledState};
 use query_foundation::materialize::{
-    MaterializationProgress, MaterializationPublication, materialize_stream,
+    MaterializationProgress, MaterializationPublication, materialize_stream_with_progress,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -217,12 +217,6 @@ pub async fn execute(
     let mut frame = session
         .read_table(source)
         .map_err(|e| tinyfs::Error::Other(format!("materialize-series: read source: {e}")))?;
-    let source_max = max_event_time(
-        frame.clone(),
-        &config.time_column,
-        "materialize-series: source frontier",
-    )
-    .await?;
 
     // Strictly greater-than: the watermark row is already stored, and the
     // target is append-only, so re-emitting it would duplicate rather than
@@ -239,31 +233,13 @@ pub async fn execute(
     let recipe_bytes = serde_json::to_vec(&config)
         .map_other_context("materialize-series: serialize recipe identity")?;
     let recipe_id = blake3::hash(&recipe_bytes).to_hex().to_string();
-    let source_max_us = source_max.as_ref().map(scalar_event_time_us).transpose()?;
     let after = watermark.as_ref().map(scalar_event_time_us).transpose()?;
-    if after.is_some_and(|after| source_max_us.is_none_or(|source_max| source_max < after)) {
-        return Err(tinyfs::Error::Other(format!(
-            "materialize-series: source frontier {source_max_us:?} is behind target watermark \
-             {after:?}; append-only materialization cannot repair removed history"
-        )));
-    }
     let source_generation = context
         .context
         .persistence
         .coherence_state()
         .map(|state| state.generation());
-    let source_state_id = format!(
-        "source={};generation={source_generation:?};observed={source_max_us:?}",
-        config.source
-    );
-    let progress = MaterializationProgress::try_new(
-        recipe_id,
-        source_state_id,
-        SettledState::try_new(source_max_us, source_max_us, RepairPolicy::reject()).map_err(
-            |error| tinyfs::Error::Other(format!("materialize-series: frontier: {error}")),
-        )?,
-    )
-    .map_err(|error| tinyfs::Error::Other(format!("materialize-series: progress: {error}")))?;
+    let source_url = config.source.to_string();
     let stream = frame
         .execute_stream()
         .await
@@ -273,11 +249,23 @@ pub async fn execute(
         &context.context,
         config.time_column.clone(),
     );
-    let outcome = materialize_stream(
+    let outcome = materialize_stream_with_progress(
         &sink,
         config.target.clone(),
         &config.time_column,
-        progress,
+        move |output| {
+            let source_max_us = output
+                .map(|output| output.event_time_bounds().max())
+                .or(after);
+            let source_state_id = format!(
+                "source={source_url};generation={source_generation:?};observed={source_max_us:?}"
+            );
+            MaterializationProgress::try_new(
+                recipe_id,
+                source_state_id,
+                SettledState::try_new(source_max_us, source_max_us, RepairPolicy::reject())?,
+            )
+        },
         MaterializationPublication::Append { after },
         stream,
     )
@@ -419,6 +407,28 @@ mod tests {
                 "/target.series.materialization-progress"
             ))
             .await
+        );
+        let progress: Value = serde_json::from_slice(
+            &root
+                .read_file_path_to_vec("/target.series.materialization-progress")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            progress["watertown.materialization.observed_through"], 3,
+            "an empty suffix must retain the prior observed frontier"
+        );
+        assert_eq!(
+            progress["watertown.materialization.settled_through"], 3,
+            "an empty suffix must retain the prior settled frontier"
+        );
+        assert!(
+            progress["watertown.materialization.source_state_id"]
+                .as_str()
+                .unwrap()
+                .contains("observed=Some(3)"),
+            "an empty suffix must not publish a rewound source-state identity"
         );
         assert_eq!(
             provider_context

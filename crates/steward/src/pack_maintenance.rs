@@ -210,6 +210,7 @@ impl std::fmt::Display for PackMaintenanceCandidate {
 pub(crate) struct PackMaintenanceReport {
     pub(crate) candidates: Vec<PackMaintenanceCandidate>,
     pub(crate) series_repacked: usize,
+    pub(crate) content_delta_scans: usize,
     pub(crate) already_bounded: usize,
     pub(crate) unsupported_legacy: usize,
     pub(crate) pack_objects_written: usize,
@@ -237,16 +238,17 @@ pub(crate) struct PackMaintenanceReport {
 }
 
 /// One native v2 series' live state, already folded into its manifest --
-/// enough to decide candidacy and, if selected, to repack (a real repack
-/// fetches this one series' full content-bearing rows fresh, right before
-/// streaming it -- see [`run_pack_maintenance`] -- rather than this struct
-/// ever holding a series' payload bytes; see the module docs' "Streaming,
-/// not buffering" section and requirement 4).
+/// enough to decide candidacy and, if selected, to repack. Payload rows are
+/// never held here; [`run_pack_maintenance`] fetches every selected series in
+/// one pond-wide scan into a disk-backed spool.
 struct DiscoveredSeries {
     file_id: FileID,
     series_hash: ObjectHash,
     entry_type: EntryType,
     manifest: SeriesManifest,
+    /// Live metadata retained only for real-run candidates, never payload
+    /// bytes. This is the same snapshot used to build `manifest`.
+    ordered_meta: Option<Vec<content_tree::SeriesVersionData>>,
     current_physical_objects: usize,
     proposed_physical_objects: usize,
     /// The existing full-range local pack advertisement's own hash, if any
@@ -472,6 +474,7 @@ struct V2SeriesDetails {
     entry_type: EntryType,
     series_hash: ObjectHash,
     manifest: SeriesManifest,
+    ordered_meta: Option<Vec<content_tree::SeriesVersionData>>,
     current_physical_objects: usize,
     proposed_physical_objects: usize,
     existing_pack_hash: Option<ObjectHash>,
@@ -487,10 +490,9 @@ struct V2SeriesDetails {
 /// `run_pack_maintenance` now calls this once and derives both views from
 /// its result (finding 6: avoid duplicate full discovery).
 ///
-/// Metadata only: no leaf's inline `content` bytes are read or buffered
-/// here for any candidate (requirement 4). A real repack re-fetches this
-/// one series' full content-bearing rows fresh, immediately before
-/// streaming it, one series at a time -- see [`run_pack_maintenance`].
+/// Metadata only: no leaf's inline `content` bytes are read or buffered here
+/// for any candidate (requirement 4). A real run fetches selected content in
+/// one pond-wide scan -- see [`run_pack_maintenance`].
 ///
 /// # Errors
 ///
@@ -500,7 +502,10 @@ struct V2SeriesDetails {
 /// to a wholly pre-v2 series, reported as [`V2SeriesSurveyKind::Legacy`]
 /// instead), or if this pond's own local pack advertisements cannot be
 /// read.
-async fn survey_all_v2_series(ship: &mut crate::Ship) -> Result<Vec<V2SeriesSurvey>, StewardError> {
+async fn survey_all_v2_series(
+    ship: &mut crate::Ship,
+    retain_metadata_above: Option<usize>,
+) -> Result<Vec<V2SeriesSurvey>, StewardError> {
     let coarse = ship.survey_collapsible_series(0).await?;
     let table = ship.data_persistence().table().clone();
     let pond_id = ship.data_persistence().pond_id().to_string();
@@ -547,6 +552,9 @@ async fn survey_all_v2_series(ship: &mut crate::Ship) -> Result<Vec<V2SeriesSurv
             current_pack_fanout(&pond_root, series_hash, &manifest).await?;
         let proposed_physical_objects =
             proposed_physical_objects(entry_type, &manifest, &ordered_meta)?;
+        let retained_metadata = retain_metadata_above
+            .is_some_and(|threshold| live_versions > threshold)
+            .then_some(ordered_meta);
 
         // For a table series, a matching layout marker on the current best
         // full-range pack is a stronger, exact signal than the row-count
@@ -569,6 +577,7 @@ async fn survey_all_v2_series(ship: &mut crate::Ship) -> Result<Vec<V2SeriesSurv
                 entry_type,
                 series_hash,
                 manifest,
+                ordered_meta: retained_metadata,
                 current_physical_objects,
                 proposed_physical_objects: if already_deterministic {
                     current_physical_objects
@@ -601,6 +610,7 @@ fn classify_discovery(survey: &[V2SeriesSurvey], threshold: usize) -> Vec<Discov
                     series_hash: details.series_hash,
                     entry_type: details.entry_type,
                     manifest: details.manifest.clone(),
+                    ordered_meta: details.ordered_meta.clone(),
                     current_physical_objects: details.current_physical_objects,
                     proposed_physical_objects: details.proposed_physical_objects,
                     existing_pack_hash: details.existing_pack_hash,
@@ -655,7 +665,7 @@ async fn discover_candidates(
     ship: &mut crate::Ship,
     threshold: usize,
 ) -> Result<Vec<Discovery>, StewardError> {
-    let survey = survey_all_v2_series(ship).await?;
+    let survey = survey_all_v2_series(ship, None).await?;
     Ok(classify_discovery(&survey, threshold))
 }
 
@@ -807,12 +817,10 @@ impl FileObjectAccumulator {
 /// [`content_tree::read_series_live_metadata_ordered`]) -- their
 /// `content` field is always `None` regardless of whether a version's row
 /// actually carries inline bytes. This function fetches each leaf's own
-/// content lazily, one leaf at a time, via
-/// [`content_tree::read_series_version_inline_content`], immediately
-/// before that leaf is streamed, and lets it drop at the end of that loop
-/// iteration -- never buffering more than one leaf's inline content
-/// (finding 2), and never held by [`DiscoveredSeries`] itself
-/// (requirement 4).
+/// content from one disk-backed
+/// [`content_tree::spool_series_inline_content`] scan, one leaf at a time,
+/// immediately before that leaf is streamed. This avoids both whole-series
+/// RAM buffering and the former complete Delta scan per leaf.
 ///
 /// # Errors
 ///
@@ -824,10 +832,10 @@ impl FileObjectAccumulator {
 async fn repack_file_series(
     ship: &crate::Ship,
     pond_root: &Path,
-    table: &deltalake::DeltaTable,
     pond_id: &str,
     series: &DiscoveredSeries,
     ordered: &[content_tree::SeriesVersionData],
+    inline_content: &mut content_tree::SeriesInlineContentSpool,
 ) -> Result<(PackIndex, StreamOutcome), StewardError> {
     let node_id = series.file_id.node_id().to_string();
     let leaf_versions: Vec<&content_tree::SeriesVersionData> = ordered
@@ -842,7 +850,6 @@ async fn repack_file_series(
     let mut bytes_written = 0u64;
     let cap = usize::try_from(FILE_PACK_MAX_BYTES_PER_OBJECT).unwrap_or(usize::MAX);
     let mut accumulator = FileObjectAccumulator::new(cap);
-
     for v in &leaf_versions {
         let expected_leaf_hash = v.logical_leaf_hash.expect("filtered for Some above");
         let logical_count = v.logical_count.ok_or_else(|| {
@@ -863,21 +870,7 @@ async fn repack_file_series(
         )
         .map_err(StewardError::Content)?;
 
-        // Fetch this one leaf's inline content lazily, immediately before
-        // streaming it, and let it drop at the end of this loop iteration
-        // -- never a whole series' worth of inline leaves at once
-        // (finding 2). `None` means this version's row was externalized,
-        // so its bytes are streamed from `_large_files` instead, exactly
-        // as before.
-        let inline_content = content_tree::read_series_version_inline_content(
-            table.clone(),
-            pond_id,
-            &node_id,
-            v.version,
-        )
-        .await?;
-
-        match inline_content {
+        match inline_content.take(pond_id, &node_id, v.version).await? {
             Some(bytes) => {
                 hasher.write(&bytes).map_err(StewardError::Content)?;
                 accumulator
@@ -1035,8 +1028,8 @@ async fn flush_table_object(
 ///
 /// `ordered` is this one series' *metadata-only* live rows (see
 /// [`content_tree::read_series_live_metadata_ordered`]); each leaf's own
-/// content is instead fetched lazily, one leaf at a time, via
-/// [`content_tree::read_series_version_inline_content`] (finding 2),
+/// content is instead read from one disk-backed
+/// [`content_tree::spool_series_inline_content`] scan, one leaf at a time,
 /// immediately before that leaf's Parquet bytes are decoded via
 /// [`content_pull::decode_table_object`], the same decoder
 /// `fetch_and_verify_table_pack` already trusts. Every leaf's decoded
@@ -1066,10 +1059,10 @@ async fn flush_table_object(
 async fn repack_table_series(
     ship: &crate::Ship,
     pond_root: &Path,
-    table: &deltalake::DeltaTable,
     pond_id: &str,
     series: &DiscoveredSeries,
     ordered: &[content_tree::SeriesVersionData],
+    inline_content: &mut content_tree::SeriesInlineContentSpool,
 ) -> Result<(PackIndex, StreamOutcome), StewardError> {
     let node_id = series.file_id.node_id().to_string();
     let leaf_versions: Vec<&content_tree::SeriesVersionData> = ordered
@@ -1100,7 +1093,6 @@ async fn repack_table_series(
     // (`whole batch's memory * rows taken / rows in whole batch`) of its
     // *un-sliced* source batch, accumulated here and reset on flush.
     let mut pending_bytes_estimate: u64 = 0;
-
     for v in &leaf_versions {
         let expected_leaf_hash = v.logical_leaf_hash.expect("filtered for Some above");
         let leaf_schema_fingerprint = v.schema_fingerprint.ok_or_else(|| {
@@ -1131,21 +1123,7 @@ async fn repack_table_series(
             canonical_schema = None;
             current_schema_fingerprint = Some(leaf_schema_fingerprint);
         }
-        // Fetch this one leaf's inline content lazily, immediately before
-        // decoding it, and let it drop once decoded -- never a whole
-        // series' worth of inline leaves at once (finding 2). Owned
-        // outright (no clone needed): unlike the old whole-series
-        // `ordered` slice, this per-leaf fetch already hands back an
-        // owned `Vec<u8>` the caller may consume directly (finding 3's
-        // "remove table's extra raw bytes clone").
-        let raw_bytes: Vec<u8> = match content_tree::read_series_version_inline_content(
-            table.clone(),
-            pond_id,
-            &node_id,
-            v.version,
-        )
-        .await?
-        {
+        let raw_bytes: Vec<u8> = match inline_content.take(pond_id, &node_id, v.version).await? {
             Some(bytes) => bytes,
             None => ship
                 .data_persistence()
@@ -1385,10 +1363,9 @@ fn finish_pack_index(
 /// strictly before the index that names them is published here --
 /// satisfies the "objects-first, index-last" atomicity requirement.
 ///
-/// `ordered` is this one series' *metadata-only* live rows (bounded, no
-/// payload bytes); each leaf's own content is instead fetched lazily, one
-/// leaf at a time, during the streaming repack itself (finding 2; see
-/// [`repack_file_series`]/[`repack_table_series`]).
+/// `ordered` is this one series' *metadata-only* live rows. Each leaf's own
+/// content is read from the run's shared disk-backed spool, one leaf at a
+/// time, during the streaming repack itself.
 ///
 /// For a `TablePhysicalSeries`, also writes a [`pack_store::TableLayoutMarker`]
 /// sidecar naming this build's exact deterministic layout constants, so a
@@ -1406,17 +1383,17 @@ fn finish_pack_index(
 async fn repack_series(
     ship: &crate::Ship,
     pond_root: &Path,
-    table: &deltalake::DeltaTable,
     pond_id: &str,
     series: &DiscoveredSeries,
     ordered: &[content_tree::SeriesVersionData],
+    inline_content: &mut content_tree::SeriesInlineContentSpool,
 ) -> Result<RepackOutcome, StewardError> {
     let (index, outcome) = match series.entry_type {
         EntryType::FilePhysicalSeries => {
-            repack_file_series(ship, pond_root, table, pond_id, series, ordered).await?
+            repack_file_series(ship, pond_root, pond_id, series, ordered, inline_content).await?
         }
         EntryType::TablePhysicalSeries => {
-            repack_table_series(ship, pond_root, table, pond_id, series, ordered).await?
+            repack_table_series(ship, pond_root, pond_id, series, ordered, inline_content).await?
         }
         other => {
             return Err(StewardError::Content(format!(
@@ -1488,14 +1465,12 @@ async fn repack_series(
 ///    set thanks to steps 2-3, which is what keeps disk growth from
 ///    becoming quadratic in the number of append/repack cycles.
 ///
-/// One series's live version *metadata* is fetched fresh, immediately
-/// before that series is streamed (bounded, no payload bytes); each
-/// leaf's own content is then fetched lazily, one leaf at a time, during
-/// the streaming repack itself and dropped once that leaf is consumed --
-/// never more than one series' metadata, nor more than one leaf's content,
-/// held at a time, and never any of it for a series that turns out not to
-/// need a repack at all (finding 2; see [`discover_candidates`]'s own
-/// metadata-only discovery stage).
+/// Candidate metadata is fetched before mutation, then one pond-wide Delta
+/// execution spools only the selected live payload rows to disk. Repacking
+/// consumes and drops one leaf at a time from that spool. The operation thus
+/// performs one content-table scan regardless of candidate count, retains no
+/// whole series in RAM, and fails before publishing any pack if the spool
+/// cannot be completed.
 ///
 /// # Errors
 ///
@@ -1515,7 +1490,7 @@ pub(crate) async fn run_pack_maintenance(
     txn_meta.pond_id = ship.control_table().pond_id_uuid().to_string();
     let _write_lock = crate::write_lock::WriteLockGuard::try_acquire(&control_dir, &txn_meta)?;
 
-    let survey = survey_all_v2_series(ship).await?;
+    let survey = survey_all_v2_series(ship, Some(threshold)).await?;
     let discovered = classify_discovery(&survey, threshold);
     let pond_root = ship.pond_path().to_path_buf();
     let table = ship.data_persistence().table().clone();
@@ -1526,6 +1501,33 @@ pub(crate) async fn run_pack_maintenance(
     // this run, whether freshly repacked or already bounded -- fed to
     // `retain_selected_pack_only` below, after pruning.
     let mut selected_packs: Vec<(ObjectHash, ObjectHash)> = Vec::new();
+    let mut requested_content = Vec::new();
+
+    for entry in &discovered {
+        let Discovery::NeedsRepack(series) = entry else {
+            continue;
+        };
+        let node_id = series.file_id.node_id().to_string();
+        let ordered = series.ordered_meta.as_ref().ok_or_else(|| {
+            StewardError::Content(format!(
+                "pack maintenance did not retain metadata for candidate node {node_id}"
+            ))
+        })?;
+        let versions = ordered
+            .iter()
+            .filter(|version| version.logical_leaf_hash.is_some())
+            .map(|version| version.version)
+            .collect();
+        requested_content.push((node_id.clone(), versions));
+    }
+    let mut inline_content = content_tree::spool_series_inline_content(
+        table.clone(),
+        &pond_root,
+        &pond_id,
+        &requested_content,
+    )
+    .await?;
+    report.content_delta_scans = inline_content.delta_scans();
 
     for entry in discovered {
         match entry {
@@ -1544,23 +1546,21 @@ pub(crate) async fn run_pack_maintenance(
                 ));
             }
             Discovery::NeedsRepack(ref series) => {
-                // Fetch this one series' live version *metadata* fresh,
-                // right before streaming it, and let it drop at the end
-                // of this loop iteration -- never buffered alongside any
-                // other series' metadata, and never carrying any leaf's
-                // payload bytes at all (finding 2): each leaf's own
-                // content is instead fetched lazily, one leaf at a time,
-                // inside `repack_series` itself.
                 let node_id = series.file_id.node_id().to_string();
-                let ordered = content_tree::read_series_live_metadata_ordered(
-                    table.clone(),
+                let ordered = series.ordered_meta.as_ref().ok_or_else(|| {
+                    StewardError::Content(format!(
+                        "pack maintenance did not retain metadata for candidate node {node_id}"
+                    ))
+                })?;
+                let outcome = repack_series(
+                    ship,
+                    &pond_root,
                     &pond_id,
-                    &node_id,
+                    series,
+                    ordered,
+                    &mut inline_content,
                 )
                 .await?;
-
-                let outcome =
-                    repack_series(ship, &pond_root, &table, &pond_id, series, &ordered).await?;
                 report.series_repacked += 1;
                 report.pack_objects_written += outcome.objects_written;
                 report.pack_bytes_written += outcome.bytes_written;

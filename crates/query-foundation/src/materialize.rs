@@ -324,8 +324,36 @@ pub async fn materialize_stream(
     event_time: &str,
     progress: MaterializationProgress,
     publication: MaterializationPublication,
-    mut stream: SendableRecordBatchStream,
+    stream: SendableRecordBatchStream,
 ) -> Result<MaterializationOutcome> {
+    materialize_stream_with_progress(
+        sink,
+        output_id,
+        event_time,
+        move |_| Ok(progress),
+        publication,
+        stream,
+    )
+    .await
+}
+
+/// Consume a DataFusion stream without collecting, derive exact progress from
+/// the consumed output, then atomically publish both.
+///
+/// The deferred callback lets an append-only adapter use the stream's measured
+/// upper event-time bound as its source frontier without executing a separate
+/// full-source aggregate. Callback failure aborts the hidden output stage.
+pub async fn materialize_stream_with_progress<F>(
+    sink: &dyn TransactionalMaterializationSink,
+    output_id: impl Into<Arc<str>>,
+    event_time: &str,
+    progress: F,
+    publication: MaterializationPublication,
+    mut stream: SendableRecordBatchStream,
+) -> Result<MaterializationOutcome>
+where
+    F: FnOnce(Option<&MaterializedOutput>) -> Result<MaterializationProgress>,
+{
     let output_id = output_id.into();
     if output_id.is_empty() {
         return Err(DataFusionError::Plan(
@@ -397,6 +425,10 @@ pub async fn materialize_stream(
         }
         (false, MaterializationPublication::Append { .. }) => MaterializationPublication::NoOutput,
         (_, publication) => publication,
+    };
+    let progress = match progress(output.as_ref()) {
+        Ok(progress) => progress,
+        Err(error) => return abort_after(writer, error).await,
     };
     writer
         .commit(MaterializationCommit {

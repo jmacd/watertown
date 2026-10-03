@@ -5763,6 +5763,7 @@ dependencies = [
  "deltalake",
  "env_logger",
  "fs2",
+ "futures",
  "hex",
  "log",
  "object_store",

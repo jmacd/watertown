@@ -18,7 +18,8 @@ use query_foundation::locality::ChangeExtent;
 use query_foundation::materialize::{
     MaterializationCommit, MaterializationProgress, MaterializationPublication,
     MaterializationReplaceReason, MaterializedOutput, TransactionalBatchWriter,
-    TransactionalMaterializationSink, materialize_stream, plan_materialization_change,
+    TransactionalMaterializationSink, materialize_stream, materialize_stream_with_progress,
+    plan_materialization_change,
 };
 use query_foundation::statistics::TimeInterval;
 use query_foundation::testkit::FoundationFixture;
@@ -233,6 +234,50 @@ async fn streams_many_batches_with_bounded_active_memory_and_exact_metadata() ->
         "source-state-1"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn deferred_progress_uses_the_streams_exact_frontier() -> Result<()> {
+    let sink = RecordingSink::default();
+    let outcome = materialize_stream_with_progress(
+        &sink,
+        "output-deferred",
+        "ts",
+        |output| {
+            let frontier = output
+                .expect("non-empty stream must supply output metadata")
+                .event_time_bounds()
+                .max();
+            MaterializationProgress::try_new(
+                "recipe-deferred",
+                format!("source-through-{frontier}"),
+                SettledState::try_new(Some(frontier), Some(frontier), RepairPolicy::reject())?,
+            )
+        },
+        MaterializationPublication::Append { after: Some(9) },
+        stream_from(vec![batch(10, 3)]),
+    )
+    .await?;
+
+    assert_eq!(
+        outcome
+            .output
+            .expect("non-empty stream must publish output")
+            .event_time_bounds()
+            .max(),
+        12
+    );
+    assert_eq!(
+        sink.state
+            .lock()
+            .expect("sink state lock poisoned")
+            .progress
+            .as_ref()
+            .expect("deferred progress must be committed")
+            .source_state_id(),
+        "source-through-12"
+    );
     Ok(())
 }
 

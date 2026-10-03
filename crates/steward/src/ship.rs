@@ -59,6 +59,10 @@ pub struct CollapseReport {
     /// Number of series actually repacked into a new, more-bounded
     /// physical pack this run.
     pub series_repacked: usize,
+    /// Number of DataFusion executions that read inline content for all
+    /// repacks. This is zero when no series needs work and one otherwise,
+    /// independent of the number of candidate series or leaves.
+    pub content_delta_scans: usize,
     /// Number of series already at their achievable bounded floor (or
     /// never exceeding the threshold once evaluated) -- an idempotent
     /// no-op, proof that repeated maintenance settles.
@@ -96,6 +100,11 @@ impl std::fmt::Display for CollapseReport {
             self.pack_bytes_written,
             self.pack_objects_removed,
             self.pack_bytes_freed
+        )?;
+        write!(
+            f,
+            "\n  source reads: {} shared inline-content Delta scan(s)",
+            self.content_delta_scans
         )?;
         if !self.reclaimed.is_empty() {
             write!(f, "\n  {}", self.reclaimed)?;
@@ -1126,6 +1135,7 @@ impl Ship {
         let mut report = CollapseReport {
             candidates: candidates.len(),
             series_repacked: maintenance.series_repacked,
+            content_delta_scans: maintenance.content_delta_scans,
             already_bounded: maintenance.already_bounded,
             unsupported_legacy: maintenance.unsupported_legacy,
             pack_objects_written: maintenance.pack_objects_written,
@@ -2820,23 +2830,32 @@ mod tests {
         let noisy = "/data/noisy.csv";
         let quiet = "/data/quiet.csv";
 
-        // noisy: three versions; quiet: a single version.
+        // Two independent series each need repacking. Their inline payloads
+        // must be fetched by one shared Delta execution, not one scan per
+        // candidate.
         let noisy_chunks: [&[u8]; 3] = [b"n,1\n", b"n,2\n", b"n,3\n"];
         let mut noisy_full: Vec<u8> = Vec::new();
         for (i, chunk) in noisy_chunks.iter().enumerate() {
             noisy_full.extend_from_slice(chunk);
             write_version(&mut ship, noisy, chunk, i == 0).await;
         }
-        write_version(&mut ship, quiet, b"q,1\n", false).await;
+        let quiet_chunks: [&[u8]; 3] = [b"q,1\n", b"q,2\n", b"q,3\n"];
+        let mut quiet_full: Vec<u8> = Vec::new();
+        for chunk in quiet_chunks {
+            quiet_full.extend_from_slice(chunk);
+            write_version(&mut ship, quiet, chunk, false).await;
+        }
 
-        // Pack maintenance repacks only the over-threshold series (noisy);
-        // quiet has a single version and is never even a coarse candidate.
         let report = ship
             .collapse_versions(1)
             .await
             .expect("pack maintenance must succeed");
-        assert_eq!(report.candidates, 1);
-        assert_eq!(report.series_repacked, 1);
+        assert_eq!(report.candidates, 2);
+        assert_eq!(report.series_repacked, 2);
+        assert_eq!(
+            report.content_delta_scans, 1,
+            "all candidate payloads must share one Delta execution"
+        );
 
         // Both files' content is untouched: pack maintenance never rewrites
         // Oplog rows.
@@ -2849,21 +2868,22 @@ mod tests {
             "noisy is unchanged by pack-only maintenance"
         );
         let quiet_content = root.read_file_path_to_vec(quiet).await.expect("read quiet");
-        assert_eq!(quiet_content, b"q,1\n", "quiet file is unchanged");
+        assert_eq!(quiet_content, quiet_full, "quiet file is unchanged");
         _ = tx.commit().await.expect("commit read");
 
-        // A repeated run settles: noisy is now already bounded and is not
-        // repacked again.
+        // A repeated run settles: both series are already bounded and need no
+        // content scan.
         let again = ship
             .collapse_versions(1)
             .await
             .expect("repeated pack maintenance must settle");
-        assert_eq!(again.candidates, 1);
+        assert_eq!(again.candidates, 2);
         assert_eq!(
             again.series_repacked, 0,
-            "a repeated run must not repack an already-bounded series"
+            "a repeated run must not repack already-bounded series"
         );
-        assert_eq!(again.already_bounded, 1);
+        assert_eq!(again.already_bounded, 2);
+        assert_eq!(again.content_delta_scans, 0);
     }
 
     fn count_log_files(log_dir: &Path, ext: &str) -> usize {

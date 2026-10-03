@@ -3,7 +3,7 @@ use std::env;
 fn main() {
     // Bake the package version into the binary so `pond --version` matches the
     // deb version, container tag, and GitHub release. CI sets WATERTOWN_VERSION
-    // to the computed 0.<pr>.<build> string; local dev builds fall back to the
+    // to the computed 0.<build>.<pr> string; local dev builds fall back to the
     // crate version from Cargo.toml so the version always resolves.
     println!("cargo:rerun-if-env-changed=WATERTOWN_VERSION");
     let version = env::var("WATERTOWN_VERSION")
