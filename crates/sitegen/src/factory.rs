@@ -26,7 +26,7 @@ use provider::{ExecutionContext, FactoryContext, register_executable_factory};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tinyfs::ResultExt;
 
@@ -142,6 +142,7 @@ async fn execute(
     match cmd.command {
         SitegenSubcommand::Build { output_dir, quick } => {
             let output_path = std::path::PathBuf::from(&output_dir);
+            let root_base_url = config.site.base_url.clone();
             // Ensure the output root exists before any write.  `sitegen build
             // <dir>` owns its target directory; creating it here makes the
             // build self-contained (callers need not pre-create it) and
@@ -263,6 +264,7 @@ async fn execute(
                 }
             }
 
+            validate_local_image_references(&output_path, &root_base_url)?;
             Ok(())
         }
         SitegenSubcommand::Report { name, output_dir } => {
@@ -1629,6 +1631,134 @@ fn copy_static_assets(
     Ok(())
 }
 
+/// Fail the build when generated HTML references a local image that was not
+/// emitted. Validation runs after all sites and assets are written so it covers
+/// shortcodes, Markdown images, raw HTML, frontmatter hero images, and subsites.
+fn validate_local_image_references(
+    output_root: &Path,
+    base_url: &str,
+) -> Result<(), tinyfs::Error> {
+    let image_src = regex::Regex::new(r#"(?is)<img\b[^>]*?\s+src\s*=\s*["']([^"']+)["']"#).unwrap();
+    let mut html_files = Vec::new();
+    collect_html_files(output_root, &mut html_files)?;
+    html_files.sort();
+
+    let mut missing = Vec::new();
+    for html_path in html_files {
+        let html = std::fs::read_to_string(&html_path)
+            .map_other_context(format!("read generated HTML {:?}", html_path))?;
+        for captures in image_src.captures_iter(&html) {
+            let src = captures.get(1).unwrap().as_str();
+            if is_nonlocal_image_source(src) {
+                continue;
+            }
+            let target = resolve_local_image_path(output_root, &html_path, base_url, src);
+            if target.as_ref().is_none_or(|target| !target.is_file()) {
+                let page = html_path
+                    .strip_prefix(output_root)
+                    .unwrap_or(&html_path)
+                    .display();
+                missing.push(format!("{}: img src=\"{}\"", page, src));
+            }
+        }
+    }
+
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(tinyfs::Error::Other(format!(
+            "Generated site contains missing local images:\n  {}",
+            missing.join("\n  ")
+        )))
+    }
+}
+
+fn collect_html_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), tinyfs::Error> {
+    for entry in
+        std::fs::read_dir(dir).map_other_context(format!("read output directory {:?}", dir))?
+    {
+        let entry = entry.map_other_context(format!("read output directory entry {:?}", dir))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_other_context(format!("read output file type {:?}", path))?;
+        if file_type.is_dir() {
+            collect_html_files(&path, files)?;
+        } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "html") {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn resolve_local_image_path(
+    output_root: &Path,
+    html_path: &Path,
+    base_url: &str,
+    src: &str,
+) -> Option<PathBuf> {
+    let src = src.trim();
+    let path = src.split(['?', '#']).next().unwrap_or(src);
+    if path.is_empty() {
+        return None;
+    }
+
+    let relative = if path.starts_with('/') {
+        let base = base_url.trim_end_matches('/');
+        if !base.is_empty() && base != "/" {
+            if path == base {
+                ""
+            } else {
+                path.strip_prefix(base)
+                    .filter(|suffix| suffix.starts_with('/'))
+                    .unwrap_or(path)
+                    .trim_start_matches('/')
+            }
+        } else {
+            path.trim_start_matches('/')
+        }
+    } else {
+        let parent = html_path
+            .parent()
+            .and_then(|parent| parent.strip_prefix(output_root).ok())
+            .unwrap_or(Path::new(""));
+        return normalize_output_path(output_root, parent.join(path));
+    };
+
+    normalize_output_path(output_root, PathBuf::from(relative))
+}
+
+fn normalize_output_path(output_root: &Path, relative: PathBuf) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop().then_some(())?;
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(output_root.join(normalized))
+}
+
+fn is_nonlocal_image_source(value: &str) -> bool {
+    let value = value.trim();
+    value.starts_with("//") || value.starts_with('#') || has_uri_scheme(value)
+}
+
+fn has_uri_scheme(value: &str) -> bool {
+    let Some(colon) = value.find(':') else {
+        return false;
+    };
+    let scheme = &value[..colon];
+    !scheme.is_empty()
+        && scheme.chars().enumerate().all(|(index, ch)| {
+            ch.is_ascii_alphabetic() || (index > 0 && matches!(ch, '+' | '-' | '.'))
+        })
+}
+
 /// Write shared build assets (base CSS, JS, vendor) to the output directory.
 ///
 /// These are compiled into the binary via `include_str!` so sitegen always
@@ -2314,6 +2444,58 @@ impl std::error::Error for GenerateError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validates_generated_local_images() {
+        let output = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(output.path().join("blog")).unwrap();
+        std::fs::create_dir_all(output.path().join("img")).unwrap();
+        std::fs::write(output.path().join("img/photo.png"), b"image").unwrap();
+        std::fs::write(
+            output.path().join("blog/index.html"),
+            r#"
+                <img src="/staging/img/photo.png?size=large#view">
+                <img src="../img/photo.png">
+                <img src="https://example.com/remote.png">
+                <img src="data:image/png;base64,AAAA">
+            "#,
+        )
+        .unwrap();
+
+        validate_local_image_references(output.path(), "/staging/").unwrap();
+    }
+
+    #[test]
+    fn rejects_missing_generated_local_images() {
+        let output = tempfile::tempdir().unwrap();
+        std::fs::write(
+            output.path().join("index.html"),
+            r#"<figure><img src="/img/ph-model.svg"></figure>"#,
+        )
+        .unwrap();
+
+        let error = validate_local_image_references(output.path(), "/")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Generated site contains missing local images"));
+        assert!(error.contains(r#"index.html: img src="/img/ph-model.svg""#));
+    }
+
+    #[test]
+    fn rejects_image_paths_that_escape_the_output_root() {
+        let output = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(output.path().join("blog")).unwrap();
+        std::fs::write(
+            output.path().join("blog/index.html"),
+            r#"<img src="../../outside.png">"#,
+        )
+        .unwrap();
+
+        let error = validate_local_image_references(output.path(), "/")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(r#"blog/index.html: img src="../../outside.png""#));
+    }
 
     /// Register an in-memory journal table (`__REALTIME_TIMESTAMP` + `MESSAGE`,
     /// both Utf8, mirroring the jsonlogs schema) from `(ts_us, message)` rows.
