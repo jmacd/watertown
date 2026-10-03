@@ -1073,7 +1073,7 @@ impl TemporalReduceSqlFile {
         );
 
         // The segments + hot file store mergeable partials
-        // (SEALED_FORMAT = partials-v2); reconstruct the output columns at read
+        // (see partial_aggregate_cache::SEALED_FORMAT); reconstruct the output columns at read
         // time so consumers see identical output (same names, order, values,
         // including Avg = Sum / Count) while the on-disk segments stay associatively
         // foldable for the coarser-from-finer rollup (design §3 / Phase 3). The
@@ -1408,8 +1408,10 @@ impl TemporalReduceSqlFile {
             .map_other()?
         {
             Some(m)
-                if m.allowed_lateness_secs == policy.lateness_secs
-                    && m.format == crate::partial_aggregate_cache::SEALED_FORMAT =>
+                if crate::partial_aggregate_cache::segment_manifest_is_compatible(
+                    &m,
+                    policy.lateness_secs,
+                ) =>
             {
                 Some(m)
             }
@@ -1700,8 +1702,10 @@ impl TemporalReduceSqlFile {
             .map_other()?
         {
             Some(m)
-                if m.allowed_lateness_secs == policy.lateness_secs
-                    && m.format == crate::partial_aggregate_cache::SEALED_FORMAT =>
+                if crate::partial_aggregate_cache::segment_manifest_is_compatible(
+                    &m,
+                    policy.lateness_secs,
+                ) =>
             {
                 Some(m)
             }

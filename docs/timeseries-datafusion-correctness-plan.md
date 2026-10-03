@@ -1442,6 +1442,29 @@ The completed work changed several assumptions made at the start:
 10. **Configuration migration belongs last.** The production graph changed
     only after the foundation, adapters, mutation matrix, backup identity, and
     old/new data-bearing comparison had passed.
+11. **Streaming does not imply one source execution.** The first live
+    materializer build streamed its output and cut peak memory by 41-49%, but
+    first executed the complete dynamic source again for `MAX(timestamp)`.
+    On selfmon this raised materializer elapsed time by 73-87%. Progress must
+    be derived from the streamed output for append-only materialization rather
+    than measured by a separate global aggregate.
+12. **Disposable cache formats are still compatibility contracts.** Typed
+    temporal reduction changed cached timestamp units while retaining the
+    `segments-v3` marker. Live staging then attempted to merge old nanosecond
+    and new microsecond Parquet files. `segments-v4` now rejects and wipes the
+    old resolution before any files are listed; every cache schema/layout
+    change must bump this marker.
+13. **Upgrade qualification must retain derived sidecars.** A restored staging
+    clone proved the logical data migration but did not expose the mixed-cache
+    failure that the long-lived staging cache did. Future upgrade fixtures must
+    include the previous build's cache manifests and Parquet files, not only
+    canonical pond state.
+14. **Non-query maintenance can dominate the query graph.** Selfmon's 29
+    routine repacks read 177-185 GB per tick from a roughly 7 GB pond because
+    payload lookup repeatedly executed against the Delta table. Maintenance now
+    spools all selected inline payloads with one DataFusion execution and
+    reports `content_delta_scans` (zero or one); controlled selfmon
+    qualification remains the physical-I/O gate.
 
 The remaining global drawdown, Horner, calibration, leak, and overlay SQL is
 deliberate scope, not an implicit claim that every domain query was converted.

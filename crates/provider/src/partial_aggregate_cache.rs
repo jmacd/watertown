@@ -238,9 +238,12 @@ pub struct Segment {
 /// *mergeable partials* (sum/count/min/max) with output columns reconstructed at
 /// read time, keys the finest resolution on source CONTENT (`sources`) rather
 /// than on per-version partial filenames, and may derive a coarser resolution by
-/// folding the next-finer resolution's segments (`source_digest`). Older caches
-/// carry a different (or empty) `format` and are wiped + rebuilt.
-pub const SEALED_FORMAT: &str = "segments-v3";
+/// folding the next-finer resolution's segments (`source_digest`). `segments-v4`
+/// records the typed reduction layout introduced with query-foundation; it must
+/// not share a directory with `segments-v3` SQL output whose timestamp unit can
+/// differ. Older caches carry a different (or empty) `format` and are wiped +
+/// rebuilt.
+pub const SEALED_FORMAT: &str = "segments-v4";
 
 /// Manifest describing the segment cache for one output resolution.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -300,6 +303,15 @@ pub struct SegmentManifest {
     /// triggers a coarse rebuild/advance.
     #[serde(default)]
     pub source_digest: Option<String>,
+}
+
+/// Whether an existing resolution cache can be read by this build.
+#[must_use]
+pub fn segment_manifest_is_compatible(
+    manifest: &SegmentManifest,
+    allowed_lateness_secs: i64,
+) -> bool {
+    manifest.format == SEALED_FORMAT && manifest.allowed_lateness_secs == allowed_lateness_secs
 }
 
 /// Per-resolution segment directory: `{merged_dir}/res{interval_secs}/`.
@@ -597,6 +609,20 @@ mod tests {
         assert_eq!(a, b, "same config must hash identically");
         assert_ne!(a, c, "different resolution list must change the namespace");
         assert_eq!(a.len(), 16);
+    }
+
+    #[test]
+    fn typed_layout_rejects_the_previous_sql_cache_format() {
+        let mut manifest = SegmentManifest {
+            format: "segments-v3".to_owned(),
+            allowed_lateness_secs: 86_400,
+            ..Default::default()
+        };
+        assert!(!segment_manifest_is_compatible(&manifest, 86_400));
+
+        manifest.format = SEALED_FORMAT.to_owned();
+        assert!(segment_manifest_is_compatible(&manifest, 86_400));
+        assert!(!segment_manifest_is_compatible(&manifest, 0));
     }
 
     /// The on-disk namespace is a compatibility contract with every deployed

@@ -33,6 +33,7 @@ datafusion = { workspace = true }
 datafusion-functions-json = { workspace = true }
 deltalake = { workspace = true }
 fs2 = { workspace = true }
+futures = { workspace = true }
 hex = { workspace = true }
 log = { workspace = true }
 object_store = { workspace = true }

@@ -20,6 +20,11 @@ All builds are performed via GitHub Actions (see `.github/workflows/rust-ci.yml`
 
 For each successful build on `main` or `workflow_dispatch`:
 
+- **Version**: `0.<commit-count>.<PR-number>`. The commit count is first so the
+  Debian version is monotonic even when PRs merge out of numeric order. CI
+  verifies the computed value is greater than the nearest prior `v*` release
+  with `dpkg --compare-versions`.
+
 - **Container Image**: `ghcr.io/jmacd/watertown/watertown:latest-<arch>`
   (plus `sha-<short>-<arch>`)
   - Built with Podman on GitHub's Ubuntu runners (amd64 + arm64)
@@ -51,28 +56,10 @@ channel via the `DEB_CHANNEL` env (default `latest`).
 
 ### Creating a Release
 
-1. **Update version** in `Cargo.toml` workspace section:
-   ```toml
-   [workspace.package]
-   version = "0.16.0"
-   ```
-
-2. **Commit and tag**:
-   ```bash
-   git commit -am "Release v0.16.0"
-   git tag v0.16.0
-   git push origin main --tags
-   ```
-
-3. **Wait for CI**: GitHub Actions will automatically build and publish
-
-4. **Download artifacts**: Go to Actions tab → select the workflow run → download artifacts
-
-5. **Create GitHub Release**:
-   - Go to Releases → Draft a new release
-   - Select the tag
-   - Attach the .deb package (download from artifacts first)
-   - Document changes
+Every successful push to `main` creates `v0.<commit-count>.<PR-number>` at the
+exact built commit and generates GitHub release notes. Re-running a workflow for
+an existing release is idempotent. Do not manually edit the workspace crate
+version or create a competing tag for routine builds.
 
 ## Software Supply Chain Security
 
@@ -82,10 +69,11 @@ channel via the `DEB_CHANNEL` env (default `latest`).
 ✅ **Dependency Pinning**: `Cargo.lock` is committed to the repository  
 ✅ **Audit Trail**: All builds are associated with specific commits and workflow runs  
 ✅ **Container Registry**: Uses GitHub Container Registry with authentication  
+✅ **Artifact Signing**: Container and Debian OCI tags are signed with keyless Cosign
 
 ### Security Gaps (TODO)
 
-❌ **No artifact signing**: Binaries and packages are not cryptographically signed  
+❌ **No host-side signature enforcement**: Hosts do not yet require Cosign verification before install
 ❌ **No SBOM generation**: No Software Bill of Materials  
 ❌ **No provenance attestation**: No SLSA provenance  
 ❌ **Limited reproducibility**: Builds may not be bit-for-bit reproducible  
