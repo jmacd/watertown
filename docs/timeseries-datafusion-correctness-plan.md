@@ -1124,6 +1124,16 @@ drawdown query exhausted the 512 MiB DataFusion pool on the full history;
 that pre-existing global SQL limitation is outside the migrated pump and daily
 paths and remains visible rather than being hidden by this qualification.
 
+Command-level deployment regressions now preserve the two operational
+transitions that the staging-clone work exercised manually.
+`crates/cmd/tests/apply_migration.rs` applies the legacy SQL pump/rate/daily
+graph, evaluates it, reapplies the typed pump-state, timestamp-local rate, and
+direct daily reducer at the same logical paths, and proves exact pump/rate
+outputs, intentional rate-schema expansion, and equivalent daily totals.
+`crates/cmd/tests/restore_cli.rs` publishes and restores through a local
+content remote, proving inert bootstrap, resumed later dispatch, exact replica
+content, and cleanup of `data`, `control`, and `tlog` after a pull failure.
+
 ### Phase 11: native-v2 backup and restore verification
 
 1. Map query-visible immutable logical leaves to current
