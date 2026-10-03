@@ -102,6 +102,28 @@ The decoder requires the exact current magic, rejects truncation and trailing
 bytes, validates canonical attributes, requires logical and leaf counts to be
 zero together, and checks empty/nonempty Merkle-root consistency.
 
+## Query identity
+
+TLogFS computes and persists each nonempty logical leaf hash once at the series
+write choke point. The query adapter uses that same persisted hash as the
+immutable `ChunkDescriptor` ID; it does not derive identity from a Parquet path,
+Delta add action, row-group layout, or backup advertisement.
+
+For an exact query snapshot:
+
+- ordered query chunk IDs are the ordered `watertown.series.v3` leaf hashes;
+- their Merkle fold reproduces the manifest frontier and root;
+- count, event-time bounds, schema fingerprint, and logical attributes come
+  from the same persisted leaf records; and
+- physically equivalent repacking leaves every query identity and result
+  invariant unchanged.
+
+This is shared identity, not shared execution. Query planning never depends on
+remote pack availability, and backup publication never executes a query. The
+cross-layer `query_chunk_ids_equal_backup_leaf_hashes_across_pack_maintenance`
+regression proves both planes name the same leaves before and after a real
+pack-only maintenance rewrite.
+
 ## `watertown.series-pack.v4`
 
 A current pack index contains:

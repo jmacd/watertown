@@ -41,15 +41,16 @@
 //! - `res=6h.series` - 6 hour aggregated data  
 //! - `res=1d.series` - 1 day aggregated data
 //!
-//! Each file contains time-bucketed aggregations using SQL GROUP BY operations.
+//! Each file contains time-bucketed aggregations built as typed logical plans.
 //!
 //! ## Multi-file glob patterns
 //!
 //! When `in_pattern` contains a glob (e.g., `oteljson:///ingest/casparwater*.json`)
 //! that matches multiple files all mapping to the same `out_pattern`, the factory
-//! delegates to `SqlDerivedFile` which expands the glob and creates a UNION ALL
-//! across all matching files.  This allows temporal-reduce to aggregate across
-//! many rotated log files or ingested data fragments in a single pass.
+//! reuses `SqlDerivedFile` source registration to expand and combine all matching
+//! files, then applies the typed reduction recipe. This allows temporal-reduce
+//! to aggregate across many rotated log files or ingested data fragments in a
+//! single pass.
 //!
 //! **Caveat -- schema inference shortcut:** The column schema is discovered from
 //! the lexicographically last matching file (the newest for timestamped names).
@@ -62,6 +63,9 @@
 use crate::factory::sql_derived::{SqlDerivedConfig, SqlDerivedFile};
 use crate::register_dynamic_factory;
 use async_trait::async_trait;
+use datafusion::common::Column;
+use datafusion::functions::core::expr_fn::{coalesce, nullif};
+use datafusion::logical_expr::{cast, col, lit};
 use futures::StreamExt;
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
@@ -114,6 +118,43 @@ pub struct AggregationConfig {
     pub columns: Option<Vec<String>>,
 }
 
+/// Configuration for a direct single-resolution temporal-reduce series.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemporalReduceSeriesConfig {
+    pub in_pattern: crate::Url,
+    pub time_column: String,
+    pub resolution: String,
+    pub aggregations: Vec<AggregationConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_aliases: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transforms: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_lateness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal_target_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_live_segments: Option<usize>,
+}
+
+impl TemporalReduceSeriesConfig {
+    fn into_temporal_config(self) -> TemporalReduceConfig {
+        TemporalReduceConfig {
+            in_pattern: self.in_pattern,
+            out_pattern: String::new(),
+            time_column: self.time_column,
+            resolutions: vec![self.resolution],
+            aggregations: self.aggregations,
+            output_aliases: self.output_aliases,
+            transforms: self.transforms,
+            allowed_lateness: self.allowed_lateness,
+            seal_target_bytes: self.seal_target_bytes,
+            max_live_segments: self.max_live_segments,
+        }
+    }
+}
+
 /// Configuration for the temporal-reduce factory
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -133,6 +174,10 @@ pub struct TemporalReduceConfig {
 
     /// Aggregation operations to perform
     pub aggregations: Vec<AggregationConfig>,
+
+    /// Optional final output aliases keyed by the default `<column>.<aggregate>` name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_aliases: Option<HashMap<String, String>>,
 
     /// Optional list of table transform factory paths to apply to input TableProvider.
     /// Transforms are applied in order before SQL execution.
@@ -234,8 +279,9 @@ impl TemporalReduceConfig {
 /// Result of building one resolution level of the segment cache. The
 /// `provider` is the `ListingTable` over that level's segments + hot (in
 /// mergeable-partials form), which the next-coarser level folds and which the
-/// final level wraps in a read-time reconstruction view. `digest` is the level's
-/// manifest digest (the coarser level records it as its `source_digest`);
+/// final level wraps in a read-time reconstruction view. `digest` identifies
+/// the level's output artifacts (the coarser level records it as its
+/// `source_digest`);
 /// `changed` feeds the export hint and the coarser level's unsealing;
 /// `rebuilt` is true when this level was
 /// wiped and rebuilt from scratch (a non-append change), which forces the next
@@ -278,13 +324,11 @@ impl LevelChange {
         }
     }
 
-    /// The export hint's `changed_since`, where `None` means "rewrite every
-    /// partition". Unchanged levels are reported as `None` as well; the hint's
-    /// digest is what lets the exporter skip them.
-    fn export_hint(self) -> Option<i64> {
+    fn export_change(self) -> tinyfs::ExportChange {
         match self {
-            LevelChange::Since(s) => Some(s),
-            LevelChange::Nothing | LevelChange::Everything => None,
+            LevelChange::Nothing => tinyfs::ExportChange::Unchanged,
+            LevelChange::Since(s) => tinyfs::ExportChange::Since(s),
+            LevelChange::Everything => tinyfs::ExportChange::Everything,
         }
     }
 
@@ -322,12 +366,56 @@ pub struct TemporalReduceSqlFile {
     discovered_columns: Arc<tokio::sync::Mutex<Option<Vec<String>>>>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LineageSchemaCache {
+    format: String,
+    leaves: Vec<tinyfs::QuerySourceLeaf>,
+    columns: Vec<String>,
+}
+
+fn update_schema_hash(hasher: &mut blake3::Hasher, value: &[u8]) {
+    _ = hasher.update(&(value.len() as u64).to_le_bytes());
+    _ = hasher.update(value);
+}
+
+fn sorted_lineage_leaves(mut leaves: Vec<tinyfs::QuerySourceLeaf>) -> Vec<tinyfs::QuerySourceLeaf> {
+    leaves.sort_by(|left, right| {
+        (&left.identity, left.min_event_time, left.max_event_time).cmp(&(
+            &right.identity,
+            right.min_event_time,
+            right.max_event_time,
+        ))
+    });
+    leaves
+}
+
 impl TemporalReduceSqlFile {
+    fn pattern_name(&self) -> String {
+        let sanitized: String = self
+            .source_path
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        format!("source_{sanitized}").to_lowercase()
+    }
+
     #[must_use]
     pub fn new(
         config: TemporalReduceConfig,
         duration: Duration,
         _source_node: Node,
+        source_path: String,
+        pattern_url: String,
+        context: crate::FactoryContext,
+    ) -> Self {
+        Self::new_direct(config, duration, source_path, pattern_url, context)
+    }
+
+    #[must_use]
+    fn new_direct(
+        config: TemporalReduceConfig,
+        duration: Duration,
         source_path: String,
         pattern_url: String,
         context: crate::FactoryContext,
@@ -360,6 +448,108 @@ impl TemporalReduceSqlFile {
         }
     }
 
+    fn lineage_schema_cache_path(
+        &self,
+        cache_dir: &std::path::Path,
+        lineage: &tinyfs::QueryLineage,
+    ) -> std::path::PathBuf {
+        let mut hasher = blake3::Hasher::new();
+        _ = hasher.update(b"watertown:temporal-reduce-schema:v1");
+        update_schema_hash(&mut hasher, self.source_url().as_bytes());
+        update_schema_hash(&mut hasher, self.config.time_column.as_bytes());
+        update_schema_hash(&mut hasher, lineage.recipe_identity.as_bytes());
+        cache_dir
+            .join("temporal-reduce-schema")
+            .join(format!("{}.json", hasher.finalize().to_hex()))
+    }
+
+    async fn load_lineage_schema_cache(
+        &self,
+        path: &std::path::Path,
+        lineage: &tinyfs::QueryLineage,
+    ) -> TinyFSResult<bool> {
+        if !tokio::fs::try_exists(path)
+            .await
+            .map_other_context(format!("check lineage schema cache '{}'", path.display()))?
+        {
+            return Ok(false);
+        }
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_other_context(format!("read lineage schema cache '{}'", path.display()))?;
+        let record: LineageSchemaCache = serde_json::from_slice(&bytes)
+            .map_other_context(format!("parse lineage schema cache '{}'", path.display()))?;
+        if record.format != "lineage-schema-v1" {
+            return Err(tinyfs::Error::Other(format!(
+                "unsupported lineage schema cache format '{}' in '{}'",
+                record.format,
+                path.display()
+            )));
+        }
+        if record.columns.is_empty() {
+            return Err(tinyfs::Error::Other(format!(
+                "lineage schema cache '{}' contains no columns",
+                path.display()
+            )));
+        }
+        if sorted_lineage_leaves(record.leaves) != sorted_lineage_leaves(lineage.leaves.clone()) {
+            return Ok(false);
+        }
+        *self.discovered_columns.lock().await = Some(record.columns);
+        log::debug!(
+            "temporal-reduce lineage schema cache hit for '{}'",
+            self.source_path
+        );
+        Ok(true)
+    }
+
+    async fn write_lineage_schema_cache(
+        &self,
+        path: &std::path::Path,
+        lineage: &tinyfs::QueryLineage,
+    ) -> TinyFSResult<()> {
+        let columns = self
+            .discovered_columns
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| {
+                tinyfs::Error::Other(
+                    "cannot persist lineage schema before column discovery".to_owned(),
+                )
+            })?;
+        let record = LineageSchemaCache {
+            format: "lineage-schema-v1".to_owned(),
+            leaves: sorted_lineage_leaves(lineage.leaves.clone()),
+            columns,
+        };
+        let bytes = serde_json::to_vec_pretty(&record)
+            .map_other_context("serialize lineage schema cache")?;
+        let parent = path.parent().ok_or_else(|| {
+            tinyfs::Error::Other(format!(
+                "lineage schema cache path '{}' has no parent",
+                path.display()
+            ))
+        })?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_other_context(format!(
+                "create lineage schema cache directory '{}'",
+                parent.display()
+            ))?;
+        let tmp = std::path::PathBuf::from(format!("{}.tmp-{}", path.display(), uuid7::uuid7()));
+        tokio::fs::write(&tmp, bytes)
+            .await
+            .map_other_context(format!(
+                "write lineage schema cache temporary file '{}'",
+                tmp.display()
+            ))?;
+        tokio::fs::rename(&tmp, path)
+            .await
+            .map_other_context(format!("publish lineage schema cache '{}'", path.display()))?;
+        Ok(())
+    }
+
     /// Discover source columns by accessing the source node directly
     /// CACHED: Only performs discovery once per TemporalReduceSqlFile instance
     async fn discover_source_columns(&self) -> TinyFSResult<Vec<String>> {
@@ -387,12 +577,31 @@ impl TemporalReduceSqlFile {
         );
 
         let fs = self.context.context.filesystem();
-        let mut provider =
-            crate::Provider::with_context(Arc::new(fs), Arc::new(self.context.context.clone()));
+        let datafusion_ctx = Arc::new(datafusion::prelude::SessionContext::new_with_config_rt(
+            datafusion::prelude::SessionConfig::new(),
+            Arc::clone(&self.context.context.datafusion_session.runtime_env()),
+        ));
+        crate::register_datafusion_functions(&datafusion_ctx)
+            .map_other_context("register functions for temporal-reduce schema discovery")?;
+        let mut discovery_context = tinyfs::ProviderContext::new(
+            Arc::clone(&datafusion_ctx),
+            Arc::clone(&self.context.context.persistence),
+        );
+        if let Some(cache_dir) = self
+            .context
+            .context
+            .cache_dir()
+            .map(std::path::Path::to_path_buf)
+        {
+            discovery_context = discovery_context.with_cache_dir(cache_dir);
+        }
+        if let Some(pond_path) = self.context.context.pond_path.clone() {
+            discovery_context = discovery_context.with_pond_path(pond_path);
+        }
+        let mut provider = crate::Provider::with_context(Arc::new(fs), Arc::new(discovery_context));
         if let Ok(root) = self.context.root().await {
             provider = provider.with_root(root);
         }
-        let datafusion_ctx = datafusion::prelude::SessionContext::new();
 
         let table_provider = provider
             .create_table_provider(&source_url, &datafusion_ctx)
@@ -435,37 +644,17 @@ impl TemporalReduceSqlFile {
         Ok(columns)
     }
 
-    /// Generate SQL with discovered schema
-    async fn generate_sql_with_discovered_schema(
-        &self,
-        pattern_name: &str,
-    ) -> TinyFSResult<String> {
-        let modified_config = self.filled_config().await?;
-
-        // Now call the existing generate_temporal_sql function with filled-in columns
-        let sql = generate_temporal_sql(
-            &modified_config,
-            self.duration,
-            &self.source_path,
-            &self.context,
-            pattern_name,
-        )
-        .await?;
-        log::debug!(
-            "[SEARCH] TEMPORAL-REDUCE SQL for {}: \n{}",
-            self.source_path,
-            sql
-        );
-        Ok(sql)
-    }
-
     /// Resolve the config's aggregation column patterns against the discovered
     /// source schema, returning a config whose every aggregation has concrete
     /// column lists. This is the shared input to both the single-pass SQL and
     /// the rollup partial/merge SQL.
     async fn filled_config(&self) -> TinyFSResult<TemporalReduceConfig> {
         // Discover available columns
-        let discovered_columns = self.discover_source_columns().await?;
+        let discovered_columns = if self.resolve_source_files().await?.is_empty() {
+            self.configured_empty_source_columns()?
+        } else {
+            self.discover_source_columns().await?
+        };
         log::debug!(
             "TemporalReduceFile: discovered {} columns: {:?}",
             discovered_columns.len(),
@@ -525,6 +714,34 @@ impl TemporalReduceSqlFile {
         Ok(modified_config)
     }
 
+    fn configured_empty_source_columns(&self) -> TinyFSResult<Vec<String>> {
+        let mut columns = std::collections::BTreeSet::new();
+        for aggregation in &self.config.aggregations {
+            let configured = aggregation.columns.as_ref().ok_or_else(|| {
+                tinyfs::Error::Other(format!(
+                    "temporal-reduce source '{}' matched no files and aggregation {} \
+                     does not declare columns; an empty output schema cannot be inferred",
+                    self.pattern_url,
+                    aggregation.agg_type.to_sql()
+                ))
+            })?;
+            for column in configured {
+                if column == "*" {
+                    continue;
+                }
+                if column.contains(['*', '?', '[']) {
+                    return Err(tinyfs::Error::Other(format!(
+                        "temporal-reduce source '{}' matched no files and configured column \
+                         pattern '{}' cannot be resolved without a source schema",
+                        self.pattern_url, column
+                    )));
+                }
+                _ = columns.insert(column.clone());
+            }
+        }
+        Ok(columns.into_iter().collect())
+    }
+
     /// Attempt to serve this resolution from the incremental partial-aggregate
     /// cache, returning `Ok(None)` to fall back to the single-pass delegate
     /// when the rollup preconditions are not met.
@@ -577,28 +794,38 @@ impl TemporalReduceSqlFile {
             return Ok(None);
         }
 
+        let fs = self.context.context.filesystem();
+        let mut provider_api =
+            crate::Provider::with_context(Arc::new(fs), Arc::new(self.context.context.clone()));
+        if let Ok(root) = self.context.root().await {
+            provider_api = provider_api.with_root(root);
+        }
+
         // A builtin source must actually be Parquet to be read without a format
-        // provider. Anything else (a raw byte series, a directory) has no
-        // columnar leaves to aggregate, so fall back to the single-pass
-        // delegate rather than failing.
-        //
-        // It must also be durable. A dynamic node is Parquet-shaped but
-        // ephemeral: it has no oplog records, so it has no versions to enumerate
-        // and nothing stable to key a cache on. Materializing it once per level
-        // would recompute it every pass, so the delegate's single pass is
-        // strictly better.
-        if format_provider.is_none()
-            && !source_files.iter().all(|np| {
+        // provider. A dynamic query is eligible only when it declares recursive
+        // immutable lineage and bounded execution; otherwise there is no stable
+        // freshness key and the conservative single-pass delegate remains the
+        // only correct option.
+        let builtin_sources = format_provider.is_none()
+            && source_files.iter().all(|np| {
                 let et = np.id().entry_type();
                 et.is_parquet_file() && !et.is_dynamic()
-            })
-        {
+            });
+        let derived_lineage = if format_provider.is_none() && !builtin_sources {
+            provider_api
+                .query_lineage_for_url(&self.pattern_url)
+                .await
+                .map_other()?
+        } else {
+            None
+        };
+        if format_provider.is_none() && !builtin_sources && derived_lineage.is_none() {
             return Ok(None);
         }
 
         // Non-`None` selects the pond-native route: these nodes' own version
         // files are the leaves the partials are computed from.
-        let builtin_source_ids: Option<Vec<tinyfs::FileID>> = if format_provider.is_none() {
+        let builtin_source_ids: Option<Vec<tinyfs::FileID>> = if builtin_sources {
             Some(source_files.iter().map(tinyfs::NodePath::id).collect())
         } else {
             None
@@ -613,7 +840,19 @@ impl TemporalReduceSqlFile {
             return Ok(None);
         };
 
+        let lineage_schema_path = derived_lineage
+            .as_ref()
+            .map(|lineage| self.lineage_schema_cache_path(&cache_dir, lineage));
+        let lineage_schema_hit = match (&lineage_schema_path, &derived_lineage) {
+            (Some(path), Some(lineage)) => self.load_lineage_schema_cache(path, lineage).await?,
+            _ => false,
+        };
         let filled = self.filled_config().await?;
+        if !lineage_schema_hit
+            && let (Some(path), Some(lineage)) = (&lineage_schema_path, &derived_lineage)
+        {
+            self.write_lineage_schema_cache(path, lineage).await?;
+        }
         let pieces = AggSqlPieces::build(&filled)?;
         let cfg_hash = crate::partial_aggregate_cache::cfg_hash(&partial_aggregate_cfg_canonical(
             &filled,
@@ -625,13 +864,6 @@ impl TemporalReduceSqlFile {
         // resolution file of this site, so all resolutions share one namespace.
         let site_node_id = id.part_id().to_node_id();
 
-        let fs = self.context.context.filesystem();
-        let mut provider_api =
-            crate::Provider::with_context(Arc::new(fs), Arc::new(self.context.context.clone()));
-        if let Ok(root) = self.context.root().await {
-            provider_api = provider_api.with_root(root);
-        }
-
         // Collect every source node's LIVE versions, plus the content identity
         // of the set: blake3 -> event-time range. That map is the freshness key
         // (design §5.3); nothing here is keyed by a version number or filename.
@@ -642,58 +874,74 @@ impl TemporalReduceSqlFile {
             crate::partial_aggregate_cache::SourceRange,
         > = std::collections::BTreeMap::new();
 
-        for node_path in &source_files {
-            let file_url_str = node_file_url(scheme, node_path);
-            let file_url = crate::Url::parse(&file_url_str).map_other()?;
-
-            let (source_node_id, versions) = match format_provider.as_ref() {
-                Some(fp) => provider_api
-                    .ensure_url_cached(&file_url, fp.as_ref(), &cache_dir)
-                    .await
-                    .map_other()?,
-                // Pond-native Parquet: the node's own version files are already
-                // the leaves, so only the version list is needed.
-                None => provider_api
-                    .list_url_versions(&file_url)
-                    .await
-                    .map_other()?,
-            };
-
-            // The rollup sums every live version of a source. Series entry types
-            // (FilePhysicalSeries, TablePhysicalSeries) store append-only deltas
-            // that are concatenated on read, so their versions are disjoint and
-            // summing them is exactly a single-pass GROUP BY over the whole
-            // series. A non-series file stores a full RE-SNAPSHOT per version,
-            // so two live versions share rows and summing them double-counts.
-            //
-            // This used to be defended by a per-source "sequentiality frontier":
-            // scan each new version's bucket span, persist the high-water mark,
-            // and fail if a later version reached below it. That is a
-            // data-dependent test for a condition fixed by the entry type -- and
-            // for a re-snapshot it fires on the second version regardless, since
-            // every snapshot re-covers all of history. Testing the structure
-            // says the same thing without the scan, the sidecar file, or the
-            // chance of a stale frontier disagreeing with the data.
-            let is_series = matches!(
-                node_path.id().entry_type(),
-                EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries
+        if let Some(lineage) = &derived_lineage {
+            let _ = now.insert(
+                format!("recipe:{}", lineage.recipe_identity),
+                crate::partial_aggregate_cache::SourceRange::UNKNOWN,
             );
-            if !is_series && versions.len() > 1 {
-                return Err(tinyfs::Error::Other(format!(
-                    "temporal-reduce rollup: source '{}' is a non-series file with \
+            for leaf in &lineage.leaves {
+                let range = match (leaf.min_event_time, leaf.max_event_time) {
+                    (Some(min_us), Some(max_us)) => {
+                        crate::partial_aggregate_cache::SourceRange { min_us, max_us }
+                    }
+                    _ => crate::partial_aggregate_cache::SourceRange::UNKNOWN,
+                };
+                let _ = now.insert(leaf.identity.clone(), range);
+            }
+        } else {
+            for node_path in &source_files {
+                let file_url_str = node_file_url(scheme, node_path);
+                let file_url = crate::Url::parse(&file_url_str).map_other()?;
+
+                let (source_node_id, versions) = match format_provider.as_ref() {
+                    Some(fp) => provider_api
+                        .ensure_url_cached(&file_url, fp.as_ref(), &cache_dir)
+                        .await
+                        .map_other()?,
+                    // Pond-native Parquet: the node's own version files are already
+                    // the leaves, so only the version list is needed.
+                    None => provider_api
+                        .list_url_versions(&file_url)
+                        .await
+                        .map_other()?,
+                };
+
+                // The rollup sums every live version of a source. Series entry types
+                // (FilePhysicalSeries, TablePhysicalSeries) store append-only deltas
+                // that are concatenated on read, so their versions are disjoint and
+                // summing them is exactly a single-pass GROUP BY over the whole
+                // series. A non-series file stores a full RE-SNAPSHOT per version,
+                // so two live versions share rows and summing them double-counts.
+                //
+                // This used to be defended by a per-source "sequentiality frontier":
+                // scan each new version's bucket span, persist the high-water mark,
+                // and fail if a later version reached below it. That is a
+                // data-dependent test for a condition fixed by the entry type -- and
+                // for a re-snapshot it fires on the second version regardless, since
+                // every snapshot re-covers all of history. Testing the structure
+                // says the same thing without the scan, the sidecar file, or the
+                // chance of a stale frontier disagreeing with the data.
+                let is_series = matches!(
+                    node_path.id().entry_type(),
+                    EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries
+                );
+                if !is_series && versions.len() > 1 {
+                    return Err(tinyfs::Error::Other(format!(
+                        "temporal-reduce rollup: source '{}' is a non-series file with \
                      {} live versions. Each version is a full re-snapshot, so they \
                      overlap and cannot be aggregated together without \
                      double-counting. Use a series entry type for incrementally \
                      appended data, or reduce a single-version source.",
-                    node_path.path().display(),
-                    versions.len()
-                )));
-            }
+                        node_path.path().display(),
+                        versions.len()
+                    )));
+                }
 
-            for v in &versions {
-                let _ = now.insert(source_version_key(&source_node_id, v), source_range(v));
+                for v in &versions {
+                    let _ = now.insert(source_version_key(&source_node_id, v), source_range(v));
+                }
+                source_nodes.push((source_node_id, versions));
             }
-            source_nodes.push((source_node_id, versions));
         }
 
         let ctx = &context.datafusion_session;
@@ -773,6 +1021,7 @@ impl TemporalReduceSqlFile {
                     scheme,
                     &source_nodes,
                     builtin_source_ids.as_deref(),
+                    derived_lineage.as_ref().map(|_| self.pattern_url.as_str()),
                     context,
                     &now,
                     &source_table,
@@ -817,10 +1066,10 @@ impl TemporalReduceSqlFile {
         }
 
         let final_level = final_level.expect("at least the finest level is always built");
-        let (table_provider, digest, changed_since) = (
+        let (table_provider, digest, export_change) = (
             final_level.provider,
             final_level.digest,
-            final_level.changed.export_hint(),
+            final_level.changed.export_change(),
         );
 
         // The segments + hot file store mergeable partials
@@ -828,37 +1077,22 @@ impl TemporalReduceSqlFile {
         // time so consumers see identical output (same names, order, values,
         // including Avg = Sum / Count) while the on-disk segments stay associatively
         // foldable for the coarser-from-finer rollup (design §3 / Phase 3). The
-        // reconstruction is a passthrough-projection view over the partials
+        // reconstruction is a passthrough typed projection over the partials
         // listing table: the timestamp column flows through unchanged so the
         // scan's declared ordering (the streaming, O(1)-memory read path) is
-        // preserved. The listing provider is embedded in the view's logical plan,
-        // so the view resolves in any consumer session, then deregistered here to
-        // avoid leaking a table into the shared session.
-        let read_name = format!(
-            "__rollup_reconstruct_{}_{}_{}",
-            cfg_hash,
-            sanitized_id,
-            self.duration.as_secs()
-        );
-        let _ = ctx
-            .register_table(read_name.as_str(), table_provider)
-            .map_other()?;
-        let recon_sql = pieces.reconstruct_sql(&ts, &read_name);
-        // Deregister before propagating: read_name is deterministic in
-        // cfg_hash/node/resolution, so leaving it behind on the shared session
-        // turns one transient planning failure into a permanent duplicate-name
-        // error for this resolution.
-        let recon_plan = {
-            let out = ctx
-                .sql(&recon_sql)
-                .await
-                .map_other_context("rollup reconstruction planning failed");
-            let _ = ctx.deregister_table(read_name.as_str()).map_other()?;
-            out?.logical_plan().clone()
-        };
-        let table_provider: Arc<dyn datafusion::catalog::TableProvider> = Arc::new(
-            datafusion::catalog::view::ViewTable::new(recon_plan, Some(recon_sql)),
-        );
+        // preserved. Embedding the provider directly also avoids transient
+        // session table names and generated built-in SQL.
+        let partials = ctx.read_table(table_provider).map_other()?;
+        let recon_plan = pieces
+            .reconstruct_frame(partials, &ts)
+            .map_other_context("rollup reconstruction planning failed")?
+            .logical_plan()
+            .clone();
+        let table_provider: Arc<dyn datafusion::catalog::TableProvider> =
+            Arc::new(datafusion::catalog::view::ViewTable::new(
+                recon_plan,
+                Some("typed temporal-reduce partial reconstruction".to_owned()),
+            ));
 
         let cache_key = crate::TableProviderKey::new(id, crate::VersionSelection::LatestVersion)
             .to_cache_string();
@@ -867,13 +1101,16 @@ impl TemporalReduceSqlFile {
         // Publish an export hint so the sitegen export layer can skip rewriting
         // output partitions whose buckets did not change this build. The digest
         // is the manifest digest (stable when content is unchanged); the export
-        // reuses partitions strictly before `changed_since`, or rewrites all when
-        // it is None (full rebuild or unchanged reuse).
+        // reuses partitions strictly before a bounded dirty watermark, skips a
+        // recipe-only change, or rewrites all after a full rebuild.
+        log::debug!(
+            "temporal-reduce export hint: node={id} digest={digest} change={export_change:?}"
+        );
         context.set_export_hint(
             &id,
             tinyfs::ExportHint {
                 digest,
-                changed_since,
+                change: export_change,
             },
         )?;
 
@@ -893,33 +1130,37 @@ impl TemporalReduceSqlFile {
         bucket_col: &str,
         output_interval: Duration,
     ) -> TinyFSResult<Option<i64>> {
-        let interval = duration_to_sql_interval(output_interval);
-        let bin = date_bin_expr(&interval, bucket_col);
-        let sql = format!(
-            "SELECT CAST(MAX(EXTRACT(EPOCH FROM {bin})) AS BIGINT) AS hi_secs \
-             FROM {table}"
-        );
-        let batches = ctx
-            .sql(&sql)
-            .await
-            .map_other_context("max-output-bucket SQL planning failed")?
+        let frame = query_foundation::plans::reduce::max_timestamp_bucket(
+            ctx.table(table).await.map_other()?,
+            bucket_col,
+            output_interval,
+        )
+        .map_other_context("max-output-bucket planning failed")?;
+        let batches = frame
             .collect()
             .await
-            .map_other_context("max-output-bucket SQL execution failed")?;
+            .map_other_context("max-output-bucket execution failed")?;
         for batch in &batches {
             if batch.num_rows() == 0 {
                 continue;
             }
-            if let Some(hi) = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-            {
-                use arrow::array::Array;
-                if !hi.is_null(0) {
-                    return Ok(Some(hi.value(0)));
+            let value =
+                datafusion::common::ScalarValue::try_from_array(batch.column(0), 0).map_other()?;
+            return match value {
+                datafusion::common::ScalarValue::TimestampSecond(value, _) => Ok(value),
+                datafusion::common::ScalarValue::TimestampMillisecond(value, _) => {
+                    Ok(value.map(|value| value.div_euclid(1_000)))
                 }
-            }
+                datafusion::common::ScalarValue::TimestampMicrosecond(value, _) => {
+                    Ok(value.map(|value| value.div_euclid(1_000_000)))
+                }
+                datafusion::common::ScalarValue::TimestampNanosecond(value, _) => {
+                    Ok(value.map(|value| value.div_euclid(1_000_000_000)))
+                }
+                other => Err(tinyfs::Error::Other(format!(
+                    "max-output-bucket produced non-timestamp value {other:?}"
+                ))),
+            };
         }
         Ok(None)
     }
@@ -969,17 +1210,19 @@ impl TemporalReduceSqlFile {
             && m.sealed_hi_secs.is_none_or(|sh| wm > sh)
             && m.hot_bytes >= policy.target_bytes
         {
-            let seal_sql = pieces.merge_partials_sql(
-                output_interval,
-                ts,
-                input_table,
-                in_bucket_col,
-                m.sealed_hi_secs,
-                Some(wm),
-            );
+            let seal = pieces
+                .merge_partials_frame(
+                    ctx.table(input_table).await.map_other()?,
+                    output_interval,
+                    ts,
+                    in_bucket_col,
+                    m.sealed_hi_secs,
+                    Some(wm),
+                )
+                .map_other_context("rollup sealed segment planning failed")?;
             let name = format!("seg-{:08}.parquet", m.next_seq);
             let seg_file = crate::partial_aggregate_cache::segment_path(res_dir, &name);
-            let (seg_digest, rows) = self.write_merge_to(ctx, &seal_sql, &seg_file).await?;
+            let (seg_digest, rows) = self.write_merge_to(seal, &seg_file).await?;
             if rows > 0 {
                 let bytes = tokio::fs::metadata(&seg_file).await.map_other()?.len();
                 m.segments.push(crate::partial_aggregate_cache::Segment {
@@ -1001,16 +1244,18 @@ impl TemporalReduceSqlFile {
         // Recompute the open hot window [sealed_hi, inf) from the current input --
         // where new appends and within-window late data land. Bounded to
         // ~allowed_lateness worth of buckets.
-        let hot_sql = pieces.merge_partials_sql(
-            output_interval,
-            ts,
-            input_table,
-            in_bucket_col,
-            m.sealed_hi_secs,
-            None,
-        );
+        let hot = pieces
+            .merge_partials_frame(
+                ctx.table(input_table).await.map_other()?,
+                output_interval,
+                ts,
+                in_bucket_col,
+                m.sealed_hi_secs,
+                None,
+            )
+            .map_other_context("rollup hot-window planning failed")?;
         let hot_file = crate::partial_aggregate_cache::hot_path(res_dir);
-        let (hot_digest, _rows) = self.write_merge_to(ctx, &hot_sql, &hot_file).await?;
+        let (hot_digest, _rows) = self.write_merge_to(hot, &hot_file).await?;
         m.hot_digest = Some(hot_digest);
         // Fatal, like the identical stat on a just-sealed segment above.
         // `write_merge_to` has just written this path atomically and a zero-row
@@ -1076,14 +1321,19 @@ impl TemporalReduceSqlFile {
             // associative, so folding a window of segments into one gives exactly
             // what folding the original inputs would have; this is the same
             // property that lets a coarser resolution be built from a finer one.
-            let table_name = format!("__rollup_compact_{}", m.next_seq);
-            _ = ctx.register_table(&table_name, table).map_other()?;
-            let sql = pieces.merge_partials_sql(output_interval, ts, &table_name, ts, None, None);
+            let merged_frame = pieces
+                .merge_partials_frame(
+                    ctx.read_table(table).map_other()?,
+                    output_interval,
+                    ts,
+                    ts,
+                    None,
+                    None,
+                )
+                .map_other_context("rollup compaction planning failed")?;
             let name = format!("seg-{:08}.parquet", m.next_seq);
             let out = crate::partial_aggregate_cache::segment_path(res_dir, &name);
-            let merged = self.write_merge_to(ctx, &sql, &out).await;
-            _ = ctx.deregister_table(&table_name).map_other()?;
-            let (digest, rows) = merged?;
+            let (digest, rows) = self.write_merge_to(merged_frame, &out).await?;
 
             if rows == 0 {
                 // Cannot happen for non-empty segments (an empty segment is never
@@ -1148,6 +1398,7 @@ impl TemporalReduceSqlFile {
         scheme: &str,
         source_nodes: &[(tinyfs::NodeID, Vec<tinyfs::FileVersionInfo>)],
         builtin_sources: Option<&[tinyfs::FileID]>,
+        derived_pattern: Option<&str>,
         provider_context: &tinyfs::ProviderContext,
         now: &std::collections::BTreeMap<String, crate::partial_aggregate_cache::SourceRange>,
         source_table: &str,
@@ -1168,6 +1419,11 @@ impl TemporalReduceSqlFile {
             }
             None => None,
         };
+        let previous_output_digest = manifest
+            .as_ref()
+            .map(crate::partial_aggregate_cache::segment_manifest_digest)
+            .transpose()
+            .map_other()?;
 
         enum Plan {
             Reuse,
@@ -1208,12 +1464,12 @@ impl TemporalReduceSqlFile {
         }
 
         let rebuilt = matches!(plan, Plan::Rebuild);
-        let (mut m, mut unsealed, changed) = match plan {
+        let (mut m, mut unsealed, mut changed) = match plan {
             Plan::Incremental { dirty_lo_us } => {
                 let mut m = manifest.expect("incremental implies a manifest");
                 // Floor to the BUCKET, not just to the second. `sealed_hi_secs`
                 // is a bucket boundary everywhere else, and every consumer
-                // compares it against a bucket START (`merge_partials_sql`
+                // compares it against a bucket START (`merge_partials_frame`
                 // filters `date_bin(...) >= lo`). An unaligned watermark would
                 // leave the bucket containing the dirty point in neither a
                 // segment (they stop at the aligned edge below it) nor the hot
@@ -1236,7 +1492,10 @@ impl TemporalReduceSqlFile {
                 // they cover, so "which segments hold this instant" is a lookup.
                 // Under the old version-keyed layout there was no way to find
                 // them again, which is exactly why it had to error instead.
-                let unsealed = unseal_from(&mut m, dirty_lo_secs, res_dir)?;
+                let mut unsealed = self
+                    .preserve_segment_prefix(ctx, &mut m, dirty_lo_secs, res_dir, ts)
+                    .await?;
+                unsealed.extend(unseal_from(&mut m, dirty_lo_secs, res_dir)?);
                 let changed = match dirty_lo_secs {
                     Some(lo) => LevelChange::Since(lo),
                     // An unbounded dirty range is the whole axis, not "nothing".
@@ -1272,15 +1531,33 @@ impl TemporalReduceSqlFile {
         // Aggregate the sources into partial columns on the fly. This view is
         // what `seal_and_recompute` folds, so it plays exactly the role the
         // partials directory used to -- as a query, not as a file population.
-        let provider = match builtin_sources {
-            None => {
-                let source_set = bounded_source_set(cache_dir, scheme, source_nodes, read_lo_us);
-                require_complete_coverage(&source_set)?;
-                source_set.table_provider().await.map_other()?
+        let provider = if let Some(pattern) = derived_pattern {
+            provider_context.record_dynamic_source_execution(read_lo_us);
+            let bounds = read_lo_us.map_or(tinyfs::SeriesReadBounds::NONE, |lo| {
+                tinyfs::SeriesReadBounds::from_event_time_lo(lo)
+            });
+            let fs = self.context.context.filesystem();
+            let mut provider_api =
+                crate::Provider::with_context(Arc::new(fs), Arc::new(provider_context.clone()));
+            if let Ok(root) = self.context.root().await {
+                provider_api = provider_api.with_root(root);
             }
-            // Pond-native Parquet has no sidecars to be missing, so there is no
-            // coverage race to defend against here.
-            Some(ids) => builtin_source_provider(provider_context, ids, read_lo_us).await?,
+            provider_api
+                .create_provider_for_url_bounded(pattern, ctx, bounds)
+                .await
+                .map_other()?
+        } else {
+            match builtin_sources {
+                None => {
+                    let source_set =
+                        bounded_source_set(cache_dir, scheme, source_nodes, read_lo_us);
+                    require_complete_coverage(&source_set)?;
+                    source_set.table_provider().await.map_other()?
+                }
+                // Pond-native Parquet has no sidecars to be missing, so there is no
+                // coverage race to defend against here.
+                Some(ids) => builtin_source_provider(provider_context, ids, read_lo_us).await?,
+            }
         };
         let available: std::collections::HashSet<String> = provider
             .schema()
@@ -1291,16 +1568,43 @@ impl TemporalReduceSqlFile {
         if ctx.table_exist(source_table).unwrap_or(false) {
             _ = ctx.deregister_table(source_table).map_other()?;
         }
-        _ = ctx.register_table(source_table, provider).map_other()?;
+        _ = ctx
+            .register_table(source_table, provider.clone())
+            .map_other()?;
 
         let partials_view = format!("{}_partials", source_table);
-        let partial_sql = pieces.partial_sql(output_interval, ts, source_table, &available);
+        let missing = pieces
+            .partials
+            .iter()
+            .filter(|partial| partial.column != "*" && !available.contains(&partial.column))
+            .map(|partial| partial.column.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|column| (column, arrow::datatypes::DataType::Float64))
+            .collect();
+        let source = query_foundation::plans::transform::null_pad(
+            ctx.read_table(provider).map_other()?,
+            missing,
+        )
+        .map_other_context("rollup source partial padding")?;
+        let partials = query_foundation::plans::reduce::reduce_timestamp_windows(
+            source,
+            &pieces
+                .timestamp_recipe(output_interval, ts)
+                .map_other_context("rollup source partial recipe")?,
+        )
+        .map_other_context("rollup source partial planning")?;
+        let partials_provider: Arc<dyn datafusion::catalog::TableProvider> =
+            Arc::new(datafusion::catalog::view::ViewTable::new(
+                partials.logical_plan().clone(),
+                Some("typed temporal-reduce source partials".to_owned()),
+            ));
+        if ctx.table_exist(&partials_view).unwrap_or(false) {
+            _ = ctx.deregister_table(&partials_view).map_other()?;
+        }
         let build = async {
             _ = ctx
-                .sql(&format!(
-                    "CREATE OR REPLACE VIEW {partials_view} AS {partial_sql}"
-                ))
-                .await
+                .register_table(&partials_view, partials_provider)
                 .map_other_context("rollup source partial view")?;
             self.seal_and_recompute(
                 ctx,
@@ -1316,10 +1620,19 @@ impl TemporalReduceSqlFile {
             .await
         }
         .await;
-        _ = ctx
-            .sql(&format!("DROP VIEW IF EXISTS {partials_view}"))
-            .await;
-        let superseded = build?;
+        let cleanup = ctx
+            .deregister_table(&partials_view)
+            .map_other_context("rollup source partial view cleanup");
+        let superseded = match (build, cleanup) {
+            (Ok(superseded), Ok(_)) => superseded,
+            (Err(build_error), Ok(_)) => return Err(build_error),
+            (Ok(_), Err(cleanup_error)) => return Err(cleanup_error),
+            (Err(build_error), Err(cleanup_error)) => {
+                return Err(tinyfs::Error::Other(format!(
+                    "{build_error}; additionally failed to clean up partial view: {cleanup_error}"
+                )));
+            }
+        };
 
         m.sources = now.clone();
         m.source_digest = None;
@@ -1327,6 +1640,9 @@ impl TemporalReduceSqlFile {
         let digest = crate::partial_aggregate_cache::write_segment_manifest(res_dir, &m)
             .await
             .map_other()?;
+        if !rebuilt && previous_output_digest.as_ref() == Some(&digest) {
+            changed = LevelChange::Nothing;
+        }
         // Only now that the manifest naming the merged segments is durable.
         unsealed.extend(superseded);
         crate::partial_aggregate_cache::remove_superseded(&unsealed).await;
@@ -1396,17 +1712,25 @@ impl TemporalReduceSqlFile {
             None => None,
         };
 
-        // Reuse: the finer level was reused (not rebuilt) and its digest matches
-        // what this level last folded, so nothing downstream changed.
+        // Reuse: the finer output artifacts are unchanged. Adopt newer source
+        // bookkeeping so an irrelevant wildcard member does not keep widening
+        // a later, genuinely dirty range.
         if !finer_rebuilt
-            && let Some(m) = &manifest
+            && let Some(mut m) = manifest.clone()
             && m.source_digest.as_deref() == Some(finer_digest)
         {
+            let digest = if m.sources == *now {
+                crate::partial_aggregate_cache::segment_manifest_digest(&m).map_other()?
+            } else {
+                m.sources = now.clone();
+                crate::partial_aggregate_cache::write_segment_manifest(res_dir, &m)
+                    .await
+                    .map_other()?
+            };
             let provider =
-                crate::partial_aggregate_cache::listing_table_for_res_dir(res_dir, m, ts)
+                crate::partial_aggregate_cache::listing_table_for_res_dir(res_dir, &m, ts)
                     .await
                     .map_other()?;
-            let digest = crate::partial_aggregate_cache::segment_manifest_digest(m).map_other()?;
             return Ok(LevelBuild {
                 provider,
                 digest,
@@ -1473,16 +1797,21 @@ impl TemporalReduceSqlFile {
             let unsealed = match dirty {
                 // Nothing below our watermark moved, so our segments stand.
                 LevelChange::Nothing => Vec::new(),
-                LevelChange::Since(lo) => unseal_from(&mut m, Some(lo), res_dir)?,
+                LevelChange::Since(lo) => {
+                    let mut stale = self
+                        .preserve_segment_prefix(ctx, &mut m, Some(lo), res_dir, ts)
+                        .await?;
+                    stale.extend(unseal_from(&mut m, Some(lo), res_dir)?);
+                    stale
+                }
                 // Unbounded: unseal everything.
                 LevelChange::Everything => unseal_from(&mut m, None, res_dir)?,
             };
-            // Post-unseal, so it already reflects any segments folded back in.
-            // No watermark left means the whole axis is hot.
-            let changed = match m.sealed_hi_secs {
-                Some(hi) => LevelChange::Since(hi),
-                None => LevelChange::Everything,
-            };
+            // `sealed_hi_secs` bounds the physical cache scan, not the logical
+            // output change. An unsealed level may recompute its whole hot file,
+            // but buckets before `dirty` remain byte-for-byte equivalent and
+            // downstream exports can still reuse their historical partitions.
+            let changed = dirty;
             (m, unsealed, changed, false)
         } else {
             crate::partial_aggregate_cache::wipe_segment_res_dir(res_dir).map_other()?;
@@ -1531,23 +1860,19 @@ impl TemporalReduceSqlFile {
         })
     }
 
-    /// Plan and execute `sql`, streaming the result to `path` atomically. Returns
+    /// Execute `frame`, streaming the result to `path` atomically. Returns
     /// the written file's blake3 digest and its row count. The row count lets the
     /// caller drop empty segments (gaps with no data) rather than record an
     /// empty segment file, while still advancing the watermark.
     async fn write_merge_to(
         &self,
-        ctx: &datafusion::prelude::SessionContext,
-        sql: &str,
+        frame: datafusion::dataframe::DataFrame,
         path: &std::path::Path,
     ) -> TinyFSResult<(String, u64)> {
-        let stream = ctx
-            .sql(sql)
-            .await
-            .map_other_context("rollup sealed-cache SQL planning failed")?
+        let stream = frame
             .execute_stream()
             .await
-            .map_other_context("rollup sealed-cache SQL execution failed")?;
+            .map_other_context("rollup sealed-cache plan execution failed")?;
         let schema = stream.schema();
         let rows = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let rows_w = rows.clone();
@@ -1564,6 +1889,69 @@ impl TemporalReduceSqlFile {
             .await
             .map_other()?;
         Ok((digest, rows.load(std::sync::atomic::Ordering::Relaxed)))
+    }
+
+    /// Preserve the clean prefix of the one sealed segment straddling a bounded
+    /// dirty point. The suffix is rebuilt from source; the prefix is copied from
+    /// already-aggregated partials, so retroactive repair never has to rescan raw
+    /// history merely because a cold build created one large segment.
+    async fn preserve_segment_prefix(
+        &self,
+        ctx: &datafusion::prelude::SessionContext,
+        manifest: &mut crate::partial_aggregate_cache::SegmentManifest,
+        dirty_lo_secs: Option<i64>,
+        res_dir: &std::path::Path,
+        ts: &str,
+    ) -> TinyFSResult<Vec<std::path::PathBuf>> {
+        let Some(dirty_lo_secs) = dirty_lo_secs else {
+            return Ok(Vec::new());
+        };
+        let Some(index) = manifest.segments.iter().position(|segment| {
+            segment.lo_secs.is_none_or(|lo| lo < dirty_lo_secs) && segment.hi_secs > dirty_lo_secs
+        }) else {
+            return Ok(Vec::new());
+        };
+
+        let old = manifest.segments[index].clone();
+        let old_path = crate::partial_aggregate_cache::segment_path(res_dir, &old.name);
+        let table = crate::partial_aggregate_cache::listing_table_for_files(
+            std::slice::from_ref(&old_path),
+            res_dir,
+            ts,
+        )
+        .await
+        .map_other()?;
+        let prefix = ctx
+            .read_table(table)
+            .map_other()?
+            .filter(col(Column::from_name(ts)).lt(lit(
+                datafusion::common::ScalarValue::TimestampMicrosecond(
+                    Some(secs_to_us(dirty_lo_secs)),
+                    None,
+                ),
+            )))
+            .map_other_context("rollup segment-prefix planning failed")?;
+        let name = format!("seg-{:08}.parquet", manifest.next_seq);
+        let path = crate::partial_aggregate_cache::segment_path(res_dir, &name);
+        let (digest, rows) = self.write_merge_to(prefix, &path).await?;
+        if rows == 0 {
+            tokio::fs::remove_file(&path).await.map_other()?;
+            return Ok(Vec::new());
+        }
+
+        let bytes = tokio::fs::metadata(&path).await.map_other()?.len();
+        manifest.segments[index] = crate::partial_aggregate_cache::Segment {
+            name,
+            lo_secs: old.lo_secs,
+            hi_secs: dirty_lo_secs,
+            digest,
+            bytes,
+        };
+        manifest.next_seq += 1;
+        // Conservative: the discarded suffix cannot be larger than the old
+        // segment, and overestimating only makes the next seal happen sooner.
+        manifest.hot_bytes = manifest.hot_bytes.saturating_add(old.bytes);
+        Ok(vec![old_path])
     }
 
     /// Resolve this partition's `pattern_url` to concrete source file
@@ -1630,25 +2018,7 @@ impl TemporalReduceSqlFile {
             // CRITICAL: Lowercase to match DataFusion's case-insensitive table name handling
             // Replace ALL non-alphanumeric characters with underscore so the name is
             // a valid unquoted SQL identifier (spaces, parens, slashes, etc.).
-            let sanitized: String = self
-                .source_path
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                .collect();
-            let pattern_name = format!("source_{}", sanitized).to_lowercase();
-
-            // Generate the SQL query with schema discovery, using the unique pattern name
-            log::debug!(
-                "[SEARCH] TEMPORAL-REDUCE: Generating SQL query for source path: {}",
-                self.source_path
-            );
-            let sql_query = self
-                .generate_sql_with_discovered_schema(&pattern_name)
-                .await?;
-            log::debug!(
-                "[SEARCH] TEMPORAL-REDUCE: Generated SQL query: {}",
-                sql_query
-            );
+            let pattern_name = self.pattern_name();
 
             // Use the pattern_url for the SqlDerived source.  When the in_pattern
             // glob matched multiple files mapping to the same output, pattern_url
@@ -1663,19 +2033,104 @@ impl TemporalReduceSqlFile {
                     _ = patterns.insert(pattern_name.clone(), source_url);
                     patterns
                 },
-                Some(sql_query.clone()),
+                None,
             )
             .with_transforms(self.config.transforms.clone());
-
-            log::debug!(
-                "[SEARCH] TEMPORAL-REDUCE SqlDerivedConfig for '{}': query=\n{}",
-                self.source_path,
-                sql_query
-            );
 
             Ok(sql_config)
         })
         .await
+    }
+
+    async fn typed_single_pass_provider(
+        &self,
+        id: tinyfs::FileID,
+        context: &tinyfs::ProviderContext,
+    ) -> TinyFSResult<Arc<dyn datafusion::catalog::TableProvider>> {
+        context.record_non_incremental_plan();
+        log::info!(
+            "query-plan visibility: node={id} locality=timestamp-local incremental=false reason=temporal-reduce-cache-unavailable"
+        );
+        let filled = self.filled_config().await?;
+        let pieces = AggSqlPieces::build(&filled)?;
+        let empty_source = self.resolve_source_files().await?.is_empty();
+        let source = if empty_source {
+            let mut fields = vec![arrow::datatypes::Field::new(
+                &filled.time_column,
+                arrow::datatypes::DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Microsecond,
+                    Some("UTC".into()),
+                ),
+                true,
+            )];
+            fields.extend(
+                self.configured_empty_source_columns()?
+                    .into_iter()
+                    .map(|column| {
+                        arrow::datatypes::Field::new(
+                            column,
+                            arrow::datatypes::DataType::Float64,
+                            true,
+                        )
+                    }),
+            );
+            let empty = datafusion::datasource::MemTable::try_new(
+                Arc::new(arrow::datatypes::Schema::new(fields)),
+                vec![vec![]],
+            )
+            .map_other_context("create empty temporal-reduce source")?;
+            context
+                .datafusion_session
+                .read_table(Arc::new(empty))
+                .map_other_context("open empty temporal-reduce source")?
+        } else {
+            self.ensure_inner().await?;
+            let pattern_name = self.pattern_name();
+            let inner = self.inner.lock().await;
+            let (source_tables, _) = inner
+                .as_ref()
+                .expect("inner initialized by ensure_inner")
+                .register_source_tables(id, context)
+                .await?;
+            let table_name = source_tables.get(&pattern_name).ok_or_else(|| {
+                tinyfs::Error::Other(format!(
+                    "temporal-reduce source table is missing for pattern '{pattern_name}'"
+                ))
+            })?;
+            context
+                .datafusion_session
+                .table(table_name)
+                .await
+                .map_other_context("failed to open temporal-reduce source")?
+        };
+        let partials = query_foundation::plans::reduce::reduce_timestamp_windows(
+            source,
+            &pieces
+                .timestamp_recipe(self.duration, &filled.time_column)
+                .map_other_context("temporal-reduce single-pass recipe")?,
+        )
+        .map_other_context("temporal-reduce single-pass partial planning")?;
+        let output = pieces
+            .reconstruct_bucketed_frame(partials, &filled.time_column)
+            .map_other_context("temporal-reduce single-pass reconstruction")?;
+        let provider: Arc<dyn datafusion::catalog::TableProvider> = if empty_source {
+            Arc::new(
+                datafusion::datasource::MemTable::try_new(
+                    Arc::new(output.schema().as_arrow().clone()),
+                    vec![vec![]],
+                )
+                .map_other_context("create empty temporal-reduce output")?,
+            )
+        } else {
+            Arc::new(datafusion::catalog::view::ViewTable::new(
+                output.logical_plan().clone(),
+                Some("typed temporal-reduce single-pass".to_owned()),
+            ))
+        };
+        let cache_key = crate::TableProviderKey::new(id, crate::VersionSelection::LatestVersion)
+            .to_cache_string();
+        context.set_table_provider_cache(cache_key, Arc::clone(&provider))?;
+        Ok(provider)
     }
 
     #[must_use]
@@ -1706,16 +2161,74 @@ impl tinyfs::QueryableFile for TemporalReduceSqlFile {
             return Ok(provider);
         }
 
-        log::debug!(
-            "DELEGATING TemporalReduceSqlFile to inner SqlDerivedFile: id={}",
-            id
-        );
-        self.ensure_inner().await?;
-        let inner_guard = self.inner.lock().await;
-        let inner = inner_guard
-            .as_ref()
-            .expect("inner initialized by ensure_inner");
-        inner.as_table_provider(id, context).await
+        log::debug!("planning typed single-pass temporal-reduce: id={id}");
+        self.typed_single_pass_provider(id, context).await
+    }
+
+    async fn as_table_provider_bounded(
+        &self,
+        id: tinyfs::FileID,
+        context: &tinyfs::ProviderContext,
+        bounds: tinyfs::SeriesReadBounds,
+    ) -> tinyfs::Result<Arc<dyn datafusion::catalog::TableProvider>> {
+        let provider = self.as_table_provider(id, context).await?;
+        let Some(event_time_lo) = bounds.event_time_lo else {
+            return Ok(provider);
+        };
+        let frame = context
+            .datafusion_session
+            .read_table(provider)
+            .map_other_context("read temporal-reduce output for bounded plan")?
+            .filter(col(Column::from_name(&self.config.time_column)).gt_eq(lit(
+                datafusion::scalar::ScalarValue::TimestampMicrosecond(Some(event_time_lo), None),
+            )))
+            .map_other_context("apply temporal-reduce output bound")?;
+        Ok(Arc::new(datafusion::catalog::view::ViewTable::new(
+            frame.logical_plan().clone(),
+            Some("bounded typed temporal-reduce output".to_owned()),
+        )))
+    }
+
+    async fn query_lineage(
+        &self,
+        _id: tinyfs::FileID,
+        context: &tinyfs::ProviderContext,
+    ) -> TinyFSResult<Option<tinyfs::QueryLineage>> {
+        if context.cache_dir().is_none()
+            || self
+                .config
+                .transforms
+                .as_ref()
+                .is_some_and(|transforms| !transforms.is_empty())
+        {
+            return Ok(None);
+        }
+
+        let config = serde_json::to_value(&self.config)
+            .map_other_context("temporal-reduce lineage config")?;
+        let recipe =
+            serde_json::to_vec(&config).map_other_context("temporal-reduce lineage recipe")?;
+        let mut recipe_hasher = blake3::Hasher::new();
+        _ = recipe_hasher.update(b"watertown:temporal-reduce-lineage:v1");
+        update_schema_hash(&mut recipe_hasher, &recipe);
+        update_schema_hash(&mut recipe_hasher, &self.duration.as_micros().to_le_bytes());
+        update_schema_hash(&mut recipe_hasher, self.source_path.as_bytes());
+        update_schema_hash(&mut recipe_hasher, self.pattern_url.as_bytes());
+
+        let root = self.context.root().await?;
+        let fs = self.context.context.filesystem();
+        let provider =
+            crate::Provider::with_context(Arc::new(fs), Arc::new(context.clone())).with_root(root);
+        let Some(nested) = provider
+            .query_lineage_for_url(&self.pattern_url)
+            .await
+            .map_other_context("temporal-reduce lineage source")?
+        else {
+            return Ok(None);
+        };
+        let mut lineage = tinyfs::QueryLineage::new(recipe_hasher.finalize().to_hex().to_string());
+        lineage.extend(nested);
+        Ok(Some(lineage))
     }
 }
 
@@ -1756,6 +2269,13 @@ fn partial_aggregate_cfg_canonical(
         }
         s.push(';');
     }
+    if let Some(aliases) = &filled.output_aliases {
+        let mut aliases = aliases.iter().collect::<Vec<_>>();
+        aliases.sort_unstable();
+        for (source, output) in aliases {
+            let _ = write!(s, "alias={source}:{output};");
+        }
+    }
     s
 }
 
@@ -1795,6 +2315,7 @@ fn parse_nesting_resolutions(resolutions: &[String]) -> TinyFSResult<Vec<Duratio
     Ok(durations)
 }
 
+#[cfg(test)]
 fn duration_to_sql_interval(duration: Duration) -> String {
     let total_seconds = duration.as_secs();
 
@@ -1897,6 +2418,7 @@ impl PartialKind {
 
     /// SQL expression computing this partial over raw source rows, grouped into
     /// a time bucket. Aliased to the partial's internal column name.
+    #[cfg(test)]
     fn raw_expr(self, column: &str, alias: &str) -> String {
         match self {
             PartialKind::Sum => format!("SUM(\"{column}\") AS \"{alias}\""),
@@ -1918,6 +2440,7 @@ impl PartialKind {
     /// which the cross-version merge listing table requires, and contributes
     /// nothing on merge: NULL sums/mins/maxes are ignored and a zero count adds
     /// nothing.
+    #[cfg(test)]
     fn raw_expr_or_absent(self, column: &str, alias: &str, present: bool) -> String {
         if present || matches!(self, PartialKind::CountStar) {
             return self.raw_expr(column, alias);
@@ -1936,6 +2459,7 @@ impl PartialKind {
     /// is associative: sums and counts add, mins/maxes extend. The result keeps
     /// the same alias so the reconstruction SELECT is identical whether it runs
     /// over raw-grouped or merged partials.
+    #[cfg(test)]
     fn merge_expr(self, alias: &str) -> String {
         match self {
             // SUM is nullable in DataFusion; COUNT is not. Single-pass COUNT
@@ -1973,9 +2497,31 @@ struct PartialDef {
 ///   cached partials back into the final output.
 struct AggSqlPieces {
     partials: Vec<PartialDef>,
-    /// Output column expressions, in the original aggregation/column order,
-    /// each referencing one or more partial aliases.
-    reconstruct_exprs: Vec<String>,
+    reconstructions: Vec<Reconstruction>,
+}
+
+enum Reconstruction {
+    Direct {
+        partial: String,
+        output: String,
+    },
+    Average {
+        sum: String,
+        count: String,
+        output: String,
+    },
+}
+
+impl Reconstruction {
+    #[cfg(test)]
+    fn sql_expr(&self) -> String {
+        match self {
+            Self::Direct { partial, output } => format!("\"{partial}\" AS \"{output}\""),
+            Self::Average { sum, count, output } => {
+                format!("CAST(\"{sum}\" AS DOUBLE) / NULLIF(\"{count}\", 0) AS \"{output}\"")
+            }
+        }
+    }
 }
 
 impl AggSqlPieces {
@@ -1983,7 +2529,9 @@ impl AggSqlPieces {
     fn build(config: &TemporalReduceConfig) -> TinyFSResult<Self> {
         let mut aliases: HashMap<(PartialKind, String), String> = HashMap::new();
         let mut partials: Vec<PartialDef> = Vec::new();
-        let mut reconstruct_exprs: Vec<String> = Vec::new();
+        let mut reconstructions = Vec::new();
+        let mut used_aliases = std::collections::HashSet::new();
+        let mut output_names = std::collections::HashSet::from([config.time_column.clone()]);
 
         // Register a partial for (kind, column), deduplicating so e.g. Avg and
         // Sum on the same column share a single SUM partial. Returns its alias.
@@ -2007,6 +2555,30 @@ impl AggSqlPieces {
             alias
         }
 
+        fn output_name(
+            default: String,
+            configured: Option<&HashMap<String, String>>,
+            used_aliases: &mut std::collections::HashSet<String>,
+            output_names: &mut std::collections::HashSet<String>,
+        ) -> TinyFSResult<String> {
+            let output = configured
+                .and_then(|aliases| aliases.get(&default))
+                .cloned()
+                .unwrap_or_else(|| default.clone());
+            if output.is_empty() {
+                return Err(tinyfs::Error::Other(format!(
+                    "temporal-reduce output alias for '{default}' must not be empty"
+                )));
+            }
+            if !output_names.insert(output.clone()) {
+                return Err(tinyfs::Error::Other(format!(
+                    "duplicate temporal-reduce output column '{output}'"
+                )));
+            }
+            _ = used_aliases.insert(default);
+            Ok(output)
+        }
+
         for agg in &config.aggregations {
             let columns = agg.columns.as_ref().ok_or_else(|| {
                 // This should never happen since
@@ -2020,15 +2592,28 @@ impl AggSqlPieces {
             for column in columns {
                 if column == "*" && matches!(agg.agg_type, AggregationType::Count) {
                     // Special case: count(*) becomes "timestamp.count".
-                    let out_alias = "timestamp.count";
+                    let out_alias = output_name(
+                        "timestamp.count".to_owned(),
+                        config.output_aliases.as_ref(),
+                        &mut used_aliases,
+                        &mut output_names,
+                    )?;
                     let p = register(PartialKind::CountStar, "*", &mut aliases, &mut partials);
-                    reconstruct_exprs.push(format!("\"{p}\" AS \"{out_alias}\""));
+                    reconstructions.push(Reconstruction::Direct {
+                        partial: p,
+                        output: out_alias,
+                    });
                     continue;
                 }
 
                 // Generate alias in format: scope.parameter.unit.agg
-                let out_alias = format!("{}.{}", column, agg.agg_type.to_sql().to_lowercase());
-                let expr = match agg.agg_type {
+                let out_alias = output_name(
+                    format!("{}.{}", column, agg.agg_type.to_sql().to_lowercase()),
+                    config.output_aliases.as_ref(),
+                    &mut used_aliases,
+                    &mut output_names,
+                )?;
+                match agg.agg_type {
                     AggregationType::Avg => {
                         // Avg is not associative; store Sum and Count partials
                         // and reconstruct Avg = Sum / Count. NULLIF guards the
@@ -2036,38 +2621,60 @@ impl AggSqlPieces {
                         let sum = register(PartialKind::Sum, column, &mut aliases, &mut partials);
                         let count =
                             register(PartialKind::Count, column, &mut aliases, &mut partials);
-                        format!(
-                            "CAST(\"{sum}\" AS DOUBLE) / NULLIF(\"{count}\", 0) AS \"{out_alias}\""
-                        )
+                        reconstructions.push(Reconstruction::Average {
+                            sum: sum.clone(),
+                            count: count.clone(),
+                            output: out_alias.clone(),
+                        });
                     }
                     AggregationType::Sum => {
                         let p = register(PartialKind::Sum, column, &mut aliases, &mut partials);
-                        format!("\"{p}\" AS \"{out_alias}\"")
+                        reconstructions.push(Reconstruction::Direct {
+                            partial: p.clone(),
+                            output: out_alias.clone(),
+                        });
                     }
                     AggregationType::Count => {
                         let p = register(PartialKind::Count, column, &mut aliases, &mut partials);
-                        format!("\"{p}\" AS \"{out_alias}\"")
+                        reconstructions.push(Reconstruction::Direct {
+                            partial: p.clone(),
+                            output: out_alias.clone(),
+                        });
                     }
                     AggregationType::Min => {
                         let p = register(PartialKind::Min, column, &mut aliases, &mut partials);
-                        format!("\"{p}\" AS \"{out_alias}\"")
+                        reconstructions.push(Reconstruction::Direct {
+                            partial: p.clone(),
+                            output: out_alias.clone(),
+                        });
                     }
                     AggregationType::Max => {
                         let p = register(PartialKind::Max, column, &mut aliases, &mut partials);
-                        format!("\"{p}\" AS \"{out_alias}\"")
+                        reconstructions.push(Reconstruction::Direct {
+                            partial: p.clone(),
+                            output: out_alias.clone(),
+                        });
                     }
-                };
-                reconstruct_exprs.push(expr);
+                }
             }
+        }
+
+        if let Some(configured) = &config.output_aliases
+            && let Some(unknown) = configured.keys().find(|name| !used_aliases.contains(*name))
+        {
+            return Err(tinyfs::Error::Other(format!(
+                "temporal-reduce output alias references unknown aggregate '{unknown}'"
+            )));
         }
 
         Ok(Self {
             partials,
-            reconstruct_exprs,
+            reconstructions,
         })
     }
 
     /// Partial expressions computed over raw source rows (one row per bucket).
+    #[cfg(test)]
     fn raw_partial_exprs(&self) -> Vec<String> {
         self.partials
             .iter()
@@ -2077,6 +2684,7 @@ impl AggSqlPieces {
 
     /// Partial expressions for one input version, substituting typed
     /// placeholders for source columns absent from that version's schema.
+    #[cfg(test)]
     fn raw_partial_exprs_for(&self, available: &std::collections::HashSet<String>) -> Vec<String> {
         self.partials
             .iter()
@@ -2088,6 +2696,7 @@ impl AggSqlPieces {
     }
 
     /// Partial expressions merging cached partials across partitions.
+    #[cfg(test)]
     fn merge_partial_exprs(&self) -> Vec<String> {
         self.partials
             .iter()
@@ -2101,6 +2710,7 @@ impl AggSqlPieces {
 /// DATE_TRUNC only supports single calendar units and discards the multiplier,
 /// so DATE_TRUNC('hour', ts) is the same whether the config says 1h or 4h.
 /// date_bin() properly handles multi-unit intervals like INTERVAL '4 HOUR'.
+#[cfg(test)]
 fn date_bin_expr(interval: &str, ts: &str) -> String {
     format!("date_bin({interval}, {ts}, TIMESTAMP '1970-01-01T00:00:00')")
 }
@@ -2112,6 +2722,7 @@ fn date_bin_expr(interval: &str, ts: &str) -> String {
 /// requested output columns, including `Avg = Sum / Count`. Output column
 /// names, ordering, and values are identical to a direct `AVG/MIN/MAX/...`
 /// GROUP BY. This form is used when no partial-aggregate cache is available.
+#[cfg(test)]
 async fn generate_temporal_sql(
     config: &TemporalReduceConfig,
     interval: Duration,
@@ -2124,8 +2735,111 @@ async fn generate_temporal_sql(
 }
 
 impl AggSqlPieces {
+    fn timestamp_recipe(
+        &self,
+        interval: Duration,
+        ts: &str,
+    ) -> datafusion::error::Result<query_foundation::plans::reduce::TimestampWindowReduce> {
+        use query_foundation::plans::reduce::TimestampPartialAggregate;
+
+        let aggregates = self
+            .partials
+            .iter()
+            .map(|partial| match partial.kind {
+                PartialKind::Sum => TimestampPartialAggregate::Sum {
+                    value: partial.column.clone(),
+                    output: partial.alias.clone(),
+                },
+                PartialKind::Count => TimestampPartialAggregate::Count {
+                    value: partial.column.clone(),
+                    output: partial.alias.clone(),
+                },
+                PartialKind::Min => TimestampPartialAggregate::Min {
+                    value: partial.column.clone(),
+                    output: partial.alias.clone(),
+                },
+                PartialKind::Max => TimestampPartialAggregate::Max {
+                    value: partial.column.clone(),
+                    output: partial.alias.clone(),
+                },
+                PartialKind::CountStar => TimestampPartialAggregate::CountStar {
+                    output: partial.alias.clone(),
+                },
+            })
+            .collect();
+        query_foundation::plans::reduce::TimestampWindowReduce::try_new(ts, interval, aggregates)
+    }
+
+    fn merge_partials_frame(
+        &self,
+        frame: datafusion::dataframe::DataFrame,
+        output_interval: Duration,
+        ts: &str,
+        in_bucket_col: &str,
+        lower_bound: Option<i64>,
+        upper_bound: Option<i64>,
+    ) -> datafusion::error::Result<datafusion::dataframe::DataFrame> {
+        use query_foundation::plans::reduce::TimestampPartialAggregate;
+
+        let aggregates = self
+            .partials
+            .iter()
+            .map(|partial| match partial.kind {
+                PartialKind::Sum | PartialKind::Count | PartialKind::CountStar => {
+                    TimestampPartialAggregate::Sum {
+                        value: partial.alias.clone(),
+                        output: partial.alias.clone(),
+                    }
+                }
+                PartialKind::Min => TimestampPartialAggregate::Min {
+                    value: partial.alias.clone(),
+                    output: partial.alias.clone(),
+                },
+                PartialKind::Max => TimestampPartialAggregate::Max {
+                    value: partial.alias.clone(),
+                    output: partial.alias.clone(),
+                },
+            })
+            .collect();
+        let recipe = query_foundation::plans::reduce::TimestampWindowReduce::try_new(
+            in_bucket_col,
+            output_interval,
+            aggregates,
+        )?
+        .with_epoch_second_bounds(lower_bound, upper_bound);
+        let merged = query_foundation::plans::reduce::reduce_timestamp_windows(frame, &recipe)?;
+        let output_timestamp =
+            arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None);
+        let mut projection = vec![
+            coalesce(vec![
+                cast(
+                    col(Column::from_name("time_bucket")),
+                    output_timestamp.clone(),
+                ),
+                lit(datafusion::common::ScalarValue::TimestampMicrosecond(
+                    Some(0),
+                    None,
+                )),
+            ])
+            .alias(ts),
+        ];
+        projection.extend(self.partials.iter().map(|partial| {
+            let value = col(Column::from_name(&partial.alias));
+            match partial.kind {
+                PartialKind::Count | PartialKind::CountStar => {
+                    coalesce(vec![value, lit(0_i64)]).alias(&partial.alias)
+                }
+                _ => value,
+            }
+        }));
+        merged
+            .select(projection)?
+            .sort(vec![col(Column::from_name(ts)).sort(true, true)])
+    }
+
     /// Single-pass query: group raw rows into buckets, compute partials, and
     /// reconstruct the output columns in one statement.
+    #[cfg(test)]
     fn full_sql(&self, interval: Duration, ts: &str, table: &str) -> String {
         let interval = duration_to_sql_interval(interval);
         let bin = date_bin_expr(&interval, ts);
@@ -2148,7 +2862,7 @@ impl AggSqlPieces {
         ORDER BY time_bucket
         "#,
             partial_exprs = self.raw_partial_exprs().join(",\n            "),
-            select_exprs = self.reconstruct_exprs.join(",\n          "),
+            select_exprs = self.reconstruction_sql_exprs().join(",\n          "),
         )
     }
 
@@ -2156,6 +2870,7 @@ impl AggSqlPieces {
     /// buckets and emit `time_bucket` plus the partial columns. The output is
     /// cached once per version; it carries no reconstruction so the partials
     /// stay mergeable across versions.
+    #[cfg(test)]
     fn partial_sql(
         &self,
         interval: Duration,
@@ -2207,8 +2922,8 @@ impl AggSqlPieces {
     ///
     /// Retained as the reference definition of the reconstructed output and as
     /// the equivalence oracle in tests; production now writes mergeable partials
-    /// via [`merge_partials_sql`] and reconstructs at read time via
-    /// [`reconstruct_sql`], whose composition is exactly this query.
+    /// via [`merge_partials_frame`] and reconstructs at read time via
+    /// [`reconstruct_frame`], whose composition is exactly this query.
     #[cfg(test)]
     fn merge_sql(
         &self,
@@ -2249,98 +2964,73 @@ impl AggSqlPieces {
         ORDER BY time_bucket
         "#,
             merge_exprs = self.merge_partial_exprs().join(",\n            "),
-            select_exprs = self.reconstruct_exprs.join(",\n          "),
+            select_exprs = self.reconstruction_sql_exprs().join(",\n          "),
         )
     }
 
-    /// Comma-separated list of the stored partial columns (`__p_*` aliases), in
-    /// declaration order. This is the on-disk column set of a segment / hot
-    /// file under [`crate::partial_aggregate_cache::SEALED_FORMAT`] = `partials-v1`, and the
-    /// input columns the read-time reconstruction ([`reconstruct_sql`]) consumes.
-    fn partial_column_list(&self) -> String {
-        self.partials
+    #[cfg(test)]
+    fn reconstruction_sql_exprs(&self) -> Vec<String> {
+        self.reconstructions
             .iter()
-            .map(|p| format!("\"{}\"", p.alias))
-            .collect::<Vec<_>>()
-            .join(",\n          ")
+            .map(Reconstruction::sql_expr)
+            .collect()
     }
 
-    /// Like [`merge_sql`], but the final projection emits the *merged partial*
-    /// columns instead of the reconstructed output columns. This is what the
-    /// Phase 2 segments and hot file store (design §3 / Phase 3 step 1): keeping
-    /// the mergeable partials (sum/count/min/max) on disk — rather than a
-    /// reconstructed, non-associative `Avg` — lets a coarser resolution correctly
-    /// fold a finer resolution's segments (Phase 3 step 2) and preserves exact
-    /// cross-version/cross-segment merge semantics. Output columns are rebuilt at read
-    /// time by [`reconstruct_sql`]. Bounds behave exactly as in [`merge_sql`].
-    ///
-    /// `in_bucket_col` is the input table's bucket-timestamp column: `time_bucket`
-    /// when folding the shared finest partials (finest resolution), or the output
-    /// timestamp column (`ts`) when folding a finer resolution's segments+hot, whose
-    /// stored bucket column is that `ts`. Both are TIMESTAMP-typed and already
-    /// aligned to the finer interval, so `date_bin` re-buckets them exactly into
-    /// the coarser output interval (nesting guarantees no split).
-    fn merge_partials_sql(
+    /// Reconstruct user-visible aggregates from stored mergeable partials.
+    fn reconstruct_frame(
         &self,
-        output_interval: Duration,
+        frame: datafusion::dataframe::DataFrame,
         ts: &str,
-        partials_table: &str,
-        in_bucket_col: &str,
-        lower_bound: Option<i64>,
-        upper_bound: Option<i64>,
-    ) -> String {
-        let interval = duration_to_sql_interval(output_interval);
-        let bin = date_bin_expr(&interval, in_bucket_col);
-        let mut preds: Vec<String> = Vec::new();
-        if let Some(lo) = lower_bound {
-            preds.push(format!("CAST(EXTRACT(EPOCH FROM {bin}) AS BIGINT) >= {lo}"));
-        }
-        if let Some(hi) = upper_bound {
-            preds.push(format!("CAST(EXTRACT(EPOCH FROM {bin}) AS BIGINT) < {hi}"));
-        }
-        let where_clause = if preds.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", preds.join(" AND "))
-        };
-        format!(
-            r#"
-        WITH merged AS (
-          SELECT 
-            {bin} AS time_bucket,
-            {merge_exprs}
-          FROM {partials_table}
-          {where_clause}
-          GROUP BY {bin}
-        )
-        SELECT 
-          COALESCE(CAST(time_bucket AS TIMESTAMP), CAST(0 AS TIMESTAMP)) AS {ts},
-          {partial_cols}
-        FROM merged
-        ORDER BY time_bucket
-        "#,
-            merge_exprs = self.merge_partial_exprs().join(",\n            "),
-            partial_cols = self.partial_column_list(),
-        )
+    ) -> datafusion::error::Result<datafusion::dataframe::DataFrame> {
+        let mut projection = vec![col(Column::from_name(ts))];
+        projection.extend(self.reconstruction_expressions());
+        frame.select(projection)
     }
 
-    /// Read-time reconstruction over a table of stored partials: reproduce the
-    /// output columns (identical names, order, and values to [`merge_sql`]'s
-    /// projection, including `Avg = Sum / Count`) from the merged partial columns
-    /// written by [`merge_partials_sql`]. `partials_table` is the registered
-    /// listing table over the segments + hot file; `ts` passes the timestamp
-    /// column through unchanged so the scan's declared ordering (the streaming
-    /// read path) is preserved.
-    fn reconstruct_sql(&self, ts: &str, partials_table: &str) -> String {
-        format!(
-            r#"
-        SELECT 
-          "{ts}",
-          {select_exprs}
-        FROM {partials_table}
-        "#,
-            select_exprs = self.reconstruct_exprs.join(",\n          "),
-        )
+    fn reconstruct_bucketed_frame(
+        &self,
+        frame: datafusion::dataframe::DataFrame,
+        ts: &str,
+    ) -> datafusion::error::Result<datafusion::dataframe::DataFrame> {
+        let mut projection = vec![
+            coalesce(vec![
+                cast(
+                    col(Column::from_name("time_bucket")),
+                    arrow::datatypes::DataType::Timestamp(
+                        arrow::datatypes::TimeUnit::Microsecond,
+                        None,
+                    ),
+                ),
+                lit(datafusion::common::ScalarValue::TimestampMicrosecond(
+                    Some(0),
+                    None,
+                )),
+            ])
+            .alias(ts),
+        ];
+        projection.extend(self.reconstruction_expressions());
+        frame
+            .select(projection)?
+            .sort(vec![col(Column::from_name(ts)).sort(true, true)])
+    }
+
+    fn reconstruction_expressions(&self) -> Vec<datafusion::logical_expr::Expr> {
+        self.reconstructions
+            .iter()
+            .map(|reconstruction| match reconstruction {
+                Reconstruction::Direct { partial, output } => {
+                    col(Column::from_name(partial)).alias(output)
+                }
+                Reconstruction::Average { sum, count, output } => (cast(
+                    col(Column::from_name(sum)),
+                    arrow::datatypes::DataType::Float64,
+                ) / cast(
+                    nullif(col(Column::from_name(count)), lit(0_i64)),
+                    arrow::datatypes::DataType::Float64,
+                ))
+                .alias(output),
+            })
+            .collect()
     }
 }
 pub struct TemporalReduceDirectory {
@@ -2543,6 +3233,19 @@ impl Directory for TemporalReduceDirectory {
             );
 
             return Ok(Some(node_ref));
+        }
+
+        if sites.is_empty()
+            && !self.config.out_pattern.contains('$')
+            && name == self.config.out_pattern
+        {
+            let root = self.context.root().await?;
+            return Ok(Some(self.create_site_directory_node(
+                name.to_owned(),
+                self.config.in_pattern.path().to_owned(),
+                root.node_path().node,
+                self.config.in_pattern.to_string(),
+            )));
         }
 
         Ok(None)
@@ -2787,6 +3490,30 @@ fn create_temporal_reduce_directory(
     Ok(directory.create_handle())
 }
 
+fn create_temporal_reduce_series_handle(
+    config: Value,
+    context: crate::FactoryContext,
+) -> TinyFSResult<tinyfs::FileHandle> {
+    let series_config: TemporalReduceSeriesConfig = crate::factory::config_util::config_from_value(
+        config,
+        "Invalid temporal-reduce-series config",
+    )?;
+    let duration = humantime::parse_duration(&series_config.resolution)
+        .map_other_context("Invalid temporal-reduce-series resolution")?;
+    let source_path = series_config.in_pattern.path().to_owned();
+    let pattern_url = series_config.in_pattern.to_string();
+    let file = TemporalReduceSqlFile::new_direct(
+        series_config.into_temporal_config(),
+        duration,
+        source_path,
+        pattern_url,
+        context,
+    );
+    Ok(tinyfs::FileHandle::new(Arc::new(tokio::sync::Mutex::new(
+        Box::new(file),
+    ))))
+}
+
 /// Validate temporal reduce configuration
 fn validate_temporal_reduce_config(config: &[u8]) -> TinyFSResult<Value> {
     let (config_value, temporal_config) = crate::factory::config_util::parse_yaml_config::<
@@ -2804,12 +3531,59 @@ fn validate_temporal_reduce_config(config: &[u8]) -> TinyFSResult<Value> {
     Ok(config_value)
 }
 
+fn validate_temporal_reduce_series_config(config: &[u8]) -> TinyFSResult<Value> {
+    let (config_value, series_config) = crate::factory::config_util::parse_yaml_config::<
+        TemporalReduceSeriesConfig,
+    >(config, "Invalid temporal-reduce-series config")?;
+    if series_config.in_pattern.path().contains(['*', '?']) {
+        return Err(tinyfs::Error::Other(
+            "temporal-reduce-series requires one exact logical source URL".to_owned(),
+        ));
+    }
+    if series_config.aggregations.is_empty() {
+        return Err(tinyfs::Error::Other(
+            "temporal-reduce-series requires at least one aggregation".to_owned(),
+        ));
+    }
+    _ = parse_nesting_resolutions(std::slice::from_ref(&series_config.resolution))?;
+    let temporal_config = series_config.into_temporal_config();
+    _ = temporal_config.allowed_lateness_secs()?;
+    if let Some(aliases) = &temporal_config.output_aliases {
+        let mut outputs = std::collections::HashSet::new();
+        for (source, output) in aliases {
+            if source.is_empty() || output.is_empty() {
+                return Err(tinyfs::Error::Other(
+                    "temporal-reduce-series output aliases must not be empty".to_owned(),
+                ));
+            }
+            if !outputs.insert(output) {
+                return Err(tinyfs::Error::Other(format!(
+                    "duplicate temporal-reduce-series output alias '{output}'"
+                )));
+            }
+            if output == &temporal_config.time_column {
+                return Err(tinyfs::Error::Other(format!(
+                    "temporal-reduce-series output alias '{output}' conflicts with the time column"
+                )));
+            }
+        }
+    }
+    Ok(config_value)
+}
+
 // Register the temporal-reduce factory
 register_dynamic_factory!(
     name: "temporal-reduce",
     description: "Create temporal downsampling views with configurable resolutions and aggregations",
     directory: create_temporal_reduce_directory,
     validate: validate_temporal_reduce_config
+);
+
+register_dynamic_factory!(
+    name: "temporal-reduce-series",
+    description: "Create one directly addressable incrementally reduced time series",
+    file: create_temporal_reduce_series_handle,
+    validate: validate_temporal_reduce_series_config
 );
 
 /// Content identity of one live source version: its blake3, qualified by node so
@@ -3110,6 +3884,7 @@ mod tests {
             time_column: "timestamp".to_string(),
             resolutions: vec!["1d".to_string()],
             aggregations,
+            output_aliases: None,
             transforms: None,
             allowed_lateness: None,
             // Seal on every advance, as before the size gate existed: these
@@ -3148,10 +3923,201 @@ mod tests {
         );
     }
 
+    #[test]
+    fn output_aliases_are_validated_and_participate_in_cache_identity() {
+        let mut cfg = cfg_with_aggs(vec![
+            agg(AggregationType::Sum, &["usage_gpm"]),
+            agg(AggregationType::Sum, &["pump_minutes"]),
+        ]);
+        cfg.output_aliases = Some(HashMap::from([
+            ("pump_minutes.sum".to_owned(), "pump_minutes".to_owned()),
+            ("usage_gpm.sum".to_owned(), "gallons".to_owned()),
+        ]));
+
+        let pieces = AggSqlPieces::build(&cfg).unwrap();
+        assert_eq!(
+            pieces
+                .reconstructions
+                .iter()
+                .map(Reconstruction::sql_expr)
+                .collect::<Vec<_>>(),
+            vec![
+                "\"__p_sum_0\" AS \"gallons\"",
+                "\"__p_sum_1\" AS \"pump_minutes\"",
+            ]
+        );
+        assert!(
+            partial_aggregate_cfg_canonical(
+                &cfg,
+                Duration::from_secs(86400),
+                "series:///usage/rate"
+            )
+            .ends_with("alias=pump_minutes.sum:pump_minutes;alias=usage_gpm.sum:gallons;")
+        );
+
+        cfg.output_aliases = Some(HashMap::from([(
+            "missing.sum".to_owned(),
+            "gallons".to_owned(),
+        )]));
+        assert!(
+            AggSqlPieces::build(&cfg)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("unknown aggregate 'missing.sum'")
+        );
+
+        cfg.output_aliases = Some(HashMap::from([
+            ("pump_minutes.sum".to_owned(), "value".to_owned()),
+            ("usage_gpm.sum".to_owned(), "value".to_owned()),
+        ]));
+        assert!(
+            AggSqlPieces::build(&cfg)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("duplicate temporal-reduce output column 'value'")
+        );
+    }
+
     fn lowering_context() -> crate::FactoryContext {
         // generate_temporal_sql does not read the context; any valid one works.
         let provider_context = crate::factory::test_support::create_provider_context();
         test_context(&provider_context, FileID::root())
+    }
+
+    #[tokio::test]
+    async fn lineage_schema_cache_requires_exact_physical_lineage() {
+        let (fs, provider_context) = create_test_environment().await;
+        let root_node = fs.root().await.unwrap().node_path().node;
+        let context = test_context(&provider_context, FileID::root());
+        let config = cfg_with_aggs(vec![AggregationConfig {
+            agg_type: AggregationType::Avg,
+            columns: None,
+        }]);
+        let file = TemporalReduceSqlFile::new(
+            config.clone(),
+            Duration::from_secs(3600),
+            root_node.clone(),
+            "/sources/site.series".to_owned(),
+            "series:///sources/site.series".to_owned(),
+            context.clone(),
+        );
+        *file.discovered_columns.lock().await =
+            Some(vec!["temperature".to_owned(), "salinity".to_owned()]);
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let lineage = tinyfs::QueryLineage {
+            recipe_identity: "pivot-recipe".to_owned(),
+            leaves: vec![tinyfs::QuerySourceLeaf {
+                identity: "source:content-a".to_owned(),
+                min_event_time: Some(10),
+                max_event_time: Some(20),
+            }],
+        };
+        let path = file.lineage_schema_cache_path(cache_dir.path(), &lineage);
+        file.write_lineage_schema_cache(&path, &lineage)
+            .await
+            .unwrap();
+
+        let restored = TemporalReduceSqlFile::new(
+            config.clone(),
+            Duration::from_secs(3600),
+            root_node.clone(),
+            "/sources/site.series".to_owned(),
+            "series:///sources/site.series".to_owned(),
+            context.clone(),
+        );
+        assert!(
+            restored
+                .load_lineage_schema_cache(&path, &lineage)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            *restored.discovered_columns.lock().await,
+            Some(vec!["temperature".to_owned(), "salinity".to_owned()])
+        );
+
+        let changed = tinyfs::QueryLineage {
+            recipe_identity: lineage.recipe_identity.clone(),
+            leaves: vec![tinyfs::QuerySourceLeaf {
+                identity: "source:content-b".to_owned(),
+                min_event_time: Some(21),
+                max_event_time: Some(30),
+            }],
+        };
+        let stale = TemporalReduceSqlFile::new(
+            config,
+            Duration::from_secs(3600),
+            root_node,
+            "/sources/site.series".to_owned(),
+            "series:///sources/site.series".to_owned(),
+            context,
+        );
+        assert!(
+            !stale
+                .load_lineage_schema_cache(&path, &changed)
+                .await
+                .unwrap()
+        );
+        assert!(stale.discovered_columns.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_source_with_explicit_columns_preserves_output_schema() {
+        let (fs, provider_context) = create_test_environment().await;
+        let root_node = fs.root().await.unwrap().node_path().node;
+        let config = TemporalReduceConfig {
+            in_pattern: crate::Url::parse("series:///missing/*.series").unwrap(),
+            out_pattern: "data".to_owned(),
+            time_column: "timestamp".to_owned(),
+            resolutions: vec!["1h".to_owned()],
+            aggregations: vec![
+                agg(AggregationType::Avg, &["temperature"]),
+                agg(AggregationType::Min, &["temperature"]),
+                agg(AggregationType::Max, &["temperature"]),
+            ],
+            output_aliases: None,
+            transforms: None,
+            allowed_lateness: None,
+            seal_target_bytes: None,
+            max_live_segments: None,
+        };
+        let file = TemporalReduceSqlFile::new(
+            config,
+            Duration::from_secs(3600),
+            root_node,
+            "/missing/source.series".to_owned(),
+            "series:///missing/*.series".to_owned(),
+            test_context(&provider_context, FileID::root()),
+        );
+        let provider =
+            tinyfs::QueryableFile::as_table_provider(&file, FileID::root(), &provider_context)
+                .await
+                .unwrap();
+        assert_eq!(
+            provider
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "timestamp",
+                "temperature.avg",
+                "temperature.min",
+                "temperature.max"
+            ]
+        );
+        let batches = provider_context
+            .datafusion_session
+            .read_table(provider)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
     }
 
     /// Phase 1: Avg must be lowered to decomposable Sum/Count partials and
@@ -3546,6 +4512,7 @@ mod tests {
                         columns: Some(vec!["temperature".to_string()]),
                     },
                 ],
+                output_aliases: None,
                 transforms: None,
                 allowed_lateness: None,
                 // Seal on every advance, as before the size gate existed: these
@@ -3729,6 +4696,129 @@ mod tests {
         let factory = factory.unwrap();
         assert_eq!(factory.name, "temporal-reduce");
         assert!(factory.description.contains("temporal downsampling"));
+
+        let direct = FactoryRegistry::get_factory("temporal-reduce-series").unwrap();
+        assert!(direct.create_file.is_some());
+        assert!(direct.create_directory.is_none());
+    }
+
+    #[test]
+    fn direct_series_config_rejects_ambiguous_sources_and_aliases() {
+        let valid = br#"
+in_pattern: series:///usage/rate
+time_column: timestamp
+resolution: 1d
+aggregations:
+  - type: sum
+    columns: [usage_gpm, pump_minutes]
+output_aliases:
+  usage_gpm.sum: gallons
+  pump_minutes.sum: pump_minutes
+"#;
+        _ = FactoryRegistry::validate_config("temporal-reduce-series", valid).unwrap();
+
+        let wildcard = std::str::from_utf8(valid)
+            .unwrap()
+            .replace("series:///usage/rate", "series:///usage/*");
+        assert!(
+            FactoryRegistry::validate_config("temporal-reduce-series", wildcard.as_bytes())
+                .unwrap_err()
+                .to_string()
+                .contains("one exact logical source URL")
+        );
+
+        let duplicate = std::str::from_utf8(valid).unwrap().replace(
+            "pump_minutes.sum: pump_minutes",
+            "pump_minutes.sum: gallons",
+        );
+        assert!(
+            FactoryRegistry::validate_config("temporal-reduce-series", duplicate.as_bytes())
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate temporal-reduce-series output alias 'gallons'")
+        );
+
+        let time_collision = std::str::from_utf8(valid)
+            .unwrap()
+            .replace("usage_gpm.sum: gallons", "usage_gpm.sum: timestamp");
+        assert!(
+            FactoryRegistry::validate_config("temporal-reduce-series", time_collision.as_bytes())
+                .unwrap_err()
+                .to_string()
+                .contains("conflicts with the time column")
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_series_factory_preserves_public_output_schema() {
+        let (fs, provider_context) = create_test_environment().await;
+        let root = fs.root().await.unwrap();
+        _ = root.create_dir_path("/ingest").await.unwrap();
+        use tokio::io::AsyncWriteExt;
+        let mut writer = root
+            .async_writer_path_with_type("/ingest/usage.csv", EntryType::FilePhysicalVersion)
+            .await
+            .unwrap();
+        writer
+            .write_all(
+                b"timestamp,usage_gpm,pump_minutes\n\
+                  1970-01-01T00:00:00,2.0,1\n\
+                  1970-01-01T00:01:00,3.0,1\n",
+            )
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+
+        let config = br#"
+in_pattern: csv:///ingest/usage.csv
+time_column: timestamp
+resolution: 1d
+aggregations:
+  - type: sum
+    columns: [usage_gpm, pump_minutes]
+output_aliases:
+  usage_gpm.sum: gallons
+  pump_minutes.sum: pump_minutes
+"#;
+        let handle = FactoryRegistry::create_file(
+            "temporal-reduce-series",
+            config,
+            test_context(&provider_context, FileID::root()),
+        )
+        .await
+        .unwrap();
+        let file = handle.get_file().await;
+        let guard = file.lock().await;
+        let provider = guard
+            .as_queryable()
+            .unwrap()
+            .as_table_provider(FileID::root(), &provider_context)
+            .await
+            .unwrap();
+        assert_eq!(
+            provider
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["timestamp", "gallons", "pump_minutes"]
+        );
+        let batches = provider_context
+            .datafusion_session
+            .read_table(provider)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let gallons = batches[0]
+            .column_by_name("gallons")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(gallons.value(0), 5.0);
     }
 
     /// Test that source_url() preserves the URL scheme from in_pattern.
@@ -3760,6 +4850,7 @@ mod tests {
                 time_column: "timestamp".to_string(),
                 resolutions: vec!["1h".to_string()],
                 aggregations: vec![],
+                output_aliases: None,
                 transforms: None,
                 allowed_lateness: None,
                 // Seal on every advance, as before the size gate existed: these
@@ -3894,6 +4985,7 @@ mod tests {
                         columns: Some(vec!["temperature".to_string()]),
                     },
                 ],
+                output_aliases: None,
                 transforms: None,
                 allowed_lateness: None,
                 // Seal on every advance, as before the size gate existed: these
@@ -4058,6 +5150,7 @@ mod tests {
                 agg(AggregationType::Min, &["temperature"]),
                 agg(AggregationType::Max, &["temperature"]),
             ],
+            output_aliases: None,
             transforms: None,
             allowed_lateness: None,
             // Seal on every advance, as before the size gate existed: these
@@ -4110,6 +5203,20 @@ mod tests {
 
             let ctx = &provider_context.datafusion_session;
             _ = ctx.register_table("reduced", table_provider).unwrap();
+            let plan = ctx
+                .table("reduced")
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap();
+            let plan = datafusion::physical_plan::displayable(plan.as_ref())
+                .indent(true)
+                .to_string();
+            assert!(
+                !plan.contains("MemoryExec"),
+                "temporal-reduce must preserve its source scan without materialization:\n{plan}"
+            );
             let batches = ctx
                 .sql("SELECT \"temperature.avg\", \"humidity.avg\", \"temperature.min\", \"temperature.max\" FROM reduced ORDER BY timestamp")
                 .await
@@ -4182,6 +5289,16 @@ mod tests {
         // Single-pass path (no cache) for the same config.
         let nocache_ctx = make_ctx(None);
         let single_rows = collect_daily(&fs, &nocache_ctx, config()).await;
+        assert_eq!(
+            cache_ctx.plan_visibility_metrics().non_incremental_plans,
+            0,
+            "incremental rollup must not be classified as a fallback"
+        );
+        assert_eq!(
+            nocache_ctx.plan_visibility_metrics().non_incremental_plans,
+            1,
+            "cacheless temporal reduction must be visible in metrics"
+        );
 
         assert_eq!(rollup_rows.len(), 2, "two daily rows");
         assert_eq!(
@@ -4270,6 +5387,7 @@ mod tests {
                 agg(AggregationType::Min, &["temperature"]),
                 agg(AggregationType::Max, &["temperature"]),
             ],
+            output_aliases: None,
             transforms: None,
             allowed_lateness: None,
             // Seal on every advance, as before the size gate existed: these
@@ -4453,6 +5571,7 @@ mod tests {
             time_column: "timestamp".to_string(),
             resolutions: vec!["1h".to_string(), "6h".to_string(), "1d".to_string()],
             aggregations: vec![agg(AggregationType::Max, &["temperature"])],
+            output_aliases: None,
             transforms: None,
             allowed_lateness: Some("1d".to_string()),
             // Seal on every advance, as before the size gate existed: these
@@ -4745,6 +5864,7 @@ mod tests {
             time_column: "timestamp".to_string(),
             resolutions: vec!["1d".to_string()],
             aggregations: vec![agg(AggregationType::Avg, &["temperature"])],
+            output_aliases: None,
             transforms: None,
             allowed_lateness: None,
             // Seal on every advance, as before the size gate existed: these
@@ -4847,6 +5967,7 @@ mod tests {
                 agg(AggregationType::Min, &["temperature"]),
                 agg(AggregationType::Max, &["temperature"]),
             ],
+            output_aliases: None,
             transforms: None,
             allowed_lateness: None,
             // Seal on every advance, as before the size gate existed: these
@@ -4983,6 +6104,7 @@ mod tests {
                 agg(AggregationType::Min, &["temperature"]),
                 agg(AggregationType::Max, &["temperature"]),
             ],
+            output_aliases: None,
             transforms: None,
             allowed_lateness: None,
             // Seal on every advance, as before the size gate existed: these
@@ -5067,10 +6189,13 @@ mod tests {
         let (rows1, hint1) = collect_daily(&make_ctx(Some(cache_dir.clone())), config()).await;
         assert_eq!(rows1.len(), 1, "one daily bucket after build 1");
         assert!(approx(rows1[0].0, 232.0), "day2 avg wrong: {:?}", rows1);
-        // First build is a cache miss: the hint carries a digest but no
-        // changed_since watermark, so the export does a full deterministic write.
+        // First build is a cache miss, so the export does a full deterministic write.
         let hint1 = hint1.expect("build 1 publishes an export hint");
-        assert!(hint1.changed_since.is_none(), "build 1 is a full rebuild");
+        assert_eq!(
+            hint1.change,
+            tinyfs::ExportChange::Everything,
+            "build 1 is a full rebuild"
+        );
 
         // Build 2 (APPEND): add day 3 -> splice cached day2 prefix + fresh day3.
         {
@@ -5089,24 +6214,23 @@ mod tests {
             "append splice values wrong: {:?}",
             rows2
         );
-        // Append splice changes buckets from day 3 onward, so the hint reports a
-        // changed_since watermark at day 3 (epoch seconds) and a new digest.
+        // Append splice changes buckets from day 3 onward and publishes a new digest.
         let hint2 = hint2.expect("build 2 publishes an export hint");
         assert_ne!(
             hint1.digest, hint2.digest,
             "append changes the merged digest"
         );
-        // `changed_since` is derived from the event-time range tlogfs records on
+        // The bounded change is derived from the event-time range tlogfs records on
         // each source version. MemoryPersistence records none, so every version
         // reports an unknown range and the dirty range is the whole axis -- the
         // export rewrites everything. Correct, merely unoptimized; `dirty_lo_us`
         // is unit-tested directly on known ranges. What matters here is that the
         // unknown case degrades to MORE work, never to stale output.
         assert!(
-            hint2.changed_since.is_none(),
+            hint2.change == tinyfs::ExportChange::Everything,
             "sources with no recorded event range must widen the dirty range, \
              not narrow it: {:?}",
-            hint2.changed_since
+            hint2.change
         );
 
         // Build 3 (BACKFILL): add day 1, older than everything already built and
@@ -5174,6 +6298,7 @@ mod tests {
             time_column: "timestamp".to_string(),
             resolutions: vec!["1h".to_string(), "1d".to_string()],
             aggregations: vec![agg(AggregationType::Max, &["temperature"])],
+            output_aliases: None,
             transforms: None,
             allowed_lateness: None,
             // Seal on every advance, as before the size gate existed: these
@@ -5346,6 +6471,7 @@ mod tests {
                 agg(AggregationType::Max, &["temperature"]),
                 agg(AggregationType::Sum, &["temperature"]),
             ],
+            output_aliases: None,
             transforms: None,
             allowed_lateness: lateness.map(str::to_string),
             // Seal on every advance, as before the size gate existed: these
@@ -5664,6 +6790,7 @@ mod tests {
             time_column: "timestamp".to_string(),
             resolutions: vec!["1d".to_string()],
             aggregations: vec![agg(AggregationType::Avg, &["temperature"])],
+            output_aliases: None,
             transforms: None,
             allowed_lateness: Some("1d".to_string()),
             // Seal on every advance, as before the size gate existed: these
@@ -6463,6 +7590,10 @@ mod tests {
         assert!(
             !plan_str.contains("SortExec"),
             "full-history ORDER BY must NOT buffer via a global SortExec; plan was:\n{plan_str}"
+        );
+        assert!(
+            !plan_str.contains("MemoryExec"),
+            "typed reconstruction must retain the bounded file scan instead of materializing; plan was:\n{plan_str}"
         );
         // The ORDER BY must be satisfied by streaming: either a k-way
         // `SortPreservingMergeExec` across per-file partitions, or directly by the

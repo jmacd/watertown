@@ -12,8 +12,13 @@ use crate::{FileID, PersistenceLayer};
 use datafusion::execution::context::SessionContext;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 type CachedTableProvider = (Option<u64>, Arc<dyn datafusion::catalog::TableProvider>);
+
+pub type QueryLineageCache = Arc<
+    std::sync::Mutex<std::collections::HashMap<String, (Option<u64>, Option<crate::QueryLineage>)>>,
+>;
 
 /// Result type for tinyfs context operations
 pub type Result<T> = std::result::Result<T, crate::Error>;
@@ -22,16 +27,61 @@ pub type Result<T> = std::result::Result<T, crate::Error>;
 /// table provider, consumed by the sitegen export layer to skip rewriting
 /// unchanged output partitions.
 ///
-/// `digest` identifies the current merged output content. When it equals the
-/// digest recorded in the seed manifest, the entire series output is unchanged
-/// and every partition file can be reused. `changed_since` bounds which output
-/// buckets changed when the digest differs: buckets with a timestamp strictly
-/// below it are unchanged, so their partitions can be reused. `None` means the
-/// output was fully rebuilt and every partition must be rewritten.
+/// `digest` identifies the current merged output recipe. When it equals the
+/// digest recorded in the seed manifest, every partition file can be reused.
+/// `change` distinguishes a recipe-only change from a bounded output change and
+/// a full rebuild, so unrelated wildcard members do not force a source scan.
 #[derive(Clone, Debug)]
 pub struct ExportHint {
     pub digest: String,
-    pub changed_since: Option<i64>,
+    pub change: ExportChange,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExportChange {
+    Unchanged,
+    Since(i64),
+    Everything,
+}
+
+/// Visible counts of fallback plans and dynamic-source executions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PlanVisibilityMetricsSnapshot {
+    pub global_plans: u64,
+    pub non_incremental_plans: u64,
+    pub dynamic_source_executions: u64,
+    pub bounded_dynamic_source_executions: u64,
+    pub minimum_dynamic_event_time_lo: Option<i64>,
+    pub export_source_executions: u64,
+    pub export_partitions_reused: u64,
+    pub export_partitions_written: u64,
+}
+
+#[derive(Debug)]
+struct PlanVisibilityMetrics {
+    global_plans: AtomicU64,
+    non_incremental_plans: AtomicU64,
+    dynamic_source_executions: AtomicU64,
+    bounded_dynamic_source_executions: AtomicU64,
+    minimum_dynamic_event_time_lo: AtomicI64,
+    export_source_executions: AtomicU64,
+    export_partitions_reused: AtomicU64,
+    export_partitions_written: AtomicU64,
+}
+
+impl Default for PlanVisibilityMetrics {
+    fn default() -> Self {
+        Self {
+            global_plans: AtomicU64::new(0),
+            non_incremental_plans: AtomicU64::new(0),
+            dynamic_source_executions: AtomicU64::new(0),
+            bounded_dynamic_source_executions: AtomicU64::new(0),
+            minimum_dynamic_event_time_lo: AtomicI64::new(i64::MAX),
+            export_source_executions: AtomicU64::new(0),
+            export_partitions_reused: AtomicU64::new(0),
+            export_partitions_written: AtomicU64::new(0),
+        }
+    }
 }
 
 /// Provider context - holds tinyfs Persistence for transaction management
@@ -51,6 +101,8 @@ pub struct ProviderContext {
     pub table_provider_cache:
         Arc<std::sync::Mutex<std::collections::HashMap<String, CachedTableProvider>>>,
 
+    query_lineage_cache: QueryLineageCache,
+
     /// TinyFS persistence layer for transaction management
     pub persistence: Arc<dyn PersistenceLayer>,
 
@@ -67,6 +119,8 @@ pub struct ProviderContext {
     /// export layer reads these immediately after obtaining the table provider
     /// to decide which output partitions are unchanged.
     pub export_hints: Arc<std::sync::Mutex<std::collections::HashMap<String, ExportHint>>>,
+
+    plan_visibility_metrics: Arc<PlanVisibilityMetrics>,
 }
 
 impl ProviderContext {
@@ -78,10 +132,12 @@ impl ProviderContext {
         Self {
             datafusion_session,
             table_provider_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            query_lineage_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             persistence,
             cache_dir: None,
             pond_path: None,
             export_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            plan_visibility_metrics: Arc::new(PlanVisibilityMetrics::default()),
         }
     }
 
@@ -96,6 +152,12 @@ impl ProviderContext {
     #[must_use]
     pub fn with_pond_path(mut self, pond_path: PathBuf) -> Self {
         self.pond_path = Some(pond_path);
+        self
+    }
+
+    #[must_use]
+    pub fn with_query_lineage_cache(mut self, cache: QueryLineageCache) -> Self {
+        self.query_lineage_cache = cache;
         self
     }
 
@@ -161,6 +223,45 @@ impl ProviderContext {
         Ok(())
     }
 
+    #[must_use]
+    pub fn get_query_lineage_cache(&self, key: &str) -> Option<Option<crate::QueryLineage>> {
+        let generation = match self.persistence.coherence_state() {
+            Some(state) => {
+                state.ensure_open().ok()?;
+                Some(state.generation())
+            }
+            None => None,
+        };
+        let mut cache = self.query_lineage_cache.lock().ok()?;
+        let (cached_generation, lineage) = cache.get(key)?;
+        if *cached_generation == generation {
+            Some(lineage.clone())
+        } else {
+            _ = cache.remove(key);
+            None
+        }
+    }
+
+    pub fn set_query_lineage_cache(
+        &self,
+        key: String,
+        lineage: Option<crate::QueryLineage>,
+    ) -> Result<()> {
+        let generation = match self.persistence.coherence_state() {
+            Some(state) => {
+                state.ensure_open()?;
+                Some(state.generation())
+            }
+            None => None,
+        };
+        _ = self
+            .query_lineage_cache
+            .lock()
+            .map_other_context("query lineage cache mutex poisoned")?
+            .insert(key, (generation, lineage));
+        Ok(())
+    }
+
     /// Publish an export hint for a node, keyed by its `FileID` string.
     pub fn set_export_hint(&self, id: &FileID, hint: ExportHint) -> Result<()> {
         _ = self
@@ -175,6 +276,104 @@ impl ProviderContext {
     #[must_use]
     pub fn get_export_hint(&self, id: &FileID) -> Option<ExportHint> {
         self.export_hints.lock().ok()?.get(&id.to_string()).cloned()
+    }
+
+    /// Record one intentionally global plan.
+    pub fn record_global_plan(&self) {
+        _ = self
+            .plan_visibility_metrics
+            .global_plans
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one execution that cannot reuse bounded incremental state.
+    pub fn record_non_incremental_plan(&self) {
+        _ = self
+            .plan_visibility_metrics
+            .non_incremental_plans
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one recursive dynamic-source execution and its optional lower bound.
+    pub fn record_dynamic_source_execution(&self, event_time_lo: Option<i64>) {
+        _ = self
+            .plan_visibility_metrics
+            .dynamic_source_executions
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(event_time_lo) = event_time_lo {
+            _ = self
+                .plan_visibility_metrics
+                .bounded_dynamic_source_executions
+                .fetch_add(1, Ordering::Relaxed);
+            _ = self
+                .plan_visibility_metrics
+                .minimum_dynamic_event_time_lo
+                .fetch_min(event_time_lo, Ordering::Relaxed);
+        }
+    }
+
+    /// Record export work after one source completes.
+    pub fn record_export_outcome(
+        &self,
+        source_executions: u64,
+        partitions_reused: usize,
+        partitions_written: usize,
+    ) {
+        _ = self
+            .plan_visibility_metrics
+            .export_source_executions
+            .fetch_add(source_executions, Ordering::Relaxed);
+        _ = self
+            .plan_visibility_metrics
+            .export_partitions_reused
+            .fetch_add(partitions_reused as u64, Ordering::Relaxed);
+        _ = self
+            .plan_visibility_metrics
+            .export_partitions_written
+            .fetch_add(partitions_written as u64, Ordering::Relaxed);
+    }
+
+    /// Snapshot fallback decisions and dynamic-source execution bounds.
+    #[must_use]
+    pub fn plan_visibility_metrics(&self) -> PlanVisibilityMetricsSnapshot {
+        PlanVisibilityMetricsSnapshot {
+            global_plans: self
+                .plan_visibility_metrics
+                .global_plans
+                .load(Ordering::Relaxed),
+            non_incremental_plans: self
+                .plan_visibility_metrics
+                .non_incremental_plans
+                .load(Ordering::Relaxed),
+            dynamic_source_executions: self
+                .plan_visibility_metrics
+                .dynamic_source_executions
+                .load(Ordering::Relaxed),
+            bounded_dynamic_source_executions: self
+                .plan_visibility_metrics
+                .bounded_dynamic_source_executions
+                .load(Ordering::Relaxed),
+            minimum_dynamic_event_time_lo: match self
+                .plan_visibility_metrics
+                .minimum_dynamic_event_time_lo
+                .load(Ordering::Relaxed)
+            {
+                i64::MAX => None,
+                value => Some(value),
+            },
+            export_source_executions: self
+                .plan_visibility_metrics
+                .export_source_executions
+                .load(Ordering::Relaxed),
+            export_partitions_reused: self
+                .plan_visibility_metrics
+                .export_partitions_reused
+                .load(Ordering::Relaxed),
+            export_partitions_written: self
+                .plan_visibility_metrics
+                .export_partitions_written
+                .load(Ordering::Relaxed),
+        }
     }
 
     /// Create a filesystem from the persistence layer
@@ -426,6 +625,26 @@ mod tests {
         let root = fs.root().await.expect("Should get root");
 
         assert_eq!(root.node_path().path, PathBuf::from("/"));
+    }
+
+    #[test]
+    fn query_lineage_cache_is_shared_across_provider_contexts() {
+        let persistence: Arc<dyn crate::PersistenceLayer> = Arc::new(MemoryPersistence::default());
+        let cache: super::QueryLineageCache = Default::default();
+        let first = ProviderContext::new(Arc::new(SessionContext::new()), Arc::clone(&persistence))
+            .with_query_lineage_cache(cache.clone());
+        let _guard = first.begin_transaction().expect("begin transaction");
+        let lineage = crate::QueryLineage::new("recipe".to_owned());
+        first
+            .set_query_lineage_cache("source".to_owned(), Some(lineage.clone()))
+            .unwrap();
+
+        let second = ProviderContext::new(Arc::new(SessionContext::new()), persistence)
+            .with_query_lineage_cache(cache);
+        assert_eq!(
+            second.get_query_lineage_cache("source"),
+            Some(Some(lineage))
+        );
     }
 
     #[tokio::test]

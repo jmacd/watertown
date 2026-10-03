@@ -2,9 +2,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+mod dynamic_lineage;
 mod large_file_corruption;
 mod large_file_roundtrip;
-mod partition_cache;
+mod node_query_visibility;
 mod persistence_contract;
 
 use crate::TLogFSError;

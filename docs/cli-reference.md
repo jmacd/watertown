@@ -1347,6 +1347,8 @@ config:
 **Behaviour:**
 
 - At least **two inputs** are required (use `sql-derived-series` for one).
+- Join and same-scope combine are typed DataFusion logical plans, not generated
+  SQL.
 - The result is ordered by the time column.
 - Where one input has data and another does not, the missing columns are
   `NULL` (FULL OUTER JOIN semantics).
@@ -1431,8 +1433,7 @@ config:
 - The pattern `series:///combined/*` matching `/combined/Silver` and
   `/combined/BDock` produces columns like:
   `timestamp`, `Silver.AT500_Surface.DO.mg/L`, `BDock.AT500_Surface.DO.mg/L`, …
-- Uses LEFT JOIN on the time column (not FULL OUTER JOIN), from a CTE
-  of all unique timestamps across all inputs.
+- Uses a typed timestamp-spine plan followed by LEFT JOINs for each input.
 - Columns that don't exist in a particular input are `NULL`-padded
   (Float64) via the `null_padding` transform.
 - The node reports `EntryType::TableDynamic`.
@@ -1514,7 +1515,11 @@ config:
 | `time_column` | yes | Name of the timestamp column in the source. |
 | `resolutions` | yes | List of time bucket sizes. Parsed with humantime: `"1h"`, `"6h"`, `"1d"`, `"30m"`, etc. |
 | `aggregations` | yes | List of aggregation operations (see below). |
+| `output_aliases` | no | Map default `<column>.<aggregate>` names to stable public names. |
 | `transforms` | no | List of paths to table-transform factories applied to each input before aggregation. |
+| `allowed_lateness` | no | Width of the unsealed repair window; defaults to one day. |
+| `seal_target_bytes` | no | Minimum frozen partial bytes to accumulate before sealing a segment. |
+| `max_live_segments` | no | Segment-count compaction backstop. |
 
 **Aggregation operations:**
 
@@ -1528,17 +1533,22 @@ Output column names are `original_column.agg_type` — e.g.
 
 **Behaviour:**
 
-- Uses `DATE_TRUNC` for time bucketing, so buckets align to calendar
-  boundaries (hour 0, midnight, etc.).
+- Uses exact integer event-time buckets and typed DataFusion aggregates.
 - Source schema is discovered dynamically on first query — column names
   in `columns` are matched against actual schema at runtime.
 - Each resolution file (`res=1h.series`, etc.) is an independent
-  `TableDynamic` node backed by `SqlDerivedFile`.
+  `TableDynamic` node.
+- Recipe- and source-identified partial manifests persist across processes.
+  Exact warm hits scan no source rows; append, disorder, and supported repair
+  rebuild only the required unsealed range.
+- Sealed runs retain associative partials. Coarser resolutions fold finer
+  partials instead of rescanning raw history.
 - The directory structure is **read-only**.
 - When `in_pattern` matches multiple files mapping to the same
-  `out_pattern`, all files are joined via UNION ALL inside
-  `SqlDerivedFile`.  This supports rotating-log-file ingestion where
-  many data fragments share the same schema.
+  `out_pattern`, source registration expands and combines the exact matched
+  membership before applying the typed reduction recipe. Membership changes
+  participate in source identity. This supports rotating-log-file ingestion
+  without silently reusing stale partial state.
 
 **Caveat — schema inference:** Schema discovery reads the lexicographically
 last matching file (the newest for timestamped filenames like rotating logs).
@@ -1575,6 +1585,64 @@ pond cat /reduce/weather/res=1h.series --sql "
 # Check schema
 pond describe /reduce/weather/res=1h.series
 ```
+
+### temporal-reduce-series
+
+Creates one directly addressable incrementally reduced series rather than a
+directory of sites and resolutions. It requires one exact logical source URL
+so persistent recipe/source identity and recursive bounded lineage are
+unambiguous.
+
+```yaml
+factory: "temporal-reduce-series"
+config:
+  in_pattern: "series:///usage/well-usage-rate"
+  time_column: "timestamp"
+  resolution: "1d"
+  allowed_lateness: "14d"
+  seal_target_bytes: 0
+  aggregations:
+    - type: "sum"
+      columns: ["usage_gpm", "pump_minutes"]
+  output_aliases:
+    "usage_gpm.sum": "gallons"
+    "pump_minutes.sum": "pump_minutes"
+```
+
+`resolution`, `aggregations`, `transforms`, `allowed_lateness`,
+`seal_target_bytes`, and `max_live_segments` have the same meaning as for
+`temporal-reduce`. `output_aliases` maps default `<column>.<aggregate>` names
+to stable public column names. Wildcard sources, empty aggregate lists,
+duplicate aliases, and aliases that conflict with the time column are rejected
+at configuration time.
+
+Cold bootstrap may scan retained history and reports that decision. A
+fresh-process warm read reuses persistent state; append or repair remains
+bounded only when the exact source exposes recursive physical lineage.
+
+### pump-state-series
+
+Classifies ordered well-depth samples into `pumping`, `recovering`, and
+`static` phases with an adaptive trailing ceiling. The output schema is
+`timestamp`, `depth`, and `phase`.
+
+```yaml
+factory: "pump-state-series"
+config:
+  source: "series:///reduced/well-depth/data/res=1m.series"
+  time_column: "timestamp"
+  depth_column: "well_depth_value.avg"
+  lookback: "60m"
+  disturbance_drop: 0.3
+  valid_depth_min: 10.0
+  valid_depth_max: 60.0
+```
+
+The source must be one exact logical URL. `lookback` must be a whole number of
+minutes, and the valid-depth bounds must be finite and increasing. The factory
+streams closed episodes, retains one provisional episode, and persists recipe-
+keyed episode spans and repair boundaries. Corrupt boundary state is an error,
+not a silent full rebuild.
 
 ### sitegen
 
@@ -2279,6 +2347,8 @@ pond run 90-sitegen build ./dist            # build site (reduce is dynamic)
 | `timeseries-join` | dynamic | `pond mknod` | `TableDynamic` |
 | `timeseries-pivot` | dynamic | `pond mknod` | `TableDynamic` |
 | `temporal-reduce` | dynamic | `pond mknod` | `DynamicDirectory` of `TableDynamic` |
+| `temporal-reduce-series` | dynamic | `pond mknod` | `TableDynamic` |
+| `pump-state-series` | dynamic | `pond mknod` | `TableDynamic` |
 | `column-rename` | transform | `pond mknod` | Wraps `TableProvider` |
 | `sitegen` | executable | `pond mknod` + `pond run ... build` | Static files on host |
 | `monitor-report` | read-only post-commit executable | `/system/run/00-monitor` | Atomic `index.html` and `status.json` on host |
@@ -2287,7 +2357,10 @@ pond run 90-sitegen build ./dist            # build site (reduce is dynamic)
 | `hydrovu` | executable | `pond mknod` + `pond run ... collect` | `table:series` in pond |
 | `remote` | executable | `pond mknod` + `pond run ... push/pull` | Backup bundles on S3 |
 
-**Dynamic** factories compute on every read — no stored state.
+**Dynamic** factories resolve their output on read. Some factories persist
+recipe-keyed caches, partial manifests, and repair boundaries so unchanged
+reads and bounded updates do not recompute retained history; those artifacts
+are derived state rather than independently authoritative data.
 **Executable** factories have side effects — run explicitly with `pond run`.
 **Transform** factories are referenced via the `transforms` field of other factories.
 

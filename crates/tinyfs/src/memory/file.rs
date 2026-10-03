@@ -12,6 +12,7 @@ use crate::memory::MemoryPersistence;
 use crate::metadata::{Metadata, NodeMetadata};
 use crate::persistence::PersistenceLayer;
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -312,6 +313,10 @@ struct MemoryFileWriter {
     completed: bool,
     completion_error: Option<String>,
     completion_future: Option<Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>>,
+    temporal_metadata: Option<(i64, i64, String)>,
+    required_timestamp_column: Option<String>,
+    exact_logical_attributes: Option<Vec<u8>>,
+    logical_leaf_metadata: Option<(String, u64, String)>,
 }
 
 impl MemoryFileWriter {
@@ -336,15 +341,36 @@ impl MemoryFileWriter {
             completed: false,
             completion_error: None,
             completion_future: None,
+            temporal_metadata: None,
+            required_timestamp_column: None,
+            exact_logical_attributes: None,
+            logical_leaf_metadata: None,
         }
     }
 }
 
 #[async_trait]
 impl crate::file::FileMetadataWriter for MemoryFileWriter {
-    fn set_temporal_metadata(&mut self, _min: i64, _max: i64, _timestamp_column: String) {
-        // Memory files don't persist metadata - this is a no-op
-        // In a real implementation, we'd store this in MemoryFile
+    fn set_temporal_metadata(&mut self, min: i64, max: i64, timestamp_column: String) {
+        self.temporal_metadata = Some((min, max, timestamp_column));
+    }
+
+    fn require_temporal_metadata(&mut self, timestamp_column: String) {
+        self.required_timestamp_column = Some(timestamp_column);
+    }
+
+    fn set_exact_logical_attributes(&mut self, canonical_attrs: Vec<u8>) {
+        self.exact_logical_attributes = Some(canonical_attrs);
+    }
+
+    fn set_logical_leaf_metadata(
+        &mut self,
+        logical_leaf_hash: String,
+        logical_count: u64,
+        series_schema_fingerprint: String,
+    ) {
+        self.logical_leaf_metadata =
+            Some((logical_leaf_hash, logical_count, series_schema_fingerprint));
     }
 
     async fn infer_temporal_bounds(&mut self) -> error::Result<(i64, i64, String)> {
@@ -414,9 +440,52 @@ impl AsyncWrite for MemoryFileWriter {
             let content = self.content.clone();
             let write_state = self.write_state.clone();
             let buffer = std::mem::take(&mut self.buffer);
+            let temporal_metadata = self.temporal_metadata.clone();
+            let required_timestamp_column = self.required_timestamp_column.clone();
+            let exact_logical_attributes = self.exact_logical_attributes.clone();
+            let logical_leaf_metadata = self.logical_leaf_metadata.clone();
 
             let future = Box::pin(async move {
                 let result: error::Result<()> = async {
+                    if let Some(required) = required_timestamp_column
+                        && temporal_metadata.is_none()
+                    {
+                        return Err(crate::Error::Other(format!(
+                            "{entry_type:?} declared temporal via \
+                             FileMetadataWriter::require_temporal_metadata('{required}') but \
+                             was finalized without bounds"
+                        )));
+                    }
+                    let mut extended_metadata = HashMap::new();
+                    if let Some((minimum, maximum, _)) = temporal_metadata {
+                        _ = extended_metadata
+                            .insert("min_event_time".to_string(), minimum.to_string());
+                        _ = extended_metadata
+                            .insert("max_event_time".to_string(), maximum.to_string());
+                    }
+                    if let Some(attributes) = exact_logical_attributes {
+                        let attributes = String::from_utf8(attributes).map_err(|error| {
+                            crate::Error::Other(format!(
+                                "exact logical attributes are not UTF-8: {error}"
+                            ))
+                        })?;
+                        _ = extended_metadata.insert("extended_attributes".to_string(), attributes);
+                    }
+                    if let Some((hash, count, fingerprint)) = logical_leaf_metadata {
+                        if count == 0 {
+                            return Err(crate::Error::Other(
+                                "logical leaf metadata requires a positive row count".to_string(),
+                            ));
+                        }
+                        _ = extended_metadata.insert("logical_leaf_hash".to_string(), hash);
+                        _ = extended_metadata
+                            .insert("logical_count".to_string(), count.to_string());
+                        _ = extended_metadata
+                            .insert("series_schema_fingerprint".to_string(), fingerprint);
+                    }
+                    let extended_metadata =
+                        (!extended_metadata.is_empty()).then_some(extended_metadata);
+
                     // Compute bao_outboard if this is a series or version type
                     let bao_outboard = match entry_type {
                         EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries => {
@@ -443,52 +512,10 @@ impl AsyncWrite for MemoryFileWriter {
                                     % utilities::bao_outboard::BLOCK_SIZE as u64)
                                     as usize;
 
-                                // Efficiently read only the pending bytes we need
-                                // Read versions from newest to oldest until we have enough bytes
                                 let pending_bytes = if pending_size > 0 {
-                                    let versions = persistence.list_file_versions(id).await?;
-
-                                    // Collect bytes from tail, reading only necessary versions
-                                    let mut tail_bytes = Vec::with_capacity(pending_size);
-
-                                    // Iterate versions in reverse (newest first)
-                                    for v in versions.iter().rev() {
-                                        if tail_bytes.len() >= pending_size {
-                                            break;
-                                        }
-
-                                        let bytes_still_needed = pending_size - tail_bytes.len();
-
-                                        if v.size as usize >= bytes_still_needed {
-                                            // This version has enough bytes - read only the tail we need
-                                            let version_content = persistence
-                                                .read_file_version(id, v.version)
-                                                .await?;
-                                            let start = version_content
-                                                .len()
-                                                .saturating_sub(bytes_still_needed);
-                                            // Prepend to tail_bytes (since we're going backwards)
-                                            let mut new_tail = version_content[start..].to_vec();
-                                            new_tail.append(&mut tail_bytes);
-                                            tail_bytes = new_tail;
-                                        } else {
-                                            // Need entire version - prepend it
-                                            let version_content = persistence
-                                                .read_file_version(id, v.version)
-                                                .await?;
-                                            let mut new_tail = version_content;
-                                            new_tail.append(&mut tail_bytes);
-                                            tail_bytes = new_tail;
-                                        }
-                                    }
-
-                                    // Trim to exact pending size (should already be correct, but safety)
-                                    if tail_bytes.len() > pending_size {
-                                        tail_bytes =
-                                            tail_bytes[tail_bytes.len() - pending_size..].to_vec();
-                                    }
-
-                                    tail_bytes
+                                    persistence
+                                        .read_file_tail_before(id, allocated_version, pending_size)
+                                        .await?
                                 } else {
                                     Vec::new()
                                 };
@@ -521,16 +548,23 @@ impl AsyncWrite for MemoryFileWriter {
 
                     if let Some(bao_bytes) = bao_outboard {
                         persistence
-                            .store_file_version_with_bao(
+                            .store_file_version_with_bao_and_metadata(
                                 id,
                                 allocated_version,
                                 buffer.clone(),
                                 bao_bytes,
+                                extended_metadata,
                             )
                             .await?;
                     } else {
                         persistence
-                            .store_file_version(id, allocated_version, buffer.clone())
+                            .store_file_version_with_metadata(
+                                id,
+                                allocated_version,
+                                buffer.clone(),
+                                entry_type,
+                                extended_metadata,
+                            )
                             .await?;
                     }
 

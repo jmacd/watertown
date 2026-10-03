@@ -78,7 +78,11 @@ REAPPLY_OUT=$(pond apply -f /tmp/setup.yaml 2>&1)
 echo "$REAPPLY_OUT"
 
 check 'echo "$REAPPLY_OUT" | grep -q "unchanged"' "reports unchanged"
-check 'echo "$REAPPLY_OUT" | grep -q "no transaction"' "no transaction committed"
+check 'echo "$REAPPLY_OUT" | grep -q "no data changes"' "no data changes committed"
+
+STATUS_OUT=$(pond status)
+echo "$STATUS_OUT"
+check 'echo "$STATUS_OUT" | grep -q "Recovery:.*OK (no incomplete transactions)"' "no incomplete transaction after unchanged apply"
 
 # ==============================================================================
 # Step 4: Verify transaction log

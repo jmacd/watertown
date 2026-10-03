@@ -442,6 +442,22 @@ async fn run_export_stages(
         }
     }
 
+    let metrics = provider_ctx.plan_visibility_metrics();
+    info!(
+        "Query execution summary: global_plans={} non_incremental_plans={} \
+         dynamic_source_executions={} bounded_dynamic_source_executions={} \
+         minimum_dynamic_event_time_lo={:?} export_source_executions={} \
+         export_partitions_reused={} export_partitions_written={}",
+        metrics.global_plans,
+        metrics.non_incremental_plans,
+        metrics.dynamic_source_executions,
+        metrics.bounded_dynamic_source_executions,
+        metrics.minimum_dynamic_event_time_lo,
+        metrics.export_source_executions,
+        metrics.export_partitions_reused,
+        metrics.export_partitions_written,
+    );
+
     Ok(exports)
 }
 

@@ -1,0 +1,19 @@
+// SPDX-FileCopyrightText: 2026 Caspar Water Company
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! Executable correctness and performance contracts for Watertown queries.
+
+pub mod frontier;
+pub mod locality;
+pub mod materialize;
+pub mod metrics;
+pub mod orchestration;
+pub mod overlap;
+pub mod partial;
+pub mod plans;
+pub mod provider;
+pub mod snapshot;
+pub mod sql;
+pub mod statistics;
+pub mod testkit;

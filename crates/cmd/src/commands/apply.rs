@@ -677,10 +677,13 @@ pub async fn apply_command(ship_context: &ShipContext, files: &[String]) -> Resu
         );
     } else {
         log::info!(
-            "apply: all {} resource(s) unchanged, no transaction committed",
+            "apply: all {} resource(s) unchanged, no data changes committed",
             unchanged
         );
-        drop(tx);
+        _ = tx
+            .commit()
+            .await
+            .map_err(|e| anyhow!("apply: failed to complete unchanged transaction: {}", e))?;
     }
 
     // Phase 3: attach remotes.  `attach_remote` is the single writer of
@@ -1380,6 +1383,14 @@ mod tests {
         apply_command(&setup.ship_context, std::slice::from_ref(&arg)).await?;
         apply_command(&setup.ship_context, &[arg]).await?;
         assert!(setup.node_exists("/data/derived").await);
+        let ship = setup.ship_context.open_pond().await?;
+        assert!(
+            ship.control_table()
+                .find_incomplete_transactions()
+                .await?
+                .is_empty(),
+            "unchanged apply must complete its write transaction"
+        );
         Ok(())
     }
 

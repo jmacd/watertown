@@ -242,9 +242,7 @@ pub struct Segment {
 /// carry a different (or empty) `format` and are wiped + rebuilt.
 pub const SEALED_FORMAT: &str = "segments-v3";
 
-/// Manifest describing the segment cache for one output resolution. Its
-/// serialized bytes are the export-hint digest, so it must serialize
-/// deterministically (fixed field order; `sources` is an ordered map).
+/// Manifest describing the segment cache for one output resolution.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SegmentManifest {
     /// On-disk file format (see [`SEALED_FORMAT`]). Absent in legacy manifests,
@@ -393,22 +391,38 @@ pub fn read_verified_segment_manifest(res_dir: &Path) -> Result<Option<SegmentMa
     }
 }
 
-/// Compute the export-hint digest of a manifest without writing it (used on the
-/// reuse path, where the res dir is served unchanged).
+/// Compute a stable digest of the output artifacts named by a manifest.
+///
+/// Freshness bookkeeping is deliberately excluded: wildcard membership can
+/// change `sources` and `source_digest` without changing this reduction's
+/// output. In that case downstream resolutions and exports must remain reusable.
 pub fn segment_manifest_digest(manifest: &SegmentManifest) -> Result<String> {
-    let bytes = serde_json::to_vec_pretty(manifest)
+    #[derive(Serialize)]
+    struct OutputArtifacts<'a> {
+        format: &'a str,
+        sealed_hi_secs: Option<i64>,
+        segments: &'a [Segment],
+        hot_digest: &'a Option<String>,
+    }
+
+    let output = OutputArtifacts {
+        format: &manifest.format,
+        sealed_hi_secs: manifest.sealed_hi_secs,
+        segments: &manifest.segments,
+        hot_digest: &manifest.hot_digest,
+    };
+    let bytes = serde_json::to_vec(&output)
         .map_err(|e| crate::error::Error::Arrow(format!("serialize sealed manifest: {}", e)))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
-/// Persist the segment manifest atomically (tmp + rename) and return the
-/// blake3 digest of its serialized bytes, which callers use as the export-hint
-/// digest for the whole resolution.
+/// Persist the segment manifest atomically (tmp + rename) and return its output
+/// artifact digest.
 pub async fn write_segment_manifest(res_dir: &Path, manifest: &SegmentManifest) -> Result<String> {
     tokio::fs::create_dir_all(res_dir).await?;
     let bytes = serde_json::to_vec_pretty(manifest)
         .map_err(|e| crate::error::Error::Arrow(format!("serialize sealed manifest: {}", e)))?;
-    let digest = blake3::hash(&bytes).to_hex().to_string();
+    let digest = segment_manifest_digest(manifest)?;
     let path = segment_manifest_path(res_dir);
     let tmp = PathBuf::from(format!("{}.tmp", path.display()));
     tokio::fs::write(&tmp, &bytes).await?;
@@ -614,6 +628,37 @@ mod tests {
             format!("/pond/cache/merged_cafef00d12345678_{node}").as_str(),
             "directory prefix must stay `merged_`"
         );
+    }
+
+    #[test]
+    fn output_digest_ignores_freshness_bookkeeping() {
+        let mut manifest = SegmentManifest {
+            format: SEALED_FORMAT.to_string(),
+            sealed_hi_secs: Some(120),
+            segments: vec![Segment {
+                name: "seg-00000000.parquet".to_string(),
+                lo_secs: None,
+                hi_secs: 120,
+                digest: "segment-digest".to_string(),
+                bytes: 42,
+            }],
+            hot_digest: Some("hot-digest".to_string()),
+            ..Default::default()
+        };
+        let digest = segment_manifest_digest(&manifest).unwrap();
+
+        _ = manifest.sources.insert(
+            "new-source".to_string(),
+            SourceRange {
+                min_us: 1,
+                max_us: 2,
+            },
+        );
+        manifest.source_digest = Some("new-finer-recipe".to_string());
+        manifest.next_seq = 99;
+        manifest.hot_bytes = 1234;
+
+        assert_eq!(segment_manifest_digest(&manifest).unwrap(), digest);
     }
 
     /// A stray Parquet in the res dir must not contribute rows: the manifest,
