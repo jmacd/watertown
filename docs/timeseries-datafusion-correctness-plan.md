@@ -1,9 +1,11 @@
-# DataFusion Query Foundation Correctness and Performance Plan
+# DataFusion Query Foundation Correctness and Performance Record
 
-> **Status:** accepted design and implementation plan as of 2026-09-28.
+> **Status:** complete as of 2026-10-02. Phases 0 through 11 are implemented
+> and qualified by the evidence recorded here.
 >
-> **Implementation:** Phase 0 passed in `477292a8`; the Phase 1 through Phase 8
-> gates are implemented on the current development branch.
+> **Implementation:** Phase 0 began in `477292a8`. The production integration,
+> Noyo performance matrix, water migration, native-v2 identity proof, and
+> read-only staging-clone qualification described below have all passed.
 >
 > **Historical baseline:** `b6913e2f9ca68eb0a1cad27970fca2f6e8487833`.
 >
@@ -11,38 +13,36 @@
 > These commits contain useful regressions and experiments, but they are not the
 > architectural starting point for this plan.
 >
-> **First delivery gate:** prove every Watertown query shape in a fresh
-> workspace crate before integrating production TinyFS, TLogFS, provider
-> factories, or backup.
+> **Delivery sequence:** every Watertown query shape was first proved in a
+> fresh workspace crate, then integrated through TinyFS, TLogFS, provider
+> factories, consumers, and backup.
 
 ## 1. Decision
 
-Watertown will build a fresh executable foundation for its DataFusion
-integration instead of continuing to repair join, pivot, combine, reduce, and
-materialize behavior independently.
+Watertown built a fresh executable foundation for its DataFusion integration
+instead of continuing to repair join, pivot, combine, reduce, and materialize
+behavior independently.
 
-The foundation will:
+The foundation:
 
-1. live in a new Watertown workspace crate;
-2. initially depend on Arrow, DataFusion, Parquet, and `object_store`, not
-   TinyFS, TLogFS, `provider`, `steward`, or `sync-store`;
-3. model immutable query snapshots and chunks explicitly;
-4. construct built-in operations as typed DataFusion logical plans and
+1. lives in the `query-foundation` workspace crate;
+2. depends at its boundary on Arrow, DataFusion, Parquet, and `object_store`,
+   not TinyFS, TLogFS, `provider`, `steward`, or `sync-store`;
+3. models immutable query snapshots and chunks explicitly;
+4. constructs built-in operations as typed DataFusion logical plans and
    expressions;
-5. reserve SQL text for user-authored SQL;
-6. prove all current timeseries and non-timeseries query shapes before
+5. reserves SQL text for user-authored SQL;
+6. proved all current timeseries and non-timeseries query shapes before
    production storage integration;
-7. treat measured work, I/O, and memory as correctness requirements;
-8. tolerate bounded out-of-order arrival through a settled frontier and an
+7. treats measured work, I/O, and memory as correctness requirements;
+8. tolerates bounded out-of-order arrival through a settled frontier and an
    efficiently queryable unsealed region;
-9. declare overlap and row-identity semantics per dataset or composition; and
-10. integrate upward through TinyFS, TLogFS/Delta, provider factories, site
-    consumers, and native-v2 incremental backup only after the isolated model
-    passes its gates.
+9. declares overlap and row-identity semantics per dataset or composition; and
+10. integrates upward through TinyFS, TLogFS/Delta, provider factories, site
+    consumers, and native-v2 incremental backup.
 
-The working crate name in this document is `query-foundation`. The name may
-change before scaffolding, but the dependency boundary and gates may not be
-weakened by a rename.
+The crate name is `query-foundation`. Its dependency boundary prevents
+production storage behavior from defining query semantics.
 
 ## 2. Why the previous approach is insufficient
 
@@ -1377,18 +1377,66 @@ The earlier audit findings remain mandatory regressions:
 | Export repeated scans | consumer execution-count gate |
 | Obsolete join SQL | typed plan only; remove generated built-in SQL |
 
-The fixes in `a0b117b3` and `cbf62ddb` demonstrate useful directions:
-logical projections and exact event-time filters. They should be compared with
-the foundation results during integration, not copied automatically.
+The fixes in `a0b117b3` and `cbf62ddb` demonstrated useful directions:
+logical projections and exact event-time filters. They were compared with the
+foundation results during integration rather than copied automatically.
 
 The dynamic rollup work in `ccba84e0` also provides valuable regressions for
 recursive bounds, accumulated timestamp joins, fine-to-coarse partials, late
-repair, and manifest-authoritative caches. Those behaviors must be reproduced
+repair, and manifest-authoritative caches. Those behaviors were reproduced
 through the new contracts before production adoption.
 
-## 17. Definition of done
+## 17. Implementation hindsight
 
-The program is complete only when:
+The completed work changed several assumptions made at the start:
+
+1. **A fresh semantic core was the right boundary.** Snapshot membership,
+   overlap policy, locality, repair, and publication could be proved without
+   TinyFS or Delta behavior leaking into their definitions. Storage adapters
+   now translate into those contracts rather than reimplementing them.
+2. **Typed plans solve only one execution.** Persistent reuse also requires
+   recursive physical lineage. A timestamp-local parent is not incremental if
+   any child hides global work, which is why direct daily reduction could not
+   ship until typed pump state exposed bounded lineage.
+3. **Cold and warm are distinct contracts.** Cold bootstrap may legitimately
+   scan history, but it must say so. Warm no-change, append, disorder, and
+   repair paths each need separate physical-work evidence.
+4. **Standard DataFusion operators remain the default.** Combine, join, pivot,
+   projection, and reduction use typed logical plans. The pump-state execution
+   node was justified only after its ordered streaming state and episode
+   boundaries could not be expressed as a bounded ordinary aggregate.
+5. **Arbitrary SQL needs a hard boundary.** SQL remains valuable for domain
+   formulas and exploration, but it is global unless a restricted parsed plan
+   proves timestamp locality. Relabeling a global child as local would make a
+   cache fast but incorrect.
+6. **Correct results are not sufficient evidence.** Several implementations
+   produced the right rows while repeating source scans, rebuilding retained
+   history, or using memory proportional to history. Plan shape, source
+   executions, row groups, bytes, peak memory, and failure behavior are part
+   of correctness.
+7. **Real-data upgrade tests are indispensable.** The staging clone proved
+   exact pump classifications, daily row counts, integer totals, and bounded
+   floating-point reassociation. It also exposed the separate legacy drawdown
+   memory limit and a restore bug that synthetic query tests could not find.
+8. **Bootstrap side effects are part of data portability.** Restoring
+   `/system/run` and `/sys/remotes` must not execute them in the bootstrap
+   transaction. Transaction-scoped suppression keeps the imported recipes
+   intact while ordinary later writes resume dispatch.
+9. **Query and backup should share facts, not execution.** Persisting one
+   logical leaf hash lets queries and native-v2 publication agree on immutable
+   membership while neither subsystem plans or executes through the other.
+10. **Configuration migration belongs last.** The production graph changed
+    only after the foundation, adapters, mutation matrix, backup identity, and
+    old/new data-bearing comparison had passed.
+
+The remaining global drawdown, Horner, calibration, leak, and overlay SQL is
+deliberate scope, not an implicit claim that every domain query was converted.
+The drawdown query's full-history memory cost is a visible follow-up rather
+than a reason to weaken or bypass the completed pump and daily migration.
+
+## 18. Definition of done
+
+The program is complete because:
 
 1. the fresh crate proves every query shape in Section 10;
 2. every gate includes result, plan, physical-work, memory, and failure
@@ -1414,7 +1462,7 @@ The program is complete only when:
 17. operator and design documentation describe implemented behavior rather
     than aspirational behavior.
 
-## 18. Non-goals
+## 19. Non-goals
 
 - Do not add materialized intermediate Noyo series to hide inefficient plans.
 - Do not reproduce TinyFS, TLogFS, Delta, or native-v2 backup inside the fresh
