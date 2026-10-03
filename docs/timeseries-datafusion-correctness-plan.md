@@ -1133,6 +1133,10 @@ outputs, intentional rate-schema expansion, and equivalent daily totals.
 `crates/cmd/tests/restore_cli.rs` publishes and restores through a local
 content remote, proving inert bootstrap, resumed later dispatch, exact replica
 content, and cleanup of `data`, `control`, and `tlog` after a pull failure.
+The outer `caspar.water/config/scripts/smoke-water-config.sh` applies the exact
+deployment configuration twice to a disposable pond, verifies the typed public
+schemas and empty-input monitor report, checks filesystem integrity, and
+requires unchanged reapply to leave no incomplete transaction.
 
 ### Phase 11: native-v2 backup and restore verification
 
