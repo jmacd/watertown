@@ -1442,12 +1442,16 @@ The completed work changed several assumptions made at the start:
 10. **Configuration migration belongs last.** The production graph changed
     only after the foundation, adapters, mutation matrix, backup identity, and
     old/new data-bearing comparison had passed.
-11. **Streaming does not imply one source execution.** The first live
+11. **Streaming does not make watermark discovery cheap.** The first live
     materializer build streamed its output and cut peak memory by 41-49%, but
-    first executed the complete dynamic source again for `MAX(timestamp)`.
-    On selfmon this raised materializer elapsed time by 73-87%. Progress must
-    be derived from the streamed output for append-only materialization rather
-    than measured by a separate global aggregate.
+    materializer elapsed time still rose 73-87%. The first diagnosis blamed a
+    separate source-frontier aggregate; removing it did not materially change
+    live time or reads. Build `0.238.175` then proved that target-side
+    `MAX(timestamp)` was the dominant operation: the perf target maximum alone
+    took 253.6s and at least 2.15 GB, versus 268.7s for the complete
+    materializer. Target progress must come from persisted live-version bounds,
+    with only a metadata-bounded exact tail scan when nanosecond precision
+    exceeds those microsecond bounds.
 12. **Disposable cache formats are still compatibility contracts.** Typed
     temporal reduction changed cached timestamp units while retaining the
     `segments-v3` marker. Live staging then attempted to merge old nanosecond
@@ -1463,8 +1467,9 @@ The completed work changed several assumptions made at the start:
     routine repacks read 177-185 GB per tick from a roughly 7 GB pond because
     payload lookup repeatedly executed against the Delta table. Maintenance now
     spools all selected inline payloads with one DataFusion execution and
-    reports `content_delta_scans` (zero or one); controlled selfmon
-    qualification remains the physical-I/O gate.
+    reports `content_delta_scans` (zero or one). The controlled `0.238.175`
+    tick confirmed 2.52 GB of maintenance reads and 3m19s elapsed, down from
+    185.4 GB and roughly 70 minutes.
 
 The remaining global drawdown, Horner, calibration, leak, and overlay SQL is
 deliberate scope, not an implicit claim that every domain query was converted.
