@@ -15,6 +15,7 @@ mod panic_alloc;
 
 // External modules
 use billing as _;
+use exec_factory as _;
 use gitpond as _;
 use hydrovu as _;
 use sitegen as _;
