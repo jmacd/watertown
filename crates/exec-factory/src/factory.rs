@@ -67,45 +67,110 @@ async fn stage_inputs(
     Ok(())
 }
 
-/// Pre-populate staging with the current pond bytes of any exact-file
-/// output that already exists, so `diff_outputs`'s "before" snapshot can see
-/// it and the deletion check in `execute` has something to compare against.
-///
-/// Limitation: this only covers `OutputSpec::File` (exact paths). A
-/// directory-prefix output (`outputs: ["reports/"]`) is not pre-staged, so a
-/// program that deletes a *pre-existing* file under such a prefix without
-/// also listing it as an input currently goes undetected -- only new/changed
-/// files under the prefix are tracked. Listing an exact pre-existing path in
-/// `inputs` (even read-only) also makes it visible to the deletion check,
-/// same as this does for `outputs`.
+/// Pre-populate staging with the current pond bytes of any exact-file or
+/// directory-prefix output that already exists, so `diff_outputs`'s "before"
+/// snapshot can see it and the deletion check in `execute` has something to
+/// compare against. Without this, a path the program deletes without ever
+/// having been staged would be invisible to the diff and the deletion would
+/// silently go undetected.
 async fn stage_existing_outputs(
     root: &tinyfs::WD,
     cfg: &ExecConfig,
     staging: &std::path::Path,
 ) -> Result<(), tinyfs::Error> {
     for spec in &cfg.outputs {
-        let crate::stage::OutputSpec::File(relative) = parse_output_spec(spec) else {
-            continue;
-        };
-        let pond_path = crate::stage::relative_to_pond_path(&relative);
-        if !root.exists(&pond_path).await {
-            continue;
+        match parse_output_spec(spec) {
+            crate::stage::OutputSpec::File(relative) => {
+                let pond_path = crate::stage::relative_to_pond_path(&relative);
+                if !root.exists(&pond_path).await {
+                    continue;
+                }
+                let host_path = staging.join(&relative);
+                if let Some(parent) = host_path.parent() {
+                    tokio::fs::create_dir_all(parent).await.map_other_context(
+                        "exec: create staging directory for existing output",
+                    )?;
+                }
+                let bytes = root.read_file_path_to_vec(&pond_path).await.map_err(|e| {
+                    tinyfs::Error::Other(format!(
+                        "exec: stage existing output '{pond_path}': {e}"
+                    ))
+                })?;
+                tokio::fs::write(&host_path, &bytes)
+                    .await
+                    .map_other_context("exec: write staged existing output")?;
+                // Writable (unlike inputs): the program is expected to
+                // overwrite it.
+            }
+            crate::stage::OutputSpec::DirPrefix(relative) => {
+                let pond_path = crate::stage::relative_to_pond_path(&relative);
+                if !root.exists(&pond_path).await {
+                    continue;
+                }
+                let dir_wd = root.open_dir_path(&pond_path).await.map_err(|e| {
+                    tinyfs::Error::Other(format!(
+                        "exec: open existing output directory '{pond_path}': {e}"
+                    ))
+                })?;
+                let mut existing = Vec::new();
+                collect_pond_files(&dir_wd, &std::path::PathBuf::new(), &mut existing).await?;
+                for (child_relative, bytes) in existing {
+                    let host_path = staging.join(&relative).join(&child_relative);
+                    if let Some(parent) = host_path.parent() {
+                        tokio::fs::create_dir_all(parent).await.map_other_context(
+                            "exec: create staging directory for existing output",
+                        )?;
+                    }
+                    tokio::fs::write(&host_path, &bytes)
+                        .await
+                        .map_other_context("exec: write staged existing output")?;
+                }
+            }
         }
-        let host_path = staging.join(&relative);
-        if let Some(parent) = host_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_other_context("exec: create staging directory for existing output")?;
-        }
-        let bytes = root.read_file_path_to_vec(&pond_path).await.map_err(|e| {
-            tinyfs::Error::Other(format!("exec: stage existing output '{pond_path}': {e}"))
-        })?;
-        tokio::fs::write(&host_path, &bytes)
-            .await
-            .map_other_context("exec: write staged existing output")?;
-        // Writable (unlike inputs): the program is expected to overwrite it.
     }
     Ok(())
+}
+
+/// Recursively collect every file under `wd` (a pond directory), paired with
+/// its path relative to `wd` and its current bytes. Used to pre-stage an
+/// existing `outputs` directory-prefix before exec so pre-existing files are
+/// visible to the deletion check, same as [`stage_existing_outputs`] does
+/// for exact-path outputs.
+fn collect_pond_files<'a>(
+    wd: &'a tinyfs::WD,
+    relative_prefix: &'a std::path::Path,
+    out: &'a mut Vec<(std::path::PathBuf, Vec<u8>)>,
+) -> std::pin::Pin<Box<dyn Future<Output = Result<(), tinyfs::Error>> + Send + 'a>> {
+    Box::pin(async move {
+        use futures::StreamExt;
+        let mut entries = wd
+            .entries()
+            .await
+            .map_err(|e| tinyfs::Error::Other(format!("exec: list existing output dir: {e}")))?;
+        while let Some(entry) = entries.next().await {
+            let entry = entry
+                .map_err(|e| tinyfs::Error::Other(format!("exec: list existing output dir: {e}")))?;
+            let child_relative = relative_prefix.join(&entry.name);
+            if entry.entry_type.is_directory() {
+                let child_wd = wd.open_dir_path(&entry.name).await.map_err(|e| {
+                    tinyfs::Error::Other(format!(
+                        "exec: descend into existing output dir '{}': {e}",
+                        entry.name
+                    ))
+                })?;
+                collect_pond_files(&child_wd, &child_relative, out).await?;
+            } else if entry.entry_type.is_file() {
+                let bytes = wd.read_file_path_to_vec(&entry.name).await.map_err(|e| {
+                    tinyfs::Error::Other(format!(
+                        "exec: read existing output file '{}': {e}",
+                        entry.name
+                    ))
+                })?;
+                out.push((child_relative, bytes));
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Commit the output diff back into the pond. All writes for one `execute`

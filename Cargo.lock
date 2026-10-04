@@ -2187,6 +2187,7 @@ name = "exec-factory"
 version = "0.52.0"
 dependencies = [
  "blake3",
+ "futures",
  "linkme",
  "log",
  "paste",

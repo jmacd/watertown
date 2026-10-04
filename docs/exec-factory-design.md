@@ -258,15 +258,12 @@ degradation of a safety property.)
   than quietly mutating the record -- an operator who wants a file gone
   can delete it with an explicit, auditable pond command afterward.
   To make this enforceable, `execute()` pre-stages any already-existing
-  pond content at an exact-path (`OutputSpec::File`) output *before* the
-  "before" snapshot, not just `inputs` -- otherwise a path the program
-  deletes without ever having been staged would be invisible to the diff
-  and the deletion would silently go undetected. **Known limitation**:
-  this pre-staging only covers exact-path outputs, not directory-prefix
-  outputs (`outputs: ["reports/"]`); a pre-existing file under such a
-  prefix that isn't also listed in `inputs` is not yet pre-staged, so its
-  deletion is not currently caught. Declaring it under `inputs` as well
-  works around this today.
+  pond content at every declared output -- both exact-path
+  (`OutputSpec::File`) and directory-prefix (`OutputSpec::DirPrefix`,
+  recursively) -- *before* the "before" snapshot, not just `inputs`;
+  otherwise a path the program deletes without ever having been staged
+  would be invisible to the diff and the deletion would silently go
+  undetected.
 - **Non-zero exit, signal, or timeout**: the staging directory is dropped,
   `execute()` returns an error, and (per `run_pond_command`,
   `crates/cmd/src/commands/run.rs: Err(e) => Err(tx.abort(&e).await.into())`)

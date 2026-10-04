@@ -20,6 +20,7 @@ doctest = false
 
 [dependencies]
 blake3.workspace = true
+futures.workspace = true
 linkme.workspace = true
 log.workspace = true
 paste.workspace = true
