@@ -319,16 +319,26 @@ stress pond. Pre-deployment measurements in October found:
 - routine pack maintenance repacked 29 series and attributed 177-185 GB of
   logical reads to a roughly 7 GB pond while writing about 100 MB; and
 - the three materializers took 81-278 seconds each. The typed build reduced
-  their peak memory by 41-49%, but a separate full-source `MAX(timestamp)`
-  execution increased their elapsed time and reads.
+  their peak memory by 41-49% while increasing elapsed time and reads by
+  73-87%.
 
 The timer is a serialized oneshot, so `OnUnitActiveSec=1min` does not stack
 runs: effective cadence is the complete tick duration plus the timer delay.
-The follow-up repair derives materialization progress from the one streamed
-output execution and changes pack maintenance from one inline-content Delta
-execution per leaf/series to one disk-spooled execution shared by all repack
-candidates. A controlled selfmon run must confirm the expected I/O reduction
-before these numbers are replaced with a new steady-state baseline.
+Build `0.238.175` was then qualified in one controlled tick with the timer
+disabled. It completed successfully in 47m57s with no failed steps. Pack
+maintenance fell from 185.4 GB to 2.52 GB of logical reads and from roughly
+70 minutes to 3m19s by replacing per-leaf/per-series Delta execution with one
+shared, disk-spooled scan.
+
+That run also corrected the initial materializer diagnosis. Removing the
+source-frontier aggregate did not materially change the three materializers:
+perf still took 268.7s/3.34 GB, limiters 257.5s/3.16 GB, and Azure access
+146.9s/2.39 GB. An isolated `MAX(timestamp)` over the physical perf target took
+253.6s and at least 2.15 GB by itself. The remaining repair therefore derives
+the coarse target watermark from every live version's persisted
+`max_event_time`; microsecond and coarser targets use it directly, while
+nanosecond targets run an exact maximum only over the metadata-selected tail.
+Missing legacy metadata remains a visible full-scan fallback.
 
 ### 9. `last_run.seconds_ago == -1` while a service is running
 

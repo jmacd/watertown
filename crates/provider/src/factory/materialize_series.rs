@@ -23,12 +23,13 @@
 //! amplification that size-tiered collapse exists to remove.
 
 use crate::{ExecutionContext, FactoryContext, register_executable_factory};
+use arrow::datatypes::{DataType, TimeUnit};
 use clap::{Parser, Subcommand};
 use datafusion::common::Column;
 use datafusion::functions_aggregate::expr_fn::max;
 use datafusion::prelude::{SessionContext, col, lit};
 use datafusion::scalar::ScalarValue;
-use log::{debug, info};
+use log::{debug, info, warn};
 use query_foundation::frontier::{RepairPolicy, SettledState};
 use query_foundation::materialize::{
     MaterializationProgress, MaterializationPublication, materialize_stream_with_progress,
@@ -117,6 +118,15 @@ async fn table_for(
     url: &str,
     ctx: &SessionContext,
 ) -> Result<Arc<dyn datafusion::catalog::TableProvider>, tinyfs::Error> {
+    table_for_bounded(context, url, ctx, tinyfs::SeriesReadBounds::NONE).await
+}
+
+async fn table_for_bounded(
+    context: &FactoryContext,
+    url: &str,
+    ctx: &SessionContext,
+    bounds: tinyfs::SeriesReadBounds,
+) -> Result<Arc<dyn datafusion::catalog::TableProvider>, tinyfs::Error> {
     let fs = context.context.filesystem();
     let mut provider =
         crate::Provider::with_context(Arc::new(fs), Arc::new(context.context.clone()));
@@ -124,7 +134,7 @@ async fn table_for(
         provider = provider.with_root(root);
     }
     provider
-        .create_table_provider(url, ctx)
+        .create_provider_for_url_bounded(url, ctx, bounds)
         .await
         .map_err(|e| tinyfs::Error::Other(format!("materialize-series: source '{url}': {e}")))
 }
@@ -157,35 +167,237 @@ async fn max_event_time(
     Ok(None)
 }
 
+/// One metadata-derived target watermark plan.
+#[derive(Debug)]
+enum TargetWatermark {
+    /// The target has no live versions.
+    Empty,
+    /// Per-version microsecond bounds exactly represent this event-time type.
+    Exact(ScalarValue),
+    /// Nanosecond values require an exact tail query because persisted bounds
+    /// intentionally have microsecond precision.
+    BoundedNanosecond { lower: ScalarValue, lower_us: i64 },
+    /// A legacy version has no usable bound; retain the full-scan fallback.
+    FullScan { reason: String },
+}
+
+fn target_watermark_from_metadata(
+    versions: &[tinyfs::FileVersionInfo],
+    time_column: &str,
+    data_type: &DataType,
+) -> TinyFSResult<TargetWatermark> {
+    if versions.is_empty() {
+        return Ok(TargetWatermark::Empty);
+    }
+
+    let mut max_us = None;
+    for version in versions {
+        let Some(metadata) = version.extended_metadata.as_ref() else {
+            return Ok(TargetWatermark::FullScan {
+                reason: format!("version {} has no extended metadata", version.version),
+            });
+        };
+        let Some(raw_max) = metadata.get("max_event_time") else {
+            return Ok(TargetWatermark::FullScan {
+                reason: format!("version {} has no max_event_time", version.version),
+            });
+        };
+        let parsed_max = raw_max.parse::<i64>().map_err(|error| {
+            tinyfs::Error::Other(format!(
+                "materialize-series: target version {} has invalid max_event_time {raw_max:?}: \
+                 {error}",
+                version.version
+            ))
+        })?;
+        let Some(raw_attributes) = metadata.get("extended_attributes") else {
+            return Ok(TargetWatermark::FullScan {
+                reason: format!("version {} has no logical attributes", version.version),
+            });
+        };
+        let attributes: Value = serde_json::from_str(raw_attributes).map_other_context(format!(
+            "materialize-series: target version {} has invalid logical attributes",
+            version.version
+        ))?;
+        let recorded_column = attributes
+            .get("watertown.timestamp_column")
+            .and_then(Value::as_str);
+        match recorded_column {
+            None => {
+                return Ok(TargetWatermark::FullScan {
+                    reason: format!(
+                        "version {} has no recorded timestamp column",
+                        version.version
+                    ),
+                });
+            }
+            Some(recorded) if recorded != time_column => {
+                return Err(tinyfs::Error::Other(format!(
+                    "materialize-series: target version {} records timestamp column \
+                     {recorded:?}, expected {time_column:?}",
+                    version.version
+                )));
+            }
+            Some(_) => {}
+        }
+        max_us = Some(max_us.map_or(parsed_max, |current: i64| current.max(parsed_max)));
+    }
+
+    let max_us = max_us.expect("nonempty versions yielded at least one bound");
+    let scalar = match data_type {
+        DataType::Int64 => TargetWatermark::Exact(ScalarValue::Int64(Some(max_us))),
+        DataType::Timestamp(TimeUnit::Second, timezone) => {
+            if max_us.rem_euclid(1_000_000) != 0 {
+                return Ok(TargetWatermark::FullScan {
+                    reason: format!(
+                        "microsecond watermark {max_us} is not aligned to whole seconds"
+                    ),
+                });
+            }
+            TargetWatermark::Exact(ScalarValue::TimestampSecond(
+                Some(max_us.div_euclid(1_000_000)),
+                timezone.clone(),
+            ))
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, timezone) => {
+            if max_us.rem_euclid(1_000) != 0 {
+                return Ok(TargetWatermark::FullScan {
+                    reason: format!(
+                        "microsecond watermark {max_us} is not aligned to whole milliseconds"
+                    ),
+                });
+            }
+            TargetWatermark::Exact(ScalarValue::TimestampMillisecond(
+                Some(max_us.div_euclid(1_000)),
+                timezone.clone(),
+            ))
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, timezone) => TargetWatermark::Exact(
+            ScalarValue::TimestampMicrosecond(Some(max_us), timezone.clone()),
+        ),
+        DataType::Timestamp(TimeUnit::Nanosecond, timezone) => {
+            let lower_ns = max_us.checked_mul(1_000).ok_or_else(|| {
+                tinyfs::Error::Other(format!(
+                    "materialize-series: target watermark {max_us}µs overflows nanoseconds"
+                ))
+            })?;
+            // Historical nanosecond bounds used integer division toward zero.
+            // For non-positive values, retain the complete microsecond bin so
+            // the exact tail scan cannot prune a pre-epoch maximum.
+            let lower_ns = if max_us <= 0 {
+                lower_ns.checked_sub(999).ok_or_else(|| {
+                    tinyfs::Error::Other(format!(
+                        "materialize-series: target watermark {max_us}µs underflows nanoseconds"
+                    ))
+                })?
+            } else {
+                lower_ns
+            };
+            TargetWatermark::BoundedNanosecond {
+                lower: ScalarValue::TimestampNanosecond(Some(lower_ns), timezone.clone()),
+                lower_us: max_us,
+            }
+        }
+        other => {
+            return Err(tinyfs::Error::Other(format!(
+                "materialize-series: unsupported event-time type {other}"
+            )));
+        }
+    };
+    Ok(scalar)
+}
+
 /// The largest event time already materialized into `target`, or `None` when
 /// the target does not exist yet.
 ///
-/// Deliberately `max()` over the WHOLE target rather than a peek at its newest
-/// version: once size-tiered collapse has run, the highest version number is a
-/// merged run standing for content in the MIDDLE of the stream, so "latest
-/// version" is not "latest data".  Reading a stale watermark that way would
-/// silently re-append rows that are already stored.  DataFusion answers this
-/// from parquet statistics, so it does not decode row groups.
+/// Every live physical-series version records its event-time maximum in epoch
+/// microseconds. Taking the maximum across all live versions remains correct
+/// after size-tiered collapse, unlike inspecting only the numerically newest
+/// version. Microsecond and coarser target types use that value directly.
+/// Nanosecond targets perform an exact `MAX` only over the metadata-selected
+/// tail because sub-microsecond precision is not present in the version bound.
+/// A legacy target with missing bounds falls back visibly to the full scan.
 async fn read_watermark(
     context: &FactoryContext,
     config: &MaterializeSeriesConfig,
+    source_time_type: &DataType,
 ) -> Result<Option<ScalarValue>, tinyfs::Error> {
     let root = context.root().await?;
     if !root.exists(&config.target).await {
         return Ok(None);
     }
+    let metadata = root.metadata_for_path(&config.target).await?;
+    if metadata.entry_type != tinyfs::EntryType::TablePhysicalSeries {
+        return Err(tinyfs::Error::Other(format!(
+            "materialize-series: target {} must be a physical table series, got {:?}",
+            config.target, metadata.entry_type
+        )));
+    }
+
+    let versions = root.list_file_versions(&config.target).await?;
+    let plan = target_watermark_from_metadata(&versions, &config.time_column, source_time_type)?;
+    match plan {
+        TargetWatermark::Empty => return Ok(None),
+        TargetWatermark::Exact(watermark) => {
+            debug!(
+                "materialize-series: target {} watermark {:?} from {} live version bound(s)",
+                config.target,
+                watermark,
+                versions.len()
+            );
+            return Ok(Some(watermark));
+        }
+        TargetWatermark::BoundedNanosecond { .. } => {}
+        TargetWatermark::FullScan { ref reason } => {
+            warn!(
+                "materialize-series: target {} requires a full watermark scan: {}",
+                config.target, reason
+            );
+        }
+    }
 
     let url = format!("series://{}", config.target);
     let ctx = &context.context.datafusion_session;
-    let table = table_for(context, &url, ctx).await?;
-    max_event_time(
-        ctx.read_table(table).map_err(|error| {
-            tinyfs::Error::Other(format!("materialize-series: target: {error}"))
-        })?,
+    let table = match &plan {
+        TargetWatermark::BoundedNanosecond { lower_us, .. } => {
+            table_for_bounded(
+                context,
+                &url,
+                ctx,
+                tinyfs::SeriesReadBounds::from_event_time_lo(*lower_us),
+            )
+            .await?
+        }
+        TargetWatermark::FullScan { .. } => table_for(context, &url, ctx).await?,
+        TargetWatermark::Empty | TargetWatermark::Exact(_) => {
+            unreachable!("empty and exact watermark plans return before provider construction")
+        }
+    };
+    let mut frame = ctx
+        .read_table(table)
+        .map_err(|error| tinyfs::Error::Other(format!("materialize-series: target: {error}")))?;
+    if let TargetWatermark::BoundedNanosecond { lower, .. } = plan {
+        frame = frame
+            .filter(col(Column::from_name(&config.time_column)).gt_eq(lit(lower)))
+            .map_err(|error| {
+                tinyfs::Error::Other(format!(
+                    "materialize-series: bound target watermark scan: {error}"
+                ))
+            })?;
+    }
+    let watermark = max_event_time(
+        frame,
         &config.time_column,
         "materialize-series: target watermark",
     )
-    .await
+    .await?;
+    watermark.map(Some).ok_or_else(|| {
+        tinyfs::Error::Other(format!(
+            "materialize-series: nonempty target {} produced no rows while resolving its \
+             watermark across {} live version(s)",
+            config.target,
+            versions.len()
+        ))
+    })
 }
 
 /// Append the source rows beyond the target's watermark as one new version.
@@ -203,7 +415,23 @@ pub async fn execute(
         return Ok(());
     }
 
-    let watermark = read_watermark(&context, &config).await?;
+    let session = &context.context.datafusion_session;
+    let source = table_for(&context, &config.source.to_string(), session).await?;
+    let mut frame = session
+        .read_table(source)
+        .map_err(|e| tinyfs::Error::Other(format!("materialize-series: read source: {e}")))?;
+    let source_time_type = frame
+        .schema()
+        .field_with_unqualified_name(&config.time_column)
+        .map_err(|error| {
+            tinyfs::Error::Other(format!(
+                "materialize-series: source event-time column {}: {error}",
+                config.time_column
+            ))
+        })?
+        .data_type()
+        .clone();
+    let watermark = read_watermark(&context, &config, &source_time_type).await?;
     if watermark.is_none() {
         context.context.record_non_incremental_plan();
         info!(
@@ -211,12 +439,6 @@ pub async fn execute(
             context.file_id
         );
     }
-
-    let session = &context.context.datafusion_session;
-    let source = table_for(&context, &config.source.to_string(), session).await?;
-    let mut frame = session
-        .read_table(source)
-        .map_err(|e| tinyfs::Error::Other(format!("materialize-series: read source: {e}")))?;
 
     // Strictly greater-than: the watermark row is already stored, and the
     // target is append-only, so re-emitting it would duplicate rather than
@@ -324,12 +546,140 @@ register_executable_factory!(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Float64Array, TimestampMicrosecondArray};
+    use arrow::array::{Float64Array, TimestampMicrosecondArray, TimestampNanosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use arrow::record_batch::RecordBatch;
+    use std::collections::HashMap;
     use std::sync::Arc;
-    use tinyfs::FileID;
     use tinyfs::arrow::parquet::ParquetExt;
+    use tinyfs::{EntryType, FileID, FileVersionInfo};
+
+    fn target_version(version: u64, max_event_time: &str, time_column: &str) -> FileVersionInfo {
+        FileVersionInfo {
+            version,
+            timestamp: i64::try_from(version).unwrap(),
+            size: 1,
+            blake3: None,
+            entry_type: EntryType::TablePhysicalSeries,
+            extended_metadata: Some(HashMap::from([
+                ("max_event_time".to_owned(), max_event_time.to_owned()),
+                (
+                    "extended_attributes".to_owned(),
+                    serde_json::json!({
+                        "watertown.timestamp_column": time_column,
+                    })
+                    .to_string(),
+                ),
+            ])),
+        }
+    }
+
+    #[test]
+    fn target_watermark_uses_every_live_version_bound() {
+        let versions = vec![
+            target_version(8, "300", "timestamp"),
+            target_version(20, "200", "timestamp"),
+        ];
+        let watermark = target_watermark_from_metadata(
+            &versions,
+            "timestamp",
+            &DataType::Timestamp(TimeUnit::Microsecond, None),
+        )
+        .unwrap();
+        assert!(matches!(
+            watermark,
+            TargetWatermark::Exact(ScalarValue::TimestampMicrosecond(Some(300), None))
+        ));
+    }
+
+    #[test]
+    fn target_watermark_bounds_nanoseconds_without_losing_exactness() {
+        let versions = vec![target_version(1, "123", "timestamp")];
+        let watermark = target_watermark_from_metadata(
+            &versions,
+            "timestamp",
+            &DataType::Timestamp(TimeUnit::Nanosecond, None),
+        )
+        .unwrap();
+        assert!(matches!(
+            watermark,
+            TargetWatermark::BoundedNanosecond {
+                lower: ScalarValue::TimestampNanosecond(Some(123_000), None),
+                lower_us: 123,
+            }
+        ));
+    }
+
+    #[test]
+    fn target_watermark_bounds_negative_nanoseconds_conservatively() {
+        let versions = vec![target_version(1, "-1", "timestamp")];
+        let watermark = target_watermark_from_metadata(
+            &versions,
+            "timestamp",
+            &DataType::Timestamp(TimeUnit::Nanosecond, None),
+        )
+        .unwrap();
+        assert!(matches!(
+            watermark,
+            TargetWatermark::BoundedNanosecond {
+                lower: ScalarValue::TimestampNanosecond(Some(-1_999), None),
+                lower_us: -1,
+            }
+        ));
+    }
+
+    #[test]
+    fn target_watermark_falls_back_for_legacy_metadata() {
+        let mut version = target_version(1, "123", "timestamp");
+        let _previous = version
+            .extended_metadata
+            .as_mut()
+            .unwrap()
+            .insert("extended_attributes".to_owned(), "{}".to_owned());
+        let watermark = target_watermark_from_metadata(
+            &[version],
+            "timestamp",
+            &DataType::Timestamp(TimeUnit::Microsecond, None),
+        )
+        .unwrap();
+        assert!(matches!(
+            watermark,
+            TargetWatermark::FullScan { reason }
+                if reason == "version 1 has no recorded timestamp column"
+        ));
+    }
+
+    #[test]
+    fn target_watermark_falls_back_for_unaligned_coarse_types() {
+        let versions = vec![target_version(1, "123", "timestamp")];
+        let watermark = target_watermark_from_metadata(
+            &versions,
+            "timestamp",
+            &DataType::Timestamp(TimeUnit::Millisecond, None),
+        )
+        .unwrap();
+        assert!(matches!(
+            watermark,
+            TargetWatermark::FullScan { reason }
+                if reason == "microsecond watermark 123 is not aligned to whole milliseconds"
+        ));
+    }
+
+    #[test]
+    fn target_watermark_rejects_a_different_timestamp_column() {
+        let versions = vec![target_version(1, "123", "recorded")];
+        let error = target_watermark_from_metadata(
+            &versions,
+            "configured",
+            &DataType::Timestamp(TimeUnit::Microsecond, None),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("records timestamp column \"recorded\", expected \"configured\"")
+        );
+    }
 
     #[tokio::test]
     async fn materialize_series_streams_and_skips_empty_versions() {
@@ -436,6 +786,109 @@ mod tests {
                 .non_incremental_plans,
             1,
             "incremental no-op must not add another non-incremental plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_series_preserves_an_exact_nanosecond_frontier() {
+        let (fs, provider_context) = crate::factory::test_support::create_test_environment().await;
+        let root = fs.root().await.unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let first = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![1_001, 1_999])),
+                Arc::new(Float64Array::from(vec![10.0, 20.0])),
+            ],
+        )
+        .unwrap();
+        _ = root
+            .write_series_from_batch("/source-ns.series", &first, Some("timestamp"))
+            .await
+            .unwrap();
+
+        let config = serde_json::to_value(MaterializeSeriesConfig {
+            source: crate::Url::parse("series:///source-ns.series").unwrap(),
+            target: "/target-ns.series".to_owned(),
+            time_column: "timestamp".to_owned(),
+        })
+        .unwrap();
+        execute(
+            config.clone(),
+            crate::factory::test_support::test_context(&provider_context, FileID::root()),
+            ExecutionContext::pond_readwriter(vec!["push".to_owned()]),
+        )
+        .await
+        .unwrap();
+        let target_versions = root.list_file_versions("/target-ns.series").await.unwrap();
+        assert!(matches!(
+            target_watermark_from_metadata(
+                &target_versions,
+                "timestamp",
+                &DataType::Timestamp(TimeUnit::Nanosecond, None),
+            )
+            .unwrap(),
+            TargetWatermark::BoundedNanosecond {
+                lower: ScalarValue::TimestampNanosecond(Some(1_000), None),
+                lower_us: 1,
+            }
+        ));
+
+        let second = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![2_001])),
+                Arc::new(Float64Array::from(vec![30.0])),
+            ],
+        )
+        .unwrap();
+        _ = root
+            .write_series_from_batch("/source-ns.series", &second, Some("timestamp"))
+            .await
+            .unwrap();
+        execute(
+            config,
+            crate::factory::test_support::test_context(&provider_context, FileID::root()),
+            ExecutionContext::pond_readwriter(vec!["push".to_owned()]),
+        )
+        .await
+        .unwrap();
+
+        let verification_context =
+            crate::factory::test_support::test_context(&provider_context, FileID::root());
+        let session = &provider_context.datafusion_session;
+        let target = table_for(&verification_context, "series:///target-ns.series", session)
+            .await
+            .unwrap();
+        let batches = session.read_table(target).unwrap().collect().await.unwrap();
+        let timestamps = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("timestamp")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(timestamps, vec![1_001, 1_999, 2_001]);
+        assert_eq!(
+            root.list_file_versions("/target-ns.series")
+                .await
+                .unwrap()
+                .len(),
+            2
         );
     }
 }
