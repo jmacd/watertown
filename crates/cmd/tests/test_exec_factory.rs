@@ -172,3 +172,94 @@ outputs: ["/data/out.txt"]
     );
     assert!(!root.exists("/data/out.txt").await);
 }
+
+#[tokio::test]
+#[cfg_attr(not(target_os = "linux"), ignore)]
+async fn exec_factory_rejects_deletion_of_prior_output() {
+    let (ship_context, _temp_dir) = setup_test_ship().await;
+
+    // The program deletes a declared output that already existed in the
+    // pond before this run. Per the design doc, deletions are never
+    // committed in v1: the whole run must fail and the prior content must
+    // still be there afterward.
+    let config_yaml = r#"
+program: /bin/sh
+args: ["-c", "rm -f data/out.txt"]
+inputs: []
+outputs: ["/data/out.txt"]
+"#;
+
+    let mut ship = ship_context.open_pond().await.expect("open pond");
+    let tx = ship
+        .begin_write(&PondUserMetadata::new(vec![
+            "test".to_string(),
+            "exec-factory-deletion-setup".to_string(),
+        ]))
+        .await
+        .expect("begin setup transaction");
+    let root = tx.root().await.expect("root");
+    _ = root
+        .create_dir_path("/data")
+        .await
+        .expect("create /data dir");
+    root.write_file_path_from_slice("/data/out.txt", b"prior output, must survive")
+        .await
+        .expect("seed prior output");
+    _ = tx.commit().await.expect("commit setup transaction");
+
+    let mut ship = ship_context.open_pond().await.expect("reopen pond");
+    let tx = ship
+        .begin_write(&PondUserMetadata::new(vec![
+            "test".to_string(),
+            "exec-factory-deletion-run".to_string(),
+        ]))
+        .await
+        .expect("begin run transaction");
+    let root = tx.root().await.expect("root");
+
+    _ = root
+        .create_dir_path("/configs")
+        .await
+        .expect("create /configs dir");
+    let (parent_wd, _) = root.resolve_path("/configs").await.expect("resolve /configs");
+    let parent_node_id = parent_wd.node_path().id();
+
+    let _node_path = root
+        .create_dynamic_path(
+            "/configs/billing-delete",
+            tinyfs::EntryType::FileDynamic,
+            "exec",
+            config_yaml.as_bytes().to_vec(),
+        )
+        .await
+        .expect("create exec config node");
+
+    let provider_context = tx.provider_context().expect("provider context");
+    let context = provider::FactoryContext::new(provider_context, parent_node_id);
+    FactoryRegistry::initialize::<tlogfs::TLogFSError>(
+        "exec",
+        config_yaml.as_bytes(),
+        context.clone(),
+    )
+    .await
+    .expect("initialize exec factory");
+
+    let result = FactoryRegistry::execute::<tlogfs::TLogFSError>(
+        "exec",
+        config_yaml.as_bytes(),
+        context,
+        ExecutionContext::pond_readwriter(vec![]),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "deleting a declared output that pre-existed must fail the run"
+    );
+
+    let surviving = root
+        .read_file_path_to_vec("/data/out.txt")
+        .await
+        .expect("prior output must still be readable after the rejected run");
+    assert_eq!(surviving, b"prior output, must survive");
+}

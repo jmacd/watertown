@@ -67,6 +67,47 @@ async fn stage_inputs(
     Ok(())
 }
 
+/// Pre-populate staging with the current pond bytes of any exact-file
+/// output that already exists, so `diff_outputs`'s "before" snapshot can see
+/// it and the deletion check in `execute` has something to compare against.
+///
+/// Limitation: this only covers `OutputSpec::File` (exact paths). A
+/// directory-prefix output (`outputs: ["reports/"]`) is not pre-staged, so a
+/// program that deletes a *pre-existing* file under such a prefix without
+/// also listing it as an input currently goes undetected -- only new/changed
+/// files under the prefix are tracked. Listing an exact pre-existing path in
+/// `inputs` (even read-only) also makes it visible to the deletion check,
+/// same as this does for `outputs`.
+async fn stage_existing_outputs(
+    root: &tinyfs::WD,
+    cfg: &ExecConfig,
+    staging: &std::path::Path,
+) -> Result<(), tinyfs::Error> {
+    for spec in &cfg.outputs {
+        let crate::stage::OutputSpec::File(relative) = parse_output_spec(spec) else {
+            continue;
+        };
+        let pond_path = crate::stage::relative_to_pond_path(&relative);
+        if !root.exists(&pond_path).await {
+            continue;
+        }
+        let host_path = staging.join(&relative);
+        if let Some(parent) = host_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_other_context("exec: create staging directory for existing output")?;
+        }
+        let bytes = root.read_file_path_to_vec(&pond_path).await.map_err(|e| {
+            tinyfs::Error::Other(format!("exec: stage existing output '{pond_path}': {e}"))
+        })?;
+        tokio::fs::write(&host_path, &bytes)
+            .await
+            .map_other_context("exec: write staged existing output")?;
+        // Writable (unlike inputs): the program is expected to overwrite it.
+    }
+    Ok(())
+}
+
 /// Commit the output diff back into the pond. All writes for one `execute`
 /// call happen inside the same pond transaction that `register_executable_factory!`
 /// already runs `execute` under, so either every output lands or (on any
@@ -106,6 +147,7 @@ pub async fn execute(
     let root = context.root().await?;
 
     stage_inputs(&root, &cfg, staging.path()).await?;
+    stage_existing_outputs(&root, &cfg, staging.path()).await?;
 
     let output_specs: Vec<_> = cfg.outputs.iter().map(|s| parse_output_spec(s)).collect();
     let before = snapshot_outputs(staging.path(), &output_specs)

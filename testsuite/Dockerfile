@@ -80,6 +80,9 @@ RUN apt-get update && \
         unzip \
         # Git for git-ingest factory testing
         git \
+        # Sandbox for the exec factory (requires --privileged, see
+        # testsuite/run-test.sh's '# REQUIRES: privileged' handling)
+        bubblewrap \
     && rm -rf /var/lib/apt/lists/*
 
 # Install the last open-source MinIO client release from its immutable GitHub
