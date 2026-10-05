@@ -355,3 +355,242 @@ outputs: ["/reports/"]
         .expect("prior nested output must still be readable after the rejected run");
     assert_eq!(surviving, b"prior report, must survive");
 }
+
+#[tokio::test]
+#[cfg_attr(not(target_os = "linux"), ignore)]
+async fn exec_factory_series_output_appends_across_multiple_runs() {
+    let (ship_context, _temp_dir) = setup_test_ship().await;
+
+    // Each run only ever appends one more line. `series_outputs` maps this
+    // onto `tinyfs::EntryType::FilePhysicalSeries`: every run commits only
+    // the *new* suffix as the next version, and reading the path
+    // concatenates all versions -- so after two runs the pond should show
+    // the full two-line journal, not a duplicated or truncated one.
+    let config_step1 = r#"
+program: /bin/sh
+args: ["-c", "echo 'entry one' >> accounting/journal.ledger"]
+inputs: []
+outputs: []
+series_outputs: ["/accounting/journal.ledger"]
+"#;
+    let config_step2 = r#"
+program: /bin/sh
+args: ["-c", "echo 'entry two' >> accounting/journal.ledger"]
+inputs: []
+outputs: []
+series_outputs: ["/accounting/journal.ledger"]
+"#;
+
+    // First run: the series output doesn't exist in the pond yet.
+    let mut ship = ship_context.open_pond().await.expect("open pond");
+    let tx = ship
+        .begin_write(&PondUserMetadata::new(vec![
+            "test".to_string(),
+            "exec-factory-series-step1".to_string(),
+        ]))
+        .await
+        .expect("begin step1 transaction");
+    let root = tx.root().await.expect("root");
+    _ = root
+        .create_dir_path("/configs")
+        .await
+        .expect("create /configs dir");
+    let (parent_wd, _) = root.resolve_path("/configs").await.expect("resolve /configs");
+    let parent_node_id = parent_wd.node_path().id();
+    let _node_path = root
+        .create_dynamic_path(
+            "/configs/journal-step1",
+            tinyfs::EntryType::FileDynamic,
+            "exec",
+            config_step1.as_bytes().to_vec(),
+        )
+        .await
+        .expect("create exec config node");
+    let provider_context = tx.provider_context().expect("provider context");
+    let context = provider::FactoryContext::new(provider_context, parent_node_id);
+    FactoryRegistry::initialize::<tlogfs::TLogFSError>(
+        "exec",
+        config_step1.as_bytes(),
+        context.clone(),
+    )
+    .await
+    .expect("initialize exec factory");
+    FactoryRegistry::execute::<tlogfs::TLogFSError>(
+        "exec",
+        config_step1.as_bytes(),
+        context,
+        ExecutionContext::pond_readwriter(vec![]),
+    )
+    .await
+    .expect("execute step1 (requires bwrap on Linux)");
+
+    let after_step1 = root
+        .read_file_path_to_vec("/accounting/journal.ledger")
+        .await
+        .expect("read journal after step1");
+    assert_eq!(after_step1, b"entry one\n");
+    _ = tx.commit().await.expect("commit step1 transaction");
+
+    // Second run: the series output already exists with one version;
+    // only "entry two\n" should be committed as the next version.
+    let mut ship = ship_context.open_pond().await.expect("reopen pond");
+    let tx = ship
+        .begin_write(&PondUserMetadata::new(vec![
+            "test".to_string(),
+            "exec-factory-series-step2".to_string(),
+        ]))
+        .await
+        .expect("begin step2 transaction");
+    let root = tx.root().await.expect("root");
+    let (parent_wd, _) = root.resolve_path("/configs").await.expect("resolve /configs");
+    let parent_node_id = parent_wd.node_path().id();
+    let _node_path = root
+        .create_dynamic_path(
+            "/configs/journal-step2",
+            tinyfs::EntryType::FileDynamic,
+            "exec",
+            config_step2.as_bytes().to_vec(),
+        )
+        .await
+        .expect("create exec config node");
+    let provider_context = tx.provider_context().expect("provider context");
+    let context = provider::FactoryContext::new(provider_context, parent_node_id);
+    FactoryRegistry::initialize::<tlogfs::TLogFSError>(
+        "exec",
+        config_step2.as_bytes(),
+        context.clone(),
+    )
+    .await
+    .expect("initialize exec factory");
+    FactoryRegistry::execute::<tlogfs::TLogFSError>(
+        "exec",
+        config_step2.as_bytes(),
+        context,
+        ExecutionContext::pond_readwriter(vec![]),
+    )
+    .await
+    .expect("execute step2 (requires bwrap on Linux)");
+
+    let after_step2 = root
+        .read_file_path_to_vec("/accounting/journal.ledger")
+        .await
+        .expect("read journal after step2");
+    assert_eq!(after_step2, b"entry one\nentry two\n");
+    _ = tx.commit().await.expect("commit step2 transaction");
+}
+
+#[tokio::test]
+#[cfg_attr(not(target_os = "linux"), ignore)]
+async fn exec_factory_series_output_rejects_rewrite() {
+    let (ship_context, _temp_dir) = setup_test_ship().await;
+
+    let config_seed = r#"
+program: /bin/sh
+args: ["-c", "echo 'entry one' >> accounting/journal.ledger"]
+inputs: []
+outputs: []
+series_outputs: ["/accounting/journal.ledger"]
+"#;
+    // Overwrites (`>`) instead of appending (`>>`): this must be rejected,
+    // not silently committed as a new "first version" that would make the
+    // concatenated read go backwards.
+    let config_rewrite = r#"
+program: /bin/sh
+args: ["-c", "echo 'REWRITTEN' > accounting/journal.ledger"]
+inputs: []
+outputs: []
+series_outputs: ["/accounting/journal.ledger"]
+"#;
+
+    let mut ship = ship_context.open_pond().await.expect("open pond");
+    let tx = ship
+        .begin_write(&PondUserMetadata::new(vec![
+            "test".to_string(),
+            "exec-factory-series-rewrite-seed".to_string(),
+        ]))
+        .await
+        .expect("begin seed transaction");
+    let root = tx.root().await.expect("root");
+    _ = root
+        .create_dir_path("/configs")
+        .await
+        .expect("create /configs dir");
+    let (parent_wd, _) = root.resolve_path("/configs").await.expect("resolve /configs");
+    let parent_node_id = parent_wd.node_path().id();
+    let _node_path = root
+        .create_dynamic_path(
+            "/configs/journal-seed",
+            tinyfs::EntryType::FileDynamic,
+            "exec",
+            config_seed.as_bytes().to_vec(),
+        )
+        .await
+        .expect("create exec config node");
+    let provider_context = tx.provider_context().expect("provider context");
+    let context = provider::FactoryContext::new(provider_context, parent_node_id);
+    FactoryRegistry::initialize::<tlogfs::TLogFSError>(
+        "exec",
+        config_seed.as_bytes(),
+        context.clone(),
+    )
+    .await
+    .expect("initialize exec factory");
+    FactoryRegistry::execute::<tlogfs::TLogFSError>(
+        "exec",
+        config_seed.as_bytes(),
+        context,
+        ExecutionContext::pond_readwriter(vec![]),
+    )
+    .await
+    .expect("execute seed run (requires bwrap on Linux)");
+    _ = tx.commit().await.expect("commit seed transaction");
+
+    let mut ship = ship_context.open_pond().await.expect("reopen pond");
+    let tx = ship
+        .begin_write(&PondUserMetadata::new(vec![
+            "test".to_string(),
+            "exec-factory-series-rewrite-attempt".to_string(),
+        ]))
+        .await
+        .expect("begin rewrite transaction");
+    let root = tx.root().await.expect("root");
+    let (parent_wd, _) = root.resolve_path("/configs").await.expect("resolve /configs");
+    let parent_node_id = parent_wd.node_path().id();
+    let _node_path = root
+        .create_dynamic_path(
+            "/configs/journal-rewrite",
+            tinyfs::EntryType::FileDynamic,
+            "exec",
+            config_rewrite.as_bytes().to_vec(),
+        )
+        .await
+        .expect("create exec config node");
+    let provider_context = tx.provider_context().expect("provider context");
+    let context = provider::FactoryContext::new(provider_context, parent_node_id);
+    FactoryRegistry::initialize::<tlogfs::TLogFSError>(
+        "exec",
+        config_rewrite.as_bytes(),
+        context.clone(),
+    )
+    .await
+    .expect("initialize exec factory");
+
+    let result = FactoryRegistry::execute::<tlogfs::TLogFSError>(
+        "exec",
+        config_rewrite.as_bytes(),
+        context,
+        ExecutionContext::pond_readwriter(vec![]),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "overwriting instead of appending to a series output must fail the run"
+    );
+
+    let surviving = root
+        .read_file_path_to_vec("/accounting/journal.ledger")
+        .await
+        .expect("prior series content must still be readable after the rejected run");
+    assert_eq!(surviving, b"entry one\n");
+}

@@ -62,7 +62,14 @@ fn build_bwrap_args(cfg: &ExecConfig, staging: &Path) -> Vec<String> {
 
     args.push("--unshare-pid".to_string());
     args.push("--die-with-parent".to_string());
-    args.push("--new-session".to_string());
+    if !cfg.interactive {
+        // `--new-session` stops the sandboxed program from injecting fake
+        // keystrokes back at the controlling terminal (TIOCSTI), but also
+        // detaches it from normal terminal job control (Ctrl-C/Ctrl-Z no
+        // longer reach it). Interactive sessions need real job control more
+        // than they need that hardening -- see `ExecConfig::interactive`.
+        args.push("--new-session".to_string());
+    }
     if !cfg.network {
         args.push("--unshare-net".to_string());
     }
@@ -88,9 +95,12 @@ fn build_bwrap_args(cfg: &ExecConfig, staging: &Path) -> Vec<String> {
 }
 
 /// Run `cfg.program` inside a `bwrap` sandbox rooted at `staging`, enforcing
-/// `cfg.timeout_seconds`. Returns the child's exit status on clean exit
-/// (any exit code -- the caller decides what "success" means); returns
-/// `SandboxError` if `bwrap` itself couldn't run or the timeout elapsed.
+/// `cfg.effective_timeout()` (if any). Returns the child's exit status on
+/// clean exit (any exit code -- the caller decides what "success" means);
+/// returns `SandboxError` if `bwrap` itself couldn't run or the timeout
+/// elapsed. stdin/stdout/stderr are inherited from the `pond` process by
+/// default (standard `tokio::process::Command` behavior), so an
+/// `interactive: true` program talking to a real terminal just works.
 pub async fn run_sandboxed(cfg: &ExecConfig, staging: &Path) -> Result<ExitStatus, SandboxError> {
     let args = build_bwrap_args(cfg, staging);
 
@@ -106,16 +116,18 @@ pub async fn run_sandboxed(cfg: &ExecConfig, staging: &Path) -> Result<ExitStatu
             }
         })?;
 
-    let timeout = Duration::from_secs(cfg.timeout_seconds);
-    match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(result) => result.map_err(SandboxError::Wait),
-        Err(_elapsed) => {
-            // kill_on_drop will send SIGKILL when `child` is dropped; also
-            // try an explicit kill so the caller's error is informative
-            // rather than racing a background drop.
-            let _ = child.start_kill();
-            Err(SandboxError::Timeout(timeout))
-        }
+    match cfg.effective_timeout() {
+        Some(timeout) => match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(result) => result.map_err(SandboxError::Wait),
+            Err(_elapsed) => {
+                // kill_on_drop will send SIGKILL when `child` is dropped; also
+                // try an explicit kill so the caller's error is informative
+                // rather than racing a background drop.
+                let _ = child.start_kill();
+                Err(SandboxError::Timeout(timeout))
+            }
+        },
+        None => child.wait().await.map_err(SandboxError::Wait),
     }
 }
 
@@ -129,9 +141,11 @@ mod tests {
             args: vec!["in.txt".to_string()],
             inputs: vec!["/in.txt".to_string()],
             outputs: vec![],
+            series_outputs: vec![],
             env: Default::default(),
             network: false,
-            timeout_seconds: 5,
+            interactive: false,
+            timeout_seconds: Some(5),
         }
     }
 
@@ -142,6 +156,7 @@ mod tests {
         assert!(args.contains(&"--unshare-net".to_string()));
         assert!(args.contains(&"--unshare-pid".to_string()));
         assert!(args.contains(&"--die-with-parent".to_string()));
+        assert!(args.contains(&"--new-session".to_string()));
         assert!(args.iter().any(|a| a == "/bin/cat"));
     }
 
@@ -151,6 +166,14 @@ mod tests {
         cfg.network = true;
         let args = build_bwrap_args(&cfg, Path::new("/tmp/staging-test"));
         assert!(!args.contains(&"--unshare-net".to_string()));
+    }
+
+    #[test]
+    fn bwrap_args_drop_new_session_when_interactive() {
+        let mut cfg = test_config();
+        cfg.interactive = true;
+        let args = build_bwrap_args(&cfg, Path::new("/tmp/staging-test"));
+        assert!(!args.contains(&"--new-session".to_string()));
     }
 
     // Exercises the real `bwrap` binary; only meaningful on Linux (see
@@ -170,9 +193,11 @@ mod tests {
             ],
             inputs: vec!["/in.txt".to_string()],
             outputs: vec!["/out.txt".to_string()],
+            series_outputs: vec![],
             env: Default::default(),
             network: false,
-            timeout_seconds: 10,
+            interactive: false,
+            timeout_seconds: Some(10),
         };
 
         let status = run_sandboxed(&cfg, dir.path())
@@ -182,5 +207,32 @@ mod tests {
 
         let out = std::fs::read_to_string(dir.path().join("out.txt")).expect("read output");
         assert_eq!(out, "hello from sandbox");
+    }
+
+    // Verifies the "no timeout" path (`effective_timeout() == None`) actually
+    // lets a program run past what would otherwise be a very short timeout,
+    // rather than accidentally always wrapping in `tokio::time::timeout`.
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn interactive_run_has_no_enforced_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let cfg = ExecConfig {
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 2".to_string()],
+            inputs: vec![],
+            outputs: vec![],
+            series_outputs: vec![],
+            env: Default::default(),
+            network: false,
+            interactive: true,
+            timeout_seconds: None,
+        };
+        assert_eq!(cfg.effective_timeout(), None);
+
+        let status = run_sandboxed(&cfg, dir.path())
+            .await
+            .expect("bwrap should run (install bubblewrap on this Linux host)");
+        assert!(status.success());
     }
 }
