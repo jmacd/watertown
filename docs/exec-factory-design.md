@@ -303,6 +303,29 @@ assert that a program exiting non-zero (`bash -c 'exit 1'`) leaves the pond
 completely unchanged, and a third should assert that a program which
 deletes a previously-existing output file fails the run per §5.
 
+This exact scenario (as `/bin/sh -c 'cat data/in.txt > data/out.txt'`) is
+checked in as `scripts/examples/cat-demo.yaml`, and the Rust/testsuite
+tests listed in §8 cover it along with the nonzero-exit and
+deletion-rejection cases. To run it yourself locally -- no Docker *image*
+build, no remote pond, just `cargo run` -- use:
+
+```
+./scripts/try-exec-factory.sh
+```
+
+On Linux this runs natively; on macOS (or anywhere else) it transparently
+runs the same `cargo run` inside a throwaway privileged Linux container
+(build/registry caches live in named Docker volumes, so repeated runs are
+incremental). With no arguments it builds a fresh temp pond, seeds an
+input file, mknods and runs the demo config above, and prints the
+committed output. Any arguments are passed straight through to
+`cargo run --bin pond --`, e.g.:
+
+```
+./scripts/try-exec-factory.sh pond --pond /tmp/my-pond init --birthplace me
+./scripts/try-exec-factory.sh pond --pond /tmp/my-pond mknod exec /system/etc/my-job --config-path scripts/examples/my-job.yaml
+```
+
 ---
 
 ## 7. Explicitly out of scope for v1
