@@ -136,6 +136,16 @@ pub trait PersistenceLayer: Send + Sync {
     /// Returns versions in chronological order (oldest to newest)
     async fn list_file_versions(&self, id: FileID) -> Result<Vec<FileVersionInfo>>;
 
+    /// Stable identity of the complete readable persistence snapshot.
+    ///
+    /// Equal identities must mean every node, version, and directory entry
+    /// visible through this layer is unchanged. Backends that cannot provide
+    /// that guarantee return `None`; callers must then inspect their inputs
+    /// conservatively.
+    async fn snapshot_identity(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Point-read metadata for one exact immutable file version.
     ///
     /// Backends should override this when they can avoid enumerating retained

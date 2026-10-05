@@ -143,6 +143,12 @@ impl PersistenceLayer for OverlayPersistence {
         self.inner.list_file_versions(id).await
     }
 
+    async fn snapshot_identity(&self) -> Result<Option<String>> {
+        // Overlay-mounted nodes are not represented in the host persistence
+        // identity, so forwarding it would not cover this layer's full view.
+        Ok(None)
+    }
+
     async fn read_file_version(&self, id: FileID, version: u64) -> Result<Vec<u8>> {
         self.inner.read_file_version(id, version).await
     }
