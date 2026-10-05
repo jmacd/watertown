@@ -379,9 +379,12 @@ defect. The successful tick exposed the following remaining costs:
    attributed 48.88 GB of logical reads, but `run-selfmon.sh` does not emit a
    `selfmon_io` record for the inline journal benchmark or for sitegen.
    Maintenance, ingestion, and materialization account for only part of the
-   total, so another optimization should first add elapsed/I/O boundaries
-   around cursor lookup, journal listing, the count query, and sitegen, and
-   retain sitegen's successful phase metrics.
+   total. Sitegen now emits elapsed summaries for exports, content,
+   status-grid, and rendering plus elapsed time and plan/work counter deltas
+   for every export stage and matched source. `run-selfmon.sh` still needs I/O
+   boundaries around cursor lookup, journal listing, the count query, and
+   sitegen so logical reads can be attributed alongside those internal
+   timings.
 
 The next performance cycle should prioritize observability, then the measured
 sitegen subphase that dominates a newly instrumented run, followed by the
