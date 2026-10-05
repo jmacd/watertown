@@ -73,6 +73,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64 as TestAtomicU64;
 use std::time::Duration;
 use tinyfs::ResultExt;
 use tinyfs::{
@@ -454,13 +456,17 @@ impl TemporalReduceSqlFile {
     /// the source_path. This ensures that schema discovery and SQL execution both use
     /// the correct format provider for the source data.
     fn source_url(&self) -> String {
+        self.source_url_for_path(&self.source_path)
+    }
+
+    fn source_url_for_path(&self, source_path: &str) -> String {
         // Use full_scheme() to preserve compression and entry type suffixes
         // (e.g., "csv+gzip", "file+series", "file+table").
         let scheme = self.config.in_pattern.full_scheme();
-        if self.source_path.starts_with('/') {
-            format!("{}://{}", scheme, self.source_path)
+        if source_path.starts_with('/') {
+            format!("{scheme}://{source_path}")
         } else {
-            format!("{}:///{}", scheme, self.source_path)
+            format!("{scheme}:///{source_path}")
         }
     }
 
@@ -482,7 +488,7 @@ impl TemporalReduceSqlFile {
     fn source_schema_cache_path(&self, cache_dir: &std::path::Path) -> std::path::PathBuf {
         let mut hasher = blake3::Hasher::new();
         _ = hasher.update(b"watertown:temporal-reduce-source-schema:v1");
-        update_schema_hash(&mut hasher, self.source_url().as_bytes());
+        update_schema_hash(&mut hasher, self.pattern_url.as_bytes());
         update_schema_hash(&mut hasher, self.config.time_column.as_bytes());
         cache_dir
             .join("temporal-reduce-schema")
@@ -637,6 +643,17 @@ impl TemporalReduceSqlFile {
         Ok(())
     }
 
+    async fn cached_source_columns(&self) -> TinyFSResult<Option<Vec<String>>> {
+        let Some(snapshot) = self.context.context.persistence.snapshot_identity().await? else {
+            return Ok(None);
+        };
+        let Some(cache_dir) = self.context.context.cache_dir() else {
+            return Ok(None);
+        };
+        self.load_source_schema_cache(&self.source_schema_cache_path(cache_dir), &snapshot)
+            .await
+    }
+
     async fn load_lineage_schema_cache(
         &self,
         path: &std::path::Path,
@@ -739,6 +756,14 @@ impl TemporalReduceSqlFile {
             return Ok(cached_columns.clone());
         }
 
+        if let Some(columns) = self.cached_source_columns().await? {
+            log::debug!(
+                "temporal-reduce source schema cache hit for '{}'",
+                self.source_path
+            );
+            *columns_guard = Some(columns.clone());
+            return Ok(columns);
+        }
         let snapshot = self.context.context.persistence.snapshot_identity().await?;
         let source_schema_cache = self
             .context
@@ -751,23 +776,27 @@ impl TemporalReduceSqlFile {
                     snapshot.to_owned(),
                 )
             });
-        if let Some((path, snapshot)) = &source_schema_cache
-            && let Some(columns) = self.load_source_schema_cache(path, snapshot).await?
-        {
-            log::debug!(
-                "temporal-reduce source schema cache hit for '{}'",
-                self.source_path
-            );
-            *columns_guard = Some(columns.clone());
-            return Ok(columns);
-        }
 
         // Use the Provider API to create a table provider, respecting the in_pattern URL scheme.
         // This is critical for format providers like oteljson://, csv://, excelhtml:// where the
         // raw file bytes need format-specific parsing to produce a queryable table.
         // Previously this went directly through as_queryable() on the raw file node, which
         // assumes Parquet format and fails for non-Parquet data files.
-        let source_url = self.source_url();
+        let source_url = if self.source_path.contains(['*', '?', '[']) {
+            let source_files = self.resolve_source_files().await?;
+            let representative = source_files
+                .iter()
+                .max_by_key(|node_path| node_path.path.as_os_str())
+                .ok_or_else(|| {
+                    tinyfs::Error::Other(format!(
+                        "temporal-reduce source '{}' matched no files",
+                        self.pattern_url
+                    ))
+                })?;
+            self.source_url_for_path(&representative.path.to_string_lossy())
+        } else {
+            self.source_url()
+        };
         log::debug!(
             "TemporalReduceFile: discovering columns via Provider API with URL '{}'",
             source_url
@@ -851,8 +880,12 @@ impl TemporalReduceSqlFile {
     /// column lists. This is the shared input to both the single-pass SQL and
     /// the rollup partial/merge SQL.
     async fn filled_config(&self) -> TinyFSResult<TemporalReduceConfig> {
-        // Discover available columns
-        let discovered_columns = if self.resolve_source_files().await?.is_empty() {
+        // Consult the snapshot-bound schema cache before resolving source
+        // membership. On a warm literal-output rollup, resolving the glob is
+        // exactly the history-sized work the cache is intended to avoid.
+        let discovered_columns = if let Some(columns) = self.cached_source_columns().await? {
+            columns
+        } else if self.resolve_source_files().await?.is_empty() {
             self.configured_empty_source_columns()?
         } else {
             self.discover_source_columns().await?
@@ -991,10 +1024,19 @@ impl TemporalReduceSqlFile {
             return Ok(None);
         }
 
-        let source_files = self.resolve_source_files().await?;
-        if source_files.is_empty() {
-            return Ok(None);
-        }
+        // Format-backed sources can prove an unchanged complete source map
+        // from the persistence snapshot without resolving the input glob.
+        // Builtin sources still need their entry types before eligibility and
+        // lineage can be classified.
+        let mut source_files = if format_provider.is_some() {
+            None
+        } else {
+            let source_files = self.resolve_source_files().await?;
+            if source_files.is_empty() {
+                return Ok(None);
+            }
+            Some(source_files)
+        };
 
         let fs = self.context.context.filesystem();
         let mut provider_api =
@@ -1008,11 +1050,13 @@ impl TemporalReduceSqlFile {
         // immutable lineage and bounded execution; otherwise there is no stable
         // freshness key and the conservative single-pass delegate remains the
         // only correct option.
-        let builtin_sources = format_provider.is_none()
-            && source_files.iter().all(|np| {
-                let et = np.id().entry_type();
-                et.is_parquet_file() && !et.is_dynamic()
-            });
+        let builtin_sources = source_files.as_ref().is_some_and(|source_files| {
+            format_provider.is_none()
+                && source_files.iter().all(|np| {
+                    let et = np.id().entry_type();
+                    et.is_parquet_file() && !et.is_dynamic()
+                })
+        });
         let derived_lineage = if format_provider.is_none() && !builtin_sources {
             provider_api
                 .query_lineage_for_url(&self.pattern_url)
@@ -1028,7 +1072,14 @@ impl TemporalReduceSqlFile {
         // Non-`None` selects the pond-native route: these nodes' own version
         // files are the leaves the partials are computed from.
         let builtin_source_ids: Option<Vec<tinyfs::FileID>> = if builtin_sources {
-            Some(source_files.iter().map(tinyfs::NodePath::id).collect())
+            Some(
+                source_files
+                    .as_ref()
+                    .expect("builtin source classification requires resolved files")
+                    .iter()
+                    .map(tinyfs::NodePath::id)
+                    .collect(),
+            )
         } else {
             None
         };
@@ -1077,7 +1128,7 @@ impl TemporalReduceSqlFile {
         // of the set: blake3 -> event-time range. That map is the freshness key
         // (design §5.3); nothing here is keyed by a version number or filename.
         let mut source_nodes: Vec<(tinyfs::NodeID, Vec<tinyfs::FileVersionInfo>)> =
-            Vec::with_capacity(source_files.len());
+            Vec::with_capacity(source_files.as_ref().map_or(0, Vec::len));
         let mut now: std::collections::BTreeMap<
             String,
             crate::partial_aggregate_cache::SourceRange,
@@ -1157,7 +1208,17 @@ impl TemporalReduceSqlFile {
                 let _ = now.insert(leaf.identity.clone(), range);
             }
         } else {
-            for node_path in &source_files {
+            if source_files.is_none() {
+                let resolved = self.resolve_source_files().await?;
+                if resolved.is_empty() {
+                    return Ok(None);
+                }
+                source_files = Some(resolved);
+            }
+            for node_path in source_files
+                .as_ref()
+                .expect("source files resolved for exact discovery")
+            {
                 let file_url_str = node_file_url(scheme, node_path);
                 let file_url = crate::Url::parse(&file_url_str).map_other()?;
 
@@ -3333,6 +3394,8 @@ pub struct TemporalReduceDirectory {
     config: TemporalReduceConfig,
     context: crate::FactoryContext,
     parsed_resolutions: Vec<(String, Duration)>,
+    #[cfg(test)]
+    source_membership_scans: TestAtomicU64,
 }
 
 impl TemporalReduceDirectory {
@@ -3352,11 +3415,20 @@ impl TemporalReduceDirectory {
             config,
             context,
             parsed_resolutions,
+            #[cfg(test)]
+            source_membership_scans: TestAtomicU64::new(0),
         })
     }
 
     /// Discover source files using the in_pattern and generate output names using out_pattern
     async fn discover_source_files(&self) -> TinyFSResult<Vec<(String, String)>> {
+        #[cfg(test)]
+        {
+            _ = self
+                .source_membership_scans
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
         let pattern = self.config.in_pattern.path();
         log::debug!(
             "TemporalReduceDirectory::discover_source_files - scanning pattern {}",
@@ -3482,6 +3554,23 @@ impl TemporalReduceDirectory {
 #[async_trait]
 impl Directory for TemporalReduceDirectory {
     async fn get(&self, name: &str) -> TinyFSResult<Option<Node>> {
+        // A literal out_pattern declares exactly one stable directory name.
+        // Defer source membership and schema work to the queryable file, where
+        // snapshot-bound caches can prove an unchanged source set without
+        // traversing retained history.
+        if !self.config.out_pattern.contains('$') {
+            if name != self.config.out_pattern {
+                return Ok(None);
+            }
+            let root = self.context.root().await?;
+            return Ok(Some(self.create_site_directory_node(
+                name.to_owned(),
+                self.config.in_pattern.path().to_owned(),
+                root.node_path().node,
+                self.config.in_pattern.to_string(),
+            )));
+        }
+
         // Discover all source files first
         let source_files = self.discover_source_files().await?;
 
@@ -3531,19 +3620,6 @@ impl Directory for TemporalReduceDirectory {
             return Ok(Some(node_ref));
         }
 
-        if sites.is_empty()
-            && !self.config.out_pattern.contains('$')
-            && name == self.config.out_pattern
-        {
-            let root = self.context.root().await?;
-            return Ok(Some(self.create_site_directory_node(
-                name.to_owned(),
-                self.config.in_pattern.path().to_owned(),
-                root.node_path().node,
-                self.config.in_pattern.to_string(),
-            )));
-        }
-
         Ok(None)
     }
 
@@ -3563,6 +3639,20 @@ impl Directory for TemporalReduceDirectory {
         &self,
     ) -> TinyFSResult<Pin<Box<dyn Stream<Item = TinyFSResult<tinyfs::DirectoryEntry>> + Send>>>
     {
+        if !self.config.out_pattern.contains('$') {
+            let node = self
+                .get(&self.config.out_pattern)
+                .await?
+                .expect("literal temporal-reduce output must resolve");
+            let entry = tinyfs::DirectoryEntry::new(
+                self.config.out_pattern.clone(),
+                node.id.node_id(),
+                EntryType::DirectoryDynamic,
+                0,
+            );
+            return Ok(Box::pin(stream::iter(vec![Ok(entry)])));
+        }
+
         // Discover all source files - fail fast on error
         let source_files = self.discover_source_files().await?;
 
@@ -5395,6 +5485,39 @@ output_aliases:
                 panic!("Expected file node for weather/res=1d.series");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn literal_output_directory_avoids_source_membership_scans() {
+        let (_fs, provider_context) = create_test_environment().await;
+        let config = TemporalReduceConfig {
+            in_pattern: crate::Url::parse("csv:///ingest/weather-*.csv").unwrap(),
+            out_pattern: "weather".to_owned(),
+            time_column: "timestamp".to_owned(),
+            resolutions: vec!["1d".to_owned()],
+            aggregations: vec![agg(AggregationType::Max, &["temperature"])],
+            output_aliases: None,
+            transforms: None,
+            allowed_lateness: None,
+            seal_target_bytes: Some(0),
+            max_live_segments: None,
+        };
+        let directory =
+            TemporalReduceDirectory::new(config, test_context(&provider_context, FileID::root()))
+                .unwrap();
+
+        assert!(directory.get("weather").await.unwrap().is_some());
+        assert!(directory.get("other").await.unwrap().is_none());
+        let entries = directory.entries().await.unwrap().collect::<Vec<_>>().await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].as_ref().unwrap().name, "weather");
+        assert_eq!(
+            directory
+                .source_membership_scans
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "literal output lookup and enumeration must not traverse source membership"
+        );
     }
 
     #[tokio::test]

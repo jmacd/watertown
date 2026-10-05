@@ -1021,8 +1021,38 @@ missing, changed, or unsupported identities retain the conservative full
 discovery path. The regression seeds 28 retained CSV versions and proves that a
 fresh-process no-change provider performs zero version-list and exact-version
 metadata reads, returns an unchanged export hint, and resumes full discovery
-after append. Live staging qualification remains required before closing this
-performance defect.
+after append.
+
+Live `0.241.178` staging qualification proved that this provider-level
+regression did not cover the dynamic-directory path used by Sitegen. Three
+successive builds spent 3,289.279, 3,217.780, and 3,265.203 seconds in the
+parent `metrics` stage. Every run still executed zero sources, wrote zero
+partitions, and reused all 7,770 partitions; Noyo remained bounded at
+15.7-16.6 seconds. The third run used an unchanged TLogFS version 952, and its
+persisted source-schema cache, 603-source identity cache, and all 25 matching
+water manifests carried the exact same snapshot token. Snapshot invalidation
+was therefore not the cause.
+
+An isolated debug export identified three history-sized traversals before the
+successful cache hits: `TemporalReduceDirectory::entries` expanded the
+116-file source glob, `TemporalReduceDirectory::get` expanded it again, and
+provider preparation resolved source membership once more before reporting
+both a source-schema cache hit and a 603-source snapshot hit. The first two
+traversals alone took 36 and 38 seconds. The caches were correct but consulted
+too late to remove the dominant work.
+
+Literal `out_pattern` directories now materialize their one declared output
+without source discovery, while captured output patterns such as Noyo's `$0`
+retain exact membership expansion. Format-backed partial planning consults the
+snapshot/source cache before resolving source files, and schema filling
+consults its snapshot-bound cache before testing source emptiness. Cache misses
+still perform exact discovery, schema inference still uses the
+lexicographically newest matching source, and unexpected cached non-reuse
+still fails loudly. A direct regression proves literal directory `get` and
+`entries` perform zero source-membership scans; all 41 temporal-reduce tests
+and workspace/all-features clippy pass. A new image and live staging run remain
+required to prove the parent `metrics` stage is now independent of retained
+source membership.
 
 Water's eight downstream pump-state, drawdown, Horner, calibration, usage, leak,
 and annotation outputs also execute successfully. They remain explicitly global
