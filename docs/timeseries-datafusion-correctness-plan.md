@@ -1002,6 +1002,28 @@ expands a registered typed `ViewTable` to anonymous internal scans, so user-SQL
 source validation now checks the parsed SQL relations before provider expansion
 while continuing to reject undeclared sources.
 
+A later instrumented warm staging build exposed a separate pre-execution cost
+that the isolated fixtures were too small to reveal. Build `0.240.177` spent
+4,931 seconds in the parent water `metrics` export while executing zero sources,
+writing zero partitions, and reusing all 7,770 existing partitions. Each of the
+25 unchanged reduced series spent roughly 151-182 seconds constructing its
+provider before the exporter could consume the unchanged hint. The finest water
+manifests contained 603 source identities across 116 physical nodes; schema
+discovery and source freshness reconstruction enumerated that retained metadata
+again for every output resolution.
+
+Warm planning now keys persisted source-schema and source-identity caches on a
+stable identity of the complete persistence snapshot. TLogFS derives that
+identity from the exact Delta version and cryptographic digest of its commit,
+and declines to provide one while any mutation is pending. A matching aggregate
+manifest can therefore reuse the complete source map without history queries;
+missing, changed, or unsupported identities retain the conservative full
+discovery path. The regression seeds 28 retained CSV versions and proves that a
+fresh-process no-change provider performs zero version-list and exact-version
+metadata reads, returns an unchanged export hint, and resumes full discovery
+after append. Live staging qualification remains required before closing this
+performance defect.
+
 Water's eight downstream pump-state, drawdown, Horner, calibration, usage, leak,
 and annotation outputs also execute successfully. They remain explicitly global
 and non-incremental: both cold and warm traversals recorded eight

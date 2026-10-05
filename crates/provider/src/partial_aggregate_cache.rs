@@ -296,6 +296,12 @@ pub struct SegmentManifest {
     /// Bounded: tlogfs collapse bounds the number of live versions, whereas a
     /// directory holding one file per version ever written was unbounded.
     pub sources: BTreeMap<String, SourceRange>,
+    /// Stable identity of the complete persistence snapshot from which
+    /// `sources` was derived. When it still matches, the source map is current
+    /// without enumerating retained file history. Backends that cannot provide
+    /// a stable identity leave this empty and use the conservative full scan.
+    #[serde(default)]
+    pub source_snapshot: Option<String>,
     /// For a coarser resolution built by folding the next-finer resolution's
     /// segments (Phase 3 step 2): the finer resolution's manifest digest this cache
     /// was folded from. `None` for the finest resolution (which aggregates the
@@ -680,6 +686,7 @@ mod tests {
                 max_us: 2,
             },
         );
+        manifest.source_snapshot = Some("new-persistence-snapshot".to_string());
         manifest.source_digest = Some("new-finer-recipe".to_string());
         manifest.next_seq = 99;
         manifest.hot_bytes = 1234;
@@ -748,6 +755,7 @@ mod tests {
             hot_digest: Some(hot_digest),
             hot_bytes: 0,
             sources: BTreeMap::new(),
+            source_snapshot: None,
             source_digest: None,
         };
 
@@ -925,6 +933,7 @@ mod tests {
             hot_digest: Some(hot_digest),
             hot_bytes: 0,
             sources: BTreeMap::new(),
+            source_snapshot: None,
             source_digest: None,
         };
 
@@ -977,6 +986,7 @@ mod tests {
             hot_digest: None,
             hot_bytes: 0,
             sources: BTreeMap::new(),
+            source_snapshot: None,
             source_digest: None,
         };
 

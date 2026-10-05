@@ -12,6 +12,25 @@ use std::path::PathBuf;
 use crate::async_helpers::convenience;
 
 #[tokio::test]
+async fn memory_snapshot_identity_tracks_directory_membership() {
+    use crate::persistence::PersistenceLayer;
+
+    let persistence = crate::memory::MemoryPersistence::default();
+    let fs = crate::FS::new(persistence.clone()).await.unwrap();
+    let root = fs.root().await.unwrap();
+    _ = root.create_dir_path("/source").await.unwrap();
+    let before = persistence.snapshot_identity().await.unwrap().unwrap();
+
+    _ = root.remove_entry("source").await.unwrap();
+    let after = persistence.snapshot_identity().await.unwrap().unwrap();
+
+    assert_ne!(
+        before, after,
+        "removing a glob-visible entry must invalidate the snapshot identity"
+    );
+}
+
+#[tokio::test]
 async fn test_pending_file_metadata_does_not_deadlock() {
     use crate::EntryType;
     use crate::node::{FileID, NodeType, PartID, local_pond_uuid};
