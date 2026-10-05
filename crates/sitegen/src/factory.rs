@@ -28,6 +28,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use tinyfs::ResultExt;
 
 // ---------------------------------------------------------------------------
@@ -301,20 +302,30 @@ async fn build_site_from_root(
     output_dir: &std::path::Path,
     root_base_url: &str,
 ) -> Result<(), tinyfs::Error> {
+    let build_started = Instant::now();
+
     // Run export stages
+    let phase_started = Instant::now();
     let exports = run_export_stages(config, root, provider_ctx, output_dir).await?;
+    log_sitegen_phase(config, output_dir, "exports", phase_started);
 
     // Run content stages
+    let phase_started = Instant::now();
     let content = run_content_stages(config, root).await?;
+    log_sitegen_phase(config, output_dir, "content", phase_started);
 
     // Run pond status grid queries (no-op when not configured).
     // We compute these once per site build and pass them through to
     // every page; the shortcode renders nothing when the option is
     // None, so unrelated pages aren't affected.
+    let phase_started = Instant::now();
     let pond_statuses = run_status_grid_queries(config, root, provider_ctx).await?;
+    log_sitegen_phase(config, output_dir, "status-grid", phase_started);
     let generated_at = chrono::Utc::now()
         .format("%Y-%m-%d %H:%M:%S UTC")
         .to_string();
+
+    let phase_started = Instant::now();
 
     // Pre-read all files from the pond into a map
     let mut file_cache: BTreeMap<String, String> = BTreeMap::new();
@@ -400,7 +411,93 @@ async fn build_site_from_root(
     // Copy static assets to output, preserving directory structure
     copy_static_assets(&static_assets, output_dir)?;
 
+    log_sitegen_phase(config, output_dir, "render", phase_started);
+    info!(
+        "Sitegen build summary: site={:?} output={:?} elapsed_s={:.3}",
+        config.site.title,
+        output_dir,
+        build_started.elapsed().as_secs_f64(),
+    );
+
     Ok(())
+}
+
+fn log_sitegen_phase(config: &SiteConfig, output_dir: &Path, phase: &str, started: Instant) {
+    info!(
+        "Sitegen phase summary: site={:?} output={:?} phase={} elapsed_s={:.3}",
+        config.site.title,
+        output_dir,
+        phase,
+        started.elapsed().as_secs_f64(),
+    );
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PlanMetricsDelta {
+    global_plans: u64,
+    non_incremental_plans: u64,
+    dynamic_source_executions: u64,
+    bounded_dynamic_source_executions: u64,
+    export_source_executions: u64,
+    export_partitions_reused: u64,
+    export_partitions_written: u64,
+}
+
+fn plan_metrics_delta(
+    before: tinyfs::PlanVisibilityMetricsSnapshot,
+    after: tinyfs::PlanVisibilityMetricsSnapshot,
+) -> PlanMetricsDelta {
+    PlanMetricsDelta {
+        global_plans: after.global_plans.saturating_sub(before.global_plans),
+        non_incremental_plans: after
+            .non_incremental_plans
+            .saturating_sub(before.non_incremental_plans),
+        dynamic_source_executions: after
+            .dynamic_source_executions
+            .saturating_sub(before.dynamic_source_executions),
+        bounded_dynamic_source_executions: after
+            .bounded_dynamic_source_executions
+            .saturating_sub(before.bounded_dynamic_source_executions),
+        export_source_executions: after
+            .export_source_executions
+            .saturating_sub(before.export_source_executions),
+        export_partitions_reused: after
+            .export_partitions_reused
+            .saturating_sub(before.export_partitions_reused),
+        export_partitions_written: after
+            .export_partitions_written
+            .saturating_sub(before.export_partitions_written),
+    }
+}
+
+fn log_export_work(
+    level: &str,
+    stage: &str,
+    source: Option<&str>,
+    started: Instant,
+    before: tinyfs::PlanVisibilityMetricsSnapshot,
+    after: tinyfs::PlanVisibilityMetricsSnapshot,
+) {
+    let delta = plan_metrics_delta(before, after);
+    info!(
+        "Sitegen export summary: level={} stage={:?} source={:?} elapsed_s={:.3} \
+         global_plans={} non_incremental_plans={} dynamic_source_executions={} \
+         bounded_dynamic_source_executions={} export_source_executions={} \
+         export_partitions_reused={} export_partitions_written={} \
+         cumulative_minimum_dynamic_event_time_lo={:?}",
+        level,
+        stage,
+        source,
+        started.elapsed().as_secs_f64(),
+        delta.global_plans,
+        delta.non_incremental_plans,
+        delta.dynamic_source_executions,
+        delta.bounded_dynamic_source_executions,
+        delta.export_source_executions,
+        delta.export_partitions_reused,
+        delta.export_partitions_written,
+        after.minimum_dynamic_event_time_lo,
+    );
 }
 
 /// Run export stages: glob-match pond files, export as Hive-partitioned parquet,
@@ -430,6 +527,9 @@ async fn run_export_stages(
     let mut exports = BTreeMap::new();
 
     for stage in &config.exports {
+        let started = Instant::now();
+        let before = provider_ctx.plan_visibility_metrics();
+
         // Detect format-provider URL patterns vs bare pond glob paths
         if stage.pattern.contains("://") {
             let (by_key, columns) =
@@ -440,6 +540,15 @@ async fn run_export_stages(
                 run_queryable_file_export(stage, root, &data_dir, provider_ctx, config).await?;
             exports.insert(stage.name.clone(), ExportContext { by_key, columns });
         }
+
+        log_export_work(
+            "stage",
+            &stage.name,
+            None,
+            started,
+            before,
+            provider_ctx.plan_visibility_metrics(),
+        );
     }
 
     let metrics = provider_ctx.plan_visibility_metrics();
@@ -554,6 +663,8 @@ async fn run_format_provider_export(
     for matched in &matched_files {
         let path_str = matched.path().to_string_lossy().to_string();
         let key = matched.captures.first().cloned().unwrap_or_default();
+        let started = Instant::now();
+        let before = provider_ctx.plan_visibility_metrics();
 
         let rel = series_path_to_data_rel(&path_str);
         let export_dir = data_dir.join(&rel);
@@ -618,6 +729,14 @@ async fn run_format_provider_export(
             path_str,
             export_outputs.len(),
             temporal_parts,
+        );
+        log_export_work(
+            "source",
+            &stage.name,
+            Some(&path_str),
+            started,
+            before,
+            provider_ctx.plan_visibility_metrics(),
         );
     }
 
@@ -1447,6 +1566,8 @@ async fn run_queryable_file_export(
     for (node_path, captures) in &matches {
         let path_str = node_path.path.to_string_lossy().to_string();
         let key = captures.first().cloned().unwrap_or_default();
+        let started = Instant::now();
+        let before = provider_ctx.plan_visibility_metrics();
 
         let rel = series_path_to_data_rel(&path_str);
         let export_dir = data_dir.join(&rel);
@@ -1519,6 +1640,14 @@ async fn run_queryable_file_export(
             path_str,
             export_outputs.len(),
             temporal_parts,
+        );
+        log_export_work(
+            "source",
+            &stage.name,
+            Some(&path_str),
+            started,
+            before,
+            provider_ctx.plan_visibility_metrics(),
         );
     }
 
@@ -2460,6 +2589,43 @@ impl std::error::Error for GenerateError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn computes_per_scope_plan_metric_deltas() {
+        let before = tinyfs::PlanVisibilityMetricsSnapshot {
+            global_plans: 10,
+            non_incremental_plans: 7,
+            dynamic_source_executions: 4,
+            bounded_dynamic_source_executions: 3,
+            minimum_dynamic_event_time_lo: Some(100),
+            export_source_executions: 20,
+            export_partitions_reused: 80,
+            export_partitions_written: 40,
+        };
+        let after = tinyfs::PlanVisibilityMetricsSnapshot {
+            global_plans: 12,
+            non_incremental_plans: 8,
+            dynamic_source_executions: 7,
+            bounded_dynamic_source_executions: 5,
+            minimum_dynamic_event_time_lo: Some(50),
+            export_source_executions: 21,
+            export_partitions_reused: 95,
+            export_partitions_written: 45,
+        };
+
+        assert_eq!(
+            plan_metrics_delta(before, after),
+            PlanMetricsDelta {
+                global_plans: 2,
+                non_incremental_plans: 1,
+                dynamic_source_executions: 3,
+                bounded_dynamic_source_executions: 2,
+                export_source_executions: 1,
+                export_partitions_reused: 15,
+                export_partitions_written: 5,
+            }
+        );
+    }
 
     #[test]
     fn validates_generated_local_images() {
