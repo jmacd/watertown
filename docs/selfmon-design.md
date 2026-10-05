@@ -340,6 +340,55 @@ the coarse target watermark from every live version's persisted
 nanosecond targets run an exact maximum only over the metadata-selected tail.
 Missing legacy metadata remains a visible full-scan fallback.
 
+Build `0.239.176` qualified that repair on October 4 in another controlled
+tick with the timer disabled. It completed successfully in 39m07s with no
+failed steps and 48.88 GB of process-attributed logical reads (`rchar`).
+Maintenance remained repaired at 3m09s/2.55 GB. Target-watermark pruning made
+all three materializers substantially faster than both `0.238.175` and the old
+pre-migration baseline:
+
+| Materializer | `0.238.175` | `0.239.176` | Logical reads |
+|---|---:|---:|---:|
+| Perf | 268.7s | 31.7s | 3.34 GB -> 441 MB |
+| Limiters | 257.5s | 15.7s | 3.16 GB -> 261 MB |
+| Azure access | 146.9s | 28.8s | 2.39 GB -> 864 MB |
+
+Materialization is therefore no longer the dominant selfmon performance
+defect. The successful tick exposed the following remaining costs:
+
+1. **Sitegen dominates the tick.** It took 1260.0s (21m00s, 54% of the
+   complete tick) at 290.23 MiB peak RSS. The successful-build log is redirected
+   to a temporary file and deleted, so selfmon currently loses sitegen's
+   internal export, temporal-reduce, and status-grid metrics. We cannot yet
+   distinguish repeated export work from status-grid/provider work using the
+   retained operational record.
+2. **The full-journal benchmark remains expensive.** The deliberate
+   `COUNT(*)` over `jsonlogs:///logs/journal/*.jsonl` took 343.2s (5m43s).
+   This is useful stress coverage and should not simply be removed, but its
+   cost still scales with retained journal data. A further approximately 229s
+   elapsed between maintenance and the timed count; that interval includes
+   untimed cursor lookup, journal listing, and other preflight/orchestration,
+   so the responsible operation is not yet attributable.
+3. **Tiny measurement appends have high fixed cost.** The eleven
+   `/system/etc/measure/*` logfile-ingest runs took 140.8s in total and
+   attributed roughly 3.37 GB of logical reads while appending inputs ranging
+   from hundreds of bytes to 6.6 KB. Each separate `pond run` took about
+   10-15s. Reusing one process/session or reducing repeated catalog startup
+   work is likely more valuable than optimizing the tiny writes themselves.
+4. **The remaining I/O is not attributable by phase.** The complete tick
+   attributed 48.88 GB of logical reads, but `run-selfmon.sh` does not emit a
+   `selfmon_io` record for the inline journal benchmark or for sitegen.
+   Maintenance, ingestion, and materialization account for only part of the
+   total, so another optimization should first add elapsed/I/O boundaries
+   around cursor lookup, journal listing, the count query, and sitegen, and
+   retain sitegen's successful phase metrics.
+
+The next performance cycle should prioritize observability, then the measured
+sitegen subphase that dominates a newly instrumented run, followed by the
+catalog/full-journal path. These defects are follow-up efficiency work rather
+than blockers for staging qualification: `0.239.176` repaired the demonstrated
+typed-migration regression and completed the stress tick cleanly.
+
 ### 9. `last_run.seconds_ago == -1` while a service is running
 
 A `pond run` invocation has no `ExecMainExitTimestamp` until it exits,
