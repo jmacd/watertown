@@ -131,6 +131,11 @@ Watertown provides several factory types for data transformation and management:
 
 ### Data Transformation Factories
 
+Built-in timeseries composition uses typed DataFusion logical plans from the
+`query-foundation` crate. SQL text is reserved for user-authored domain
+queries; unrestricted SQL is conservatively global unless it passes the
+validated timestamp-local contract.
+
 - **`sql-derived-table`**: Apply SQL transformations to single files
   - Query individual Parquet/CSV files with SELECT, WHERE, JOIN
   - Uses DataFusion's native ListingTable for predicate pushdown
@@ -142,7 +147,7 @@ Watertown provides several factory types for data transformation and management:
   - Ideal for time-series aggregation and multi-file analytics
 
 - **`timeseries-join`**: Join multiple time series by timestamp
-  - FULL OUTER JOIN on timestamp with COALESCE
+  - Typed accumulated FULL OUTER JOIN on timestamp
   - Per-input time range filtering
   - Scope prefixing for column disambiguation
   - Optional per-input transform pipelines
@@ -151,11 +156,22 @@ Watertown provides several factory types for data transformation and management:
   - Creates multiple resolution levels (1h, 6h, 1d, etc.)
   - Aggregation types: avg, min, max, count, sum
   - Outputs directory with `res={duration}.series` files
-  - SQL GROUP BY with efficient DataFusion execution
+  - Typed partial aggregation, bounded repair, and persistent sealed/hot state
+
+- **`temporal-reduce-series`**: One directly addressable reduced series
+  - Requires one exact logical source
+  - Uses the same persistent partial state as `temporal-reduce`
+  - Supports stable output aliases for public schemas
 
 - **`timeseries-pivot`**: Long-to-wide format conversion
   - Pivots row-based data into columnar time series
   - Configurable pivot columns and value columns
+  - Uses a typed timestamp-spine plan with explicit null padding
+
+- **`pump-state-series`**: Adaptive well-pump episode classification
+  - Streams ordered depth samples into pumping, recovering, and static phases
+  - Persists provisional episode and repair boundaries
+  - Exposes recursive bounded lineage to downstream reductions
 
 - **`column-rename`**: Rename or drop columns
   - Glob pattern support for bulk renaming
@@ -187,7 +203,7 @@ A complete example using multiple factories can be found in `${REPO_ROOT}/noyo`.
 
 ## Project Crates
 
-Watertown is organized into eight Rust crates with clear separation of concerns:
+Watertown is organized into workspace crates with clear separation of concerns:
 
 ### Core Filesystem Crates
 
@@ -241,6 +257,21 @@ Manages transaction lifecycle with separate control table for audit and recovery
 
 ### Data Access & Transformation
 
+#### `query-foundation` - Typed Query Semantics
+
+Defines storage-independent query contracts and typed DataFusion plans:
+
+- **Snapshots and Chunks**: Exact immutable membership and physical statistics
+- **Overlap Policies**: Preserve-all, precedence, and key-conflict semantics
+- **Locality and Frontier**: Append, unsealed disorder, repair, and rejection
+- **Typed Plans**: Transform, combine, join, pivot, fixed-window reduction, and
+  pump-state classification
+- **Materialization**: Streaming, failure-atomic output and progress publication
+- **Metrics**: Result, plan, I/O, memory, and failure evidence
+
+TinyFS, TLogFS, and provider code adapt storage into these contracts. The
+foundation does not depend on those production crates.
+
 #### `provider` - URL-Based Access & Factory Infrastructure
 
 Provides unified data access and the factory plugin system:
@@ -262,11 +293,13 @@ Provides unified data access and the factory plugin system:
 **Factory Subdirectories**:
 - `factory/sql_derived.rs`: SQL transformation factories (table and series modes)
 - `factory/temporal_reduce.rs`: Time-bucketed aggregation factory
+- `factory/pump_state.rs`: Streaming pump-state classification factory
 - `factory/timeseries_join.rs`: Multi-series join factory
 - `factory/timeseries_pivot.rs`: Long-to-wide pivot factory
 - `factory/dynamic_dir.rs`: Composite directory factory
 - `factory/column_rename.rs`: Column transformation factory
 - `factory/template.rs`: Tera template rendering factory
+- `query_foundation_adapter.rs`: TinyFS/TLogFS snapshot and lineage adapter
 
 ### Domain-Specific Crates
 

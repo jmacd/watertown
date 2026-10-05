@@ -1,9 +1,18 @@
 # Selfmon `.deb` Auto-Update Pipeline (Design)
 
-Status: **Design only** -- no code or infrastructure has been changed yet.
-Decision locked: publish the `pond` Debian package as a **ghcr OCI artifact**
-pulled with `oras`, with **latest/prod promotion parity** matching the container
-images.
+Status: **Implemented.** CI publishes the `pond` Debian package as
+`ghcr.io/jmacd/watertown/pond-deb`, the watershop updater pulls it with `oras`,
+and latest/prod promotion matches the container images. Sections 1-5 preserve
+the original design rationale; `RELEASING.md` describes the current operator
+flow.
+
+Package versions use `0.<commit-count>.<PR-number>`. The monotonic commit count
+must be the first Debian-comparison component: the former
+`0.<PR-number>.<commit-count>` scheme made the newer merged build `0.173.237`
+sort below `0.174.236` when PRs merged out of numeric order, so `dpkg` correctly
+refused the upgrade. CI compares every computed version with the nearest prior
+release tag using `dpkg --compare-versions` and fails rather than publishing a
+non-increasing version.
 
 This document describes how to automate updates for the natively-installed
 `watershop-selfmon` pond so it stays current the same way the containerized
@@ -11,7 +20,7 @@ production ponds do.
 
 ## Sequencing and naming (relative to the watertown rename)
 
-This pipeline is built **after** the `duckpond` -> `watertown` rename lands
+This pipeline was built **after** the `duckpond` -> `watertown` rename landed
 (see `docs/watertown-migration-plan.md`, Part 4). The sequence is deliberate:
 the rename is a mechanical, low-risk sweep, whereas this pipeline introduces
 brand-new, unverified CI and deployment surface. Building the pipeline once, on
@@ -28,16 +37,14 @@ Naming consequences (all post-rename `watertown` identifiers):
 - The CLI binary stays `/usr/bin/pond`, the `pond-deb` artifact name keeps its
   `pond` element, and every genuine `duckdb-*` asset is untouched.
 
-Section 1 below describes the current (pre-rename) state, so it still uses the
-present `duckpond` names. This document lives under `docs/` and is in the
-rename's scope, so its remaining `duckpond` brand tokens are swept to
-`watertown` along with the rest of the active tree when the rename lands.
+Section 1 below describes the historical pre-implementation state and therefore
+retains some former `duckpond` names.
 
 ---
 
-## 1. Problem / current state
+## 1. Problem / pre-implementation state
 
-Two update paths exist today; only the container one is automated.
+Two update paths existed; only the container one was automated.
 
 ### Container ponds (water / noyo / septic / site) -- fully automated
 

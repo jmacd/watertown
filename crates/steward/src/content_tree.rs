@@ -34,9 +34,12 @@
 //! their computed output, and their generated children are not folded in.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::io::SeekFrom;
 use std::sync::Arc;
 
-use datafusion::execution::context::SessionContext;
+use datafusion::execution::context::{SessionConfig, SessionContext};
+use futures::StreamExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use sync_store::content::{
     Commit, ContentModelVersion, ContentObjectKind, ManifestChange, ManifestEntry,
@@ -336,11 +339,9 @@ struct NodeFacts {
 #[derive(Debug, Clone)]
 pub(crate) struct SeriesVersionData {
     /// This row's Delta table `version` number. Needed (only by
-    /// pack-maintenance's bounded repack) to fetch this one version's
-    /// inline content lazily and individually via
-    /// [`read_series_version_inline_content`], rather than the whole
-    /// series' content column being read into memory in one batch (see
-    /// that function's doc comment).
+    /// pack-maintenance's bounded repack) to fetch this version's inline
+    /// content from [`spool_series_inline_content`], rather than the whole
+    /// series' content column being read into memory in one batch.
     pub(crate) version: i64,
     /// The physical blob hash of this version's raw bytes. Unrelated to the
     /// v2 logical identity, but still needed to materialize/publish this
@@ -1736,70 +1737,214 @@ fn node_depth(
     depth
 }
 
-/// Fetch **one** already-known-live series version's inline content, by
-/// `(pond_id, node_id, version)`, straight from that one Oplog row --
-/// never the whole series' `content` column read into memory in one batch.
+/// Disk-backed inline-content source shared by every series repacked in one
+/// maintenance run.
 ///
-/// Returns `None` when that version's row carries no inline `content` --
-/// it was externalized to `_large_files`, so its bytes must instead be
-/// streamed from there by [`SeriesVersionData::blob_hash`] -- never as a
-/// signal that the version itself is missing (callers already know it
-/// exists from a prior metadata-only ordered read, e.g.
-/// [`read_series_live_metadata_ordered`], and use `None` exactly to decide
-/// "stream externally" vs "use these inline bytes").
+/// One pond-wide Delta scan writes each requested inline payload to an unnamed
+/// temporary file and retains only `(offset, length)` metadata in memory.
+/// Callers then take one version at a time in logical order. This preserves
+/// the one-leaf memory bound without issuing a complete Delta query per leaf
+/// or per series.
+pub(crate) struct SeriesInlineContentSpool {
+    file: tokio::fs::File,
+    entries: HashMap<(String, i64), Option<(u64, u64)>>,
+    delta_scans: usize,
+}
+
+impl SeriesInlineContentSpool {
+    /// Number of DataFusion content scans actually started to build this spool.
+    #[must_use]
+    pub(crate) fn delta_scans(&self) -> usize {
+        self.delta_scans
+    }
+
+    /// Read and remove one expected version's inline payload.
+    ///
+    /// `None` means the row was externalized to `_large_files`; a missing row
+    /// is an error rather than being confused with externalized content.
+    pub(crate) async fn take(
+        &mut self,
+        pond_id: &str,
+        node_id: &str,
+        version: i64,
+    ) -> Result<Option<Vec<u8>>, StewardError> {
+        let entry = self
+            .entries
+            .remove(&(node_id.to_string(), version))
+            .ok_or_else(|| {
+            StewardError::DeltaLake(format!(
+                "node {pond_id}/{node_id} version {version}: expected inline-content row is missing"
+            ))
+        })?;
+        let Some((offset, length)) = entry else {
+            return Ok(None);
+        };
+        let length = usize::try_from(length).map_err(|_| {
+            StewardError::Content(format!(
+                "node {pond_id}/{node_id} version {version}: inline content is too large to read"
+            ))
+        })?;
+        let _position = self.file.seek(SeekFrom::Start(offset)).await?;
+        let mut bytes = vec![0u8; length];
+        let _bytes_read = self.file.read_exact(&mut bytes).await?;
+        Ok(Some(bytes))
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct InlineContentRow {
+    node_id: String,
+    version: i64,
+    content: Option<Vec<u8>>,
+}
+
+/// Scan all series selected for one maintenance run once and spool their
+/// requested inline payloads to disk.
 ///
-/// This is `crate::pack_maintenance`'s bounded per-leaf content source: a
-/// real repack fetches metadata for every live version up front (bounded,
-/// tiny), then calls this once per leaf, immediately before that leaf's
-/// bytes are streamed into the pack, so at most one leaf's inline content
-/// is ever held in memory at a time -- never a whole series' worth
-/// (finding 2, `docs/logical-series-identity-design.md`'s pack-maintenance
-/// memory-boundedness requirement).
+/// The compact predicate is the intersection of requested node IDs and
+/// versions. The explicit version range remains useful for Parquet pruning
+/// when DataFusion declines to rewrite a long `IN` list into its pruning
+/// predicate. The query can return cross-product rows that were not requested;
+/// those are discarded before their payload is spooled. It deliberately has no
+/// `ORDER BY`: pack maintenance already knows each series' live logical order
+/// from [`read_series_live_metadata_ordered`], while sorting payloads inside
+/// DataFusion could retain a whole series in memory. A one-row output batch
+/// keeps deserialization bounded; the temporary file supplies random access
+/// when callers consume versions in logical order.
 ///
 /// # Errors
 ///
-/// Returns an error if the query fails, if the row cannot be deserialized,
-/// or if more than one row shares this `(pond_id, node_id, version)` key
-/// (a corrupt/duplicated commit -- never silently resolved by picking one).
-pub(crate) async fn read_series_version_inline_content(
+/// Returns an error if the query fails, a requested row is absent, or more
+/// than one row shares a requested `(pond_id, node_id, version)` key.
+pub(crate) async fn spool_series_inline_content(
     table: deltalake::DeltaTable,
+    spool_directory: &std::path::Path,
     pond_id: &str,
-    node_id: &str,
-    version: i64,
-) -> Result<Option<Vec<u8>>, StewardError> {
-    let ctx = SessionContext::new();
+    requested_series: &[(String, Vec<i64>)],
+) -> Result<SeriesInlineContentSpool, StewardError> {
+    let file = tempfile::tempfile_in(spool_directory)?;
+    let requested = requested_series
+        .iter()
+        .flat_map(|(node_id, versions)| {
+            versions
+                .iter()
+                .map(move |version| (node_id.clone(), *version))
+        })
+        .collect::<HashSet<_>>();
+    let mut spool = SeriesInlineContentSpool {
+        file: tokio::fs::File::from_std(file),
+        entries: HashMap::with_capacity(requested.len()),
+        delta_scans: 0,
+    };
+    if requested.is_empty() {
+        return Ok(spool);
+    }
+
+    let node_ids = requested_series
+        .iter()
+        .map(|(node_id, _)| format!("'{node_id}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let versions = requested
+        .iter()
+        .map(|(_, version)| *version)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|version| version.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let min_version = requested
+        .iter()
+        .map(|(_, version)| *version)
+        .min()
+        .expect("nonempty request has a minimum version");
+    let max_version = requested
+        .iter()
+        .map(|(_, version)| *version)
+        .max()
+        .expect("nonempty request has a maximum version");
+    let mut session_config = SessionConfig::new().with_batch_size(1);
+    session_config
+        .options_mut()
+        .execution
+        .parquet
+        .pushdown_filters = true;
+    session_config
+        .options_mut()
+        .execution
+        .parquet
+        .reorder_filters = true;
+    let ctx = SessionContext::new_with_config(session_config);
     let _previous = ctx
         .register_table("series_live", Arc::new(table))
         .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
     let sql = format!(
-        "SELECT content FROM series_live WHERE pond_id = '{pond_id}' AND node_id = '{node_id}' \
-         AND version = {version}",
+        "SELECT node_id, version, content FROM series_live \
+         WHERE pond_id = '{pond_id}' AND node_id IN ({node_ids}) \
+         AND version BETWEEN {min_version} AND {max_version} \
+         AND version IN ({versions})",
     );
-    let batches = ctx
+    let mut stream = ctx
         .sql(&sql)
         .await
         .map_err(|e| StewardError::DeltaLake(e.to_string()))?
-        .collect()
+        .execute_stream()
         .await
         .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
-    #[derive(serde::Deserialize)]
-    struct InlineContentRow {
-        content: Option<Vec<u8>>,
-    }
-    let mut rows: Vec<InlineContentRow> = Vec::new();
-    for batch in &batches {
-        let parsed: Vec<InlineContentRow> = serde_arrow::from_record_batch(batch)
+    spool.delta_scans = 1;
+
+    let mut offset = 0u64;
+    while let Some(batch) = stream.next().await {
+        let batch = batch.map_err(|e| StewardError::DeltaLake(e.to_string()))?;
+        let rows: Vec<InlineContentRow> = serde_arrow::from_record_batch(&batch)
             .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
-        rows.extend(parsed);
+        for row in rows {
+            let key = (row.node_id.clone(), row.version);
+            if !requested.contains(&key) {
+                continue;
+            }
+            let entry = match row.content {
+                Some(bytes) => {
+                    let length = u64::try_from(bytes.len()).map_err(|_| {
+                        StewardError::Content(format!(
+                            "node {pond_id}/{} version {}: inline content is too large",
+                            row.node_id, row.version
+                        ))
+                    })?;
+                    spool.file.write_all(&bytes).await?;
+                    let entry = Some((offset, length));
+                    offset = offset.checked_add(length).ok_or_else(|| {
+                        StewardError::Content(format!(
+                            "pond {pond_id}: inline-content spool length overflow"
+                        ))
+                    })?;
+                    entry
+                }
+                None => None,
+            };
+            if spool.entries.insert(key, entry).is_some() {
+                return Err(StewardError::DeltaLake(format!(
+                    "node {pond_id}/{} version {}: multiple rows share one \
+                     (pond_id, node_id, version) key",
+                    row.node_id, row.version
+                )));
+            }
+        }
     }
-    if rows.len() > 1 {
+
+    if spool.entries.len() != requested.len() {
+        let missing = requested
+            .iter()
+            .filter(|key| !spool.entries.contains_key(*key))
+            .map(|(node_id, version)| format!("{node_id}@{version}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         return Err(StewardError::DeltaLake(format!(
-            "node {pond_id}/{node_id} version {version}: {} rows share one (pond_id, node_id, \
-             version) key (expected at most one)",
-            rows.len()
+            "pond {pond_id}: requested inline-content rows are missing for [{missing}]"
         )));
     }
-    Ok(rows.into_iter().next().and_then(|r| r.content))
+    spool.file.flush().await?;
+    Ok(spool)
 }
 
 /// Read one series node's current *live* versions' identity/bookkeeping
@@ -1811,10 +1956,10 @@ pub(crate) async fn read_series_version_inline_content(
 ///
 /// `crate::pack_maintenance`'s discovery (shared by dry-run and a real run)
 /// uses this so surveying every over-threshold series in a pond never reads,
-/// decodes, or buffers a single byte of any series' actual payload -- a real
-/// repack instead fetches one leaf's inline content at a time, only for the
-/// one leaf it is about to stream, via
-/// [`read_series_version_inline_content`].
+/// decodes, or buffers a single byte of any series' actual payload. A real
+/// maintenance run fetches all selected payload rows in one pond-wide scan
+/// into [`SeriesInlineContentSpool`], then reads one leaf at a time from that
+/// disk-backed spool.
 ///
 /// Every [`SeriesVersionData::content`] returned here is `None` regardless of
 /// whether the row's content was actually inline or externalized: nothing

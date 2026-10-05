@@ -2035,6 +2035,29 @@ pub async fn rebuild_pond(
     remote: &dyn ContentSource,
     graph: &FetchedGraph,
 ) -> Result<RebuildOutcome, StewardError> {
+    rebuild_pond_inner(target, remote, graph, false).await
+}
+
+/// Rebuild a pond without dispatching restored post-commit factories or
+/// remotes for the rebuild transaction.
+///
+/// This is the bootstrap path for `pond restore`: automatic configuration is
+/// part of the restored content, but it must not execute before the restore
+/// has completed and the operator can supply the target environment.
+pub async fn rebuild_pond_suppressed(
+    target: &mut Ship,
+    remote: &dyn ContentSource,
+    graph: &FetchedGraph,
+) -> Result<RebuildOutcome, StewardError> {
+    rebuild_pond_inner(target, remote, graph, true).await
+}
+
+async fn rebuild_pond_inner(
+    target: &mut Ship,
+    remote: &dyn ContentSource,
+    graph: &FetchedGraph,
+    suppress_post_commit: bool,
+) -> Result<RebuildOutcome, StewardError> {
     let root = graph
         .root_tree_hash()
         .ok_or_else(|| StewardError::Content("cannot rebuild from an empty graph".to_string()))?;
@@ -2088,9 +2111,12 @@ pub async fn rebuild_pond(
     let mut pack_objects = prepare_pack_objects(&ops, &effective_graph, remote).await?;
 
     let root_node_id = src_root_id(&effective_graph)?.to_string();
-    let mut tx = target
-        .begin_write(&PondUserMetadata::new(vec!["pull".to_string()]))
-        .await?;
+    let metadata = PondUserMetadata::new(vec!["pull".to_string()]);
+    let mut tx = if suppress_post_commit {
+        target.begin_write_suppressed(&metadata).await?
+    } else {
+        target.begin_write(&metadata).await?
+    };
     tx.expect_content_roots(root, tip_manifest_root);
     let apply_result = async {
         let root_wd = tx.root().await?;

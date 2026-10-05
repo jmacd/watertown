@@ -16,7 +16,8 @@ use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 
 /// Version information for a file in memory persistence
@@ -33,6 +34,17 @@ struct MemoryFileVersion {
     blake3: String,
 }
 
+fn memory_version_info(version: &MemoryFileVersion) -> FileVersionInfo {
+    FileVersionInfo {
+        version: version.version,
+        timestamp: version.timestamp,
+        size: version.content.len() as u64,
+        blake3: Some(version.blake3.clone()),
+        entry_type: version.entry_type,
+        extended_metadata: version.extended_metadata.clone(),
+    }
+}
+
 /// In-memory persistence layer for testing and derived file computation
 /// This implements the PersistenceLayer trait using in-memory storage
 #[derive(Clone)]
@@ -41,8 +53,42 @@ pub struct MemoryPersistence {
     coherence: Arc<crate::CoherenceState>,
     /// Transaction state for enforcing single-writer pattern
     pub txn_state: Arc<TransactionState>,
+    metrics: Arc<MemoryPersistenceMetricCounters>,
     #[cfg(test)]
     fail_next_store: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct MemoryPersistenceMetricCounters {
+    version_lists: AtomicU64,
+    version_info_reads: AtomicU64,
+    version_reads: AtomicU64,
+    version_opens: AtomicU64,
+    range_reads: AtomicU64,
+    tail_reads: AtomicU64,
+    tail_bytes: AtomicU64,
+    bytes_read: AtomicU64,
+}
+
+/// Observable persistence work for MemoryPersistence contract tests.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MemoryPersistenceMetrics {
+    /// Version-membership list operations.
+    pub version_lists: u64,
+    /// Exact-version metadata point reads.
+    pub version_info_reads: u64,
+    /// Complete-version reads.
+    pub version_reads: u64,
+    /// Complete-version streaming opens.
+    pub version_opens: u64,
+    /// Bounded version-range reads.
+    pub range_reads: u64,
+    /// Bounded reads of the preceding series tail for Bao continuation.
+    pub tail_reads: u64,
+    /// Bytes returned by preceding-series-tail reads.
+    pub tail_bytes: u64,
+    /// Total bytes returned by reads and opens.
+    pub bytes_read: u64,
 }
 
 pub struct State {
@@ -73,6 +119,7 @@ impl Default for MemoryPersistence {
             state: Arc::new(Mutex::new(State::default())),
             coherence: Arc::new(crate::CoherenceState::default()),
             txn_state: Arc::new(TransactionState::new()),
+            metrics: Arc::new(MemoryPersistenceMetricCounters::default()),
             #[cfg(test)]
             fail_next_store: Arc::new(AtomicBool::new(false)),
         }
@@ -227,11 +274,31 @@ impl PersistenceLayer for MemoryPersistence {
     }
 
     async fn list_file_versions(&self, id: FileID) -> Result<Vec<FileVersionInfo>> {
+        _ = self.metrics.version_lists.fetch_add(1, Ordering::Relaxed);
         self.state.lock().await.list_file_versions(id).await
     }
 
+    async fn file_version_info(&self, id: FileID, version: u64) -> Result<Option<FileVersionInfo>> {
+        _ = self
+            .metrics
+            .version_info_reads
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(self.state.lock().await.file_version_info(id, version))
+    }
+
     async fn read_file_version(&self, id: FileID, version: u64) -> Result<Vec<u8>> {
-        self.state.lock().await.read_file_version(id, version).await
+        _ = self.metrics.version_reads.fetch_add(1, Ordering::Relaxed);
+        let content = self
+            .state
+            .lock()
+            .await
+            .read_file_version(id, version)
+            .await?;
+        _ = self
+            .metrics
+            .bytes_read
+            .fetch_add(content.len() as u64, Ordering::Relaxed);
+        Ok(content)
     }
 
     async fn open_file_version(
@@ -239,12 +306,17 @@ impl PersistenceLayer for MemoryPersistence {
         id: FileID,
         version: u64,
     ) -> Result<Pin<Box<dyn crate::AsyncReadSeek>>> {
+        _ = self.metrics.version_opens.fetch_add(1, Ordering::Relaxed);
         let content = self
             .state
             .lock()
             .await
             .read_file_version(id, version)
             .await?;
+        _ = self
+            .metrics
+            .bytes_read
+            .fetch_add(content.len() as u64, Ordering::Relaxed);
         Ok(Box::pin(Cursor::new(content)))
     }
 
@@ -254,11 +326,18 @@ impl PersistenceLayer for MemoryPersistence {
         version: u64,
         range: Range<u64>,
     ) -> Result<Bytes> {
-        self.state
+        _ = self.metrics.range_reads.fetch_add(1, Ordering::Relaxed);
+        let content = self
+            .state
             .lock()
             .await
             .read_file_version_range(id, version, range)
-            .await
+            .await?;
+        _ = self
+            .metrics
+            .bytes_read
+            .fetch_add(content.len() as u64, Ordering::Relaxed);
+        Ok(content)
     }
 
     async fn set_extended_attributes(
@@ -278,6 +357,53 @@ impl PersistenceLayer for MemoryPersistence {
 }
 
 impl MemoryPersistence {
+    /// Reset observable read-work counters.
+    pub fn reset_metrics(&self) {
+        self.metrics.version_lists.store(0, Ordering::Relaxed);
+        self.metrics.version_info_reads.store(0, Ordering::Relaxed);
+        self.metrics.version_reads.store(0, Ordering::Relaxed);
+        self.metrics.version_opens.store(0, Ordering::Relaxed);
+        self.metrics.range_reads.store(0, Ordering::Relaxed);
+        self.metrics.tail_reads.store(0, Ordering::Relaxed);
+        self.metrics.tail_bytes.store(0, Ordering::Relaxed);
+        self.metrics.bytes_read.store(0, Ordering::Relaxed);
+    }
+
+    /// Snapshot observable read work.
+    #[must_use]
+    pub fn metrics(&self) -> MemoryPersistenceMetrics {
+        MemoryPersistenceMetrics {
+            version_lists: self.metrics.version_lists.load(Ordering::Relaxed),
+            version_info_reads: self.metrics.version_info_reads.load(Ordering::Relaxed),
+            version_reads: self.metrics.version_reads.load(Ordering::Relaxed),
+            version_opens: self.metrics.version_opens.load(Ordering::Relaxed),
+            range_reads: self.metrics.range_reads.load(Ordering::Relaxed),
+            tail_reads: self.metrics.tail_reads.load(Ordering::Relaxed),
+            tail_bytes: self.metrics.tail_bytes.load(Ordering::Relaxed),
+            bytes_read: self.metrics.bytes_read.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Read at most `size` trailing bytes preceding one series version.
+    pub async fn read_file_tail_before(
+        &self,
+        id: FileID,
+        version_exclusive: u64,
+        size: usize,
+    ) -> Result<Vec<u8>> {
+        _ = self.metrics.tail_reads.fetch_add(1, Ordering::Relaxed);
+        let bytes = self
+            .state
+            .lock()
+            .await
+            .read_file_tail_before(id, version_exclusive, size)?;
+        _ = self
+            .metrics
+            .tail_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        Ok(bytes)
+    }
+
     #[cfg(test)]
     pub(crate) fn fail_next_store(&self) {
         self.fail_next_store.store(true, Ordering::SeqCst);
@@ -351,6 +477,33 @@ impl MemoryPersistence {
             .lock()
             .await
             .store_file_version_with_bao(id, version, content, bao_outboard)
+            .await?;
+        _ = self.coherence.advance()?;
+        Ok(())
+    }
+
+    /// Store a file version with both integrity data and extended metadata.
+    pub async fn store_file_version_with_bao_and_metadata(
+        &self,
+        id: FileID,
+        version: u64,
+        content: Vec<u8>,
+        bao_outboard: Vec<u8>,
+        extended_metadata: Option<HashMap<String, String>>,
+    ) -> Result<()> {
+        #[cfg(test)]
+        self.take_store_failure()?;
+        let _mutation = self.coherence.begin_mutation()?;
+        self.state
+            .lock()
+            .await
+            .store_file_version_with_bao_and_metadata(
+                id,
+                version,
+                content,
+                bao_outboard,
+                extended_metadata,
+            )
             .await?;
         _ = self.coherence.advance()?;
         Ok(())
@@ -460,6 +613,18 @@ impl State {
         content: Vec<u8>,
         bao_outboard: Vec<u8>,
     ) -> Result<()> {
+        self.store_file_version_with_bao_and_metadata(id, version, content, bao_outboard, None)
+            .await
+    }
+
+    async fn store_file_version_with_bao_and_metadata(
+        &mut self,
+        id: FileID,
+        version: u64,
+        content: Vec<u8>,
+        bao_outboard: Vec<u8>,
+        extended_metadata: Option<HashMap<String, String>>,
+    ) -> Result<()> {
         // For series types, extract cumulative_blake3 from SeriesOutboard
         // For version types, extract root hash from VersionOutboard
         // This avoids hashing the content twice
@@ -471,7 +636,7 @@ impl State {
             version,
             content,
             id.entry_type(),
-            None,
+            extended_metadata,
             Some(bao_outboard),
             blake3_from_outboard,
         )
@@ -560,21 +725,56 @@ impl State {
 
     async fn list_file_versions(&self, id: FileID) -> Result<Vec<FileVersionInfo>> {
         if let Some(versions) = self.file_versions.get(&id) {
-            let version_infos = versions
-                .iter()
-                .map(|v| FileVersionInfo {
-                    version: v.version,
-                    timestamp: v.timestamp,
-                    size: v.content.len() as u64,
-                    blake3: Some(v.blake3.clone()),
-                    entry_type: v.entry_type,
-                    extended_metadata: v.extended_metadata.clone(),
-                })
-                .collect();
+            let version_infos = versions.iter().map(memory_version_info).collect();
             Ok(version_infos)
         } else {
             Ok(Vec::new())
         }
+    }
+
+    fn file_version_info(&self, id: FileID, version: u64) -> Option<FileVersionInfo> {
+        let versions = self.file_versions.get(&id)?;
+        let candidate = usize::try_from(version.checked_sub(1)?)
+            .ok()
+            .and_then(|index| versions.get(index))
+            .filter(|candidate| candidate.version == version)
+            .or_else(|| {
+                versions
+                    .binary_search_by_key(&version, |candidate| candidate.version)
+                    .ok()
+                    .and_then(|index| versions.get(index))
+            })?;
+        Some(memory_version_info(candidate))
+    }
+
+    fn read_file_tail_before(
+        &self,
+        id: FileID,
+        version_exclusive: u64,
+        size: usize,
+    ) -> Result<Vec<u8>> {
+        let versions = self.file_versions.get(&id).ok_or_else(|| {
+            Error::NotFound(std::path::PathBuf::from(format!("File {id} not found")))
+        })?;
+        let mut chunks = Vec::new();
+        let mut remaining = size;
+        for version in versions
+            .iter()
+            .rev()
+            .filter(|version| version.version < version_exclusive)
+        {
+            if remaining == 0 {
+                break;
+            }
+            let start = version.content.len().saturating_sub(remaining);
+            remaining = remaining.saturating_sub(version.content.len() - start);
+            chunks.push(&version.content[start..]);
+        }
+        let mut result = Vec::with_capacity(size - remaining);
+        for chunk in chunks.into_iter().rev() {
+            result.extend_from_slice(chunk);
+        }
+        Ok(result)
     }
 
     async fn read_file_version(&self, id: FileID, version: u64) -> Result<Vec<u8>> {

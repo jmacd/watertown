@@ -4751,6 +4751,7 @@ dependencies = [
  "parquet",
  "paste",
  "percent-encoding",
+ "query-foundation",
  "regex",
  "serde",
  "serde_json",
@@ -4874,6 +4875,20 @@ dependencies = [
  "pyo3-build-config",
  "quote",
  "syn 2.0.111",
+]
+
+[[package]]
+name = "query-foundation"
+version = "0.52.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "datafusion",
+ "futures",
+ "object_store",
+ "parquet",
+ "tokio",
+ "url",
 ]
 
 [[package]]
@@ -5748,11 +5763,13 @@ dependencies = [
  "deltalake",
  "env_logger",
  "fs2",
+ "futures",
  "hex",
  "log",
  "object_store",
  "parquet",
  "provider",
+ "query-foundation",
  "rustix 1.1.3",
  "serde",
  "serde_arrow",

@@ -2,12 +2,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for partition cache write-through correctness.
+//! Tests for node-scoped committed queries and pending-write visibility.
 //!
-//! The partition_records_cache in InnerState caches committed oplog
-//! records by partition.  These tests verify that reads within the
-//! same transaction always see pending writes, even after the cache
-//! has been populated from committed data.
+//! These tests verify that reads within the same transaction always see
+//! pending writes after node-scoped committed data has been queried.
 
 use crate::persistence::OpLogPersistence;
 use arrow_array::record_batch;
@@ -16,11 +14,10 @@ use tinyfs::arrow::ParquetExt;
 
 use super::test_dir;
 
-/// After populating the cache by reading a committed file, a NEW
-/// file created in the same partition (directory) must be visible
-/// via exists() and readable in the same transaction.
+/// After reading a committed file, a new file in the same directory remains
+/// visible and readable in the same transaction.
 #[tokio::test]
-async fn test_cache_write_through_new_file_same_partition() {
+async fn test_node_query_then_new_file_same_partition() {
     let store_path = test_dir();
 
     let mut persistence = OpLogPersistence::create_test(&store_path)
@@ -46,13 +43,12 @@ async fn test_cache_write_through_new_file_same_partition() {
         tx.commit_test().await.expect("commit tx1");
     }
 
-    // Transaction 2: read the committed file (populates cache),
-    // then create a second file and verify it is visible.
+    // Transaction 2: read committed state, then create a visible second file.
     {
         let tx = persistence.begin_test().await.expect("begin tx2");
         let root = tx.root().await.expect("root");
 
-        // Read first.series -- populates partition cache for root.
+        // Read committed node state.
         let b1 = root
             .read_table_as_batch("first.series")
             .await
@@ -73,7 +69,7 @@ async fn test_cache_write_through_new_file_same_partition() {
             .expect("create second.series");
         debug!("[OK] created second.series");
 
-        // The new file must be visible despite the cache.
+        // The new file must be visible.
         let exists = root.exists(std::path::Path::new("second.series")).await;
         assert!(exists, "second.series must be visible after creation");
 
@@ -97,11 +93,10 @@ async fn test_cache_write_through_new_file_same_partition() {
     }
 }
 
-/// After populating the cache by reading a committed file, appending
-/// a new version in the same transaction must produce a file whose
-/// latest version contains the new data.
+/// After reading a committed file, appending in the same transaction must
+/// expose the new latest version.
 #[tokio::test]
-async fn test_cache_write_through_append_version() {
+async fn test_node_query_then_append_version() {
     let store_path = test_dir();
 
     let mut persistence = OpLogPersistence::create_test(&store_path)
@@ -127,12 +122,12 @@ async fn test_cache_write_through_append_version() {
         tx.commit_test().await.expect("commit tx1");
     }
 
-    // Transaction 2: read (populates cache), append, verify latest.
+    // Transaction 2: read, append, and verify latest.
     {
         let tx = persistence.begin_test().await.expect("begin tx2");
         let root = tx.root().await.expect("root");
 
-        // Read v1 -- populates partition cache.
+        // Read v1 from committed state.
         let b1 = root
             .read_table_as_batch("sensor.series")
             .await
@@ -178,10 +173,9 @@ async fn test_cache_write_through_append_version() {
     }
 }
 
-/// Writing a new file into a directory whose partition is already
-/// cached must be visible when listing that directory.
+/// Writing a new file after listing a directory must remain visible.
 #[tokio::test]
-async fn test_cache_write_through_directory_listing() {
+async fn test_directory_query_then_new_file_listing() {
     use futures::stream::StreamExt;
 
     let store_path = test_dir();
@@ -211,13 +205,12 @@ async fn test_cache_write_through_directory_listing() {
         tx.commit_test().await.expect("commit tx1");
     }
 
-    // Transaction 2: list the directory (populates cache), then add
-    // a second file and verify it appears in the listing.
+    // Transaction 2: list the directory, then add and observe a second file.
     {
         let tx = persistence.begin_test().await.expect("begin tx2");
         let root = tx.root().await.expect("root");
 
-        // List /data -- populates partition cache for the data dir.
+        // List committed /data contents.
         let data_dir = root.open_dir_path("data").await.expect("open data");
         let mut stream = data_dir.entries().await.expect("entries before");
         let mut entries_before = Vec::new();
@@ -264,11 +257,9 @@ async fn test_cache_write_through_directory_listing() {
     }
 }
 
-/// After committing, a fresh transaction reads from Delta Lake (not
-/// stale cache).  The cache is per-InnerState, so each begin_test()
-/// starts with an empty cache.
+/// A new transaction sees committed writes from the preceding transaction.
 #[tokio::test]
-async fn test_cache_fresh_across_transactions() {
+async fn test_node_queries_are_fresh_across_transactions() {
     let store_path = test_dir();
 
     let mut persistence = OpLogPersistence::create_test(&store_path)
@@ -296,7 +287,7 @@ async fn test_cache_fresh_across_transactions() {
         let tx = persistence.begin_test().await.expect("begin tx2");
         let root = tx.root().await.expect("root");
 
-        // Read a.series -- populates cache.
+        // Read committed a.series.
         let b = root
             .read_table_as_batch("a.series")
             .await
@@ -315,8 +306,7 @@ async fn test_cache_fresh_across_transactions() {
         tx.commit_test().await.expect("commit tx2");
     }
 
-    // Transaction 3: fresh cache -- must see both files from
-    // Delta Lake, not stale single-file from tx2's cache.
+    // Transaction 3 must see both committed files from Delta Lake.
     {
         let tx = persistence.begin_test().await.expect("begin tx3");
         let root = tx.root().await.expect("root");
@@ -336,6 +326,6 @@ async fn test_cache_fresh_across_transactions() {
             .expect("read b in tx3");
         assert_eq!(ba.num_rows(), 1, "a.series should have 1 row");
         assert_eq!(bb.num_rows(), 1, "b.series should have 1 row");
-        debug!("[OK] tx3 sees both files from fresh cache");
+        debug!("[OK] tx3 sees both committed files");
     }
 }

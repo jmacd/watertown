@@ -10,6 +10,7 @@
 //! factory.
 
 use anyhow::Result;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -81,28 +82,6 @@ pub struct SeriesExportManifest {
 
 /// File name of the per-series export manifest inside a series export dir.
 pub const MANIFEST_FILE: &str = ".export-manifest.json";
-
-/// Maximum number of Hive partitions written by a single `COPY ... PARTITIONED
-/// BY` statement.
-///
-/// DataFusion's partitioned write holds one open Parquet writer per partition
-/// for the whole statement and never closes one early, even though our source
-/// query is `ORDER BY` the timestamp and therefore visits partitions in order.
-/// Each open writer costs on the order of a megabyte of column and page
-/// buffers, so peak memory tracks *partition count*, not data volume. Measured
-/// on a 1-minute series whose partitioned form is ~100 MB of data:
-///
-/// | partitioning        | partitions | peak     |
-/// |---------------------|-----------:|---------:|
-/// | `year`              |          4 |    50 MB |
-/// | `year,month`        |         48 |   185 MB |
-/// | `year,month,day`    |       1412 |  2042 MB |
-///
-/// Chunking the rewrite bounds that cost, at the price of one enumeration pass
-/// over the timestamp column plus one source scan per chunk. The budget is
-/// deliberately conservative: wider schemas hold more per-writer buffers, and
-/// the export runs alongside the rest of a site build.
-const MAX_OPEN_PARTITIONS: usize = 128;
 
 /// Hierarchical metadata structure for export results
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -369,27 +348,53 @@ pub async fn export_table_provider_to_parquet(
             results.len(),
             source_label
         );
+        provider_ctx.record_export_outcome(0, results.len(), 0);
+        return Ok((results, schema));
+    }
+
+    // A reducer may prove that a wildcard/version recipe change produced no
+    // output changes for this series. Adopt the new recipe digest without
+    // scanning the source or rewriting byte-identical partitions.
+    if let (Some(h), Some(seed)) = (hint, seed_manifest.as_ref())
+        && h.change == tinyfs::ExportChange::Unchanged
+        && !seed.partitions.is_empty()
+    {
+        let mut results = Vec::new();
+        for p in &seed.partitions {
+            let abs = base_output_dir.join(&p.file);
+            verify_partition_digest(&abs, &p.digest, source_label)?;
+            results.push((
+                captures.to_vec(),
+                ExportOutput {
+                    file: p.file.clone(),
+                    start_time: p.start_time,
+                    end_time: p.end_time,
+                },
+            ));
+        }
+        let mut manifest = seed.clone();
+        manifest.digest = Some(h.digest.clone());
+        write_series_manifest(&manifest_path, &manifest)?;
+        let schema = read_parquet_schema(export_dir)?;
+        provider_ctx.record_export_outcome(0, results.len(), 0);
         return Ok((results, schema));
     }
 
     // Reconcile mode reuses partitions strictly before the changed-bucket
-    // watermark; it requires both a seed manifest and a Some(lo) watermark.
+    // watermark; it requires both a seed manifest and a bounded change.
     // Otherwise the output is fully rebuilt with deterministic file names.
     let reuse_before: Option<i64> = match (hint, seed_manifest.as_ref()) {
-        (Some(h), Some(_)) => h.changed_since,
+        (Some(h), Some(_)) => match h.change {
+            tinyfs::ExportChange::Since(lo) => Some(lo),
+            tinyfs::ExportChange::Unchanged | tinyfs::ExportChange::Everything => None,
+        },
         _ => None,
     };
     let can_reuse = reuse_before.is_some() && seed_manifest.is_some();
 
-    let seed_by_file: HashMap<PathBuf, &ManifestPartition> = seed_manifest
-        .as_ref()
-        .map(|m| m.partitions.iter().map(|p| (p.file.clone(), p)).collect())
-        .unwrap_or_default();
-
     if !can_reuse {
-        // Full rewrite: clear the dir so no stale partitions or prior
-        // UUID-named COPY output remain. An export is a full regenerate from
-        // source, so prior outputs are unconditionally stale.
+        // A full export regenerates every partition, so prior outputs are
+        // unconditionally stale.
         if export_dir.exists() {
             std::fs::remove_dir_all(export_dir).map_err(|e| {
                 anyhow::anyhow!(
@@ -402,6 +407,7 @@ pub async fn export_table_provider_to_parquet(
     }
     std::fs::create_dir_all(export_dir)?;
 
+    let source_schema = table_provider.schema();
     let ctx = &provider_ctx.datafusion_session;
     let unique_table_name = format!(
         "series_{}_{}",
@@ -418,16 +424,6 @@ pub async fn export_table_provider_to_parquet(
         )
         .map_err(|e| anyhow::anyhow!("Failed to register table: {}", e))?;
 
-    let export_dir_rel = export_dir
-        .strip_prefix(base_output_dir)
-        .map_err(|e| anyhow::anyhow!("export_dir not under base_output_dir: {}", e))?
-        .to_path_buf();
-
-    // Full-rewrite fast path: no prior output is reusable, so write every
-    // partition in a single `COPY ... PARTITIONED BY` (one source scan) rather
-    // than rescanning the source once per partition. The per-partition loop
-    // below is reserved for the small changed-partition tail of an incremental
-    // reconcile, where most partitions are reused and only a few are rewritten.
     if !can_reuse {
         let (results, manifest) = full_rewrite_partitioned(
             ctx,
@@ -439,6 +435,7 @@ pub async fn export_table_provider_to_parquet(
             captures,
             source_label,
             hint,
+            source_schema,
         )
         .await?;
 
@@ -446,6 +443,7 @@ pub async fn export_table_provider_to_parquet(
             unique_table_name.as_str(),
         ));
         write_series_manifest(&manifest_path, &manifest)?;
+        provider_ctx.record_export_outcome(1, 0, results.len());
 
         if results.is_empty() {
             return Err(anyhow::anyhow!(
@@ -457,104 +455,30 @@ pub async fn export_table_provider_to_parquet(
         return Ok((results, schema));
     }
 
-    let partitions = distinct_partitions(
+    let (results, manifest, reused, written) = reconcile_partitioned(
         ctx,
         &unique_table_name,
         temporal_parts,
         timestamp_column,
+        export_dir,
+        base_output_dir,
+        captures,
         source_label,
+        hint.expect("reconcile requires an export hint"),
+        seed_manifest
+            .as_ref()
+            .expect("reconcile requires a seed manifest"),
+        reuse_before.expect("reconcile requires a changed-since watermark"),
+        source_schema,
     )
     .await?;
-
-    let mut manifest = SeriesExportManifest {
-        digest: hint.map(|h| h.digest.clone()),
-        partitions: Vec::new(),
-    };
-    let mut results: Vec<(Vec<String>, ExportOutput)> = Vec::new();
-    let mut kept: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    let mut reused = 0usize;
-    let mut written = 0usize;
-
-    for part in &partitions {
-        let rel_dir = partition_rel_dir(part);
-        let file_rel = export_dir_rel.join(&rel_dir).join("data.parquet");
-        let abs_file = base_output_dir.join(&file_rel);
-        let (start_time, end_time) = extract_timestamps_from_path(&file_rel)?;
-
-        // A partition is unchanged iff its whole time window ends at or before
-        // the changed-bucket watermark, so no changed bucket falls inside it.
-        let reusable =
-            can_reuse && matches!((reuse_before, end_time), (Some(lo), Some(end)) if end <= lo);
-
-        if reusable
-            && let Some(seed_part) = seed_by_file.get(&file_rel)
-            && abs_file.exists()
-            && verify_partition_digest(&abs_file, &seed_part.digest, source_label).is_ok()
-        {
-            manifest.partitions.push((*seed_part).clone());
-            results.push((
-                captures.to_vec(),
-                ExportOutput {
-                    file: file_rel.clone(),
-                    start_time: seed_part.start_time,
-                    end_time: seed_part.end_time,
-                },
-            ));
-            _ = kept.insert(file_rel);
-            reused += 1;
-            continue;
-        }
-
-        let digest = export_one_partition(
-            ctx,
-            &unique_table_name,
-            timestamp_column,
-            part,
-            &abs_file,
-            source_label,
-        )
-        .await?;
-        manifest.partitions.push(ManifestPartition {
-            file: file_rel.clone(),
-            digest,
-            start_time,
-            end_time,
-        });
-        results.push((
-            captures.to_vec(),
-            ExportOutput {
-                file: file_rel.clone(),
-                start_time,
-                end_time,
-            },
-        ));
-        _ = kept.insert(file_rel);
-        written += 1;
-    }
-
-    // Drop any seeded partition file the current data no longer produces.
-    if can_reuse {
-        for p in seed_manifest.iter().flat_map(|m| &m.partitions) {
-            if !kept.contains(&p.file) {
-                let abs = base_output_dir.join(&p.file);
-                if abs.exists() {
-                    std::fs::remove_file(&abs).map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to remove stale partition '{}': {}",
-                            abs.display(),
-                            e
-                        )
-                    })?;
-                }
-            }
-        }
-    }
 
     _ = ctx.deregister_table(datafusion::sql::TableReference::bare(
         unique_table_name.as_str(),
     ));
 
     write_series_manifest(&manifest_path, &manifest)?;
+    provider_ctx.record_export_outcome(1, reused, written);
 
     log::debug!(
         "export {}: {} partitions ({} reused, {} written)",
@@ -587,154 +511,106 @@ fn partition_rel_dir(part: &[(String, i64)]) -> PathBuf {
     dir
 }
 
-/// Enumerate the distinct temporal-partition tuples present in the source,
-/// ordered chronologically. A null timestamp is a hard failure: it would map to
-/// an invalid `year=0` partition, so the caller must never emit one.
-async fn distinct_partitions(
+async fn reconcile_partitioned(
     ctx: &datafusion::prelude::SessionContext,
     table: &str,
     temporal_parts: &[String],
     timestamp_column: &str,
+    export_dir: &Path,
+    base_output_dir: &Path,
+    captures: &[String],
     source_label: &str,
-) -> Result<Vec<Vec<(String, i64)>>> {
-    if temporal_parts.is_empty() {
-        return Ok(vec![vec![]]);
-    }
+    hint: &tinyfs::ExportHint,
+    seed: &SeriesExportManifest,
+    changed_since: i64,
+    source_schema: arrow::datatypes::SchemaRef,
+) -> Result<(
+    Vec<(Vec<String>, ExportOutput)>,
+    SeriesExportManifest,
+    usize,
+    usize,
+)> {
+    let mut reusable_by_file: HashMap<PathBuf, &ManifestPartition> = HashMap::new();
+    let mut rewrite_from = Some(changed_since);
 
-    let cols = temporal_parts
-        .iter()
-        .map(|p| {
-            format!(
-                "CAST(date_part('{}', \"{}\") AS BIGINT) AS {}",
-                p, timestamp_column, p
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let order = (1..=temporal_parts.len())
-        .map(|i| i.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!("SELECT DISTINCT {cols} FROM \"{table}\" ORDER BY {order}");
-
-    let batches = ctx
-        .sql(&sql)
-        .await
-        .map_err(|e| anyhow::anyhow!("partition enumeration failed for '{}': {}", source_label, e))?
-        .collect()
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!("partition enumeration failed for '{}': {}", source_label, e)
-        })?;
-
-    let mut out = Vec::new();
-    for batch in &batches {
-        use arrow::array::Array;
-        let arrays: Vec<&arrow::array::Int64Array> = (0..temporal_parts.len())
-            .map(|i| {
-                batch
-                    .column(i)
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int64Array>()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "partition column {} is not Int64 for '{}'",
-                            i,
-                            source_label
-                        )
-                    })
-            })
-            .collect::<Result<_>>()?;
-        for row in 0..batch.num_rows() {
-            let mut tuple = Vec::with_capacity(temporal_parts.len());
-            for (i, name) in temporal_parts.iter().enumerate() {
-                if arrays[i].is_null(row) {
-                    return Err(anyhow::anyhow!(
-                        "Null timestamp partition value for '{}' in '{}'. \
-                         This indicates nullable timestamp data.",
-                        name,
-                        source_label
-                    ));
-                }
-                tuple.push((name.clone(), arrays[i].value(row)));
+    for partition in &seed.partitions {
+        let abs = base_output_dir.join(&partition.file);
+        if matches!(partition.end_time, Some(end) if end <= changed_since) {
+            if !abs.exists() {
+                return Err(anyhow::anyhow!(
+                    "Reusable export partition '{}' for '{}' is missing",
+                    abs.display(),
+                    source_label
+                ));
             }
-            out.push(tuple);
+            verify_partition_digest(&abs, &partition.digest, source_label)?;
+            _ = reusable_by_file.insert(partition.file.clone(), partition);
+            continue;
+        }
+
+        rewrite_from = match (rewrite_from, partition.start_time) {
+            (Some(current), Some(start)) => Some(current.min(start)),
+            _ => None,
+        };
+        if abs.exists() {
+            std::fs::remove_file(&abs).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to remove stale partition '{}': {}",
+                    abs.display(),
+                    e
+                )
+            })?;
         }
     }
-    Ok(out)
-}
 
-/// Export a single partition to a deterministic file via a temp-then-rename so
-/// a hardlinked seed file (from `build-<ts>/` seeded off `current/`) is never
-/// modified in place. Returns the blake3 digest of the written file.
-async fn export_one_partition(
-    ctx: &datafusion::prelude::SessionContext,
-    table: &str,
-    timestamp_column: &str,
-    part: &[(String, i64)],
-    abs_file: &Path,
-    source_label: &str,
-) -> Result<String> {
-    if let Some(parent) = abs_file.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = abs_file.with_extension(format!("parquet.tmp-{}", std::process::id()));
+    stream_partitioned_export(
+        ctx,
+        table,
+        temporal_parts,
+        timestamp_column,
+        export_dir,
+        source_label,
+        source_schema,
+        rewrite_from,
+    )
+    .await?;
 
-    let mut where_clause = String::new();
-    for (i, (name, value)) in part.iter().enumerate() {
-        if i > 0 {
-            where_clause.push_str(" AND ");
-        }
-        where_clause.push_str(&format!(
-            "CAST(date_part('{}', \"{}\") AS BIGINT) = {}",
-            name, timestamp_column, value
-        ));
-    }
-    let where_sql = if where_clause.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", where_clause)
+    let produced = discover_exported_files(export_dir, base_output_dir)?;
+    let mut manifest = SeriesExportManifest {
+        digest: Some(hint.digest.clone()),
+        partitions: Vec::with_capacity(produced.len()),
     };
-    let copy_sql = format!(
-        "COPY (SELECT * FROM \"{table}\"{where_sql} ORDER BY \"{ts}\") TO '{out}' STORED AS PARQUET",
-        ts = timestamp_column,
-        out = tmp.to_string_lossy()
-    );
-    log::debug!("export partition SQL: {}", copy_sql);
-    let df = ctx
-        .sql(&copy_sql)
-        .await
-        .map_err(|e| anyhow::anyhow!("COPY failed for '{}': {}", source_label, e))?;
-    let _ = df
-        .collect()
-        .await
-        .map_err(|e| anyhow::anyhow!("COPY stream failed for '{}': {}", source_label, e))?;
-
-    std::fs::rename(&tmp, abs_file).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to publish partition '{}': {}",
-            abs_file.display(),
-            e
-        )
-    })?;
-    Ok(crate::version_cache::file_blake3(abs_file)?)
+    let mut results = Vec::with_capacity(produced.len());
+    let mut reused = 0;
+    let mut written = 0;
+    for output in produced {
+        let partition = if let Some(seed_partition) = reusable_by_file.get(&output.file) {
+            reused += 1;
+            (*seed_partition).clone()
+        } else {
+            written += 1;
+            ManifestPartition {
+                digest: crate::version_cache::file_blake3(&base_output_dir.join(&output.file))?,
+                file: output.file.clone(),
+                start_time: output.start_time,
+                end_time: output.end_time,
+            }
+        };
+        manifest.partitions.push(partition);
+        results.push((captures.to_vec(), output));
+    }
+    results.sort_by(|a, b| a.1.file.cmp(&b.1.file));
+    manifest.partitions.sort_by(|a, b| a.file.cmp(&b.file));
+    Ok((results, manifest, reused, written))
 }
 
-/// Full-rewrite export via `COPY ... PARTITIONED BY` (one source scan per chunk).
+/// Full-rewrite export from one ordered source execution.
 ///
-/// This is the fast path taken when no prior output can be reused (first build,
-/// missing seed manifest, or an unbounded `changed_since`). It writes the
-/// partitions in as few DataFusion passes as the [`MAX_OPEN_PARTITIONS`] writer
-/// budget allows -- as opposed to `export_one_partition`, which rescans the
-/// source once per partition and is only appropriate for the small
-/// changed-partition tail of an incremental reconcile. DataFusion emits one
-/// UUID-named parquet per Hive partition; each is renamed to the deterministic
-/// `data.parquet` so a later build can reuse it by path, and its blake3 digest
-/// is recorded in the returned manifest.
-///
-/// Chunking does not change the output: each chunk selects a disjoint set of
-/// partitions, so every partition is written exactly once, by exactly one
-/// statement, from the same rows it would have received from a single COPY.
+/// DataFusion's partitioned `COPY` holds one writer open per partition and
+/// requires a separate partition-enumeration execution to bound that set.
+/// Instead, this path orders rows by their partition tuple and timestamp, then
+/// closes each Parquet writer before opening the next. DataFusion may spill the
+/// sort, while export memory remains independent of partition count.
 async fn full_rewrite_partitioned(
     ctx: &datafusion::prelude::SessionContext,
     table: &str,
@@ -745,62 +621,20 @@ async fn full_rewrite_partitioned(
     captures: &[String],
     source_label: &str,
     hint: Option<&tinyfs::ExportHint>,
+    source_schema: arrow::datatypes::SchemaRef,
 ) -> Result<(Vec<(Vec<String>, ExportOutput)>, SeriesExportManifest)> {
-    // Enumerate the partitions up front so the rewrite can be split when there
-    // are more of them than one statement should hold writers for.
-    let partitions = if temporal_parts.is_empty() {
-        Vec::new()
-    } else {
-        distinct_partitions(ctx, table, temporal_parts, timestamp_column, source_label).await?
-    };
+    stream_partitioned_export(
+        ctx,
+        table,
+        temporal_parts,
+        timestamp_column,
+        export_dir,
+        source_label,
+        source_schema,
+        None,
+    )
+    .await?;
 
-    if partitions.len() > MAX_OPEN_PARTITIONS {
-        let chunks: Vec<&[Vec<(String, i64)>]> = partitions.chunks(MAX_OPEN_PARTITIONS).collect();
-        log::debug!(
-            "full-rewrite export: {} partitions for '{}' exceed the {}-writer budget; \
-             rewriting in {} chunks",
-            partitions.len(),
-            source_label,
-            MAX_OPEN_PARTITIONS,
-            chunks.len()
-        );
-        for (i, chunk) in chunks.iter().enumerate() {
-            // Each chunk writes to its own directory and is then moved into
-            // place. Writing every chunk straight into `export_dir` would rely
-            // on DataFusion appending rather than replacing the directory
-            // contents; staging keeps the result independent of that.
-            let chunk_dir = export_dir.join(format!(".chunk-{i}"));
-            if chunk_dir.exists() {
-                std::fs::remove_dir_all(&chunk_dir)?;
-            }
-            std::fs::create_dir_all(&chunk_dir)?;
-            run_partitioned_copy(
-                ctx,
-                table,
-                temporal_parts,
-                timestamp_column,
-                &chunk_dir,
-                Some(chunk),
-                source_label,
-            )
-            .await?;
-            merge_chunk_dir(&chunk_dir, export_dir, source_label)?;
-        }
-    } else {
-        run_partitioned_copy(
-            ctx,
-            table,
-            temporal_parts,
-            timestamp_column,
-            export_dir,
-            None,
-            source_label,
-        )
-        .await?;
-    }
-
-    // DataFusion wrote one UUID-named parquet per Hive partition. Rename each to
-    // the deterministic `data.parquet` and record its digest + temporal bounds.
     let produced = discover_exported_files(export_dir, base_output_dir)?;
     let mut manifest = SeriesExportManifest {
         digest: hint.map(|h| h.digest.clone()),
@@ -808,33 +642,9 @@ async fn full_rewrite_partitioned(
     };
     let mut results: Vec<(Vec<String>, ExportOutput)> = Vec::new();
     for out in produced {
-        let src_abs = base_output_dir.join(&out.file);
-        let file_rel = out
-            .file
-            .parent()
-            .map(|d| d.join("data.parquet"))
-            .unwrap_or_else(|| PathBuf::from("data.parquet"));
-        let dst_abs = base_output_dir.join(&file_rel);
-        if src_abs != dst_abs {
-            if dst_abs.exists() {
-                return Err(anyhow::anyhow!(
-                    "Partition '{}' produced more than one parquet file for '{}'; \
-                     deterministic naming requires exactly one file per partition.",
-                    file_rel.display(),
-                    source_label
-                ));
-            }
-            std::fs::rename(&src_abs, &dst_abs).map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to normalize partition '{}': {}",
-                    dst_abs.display(),
-                    e
-                )
-            })?;
-        }
-        let digest = crate::version_cache::file_blake3(&dst_abs)?;
+        let digest = crate::version_cache::file_blake3(&base_output_dir.join(&out.file))?;
         manifest.partitions.push(ManifestPartition {
-            file: file_rel.clone(),
+            file: out.file.clone(),
             digest,
             start_time: out.start_time,
             end_time: out.end_time,
@@ -842,7 +652,7 @@ async fn full_rewrite_partitioned(
         results.push((
             captures.to_vec(),
             ExportOutput {
-                file: file_rel,
+                file: out.file,
                 start_time: out.start_time,
                 end_time: out.end_time,
             },
@@ -853,126 +663,199 @@ async fn full_rewrite_partitioned(
     Ok((results, manifest))
 }
 
-/// Build the predicate selecting exactly the partitions in `chunk`.
-///
-/// Each partition contributes one conjunction of `date_part(...) = value`
-/// equalities -- the same form `export_one_partition` uses for a single
-/// partition -- and the chunk is their disjunction. Chunks partition the
-/// enumerated tuples, so the predicates are mutually exclusive and jointly
-/// cover every partition.
-fn partition_chunk_predicate(chunk: &[Vec<(String, i64)>], timestamp_column: &str) -> String {
-    chunk
-        .iter()
-        .map(|part| {
-            let conj = part
-                .iter()
-                .map(|(name, value)| {
-                    format!(
-                        "CAST(date_part('{}', \"{}\") AS BIGINT) = {}",
-                        name, timestamp_column, value
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" AND ");
-            format!("({conj})")
-        })
-        .collect::<Vec<_>>()
-        .join(" OR ")
-}
-
-/// Run one `COPY ... PARTITIONED BY` into `target_dir`.
-///
-/// `chunk` restricts the statement to a subset of partitions; `None` writes the
-/// whole source in one pass.
-async fn run_partitioned_copy(
+async fn stream_partitioned_export(
     ctx: &datafusion::prelude::SessionContext,
     table: &str,
     temporal_parts: &[String],
     timestamp_column: &str,
-    target_dir: &Path,
-    chunk: Option<&[Vec<(String, i64)>]>,
+    export_dir: &Path,
     source_label: &str,
+    source_schema: arrow::datatypes::SchemaRef,
+    event_time_lo: Option<i64>,
 ) -> Result<()> {
+    let partition_aliases = temporal_parts
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("__watertown_export_partition_{i}"))
+        .collect::<Vec<_>>();
     let temporal_columns = temporal_parts
         .iter()
-        .map(|p| {
+        .zip(&partition_aliases)
+        .map(|(part, alias)| {
             format!(
-                "CAST(date_part('{}', \"{}\") AS BIGINT) AS {}",
-                p, timestamp_column, p
+                "CAST(date_part('{}', \"{}\") AS BIGINT) AS \"{}\"",
+                part, timestamp_column, alias
             )
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let where_sql = match chunk {
-        Some(c) => format!(" WHERE {}", partition_chunk_predicate(c, timestamp_column)),
-        None => String::new(),
-    };
-    let select = if temporal_parts.is_empty() {
+    let where_sql = event_time_lo.map_or_else(String::new, |lo| {
+        format!(" WHERE \"{timestamp_column}\" >= to_timestamp_seconds({lo})")
+    });
+    let sql = if temporal_parts.is_empty() {
         format!("SELECT * FROM \"{table}\"{where_sql} ORDER BY \"{timestamp_column}\"")
     } else {
+        let partition_order = (1..=temporal_parts.len())
+            .map(|i| (source_schema.fields().len() + i).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
-            "SELECT *, {temporal_columns} FROM \"{table}\"{where_sql} ORDER BY \"{timestamp_column}\""
+            "SELECT *, {temporal_columns} FROM \"{table}\"{where_sql} \
+             ORDER BY {partition_order}, \"{timestamp_column}\""
         )
     };
-    let mut copy_sql = format!(
-        "COPY ({select}) TO '{}' STORED AS PARQUET",
-        target_dir.to_string_lossy()
-    );
-    if !temporal_parts.is_empty() {
-        copy_sql.push_str(&format!(" PARTITIONED BY ({})", temporal_parts.join(", ")));
+    log::debug!("full-rewrite export query: {}", sql);
+    let mut stream = ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| anyhow::anyhow!("export planning failed for '{}': {}", source_label, e))?
+        .execute_stream()
+        .await
+        .map_err(|e| anyhow::anyhow!("export execution failed for '{}': {}", source_label, e))?;
+
+    let source_columns = source_schema.fields().len();
+    let mut active: Option<ActivePartitionWriter> = None;
+    while let Some(batch) = stream.next().await {
+        let batch = batch.map_err(|e| {
+            anyhow::anyhow!("export execution failed for '{}': {}", source_label, e)
+        })?;
+        let partition_columns = (0..temporal_parts.len())
+            .map(|i| {
+                batch
+                    .column(source_columns + i)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "partition column {} is not Int64 for '{}'",
+                            i,
+                            source_label
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let source_batch = arrow::record_batch::RecordBatch::try_new(
+            source_schema.clone(),
+            batch.columns()[..source_columns].to_vec(),
+        )?;
+
+        let mut start = 0;
+        while start < batch.num_rows() {
+            let part = partition_tuple(&partition_columns, temporal_parts, start, source_label)?;
+            let mut end = start + 1;
+            while end < batch.num_rows()
+                && partition_tuple(&partition_columns, temporal_parts, end, source_label)? == part
+            {
+                end += 1;
+            }
+            if active.as_ref().map(|writer| &writer.part) != Some(&part) {
+                if let Some(writer) = active.take() {
+                    writer.finish(source_label)?;
+                }
+                active = Some(ActivePartitionWriter::create(
+                    export_dir,
+                    part,
+                    source_schema.clone(),
+                    source_label,
+                )?);
+            }
+            active
+                .as_mut()
+                .expect("partition writer was just created")
+                .writer
+                .write(&source_batch.slice(start, end - start))
+                .map_err(|e| {
+                    anyhow::anyhow!("Parquet write failed for '{}': {}", source_label, e)
+                })?;
+            start = end;
+        }
     }
-    log::debug!("full-rewrite export SQL: {}", copy_sql);
-    let df = ctx
-        .sql(&copy_sql)
-        .await
-        .map_err(|e| anyhow::anyhow!("COPY failed for '{}': {}", source_label, e))?;
-    _ = df
-        .collect()
-        .await
-        .map_err(|e| anyhow::anyhow!("COPY stream failed for '{}': {}", source_label, e))?;
+
+    if let Some(writer) = active {
+        writer.finish(source_label)?;
+    }
     Ok(())
 }
 
-/// Move a chunk's partition tree into the export directory and remove the
-/// staging directory.
-///
-/// Chunks write disjoint partitions, so no destination file can already exist.
-/// A collision means two chunks claimed the same partition -- a correctness bug
-/// in the chunking, not a condition to resolve by overwriting -- so it is a hard
-/// failure.
-fn merge_chunk_dir(chunk_dir: &Path, export_dir: &Path, source_label: &str) -> Result<()> {
-    fn move_tree(dir: &Path, chunk_root: &Path, export_dir: &Path, label: &str) -> Result<()> {
-        for entry in std::fs::read_dir(dir)? {
-            let path = entry?.path();
-            if path.is_dir() {
-                move_tree(&path, chunk_root, export_dir, label)?;
-                continue;
-            }
-            let rel = path
-                .strip_prefix(chunk_root)
-                .map_err(|e| anyhow::anyhow!("chunk path outside its staging dir: {}", e))?;
-            let dst = export_dir.join(rel);
-            if dst.exists() {
+fn partition_tuple(
+    columns: &[&arrow::array::Int64Array],
+    names: &[String],
+    row: usize,
+    source_label: &str,
+) -> Result<Vec<(String, i64)>> {
+    use arrow::array::Array;
+
+    columns
+        .iter()
+        .zip(names)
+        .map(|(column, name)| {
+            if column.is_null(row) {
                 return Err(anyhow::anyhow!(
-                    "Chunked export produced partition '{}' twice for '{}'; \
-                     chunks must cover disjoint partitions.",
-                    rel.display(),
-                    label
+                    "Null timestamp partition value for '{}' in '{}'. \
+                     This indicates nullable timestamp data.",
+                    name,
+                    source_label
                 ));
             }
-            if let Some(parent) = dst.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::rename(&path, &dst).map_err(|e| {
-                anyhow::anyhow!("Failed to publish chunk file '{}': {}", dst.display(), e)
-            })?;
+            Ok((name.clone(), column.value(row)))
+        })
+        .collect()
+}
+
+struct ActivePartitionWriter {
+    part: Vec<(String, i64)>,
+    final_path: PathBuf,
+    temp_path: PathBuf,
+    writer: parquet::arrow::ArrowWriter<std::fs::File>,
+}
+
+impl ActivePartitionWriter {
+    fn create(
+        export_dir: &Path,
+        part: Vec<(String, i64)>,
+        schema: arrow::datatypes::SchemaRef,
+        source_label: &str,
+    ) -> Result<Self> {
+        let final_path = export_dir
+            .join(partition_rel_dir(&part))
+            .join("data.parquet");
+        if let Some(parent) = final_path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
-        Ok(())
+        if final_path.exists() {
+            return Err(anyhow::anyhow!(
+                "Partition '{}' was encountered more than once for '{}'; \
+                 ordered export must make each partition contiguous.",
+                final_path.display(),
+                source_label
+            ));
+        }
+        let temp_path = final_path.with_extension(format!("parquet.tmp-{}", std::process::id()));
+        let file = std::fs::File::create(&temp_path)?;
+        let writer = parquet::arrow::ArrowWriter::try_new(file, schema, None)?;
+        Ok(Self {
+            part,
+            final_path,
+            temp_path,
+            writer,
+        })
     }
 
-    move_tree(chunk_dir, chunk_dir, export_dir, source_label)?;
-    std::fs::remove_dir_all(chunk_dir)?;
-    Ok(())
+    fn finish(self, source_label: &str) -> Result<()> {
+        _ = self
+            .writer
+            .close()
+            .map_err(|e| anyhow::anyhow!("Parquet close failed for '{}': {}", source_label, e))?;
+        std::fs::rename(&self.temp_path, &self.final_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to publish partition '{}' for '{}': {}",
+                self.final_path.display(),
+                source_label,
+                e
+            )
+        })?;
+        Ok(())
+    }
 }
 
 /// Verify a partition file's bytes match a recorded digest, hard-failing on a
@@ -1611,7 +1494,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::factory::test_support::create_provider_context;
+    use std::any::Any;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn mem_table(rows: &[(i64, f64)]) -> Arc<dyn datafusion::catalog::TableProvider> {
         use arrow::array::{Float64Array, TimestampSecondArray};
@@ -1638,6 +1523,62 @@ mod tests {
         )
         .unwrap();
         Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
+    }
+
+    #[derive(Debug)]
+    struct ScanCountingTableProvider {
+        inner: Arc<dyn datafusion::catalog::TableProvider>,
+        scans: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl datafusion::catalog::TableProvider for ScanCountingTableProvider {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            self.inner.schema()
+        }
+
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            self.inner.table_type()
+        }
+
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&datafusion::logical_expr::Expr],
+        ) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>>
+        {
+            self.inner.supports_filters_pushdown(filters)
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn datafusion::catalog::Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[datafusion::logical_expr::Expr],
+            limit: Option<usize>,
+        ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+            _ = self.scans.fetch_add(1, Ordering::Relaxed);
+            self.inner.scan(state, projection, filters, limit).await
+        }
+    }
+
+    fn scan_counting_table(
+        inner: Arc<dyn datafusion::catalog::TableProvider>,
+    ) -> (
+        Arc<dyn datafusion::catalog::TableProvider>,
+        Arc<AtomicUsize>,
+    ) {
+        let scans = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(ScanCountingTableProvider {
+                inner,
+                scans: scans.clone(),
+            }),
+            scans,
+        )
     }
 
     fn ts(y: i32, mo: u32, d: u32) -> i64 {
@@ -1694,43 +1635,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn partition_chunk_predicate_is_a_disjunction_of_partition_equalities() {
-        let chunk = vec![
-            vec![("year".to_string(), 2025), ("month".to_string(), 6)],
-            vec![("year".to_string(), 2025), ("month".to_string(), 7)],
-        ];
-        let sql = partition_chunk_predicate(&chunk, "timestamp");
-        assert_eq!(
-            sql,
-            "(CAST(date_part('year', \"timestamp\") AS BIGINT) = 2025 AND \
-             CAST(date_part('month', \"timestamp\") AS BIGINT) = 6) OR \
-             (CAST(date_part('year', \"timestamp\") AS BIGINT) = 2025 AND \
-             CAST(date_part('month', \"timestamp\") AS BIGINT) = 7)"
-        );
-    }
-
-    /// A full rewrite whose partition count exceeds the writer budget is split
-    /// into several `COPY` statements. The split must be invisible: every
-    /// partition still appears exactly once, holding exactly its own rows, and
-    /// no staging directory survives to confuse partition discovery.
+    /// A full rewrite with many partitions keeps one writer open at a time.
+    /// Every partition must appear exactly once and hold exactly its own rows.
     #[tokio::test]
-    async fn test_export_chunks_large_partition_counts_without_changing_output() {
+    async fn test_export_streams_large_partition_counts_without_changing_output() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
         let export_dir = base.join("WellDepth/res=1m");
         let ctx = create_provider_context();
         let parts = vec!["year".to_string(), "month".to_string(), "day".to_string()];
 
-        // One row per day, over enough days to force multiple chunks.
-        let days = MAX_OPEN_PARTITIONS * 2 + 5;
+        // This exceeds the former 128-writer budget by more than twofold.
+        let days = 261;
         let start = ts(2024, 1, 1);
         let rows: Vec<(i64, f64)> = (0..days)
             .map(|i| (start + (i as i64) * 86_400, i as f64))
             .collect();
 
+        let (table, scans) = scan_counting_table(mem_table(&rows));
         let (results, _schema) = export_table_provider_to_parquet(
-            mem_table(&rows),
+            table,
             "welldepth",
             &export_dir,
             &parts,
@@ -1744,20 +1668,24 @@ mod tests {
         .unwrap();
 
         assert_eq!(results.len(), days, "every day must yield one partition");
+        assert_eq!(
+            scans.load(Ordering::Relaxed),
+            1,
+            "full rewrite must plan exactly one source scan"
+        );
 
-        // No staging directory may remain: discovery walks the whole tree and
-        // would otherwise pick up chunk files under a bogus partition path.
+        // No temporary output may remain for discovery to mistake as data.
         for entry in std::fs::read_dir(&export_dir).unwrap() {
             let name = entry.unwrap().file_name();
             assert!(
                 !name.to_string_lossy().starts_with(".chunk-"),
-                "chunk staging dir left behind: {:?}",
+                "staging dir left behind: {:?}",
                 name
             );
         }
 
         // Each partition holds exactly the single row belonging to that day,
-        // which is only true if the chunk predicates were disjoint and total.
+        // which is only true if streamed partition routing was exact.
         let manifest = read_series_manifest(&export_dir.join(MANIFEST_FILE))
             .unwrap()
             .unwrap();
@@ -1796,7 +1724,7 @@ mod tests {
         let rows = [(ts(2025, 6, 15), 1.0), (ts(2025, 7, 10), 2.0)];
         let hint = tinyfs::ExportHint {
             digest: "DIGEST-A".into(),
-            changed_since: None,
+            change: tinyfs::ExportChange::Everything,
         };
 
         let (_r, _s) = export_table_provider_to_parquet(
@@ -1815,8 +1743,9 @@ mod tests {
         let jul = export_dir.join("year=2025/month=7/data.parquet");
         let jul_ino = inode(&jul);
 
+        let (table, scans) = scan_counting_table(mem_table(&rows));
         let (results, _s) = export_table_provider_to_parquet(
-            mem_table(&rows),
+            table,
             "wd",
             &export_dir,
             &parts,
@@ -1830,6 +1759,15 @@ mod tests {
         .unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(inode(&jul), jul_ino, "reuse must not rewrite the file");
+        assert_eq!(
+            scans.load(Ordering::Relaxed),
+            0,
+            "unchanged export must not plan a source scan"
+        );
+        let metrics = ctx.plan_visibility_metrics();
+        assert_eq!(metrics.export_source_executions, 1);
+        assert_eq!(metrics.export_partitions_reused, 2);
+        assert_eq!(metrics.export_partitions_written, 2);
 
         std::fs::write(&jul, b"corrupt").unwrap();
         let err = export_table_provider_to_parquet(
@@ -1853,6 +1791,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_export_recipe_only_change_adopts_digest_without_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let export_dir = base.join("WellDepth/res=1m");
+        let ctx = create_provider_context();
+        let parts = vec!["year".to_string(), "month".to_string()];
+        let rows = [(ts(2025, 6, 15), 1.0), (ts(2025, 7, 10), 2.0)];
+
+        let (_r, _s) = export_table_provider_to_parquet(
+            mem_table(&rows),
+            "wd",
+            &export_dir,
+            &parts,
+            &["x".into()],
+            base,
+            &ctx,
+            "timestamp",
+            Some(&tinyfs::ExportHint {
+                digest: "D1".into(),
+                change: tinyfs::ExportChange::Everything,
+            }),
+        )
+        .await
+        .unwrap();
+        let jun = export_dir.join("year=2025/month=6/data.parquet");
+        let jul = export_dir.join("year=2025/month=7/data.parquet");
+        let jun_ino = inode(&jun);
+        let jul_ino = inode(&jul);
+
+        let (table, scans) = scan_counting_table(mem_table(&rows));
+        let (results, _s) = export_table_provider_to_parquet(
+            table,
+            "wd",
+            &export_dir,
+            &parts,
+            &["x".into()],
+            base,
+            &ctx,
+            "timestamp",
+            Some(&tinyfs::ExportHint {
+                digest: "D2".into(),
+                change: tinyfs::ExportChange::Unchanged,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(scans.load(Ordering::Relaxed), 0);
+        assert_eq!(inode(&jun), jun_ino);
+        assert_eq!(inode(&jul), jul_ino);
+        let manifest = read_series_manifest(&export_dir.join(MANIFEST_FILE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(manifest.digest.as_deref(), Some("D2"));
+        let metrics = ctx.plan_visibility_metrics();
+        assert_eq!(metrics.export_source_executions, 1);
+        assert_eq!(metrics.export_partitions_reused, 2);
+        assert_eq!(metrics.export_partitions_written, 2);
+    }
+
+    #[tokio::test]
     async fn test_export_partial_reconcile_reuses_unchanged_partitions() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
@@ -1871,7 +1871,7 @@ mod tests {
             "timestamp",
             Some(&tinyfs::ExportHint {
                 digest: "D1".into(),
-                changed_since: None,
+                change: tinyfs::ExportChange::Everything,
             }),
         )
         .await
@@ -1881,15 +1881,17 @@ mod tests {
         let jun_ino = inode(&jun);
         let jul_ino = inode(&jul);
 
-        // July gains a point; changed_since = 2025-07-01. June ends at
-        // 2025-07-01 <= lo so it is reused; July is rewritten.
-        let lo = ts(2025, 7, 1);
+        // July gains a point after the dirty watermark. June ends before the
+        // watermark and is reused; July is rewritten from its partition start
+        // so the unchanged July 10 row is retained.
+        let lo = ts(2025, 7, 20);
+        let (table, scans) = scan_counting_table(mem_table(&[
+            (ts(2025, 6, 15), 1.0),
+            (ts(2025, 7, 10), 2.0),
+            (ts(2025, 7, 25), 3.0),
+        ]));
         let (results, _s) = export_table_provider_to_parquet(
-            mem_table(&[
-                (ts(2025, 6, 15), 1.0),
-                (ts(2025, 7, 10), 2.0),
-                (ts(2025, 7, 25), 3.0),
-            ]),
+            table,
             "wd",
             &export_dir,
             &parts,
@@ -1899,7 +1901,7 @@ mod tests {
             "timestamp",
             Some(&tinyfs::ExportHint {
                 digest: "D2".into(),
-                changed_since: Some(lo),
+                change: tinyfs::ExportChange::Since(lo),
             }),
         )
         .await
@@ -1916,10 +1918,28 @@ mod tests {
             jul_ino,
             "changed July partition must be rewritten"
         );
+        assert_eq!(
+            scans.load(Ordering::Relaxed),
+            1,
+            "reconcile must plan one bounded dirty-tail source scan"
+        );
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            std::fs::File::open(&jul).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            reader.metadata().file_metadata().num_rows(),
+            2,
+            "dirty partition rewrite must include rows before the watermark"
+        );
 
         let manifest = read_series_manifest(&export_dir.join(MANIFEST_FILE))
             .unwrap()
             .unwrap();
         assert_eq!(manifest.digest.as_deref(), Some("D2"));
+        let metrics = ctx.plan_visibility_metrics();
+        assert_eq!(metrics.export_source_executions, 2);
+        assert_eq!(metrics.export_partitions_reused, 1);
+        assert_eq!(metrics.export_partitions_written, 3);
     }
 }

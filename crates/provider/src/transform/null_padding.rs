@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, new_null_array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
@@ -374,6 +374,22 @@ fn extend_batch(
     inner_projection: &Option<Vec<usize>>,
 ) -> DataFusionResult<RecordBatch> {
     let num_rows = batch.num_rows();
+
+    if let Some(proj) = projection
+        && proj.is_empty()
+    {
+        let schema = Arc::new(
+            extended_schema
+                .project(proj)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
+        );
+        return RecordBatch::try_new_with_options(
+            schema,
+            Vec::new(),
+            &RecordBatchOptions::new().with_row_count(Some(num_rows)),
+        )
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None));
+    }
 
     // If we have inner_projection, we need to reconstruct the full extended schema
     let columns: Vec<ArrayRef> = if let Some(inner_proj) = inner_projection {
@@ -908,6 +924,28 @@ mod tests {
             assert!(proj.contains(&0) && proj.contains(&1) && proj.contains(&2));
         }
         // Either None or Some([0,1,2]) is acceptable for scanning all columns
+
+        // Test 5: COUNT(*) projects no output columns through the padding plan,
+        // but its input batches must retain their row counts.
+        *last_projection.lock().unwrap() = None;
+        let df = ctx.sql("SELECT COUNT(*) AS count FROM test").await?;
+        let results = df.collect().await?;
+        assert_eq!(results[0].num_columns(), 1);
+        assert_eq!(results[0].num_rows(), 1);
+        assert_eq!(
+            results[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap()
+                .value(0),
+            3
+        );
+        assert_eq!(
+            last_projection.lock().unwrap().clone(),
+            Some(vec![0]),
+            "empty output projection still needs one inner column for row count"
+        );
 
         Ok(())
     }

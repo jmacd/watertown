@@ -65,11 +65,11 @@ jobs:
         id: v
         run: |
           set -euo pipefail
-          # Version scheme: 0.<pr>.<build>. <pr> is the pull-request number,
-          # taken directly on PR events or parsed from the merge/squash commit
-          # subject on main. <build> is the total commit count, monotonic across
-          # every build cause, so each build is strictly-newer under
-          # dpkg --compare-versions and the selfmon auto-updater always upgrades.
+          # Version scheme: 0.<build>.<pr>. <build> is the total commit count
+          # and therefore the first compared, monotonic component, so every
+          # later build is strictly newer under dpkg --compare-versions even
+          # when PRs merge out of numeric order. <pr> is taken directly on PR
+          # events or parsed from the merge/squash commit subject on main.
           # A direct push without a PR ref inherits the most recent PR number in
           # history so <pr> never collapses to 0. 0. is the epoch until a
           # deliberate 1.0.0.
@@ -80,7 +80,16 @@ jobs:
             PR=$(git log --pretty=%s | grep -oE '#[0-9]+' | head -1 | tr -d '#' || true)
             PR=${PR:-0}
           fi
-          VERSION="0.${PR}.${BUILD}"
+          VERSION="0.${BUILD}.${PR}"
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD^ 2>/dev/null || true)
+          if [ -z "${PREVIOUS_TAG}" ]; then
+            echo "::error::cannot verify ${VERSION}: no prior v* release tag is reachable" >&2
+            exit 1
+          fi
+          if ! dpkg --compare-versions "${VERSION}" gt "${PREVIOUS_TAG#v}"; then
+            echo "::error::computed version ${VERSION} is not newer than ${PREVIOUS_TAG}" >&2
+            exit 1
+          fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Computed version: ${VERSION}"
 
@@ -89,7 +98,7 @@ jobs:
     needs: [check, version]
     # Run on main/tags always, on PRs only with 'build-container' label
     if: |
-      (success() || failure()) && (
+      needs.check.result == 'success' && needs.version.result == 'success' && (
         github.event_name != 'pull_request' ||
         contains(github.event.pull_request.labels.*.name, 'build-container')
       )
@@ -166,7 +175,7 @@ jobs:
             --build-arg WATERTOWN_VERSION=${{ steps.meta.outputs.semver }} \
             -t ${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.version }}-${{ matrix.arch }} \
             -f Dockerfile .
-          # The 0.<pr>.<build> semver is an immutable, human-readable handle
+          # The 0.<build>.<pr> semver is an immutable, human-readable handle
           # alongside the moving version tag (latest / pr-N).
           podman tag \
             ${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.version }}-${{ matrix.arch }} \
@@ -202,7 +211,7 @@ jobs:
     # Same gate as build-container: always on main/workflow_dispatch, on PRs
     # only when the 'build-container' label is present.
     if: |
-      (success() || failure()) && (
+      needs.check.result == 'success' && needs.version.result == 'success' && (
         github.event_name != 'pull_request' ||
         contains(github.event.pull_request.labels.*.name, 'build-container')
       )

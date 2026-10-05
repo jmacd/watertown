@@ -1,10 +1,10 @@
 # Bounded-Memory Temporal Reduce: Sealed Runs + Hot Window
 
-> **Status:** Phases 1, 2 & 3 **implemented**. Motivated by the
-> watershop **selfmon** deployment, which
+> **Status:** Phases 1, 2 & 3 **implemented** and integrated with the typed
+> query foundation. Motivated by the watershop **selfmon** deployment, which
 > was run deliberately as a long-lived stressor and exposed unbounded memory
-> growth in the `temporal-reduce` read path. This note proposes reorganizing the
-> reduced-series materialization so that **no operator ever holds state
+> growth in the `temporal-reduce` read path. This note records the reorganization
+> of the reduced-series materialization so that **no operator ever holds state
 > proportional to total history**, while **all history is retained and remains
 > fully queryable** (this bounds *memory*, not *how far back you can query*). The
 > raw object model, the series delta layout, and the factory configuration
@@ -12,6 +12,31 @@
 > cached, and stored* changes.
 
 ---
+
+## Current integration
+
+This design supplied the sealed-run, hot-window, and hierarchical-partial
+storage machinery used by the completed DataFusion query-foundation work.
+Production behavior now has these additional guarantees:
+
+- partial creation, merge, reconstruction, and fixed-window reduction are
+  typed DataFusion plans; generated reduction SQL remains only as a test oracle;
+- recipe identity, exact source membership, settled frontier, and dirty ranges
+  are explicit contracts rather than cache-directory inference;
+- recursive physical lineage lets a cached reduction become a bounded source
+  for another reduction;
+- `temporal-reduce-series` exposes one exact source and resolution directly,
+  avoiding a materialized intermediate series;
+- a no-change read in a fresh process executes no dynamic source;
+- append, ordinary disorder, and supported retroactive repair each have
+  separate bounded-work tests; unsupported repair fails visibly; and
+- transactional streaming publication exposes neither partial output nor
+  progress after failure.
+
+The SQL names and line references below document the implementation that led
+to the sealed/hot layout. Later sections already record where production SQL
+was replaced by typed partial plans. The storage invariants remain current
+even where historical function names have moved.
 
 ## 0. Problem statement
 

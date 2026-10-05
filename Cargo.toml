@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+"crates/query-foundation",
 "crates/tinyfs",
 "crates/tlogfs",
 "crates/steward",
@@ -33,6 +34,7 @@ tlogfs = { path = "crates/tlogfs" }
 hydrovu = { path = "crates/hydrovu" }
 gitpond = { path = "crates/gitpond" }
 provider = { path = "crates/provider" }
+query-foundation = { path = "crates/query-foundation" }
 utilities = { path = "crates/utilities" }
 sitegen = { path = "crates/sitegen" }
 billing = { path = "crates/billing" }
@@ -151,7 +153,7 @@ restriction = { level = "allow", priority = -1 }
 unwrap_used = "deny"
 print_stdout = "deny"
 print_stderr = "deny"
-must-use-candidate = "warn"
+must_use_candidate = "warn"
 await_holding_lock = "warn"
 manual_async_fn = "warn"
 dbg_macro = "warn"

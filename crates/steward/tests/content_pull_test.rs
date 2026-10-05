@@ -26,7 +26,7 @@ use std::task::{Context, Poll};
 
 use arrow_array::{RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 
 fn meta(label: &str) -> PondUserMetadata {
     PondUserMetadata::new(vec!["test".into(), label.into()])
@@ -1710,6 +1710,52 @@ async fn rebuild_reproduces_dynamic_nodes() {
         dst_root, src_root,
         "rebuilt pond with dynamic nodes must be content-equal to the source"
     );
+}
+
+#[tokio::test]
+async fn restore_rebuild_keeps_imported_automatic_factories_inert() {
+    let (_t, mut src) = new_pond("restore-inert-src").await;
+    let error = src
+        .write_transaction(&meta("automatic-factory"), async move |fs| {
+            let root = fs.root().await?;
+            let _ = root.create_dir_all("/system/run").await?;
+            let _ = root
+                .create_dynamic_path(
+                    "/system/run/10-restored",
+                    tinyfs::EntryType::FileDynamic,
+                    "no-such-restored-factory",
+                    b"key: value\n".to_vec(),
+                )
+                .await?;
+            Ok(())
+        })
+        .await
+        .expect_err("source commit must expose the deliberately unknown factory");
+    assert!(error.to_string().contains("no-such-restored-factory"));
+
+    let (_rt, remote) = push(&src).await;
+    let graph = fetch_object_graph(&remote, "main").await.expect("fetch");
+    let dst_dir = tempdir().expect("dst dir");
+    let mut dst = Ship::create_pond(dst_dir.path().join("pond"), "restore-inert-dst")
+        .await
+        .expect("create destination");
+
+    let outcome = steward::rebuild_pond_suppressed(&mut dst, &remote, &graph)
+        .await
+        .expect("restore rebuild must not dispatch imported automatic factories");
+    assert_eq!(outcome.dynamic, 1);
+
+    let error = dst
+        .write_transaction(&meta("post-restore-write"), async move |fs| {
+            let root = fs.root().await?;
+            let mut writer = root.async_writer_path("/after-restore.txt").await?;
+            writer.write_all(b"trigger").await?;
+            writer.shutdown().await?;
+            Ok(())
+        })
+        .await
+        .expect_err("later ordinary writes must resume post-commit dispatch");
+    assert!(error.to_string().contains("no-such-restored-factory"));
 }
 
 /// Rebuilding from an empty graph is a hard error, not a silent no-op.

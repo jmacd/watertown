@@ -67,7 +67,7 @@ pub use content_pull::{
     destination_matches_publication, fetch_manifest_records, fetch_object_graph,
     fetch_object_graph_at_publication, fetch_object_graph_from_acknowledgement,
     fetch_object_graph_since, import_graft, import_pond, narrow_authenticated_publication_window,
-    rebuild_pond, recover_applied_publication, replace_graft,
+    rebuild_pond, rebuild_pond_suppressed, recover_applied_publication, replace_graft,
 };
 pub use content_push::{
     ContentPushOutcome, open_and_push_to_remote_limited, push_content_to_remote,

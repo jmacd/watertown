@@ -15,8 +15,9 @@
 //! - Batch column renaming in ExecutionPlan
 
 use async_trait::async_trait;
+use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::TableProvider;
 use datafusion::datasource::TableType;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -362,8 +363,7 @@ fn rename_batch_columns(
     // If no casts needed, just rename schema
     if cast_map.is_empty() {
         let columns = batch.columns().to_vec();
-        return RecordBatch::try_new(target_schema.clone(), columns)
-            .map_err(|e| DataFusionError::ArrowError(e.into(), None));
+        return renamed_batch(target_schema, columns, batch.num_rows());
     }
 
     // Apply casts where needed
@@ -383,6 +383,67 @@ fn rename_batch_columns(
         }
     }
 
-    RecordBatch::try_new(target_schema.clone(), new_columns)
-        .map_err(|e| DataFusionError::ArrowError(e.into(), None))
+    renamed_batch(target_schema, new_columns, batch.num_rows())
+}
+
+fn renamed_batch(
+    schema: &SchemaRef,
+    columns: Vec<ArrayRef>,
+    row_count: usize,
+) -> DataFusionResult<RecordBatch> {
+    RecordBatch::try_new_with_options(
+        schema.clone(),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(row_count)),
+    )
+    .map_err(|e| DataFusionError::ArrowError(e.into(), None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{Int32Array, Int64Array};
+    use datafusion::arrow::datatypes::Field;
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+
+    #[tokio::test]
+    async fn count_star_preserves_rows_through_empty_projection() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let inner = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap());
+        let table = Arc::new(
+            ColumnRenameTableProvider::new(
+                inner,
+                Arc::new(|name| format!("renamed_{name}")),
+                HashMap::new(),
+            )
+            .unwrap(),
+        );
+        let context = SessionContext::new();
+        _ = context.register_table("renamed", table).unwrap();
+
+        let batches = context
+            .sql("SELECT COUNT(*) AS count FROM renamed")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let count = batches[0]
+            .column_by_name("count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(count.value(0), 3);
+    }
 }

@@ -18,13 +18,29 @@ use steward::REMOTE_MOUNT_PATH_PREFIX;
 /// Pull from `name`, or from every remote in `pull`/`both` mode when `name`
 /// is `None`.  Each remote is processed independently.
 pub async fn pull_command(ship_context: &ShipContext, name: Option<String>) -> Result<()> {
-    pull_command_with_rebuild(ship_context, name, false).await
+    pull_command_inner(ship_context, name, false, false).await
 }
 
 pub async fn pull_command_with_rebuild(
     ship_context: &ShipContext,
     name: Option<String>,
     rebuild_graft: bool,
+) -> Result<()> {
+    pull_command_inner(ship_context, name, rebuild_graft, false).await
+}
+
+pub(crate) async fn pull_command_suppressed(
+    ship_context: &ShipContext,
+    name: Option<String>,
+) -> Result<()> {
+    pull_command_inner(ship_context, name, false, true).await
+}
+
+async fn pull_command_inner(
+    ship_context: &ShipContext,
+    name: Option<String>,
+    rebuild_graft: bool,
+    suppress_post_commit: bool,
 ) -> Result<()> {
     if rebuild_graft && name.is_none() {
         return Err(anyhow!(
@@ -61,7 +77,7 @@ pub async fn pull_command_with_rebuild(
     // makes a routine throttle look like an outage.
     let mut failures: Vec<String> = Vec::new();
     for name in targets {
-        if let Err(e) = pull_one(&mut ship, &name, rebuild_graft).await {
+        if let Err(e) = pull_one(&mut ship, &name, rebuild_graft, suppress_post_commit).await {
             log::error!("[ERR] pull {}: {}", name, e);
             failures.push(format!("{}: {}", name, e));
         }
@@ -293,7 +309,12 @@ async fn open_content_source(
     }
 }
 
-async fn pull_one(ship: &mut steward::Steward, name: &str, rebuild_graft: bool) -> Result<()> {
+async fn pull_one(
+    ship: &mut steward::Steward,
+    name: &str,
+    rebuild_graft: bool,
+    suppress_post_commit: bool,
+) -> Result<()> {
     let attachment = load_remote_attachment(ship, name).await?;
 
     // One dispatch, from the profile when there is one (Decision A8).  A
@@ -365,7 +386,7 @@ async fn pull_one(ship: &mut steward::Steward, name: &str, rebuild_graft: bool) 
         None if rebuild_graft => Err(anyhow!(
             "remote `{name}` is a mirror; --rebuild-graft only replaces a non-root graft"
         )),
-        None => pull_mirror(ship, name, &attachment, &source).await,
+        None => pull_mirror(ship, name, &attachment, &source, suppress_post_commit).await,
         Some(mount_path) => {
             pull_import(ship, name, &attachment, &source, &mount_path, rebuild_graft).await
         }
@@ -571,6 +592,7 @@ async fn pull_mirror(
     name: &str,
     attachment: &steward::RemoteAttachment,
     remote: &dyn steward::ContentSource,
+    suppress_post_commit: bool,
 ) -> Result<()> {
     let ship_ref = ship
         .as_pond_mut()
@@ -657,9 +679,12 @@ async fn pull_mirror(
         );
         graph = remaining;
     }
-    let outcome = steward::rebuild_pond(ship_ref, remote, &graph)
-        .await
-        .map_err(|e| anyhow!("rebuild from `{}`: {}", attachment.url, e))?;
+    let rebuild = if suppress_post_commit {
+        steward::rebuild_pond_suppressed(ship_ref, remote, &graph).await
+    } else {
+        steward::rebuild_pond(ship_ref, remote, &graph).await
+    };
+    let outcome = rebuild.map_err(|e| anyhow!("rebuild from `{}`: {}", attachment.url, e))?;
     log::info!(
         "[OK] pull {} complete (mirror rebuild: {:?})",
         name,

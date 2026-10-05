@@ -14,9 +14,12 @@
 //! This enables using `csv:///path/*.csv` in factory configs like timeseries_join.
 
 use crate::{Error, FileProvider, FormatProvider, FormatRegistry, Result, Url};
+use datafusion::catalog::view::ViewTable;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
+use query_foundation::overlap::OverlapPolicy;
+use query_foundation::plans::combine::{CombineInput, combine_same_scope};
 use std::future::Future;
 use std::sync::Arc;
 
@@ -744,7 +747,7 @@ impl Provider {
     /// materialization.
     ///
     /// For builtin types (`file`/`series`/`table`) or when no cache is
-    /// available, falls back to UNION ALL BY NAME (which materializes).
+    /// available, falls back to a typed, non-materializing same-scope combine.
     pub async fn create_provider_for_url(
         &self,
         url_str: &str,
@@ -830,35 +833,147 @@ impl Provider {
             return Ok(provider);
         }
 
-        // Fallback: individual providers + UNION ALL BY NAME
+        // Fallback: individual providers + typed same-scope combine.
         let mut table_providers = Vec::new();
         let _ = self
             .for_each_match_bounded(url_str, bounds, |tp, file_path| {
                 log::debug!("Matched file: {}", file_path);
-                table_providers.push(tp);
+                table_providers.push((file_path, tp));
                 async { Ok(()) }
             })
             .await?;
 
         if table_providers.len() == 1 {
-            return Ok(table_providers.into_iter().next().expect("len == 1"));
+            return Ok(table_providers.into_iter().next().expect("len == 1").1);
         }
 
-        // Multiple files without cache -- materialize via UNION ALL BY NAME in
-        // the caller's runtime so providers can use its registered object stores.
-        let mut providers = table_providers.into_iter();
-        let first = providers.next().expect("multiple providers");
-        let mut df = ctx.read_table(first)?;
-        for table_provider in providers {
-            df = df.union_by_name(ctx.read_table(table_provider)?)?;
+        let inputs = table_providers
+            .into_iter()
+            .enumerate()
+            .map(|(sequence, (path, table_provider))| {
+                Ok(CombineInput::new(
+                    path,
+                    u64::try_from(sequence).map_err(|_| {
+                        Error::SessionContext(
+                            "wildcard source count exceeds supported sequence range".to_owned(),
+                        )
+                    })?,
+                    ctx.read_table(table_provider)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let combined = combine_same_scope(inputs, &OverlapPolicy::PreserveAll).await?;
+        Ok(Arc::new(ViewTable::new(
+            combined.logical_plan().clone(),
+            Some(format!(
+                "typed PreserveAll combine for wildcard source {url_str}"
+            )),
+        )))
+    }
+
+    /// Resolve the immutable physical lineage of a URL pattern.
+    ///
+    /// Dynamic query nodes must explicitly expose recursive lineage and bounded
+    /// planning. A dynamic node without that contract returns `None`, forcing
+    /// callers onto their conservative non-incremental path.
+    pub(crate) async fn query_lineage_for_url(
+        &self,
+        url_str: &str,
+    ) -> Result<Option<tinyfs::QueryLineage>> {
+        let Some(context) = self.provider_context.as_ref() else {
+            return self.query_lineage_for_url_uncached(url_str).await;
+        };
+        let root_id = self.root().await?.node_path().id();
+        let cache_key = format!("{root_id}:{url_str}");
+        if let Some(lineage) = context.get_query_lineage_cache(&cache_key) {
+            return Ok(lineage);
         }
-        let batches = df.collect().await?;
-        let schema = batches
-            .first()
-            .map(|b| b.schema())
-            .ok_or_else(|| Error::SessionContext("No batches in union result".to_string()))?;
-        let mem_table = MemTable::try_new(schema, vec![batches])?;
-        Ok(Arc::new(mem_table))
+        let lineage = self.query_lineage_for_url_uncached(url_str).await?;
+        context.set_query_lineage_cache(cache_key, lineage.clone())?;
+        Ok(lineage)
+    }
+
+    async fn query_lineage_for_url_uncached(
+        &self,
+        url_str: &str,
+    ) -> Result<Option<tinyfs::QueryLineage>> {
+        let url = Url::parse(url_str)?;
+        let root = self.root().await?;
+        let mut matches = if url.path().contains('*') || url.path().contains('?') {
+            root.collect_matches(url.path()).await.map_err(|error| {
+                Error::InvalidUrl(format!(
+                    "Lineage pattern expansion failed for '{}': {error}",
+                    url.path()
+                ))
+            })?
+        } else {
+            vec![(self.resolve_url_node(&url).await?, Vec::new())]
+        };
+        matches.sort_by_key(|(node, _)| node.path());
+        matches.dedup_by_key(|(node, _)| node.id());
+
+        let mut lineage = tinyfs::QueryLineage::new(format!("pattern:{url}"));
+        for (node_path, _) in matches {
+            let file_id = node_path.id();
+            if file_id.entry_type().is_dynamic() {
+                let file_node = node_path.as_file().await.map_err(|error| {
+                    Error::InvalidUrl(format!(
+                        "Dynamic lineage node '{}' is not a file: {error}",
+                        node_path.path().display()
+                    ))
+                })?;
+                let file = file_node.handle.get_file().await;
+                let guard = file.lock().await;
+                if let Some(queryable) = guard.as_queryable() {
+                    let context = self
+                        .provider_context
+                        .as_ref()
+                        .expect("dynamic lineage requires ProviderContext");
+                    let Some(nested) = queryable.query_lineage(file_id, context).await? else {
+                        log::debug!(
+                            "query lineage unavailable for dynamic source '{}'",
+                            node_path.path().display()
+                        );
+                        return Ok(None);
+                    };
+                    lineage.extend(nested);
+                    continue;
+                }
+            }
+
+            let matched_url = url.with_path(&node_path.path().to_string_lossy());
+            let (node_id, versions) =
+                if let Some(format_provider) = FormatRegistry::get_provider(url.scheme()) {
+                    let Some(cache_dir) = self
+                        .provider_context
+                        .as_ref()
+                        .and_then(|context| context.cache_dir())
+                    else {
+                        return Ok(None);
+                    };
+                    self.ensure_url_cached(&matched_url, format_provider.as_ref(), cache_dir)
+                        .await?
+                } else {
+                    self.list_url_versions(&matched_url).await?
+                };
+            for version in versions {
+                let metadata = version.extended_metadata.as_ref();
+                let parse = |name: &str| {
+                    metadata
+                        .and_then(|values| values.get(name))
+                        .and_then(|value| value.parse::<i64>().ok())
+                };
+                lineage.leaves.push(tinyfs::QuerySourceLeaf {
+                    identity: match version.blake3 {
+                        Some(hash) => format!("{node_id}:{hash}"),
+                        None => format!("{node_id}:v{}", version.version),
+                    },
+                    min_event_time: parse("min_event_time"),
+                    max_event_time: parse("max_event_time"),
+                });
+            }
+        }
+        Ok(Some(lineage))
     }
 }
 
