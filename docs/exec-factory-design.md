@@ -1,8 +1,8 @@
 # Exec Factory: Running External Programs Against Pond Files
 
-> **Status:** Design proposal (unimplemented). Scoped to Linux only for v1
-> (Watershop + Azure, per `README.operations.md`); macOS is dev-only and is
-> validated through Docker, never treated as a security boundary.
+> **Status:** Implemented (`crates/exec-factory`). Scoped to Linux only for
+> v1 (Watershop + Azure, per `README.operations.md`); macOS is dev-only and
+> is validated through Docker, never treated as a security boundary.
 
 ---
 
@@ -126,20 +126,32 @@ spec:
     program: /bin/cat                   # absolute path, never PATH-searched
     args: ["journal.ledger"]
     inputs:
-      - /data/billing/journal.ledger     # pond path -> staged read-only
+      - /data/billing/journal.ledger     # exact pond path -> staged read-only
     outputs:
-      - /data/billing/reports/**         # pond paths this run may create/modify
-    on_missing_output: error             # error | ignore (deletions: always error, see §5)
+      - /data/billing/reports/           # trailing "/" = directory prefix;
+                                          # otherwise an exact file path
+    series_outputs:
+      - /data/billing/journal.ledger     # exact path, append-only (see §5b)
     env: {}                              # explicit allow-list; empty by default
     network: false                       # bwrap --unshare-net unless true
-    timeout_seconds: 60
+    interactive: false                   # true: keep terminal job control (§5c)
+    timeout_seconds: 60                  # 0 = no timeout; default depends on
+                                          # `interactive` (see below)
 ```
 
-`inputs`/`outputs` are pond-path globs, resolved relative to
-`context.root()` (which, per `FactoryContext::root()`
-(`crates/tinyfs/src/context.rs:522-534`), already honors an
-`effective_root` chroot when the factory config itself lives inside a
-foreign mount -- `exec` gets that scoping for free).
+`inputs` and `outputs` are exact pond paths, or (for `outputs` only) a
+directory prefix written with a trailing `/`; `series_outputs` entries must
+always be exact file paths (validated at `mknod` time). None of these are
+glob patterns -- see this module's doc comment in `config.rs` for why that
+simplification was made instead of reinventing a glob engine. Every path
+listed in `series_outputs` must *not* also appear in `outputs`: each output
+path picks exactly one commit semantics (whole-file diff vs. append-only),
+and listing it in both is rejected at `mknod` time.
+
+Paths are resolved relative to `context.root()` (which, per
+`FactoryContext::root()` (`crates/tinyfs/src/context.rs:522-534`), already
+honors an `effective_root` chroot when the factory config itself lives
+inside a foreign mount -- `exec` gets that scoping for free).
 
 `program` is always an absolute, explicit path -- there is no `$PATH`
 lookup, and `args` is always a literal `Vec<String>`, never a shell string,
@@ -147,36 +159,54 @@ so there is no shell-injection surface. If a program genuinely needs shell
 semantics, `program: /bin/bash, args: ["-c", "..."]` is spelled out
 explicitly in the config, which is pond-versioned and auditable.
 
+`timeout_seconds` defaults to 60s for ordinary runs and to "no timeout" for
+`interactive: true` runs (an attended session shouldn't be killed out from
+under the operator); `Some(0)` always means "no timeout" explicitly,
+either way. See `ExecConfig::effective_timeout`.
+
 ---
 
 ## 3. Staging and the input/output boundary
 
-1. **Stage inputs**: for each `inputs` glob, read the matching pond files
-   (`root.async_reader_path` / existing streaming read path) and write them
-   into `staging/<relative-path>` with the same relative layout they have
-   in the pond. Inputs are staged read-only (`chmod 0o444`) so a
-   misbehaving program gets `EACCES`, not a silent accepted write, if it
-   tries to modify something outside its declared `outputs`.
-2. **Snapshot outputs**: before exec, hash (BLAKE3, matching TinyFS's own
+1. **Stage inputs**: for each exact `inputs` path, read the pond file
+   (`root.read_file_path_to_vec`) and write it into
+   `staging/<relative-path>` with the same relative layout it has in the
+   pond. Inputs are staged read-only (`chmod 0o444`) so a misbehaving
+   program gets `EACCES`, not a silent accepted write, if it tries to
+   modify something outside its declared `outputs`/`series_outputs`.
+2. **Stage existing outputs**: any pond content already present at an
+   `outputs` path (exact or directory-prefix) is also staged -- writable
+   this time -- so the deletion check in §5 has something to compare
+   against, and so a program that only partially rewrites a file (e.g. a
+   report generator re-reading its own prior output) sees it.
+3. **Stage series outputs**: for each `series_outputs` path, load the
+   pond's current committed state via `provider::series_append` (§5b) and
+   write its full existing content into staging, writable. A path with no
+   prior committed version stages as an empty file -- the program's first
+   run creates the series' first version.
+4. **Snapshot outputs**: before exec, hash (BLAKE3, matching TinyFS's own
    content hashing -- `tinyfs::NodeMetadata::blake3`) every path that
-   currently matches an `outputs` glob, whether or not it exists yet
-   (nonexistent = `None`).
-3. **Exec** (see §4).
-4. **Re-snapshot and diff**: walk `outputs` globs again. Any path whose
-   hash changed from step 2 is a pending write. Any path that
-   newly matches `outputs` (and didn't in step 2) is a pending create. Any
-   path that existed in step 2 but is now missing is a **deletion** --
-   see §5.
-5. **Commit**: write every pending create/modify into TinyFS via the
-   existing `WD` write methods, inside the transaction `execute()` is
-   already running in. A failure partway through this loop fails the whole
-   `pond run` the same way any other factory error does -- nothing commits
-   until the surrounding transaction commits.
+   currently matches an `outputs` entry, whether or not it exists yet
+   (nonexistent = `None`). `series_outputs` paths are handled separately
+   (§5b), not through this whole-file hash/diff path.
+5. **Exec** (see §4).
+6. **Re-snapshot and diff**: walk `outputs` paths again. Any path whose
+   hash changed from step 4 is a pending write. Any path that newly
+   matches `outputs` (and didn't in step 4) is a pending create. Any path
+   that existed in step 4 but is now missing is a **deletion** -- see §5.
+7. **Commit**: write every pending create/modify into TinyFS via the
+   existing `WD` write methods, and commit every `series_outputs` suffix
+   via `provider::series_append::commit_series_append` (§5b) -- all inside
+   the transaction `execute()` is already running in. A failure partway
+   through this loop fails the whole `pond run` the same way any other
+   factory error does -- nothing commits until the surrounding transaction
+   commits.
 
-Paths outside every declared `outputs` glob are never written back, even if
-the program changed them in the staging directory -- they are silently
-discarded with the rest of the temp dir. Paths inside `inputs` globs are
-read-only at the OS level; the program simply cannot change them.
+Paths outside every declared `outputs`/`series_outputs` entry are never
+written back, even if the program changed them in the staging directory --
+they are silently discarded with the rest of the temp dir. Paths inside
+`inputs` are read-only at the OS level; the program simply cannot change
+them.
 
 ---
 
@@ -193,14 +223,16 @@ Representative invocation:
 
 ```
 bwrap \
-  --ro-bind /bin/cat /bin/cat \
-  --ro-bind /lib /lib --ro-bind /lib64 /lib64 --ro-bind /usr/lib /usr/lib \
+  --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
+  --ro-bind /bin /bin --ro-bind /sbin /sbin --ro-bind /etc /etc \
+  --dev /dev --proc /proc \
   --bind <staging> <staging> \
   --chdir <staging> \
-  --unshare-net \
   --unshare-pid \
   --die-with-parent \
   --new-session \
+  --unshare-net \
+  --setenv PATH /usr/local/bin:/usr/bin:/bin \
   -- /bin/cat journal.ledger
 ```
 
@@ -214,8 +246,12 @@ bwrap \
   `/lib*` read-only wholesale for v1 -- simplicity over minimality to
   start; tightening the bind set is a later hardening pass, not a
   blocker).
+- `--new-session` is **omitted** when `config.interactive: true` -- see
+  §5c for why an attended session trades away the `TIOCSTI` hardening that
+  flag provides.
 - `timeout_seconds` enforced from the Rust side (`tokio::time::timeout`
-  around the child wait), killing the process group on expiry.
+  around the child wait), killing the process group on expiry; `None` for
+  `interactive: true` runs by default (§2).
 
 **v1 is Linux-only by design** -- `bwrap` needs Linux namespace support.
 Since the deployment targets (Watershop, Azure, per stored project
@@ -268,15 +304,69 @@ degradation of a safety property.)
   `execute()` returns an error, and (per `run_pond_command`,
   `crates/cmd/src/commands/run.rs: Err(e) => Err(tx.abort(&e).await.into())`)
   the whole transaction aborts. No partial state ever reaches the pond.
-- **A program that writes outside its declared `outputs`** inside the
-  staging dir has those writes silently discarded with the temp directory
-  -- not an error, since the sandbox already prevented it from reaching
-  anything outside staging; the pond-path diff is simply scoped to
-  `outputs` regardless.
-- There is no notion of a long-running or interactive session in v1: one
-  `pond run` invocation is one program invocation, start to clean exit,
-  same as every other executable factory. A REPL-style editing session is
-  out of scope (see §7).
+- **A program that writes outside its declared `outputs`/`series_outputs`**
+  inside the staging dir has those writes silently discarded with the
+  temp directory -- not an error, since the sandbox already prevented it
+  from reaching anything outside staging; the pond-path diff is simply
+  scoped to the declared paths regardless.
+
+### 5b. `series_outputs`: append-only `FilePhysicalSeries` paths
+
+Some tools -- a Ledger-format journal chief among them -- only ever
+*append* new records to an existing file; the file's prior bytes are
+immutable history, not a snapshot to be freely rewritten. `series_outputs`
+maps a pond path onto `tinyfs::EntryType::FilePhysicalSeries` instead of
+the ordinary whole-file diff in §3: the program sees the path's full prior
+content (all committed versions concatenated), and on clean exit only the
+**new suffix bytes** -- not the whole file -- are committed as the next
+version, via `root.async_writer_path_with_type(path,
+EntryType::FilePhysicalSeries)`.
+
+This is exactly the problem `logfile_ingest` already solves (tailing an
+actively-written host log file into a pond series), so `exec-factory`
+doesn't reimplement it: both factories share
+**`provider::series_append`** (`crates/provider/src/series_append.rs`):
+
+- `PondSeriesState` / `load_series_state`: the pond's committed cumulative
+  state for a series path -- cumulative BLAKE3, cumulative byte count, and
+  (when available) the bao-tree frontier from the stored
+  `SeriesOutboard`.
+- `verify_prefix_matches`: confirms a host file's current bytes still
+  start with exactly the pond's committed prefix. When a frontier is
+  available this costs at most one `BLOCK_SIZE` read of the trailing
+  partial block, not a full re-hash of the whole file -- the same
+  incremental-bao-tree trick `logfile_ingest` uses to tail multi-GB log
+  files cheaply.
+- `read_new_suffix`: a TOCTOU-safe exact read of only the bytes past the
+  verified prefix.
+- `commit_series_append`: writes just that suffix as the series' next
+  version.
+
+If the staged file isn't a byte-for-byte extension of what was staged
+(the program edited, truncated, or deleted a prefix instead of only
+appending), `verify_prefix_matches` fails and the whole run is rejected --
+pond is left unchanged, same as any other output error. A path with no
+prior committed version (first run) always passes trivially and the whole
+staged file becomes the series' first version.
+
+### 5c. Interactive sessions
+
+`interactive: true` drops `bwrap`'s `--new-session` flag (§4) so a real
+interactive program -- an `hledger repl` session, `hledger add`'s
+prompts, an editor -- keeps normal terminal job control (Ctrl-C, Ctrl-Z)
+instead of losing it to a detached session. This trades away
+`--new-session`'s defense against the sandboxed program injecting fake
+keystrokes back at the controlling terminal (`TIOCSTI`) -- acceptable
+only because running a program interactively is already an explicit,
+attended choice by the operator at a real terminal, not something that
+runs unattended or from automation. It also defaults `timeout_seconds` to
+"no timeout" (§2), since an attended session shouldn't be killed out from
+under the operator mid-conversation.
+
+stdin/stdout/stderr are inherited from the `pond` process by default
+(standard `tokio::process::Command` behavior), so `pond run
+/system/etc/<interactive-exec-node>` at a real terminal just works --
+no separate plumbing needed for v1.
 
 ---
 
@@ -328,6 +418,47 @@ committed output. Any arguments are passed straight through to
 
 ---
 
+## 6b. Worked example: an interactive `hledger` session against a pond journal
+
+`scripts/examples/hledger-journal.yaml`:
+
+```yaml
+program: /usr/bin/hledger
+args: ["repl", "-f", "accounting/journal.ledger"]
+inputs: []
+series_outputs: ["/accounting/journal.ledger"]
+interactive: true
+```
+
+This mounts the journal as a `series_outputs` path (§5b) -- `hledger`
+itself only ever appends new transactions to a Ledger file, never rewrites
+old ones, so the pond keeps every prior version's bytes immutable and only
+commits what the session actually added. `interactive: true` (§5c) keeps
+real terminal job control, since `hledger repl` is an attended
+read/query REPL (`balance`, `register`, `print`, ...); extending the
+journal from the same session (e.g. with `hledger add`, or any editor
+reachable inside the sandbox) is an ordinary append and commits like any
+other `series_outputs` write.
+
+End to end -- the first run against a not-yet-existing
+`/accounting/journal.ledger` stages an empty file and whatever the session
+writes becomes the series' first version, so there's no separate seeding
+step (and no need for `pond copy`, which would create a plain
+`file:physical:version` that collides with `file:physical:series` on the
+next run):
+
+```
+pond mknod exec /system/etc/hledger --config-path scripts/examples/hledger-journal.yaml
+pond run /system/etc/hledger
+```
+
+`pond run` inherits the controlling terminal's stdin/stdout/stderr, so this
+drops the operator straight into `hledger`'s REPL against the pond's
+current journal; on clean exit (`q` / EOF), anything appended during the
+session is committed as the journal's next version.
+
+---
+
 ## 7. Explicitly out of scope for v1
 
 - **macOS production support.** Linux + bwrap only; macOS is Docker-tested
@@ -341,11 +472,11 @@ committed output. Any arguments are passed straight through to
   `pond run /system/etc/...`. `exec` factories should be mounted under
   `/system/etc`, invoked manually, same as `accounts` is today. Revisit
   only with a much narrower, explicitly-opted-in allowlist story.
-- **Interactive/long-running programs.** One invocation, one clean exit,
-  one commit -- no daemons, no REPLs.
-- **Teaching `cmd/billing` to read Ledger format, or evaluating
-  `hledger`/`ledger`/`beancount` specifically.** Deliberately deferred
-  until the plumbing in this document is proven with trivial programs.
+- **Teaching `cmd/billing` to read Ledger format.** `series_outputs` plus
+  an interactive `hledger` session (§6b) covers *entering and storing*
+  journal data; generating PDF statements from that journal (today
+  `cmd/billing` reads its own four CSV files) is still deliberately
+  deferred to a later pass.
 
 ---
 

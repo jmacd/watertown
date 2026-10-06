@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: 2026 Caspar Water Company
+# SPDX-License-Identifier: Apache-2.0
+#
+# Interactive hledger session against a pond-backed Ledger journal. The
+# journal is a FilePhysicalSeries (series_outputs), so only the new bytes
+# the session actually adds are committed as its next version -- the prior
+# history is never rewritten. `hledger repl` itself only queries; use
+# `hledger add` (or any editor) from the same session to actually extend
+# the journal. See docs/exec-factory-design.md §6b.
+program: /usr/bin/hledger
+args: ["repl", "-f", "accounting/journal.ledger"]
+inputs: []
+series_outputs: ["/accounting/journal.ledger"]
+interactive: true

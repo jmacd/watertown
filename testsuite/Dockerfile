@@ -83,6 +83,10 @@ RUN apt-get update && \
         # Sandbox for the exec factory (requires --privileged, see
         # testsuite/run-test.sh's '# REQUIRES: privileged' handling)
         bubblewrap \
+        # Plaintext-accounting tool exercised by the exec factory's
+        # series_outputs (append-only Ledger-format journal), see
+        # docs/exec-factory-design.md
+        hledger \
     && rm -rf /var/lib/apt/lists/*
 
 # Install the last open-source MinIO client release from its immutable GitHub
