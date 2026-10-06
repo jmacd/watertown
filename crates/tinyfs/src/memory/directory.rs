@@ -19,6 +19,7 @@ use std::sync::Arc;
 pub struct MemoryDirectory {
     entries: BTreeMap<String, Node>,
     entry_type: EntryType,
+    coherence: Option<Arc<crate::CoherenceState>>,
 }
 
 #[async_trait]
@@ -42,15 +43,25 @@ impl Directory for MemoryDirectory {
     }
 
     async fn insert(&mut self, name: String, id: Node) -> Result<()> {
-        if self.entries.insert(name.clone(), id).is_some() {
+        if self.entries.contains_key(&name) {
             // Note this is not a full path.
             return Err(Error::already_exists(&name));
+        }
+        _ = self.entries.insert(name, id);
+        if let Some(coherence) = &self.coherence {
+            _ = coherence.advance()?;
         }
         Ok(())
     }
 
     async fn remove(&mut self, name: &str) -> Result<Option<Node>> {
-        Ok(self.entries.remove(name))
+        let removed = self.entries.remove(name);
+        if removed.is_some()
+            && let Some(coherence) = &self.coherence
+        {
+            _ = coherence.advance()?;
+        }
+        Ok(removed)
     }
 
     async fn entries(&self) -> Result<Pin<Box<dyn Stream<Item = Result<DirectoryEntry>> + Send>>> {
@@ -78,11 +89,26 @@ impl MemoryDirectory {
     /// Create a new MemoryDirectory handle with an explicit directory type.
     #[must_use]
     pub fn new_handle_with_entry_type(entry_type: EntryType) -> Handle {
+        Self::new_handle_with_entry_type_and_coherence(entry_type, None)
+    }
+
+    pub(crate) fn new_handle_with_coherence(coherence: Arc<crate::CoherenceState>) -> Handle {
+        Self::new_handle_with_entry_type_and_coherence(
+            EntryType::DirectoryPhysical,
+            Some(coherence),
+        )
+    }
+
+    pub(crate) fn new_handle_with_entry_type_and_coherence(
+        entry_type: EntryType,
+        coherence: Option<Arc<crate::CoherenceState>>,
+    ) -> Handle {
         debug_assert!(entry_type.is_directory());
         Handle::new(Arc::new(tokio::sync::Mutex::new(Box::new(
             MemoryDirectory {
                 entries: BTreeMap::new(),
                 entry_type,
+                coherence,
             },
         ))))
     }
@@ -100,6 +126,7 @@ impl Default for MemoryDirectory {
         Self {
             entries: BTreeMap::new(),
             entry_type: EntryType::DirectoryPhysical,
+            coherence: None,
         }
     }
 }

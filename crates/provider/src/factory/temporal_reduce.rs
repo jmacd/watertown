@@ -73,6 +73,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64 as TestAtomicU64;
 use std::time::Duration;
 use tinyfs::ResultExt;
 use tinyfs::{
@@ -374,6 +376,22 @@ struct LineageSchemaCache {
     columns: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceSchemaCache {
+    format: String,
+    snapshot: String,
+    columns: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceIdentityCache {
+    format: String,
+    snapshot: String,
+    sources: std::collections::BTreeMap<String, crate::partial_aggregate_cache::SourceRange>,
+}
+
 fn update_schema_hash(hasher: &mut blake3::Hasher, value: &[u8]) {
     _ = hasher.update(&(value.len() as u64).to_le_bytes());
     _ = hasher.update(value);
@@ -438,13 +456,17 @@ impl TemporalReduceSqlFile {
     /// the source_path. This ensures that schema discovery and SQL execution both use
     /// the correct format provider for the source data.
     fn source_url(&self) -> String {
+        self.source_url_for_path(&self.source_path)
+    }
+
+    fn source_url_for_path(&self, source_path: &str) -> String {
         // Use full_scheme() to preserve compression and entry type suffixes
         // (e.g., "csv+gzip", "file+series", "file+table").
         let scheme = self.config.in_pattern.full_scheme();
-        if self.source_path.starts_with('/') {
-            format!("{}://{}", scheme, self.source_path)
+        if source_path.starts_with('/') {
+            format!("{scheme}://{source_path}")
         } else {
-            format!("{}:///{}", scheme, self.source_path)
+            format!("{scheme}:///{source_path}")
         }
     }
 
@@ -461,6 +483,175 @@ impl TemporalReduceSqlFile {
         cache_dir
             .join("temporal-reduce-schema")
             .join(format!("{}.json", hasher.finalize().to_hex()))
+    }
+
+    fn source_schema_cache_path(&self, cache_dir: &std::path::Path) -> std::path::PathBuf {
+        let mut hasher = blake3::Hasher::new();
+        _ = hasher.update(b"watertown:temporal-reduce-source-schema:v1");
+        update_schema_hash(&mut hasher, self.pattern_url.as_bytes());
+        update_schema_hash(&mut hasher, self.config.time_column.as_bytes());
+        cache_dir
+            .join("temporal-reduce-schema")
+            .join(format!("{}.json", hasher.finalize().to_hex()))
+    }
+
+    fn source_identity_cache_path(&self, cache_dir: &std::path::Path) -> std::path::PathBuf {
+        let mut hasher = blake3::Hasher::new();
+        _ = hasher.update(b"watertown:temporal-reduce-source-identity:v1");
+        update_schema_hash(&mut hasher, self.pattern_url.as_bytes());
+        cache_dir
+            .join("temporal-reduce-sources")
+            .join(format!("{}.json", hasher.finalize().to_hex()))
+    }
+
+    async fn load_source_identity_cache(
+        &self,
+        path: &std::path::Path,
+        snapshot: &str,
+    ) -> TinyFSResult<
+        Option<std::collections::BTreeMap<String, crate::partial_aggregate_cache::SourceRange>>,
+    > {
+        if !tokio::fs::try_exists(path)
+            .await
+            .map_other_context(format!("check source identity cache '{}'", path.display()))?
+        {
+            return Ok(None);
+        }
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_other_context(format!("read source identity cache '{}'", path.display()))?;
+        let record: SourceIdentityCache = serde_json::from_slice(&bytes)
+            .map_other_context(format!("parse source identity cache '{}'", path.display()))?;
+        if record.format != "source-identity-v1" {
+            return Err(tinyfs::Error::Other(format!(
+                "unsupported source identity cache format '{}' in '{}'",
+                record.format,
+                path.display()
+            )));
+        }
+        Ok((record.snapshot == snapshot).then_some(record.sources))
+    }
+
+    async fn write_source_identity_cache(
+        &self,
+        path: &std::path::Path,
+        snapshot: &str,
+        sources: &std::collections::BTreeMap<String, crate::partial_aggregate_cache::SourceRange>,
+    ) -> TinyFSResult<()> {
+        let record = SourceIdentityCache {
+            format: "source-identity-v1".to_owned(),
+            snapshot: snapshot.to_owned(),
+            sources: sources.clone(),
+        };
+        let bytes = serde_json::to_vec_pretty(&record)
+            .map_other_context("serialize source identity cache")?;
+        let parent = path.parent().ok_or_else(|| {
+            tinyfs::Error::Other(format!(
+                "source identity cache path '{}' has no parent",
+                path.display()
+            ))
+        })?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_other_context(format!(
+                "create source identity cache directory '{}'",
+                parent.display()
+            ))?;
+        let tmp = std::path::PathBuf::from(format!("{}.tmp-{}", path.display(), uuid7::uuid7()));
+        tokio::fs::write(&tmp, bytes)
+            .await
+            .map_other_context(format!(
+                "write source identity cache temporary file '{}'",
+                tmp.display()
+            ))?;
+        tokio::fs::rename(&tmp, path)
+            .await
+            .map_other_context(format!(
+                "publish source identity cache '{}'",
+                path.display()
+            ))?;
+        Ok(())
+    }
+
+    async fn load_source_schema_cache(
+        &self,
+        path: &std::path::Path,
+        snapshot: &str,
+    ) -> TinyFSResult<Option<Vec<String>>> {
+        if !tokio::fs::try_exists(path)
+            .await
+            .map_other_context(format!("check source schema cache '{}'", path.display()))?
+        {
+            return Ok(None);
+        }
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_other_context(format!("read source schema cache '{}'", path.display()))?;
+        let record: SourceSchemaCache = serde_json::from_slice(&bytes)
+            .map_other_context(format!("parse source schema cache '{}'", path.display()))?;
+        if record.format != "source-schema-v1" {
+            return Err(tinyfs::Error::Other(format!(
+                "unsupported source schema cache format '{}' in '{}'",
+                record.format,
+                path.display()
+            )));
+        }
+        if record.columns.is_empty() {
+            return Err(tinyfs::Error::Other(format!(
+                "source schema cache '{}' contains no columns",
+                path.display()
+            )));
+        }
+        Ok((record.snapshot == snapshot).then_some(record.columns))
+    }
+
+    async fn write_source_schema_cache(
+        &self,
+        path: &std::path::Path,
+        snapshot: &str,
+        columns: &[String],
+    ) -> TinyFSResult<()> {
+        let record = SourceSchemaCache {
+            format: "source-schema-v1".to_owned(),
+            snapshot: snapshot.to_owned(),
+            columns: columns.to_vec(),
+        };
+        let bytes = serde_json::to_vec_pretty(&record)
+            .map_other_context("serialize source schema cache")?;
+        let parent = path.parent().ok_or_else(|| {
+            tinyfs::Error::Other(format!(
+                "source schema cache path '{}' has no parent",
+                path.display()
+            ))
+        })?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_other_context(format!(
+                "create source schema cache directory '{}'",
+                parent.display()
+            ))?;
+        let tmp = std::path::PathBuf::from(format!("{}.tmp-{}", path.display(), uuid7::uuid7()));
+        tokio::fs::write(&tmp, bytes)
+            .await
+            .map_other_context(format!(
+                "write source schema cache temporary file '{}'",
+                tmp.display()
+            ))?;
+        tokio::fs::rename(&tmp, path)
+            .await
+            .map_other_context(format!("publish source schema cache '{}'", path.display()))?;
+        Ok(())
+    }
+
+    async fn cached_source_columns(&self) -> TinyFSResult<Option<Vec<String>>> {
+        let Some(snapshot) = self.context.context.persistence.snapshot_identity().await? else {
+            return Ok(None);
+        };
+        let Some(cache_dir) = self.context.context.cache_dir() else {
+            return Ok(None);
+        };
+        self.load_source_schema_cache(&self.source_schema_cache_path(cache_dir), &snapshot)
+            .await
     }
 
     async fn load_lineage_schema_cache(
@@ -565,12 +756,47 @@ impl TemporalReduceSqlFile {
             return Ok(cached_columns.clone());
         }
 
+        if let Some(columns) = self.cached_source_columns().await? {
+            log::debug!(
+                "temporal-reduce source schema cache hit for '{}'",
+                self.source_path
+            );
+            *columns_guard = Some(columns.clone());
+            return Ok(columns);
+        }
+        let snapshot = self.context.context.persistence.snapshot_identity().await?;
+        let source_schema_cache = self
+            .context
+            .context
+            .cache_dir()
+            .zip(snapshot.as_deref())
+            .map(|(cache_dir, snapshot)| {
+                (
+                    self.source_schema_cache_path(cache_dir),
+                    snapshot.to_owned(),
+                )
+            });
+
         // Use the Provider API to create a table provider, respecting the in_pattern URL scheme.
         // This is critical for format providers like oteljson://, csv://, excelhtml:// where the
         // raw file bytes need format-specific parsing to produce a queryable table.
         // Previously this went directly through as_queryable() on the raw file node, which
         // assumes Parquet format and fails for non-Parquet data files.
-        let source_url = self.source_url();
+        let source_url = if self.source_path.contains(['*', '?', '[']) {
+            let source_files = self.resolve_source_files().await?;
+            let representative = source_files
+                .iter()
+                .max_by_key(|node_path| node_path.path.as_os_str())
+                .ok_or_else(|| {
+                    tinyfs::Error::Other(format!(
+                        "temporal-reduce source '{}' matched no files",
+                        self.pattern_url
+                    ))
+                })?;
+            self.source_url_for_path(&representative.path.to_string_lossy())
+        } else {
+            self.source_url()
+        };
         log::debug!(
             "TemporalReduceFile: discovering columns via Provider API with URL '{}'",
             source_url
@@ -633,6 +859,11 @@ impl TemporalReduceSqlFile {
             )));
         }
 
+        if let Some((path, snapshot)) = &source_schema_cache {
+            self.write_source_schema_cache(path, snapshot, &columns)
+                .await?;
+        }
+
         // Cache the discovered columns for future calls
         *columns_guard = Some(columns.clone());
         log::debug!(
@@ -649,8 +880,12 @@ impl TemporalReduceSqlFile {
     /// column lists. This is the shared input to both the single-pass SQL and
     /// the rollup partial/merge SQL.
     async fn filled_config(&self) -> TinyFSResult<TemporalReduceConfig> {
-        // Discover available columns
-        let discovered_columns = if self.resolve_source_files().await?.is_empty() {
+        // Consult the snapshot-bound schema cache before resolving source
+        // membership. On a warm literal-output rollup, resolving the glob is
+        // exactly the history-sized work the cache is intended to avoid.
+        let discovered_columns = if let Some(columns) = self.cached_source_columns().await? {
+            columns
+        } else if self.resolve_source_files().await?.is_empty() {
             self.configured_empty_source_columns()?
         } else {
             self.discover_source_columns().await?
@@ -789,10 +1024,19 @@ impl TemporalReduceSqlFile {
             return Ok(None);
         }
 
-        let source_files = self.resolve_source_files().await?;
-        if source_files.is_empty() {
-            return Ok(None);
-        }
+        // Format-backed sources can prove an unchanged complete source map
+        // from the persistence snapshot without resolving the input glob.
+        // Builtin sources still need their entry types before eligibility and
+        // lineage can be classified.
+        let mut source_files = if format_provider.is_some() {
+            None
+        } else {
+            let source_files = self.resolve_source_files().await?;
+            if source_files.is_empty() {
+                return Ok(None);
+            }
+            Some(source_files)
+        };
 
         let fs = self.context.context.filesystem();
         let mut provider_api =
@@ -806,11 +1050,13 @@ impl TemporalReduceSqlFile {
         // immutable lineage and bounded execution; otherwise there is no stable
         // freshness key and the conservative single-pass delegate remains the
         // only correct option.
-        let builtin_sources = format_provider.is_none()
-            && source_files.iter().all(|np| {
-                let et = np.id().entry_type();
-                et.is_parquet_file() && !et.is_dynamic()
-            });
+        let builtin_sources = source_files.as_ref().is_some_and(|source_files| {
+            format_provider.is_none()
+                && source_files.iter().all(|np| {
+                    let et = np.id().entry_type();
+                    et.is_parquet_file() && !et.is_dynamic()
+                })
+        });
         let derived_lineage = if format_provider.is_none() && !builtin_sources {
             provider_api
                 .query_lineage_for_url(&self.pattern_url)
@@ -826,7 +1072,14 @@ impl TemporalReduceSqlFile {
         // Non-`None` selects the pond-native route: these nodes' own version
         // files are the leaves the partials are computed from.
         let builtin_source_ids: Option<Vec<tinyfs::FileID>> = if builtin_sources {
-            Some(source_files.iter().map(tinyfs::NodePath::id).collect())
+            Some(
+                source_files
+                    .as_ref()
+                    .expect("builtin source classification requires resolved files")
+                    .iter()
+                    .map(tinyfs::NodePath::id)
+                    .collect(),
+            )
         } else {
             None
         };
@@ -863,18 +1116,84 @@ impl TemporalReduceSqlFile {
         // Key the cache by the parent site partition, which is shared by every
         // resolution file of this site, so all resolutions share one namespace.
         let site_node_id = id.part_id().to_node_id();
+        let policy = SealPolicy {
+            lateness_secs: filled.allowed_lateness_secs()?,
+            target_bytes: filled.seal_target_bytes(),
+            max_segments: filled.max_live_segments(),
+        };
+        let merged_dir =
+            crate::partial_aggregate_cache::merged_dir(&cache_dir, &cfg_hash, &site_node_id);
 
         // Collect every source node's LIVE versions, plus the content identity
         // of the set: blake3 -> event-time range. That map is the freshness key
         // (design §5.3); nothing here is keyed by a version number or filename.
         let mut source_nodes: Vec<(tinyfs::NodeID, Vec<tinyfs::FileVersionInfo>)> =
-            Vec::with_capacity(source_files.len());
+            Vec::with_capacity(source_files.as_ref().map_or(0, Vec::len));
         let mut now: std::collections::BTreeMap<
             String,
             crate::partial_aggregate_cache::SourceRange,
         > = std::collections::BTreeMap::new();
+        let finest_res_dir =
+            crate::partial_aggregate_cache::segment_res_dir(&merged_dir, finest_interval.as_secs());
+        let finest_manifest =
+            crate::partial_aggregate_cache::read_verified_segment_manifest(&finest_res_dir)
+                .map_other()?;
+        let source_snapshot = context.persistence.snapshot_identity().await?;
 
-        if let Some(lineage) = &derived_lineage {
+        // A stable persistence-snapshot identity covers both source membership
+        // and every retained version. If it still matches the finest compatible
+        // manifest, reuse that complete source-content map instead of issuing
+        // one history query per matched file. Backends without this contract,
+        // old manifests, and changed snapshots fall through to full discovery.
+        let source_identity_cache = if derived_lineage.is_none() {
+            source_snapshot.as_ref().map(|snapshot| {
+                (
+                    self.source_identity_cache_path(&cache_dir),
+                    snapshot.clone(),
+                )
+            })
+        } else {
+            None
+        };
+        let mut cached_sources = if derived_lineage.is_none()
+            && let Some(snapshot) = source_snapshot.as_ref()
+        {
+            finest_manifest
+                .clone()
+                .filter(|manifest| {
+                    crate::partial_aggregate_cache::segment_manifest_is_compatible(
+                        manifest,
+                        policy.lateness_secs,
+                    )
+                })
+                .filter(|manifest| manifest.source_snapshot.as_ref() == Some(snapshot))
+                .map(|manifest| manifest.sources)
+        } else {
+            None
+        };
+        if cached_sources.is_none()
+            && let Some((path, snapshot)) = &source_identity_cache
+            && let Some(shared_sources) = self.load_source_identity_cache(path, snapshot).await?
+        {
+            let manifest = finest_manifest.clone().filter(|manifest| {
+                crate::partial_aggregate_cache::segment_manifest_is_compatible(
+                    manifest,
+                    policy.lateness_secs,
+                )
+            });
+            if manifest.is_some_and(|manifest| manifest.sources == shared_sources) {
+                cached_sources = Some(shared_sources);
+            }
+        }
+        let source_snapshot_hit = cached_sources.is_some();
+
+        if let Some(cached_sources) = cached_sources {
+            log::debug!(
+                "temporal-reduce source snapshot hit: node={id} sources={}",
+                cached_sources.len()
+            );
+            now = cached_sources;
+        } else if let Some(lineage) = &derived_lineage {
             let _ = now.insert(
                 format!("recipe:{}", lineage.recipe_identity),
                 crate::partial_aggregate_cache::SourceRange::UNKNOWN,
@@ -889,7 +1208,17 @@ impl TemporalReduceSqlFile {
                 let _ = now.insert(leaf.identity.clone(), range);
             }
         } else {
-            for node_path in &source_files {
+            if source_files.is_none() {
+                let resolved = self.resolve_source_files().await?;
+                if resolved.is_empty() {
+                    return Ok(None);
+                }
+                source_files = Some(resolved);
+            }
+            for node_path in source_files
+                .as_ref()
+                .expect("source files resolved for exact discovery")
+            {
                 let file_url_str = node_file_url(scheme, node_path);
                 let file_url = crate::Url::parse(&file_url_str).map_other()?;
 
@@ -943,6 +1272,10 @@ impl TemporalReduceSqlFile {
                 source_nodes.push((source_node_id, versions));
             }
         }
+        if !source_snapshot_hit && let Some((path, snapshot)) = &source_identity_cache {
+            self.write_source_identity_cache(path, snapshot, &now)
+                .await?;
+        }
 
         let ctx = &context.datafusion_session;
 
@@ -984,14 +1317,6 @@ impl TemporalReduceSqlFile {
         // resolution, so a consumer of any resolution transparently materializes
         // the finer levels it depends on. Each level reuses its cache when
         // unchanged, so this is cheap after the first cold build.
-        let policy = SealPolicy {
-            lateness_secs: filled.allowed_lateness_secs()?,
-            target_bytes: filled.seal_target_bytes(),
-            max_segments: filled.max_live_segments(),
-        };
-        let merged_dir =
-            crate::partial_aggregate_cache::merged_dir(&cache_dir, &cfg_hash, &site_node_id);
-
         // Levels to build: finest .. this file's resolution (inclusive).
         let levels: Vec<Duration> = resolution_durations
             .iter()
@@ -1017,6 +1342,7 @@ impl TemporalReduceSqlFile {
                     &ts,
                     level,
                     &res_dir,
+                    finest_manifest.clone(),
                     &cache_dir,
                     scheme,
                     &source_nodes,
@@ -1024,6 +1350,8 @@ impl TemporalReduceSqlFile {
                     derived_lineage.as_ref().map(|_| self.pattern_url.as_str()),
                     context,
                     &now,
+                    source_snapshot.as_deref(),
+                    source_snapshot_hit,
                     &source_table,
                     policy,
                 )
@@ -1053,6 +1381,7 @@ impl TemporalReduceSqlFile {
                         finer_rebuilt,
                         finer_changed,
                         &now,
+                        source_snapshot.as_deref(),
                         policy,
                     )
                     .await;
@@ -1394,6 +1723,7 @@ impl TemporalReduceSqlFile {
         ts: &str,
         output_interval: Duration,
         res_dir: &std::path::Path,
+        manifest: Option<crate::partial_aggregate_cache::SegmentManifest>,
         cache_dir: &std::path::Path,
         scheme: &str,
         source_nodes: &[(tinyfs::NodeID, Vec<tinyfs::FileVersionInfo>)],
@@ -1401,12 +1731,12 @@ impl TemporalReduceSqlFile {
         derived_pattern: Option<&str>,
         provider_context: &tinyfs::ProviderContext,
         now: &std::collections::BTreeMap<String, crate::partial_aggregate_cache::SourceRange>,
+        source_snapshot: Option<&str>,
+        source_snapshot_hit: bool,
         source_table: &str,
         policy: SealPolicy,
     ) -> TinyFSResult<LevelBuild> {
-        let manifest = match crate::partial_aggregate_cache::read_verified_segment_manifest(res_dir)
-            .map_other()?
-        {
+        let manifest = match manifest {
             Some(m)
                 if crate::partial_aggregate_cache::segment_manifest_is_compatible(
                     &m,
@@ -1450,13 +1780,28 @@ impl TemporalReduceSqlFile {
             None => Plan::Rebuild,
         };
 
+        if source_snapshot_hit && !matches!(plan, Plan::Reuse) {
+            return Err(tinyfs::Error::Other(format!(
+                "temporal-reduce source cache changed while planning '{}'; retry the export",
+                self.pattern_url
+            )));
+        }
+
         if let Plan::Reuse = plan {
-            let m = manifest.as_ref().expect("reuse implies a manifest");
-            let provider =
-                crate::partial_aggregate_cache::listing_table_for_res_dir(res_dir, m, ts)
+            let mut m = manifest.expect("reuse implies a manifest");
+            if let Some(source_snapshot) = source_snapshot
+                && m.source_snapshot.as_deref() != Some(source_snapshot)
+            {
+                m.source_snapshot = Some(source_snapshot.to_owned());
+                _ = crate::partial_aggregate_cache::write_segment_manifest(res_dir, &m)
                     .await
                     .map_other()?;
-            let digest = crate::partial_aggregate_cache::segment_manifest_digest(m).map_other()?;
+            }
+            let provider =
+                crate::partial_aggregate_cache::listing_table_for_res_dir(res_dir, &m, ts)
+                    .await
+                    .map_other()?;
+            let digest = crate::partial_aggregate_cache::segment_manifest_digest(&m).map_other()?;
             return Ok(LevelBuild {
                 provider,
                 digest,
@@ -1637,6 +1982,7 @@ impl TemporalReduceSqlFile {
         };
 
         m.sources = now.clone();
+        m.source_snapshot = source_snapshot.map(str::to_owned);
         m.source_digest = None;
 
         let digest = crate::partial_aggregate_cache::write_segment_manifest(res_dir, &m)
@@ -1696,6 +2042,7 @@ impl TemporalReduceSqlFile {
         finer_rebuilt: bool,
         finer_changed: LevelChange,
         now: &std::collections::BTreeMap<String, crate::partial_aggregate_cache::SourceRange>,
+        source_snapshot: Option<&str>,
         policy: SealPolicy,
     ) -> TinyFSResult<LevelBuild> {
         let manifest = match crate::partial_aggregate_cache::read_verified_segment_manifest(res_dir)
@@ -1723,10 +2070,15 @@ impl TemporalReduceSqlFile {
             && let Some(mut m) = manifest.clone()
             && m.source_digest.as_deref() == Some(finer_digest)
         {
-            let digest = if m.sources == *now {
+            let snapshot_current =
+                source_snapshot.is_none() || m.source_snapshot.as_deref() == source_snapshot;
+            let digest = if m.sources == *now && snapshot_current {
                 crate::partial_aggregate_cache::segment_manifest_digest(&m).map_other()?
             } else {
                 m.sources = now.clone();
+                if let Some(source_snapshot) = source_snapshot {
+                    m.source_snapshot = Some(source_snapshot.to_owned());
+                }
                 crate::partial_aggregate_cache::write_segment_manifest(res_dir, &m)
                     .await
                     .map_other()?
@@ -1845,6 +2197,7 @@ impl TemporalReduceSqlFile {
             )
             .await?;
         m.sources = now.clone();
+        m.source_snapshot = source_snapshot.map(str::to_owned);
         m.source_digest = Some(finer_digest.to_string());
 
         let digest = crate::partial_aggregate_cache::write_segment_manifest(res_dir, &m)
@@ -3041,6 +3394,8 @@ pub struct TemporalReduceDirectory {
     config: TemporalReduceConfig,
     context: crate::FactoryContext,
     parsed_resolutions: Vec<(String, Duration)>,
+    #[cfg(test)]
+    source_membership_scans: TestAtomicU64,
 }
 
 impl TemporalReduceDirectory {
@@ -3060,11 +3415,20 @@ impl TemporalReduceDirectory {
             config,
             context,
             parsed_resolutions,
+            #[cfg(test)]
+            source_membership_scans: TestAtomicU64::new(0),
         })
     }
 
     /// Discover source files using the in_pattern and generate output names using out_pattern
     async fn discover_source_files(&self) -> TinyFSResult<Vec<(String, String)>> {
+        #[cfg(test)]
+        {
+            _ = self
+                .source_membership_scans
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
         let pattern = self.config.in_pattern.path();
         log::debug!(
             "TemporalReduceDirectory::discover_source_files - scanning pattern {}",
@@ -3190,6 +3554,23 @@ impl TemporalReduceDirectory {
 #[async_trait]
 impl Directory for TemporalReduceDirectory {
     async fn get(&self, name: &str) -> TinyFSResult<Option<Node>> {
+        // A literal out_pattern declares exactly one stable directory name.
+        // Defer source membership and schema work to the queryable file, where
+        // snapshot-bound caches can prove an unchanged source set without
+        // traversing retained history.
+        if !self.config.out_pattern.contains('$') {
+            if name != self.config.out_pattern {
+                return Ok(None);
+            }
+            let root = self.context.root().await?;
+            return Ok(Some(self.create_site_directory_node(
+                name.to_owned(),
+                self.config.in_pattern.path().to_owned(),
+                root.node_path().node,
+                self.config.in_pattern.to_string(),
+            )));
+        }
+
         // Discover all source files first
         let source_files = self.discover_source_files().await?;
 
@@ -3239,19 +3620,6 @@ impl Directory for TemporalReduceDirectory {
             return Ok(Some(node_ref));
         }
 
-        if sites.is_empty()
-            && !self.config.out_pattern.contains('$')
-            && name == self.config.out_pattern
-        {
-            let root = self.context.root().await?;
-            return Ok(Some(self.create_site_directory_node(
-                name.to_owned(),
-                self.config.in_pattern.path().to_owned(),
-                root.node_path().node,
-                self.config.in_pattern.to_string(),
-            )));
-        }
-
         Ok(None)
     }
 
@@ -3271,6 +3639,20 @@ impl Directory for TemporalReduceDirectory {
         &self,
     ) -> TinyFSResult<Pin<Box<dyn Stream<Item = TinyFSResult<tinyfs::DirectoryEntry>> + Send>>>
     {
+        if !self.config.out_pattern.contains('$') {
+            let node = self
+                .get(&self.config.out_pattern)
+                .await?
+                .expect("literal temporal-reduce output must resolve");
+            let entry = tinyfs::DirectoryEntry::new(
+                self.config.out_pattern.clone(),
+                node.id.node_id(),
+                EntryType::DirectoryDynamic,
+                0,
+            );
+            return Ok(Box::pin(stream::iter(vec![Ok(entry)])));
+        }
+
         // Discover all source files - fail fast on error
         let source_files = self.discover_source_files().await?;
 
@@ -5103,6 +5485,141 @@ output_aliases:
                 panic!("Expected file node for weather/res=1d.series");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn literal_output_directory_avoids_source_membership_scans() {
+        let (_fs, provider_context) = create_test_environment().await;
+        let config = TemporalReduceConfig {
+            in_pattern: crate::Url::parse("csv:///ingest/weather-*.csv").unwrap(),
+            out_pattern: "weather".to_owned(),
+            time_column: "timestamp".to_owned(),
+            resolutions: vec!["1d".to_owned()],
+            aggregations: vec![agg(AggregationType::Max, &["temperature"])],
+            output_aliases: None,
+            transforms: None,
+            allowed_lateness: None,
+            seal_target_bytes: Some(0),
+            max_live_segments: None,
+        };
+        let directory =
+            TemporalReduceDirectory::new(config, test_context(&provider_context, FileID::root()))
+                .unwrap();
+
+        assert!(directory.get("weather").await.unwrap().is_some());
+        assert!(directory.get("other").await.unwrap().is_none());
+        let entries = directory.entries().await.unwrap().collect::<Vec<_>>().await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].as_ref().unwrap().name, "weather");
+        assert_eq!(
+            directory
+                .source_membership_scans
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "literal output lookup and enumeration must not traverse source membership"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_source_snapshot_avoids_retained_history_queries() {
+        let persistence = tinyfs::MemoryPersistence::default();
+        let fs = tinyfs::FS::new(persistence.clone()).await.unwrap();
+        let root = fs.root().await.unwrap();
+        _ = root.create_dir_path("/ingest").await.unwrap();
+
+        use tokio::io::AsyncWriteExt;
+        for day in 1..=28 {
+            let csv = format!(
+                "timestamp,temperature\n1970-02-{day:02}T00:00:00,{}.5\n",
+                day + 20
+            );
+            let mut writer = root
+                .async_writer_path_with_type("/ingest/weather.csv", EntryType::FilePhysicalSeries)
+                .await
+                .unwrap();
+            writer.write_all(csv.as_bytes()).await.unwrap();
+            writer.shutdown().await.unwrap();
+        }
+
+        let config = TemporalReduceConfig {
+            in_pattern: crate::Url::parse("csv:///ingest/weather.csv").unwrap(),
+            out_pattern: "weather".to_owned(),
+            time_column: "timestamp".to_owned(),
+            resolutions: vec!["1d".to_owned()],
+            aggregations: vec![agg(AggregationType::Max, &["temperature"])],
+            output_aliases: None,
+            transforms: None,
+            allowed_lateness: None,
+            seal_target_bytes: Some(0),
+            max_live_segments: None,
+        };
+        let cache = tempfile::tempdir().unwrap();
+
+        let make_context = || {
+            let session = Arc::new(datafusion::prelude::SessionContext::new());
+            _ = crate::register_tinyfs_object_store(&session, persistence.clone()).unwrap();
+            crate::ProviderContext::new(session, Arc::new(persistence.clone()))
+                .with_cache_dir(cache.path().to_path_buf())
+        };
+        async fn build(
+            config: TemporalReduceConfig,
+            context: &crate::ProviderContext,
+        ) -> tinyfs::ExportHint {
+            let factory_context = test_context(context, FileID::root());
+            let directory = TemporalReduceDirectory::new(config, factory_context).unwrap();
+            let handle = directory.create_handle();
+            let site = handle.get("weather").await.unwrap().unwrap();
+            let NodeType::Directory(site) = site.node_type else {
+                panic!("weather must be a directory");
+            };
+            let output = site.get("res=1d.series").await.unwrap().unwrap();
+            let NodeType::File(file) = output.node_type else {
+                panic!("daily output must be a file");
+            };
+            let file = file.get_file().await;
+            let guard = file.lock().await;
+            let queryable = guard.as_queryable().unwrap();
+            _ = queryable
+                .as_table_provider(output.id, context)
+                .await
+                .unwrap();
+            context
+                .get_export_hint(&output.id)
+                .expect("rollup must publish an export hint")
+        }
+
+        _ = build(config.clone(), &make_context()).await;
+        persistence.reset_metrics();
+
+        let hint = build(config.clone(), &make_context()).await;
+        let metrics = persistence.metrics();
+        assert_eq!(hint.change, tinyfs::ExportChange::Unchanged);
+        assert_eq!(
+            metrics.version_lists, 0,
+            "warm planning must not enumerate retained source history"
+        );
+        assert_eq!(
+            metrics.version_info_reads, 0,
+            "one snapshot proof replaces per-version point reads"
+        );
+
+        let mut writer = root
+            .async_writer_path_with_type("/ingest/weather.csv", EntryType::FilePhysicalSeries)
+            .await
+            .unwrap();
+        writer
+            .write_all(b"timestamp,temperature\n1970-03-05T00:00:00,99.5\n")
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+        persistence.reset_metrics();
+
+        let changed = build(config, &make_context()).await;
+        assert_ne!(changed.change, tinyfs::ExportChange::Unchanged);
+        assert!(
+            persistence.metrics().version_lists > 0,
+            "a changed snapshot must fall back to exact source discovery"
+        );
     }
 
     /// Phase 2: the incremental partial-aggregate cache must produce the same aggregated

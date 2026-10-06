@@ -51,6 +51,7 @@ fn memory_version_info(version: &MemoryFileVersion) -> FileVersionInfo {
 pub struct MemoryPersistence {
     state: Arc<Mutex<State>>,
     coherence: Arc<crate::CoherenceState>,
+    snapshot_namespace: Arc<str>,
     /// Transaction state for enforcing single-writer pattern
     pub txn_state: Arc<TransactionState>,
     metrics: Arc<MemoryPersistenceMetricCounters>,
@@ -102,10 +103,13 @@ pub struct State {
 
 impl Default for State {
     fn default() -> Self {
-        let root_dir = Node::new(
-            FileID::root(),
-            NodeType::Directory(MemoryDirectory::new_handle()),
-        );
+        Self::new(MemoryDirectory::new_handle())
+    }
+}
+
+impl State {
+    fn new(root: crate::dir::Handle) -> Self {
+        let root_dir = Node::new(FileID::root(), NodeType::Directory(root));
         Self {
             file_versions: HashMap::new(),
             nodes: HashMap::from([(root_dir.id, root_dir)]),
@@ -115,9 +119,13 @@ impl Default for State {
 
 impl Default for MemoryPersistence {
     fn default() -> Self {
+        let coherence = Arc::new(crate::CoherenceState::default());
         Self {
-            state: Arc::new(Mutex::new(State::default())),
-            coherence: Arc::new(crate::CoherenceState::default()),
+            state: Arc::new(Mutex::new(State::new(
+                MemoryDirectory::new_handle_with_coherence(Arc::clone(&coherence)),
+            ))),
+            coherence,
+            snapshot_namespace: Arc::from(uuid7::uuid7().to_string()),
             txn_state: Arc::new(TransactionState::new()),
             metrics: Arc::new(MemoryPersistenceMetricCounters::default()),
             #[cfg(test)]
@@ -163,7 +171,11 @@ impl PersistenceLayer for MemoryPersistence {
     }
 
     async fn create_directory_node(&self, id: FileID) -> Result<Node> {
-        self.state.lock().await.create_directory_node(id).await
+        self.state
+            .lock()
+            .await
+            .create_directory_node(id, Arc::clone(&self.coherence))
+            .await
     }
 
     async fn create_symlink_node(
@@ -206,7 +218,10 @@ impl PersistenceLayer for MemoryPersistence {
         _ = self.coherence.advance()?;
 
         let node_type = if entry_type.is_directory() {
-            NodeType::Directory(MemoryDirectory::new_handle_with_entry_type(entry_type))
+            NodeType::Directory(MemoryDirectory::new_handle_with_entry_type_and_coherence(
+                entry_type,
+                Some(Arc::clone(&self.coherence)),
+            ))
         } else {
             NodeType::File(crate::memory::MemoryFile::new_handle(
                 id,
@@ -276,6 +291,14 @@ impl PersistenceLayer for MemoryPersistence {
     async fn list_file_versions(&self, id: FileID) -> Result<Vec<FileVersionInfo>> {
         _ = self.metrics.version_lists.fetch_add(1, Ordering::Relaxed);
         self.state.lock().await.list_file_versions(id).await
+    }
+
+    async fn snapshot_identity(&self) -> Result<Option<String>> {
+        Ok(Some(format!(
+            "memory:{}:{}",
+            self.snapshot_namespace,
+            self.coherence.generation()
+        )))
     }
 
     async fn file_version_info(&self, id: FileID, version: u64) -> Result<Option<FileVersionInfo>> {
@@ -572,8 +595,12 @@ impl State {
         Ok(())
     }
 
-    async fn create_directory_node(&self, id: FileID) -> Result<Node> {
-        let dir_handle = MemoryDirectory::new_handle();
+    async fn create_directory_node(
+        &self,
+        id: FileID,
+        coherence: Arc<crate::CoherenceState>,
+    ) -> Result<Node> {
+        let dir_handle = MemoryDirectory::new_handle_with_coherence(coherence);
         Ok(Node::new(id, NodeType::Directory(dir_handle)))
     }
 
