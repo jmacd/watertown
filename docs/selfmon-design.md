@@ -392,6 +392,43 @@ catalog/full-journal path. These defects are follow-up efficiency work rather
 than blockers for staging qualification: `0.239.176` repaired the demonstrated
 typed-migration regression and completed the stress tick cleanly.
 
+Build `0.242.179` was qualified on October 7 after the warm temporal-reduce
+planning repair. The controlled tick completed successfully in 38m14s with no
+failed steps and 51.60 GB of process-attributed logical reads. Maintenance
+remained bounded at 3m00s/2.50 GB; perf, limiter, and Azure materialization took
+31.3s/461 MB, 15.3s/272 MB, and 28.5s/903 MB respectively. The tick's Sitegen
+record was still cold at 1237.8s (20m38s), 299.53 MB peak.
+
+Two isolated warm measurements then separated the remaining costs:
+
+| Operation | Elapsed | Logical reads | Result |
+|---|---:|---:|---|
+| Selfmon Sitegen | 172.3s | 5.19 GB | success, 233.63 MB peak |
+| Sitegen exports | 2.65s | included above | all 48 partitions reused; 0 source executions/writes |
+| Sitegen status grid | 166.9s | nearly all Sitegen reads | dominant warm Sitegen phase |
+| Full-journal `COUNT(*)` benchmark | 527.2s | 14.34 GB | success, 441.65 MiB peak |
+
+The warm Sitegen profile proves the temporal-reduce work applies to selfmon:
+exports are no longer the defect. The status grid's journal summaries were also
+already bounded, but its perf enrichment still constructed
+`series:///derived/p-{pond}` without a bound and ran two independent
+`ORDER BY timestamp DESC LIMIT 1` queries per card: one for the established
+liveness fields and one compatibility query for `run.wall_s`.
+
+The follow-up repair applies the status grid's existing `hot_window` bound to
+each perf provider and projects all four fields in one query. Provider schema
+inspection supplies a typed NULL for `run.wall_s` on old series, preserving
+rolling-deploy compatibility without a second scan. Scan-counting regressions
+require exactly one provider execution for both current and old schemas.
+
+The full-history journal count is intentionally a stress benchmark rather than
+a dashboard dependency. At 8m47s and 14.34 GB per invocation it should move to
+a slower independent cadence instead of taxing every ordinary monitoring tick.
+The eleven tiny metric ingests also still repay process/catalog startup
+individually (roughly 10-15s each); session reuse or grouped execution remains a
+separate opportunity. `OnUnitActiveSec=1min` serializes safely but is not a
+realistic operational cadence for this workload.
+
 ### 9. `last_run.seconds_ago == -1` while a service is running
 
 A `pond run` invocation has no `ExecMainExitTimestamp` until it exits,
