@@ -87,6 +87,7 @@ RUN apt-get update && \
         # series_outputs (append-only Ledger-format journal), see
         # docs/exec-factory-design.md
         hledger \
+        hledger-ui \
     && rm -rf /var/lib/apt/lists/*
 
 # Install the last open-source MinIO client release from its immutable GitHub

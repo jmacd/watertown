@@ -352,8 +352,8 @@ staged file becomes the series' first version.
 ### 5c. Interactive sessions
 
 `interactive: true` drops `bwrap`'s `--new-session` flag (§4) so a real
-interactive program -- an `hledger repl` session, `hledger add`'s
-prompts, an editor -- keeps normal terminal job control (Ctrl-C, Ctrl-Z)
+interactive program -- an `hledger-ui` session, `hledger add`'s prompts,
+an editor -- keeps normal terminal job control (Ctrl-C, Ctrl-Z)
 instead of losing it to a detached session. This trades away
 `--new-session`'s defense against the sandboxed program injecting fake
 keystrokes back at the controlling terminal (`TIOCSTI`) -- acceptable
@@ -418,27 +418,25 @@ committed output. Any arguments are passed straight through to
 
 ---
 
-## 6b. Worked example: an interactive `hledger` session against a pond journal
+## 6b. Worked example: interactive `hledger-ui` against a pond journal
 
 `scripts/examples/hledger-journal.yaml`:
 
 ```yaml
-program: /usr/bin/hledger
-args: ["repl", "-f", "accounting/journal.ledger"]
+program: /usr/bin/hledger-ui
+args: ["-f", "accounting/journal.ledger"]
 inputs: []
 series_outputs: ["/accounting/journal.ledger"]
 interactive: true
 ```
 
-This mounts the journal as a `series_outputs` path (§5b) -- `hledger`
-itself only ever appends new transactions to a Ledger file, never rewrites
-old ones, so the pond keeps every prior version's bytes immutable and only
-commits what the session actually added. `interactive: true` (§5c) keeps
-real terminal job control, since `hledger repl` is an attended
-read/query REPL (`balance`, `register`, `print`, ...); extending the
-journal from the same session (e.g. with `hledger add`, or any editor
-reachable inside the sandbox) is an ordinary append and commits like any
-other `series_outputs` write.
+This mounts the journal as a `series_outputs` path (§5b), so the pond keeps
+every prior version's bytes immutable and commits only bytes appended by
+hledger-ui's `a` (add transaction) workflow. `interactive: true` (§5c)
+keeps real terminal job control for the full-window curses interface. The
+stable Debian bookworm packages provide `hledger` and `hledger-ui`, but not
+the newer `hledger repl` command; using the packaged TUI avoids making a
+preview hledger build part of the accounting image.
 
 End to end -- the first run against a not-yet-existing
 `/accounting/journal.ledger` stages an empty file and whatever the session
@@ -453,9 +451,11 @@ pond run /system/etc/hledger
 ```
 
 `pond run` inherits the controlling terminal's stdin/stdout/stderr, so this
-drops the operator straight into `hledger`'s REPL against the pond's
-current journal; on clean exit (`q` / EOF), anything appended during the
-session is committed as the journal's next version.
+drops the operator into `hledger-ui` against the pond's current journal. On
+clean exit (`q`), transactions entered with `a` are committed as the
+journal's next version. A separate exec node running `hledger add -f
+accounting/journal.ledger` with the same `series_outputs` declaration is
+also possible, but is not required for ordinary entry from the TUI.
 
 ---
 
@@ -473,10 +473,10 @@ session is committed as the journal's next version.
   `/system/etc`, invoked manually, same as `accounts` is today. Revisit
   only with a much narrower, explicitly-opted-in allowlist story.
 - **Teaching `cmd/billing` to read Ledger format.** `series_outputs` plus
-  an interactive `hledger` session (§6b) covers *entering and storing*
-  journal data; generating PDF statements from that journal (today
-  `cmd/billing` reads its own four CSV files) is still deliberately
-  deferred to a later pass.
+  interactive `hledger-ui`/`hledger add` sessions (§6b) cover browsing,
+  entering, and storing journal data; generating PDF statements from that
+  journal (today `cmd/billing` reads its own four CSV files) is still
+  deliberately deferred to a later pass.
 
 ---
 

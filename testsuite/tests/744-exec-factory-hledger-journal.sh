@@ -7,7 +7,7 @@
 #             docs/exec-factory-design.md §5b/§6b.
 #
 # DESCRIPTION:
-#   A non-interactive stand-in for the attended `hledger repl` session in
+#   A non-interactive stand-in for the attended `hledger-ui` session in
 #   scripts/examples/hledger-journal.yaml: `hledger` both validates the
 #   existing journal (exits non-zero on a parse error, so a corrupt
 #   journal never gets appended to) and appends one new transaction to it,

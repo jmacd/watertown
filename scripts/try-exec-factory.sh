@@ -51,9 +51,9 @@ CARGO_REGISTRY_VOLUME="exec-factory-try-registry"
 # argv: either empty (built-in demo) or "pond <pond-subcommand-args...>".
 INNER_SCRIPT='
 set -euo pipefail
-if ! command -v bwrap >/dev/null 2>&1 || ! command -v hledger >/dev/null 2>&1; then
-    echo "=== installing bubblewrap + hledger (one-time per container/host) ===" >&2
-    apt-get update -qq && apt-get install -y -qq bubblewrap hledger pkg-config libssl-dev >/dev/null
+if ! command -v bwrap >/dev/null 2>&1 || ! command -v hledger >/dev/null 2>&1 || ! command -v hledger-ui >/dev/null 2>&1; then
+    echo "=== installing bubblewrap + hledger + hledger-ui (one-time per container/host) ===" >&2
+    apt-get update -qq && apt-get install -y -qq bubblewrap hledger hledger-ui pkg-config libssl-dev >/dev/null
 fi
 cd /work
 
