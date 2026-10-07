@@ -878,7 +878,7 @@ async fn run_status_grid_queries(
             && let Some(pond_name) = extract_pond_name(&unit)
         {
             let perf_url = pattern.replace("{pond}", pond_name);
-            populate_perf_fields(&perf_provider, ctx, &perf_url, &mut status).await;
+            populate_perf_fields(&perf_provider, ctx, &perf_url, window_bounds, &mut status).await;
         }
 
         status.health = classify(
@@ -1057,7 +1057,7 @@ fn extract_pond_name(unit: &str) -> Option<&str> {
 }
 
 /// Look up the per-pond perf series and fill in `timer_active`,
-/// `last_run_seconds_ago`, `timer_interval_s` on `status`.  All
+/// `last_run_seconds_ago`, `timer_interval_s`, and `run_wall_s` on `status`. All
 /// failures are warned and swallowed; missing perf data is not a
 /// build error.  Registers the table under a per-unit name so
 /// concurrent invocations don't collide.
@@ -1065,11 +1065,13 @@ async fn populate_perf_fields(
     perf_provider: &provider::Provider,
     ctx: &datafusion::prelude::SessionContext,
     perf_url: &str,
+    bounds: tinyfs::SeriesReadBounds,
     status: &mut PondStatus,
 ) {
-    use datafusion::arrow::array::{Array, Int64Array};
-
-    let table_provider = match perf_provider.create_table_provider(perf_url, ctx).await {
+    let table_provider = match perf_provider
+        .create_table_provider_bounded(perf_url, ctx, bounds)
+        .await
+    {
         Ok(tp) => tp,
         Err(e) => {
             warn!(
@@ -1089,61 +1091,61 @@ async fn populate_perf_fields(
             "_"
         )
     );
-    if let Err(e) = ctx.register_table(
-        datafusion::sql::TableReference::bare(perf_table.as_str()),
-        table_provider,
-    ) {
-        warn!(
-            "status_grid: perf register_table('{}') failed: {}",
-            perf_table, e
-        );
-        return;
+    if let Err(e) =
+        populate_perf_fields_from_provider(ctx, table_provider, &perf_table, status).await
+    {
+        warn!("status_grid: perf query for '{}' failed: {}", perf_url, e);
     }
+}
+
+async fn populate_perf_fields_from_provider(
+    ctx: &datafusion::prelude::SessionContext,
+    table_provider: Arc<dyn datafusion::catalog::TableProvider>,
+    perf_table: &str,
+    status: &mut PondStatus,
+) -> Result<(), tinyfs::Error> {
+    use datafusion::arrow::array::{Array, Int64Array};
+
+    // `run.wall_s` was added after the established liveness columns. Older
+    // series omit it entirely, so project a typed NULL in the same query rather
+    // than paying for a second latest-row scan or losing the other fields.
+    let run_wall = if table_provider
+        .schema()
+        .field_with_name("run.wall_s")
+        .is_ok()
+    {
+        "\"run.wall_s\""
+    } else {
+        "CAST(NULL AS BIGINT)"
+    };
+    ctx.register_table(
+        datafusion::sql::TableReference::bare(perf_table),
+        table_provider,
+    )
+    .map_err(|e| {
+        tinyfs::Error::Other(format!(
+            "status_grid perf register_table('{}'): {}",
+            perf_table, e
+        ))
+    })?;
 
     let sql = format!(
         "SELECT \"timer.active\" AS timer_active, \
                 \"last_run.seconds_ago\" AS last_run_seconds_ago, \
-                \"timer.interval_s\" AS timer_interval_s \
-         FROM {} \
-         ORDER BY timestamp DESC LIMIT 1",
-        perf_table
+                \"timer.interval_s\" AS timer_interval_s, \
+                {run_wall} AS run_wall_s \
+         FROM {perf_table} \
+         ORDER BY timestamp DESC LIMIT 1"
     );
     let result = async {
         let df = ctx.sql(&sql).await?;
         df.collect().await
     }
     .await;
+    let _ = ctx.deregister_table(datafusion::sql::TableReference::bare(perf_table));
 
-    // `run.wall_s` was added to measure-pond.sh after the other perf
-    // fields, so a perf series written by an older probe lacks the
-    // column entirely and this SELECT would fail schema resolution.
-    // Query it separately and best-effort so that during a deploy the
-    // established liveness fields above are never lost -- a missing
-    // `run.wall_s` just falls the staleness threshold back to
-    // `2 * timer_interval_s`.
-    let run_wall_result = async {
-        let df = ctx
-            .sql(&format!(
-                "SELECT \"run.wall_s\" AS run_wall_s \
-                 FROM {} \
-                 ORDER BY timestamp DESC LIMIT 1",
-                perf_table
-            ))
-            .await?;
-        df.collect().await
-    }
-    .await;
-
-    let _ = ctx.deregister_table(datafusion::sql::TableReference::bare(perf_table.as_str()));
-
-    let batches = match result {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("status_grid: perf query for '{}' failed: {}", perf_url, e);
-            return;
-        }
-    };
-
+    let batches = result
+        .map_err(|e| tinyfs::Error::Other(format!("status_grid perf latest-row query: {e}")))?;
     let scalar_i64 =
         |batches: &[datafusion::arrow::array::RecordBatch], col: usize| -> Option<i64> {
             batches.iter().find_map(|b| {
@@ -1166,10 +1168,8 @@ async fn populate_perf_fields(
     }
     status.last_run_seconds_ago = get_i64(1);
     status.timer_interval_s = get_i64(2).filter(|&v| v > 0);
-    status.run_wall_s = run_wall_result
-        .ok()
-        .and_then(|b| scalar_i64(&b, 0))
-        .filter(|&v| v > 0);
+    status.run_wall_s = get_i64(3).filter(|&v| v > 0);
+    Ok(())
 }
 
 /// Run the per-unit DataFusion queries for the status grid.
@@ -2706,6 +2706,135 @@ mod tests {
             Arc::new(provider),
         )
         .unwrap();
+    }
+
+    fn perf_table(include_run_wall: bool) -> Arc<dyn datafusion::catalog::TableProvider> {
+        use datafusion::arrow::array::{ArrayRef, Int64Array};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::datasource::MemTable;
+
+        let mut fields = vec![
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("timer.active", DataType::Int64, true),
+            Field::new("last_run.seconds_ago", DataType::Int64, true),
+            Field::new("timer.interval_s", DataType::Int64, true),
+        ];
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![100, 200])),
+            Arc::new(Int64Array::from(vec![0, 1])),
+            Arc::new(Int64Array::from(vec![90, 3])),
+            Arc::new(Int64Array::from(vec![60, 3600])),
+        ];
+        if include_run_wall {
+            fields.push(Field::new("run.wall_s", DataType::Int64, true));
+            columns.push(Arc::new(Int64Array::from(vec![10, 20])));
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
+    }
+
+    #[derive(Debug)]
+    struct ScanCountingTableProvider {
+        inner: Arc<dyn datafusion::catalog::TableProvider>,
+        scans: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl datafusion::catalog::TableProvider for ScanCountingTableProvider {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
+            self.inner.schema()
+        }
+
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            self.inner.table_type()
+        }
+
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&datafusion::logical_expr::Expr],
+        ) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>>
+        {
+            self.inner.supports_filters_pushdown(filters)
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn datafusion::catalog::Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[datafusion::logical_expr::Expr],
+            limit: Option<usize>,
+        ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+            _ = self
+                .scans
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.scan(state, projection, filters, limit).await
+        }
+    }
+
+    fn scan_counting_table(
+        inner: Arc<dyn datafusion::catalog::TableProvider>,
+    ) -> (
+        Arc<dyn datafusion::catalog::TableProvider>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            Arc::new(ScanCountingTableProvider {
+                inner,
+                scans: scans.clone(),
+            }),
+            scans,
+        )
+    }
+
+    #[tokio::test]
+    async fn status_perf_fields_use_one_latest_row_scan() {
+        let ctx = datafusion::prelude::SessionContext::new();
+        let (table, scans) = scan_counting_table(perf_table(true));
+        let mut status =
+            summary_to_pond_status(&status_summary::UnitSummary::default(), "pond@x.service");
+
+        populate_perf_fields_from_provider(&ctx, table, "status_perf", &mut status)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "all status perf fields must come from one provider scan"
+        );
+        assert_eq!(status.timer_active, Some(true));
+        assert_eq!(status.last_run_seconds_ago, Some(3));
+        assert_eq!(status.timer_interval_s, Some(3600));
+        assert_eq!(status.run_wall_s, Some(20));
+    }
+
+    #[tokio::test]
+    async fn status_perf_fields_keep_old_schema_compatibility_in_one_scan() {
+        let ctx = datafusion::prelude::SessionContext::new();
+        let (table, scans) = scan_counting_table(perf_table(false));
+        let mut status =
+            summary_to_pond_status(&status_summary::UnitSummary::default(), "pond@x.service");
+
+        populate_perf_fields_from_provider(&ctx, table, "status_perf_old", &mut status)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "missing run.wall_s must not trigger a compatibility scan"
+        );
+        assert_eq!(status.timer_active, Some(true));
+        assert_eq!(status.last_run_seconds_ago, Some(3));
+        assert_eq!(status.timer_interval_s, Some(3600));
+        assert_eq!(status.run_wall_s, None);
     }
 
     /// The `_msg` fields must be paired to the row holding the matching max
