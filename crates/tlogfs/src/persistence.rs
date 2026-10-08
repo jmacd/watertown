@@ -2081,6 +2081,45 @@ impl PersistenceLayer for State {
         self.inner.lock().await.list_file_versions(id).await
     }
 
+    async fn snapshot_identity(&self) -> TinyFSResult<Option<String>> {
+        self.coherence.ensure_open()?;
+        let (path, version) = {
+            let inner = self.inner.lock().await;
+            let has_pending = !inner.records.is_empty()
+                || !inner.pending_files.is_empty()
+                || !inner.pending_mtimes.is_empty()
+                || !inner.allocated_versions.is_empty()
+                || !inner.external_add_actions.is_empty()
+                || inner
+                    .directories
+                    .values()
+                    .any(|directory| directory.modified);
+            if has_pending {
+                return Ok(None);
+            }
+            let Some(version) = inner.table.version() else {
+                return Ok(None);
+            };
+            (inner.path.clone(), version)
+        };
+        let commit_path = path.join("_delta_log").join(format!("{version:020}.json"));
+        let commit = match tokio::fs::read(&commit_path).await {
+            Ok(commit) => commit,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).map_other_context(format!(
+                    "read Delta snapshot identity '{}'",
+                    commit_path.display()
+                ));
+            }
+        };
+        Ok(Some(format!(
+            "tlogfs:{}:{version}:{}",
+            path.display(),
+            blake3::hash(&commit).to_hex()
+        )))
+    }
+
     async fn file_version_info(
         &self,
         id: FileID,

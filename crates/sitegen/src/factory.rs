@@ -28,6 +28,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use tinyfs::ResultExt;
 
 // ---------------------------------------------------------------------------
@@ -301,20 +302,30 @@ async fn build_site_from_root(
     output_dir: &std::path::Path,
     root_base_url: &str,
 ) -> Result<(), tinyfs::Error> {
+    let build_started = Instant::now();
+
     // Run export stages
+    let phase_started = Instant::now();
     let exports = run_export_stages(config, root, provider_ctx, output_dir).await?;
+    log_sitegen_phase(config, output_dir, "exports", phase_started);
 
     // Run content stages
+    let phase_started = Instant::now();
     let content = run_content_stages(config, root).await?;
+    log_sitegen_phase(config, output_dir, "content", phase_started);
 
     // Run pond status grid queries (no-op when not configured).
     // We compute these once per site build and pass them through to
     // every page; the shortcode renders nothing when the option is
     // None, so unrelated pages aren't affected.
+    let phase_started = Instant::now();
     let pond_statuses = run_status_grid_queries(config, root, provider_ctx).await?;
+    log_sitegen_phase(config, output_dir, "status-grid", phase_started);
     let generated_at = chrono::Utc::now()
         .format("%Y-%m-%d %H:%M:%S UTC")
         .to_string();
+
+    let phase_started = Instant::now();
 
     // Pre-read all files from the pond into a map
     let mut file_cache: BTreeMap<String, String> = BTreeMap::new();
@@ -400,7 +411,93 @@ async fn build_site_from_root(
     // Copy static assets to output, preserving directory structure
     copy_static_assets(&static_assets, output_dir)?;
 
+    log_sitegen_phase(config, output_dir, "render", phase_started);
+    info!(
+        "Sitegen build summary: site={:?} output={:?} elapsed_s={:.3}",
+        config.site.title,
+        output_dir,
+        build_started.elapsed().as_secs_f64(),
+    );
+
     Ok(())
+}
+
+fn log_sitegen_phase(config: &SiteConfig, output_dir: &Path, phase: &str, started: Instant) {
+    info!(
+        "Sitegen phase summary: site={:?} output={:?} phase={} elapsed_s={:.3}",
+        config.site.title,
+        output_dir,
+        phase,
+        started.elapsed().as_secs_f64(),
+    );
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PlanMetricsDelta {
+    global_plans: u64,
+    non_incremental_plans: u64,
+    dynamic_source_executions: u64,
+    bounded_dynamic_source_executions: u64,
+    export_source_executions: u64,
+    export_partitions_reused: u64,
+    export_partitions_written: u64,
+}
+
+fn plan_metrics_delta(
+    before: tinyfs::PlanVisibilityMetricsSnapshot,
+    after: tinyfs::PlanVisibilityMetricsSnapshot,
+) -> PlanMetricsDelta {
+    PlanMetricsDelta {
+        global_plans: after.global_plans.saturating_sub(before.global_plans),
+        non_incremental_plans: after
+            .non_incremental_plans
+            .saturating_sub(before.non_incremental_plans),
+        dynamic_source_executions: after
+            .dynamic_source_executions
+            .saturating_sub(before.dynamic_source_executions),
+        bounded_dynamic_source_executions: after
+            .bounded_dynamic_source_executions
+            .saturating_sub(before.bounded_dynamic_source_executions),
+        export_source_executions: after
+            .export_source_executions
+            .saturating_sub(before.export_source_executions),
+        export_partitions_reused: after
+            .export_partitions_reused
+            .saturating_sub(before.export_partitions_reused),
+        export_partitions_written: after
+            .export_partitions_written
+            .saturating_sub(before.export_partitions_written),
+    }
+}
+
+fn log_export_work(
+    level: &str,
+    stage: &str,
+    source: Option<&str>,
+    started: Instant,
+    before: tinyfs::PlanVisibilityMetricsSnapshot,
+    after: tinyfs::PlanVisibilityMetricsSnapshot,
+) {
+    let delta = plan_metrics_delta(before, after);
+    info!(
+        "Sitegen export summary: level={} stage={:?} source={:?} elapsed_s={:.3} \
+         global_plans={} non_incremental_plans={} dynamic_source_executions={} \
+         bounded_dynamic_source_executions={} export_source_executions={} \
+         export_partitions_reused={} export_partitions_written={} \
+         cumulative_minimum_dynamic_event_time_lo={:?}",
+        level,
+        stage,
+        source,
+        started.elapsed().as_secs_f64(),
+        delta.global_plans,
+        delta.non_incremental_plans,
+        delta.dynamic_source_executions,
+        delta.bounded_dynamic_source_executions,
+        delta.export_source_executions,
+        delta.export_partitions_reused,
+        delta.export_partitions_written,
+        after.minimum_dynamic_event_time_lo,
+    );
 }
 
 /// Run export stages: glob-match pond files, export as Hive-partitioned parquet,
@@ -430,6 +527,9 @@ async fn run_export_stages(
     let mut exports = BTreeMap::new();
 
     for stage in &config.exports {
+        let started = Instant::now();
+        let before = provider_ctx.plan_visibility_metrics();
+
         // Detect format-provider URL patterns vs bare pond glob paths
         if stage.pattern.contains("://") {
             let (by_key, columns) =
@@ -440,6 +540,15 @@ async fn run_export_stages(
                 run_queryable_file_export(stage, root, &data_dir, provider_ctx, config).await?;
             exports.insert(stage.name.clone(), ExportContext { by_key, columns });
         }
+
+        log_export_work(
+            "stage",
+            &stage.name,
+            None,
+            started,
+            before,
+            provider_ctx.plan_visibility_metrics(),
+        );
     }
 
     let metrics = provider_ctx.plan_visibility_metrics();
@@ -554,6 +663,8 @@ async fn run_format_provider_export(
     for matched in &matched_files {
         let path_str = matched.path().to_string_lossy().to_string();
         let key = matched.captures.first().cloned().unwrap_or_default();
+        let started = Instant::now();
+        let before = provider_ctx.plan_visibility_metrics();
 
         let rel = series_path_to_data_rel(&path_str);
         let export_dir = data_dir.join(&rel);
@@ -618,6 +729,14 @@ async fn run_format_provider_export(
             path_str,
             export_outputs.len(),
             temporal_parts,
+        );
+        log_export_work(
+            "source",
+            &stage.name,
+            Some(&path_str),
+            started,
+            before,
+            provider_ctx.plan_visibility_metrics(),
         );
     }
 
@@ -759,7 +878,7 @@ async fn run_status_grid_queries(
             && let Some(pond_name) = extract_pond_name(&unit)
         {
             let perf_url = pattern.replace("{pond}", pond_name);
-            populate_perf_fields(&perf_provider, ctx, &perf_url, &mut status).await;
+            populate_perf_fields(&perf_provider, ctx, &perf_url, window_bounds, &mut status).await;
         }
 
         status.health = classify(
@@ -938,7 +1057,7 @@ fn extract_pond_name(unit: &str) -> Option<&str> {
 }
 
 /// Look up the per-pond perf series and fill in `timer_active`,
-/// `last_run_seconds_ago`, `timer_interval_s` on `status`.  All
+/// `last_run_seconds_ago`, `timer_interval_s`, and `run_wall_s` on `status`. All
 /// failures are warned and swallowed; missing perf data is not a
 /// build error.  Registers the table under a per-unit name so
 /// concurrent invocations don't collide.
@@ -946,11 +1065,13 @@ async fn populate_perf_fields(
     perf_provider: &provider::Provider,
     ctx: &datafusion::prelude::SessionContext,
     perf_url: &str,
+    bounds: tinyfs::SeriesReadBounds,
     status: &mut PondStatus,
 ) {
-    use datafusion::arrow::array::{Array, Int64Array};
-
-    let table_provider = match perf_provider.create_table_provider(perf_url, ctx).await {
+    let table_provider = match perf_provider
+        .create_table_provider_bounded(perf_url, ctx, bounds)
+        .await
+    {
         Ok(tp) => tp,
         Err(e) => {
             warn!(
@@ -970,61 +1091,61 @@ async fn populate_perf_fields(
             "_"
         )
     );
-    if let Err(e) = ctx.register_table(
-        datafusion::sql::TableReference::bare(perf_table.as_str()),
-        table_provider,
-    ) {
-        warn!(
-            "status_grid: perf register_table('{}') failed: {}",
-            perf_table, e
-        );
-        return;
+    if let Err(e) =
+        populate_perf_fields_from_provider(ctx, table_provider, &perf_table, status).await
+    {
+        warn!("status_grid: perf query for '{}' failed: {}", perf_url, e);
     }
+}
+
+async fn populate_perf_fields_from_provider(
+    ctx: &datafusion::prelude::SessionContext,
+    table_provider: Arc<dyn datafusion::catalog::TableProvider>,
+    perf_table: &str,
+    status: &mut PondStatus,
+) -> Result<(), tinyfs::Error> {
+    use datafusion::arrow::array::{Array, Int64Array};
+
+    // `run.wall_s` was added after the established liveness columns. Older
+    // series omit it entirely, so project a typed NULL in the same query rather
+    // than paying for a second latest-row scan or losing the other fields.
+    let run_wall = if table_provider
+        .schema()
+        .field_with_name("run.wall_s")
+        .is_ok()
+    {
+        "\"run.wall_s\""
+    } else {
+        "CAST(NULL AS BIGINT)"
+    };
+    ctx.register_table(
+        datafusion::sql::TableReference::bare(perf_table),
+        table_provider,
+    )
+    .map_err(|e| {
+        tinyfs::Error::Other(format!(
+            "status_grid perf register_table('{}'): {}",
+            perf_table, e
+        ))
+    })?;
 
     let sql = format!(
         "SELECT \"timer.active\" AS timer_active, \
                 \"last_run.seconds_ago\" AS last_run_seconds_ago, \
-                \"timer.interval_s\" AS timer_interval_s \
-         FROM {} \
-         ORDER BY timestamp DESC LIMIT 1",
-        perf_table
+                \"timer.interval_s\" AS timer_interval_s, \
+                {run_wall} AS run_wall_s \
+         FROM {perf_table} \
+         ORDER BY timestamp DESC LIMIT 1"
     );
     let result = async {
         let df = ctx.sql(&sql).await?;
         df.collect().await
     }
     .await;
+    let _ = ctx.deregister_table(datafusion::sql::TableReference::bare(perf_table));
 
-    // `run.wall_s` was added to measure-pond.sh after the other perf
-    // fields, so a perf series written by an older probe lacks the
-    // column entirely and this SELECT would fail schema resolution.
-    // Query it separately and best-effort so that during a deploy the
-    // established liveness fields above are never lost -- a missing
-    // `run.wall_s` just falls the staleness threshold back to
-    // `2 * timer_interval_s`.
-    let run_wall_result = async {
-        let df = ctx
-            .sql(&format!(
-                "SELECT \"run.wall_s\" AS run_wall_s \
-                 FROM {} \
-                 ORDER BY timestamp DESC LIMIT 1",
-                perf_table
-            ))
-            .await?;
-        df.collect().await
-    }
-    .await;
-
-    let _ = ctx.deregister_table(datafusion::sql::TableReference::bare(perf_table.as_str()));
-
-    let batches = match result {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("status_grid: perf query for '{}' failed: {}", perf_url, e);
-            return;
-        }
-    };
-
+    let batches = result
+        .map_err(|e| tinyfs::Error::Other(format!("status_grid perf latest-row query: {e}")))?;
     let scalar_i64 =
         |batches: &[datafusion::arrow::array::RecordBatch], col: usize| -> Option<i64> {
             batches.iter().find_map(|b| {
@@ -1047,10 +1168,8 @@ async fn populate_perf_fields(
     }
     status.last_run_seconds_ago = get_i64(1);
     status.timer_interval_s = get_i64(2).filter(|&v| v > 0);
-    status.run_wall_s = run_wall_result
-        .ok()
-        .and_then(|b| scalar_i64(&b, 0))
-        .filter(|&v| v > 0);
+    status.run_wall_s = get_i64(3).filter(|&v| v > 0);
+    Ok(())
 }
 
 /// Run the per-unit DataFusion queries for the status grid.
@@ -1447,6 +1566,8 @@ async fn run_queryable_file_export(
     for (node_path, captures) in &matches {
         let path_str = node_path.path.to_string_lossy().to_string();
         let key = captures.first().cloned().unwrap_or_default();
+        let started = Instant::now();
+        let before = provider_ctx.plan_visibility_metrics();
 
         let rel = series_path_to_data_rel(&path_str);
         let export_dir = data_dir.join(&rel);
@@ -1519,6 +1640,14 @@ async fn run_queryable_file_export(
             path_str,
             export_outputs.len(),
             temporal_parts,
+        );
+        log_export_work(
+            "source",
+            &stage.name,
+            Some(&path_str),
+            started,
+            before,
+            provider_ctx.plan_visibility_metrics(),
         );
     }
 
@@ -2462,6 +2591,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn computes_per_scope_plan_metric_deltas() {
+        let before = tinyfs::PlanVisibilityMetricsSnapshot {
+            global_plans: 10,
+            non_incremental_plans: 7,
+            dynamic_source_executions: 4,
+            bounded_dynamic_source_executions: 3,
+            minimum_dynamic_event_time_lo: Some(100),
+            export_source_executions: 20,
+            export_partitions_reused: 80,
+            export_partitions_written: 40,
+        };
+        let after = tinyfs::PlanVisibilityMetricsSnapshot {
+            global_plans: 12,
+            non_incremental_plans: 8,
+            dynamic_source_executions: 7,
+            bounded_dynamic_source_executions: 5,
+            minimum_dynamic_event_time_lo: Some(50),
+            export_source_executions: 21,
+            export_partitions_reused: 95,
+            export_partitions_written: 45,
+        };
+
+        assert_eq!(
+            plan_metrics_delta(before, after),
+            PlanMetricsDelta {
+                global_plans: 2,
+                non_incremental_plans: 1,
+                dynamic_source_executions: 3,
+                bounded_dynamic_source_executions: 2,
+                export_source_executions: 1,
+                export_partitions_reused: 15,
+                export_partitions_written: 5,
+            }
+        );
+    }
+
+    #[test]
     fn validates_generated_local_images() {
         let output = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(output.path().join("blog")).unwrap();
@@ -2540,6 +2706,135 @@ mod tests {
             Arc::new(provider),
         )
         .unwrap();
+    }
+
+    fn perf_table(include_run_wall: bool) -> Arc<dyn datafusion::catalog::TableProvider> {
+        use datafusion::arrow::array::{ArrayRef, Int64Array};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::datasource::MemTable;
+
+        let mut fields = vec![
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("timer.active", DataType::Int64, true),
+            Field::new("last_run.seconds_ago", DataType::Int64, true),
+            Field::new("timer.interval_s", DataType::Int64, true),
+        ];
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![100, 200])),
+            Arc::new(Int64Array::from(vec![0, 1])),
+            Arc::new(Int64Array::from(vec![90, 3])),
+            Arc::new(Int64Array::from(vec![60, 3600])),
+        ];
+        if include_run_wall {
+            fields.push(Field::new("run.wall_s", DataType::Int64, true));
+            columns.push(Arc::new(Int64Array::from(vec![10, 20])));
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
+    }
+
+    #[derive(Debug)]
+    struct ScanCountingTableProvider {
+        inner: Arc<dyn datafusion::catalog::TableProvider>,
+        scans: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl datafusion::catalog::TableProvider for ScanCountingTableProvider {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
+            self.inner.schema()
+        }
+
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            self.inner.table_type()
+        }
+
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&datafusion::logical_expr::Expr],
+        ) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>>
+        {
+            self.inner.supports_filters_pushdown(filters)
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn datafusion::catalog::Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[datafusion::logical_expr::Expr],
+            limit: Option<usize>,
+        ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+            _ = self
+                .scans
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.scan(state, projection, filters, limit).await
+        }
+    }
+
+    fn scan_counting_table(
+        inner: Arc<dyn datafusion::catalog::TableProvider>,
+    ) -> (
+        Arc<dyn datafusion::catalog::TableProvider>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            Arc::new(ScanCountingTableProvider {
+                inner,
+                scans: scans.clone(),
+            }),
+            scans,
+        )
+    }
+
+    #[tokio::test]
+    async fn status_perf_fields_use_one_latest_row_scan() {
+        let ctx = datafusion::prelude::SessionContext::new();
+        let (table, scans) = scan_counting_table(perf_table(true));
+        let mut status =
+            summary_to_pond_status(&status_summary::UnitSummary::default(), "pond@x.service");
+
+        populate_perf_fields_from_provider(&ctx, table, "status_perf", &mut status)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "all status perf fields must come from one provider scan"
+        );
+        assert_eq!(status.timer_active, Some(true));
+        assert_eq!(status.last_run_seconds_ago, Some(3));
+        assert_eq!(status.timer_interval_s, Some(3600));
+        assert_eq!(status.run_wall_s, Some(20));
+    }
+
+    #[tokio::test]
+    async fn status_perf_fields_keep_old_schema_compatibility_in_one_scan() {
+        let ctx = datafusion::prelude::SessionContext::new();
+        let (table, scans) = scan_counting_table(perf_table(false));
+        let mut status =
+            summary_to_pond_status(&status_summary::UnitSummary::default(), "pond@x.service");
+
+        populate_perf_fields_from_provider(&ctx, table, "status_perf_old", &mut status)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "missing run.wall_s must not trigger a compatibility scan"
+        );
+        assert_eq!(status.timer_active, Some(true));
+        assert_eq!(status.last_run_seconds_ago, Some(3));
+        assert_eq!(status.timer_interval_s, Some(3600));
+        assert_eq!(status.run_wall_s, None);
     }
 
     /// The `_msg` fields must be paired to the row holding the matching max

@@ -319,16 +319,115 @@ stress pond. Pre-deployment measurements in October found:
 - routine pack maintenance repacked 29 series and attributed 177-185 GB of
   logical reads to a roughly 7 GB pond while writing about 100 MB; and
 - the three materializers took 81-278 seconds each. The typed build reduced
-  their peak memory by 41-49%, but a separate full-source `MAX(timestamp)`
-  execution increased their elapsed time and reads.
+  their peak memory by 41-49% while increasing elapsed time and reads by
+  73-87%.
 
 The timer is a serialized oneshot, so `OnUnitActiveSec=1min` does not stack
 runs: effective cadence is the complete tick duration plus the timer delay.
-The follow-up repair derives materialization progress from the one streamed
-output execution and changes pack maintenance from one inline-content Delta
-execution per leaf/series to one disk-spooled execution shared by all repack
-candidates. A controlled selfmon run must confirm the expected I/O reduction
-before these numbers are replaced with a new steady-state baseline.
+Build `0.238.175` was then qualified in one controlled tick with the timer
+disabled. It completed successfully in 47m57s with no failed steps. Pack
+maintenance fell from 185.4 GB to 2.52 GB of logical reads and from roughly
+70 minutes to 3m19s by replacing per-leaf/per-series Delta execution with one
+shared, disk-spooled scan.
+
+That run also corrected the initial materializer diagnosis. Removing the
+source-frontier aggregate did not materially change the three materializers:
+perf still took 268.7s/3.34 GB, limiters 257.5s/3.16 GB, and Azure access
+146.9s/2.39 GB. An isolated `MAX(timestamp)` over the physical perf target took
+253.6s and at least 2.15 GB by itself. The remaining repair therefore derives
+the coarse target watermark from every live version's persisted
+`max_event_time`; microsecond and coarser targets use it directly, while
+nanosecond targets run an exact maximum only over the metadata-selected tail.
+Missing legacy metadata remains a visible full-scan fallback.
+
+Build `0.239.176` qualified that repair on October 4 in another controlled
+tick with the timer disabled. It completed successfully in 39m07s with no
+failed steps and 48.88 GB of process-attributed logical reads (`rchar`).
+Maintenance remained repaired at 3m09s/2.55 GB. Target-watermark pruning made
+all three materializers substantially faster than both `0.238.175` and the old
+pre-migration baseline:
+
+| Materializer | `0.238.175` | `0.239.176` | Logical reads |
+|---|---:|---:|---:|
+| Perf | 268.7s | 31.7s | 3.34 GB -> 441 MB |
+| Limiters | 257.5s | 15.7s | 3.16 GB -> 261 MB |
+| Azure access | 146.9s | 28.8s | 2.39 GB -> 864 MB |
+
+Materialization is therefore no longer the dominant selfmon performance
+defect. The successful tick exposed the following remaining costs:
+
+1. **Sitegen dominates the tick.** It took 1260.0s (21m00s, 54% of the
+   complete tick) at 290.23 MiB peak RSS. The successful-build log is redirected
+   to a temporary file and deleted, so selfmon currently loses sitegen's
+   internal export, temporal-reduce, and status-grid metrics. We cannot yet
+   distinguish repeated export work from status-grid/provider work using the
+   retained operational record.
+2. **The full-journal benchmark remains expensive.** The deliberate
+   `COUNT(*)` over `jsonlogs:///logs/journal/*.jsonl` took 343.2s (5m43s).
+   This is useful stress coverage and should not simply be removed, but its
+   cost still scales with retained journal data. A further approximately 229s
+   elapsed between maintenance and the timed count; that interval includes
+   untimed cursor lookup, journal listing, and other preflight/orchestration,
+   so the responsible operation is not yet attributable.
+3. **Tiny measurement appends have high fixed cost.** The eleven
+   `/system/etc/measure/*` logfile-ingest runs took 140.8s in total and
+   attributed roughly 3.37 GB of logical reads while appending inputs ranging
+   from hundreds of bytes to 6.6 KB. Each separate `pond run` took about
+   10-15s. Reusing one process/session or reducing repeated catalog startup
+   work is likely more valuable than optimizing the tiny writes themselves.
+4. **The remaining I/O is not attributable by phase.** The complete tick
+   attributed 48.88 GB of logical reads, but `run-selfmon.sh` does not emit a
+   `selfmon_io` record for the inline journal benchmark or for sitegen.
+   Maintenance, ingestion, and materialization account for only part of the
+   total. Sitegen now emits elapsed summaries for exports, content,
+   status-grid, and rendering plus elapsed time and plan/work counter deltas
+   for every export stage and matched source. `run-selfmon.sh` still needs I/O
+   boundaries around cursor lookup, journal listing, the count query, and
+   sitegen so logical reads can be attributed alongside those internal
+   timings.
+
+The next performance cycle should prioritize observability, then the measured
+sitegen subphase that dominates a newly instrumented run, followed by the
+catalog/full-journal path. These defects are follow-up efficiency work rather
+than blockers for staging qualification: `0.239.176` repaired the demonstrated
+typed-migration regression and completed the stress tick cleanly.
+
+Build `0.242.179` was qualified on October 7 after the warm temporal-reduce
+planning repair. The controlled tick completed successfully in 38m14s with no
+failed steps and 51.60 GB of process-attributed logical reads. Maintenance
+remained bounded at 3m00s/2.50 GB; perf, limiter, and Azure materialization took
+31.3s/461 MB, 15.3s/272 MB, and 28.5s/903 MB respectively. The tick's Sitegen
+record was still cold at 1237.8s (20m38s), 299.53 MB peak.
+
+Two isolated warm measurements then separated the remaining costs:
+
+| Operation | Elapsed | Logical reads | Result |
+|---|---:|---:|---|
+| Selfmon Sitegen | 172.3s | 5.19 GB | success, 233.63 MB peak |
+| Sitegen exports | 2.65s | included above | all 48 partitions reused; 0 source executions/writes |
+| Sitegen status grid | 166.9s | nearly all Sitegen reads | dominant warm Sitegen phase |
+| Full-journal `COUNT(*)` benchmark | 527.2s | 14.34 GB | success, 441.65 MiB peak |
+
+The warm Sitegen profile proves the temporal-reduce work applies to selfmon:
+exports are no longer the defect. The status grid's journal summaries were also
+already bounded, but its perf enrichment still constructed
+`series:///derived/p-{pond}` without a bound and ran two independent
+`ORDER BY timestamp DESC LIMIT 1` queries per card: one for the established
+liveness fields and one compatibility query for `run.wall_s`.
+
+The follow-up repair applies the status grid's existing `hot_window` bound to
+each perf provider and projects all four fields in one query. Provider schema
+inspection supplies a typed NULL for `run.wall_s` on old series, preserving
+rolling-deploy compatibility without a second scan. Scan-counting regressions
+require exactly one provider execution for both current and old schemas.
+
+The full-history journal count is intentionally a stress benchmark rather than
+a dashboard dependency. At 8m47s and 14.34 GB per invocation it should move to
+a slower independent cadence instead of taxing every ordinary monitoring tick.
+The eleven tiny metric ingests also still repay process/catalog startup
+individually (roughly 10-15s each); session reuse or grouped execution remains a
+separate opportunity. `OnUnitActiveSec=1min` serializes safely but is not a
+realistic operational cadence for this workload.
 
 ### 9. `last_run.seconds_ago == -1` while a service is running
 
