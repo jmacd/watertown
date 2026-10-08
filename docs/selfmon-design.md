@@ -445,6 +445,31 @@ Noncanonical patterns keep the generic traversal. This preserves the durable
 summary and bounded perf behavior while removing unrelated journal files from
 the hot path.
 
+Build `0.244.181` qualified the isolated path. Sitegen completed in 33.547s
+with 695,141,036 process-attributed logical-read bytes and a 232.62 MB peak.
+Discovery took 2.856s for two patterns and ten matches, status-grid took
+25.786s, and exports took 4.122s with all 48 partitions reused and zero source
+executions or writes. Relative to the timestamp-local-only run, total time fell
+from 216.481s to 33.547s and logical reads fell from 5.241 GB to 695 MB.
+
+The controlled full tick passed correctness but not the integrated performance
+gate. It completed in 36m12s with exit 0 and no failed steps, attributed 48.743
+GB of logical reads and 491.0 MB of physical writes, and improved on the prior
+38m14s/51.599 GB tick. Its Sitegen record was nevertheless still cold at
+1021.691s (17m02s) and 202.66 MB peak. The successful Sitegen log was deleted,
+so that record cannot distinguish discovery, summary folding, exports, or
+rendering.
+
+After the tick and the automatically restored staging build were idle, an
+immediate isolated Sitegen run returned to 30.904s/689,294,923 logical-read
+bytes at 151.65 MB peak. Discovery took 2.421s, status-grid 24.236s, and exports
+3.538s; all 50 partitions were reused with zero source executions or writes.
+The regression is therefore transient cold/post-ingest work rather than a
+persistent discovery failure. Before another full tick, `run-selfmon.sh` must
+retain successful discovery/export/phase summaries and emit a separate Sitegen
+I/O boundary. The execution timer remains disabled until that instrumented run
+attributes the 17-minute path.
+
 The full-history journal count is intentionally a stress benchmark rather than
 a dashboard dependency. At 8m47s and 14.34 GB per invocation it should move to
 a slower independent cadence instead of taxing every ordinary monitoring tick.

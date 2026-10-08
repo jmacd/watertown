@@ -302,6 +302,15 @@ bounded; a missing per-version bound retains (never drops) the version.
 | 4 | Selfmon memory-plateau stressor test + docs; retire the `docs/selfmon-design.md §1` open item. Added `series_bounded_read_memory_plateaus_as_history_grows` (tlogfs): as an append-only `FilePhysicalSeries` grows 4→8→16 versions, a fixed-width event-time-bounded read stays byte-for-byte flat while the unbounded read grows monotonically. Also exposed per-version `max_event_time` on `FileVersionInfo` for `FilePhysicalSeries` (not just Table series), so the A.2 cache prune is effective for real jsonlogs journals, not just the read-path filter. | **Done** |
 | 5 | Pre-filter status discovery by `unit_globs` before loading TinyFS children. The live broad `*.jsonl` traversal loaded 1,461 nodes in 359.851s/9.283 GB; two narrowed pond-unit globs loaded ten nodes in 8.429s/285.65 MB. Noncanonical layouts retain generic traversal. | **Done** |
 
+Build `0.244.181` qualified Phase 5 in the live selfmon pond. An isolated build
+completed in 33.547s/695 MB of logical reads, including 2.856s to discover ten
+matches and 25.786s for the complete status grid; the previous
+timestamp-local-only build took 216.481s/5.241 GB. A later warm run remained
+fast at 30.904s/689 MB. One controlled full tick still produced a cold
+1021.691-second Sitegen record, so integrated post-ingest work remains open and
+requires retained phase summaries; it does not invalidate the isolated
+discovery qualification.
+
 ### Notes / open questions
 
 - **Carrying the bound to the no-context path.** The status_grid provider has no

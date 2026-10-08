@@ -1050,9 +1050,26 @@ still perform exact discovery, schema inference still uses the
 lexicographically newest matching source, and unexpected cached non-reuse
 still fails loudly. A direct regression proves literal directory `get` and
 `entries` perform zero source-membership scans; all 41 temporal-reduce tests
-and workspace/all-features clippy pass. A new image and live staging run remain
-required to prove the parent `metrics` stage is now independent of retained
-source membership.
+and workspace/all-features clippy pass.
+
+Live `0.244.181` staging qualification closes this gate. The first scheduled,
+data-changing build completed in 21m20s at 451.79 MB peak; the parent
+`metrics` stage took 673.228 seconds while executing 25 changed sources,
+reusing 7,765 partitions, and writing 25. An immediate no-pull, no-change
+Sitegen run then completed in 555.214 seconds with 385,091,837 process-attributed
+logical-read bytes and a 578.88 MB peak. In that run `metrics` took 190.356
+seconds, reused all 7,790 partitions, and performed zero source executions and
+zero writes. This is a 25.9x reduction from the 4,931-second `0.240.177`
+measurement while retained source membership remained unchanged. Noyo's
+captured-output `params` stage remained exact and completed in 16.717 seconds
+with all 152 partitions reused and zero executions/writes.
+
+The same no-change run also makes the next boundary explicit. The parent
+Sitegen export phase still took 528.378 seconds because ten already-declared
+global/non-incremental downstream plans executed nine sources and rewrote 45
+partitions. The literal-output planning defect is qualified; those global
+graphs, not source-membership discovery, now dominate the warm build and remain
+the Phase 10 gate below.
 
 Water's eight downstream pump-state, drawdown, Horner, calibration, usage, leak,
 and annotation outputs also execute successfully. They remain explicitly global
