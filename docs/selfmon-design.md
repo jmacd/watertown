@@ -421,6 +421,30 @@ inspection supplies a typed NULL for `run.wall_s` on old series, preserving
 rolling-deploy compatibility without a second scan. Scan-counting regressions
 require exactly one provider execution for both current and old schemas.
 
+Build `0.243.180` showed that perf enrichment was not the dominant residual
+cost. An unchanged isolated run completed in 192.5s/5.19 GB, with 186.0s in
+status-grid. After the per-pond views were declared timestamp-local and fresh
+non-production health rows were ingested, the run still took 216.5s/5.24 GB,
+including 205.5s in status-grid. Log timestamps placed about 185s before the
+first perf view was planned; all nine timestamp-local perf views then completed
+in about 21s.
+
+The remaining cost was status discovery. Sitegen expanded
+`/logs/journal/*.jsonl` into 1,461 loaded TinyFS child nodes and only afterward
+filtered their basenames against the two configured pond-unit globs. An
+isolated live measurement took 359.851s and 9.283 GB of logical reads merely to
+list those matches. Running the two already-configured narrow patterns directly
+matched the intended ten files in 8.429s/285.65 MB across two separate Pond
+processes: 42.7x faster and 32.5x fewer logical reads despite paying process
+startup twice.
+
+Status discovery now intersects the canonical `*.jsonl` pattern with
+`unit_globs` before TinyFS loads child nodes, deduplicates overlapping matches,
+and logs the discovery mode, pattern count, match count, and elapsed time.
+Noncanonical patterns keep the generic traversal. This preserves the durable
+summary and bounded perf behavior while removing unrelated journal files from
+the hot path.
+
 The full-history journal count is intentionally a stress benchmark rather than
 a dashboard dependency. At 8m47s and 14.34 GB per invocation it should move to
 a slower independent cadence instead of taxing every ordinary monitoring tick.
