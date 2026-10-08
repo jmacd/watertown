@@ -773,7 +773,39 @@ async fn run_status_grid_queries(
     let scheme = pattern_url.scheme().to_string();
     let path_pattern = pattern_url.path().to_string();
 
-    let matches = match root.collect_matches(&path_pattern).await {
+    // Narrow the canonical journal wildcard with unit_globs before TinyFS
+    // loads matching child nodes. A selfmon journal directory can contain
+    // thousands of unrelated unit files; collecting `*.jsonl` first and
+    // filtering afterward pays to reconstruct every one of them.
+    let unit_globs: Vec<&str> = grid_cfg.unit_globs.iter().map(String::as_str).collect();
+    let narrowed_patterns = status_grid_discovery_patterns(&path_pattern, &unit_globs);
+    let discovery_started = Instant::now();
+    let matches_result: Result<Vec<_>, tinyfs::Error> = if let Some(patterns) = &narrowed_patterns {
+        let mut unique = BTreeMap::new();
+        let mut failure = None;
+        for pattern in patterns {
+            match root.collect_matches(pattern).await {
+                Ok(matches) => {
+                    for (node, _) in matches {
+                        _ = unique.insert(node.path().to_path_buf(), node);
+                    }
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(unique.into_values().collect()),
+        }
+    } else {
+        root.collect_matches(&path_pattern)
+            .await
+            .map(|matches| matches.into_iter().map(|(node, _)| node).collect())
+    };
+    let matches = match matches_result {
         Ok(m) => m,
         Err(e) => {
             warn!(
@@ -783,9 +815,21 @@ async fn run_status_grid_queries(
             return Ok(Some(Vec::new()));
         }
     };
+    info!(
+        "Sitegen status-grid discovery summary: pattern={:?} mode={} \
+         discovery_patterns={} matches={} elapsed_s={:.3}",
+        path_pattern,
+        if narrowed_patterns.is_some() {
+            "unit-globs"
+        } else {
+            "generic"
+        },
+        narrowed_patterns.as_ref().map_or(1, Vec::len),
+        matches.len(),
+        discovery_started.elapsed().as_secs_f64(),
+    );
 
     // Filter basenames against unit_globs (simple `*` wildcard).
-    let unit_globs: Vec<&str> = grid_cfg.unit_globs.iter().map(String::as_str).collect();
     let matches_unit = |unit: &str| -> bool {
         if unit_globs.is_empty() {
             return true;
@@ -818,7 +862,7 @@ async fn run_status_grid_queries(
 
     let mut statuses: Vec<PondStatus> = Vec::new();
 
-    for (np, _captures) in &matches {
+    for np in &matches {
         let basename = np.basename();
         let unit = basename.trim_end_matches(".jsonl").to_string();
         if !matches_unit(&unit) {
@@ -1487,6 +1531,34 @@ fn simple_glob_match(pattern: &str, s: &str) -> bool {
         pi += 1;
     }
     pi == p.len()
+}
+
+/// For the status grid's canonical journal layout, intersect the broad
+/// `*.jsonl` filename glob with configured unit globs before node loading.
+/// Other layouts retain the generic TinyFS traversal.
+fn status_grid_discovery_patterns(path_pattern: &str, unit_globs: &[&str]) -> Option<Vec<PathBuf>> {
+    if unit_globs.is_empty() {
+        return None;
+    }
+    let path = Path::new(path_pattern);
+    if path.file_name()?.to_str()? != "*.jsonl" {
+        return None;
+    }
+    let parent = path.parent()?;
+    let parent_text = parent.to_string_lossy();
+    if parent_text.contains(['*', '?', '[', ']'])
+        || unit_globs.iter().any(|glob| {
+            glob.is_empty() || glob.contains(['/', '\\', '?', '[', ']']) || glob.ends_with(".jsonl")
+        })
+    {
+        return None;
+    }
+    Some(
+        unit_globs
+            .iter()
+            .map(|glob| parent.join(format!("{glob}.jsonl")))
+            .collect(),
+    )
 }
 
 /// Export queryable pond files (original path: bare glob patterns).
@@ -2902,6 +2974,41 @@ mod tests {
         assert_eq!(s.last_err_us, None);
         assert_eq!(s.last_err_msg, None);
         assert_eq!(s.peak_rss_bytes, None);
+    }
+
+    #[test]
+    fn status_grid_discovery_narrows_before_loading_nodes() {
+        let patterns = status_grid_discovery_patterns(
+            "/logs/journal/*.jsonl",
+            &["user-pond@*.service", "user-pond-selfmon@*.service"],
+        )
+        .unwrap();
+
+        assert_eq!(
+            patterns,
+            vec![
+                PathBuf::from("/logs/journal/user-pond@*.service.jsonl"),
+                PathBuf::from("/logs/journal/user-pond-selfmon@*.service.jsonl"),
+            ]
+        );
+        assert!(
+            patterns
+                .iter()
+                .all(|pattern| pattern != Path::new("/logs/journal/*.jsonl")),
+            "the broad 1,461-file journal glob must never be traversed"
+        );
+    }
+
+    #[test]
+    fn status_grid_discovery_preserves_generic_fallbacks() {
+        assert!(
+            status_grid_discovery_patterns("/logs/**/*.jsonl", &["user-pond@*.service"]).is_none()
+        );
+        assert!(
+            status_grid_discovery_patterns("/logs/journal/*.log", &["user-pond@*.service"])
+                .is_none()
+        );
+        assert!(status_grid_discovery_patterns("/logs/journal/*.jsonl", &[]).is_none());
     }
 
     #[test]
