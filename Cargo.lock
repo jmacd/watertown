@@ -853,6 +853,7 @@ dependencies = [
  "datafusion-expr",
  "deltalake",
  "env_logger",
+ "exec-factory",
  "file-rotate",
  "futures",
  "gitpond",
@@ -2179,6 +2180,25 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "exec-factory"
+version = "0.52.0"
+dependencies = [
+ "blake3",
+ "futures",
+ "linkme",
+ "log",
+ "paste",
+ "provider",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tinyfs",
+ "tokio",
 ]
 
 [[package]]
