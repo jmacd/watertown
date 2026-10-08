@@ -50,6 +50,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends bubblewrap
+          # Ubuntu 24.04 restricts unprivileged user namespaces through
+          # AppArmor by default. Bubblewrap can start under that policy, but
+          # cannot configure the isolated loopback interface requested by
+          # --unshare-net. This is an ephemeral hosted runner executing
+          # trusted repository tests; keep production hosts unchanged.
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       
       - name: Run tests
         run: cargo test --workspace
