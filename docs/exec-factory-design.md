@@ -480,24 +480,176 @@ also possible, but is not required for ordinary entry from the TUI.
 
 ---
 
-## 8. Implementation plan
+## 8. Accounting deployment roadmap
 
-1. New workspace member `crates/exec-factory`; add to root `Cargo.toml`
-   members + workspace deps, and as a dependency of `crates/cmd` (mirrors
-   `billing`'s wiring exactly).
-2. `ExecConfig` (serde) + `validate_exec_config`, following the
-   `#[serde(deny_unknown_fields)]` convention used by every other factory
-   config (e.g. `TestConfig` in `test_factory.rs:21`).
-3. `stage_inputs` / `snapshot_outputs` / `diff_outputs` as small,
-   independently unit-testable functions operating on `std::path::Path`,
-   with no TinyFS or subprocess dependency -- so the diffing logic can be
-   tested without an actual pond or an actual `bwrap`.
-4. `run_sandboxed`: builds the `bwrap` argv from `ExecConfig`, wraps the
-   child in `tokio::time::timeout`, returns `ExitStatus`.
-5. `execute()` wiring the above together, `register_executable_factory!`.
-6. Tests per §6, run via the Docker loop in §4; wire that `docker run` as
-   the `cargo test -p exec-factory` recipe documented in this crate's
-   README, not as a new CI job (existing `rust-ci.yml` already runs on
-   Linux runners, so `cargo test -p exec-factory` there exercises the real
-   sandbox path with no Docker indirection needed -- Docker is purely a
-   macOS dev convenience).
+The exec factory, append-only `series_outputs`, interactive terminal mode,
+and hledger smoke/integration tests described above are implemented. The next
+phase is to replace the bespoke billing ledger with ordinary Ledger-format
+files while retaining Watertown's transactions, history, and remote backups.
+
+This phase deliberately stops before statement generation. Its deliverable is
+a complete, reconciled set of historical and current books that hledger can
+operate interactively and DataFusion can read through Ledger format
+providers.
+
+### 8a. Canonical journal layout
+
+The accounting pond will hold:
+
+```text
+/accounting/
+  books.journal                 # includes the files below
+  accounts.journal              # chart of accounts and shared directives
+  cycles/
+    YYYY-MM.journal             # one immutable six-month billing cycle
+  current.journal               # the one writable FilePhysicalSeries
+  current-cycle.yaml            # closing month/year and cycle metadata
+```
+
+`YYYY-MM` is the closing month and year of a six-month billing cycle. The
+active cycle is therefore named logically by its closing month/year even
+while its writable file remains at the stable `/accounting/current.journal`
+path. On close, that file becomes `/accounting/cycles/YYYY-MM.journal` and a
+new empty `current.journal` is created for the next declared closing month.
+
+`books.journal` is the hledger entry point. It includes `accounts.journal`,
+all closed journals under `cycles/`, and `current.journal`, so interactive
+and reporting commands always see the complete accounting history. Closed
+cycle files and `accounts.journal` are read-only inputs to exec factories;
+only `current.journal` is a `series_outputs` path.
+
+### 8b. Historical CSV migration
+
+A Go migration program will live beside and reuse the existing Caspar Water
+billing software and its CSV models. The original CSVs remain authoritative
+source material; generated journals are reproducible migration artifacts,
+not the only recoverable copy.
+
+The program will:
+
+1. Read the existing customer, connection, cycle, payment, and business
+   inputs using the same parsing and identity rules as the current billing
+   program.
+2. Generate one deterministic `accounts.journal` containing the chart of
+   accounts and shared commodity/account declarations.
+3. Generate one deterministic `cycles/YYYY-MM.journal` for every historical
+   six-month billing cycle.
+4. Record the already-tallied total for each expense account in that cycle
+   rather than attempting to reconstruct individual historical expenses that
+   were never captured.
+5. Record every payment received on or before the cycle's close cutoff in the
+   applicable historical journal, with stable source identifiers in comments
+   or tags so duplicate or omitted payments can be diagnosed.
+6. Fail loudly on unknown identities, ambiguous cycle assignment, unbalanced
+   transactions, duplicate source records, or reconciliation differences.
+   It must never silently omit or coerce a historical row.
+
+Migration acceptance is reconciliation, not merely successful parsing:
+
+- every generated journal passes hledger's strict validation;
+- every transaction balances;
+- per-cycle expense totals match the source billing totals;
+- per-cycle and cumulative payments match the source payment data;
+- customer/account balances at every cycle boundary match the existing
+  billing system; and
+- rerunning the migration from identical inputs produces byte-identical
+  journal files.
+
+The migration first writes ordinary host files for review and reconciliation.
+Only an explicitly accepted output set is loaded into a fresh accounting
+pond.
+
+### 8c. Interactive current-cycle operation
+
+The accounting runtime image will be a separately published Watertown image
+containing `bubblewrap`, stable Debian `hledger`, and `hledger-ui`. It will
+not add accounting tools or elevated container privileges to water, septic,
+noyo, or site instances.
+
+The ordinary attended workflow is:
+
+1. Start the accounting pond against `books.journal`.
+2. Stage `accounts.journal`, closed cycle journals, and the include file
+   read-only; stage `current.journal` read-write as a `series_outputs` file.
+3. Run `hledger-ui` interactively inside the exec sandbox.
+4. Enter new expenses and payments with the TUI's add-transaction workflow.
+5. Exit cleanly with `q`; exec-factory validates the append-only boundary and
+   commits the new journal suffix as one Watertown transaction.
+6. Let the pond's configured post-commit backup push that transaction. A
+   sandbox or validation failure aborts the pond transaction and leaves both
+   the journal and remote publication unchanged.
+
+Every entry session is explicit and attended; accounting exec nodes remain
+under `/system/etc`, not `/system/run`.
+
+### 8d. Closing a billing cycle
+
+Cycle close will be a separate explicit command, not an hledger-ui side
+effect. It will perform one atomic Watertown transaction that:
+
+1. validates all journals with hledger;
+2. verifies that `current-cycle.yaml` names the expected closing month/year;
+3. refuses to overwrite an existing `cycles/YYYY-MM.journal`;
+4. finalizes `current.journal` at that dated cycle path without rewriting its
+   committed bytes;
+5. creates a new empty `current.journal`;
+6. advances `current-cycle.yaml` to the next six-month close; and
+7. updates `books.journal` if its include structure requires an explicit
+   cycle list.
+
+The command must be idempotent or fail with a precise already-closed
+diagnostic. Any validation, naming, or filesystem error aborts the entire
+transaction. Remote backup occurs only after the close transaction commits.
+
+The implementation must preserve `FilePhysicalSeries` identity and history;
+whether close is represented internally as a TinyFS rename or as a
+transactional finalization operation will be decided from the filesystem's
+existing rename and series semantics, not by copying bytes through the host.
+
+### 8e. Staging and production ponds
+
+Accounting follows the existing producer pattern but remains independent of
+sitegen for now:
+
+- `accounting-staging` runs on Watershop and backs up to its own MinIO bucket;
+- `accounting-prod` uses its own production storage and Azure backup;
+- each tier has a distinct pond volume, remote URL, credentials, rate limits,
+  and immutable recovery path;
+- neither pond is imported by the public site pond; and
+- restore drills must prove that a fresh local pond can recover the complete
+  journal set and open it successfully with hledger-ui.
+
+The deployment wrapper selects the accounting image only for
+`accounting-*`. Because nested bubblewrap requires container privileges on
+the current runtime, those privileges are also scoped only to accounting
+instances and must be re-verified on the actual Watershop and production
+hosts.
+
+### 8f. Ledger format providers
+
+After migration, interactive operation, close, backup, and restore are
+working, add Ledger-format providers that expose journal records as typed
+DataFusion tables. At minimum the provider model must represent transactions,
+postings, accounts, commodities, dates, descriptions/payees, amounts, and
+source journal/cycle identity without losing Ledger semantics.
+
+The provider reads the canonical journal files; it does not create a second
+accounting authority or materialize an independently editable ledger. Tests
+will compare provider output with hledger reports for the same fixture books.
+
+Generating customer statements from those tables is a later phase and is not
+part of this roadmap's exit criteria.
+
+### 8g. Exit criteria
+
+This phase is complete when:
+
+1. historical CSVs deterministically produce reconciled Ledger journals;
+2. the accepted journals load into fresh staging and production accounting
+   ponds;
+3. an attended hledger-ui session can append a balanced transaction and
+   commit it through exec-factory;
+4. cycle close atomically archives the current journal and starts the next
+   six-month cycle;
+5. post-commit remote backup and full restore are verified in both tiers; and
+6. DataFusion can query the journals through tested Ledger format providers.
