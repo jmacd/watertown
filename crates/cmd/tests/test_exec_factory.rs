@@ -68,7 +68,10 @@ outputs: ["/data/out.txt"]
         .create_dir_path("/configs")
         .await
         .expect("create /configs dir");
-    let (parent_wd, _) = root.resolve_path("/configs").await.expect("resolve /configs");
+    let (parent_wd, _) = root
+        .resolve_path("/configs")
+        .await
+        .expect("resolve /configs");
     let parent_node_id = parent_wd.node_path().id();
 
     let _node_path = root
@@ -135,7 +138,10 @@ outputs: ["/data/out.txt"]
         .create_dir_path("/configs")
         .await
         .expect("create /configs dir");
-    let (parent_wd, _) = root.resolve_path("/configs").await.expect("resolve /configs");
+    let (parent_wd, _) = root
+        .resolve_path("/configs")
+        .await
+        .expect("resolve /configs");
     let parent_node_id = parent_wd.node_path().id();
 
     let _node_path = root
@@ -221,7 +227,10 @@ outputs: ["/data/out.txt"]
         .create_dir_path("/configs")
         .await
         .expect("create /configs dir");
-    let (parent_wd, _) = root.resolve_path("/configs").await.expect("resolve /configs");
+    let (parent_wd, _) = root
+        .resolve_path("/configs")
+        .await
+        .expect("resolve /configs");
     let parent_node_id = parent_wd.node_path().id();
 
     let _node_path = root
@@ -313,7 +322,10 @@ outputs: ["/reports/"]
         .create_dir_path("/configs")
         .await
         .expect("create /configs dir");
-    let (parent_wd, _) = root.resolve_path("/configs").await.expect("resolve /configs");
+    let (parent_wd, _) = root
+        .resolve_path("/configs")
+        .await
+        .expect("resolve /configs");
     let parent_node_id = parent_wd.node_path().id();
 
     let _node_path = root
@@ -395,7 +407,10 @@ series_outputs: ["/accounting/journal.ledger"]
         .create_dir_path("/configs")
         .await
         .expect("create /configs dir");
-    let (parent_wd, _) = root.resolve_path("/configs").await.expect("resolve /configs");
+    let (parent_wd, _) = root
+        .resolve_path("/configs")
+        .await
+        .expect("resolve /configs");
     let parent_node_id = parent_wd.node_path().id();
     let _node_path = root
         .create_dynamic_path(
@@ -442,7 +457,10 @@ series_outputs: ["/accounting/journal.ledger"]
         .await
         .expect("begin step2 transaction");
     let root = tx.root().await.expect("root");
-    let (parent_wd, _) = root.resolve_path("/configs").await.expect("resolve /configs");
+    let (parent_wd, _) = root
+        .resolve_path("/configs")
+        .await
+        .expect("resolve /configs");
     let parent_node_id = parent_wd.node_path().id();
     let _node_path = root
         .create_dynamic_path(
@@ -515,7 +533,10 @@ series_outputs: ["/accounting/journal.ledger"]
         .create_dir_path("/configs")
         .await
         .expect("create /configs dir");
-    let (parent_wd, _) = root.resolve_path("/configs").await.expect("resolve /configs");
+    let (parent_wd, _) = root
+        .resolve_path("/configs")
+        .await
+        .expect("resolve /configs");
     let parent_node_id = parent_wd.node_path().id();
     let _node_path = root
         .create_dynamic_path(
@@ -554,7 +575,10 @@ series_outputs: ["/accounting/journal.ledger"]
         .await
         .expect("begin rewrite transaction");
     let root = tx.root().await.expect("root");
-    let (parent_wd, _) = root.resolve_path("/configs").await.expect("resolve /configs");
+    let (parent_wd, _) = root
+        .resolve_path("/configs")
+        .await
+        .expect("resolve /configs");
     let parent_node_id = parent_wd.node_path().id();
     let _node_path = root
         .create_dynamic_path(

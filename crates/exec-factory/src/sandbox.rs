@@ -187,10 +187,7 @@ mod tests {
 
         let cfg = ExecConfig {
             program: "/bin/sh".to_string(),
-            args: vec![
-                "-c".to_string(),
-                "cat in.txt > out.txt".to_string(),
-            ],
+            args: vec!["-c".to_string(), "cat in.txt > out.txt".to_string()],
             inputs: vec!["/in.txt".to_string()],
             outputs: vec!["/out.txt".to_string()],
             series_outputs: vec![],

@@ -183,7 +183,9 @@ mod tests {
         assert_eq!(diff.changed.len(), 1);
         assert!(diff.deleted.is_empty());
         assert_eq!(
-            diff.changed.get(Path::new("reports/a.txt")).expect("present"),
+            diff.changed
+                .get(Path::new("reports/a.txt"))
+                .expect("present"),
             b"hello"
         );
     }
@@ -211,7 +213,9 @@ mod tests {
         let diff = diff_outputs(dir.path(), &outputs, &before).expect("diff");
         assert_eq!(diff.changed.len(), 1);
         assert_eq!(
-            diff.changed.get(Path::new("reports/a.txt")).expect("present"),
+            diff.changed
+                .get(Path::new("reports/a.txt"))
+                .expect("present"),
             b"goodbye"
         );
     }
@@ -245,9 +249,6 @@ mod tests {
     fn pond_path_round_trip() {
         let rel = pond_path_to_relative("/data/billing/journal.ledger");
         assert_eq!(rel, PathBuf::from("data/billing/journal.ledger"));
-        assert_eq!(
-            relative_to_pond_path(&rel),
-            "/data/billing/journal.ledger"
-        );
+        assert_eq!(relative_to_pond_path(&rel), "/data/billing/journal.ledger");
     }
 }

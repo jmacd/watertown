@@ -159,7 +159,9 @@ pub fn read_new_suffix(
     })?;
 
     let mut file = std::fs::File::open(host_path).map_other()?;
-    let _ = file.seek(SeekFrom::Start(prior_cumulative_size)).map_other()?;
+    let _ = file
+        .seek(SeekFrom::Start(prior_cumulative_size))
+        .map_other()?;
     let mut new_content = vec![0u8; new_len as usize];
     file.read_exact(&mut new_content).map_other()?;
     Ok(new_content)

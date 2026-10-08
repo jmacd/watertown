@@ -173,10 +173,7 @@ outputs: ["/data/out.txt"]
         let value = validate_exec_config(yaml).expect("valid config should parse");
         let config: ExecConfig = serde_json::from_value(value).expect("round-trip");
         assert_eq!(config.program, "/bin/cat");
-        assert_eq!(
-            config.effective_timeout(),
-            Some(Duration::from_secs(60))
-        );
+        assert_eq!(config.effective_timeout(), Some(Duration::from_secs(60)));
         assert!(!config.network);
     }
 
@@ -190,15 +187,19 @@ outputs: ["/data/out.txt"]
 
     #[test]
     fn rejects_series_output_directory_prefix() {
-        let yaml = b"program: /bin/sh\ninputs: []\noutputs: []\nseries_outputs: [\"/accounting/\"]\n";
-        let err = validate_exec_config(yaml).expect_err("directory-style series output should be rejected");
+        let yaml =
+            b"program: /bin/sh\ninputs: []\noutputs: []\nseries_outputs: [\"/accounting/\"]\n";
+        let err = validate_exec_config(yaml)
+            .expect_err("directory-style series output should be rejected");
         assert!(format!("{err}").contains("exact file paths"));
     }
 
     #[test]
     fn rejects_path_in_both_outputs_and_series_outputs() {
-        let yaml = b"program: /bin/sh\ninputs: []\noutputs: [\"/a.txt\"]\nseries_outputs: [\"/a.txt\"]\n";
-        let err = validate_exec_config(yaml).expect_err("overlapping output path should be rejected");
+        let yaml =
+            b"program: /bin/sh\ninputs: []\noutputs: [\"/a.txt\"]\nseries_outputs: [\"/a.txt\"]\n";
+        let err =
+            validate_exec_config(yaml).expect_err("overlapping output path should be rejected");
         assert!(format!("{err}").contains("both"));
     }
 

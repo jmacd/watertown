@@ -14,7 +14,9 @@
 
 use crate::config::{ExecConfig, validate_exec_config};
 use crate::sandbox::run_sandboxed;
-use crate::stage::{diff_outputs, parse_output_spec, pond_path_to_relative, relative_to_pond_path, snapshot_outputs};
+use crate::stage::{
+    diff_outputs, parse_output_spec, pond_path_to_relative, relative_to_pond_path, snapshot_outputs,
+};
 use provider::series_append::{self, PondSeriesState};
 use provider::{ExecutionContext, FactoryContext, register_executable_factory};
 use serde_json::Value;
@@ -90,14 +92,12 @@ async fn stage_existing_outputs(
                 }
                 let host_path = staging.join(&relative);
                 if let Some(parent) = host_path.parent() {
-                    tokio::fs::create_dir_all(parent).await.map_other_context(
-                        "exec: create staging directory for existing output",
-                    )?;
+                    tokio::fs::create_dir_all(parent)
+                        .await
+                        .map_other_context("exec: create staging directory for existing output")?;
                 }
                 let bytes = root.read_file_path_to_vec(&pond_path).await.map_err(|e| {
-                    tinyfs::Error::Other(format!(
-                        "exec: stage existing output '{pond_path}': {e}"
-                    ))
+                    tinyfs::Error::Other(format!("exec: stage existing output '{pond_path}': {e}"))
                 })?;
                 tokio::fs::write(&host_path, &bytes)
                     .await
@@ -151,8 +151,9 @@ fn collect_pond_files<'a>(
             .await
             .map_err(|e| tinyfs::Error::Other(format!("exec: list existing output dir: {e}")))?;
         while let Some(entry) = entries.next().await {
-            let entry = entry
-                .map_err(|e| tinyfs::Error::Other(format!("exec: list existing output dir: {e}")))?;
+            let entry = entry.map_err(|e| {
+                tinyfs::Error::Other(format!("exec: list existing output dir: {e}"))
+            })?;
             let child_relative = relative_prefix.join(&entry.name);
             if entry.entry_type.is_directory() {
                 let child_wd = wd.open_dir_path(&entry.name).await.map_err(|e| {
@@ -196,9 +197,7 @@ async fn commit_outputs(
         }
         root.write_file_path_from_slice(&pond_path, content)
             .await
-            .map_err(|e| {
-                tinyfs::Error::Other(format!("exec: commit output '{pond_path}': {e}"))
-            })?;
+            .map_err(|e| tinyfs::Error::Other(format!("exec: commit output '{pond_path}': {e}")))?;
     }
     Ok(())
 }
@@ -221,7 +220,9 @@ async fn stage_series_outputs(
     let mut states = BTreeMap::new();
     for pond_path in &cfg.series_outputs {
         let relative = pond_path_to_relative(pond_path);
-        let bytes = if let Some(state) = series_append::load_series_state(context, root, pond_path).await? {
+        let bytes = if let Some(state) =
+            series_append::load_series_state(context, root, pond_path).await?
+        {
             let content = root.read_file_path_to_vec(pond_path).await.map_err(|e| {
                 tinyfs::Error::Other(format!(
                     "exec: stage existing series output '{pond_path}': {e}"
@@ -310,10 +311,10 @@ pub async fn execute(
     context: FactoryContext,
     _ctx: ExecutionContext,
 ) -> Result<(), tinyfs::Error> {
-    let cfg: ExecConfig = serde_json::from_value(config).map_other_context("exec: invalid config")?;
+    let cfg: ExecConfig =
+        serde_json::from_value(config).map_other_context("exec: invalid config")?;
 
-    let staging = tempfile::tempdir()
-        .map_other_context("exec: create staging directory")?;
+    let staging = tempfile::tempdir().map_other_context("exec: create staging directory")?;
     let root = context.root().await?;
 
     stage_inputs(&root, &cfg, staging.path()).await?;
