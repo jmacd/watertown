@@ -541,38 +541,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "billing"
-version = "0.52.0"
-dependencies = [
- "anyhow",
- "arrow",
- "arrow-array",
- "arrow-schema",
- "async-trait",
- "chrono",
- "clap",
- "datafusion",
- "futures",
- "linkme",
- "log",
- "parquet",
- "paste",
- "provider",
- "regex",
- "serde",
- "serde_arrow",
- "serde_json",
- "serde_yaml",
- "steward",
- "tempfile",
- "thiserror 2.0.18",
- "tinyfs",
- "tlogfs",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
 name = "binary-merge"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -842,7 +810,6 @@ dependencies = [
  "arrow-csv",
  "arrow-schema",
  "async-trait",
- "billing",
  "blake3",
  "bytes",
  "chrono",

@@ -11,7 +11,6 @@ members = [
 "crates/provider",
 "crates/sitegen",
 "crates/gitpond",
-"crates/billing",
 "crates/sync-store",
 ]
 
@@ -37,7 +36,6 @@ provider = { path = "crates/provider" }
 query-foundation = { path = "crates/query-foundation" }
 utilities = { path = "crates/utilities" }
 sitegen = { path = "crates/sitegen" }
-billing = { path = "crates/billing" }
 sync-store = { path = "crates/sync-store" }
 
 anyhow = "1.0.82"
