@@ -8,13 +8,13 @@
 
 ## 0. Problem statement
 
-`crates/billing` is a hand-written, from-scratch double-entry bookkeeping
-system -- an "executable factory" in the existing sense
-(`crates/provider/src/registry.rs`, `register_executable_factory!`): ~30
-clap subcommands, its own journal/ledger tables, its own invariant checker
-(`billing/src/cli/verify.rs`, 11 checks). It works, but it is bespoke
-accounting software that we now have to maintain forever: schema
-migrations, policy edge cases, audit correctness -- all of it ours to own.
+Watertown previously contained `crates/billing`, a hand-written,
+from-scratch double-entry bookkeeping system implemented as an executable
+factory. It had roughly 30 clap subcommands, its own journal/ledger tables,
+and its own invariant checker. It worked, but keeping it meant maintaining
+bespoke accounting software forever: schema migrations, policy edge cases,
+and audit correctness -- all of it ours to own. That crate was removed once
+the exec-factory and hledger path became viable.
 
 The plaintext-accounting ecosystem (`ledger`, `hledger`, `beancount`, and
 others) already solves double-entry bookkeeping, with mature CLIs, reports,
@@ -24,8 +24,8 @@ on their own is: transactional commits, content-addressed versioning,
 automatic remote backup, and DataFusion queryability over the result. The
 gap is that these tools are **ordinary programs that do raw file I/O against
 a real filesystem** -- `open()`, `read()`, `write()`, `rename()` -- not
-TinyFS API calls. Every existing factory (`billing`, `sitegen`, `hydrovu`,
-`materialize-series`, ...) is Rust code linked into the `pond` binary and
+TinyFS API calls. Existing factories (`sitegen`, `hydrovu`,
+`materialize-series`, ...) are Rust code linked into the `pond` binary and
 compiled against `FactoryContext`/`WD`. None of them can host an arbitrary
 external program.
 
@@ -44,8 +44,7 @@ of its four CSV files.
 
 `crates/provider/src/registry.rs` already defines the extension point this
 needs. A `DynamicFactory` (registered via `register_executable_factory!`,
-e.g. `crates/provider/src/factory/materialize_series.rs:316-321` or
-`crates/billing/src/factory.rs`) provides:
+for example `crates/provider/src/factory/materialize_series.rs`) provides:
 
 ```rust
 pub execute: Option<
@@ -68,9 +67,8 @@ calls (`crates/tinyfs/src/wd.rs:260-269,1387`) that every other factory
 already uses. The novelty is entirely in steps (a)-(b); the commit path is
 unremarkable.
 
-Concretely, in `crates/exec-factory` (new crate, wired into `crates/cmd`
-exactly like `billing`/`hydrovu`/`sitegen` are today -- see root
-`Cargo.toml:9-14,34-40` and `crates/cmd/Cargo.toml:83,97-98,110`; linkme's
+Concretely, `crates/exec-factory` is wired into `crates/cmd` like
+`hydrovu` and `sitegen`; linkme's
 `DYNAMIC_FACTORIES` distributed slice only sees factories from crates that
 are actually linked into the `pond` binary):
 
@@ -289,9 +287,9 @@ degradation of a safety property.)
 
 - **Deletions are always an error for v1**, not configurable: if a path
   that matched `outputs` before exec is gone afterward, `exec` fails the
-  whole run rather than deleting pond history. This matches the
-  `billing-v2` philosophy of "always reverse + reissue explicitly" rather
-  than quietly mutating the record -- an operator who wants a file gone
+  whole run rather than deleting pond history. This follows the accounting
+  principle of "always reverse + reissue explicitly" rather than quietly
+  mutating the record -- an operator who wants a file gone
   can delete it with an explicit, auditable pond command afterward.
   To make this enforceable, `execute()` pre-stages any already-existing
   pond content at every declared output -- both exact-path
@@ -470,8 +468,8 @@ also possible, but is not required for ordinary entry from the TUI.
   arbitrary external program automatically after every commit is a much
   larger trust decision than running it on explicit operator request via
   `pond run /system/etc/...`. `exec` factories should be mounted under
-  `/system/etc`, invoked manually, same as `accounts` is today. Revisit
-  only with a much narrower, explicitly-opted-in allowlist story.
+  `/system/etc` and invoked manually. Revisit only with a much narrower,
+  explicitly-opted-in allowlist story.
 - **Teaching `cmd/billing` to read Ledger format.** `series_outputs` plus
   interactive `hledger-ui`/`hledger add` sessions (§6b) cover browsing,
   entering, and storing journal data; generating PDF statements from that

@@ -76,7 +76,7 @@ outputs: ["/data/out.txt"]
 
     let _node_path = root
         .create_dynamic_path(
-            "/configs/billing-cat",
+            "/configs/exec-cat",
             tinyfs::EntryType::FileDynamic,
             "exec",
             config_yaml.as_bytes().to_vec(),
@@ -146,7 +146,7 @@ outputs: ["/data/out.txt"]
 
     let _node_path = root
         .create_dynamic_path(
-            "/configs/billing-fail",
+            "/configs/exec-fail",
             tinyfs::EntryType::FileDynamic,
             "exec",
             config_yaml.as_bytes().to_vec(),
@@ -235,7 +235,7 @@ outputs: ["/data/out.txt"]
 
     let _node_path = root
         .create_dynamic_path(
-            "/configs/billing-delete",
+            "/configs/exec-delete",
             tinyfs::EntryType::FileDynamic,
             "exec",
             config_yaml.as_bytes().to_vec(),
@@ -330,7 +330,7 @@ outputs: ["/reports/"]
 
     let _node_path = root
         .create_dynamic_path(
-            "/configs/billing-delete-dirprefix",
+            "/configs/exec-delete-dirprefix",
             tinyfs::EntryType::FileDynamic,
             "exec",
             config_yaml.as_bytes().to_vec(),

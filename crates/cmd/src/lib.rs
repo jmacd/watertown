@@ -6,7 +6,6 @@
 // entries are included. Without this, `FactoryRegistry` and `SchemeRegistry`
 // won't see factories registered in hydrovu, sitegen, etc. when running
 // lib tests.
-use billing as _;
 use exec_factory as _;
 use gitpond as _;
 use hydrovu as _;
