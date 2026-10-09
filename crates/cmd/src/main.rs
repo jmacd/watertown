@@ -14,6 +14,7 @@ mod common;
 mod panic_alloc;
 
 // External modules
+use exec_factory as _;
 use gitpond as _;
 use hydrovu as _;
 use sitegen as _;

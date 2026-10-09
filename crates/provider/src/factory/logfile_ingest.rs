@@ -12,6 +12,7 @@
 //! - `MemoryPersistence` for fast testing
 //! - `OpLogPersistence` (tlogfs) for production
 
+use crate::series_append::PondSeriesState;
 use crate::{ExecutionContext, ExecutionMode, FactoryContext, register_executable_factory};
 use clap::{Parser, Subcommand};
 use log::{debug, info, warn};
@@ -408,58 +409,21 @@ struct PondFileState {
     frontier: Option<Vec<(u32, [u8; 32], u64)>>,
 }
 
-/// Verify that the host file's tracked prefix still matches the pond's committed
-/// cumulative hash, using the stored bao-tree frontier so we read at most one
-/// `BLOCK_SIZE` trailing block instead of re-hashing the entire prefix.
-///
-/// Returns `(matches, host_root_hex)`. `matches` is true when the prefix is
-/// intact (a normal append) and false when it changed (a rotation). The host
-/// root hash is returned so callers can include it in diagnostics.
-///
-/// When no frontier is stored (a legacy entry without a bao_outboard) this falls
-/// back to the historical full-prefix read so behavior is unchanged for that
-/// degraded case. This is a precondition fallback, not a verification fallback:
-/// a genuine hash mismatch is still surfaced to the caller as `matches == false`.
+/// Verify that the host file's tracked prefix still matches the pond's
+/// committed cumulative hash. Thin wrapper around
+/// `series_append::verify_prefix_matches` (shared with exec-factory's
+/// `series_outputs`), since this factory tracks `PondFileState` with a few
+/// extra fields the shared helper doesn't need.
 fn verify_prefix_matches(
     host_path: &std::path::Path,
     pond_state: &PondFileState,
 ) -> Result<(bool, String), tinyfs::Error> {
-    use std::io::{Read, Seek, SeekFrom};
-    use utilities::bao_outboard::{BLOCK_SIZE, IncrementalHashState};
-
-    let cumulative_size = pond_state.cumulative_size;
-    if cumulative_size == 0 {
-        // Nothing tracked yet; any host content is a fresh prefix.
-        return Ok((true, String::new()));
-    }
-
-    let host_root = match &pond_state.frontier {
-        Some(frontier) => {
-            let block = BLOCK_SIZE as u64;
-            let pending_start = (cumulative_size / block) * block;
-            let pending_len = (cumulative_size % block) as usize;
-
-            let mut file = std::fs::File::open(host_path).map_other()?;
-            let _ = file.seek(SeekFrom::Start(pending_start)).map_other()?;
-            let mut verified_pending = vec![0u8; pending_len];
-            file.read_exact(&mut verified_pending).map_other()?;
-
-            let state = IncrementalHashState::resume(frontier, cumulative_size, &verified_pending)
-                .map_other()?;
-            state.root_hash().to_hex().to_string()
-        }
-        None => {
-            let mut file = std::fs::File::open(host_path).map_other()?;
-            let mut prefix_content = vec![0u8; cumulative_size as usize];
-            file.read_exact(&mut prefix_content).map_other()?;
-            let mut hasher = IncrementalHashState::new();
-            hasher.ingest(&prefix_content);
-            hasher.root_hash().to_hex().to_string()
-        }
+    let series_state = PondSeriesState {
+        blake3: pond_state.blake3.clone(),
+        cumulative_size: pond_state.cumulative_size,
+        frontier: pond_state.frontier.clone(),
     };
-
-    let matches = host_root == pond_state.blake3;
-    Ok((matches, host_root))
+    crate::series_append::verify_prefix_matches(host_path, &series_state)
 }
 
 /// Summary of ingestion activity for logging
@@ -882,47 +846,10 @@ async fn read_pond_state(
 
         // Get metadata from persistence layer (works with any backend)
         let metadata = persistence.metadata(file_id).await?;
-
-        // Require blake3 - fail fast if missing
-        let blake3 = metadata.blake3.ok_or_else(|| {
-            tinyfs::Error::Other(format!(
-                "Pond file {} missing required blake3 hash",
-                filename
-            ))
-        })?;
-
-        // For FilePhysicalSeries, extract cumulative_size and the bao-tree
-        // frontier from the bao_outboard. The frontier lets prefix verification
-        // resume from committed hashes instead of re-reading the whole prefix.
-        // metadata.size is just the latest version's size, not cumulative.
-        let (cumulative_size, frontier) = if let Some(bao_outboard) = &metadata.bao_outboard {
-            match utilities::bao_outboard::SeriesOutboard::from_bytes(bao_outboard) {
-                Ok(series) => {
-                    debug!(
-                        "File {} has bao_outboard with cumulative_size={}",
-                        filename, series.cumulative_size
-                    );
-                    (series.cumulative_size, Some(series.incremental.frontier))
-                }
-                Err(e) => {
-                    warn!(
-                        "File {} has bao_outboard but failed to parse: {:?}, falling back to size={}",
-                        filename,
-                        e,
-                        metadata.size.unwrap_or(0)
-                    );
-                    (metadata.size.unwrap_or(0), None)
-                }
-            }
-        } else {
-            warn!(
-                "File {} has NO bao_outboard, falling back to size={:?}",
-                filename, metadata.size
-            );
-            (metadata.size.unwrap_or(0), None)
-        };
-
         let size = metadata.size.unwrap_or(0);
+        // Shared with exec-factory's series_outputs: extracts blake3,
+        // cumulative_size, and the bao-tree frontier from node metadata.
+        let series_state = PondSeriesState::from_metadata(&metadata, &filename)?;
 
         let _ = pond_files.insert(
             filename,
@@ -930,9 +857,9 @@ async fn read_pond_state(
                 node_id: file_id,
                 version: metadata.version,
                 size,
-                blake3,
-                cumulative_size,
-                frontier,
+                blake3: series_state.blake3,
+                cumulative_size: series_state.cumulative_size,
+                frontier: series_state.frontier,
             },
         );
     }

@@ -85,6 +85,7 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 datafusion = { workspace = true }
+exec-factory = { workspace = true }
 hex = { workspace = true }
 datafusion-common = { workspace = true }
 datafusion-common-runtime = { workspace = true }

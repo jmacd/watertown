@@ -12,6 +12,7 @@ members = [
 "crates/sitegen",
 "crates/gitpond",
 "crates/sync-store",
+"crates/exec-factory",
 ]
 
 [workspace.package]
@@ -37,6 +38,7 @@ query-foundation = { path = "crates/query-foundation" }
 utilities = { path = "crates/utilities" }
 sitegen = { path = "crates/sitegen" }
 sync-store = { path = "crates/sync-store" }
+exec-factory = { path = "crates/exec-factory" }
 
 anyhow = "1.0.82"
 arrow = { version = "57", default-features = false, features = ["prettyprint", "ipc"] }

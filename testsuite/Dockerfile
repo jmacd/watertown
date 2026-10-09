@@ -80,6 +80,14 @@ RUN apt-get update && \
         unzip \
         # Git for git-ingest factory testing
         git \
+        # Sandbox for the exec factory (requires --privileged, see
+        # testsuite/run-test.sh's '# REQUIRES: privileged' handling)
+        bubblewrap \
+        # Plaintext-accounting tool exercised by the exec factory's
+        # series_outputs (append-only Ledger-format journal), see
+        # docs/exec-factory-design.md
+        hledger \
+        hledger-ui \
     && rm -rf /var/lib/apt/lists/*
 
 # Install the last open-source MinIO client release from its immutable GitHub
