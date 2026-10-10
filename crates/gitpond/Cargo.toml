@@ -34,9 +34,10 @@ provider.workspace = true
 tokio.workspace = true
 
 # Git support (pure Rust)
-gix = { version = "0.72", default-features = false, features = [
+gix = { version = "0.89", default-features = false, features = [
     "blocking-network-client",
     "blocking-http-transport-reqwest-rust-tls",
+    "sha1",
 ] }
 
 [lints]

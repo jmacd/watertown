@@ -41,14 +41,14 @@ sync-store = { path = "crates/sync-store" }
 exec-factory = { path = "crates/exec-factory" }
 
 anyhow = "1.0.82"
-arrow = { version = "57", default-features = false, features = ["prettyprint", "ipc"] }
-arrow-arith = "57"
-arrow-array = "57"
-arrow-buffer = "57"
-arrow-cast = { version = "57", features = ["prettyprint"] }
-arrow-csv = "57"
-arrow-schema = "57"
-arrow-select = "57"
+arrow = { version = "59", default-features = false, features = ["prettyprint", "ipc"] }
+arrow-arith = "59"
+arrow-array = "59"
+arrow-buffer = "59"
+arrow-cast = { version = "59", features = ["prettyprint"] }
+arrow-csv = "59"
+arrow-schema = "59"
+arrow-select = "59"
 async-compression = { version = "0.4", features = ["tokio", "zstd"] }
 async-stream = "0.3"
 async-trait = "0.1.88"
@@ -61,12 +61,12 @@ bao-tree = { version = "0.16", features = ["validate"] }
 blake3 = "1.8"
 data_privacy = { version = "0.5.0", default-features = false, features = ["serde"] }
 data_privacy_macros = { version = "0.3.0", default-features = false }
-datafusion = "51"
-datafusion-common = "51"
-datafusion-common-runtime = "51"
-datafusion-expr = "51"
-datafusion-functions-json = "0.51"
-deltalake = { version = "0.30", default-features = false, features = ["datafusion", "rustls"] }
+datafusion = "55"
+datafusion-common = "55"
+datafusion-common-runtime = "55"
+datafusion-expr = "55"
+datafusion-functions-json = "0.55"
+deltalake = { version = "1.1", default-features = false, features = ["datafusion", "rustls"] }
 duckdb = { version = "1.3", features = ["bundled"] }
 env_logger = "0.11.3"
 file-rotate = "0.8"
@@ -79,9 +79,9 @@ humantime = "2.1"
 linkme = "0.3"
 log = "0.4.17"
 oauth2 = { version = "5.0", default-features = false, features = ["reqwest", "rustls-tls"] }
-object_store = { version = "0.12", features = ["aws", "azure"] }
+object_store = { version = "0.13", features = ["aws", "azure"] }
 opentelemetry-proto = { version = "0.27.0", features = ["gen-tonic-messages", "metrics", "with-serde"] }
-parquet = { version = "57", features = ["async", "arrow"] }
+parquet = { version = "59", features = ["async", "arrow"] }
 parse_duration = "2.1.1"
 paste = "1.0"
 peak_alloc = "0.3.0"
@@ -92,7 +92,7 @@ reqwest = { version = "0.12.4", default-features = false, features = ["blocking"
 rustix = { version = "1.1", features = ["fs"] }
 sea-query = { version = "0", features = ["with-chrono"] }
 serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
-serde_arrow = { version = "0.14", features = ["arrow-57"] }
+serde_arrow = { version = "0.15", features = ["arrow-59"] }
 serde_json = "1.0.116"
 serde_qs = "0.15"
 serde_repr = "0.1.19"

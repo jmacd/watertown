@@ -121,7 +121,7 @@ impl PublicationTable {
         Ok(self.table.version() == Some(0)
             && self.table.get_file_uris()?.next().is_none()
             && snapshot.schema().as_ref() == &expected_schema
-            && snapshot.metadata().partition_columns() == &expected_partitions)
+            && snapshot.metadata().partition_columns() == expected_partitions)
     }
 
     /// Create a new local publication table beneath `remote_root`.
@@ -171,7 +171,7 @@ impl PublicationTable {
             ]))
             .with_save_mode(SaveMode::ErrorIfExists)
             .await?;
-        let context = build_context(&table)?;
+        let context = build_context(&table).await?;
         Ok(Self { table, context })
     }
 
@@ -185,7 +185,7 @@ impl PublicationTable {
             storage_options,
         )
         .await?;
-        let context = build_context(&table)?;
+        let context = build_context(&table).await?;
         Ok(Self { table, context })
     }
 
@@ -347,14 +347,14 @@ impl PublicationTable {
             )
             .await?;
         self.table = table;
-        self.context = build_context(&self.table)?;
+        self.context = build_context(&self.table).await?;
         self.checkpoint().await?;
         Ok(next)
     }
 
     /// Current Delta version.
     #[must_use]
-    pub fn version(&self) -> i64 {
+    pub fn version(&self) -> u64 {
         self.table.version().unwrap_or(0)
     }
 
@@ -365,7 +365,7 @@ impl PublicationTable {
 
     async fn refresh(&mut self) -> Result<()> {
         self.table.load().await?;
-        self.context = build_context(&self.table)?;
+        self.context = build_context(&self.table).await?;
         Ok(())
     }
 
@@ -440,9 +440,9 @@ fn state_batch(state: &PublicationState) -> Result<RecordBatch> {
     .map_err(StoreError::Arrow)
 }
 
-fn build_context(table: &DeltaTable) -> Result<Arc<SessionContext>> {
+async fn build_context(table: &DeltaTable) -> Result<Arc<SessionContext>> {
     let context = SessionContext::new();
-    let _ = context.register_table(TABLE_NAME, Arc::new(table.clone()))?;
+    let _ = context.register_table(TABLE_NAME, table.table_provider().await?)?;
     Ok(Arc::new(context))
 }
 

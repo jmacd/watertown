@@ -15,10 +15,10 @@ jobs:
     outputs:
       hashes: ${{ steps.hash.outputs.hashes }}
     permissions:
-      contents: write
+      contents: read
     
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       
       - name: Free up disk space
         run: |
@@ -28,9 +28,9 @@ jobs:
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
       
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
-          toolchain: 1.88
+          toolchain: 1.99
       
       - name: Install cargo-deb
         run: cargo install cargo-deb
@@ -54,11 +54,11 @@ jobs:
         id: hash
         run: |
           cd artifacts
-          sha256sum * > checksums.txt
-          echo "hashes=$(cat checksums.txt | base64 -w0)" >> $GITHUB_OUTPUT
+          sha256sum -- ./* > checksums.txt
+          echo "hashes=$(base64 -w0 < checksums.txt)" >> "$GITHUB_OUTPUT"
       
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pond-release-artifacts
           path: artifacts/*
@@ -71,7 +71,7 @@ jobs:
       actions: read
       id-token: write
       contents: write
-    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.0.0
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a # v2.1.0
     with:
       base64-subjects: "${{ needs.build.outputs.hashes }}"
       upload-assets: true

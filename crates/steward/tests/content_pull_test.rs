@@ -1467,6 +1467,7 @@ async fn push_uses_log_tip_when_control_spine_is_stale() {
         .table()
         .version()
         .expect("data version");
+    let data_version = i64::try_from(data_version).expect("data version must fit in i64");
     src.control_table_mut()
         .record_data_committed(
             &fake_meta,

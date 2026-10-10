@@ -7,6 +7,8 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 
+permissions: read-all
+
 env:
   RUST_BACKTRACE: 1
   REGISTRY: ghcr.io
@@ -22,7 +24,7 @@ jobs:
     name: Check, Build & Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       
       - name: Free up disk space
         run: |
@@ -38,13 +40,27 @@ jobs:
           df -h
       
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
       
       - name: Check formatting
         run: cargo fmt --all -- --check
       
       - name: Run clippy
         run: cargo clippy --workspace --all-features -- -D warnings
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Audit Rust dependencies
+        run: |
+          # DataFusion 55 and Delta Lake 1.1 require object_store 0.13, whose
+          # quick-xml 0.39 dependency cannot accept the fixed 0.41 release.
+          # Fail on every other advisory while awaiting an object_store 0.13
+          # security release: https://github.com/apache/arrow-rs-object-store/issues/870
+          echo "::warning::Temporarily accepting RUSTSEC-2026-0194 and RUSTSEC-2026-0195 through object_store 0.13"
+          cargo audit \
+            --ignore RUSTSEC-2026-0194 \
+            --ignore RUSTSEC-2026-0195
 
       - name: Install exec-factory runtime dependencies
         run: |
@@ -68,7 +84,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Full history so the commit-count build number is accurate; a
           # shallow clone would report 1.
@@ -136,7 +152,7 @@ jobs:
     
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       
       - name: Set up Podman
         run: |
@@ -144,7 +160,7 @@ jobs:
           sudo apt-get -y install podman
       
       - name: Install Cosign
-        uses: sigstore/cosign-installer@v3.6.0
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       
       - name: Log in to Container Registry (Podman)
         run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
@@ -155,8 +171,9 @@ jobs:
       - name: Extract metadata
         id: meta
         run: |
+          set -euo pipefail
           IMAGE_ID=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          IMAGE_ID=$(echo $IMAGE_ID | tr '[A-Z]' '[a-z]')
+          IMAGE_ID=$(printf '%s\n' "$IMAGE_ID" | tr '[:upper:]' '[:lower:]')
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
 
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
@@ -168,10 +185,12 @@ jobs:
             EXTRA_TAG=sha-${SHORT_SHA}
           fi
 
-          echo "image_id=$IMAGE_ID" >> $GITHUB_OUTPUT
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "extra_tag=$EXTRA_TAG" >> $GITHUB_OUTPUT
-          echo "semver=${{ needs.version.outputs.version }}" >> $GITHUB_OUTPUT
+          {
+            echo "image_id=$IMAGE_ID"
+            echo "version=$VERSION"
+            echo "extra_tag=$EXTRA_TAG"
+            echo "semver=${{ needs.version.outputs.version }}"
+          } >> "$GITHUB_OUTPUT"
       
       - name: Free up disk space before build
         run: |
@@ -184,38 +203,43 @@ jobs:
       
       - name: Build container image
         run: |
+          IMAGE="${{ steps.meta.outputs.image_id }}"
+          VERSION="${{ steps.meta.outputs.version }}"
+          SEMVER="${{ steps.meta.outputs.semver }}"
+          EXTRA_TAG="${{ steps.meta.outputs.extra_tag }}"
+          ARCH="${{ matrix.arch }}"
           podman build \
-            --build-arg WATERTOWN_VERSION=${{ steps.meta.outputs.semver }} \
-            -t ${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.version }}-${{ matrix.arch }} \
+            --build-arg "WATERTOWN_VERSION=${SEMVER}" \
+            -t "${IMAGE}:${VERSION}-${ARCH}" \
             -f Dockerfile .
           # The 0.<build>.<pr> semver is an immutable, human-readable handle
           # alongside the moving version tag (latest / pr-N).
           podman tag \
-            ${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.version }}-${{ matrix.arch }} \
-            ${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.semver }}-${{ matrix.arch }}
-          if [ -n "${{ steps.meta.outputs.extra_tag }}" ]; then
+            "${IMAGE}:${VERSION}-${ARCH}" \
+            "${IMAGE}:${SEMVER}-${ARCH}"
+          if [ -n "$EXTRA_TAG" ]; then
             podman tag \
-              ${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.version }}-${{ matrix.arch }} \
-              ${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.extra_tag }}-${{ matrix.arch }}
+              "${IMAGE}:${VERSION}-${ARCH}" \
+              "${IMAGE}:${EXTRA_TAG}-${ARCH}"
           fi
 
       - name: Push container image
         id: push
         run: |
-          podman push ${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.version }}-${{ matrix.arch }}
-          podman push ${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.semver }}-${{ matrix.arch }}
+          podman push "${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.version }}-${{ matrix.arch }}"
+          podman push "${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.semver }}-${{ matrix.arch }}"
           if [ -n "${{ steps.meta.outputs.extra_tag }}" ]; then
-            podman push ${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.extra_tag }}-${{ matrix.arch }}
+            podman push "${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.extra_tag }}-${{ matrix.arch }}"
           fi
-          DIGEST=$(podman inspect ${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.version }}-${{ matrix.arch }} --format '{{.Digest}}')
-          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+          DIGEST=$(podman inspect "${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.version }}-${{ matrix.arch }}" --format '{{.Digest}}')
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
 
       - name: Sign container image with Sigstore
         run: |
-          cosign sign --yes ${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.version }}-${{ matrix.arch }}
-          cosign sign --yes ${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.semver }}-${{ matrix.arch }}
+          cosign sign --yes "${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.version }}-${{ matrix.arch }}"
+          cosign sign --yes "${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.semver }}-${{ matrix.arch }}"
           if [ -n "${{ steps.meta.outputs.extra_tag }}" ]; then
-            cosign sign --yes ${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.extra_tag }}-${{ matrix.arch }}
+            cosign sign --yes "${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.extra_tag }}-${{ matrix.arch }}"
           fi
 
   build-deb:
@@ -248,15 +272,15 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 18
+          node-version: 22
 
       - name: Install build tooling (brotli, cargo-deb, oras)
         run: |
@@ -279,7 +303,7 @@ jobs:
           oras version
 
       - name: Install Cosign
-        uses: sigstore/cosign-installer@v3.6.0
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Build vendor assets
         run: make vendor
@@ -314,7 +338,7 @@ jobs:
         run: |
           set -euo pipefail
           PKG=${{ env.REGISTRY }}/${{ env.DEB_PACKAGE }}
-          PKG=$(echo "$PKG" | tr '[A-Z]' '[a-z]')
+          PKG=$(printf '%s\n' "$PKG" | tr '[:upper:]' '[:lower:]')
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             VERSION=pr-${{ github.event.pull_request.number }}
@@ -323,12 +347,19 @@ jobs:
             VERSION=latest
             EXTRA_TAG=sha-${SHORT_SHA}
           fi
-          DEB=$(ls -t target/debian/watertown_*_${{ matrix.arch }}.deb | head -1)
-          echo "pkg=$PKG" >> $GITHUB_OUTPUT
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "extra_tag=$EXTRA_TAG" >> $GITHUB_OUTPUT
-          echo "semver=${{ needs.version.outputs.version }}" >> $GITHUB_OUTPUT
-          echo "deb=$DEB" >> $GITHUB_OUTPUT
+          DEBS=(target/debian/watertown_*_"${{ matrix.arch }}".deb)
+          if (( ${#DEBS[@]} != 1 )); then
+            echo "::error::Expected one Debian package for ${{ matrix.arch }}, found ${#DEBS[@]}" >&2
+            exit 1
+          fi
+          DEB=${DEBS[0]}
+          {
+            echo "pkg=$PKG"
+            echo "version=$VERSION"
+            echo "extra_tag=$EXTRA_TAG"
+            echo "semver=${{ needs.version.outputs.version }}"
+            echo "deb=$DEB"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Log in to Container Registry (oras)
         run: echo "${{ secrets.GITHUB_TOKEN }}" | oras login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
@@ -377,7 +408,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Comment PR with image tags
-        uses: actions/github-script@v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const imageId = '${{ needs.build-container.outputs.image_id }}';
@@ -413,7 +444,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 

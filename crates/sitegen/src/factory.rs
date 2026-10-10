@@ -970,7 +970,7 @@ async fn register_bounded_journal(
         .map_err(|e| {
             tinyfs::Error::Other(format!("create_table_provider('{}'): {}", file_url, e))
         })?;
-    ctx.register_table(datafusion::sql::TableReference::bare(table_name), tp)
+    ctx.register_table(datafusion::common::TableReference::bare(table_name), tp)
         .map_err(|e| tinyfs::Error::Other(format!("register_table('{}'): {}", table_name, e)))?;
     Ok(())
 }
@@ -989,7 +989,7 @@ async fn render_unit_windowed(
 ) -> Result<PondStatus, tinyfs::Error> {
     register_bounded_journal(journal_matcher, ctx, file_url, table_name, window_bounds).await?;
     let status = query_pond_status(ctx, table_name, unit, tail_lines).await;
-    let _ = ctx.deregister_table(datafusion::sql::TableReference::bare(table_name));
+    let _ = ctx.deregister_table(datafusion::common::TableReference::bare(table_name));
     status
 }
 
@@ -1047,7 +1047,7 @@ async fn maintain_unit_summary(
 
     register_bounded_journal(journal_matcher, ctx, file_url, table_name, bounds).await?;
     let fold = fold_unit_versions(ctx, table_name, tail_lines).await;
-    let _ = ctx.deregister_table(datafusion::sql::TableReference::bare(table_name));
+    let _ = ctx.deregister_table(datafusion::common::TableReference::bare(table_name));
     let fold = fold?;
 
     let merged = status_summary::merge(prior, fold, max_version, tail_lines);
@@ -1163,7 +1163,7 @@ async fn populate_perf_fields_from_provider(
         "CAST(NULL AS BIGINT)"
     };
     ctx.register_table(
-        datafusion::sql::TableReference::bare(perf_table),
+        datafusion::common::TableReference::bare(perf_table),
         table_provider,
     )
     .map_err(|e| {
@@ -1186,7 +1186,7 @@ async fn populate_perf_fields_from_provider(
         df.collect().await
     }
     .await;
-    let _ = ctx.deregister_table(datafusion::sql::TableReference::bare(perf_table));
+    let _ = ctx.deregister_table(datafusion::common::TableReference::bare(perf_table));
 
     let batches = result
         .map_err(|e| tinyfs::Error::Other(format!("status_grid perf latest-row query: {e}")))?;
@@ -2774,7 +2774,7 @@ mod tests {
             RecordBatch::try_new(schema.clone(), vec![Arc::new(ts), Arc::new(msg)]).unwrap();
         let provider = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
         ctx.register_table(
-            datafusion::sql::TableReference::bare(table),
+            datafusion::common::TableReference::bare(table),
             Arc::new(provider),
         )
         .unwrap();
@@ -2815,10 +2815,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl datafusion::catalog::TableProvider for ScanCountingTableProvider {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
         fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
             self.inner.schema()
         }

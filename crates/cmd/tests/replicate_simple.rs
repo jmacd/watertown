@@ -14,7 +14,6 @@ use datafusion::prelude::SessionContext;
 use log::debug;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 use tempfile::TempDir;
 use uuid7::Uuid;
 
@@ -107,7 +106,7 @@ impl SimpleReplicationTest {
         let ctx = SessionContext::new();
 
         _ = ctx
-            .register_table("control", Arc::new(control_table.table().clone()))
+            .register_table("control", control_table.table().table_provider().await?)
             .map_err(|e| anyhow::anyhow!("Failed to register table: {}", e))?;
 
         let sql = r#"
@@ -148,9 +147,10 @@ impl SimpleReplicationTest {
                 .downcast_ref::<arrow::array::Int64Array>()
                 .unwrap();
 
-            let record_kinds = batch
-                .column_by_name("record_kind")
-                .unwrap()
+            let record_kind_col = batch.column_by_name("record_kind").unwrap();
+            let record_kind_utf8 =
+                arrow_cast::cast(record_kind_col.as_ref(), &arrow::datatypes::DataType::Utf8)?;
+            let record_kinds = record_kind_utf8
                 .as_any()
                 .downcast_ref::<arrow::array::StringArray>()
                 .unwrap();
@@ -175,7 +175,7 @@ impl SimpleReplicationTest {
         // Register control table under the post-D2 lean schema's
         // canonical name ("control").
         _ = ctx
-            .register_table("control", Arc::new(control_table.table().clone()))
+            .register_table("control", control_table.table().table_provider().await?)
             .map_err(|e| anyhow::anyhow!("Failed to register control table: {}", e))?;
 
         // Get transaction count -- count `data_committed` records (one
@@ -214,7 +214,7 @@ impl SimpleReplicationTest {
         // Query oplog entries (nodes created/modified)
         let data_table = persistence.table();
         _ = ctx
-            .register_table("oplog", Arc::new(data_table.clone()))
+            .register_table("oplog", data_table.table_provider().await?)
             .map_err(|e| anyhow::anyhow!("Failed to register oplog table: {}", e))?;
 
         // Count nodes by file_type
@@ -239,9 +239,10 @@ impl SimpleReplicationTest {
                 continue;
             }
 
-            let file_types = batch
-                .column_by_name("file_type")
-                .unwrap()
+            let file_type_col = batch.column_by_name("file_type").unwrap();
+            let file_type_utf8 =
+                arrow_cast::cast(file_type_col.as_ref(), &arrow::datatypes::DataType::Utf8)?;
+            let file_types = file_type_utf8
                 .as_any()
                 .downcast_ref::<arrow::array::StringArray>()
                 .unwrap();
