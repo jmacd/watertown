@@ -94,15 +94,14 @@ async fn active_transaction_matches_tinyfs_persistence_contract() {
             .num_rows(),
         3
     );
-    assert_eq!(
-        root.list_file_versions(format!(
-            "{}.materialization-progress",
-            provider::testing::EMPTY_MATERIALIZED_SERIES_PATH
-        ))
-        .await
-        .expect("persisted no-output progress")
-        .len(),
-        1
+    assert!(
+        !root
+            .exists(std::path::Path::new(&format!(
+                "{}.materialization-progress",
+                provider::testing::EMPTY_MATERIALIZED_SERIES_PATH
+            )))
+            .await,
+        "append-only no-output materialization must not persist progress"
     );
 }
 

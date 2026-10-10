@@ -346,14 +346,13 @@ pub async fn assert_materialization_failure_contract(
             .exists(std::path::Path::new(EMPTY_MATERIALIZED_SERIES_PATH))
             .await
     );
-    assert_eq!(
-        root.list_file_versions(format!(
-            "{EMPTY_MATERIALIZED_SERIES_PATH}.materialization-progress"
-        ))
-        .await
-        .expect("no-output progress versions")
-        .len(),
-        1
+    assert!(
+        !root
+            .exists(std::path::Path::new(&format!(
+                "{EMPTY_MATERIALIZED_SERIES_PATH}.materialization-progress"
+            )))
+            .await,
+        "append-only no-output materialization must not publish progress"
     );
 
     let repair_path = "/provider-contract/unsupported-repair.series";

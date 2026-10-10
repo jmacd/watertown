@@ -117,7 +117,8 @@ pub enum MaterializationReplaceReason {
 /// Atomic visibility operation for one materialization.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaterializationPublication {
-    /// Advance progress without publishing output.
+    /// Publish no output. Sinks with an independent frontier may advance
+    /// progress; target-derived append-only sinks may commit a no-op.
     NoOutput,
     /// Add output strictly after the prior observed event time.
     Append {
@@ -140,7 +141,8 @@ pub struct MaterializationCommit {
     pub output: Option<MaterializedOutput>,
     /// Visibility operation applied atomically with progress.
     pub publication: MaterializationPublication,
-    /// Progress that becomes authoritative in the same transaction.
+    /// Progress associated with the publication. Sinks with target-derived
+    /// append-only progress need not persist it for `NoOutput`.
     pub progress: MaterializationProgress,
 }
 
@@ -284,8 +286,10 @@ pub fn plan_materialization_change(
 
 /// One hidden staged writer.
 ///
-/// `commit` must atomically publish its optional output and progress. If it
-/// returns an error, neither may be authoritative.
+/// `commit` must atomically publish its optional output and any durable
+/// progress supported by the sink. If it returns an error, neither may be
+/// authoritative. A target-derived append-only sink may commit `NoOutput`
+/// without writing progress.
 #[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait TransactionalBatchWriter: Send {
@@ -317,7 +321,7 @@ pub trait TransactionalMaterializationSink: Sync {
 }
 
 /// Consume a DataFusion stream without collecting, then atomically publish its
-/// exact metadata and progress.
+/// exact metadata and applicable progress.
 pub async fn materialize_stream(
     sink: &dyn TransactionalMaterializationSink,
     output_id: impl Into<Arc<str>>,
