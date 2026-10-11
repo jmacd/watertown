@@ -59,7 +59,7 @@ chrono = { version = "0.4" }
 clap = { version = "4.5.4", features = ["derive"] }
 bao-tree = { version = "0.16", features = ["validate"] }
 blake3 = "1.8"
-data_privacy = { version = "0.5.0", default-features = false, features = ["serde"] }
+data_privacy = { version = "0.13.0", default-features = false, features = ["serde"] }
 data_privacy_macros = { version = "0.3.0", default-features = false }
 datafusion = "55"
 datafusion-common = "55"
