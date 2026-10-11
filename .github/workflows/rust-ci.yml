@@ -229,6 +229,18 @@ jobs:
               "${IMAGE}:${EXTRA_TAG}-${ARCH}"
           fi
 
+      - name: Verify container runs on Bookworm
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.version }}-${{ matrix.arch }}"
+          EXPECTED="pond ${{ steps.meta.outputs.semver }}"
+          ACTUAL=$(podman run --rm "$IMAGE" --version)
+          echo "container version: ${ACTUAL}"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::Expected '${EXPECTED}', got '${ACTUAL}'" >&2
+            exit 1
+          fi
+
       - name: Push container image
         id: push
         run: |
@@ -288,11 +300,11 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install build tooling (brotli, cargo-deb, oras)
+      - name: Install build tooling (brotli, cargo-deb, oras, podman)
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y brotli
+          sudo apt-get install -y brotli podman
           cargo install cargo-deb --locked
           case "${{ matrix.arch }}" in
             amd64) ORAS_SHA=${ORAS_SHA256_AMD64} ;;
@@ -338,6 +350,32 @@ jobs:
             echo "::error::pond requires glibc ${NEED} > ${MAX_GLIBC}; it will not load on Debian 12 bookworm" >&2
             exit 1
           fi
+
+      - name: Verify Debian package installs on Bookworm
+        run: |
+          set -euo pipefail
+          DEBS=(target/debian/watertown_*_"${{ matrix.arch }}".deb)
+          if (( ${#DEBS[@]} != 1 )); then
+            echo "::error::Expected one Debian package for ${{ matrix.arch }}, found ${#DEBS[@]}" >&2
+            exit 1
+          fi
+          DEB=$(basename "${DEBS[0]}")
+          EXPECTED="pond ${{ needs.version.outputs.version }}"
+          podman run --rm \
+            -v "$PWD/target/debian:/debs:ro" \
+            -e "DEB=/debs/${DEB}" \
+            -e "EXPECTED=${EXPECTED}" \
+            debian:bookworm-slim \
+            sh -ceu '
+              apt-get update
+              apt-get install -y --no-install-recommends "$DEB"
+              ACTUAL=$(/usr/bin/pond --version)
+              echo "package version: ${ACTUAL}"
+              if [ "$ACTUAL" != "$EXPECTED" ]; then
+                echo "Expected ${EXPECTED}, got ${ACTUAL}" >&2
+                exit 1
+              fi
+            '
 
       - name: Extract metadata
         id: meta
