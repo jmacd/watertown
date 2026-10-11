@@ -43,7 +43,7 @@ exec-factory = { path = "crates/exec-factory" }
 anyhow = "1.0.82"
 arrow = { version = "59", default-features = false, features = ["prettyprint", "ipc"] }
 arrow-arith = "59"
-arrow-array = "59"
+arrow-array = "60"
 arrow-buffer = "59"
 arrow-cast = { version = "59", features = ["prettyprint"] }
 arrow-csv = "59"
