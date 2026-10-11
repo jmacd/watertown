@@ -1,12 +1,13 @@
 # Vendor stage — download JS/WASM dependencies for sitegen (DuckDB-WASM,
 # Observable Plot, D3).  Runs in parallel with the Rust build.
-FROM node:22-slim AS vendor
+FROM node:22-bookworm-slim AS vendor
 WORKDIR /vendor
 COPY crates/sitegen/vendor/download.sh .
 RUN bash download.sh
 
-# Build stage
-FROM rust:1.99 AS builder
+# Build against the same glibc ABI as the runtime. An unqualified rust tag can
+# move to a newer Debian release and produce a binary that Bookworm cannot load.
+FROM rust:1.99-bookworm AS builder
 WORKDIR /app
 
 # Copy source
