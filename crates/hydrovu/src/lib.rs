@@ -230,7 +230,7 @@ async fn compact_series(
 
     // Register in DataFusion, execute query, always deregister on exit
     let ctx = &provider_ctx.datafusion_session;
-    let table_ref = datafusion::sql::TableReference::bare("_compact");
+    let table_ref = datafusion::common::TableReference::bare("_compact");
 
     _ = ctx
         .register_table(table_ref.clone(), table_provider)

@@ -8,7 +8,6 @@
 //! When the underlying table is missing specified columns, they are added as
 //! nullable fields filled with NULL values.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -17,11 +16,12 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
@@ -91,10 +91,6 @@ impl NullPaddingTableProvider {
 
 #[async_trait]
 impl TableProvider for NullPaddingTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.extended_schema.clone()
     }
@@ -122,9 +118,9 @@ impl TableProvider for NullPaddingTableProvider {
                     && inner_schema.column_with_name(&col.name).is_none()
                 {
                     references_padded = true;
-                    return Ok(datafusion::common::tree_node::TreeNodeRecursion::Stop);
+                    return Ok(TreeNodeRecursion::Stop);
                 }
-                Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+                Ok(TreeNodeRecursion::Continue)
             });
 
             if references_padded {
@@ -177,9 +173,9 @@ impl TableProvider for NullPaddingTableProvider {
                         && inner_schema.column_with_name(&col.name).is_none()
                     {
                         references_padded = true;
-                        return Ok(datafusion::common::tree_node::TreeNodeRecursion::Stop);
+                        return Ok(TreeNodeRecursion::Stop);
                     }
-                    Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+                    Ok(TreeNodeRecursion::Continue)
                 });
                 !references_padded
             })
@@ -248,7 +244,7 @@ struct NullPaddingExec {
     projection: Option<Vec<usize>>,
     /// The projection that was pushed down to the inner plan
     inner_projection: Option<Vec<usize>>,
-    cache: PlanProperties,
+    cache: Arc<PlanProperties>,
 }
 
 impl NullPaddingExec {
@@ -256,15 +252,15 @@ impl NullPaddingExec {
     fn compute_properties(
         inner_props: &PlanProperties,
         output_schema: SchemaRef,
-    ) -> PlanProperties {
+    ) -> Arc<PlanProperties> {
         // We preserve partitioning, boundedness, and emission type from inner plan
         // but create new equivalence properties for the extended schema
-        PlanProperties::new(
+        Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema),
             inner_props.output_partitioning().clone(),
             inner_props.emission_type,
             inner_props.boundedness,
-        )
+        ))
     }
 }
 
@@ -290,16 +286,19 @@ impl ExecutionPlan for NullPaddingExec {
         "NullPaddingExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.inner]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -356,12 +355,6 @@ impl ExecutionPlan for NullPaddingExec {
             output_schema,
             stream,
         )))
-    }
-
-    fn statistics(&self) -> DataFusionResult<datafusion::physical_plan::Statistics> {
-        // statistics() is deprecated, but we can still provide it for backwards compatibility
-        #[allow(deprecated)]
-        self.inner.statistics()
     }
 }
 
@@ -799,10 +792,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TableProvider for SpyTableProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             self.inner.schema()
         }

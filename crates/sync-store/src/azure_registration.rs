@@ -116,6 +116,7 @@ pub fn register_azure_handlers() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::ObjectStoreExt;
 
     #[test]
     fn azure_root_has_empty_prefix() {

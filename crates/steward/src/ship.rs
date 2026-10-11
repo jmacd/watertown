@@ -178,7 +178,8 @@ impl Ship {
         // `Remote::push` replicate the pond_init bundle, so a bootstrapped
         // replica holds the root-dir v1 row and `pond verify` matches
         // (P2-VERIFY-BOOTSTRAP-DRIFT).
-        let root_version = ship.data_persistence.table().version().unwrap_or(0);
+        let root_version = i64::try_from(ship.data_persistence.table().version().unwrap_or(0))
+            .map_err(|_| StewardError::DeltaLake("Delta table version exceeds i64".to_string()))?;
         // Partition checksums are retired (Decision D9, step 5b): the content
         // root recorded in the commit-log node subsumes them.
         ship.control_table
@@ -1003,7 +1004,7 @@ impl Ship {
             Some(chrono::Duration::minutes(control_minutes)),
         )
         .await?;
-        self.control_table.set_table(new_control_table);
+        self.control_table.set_table(new_control_table).await;
         report.control = Some(control_result);
 
         Ok(report)
@@ -1331,7 +1332,8 @@ impl Ship {
         // 6. Record DataCommitted(Compact) at the new data Delta version.
         //    DataCommitted is the terminal record for a data write in the
         //    watertown control schema (no trailing Completed).
-        let new_version = self.data_persistence.table().version().unwrap_or(-1);
+        let new_version = i64::try_from(self.data_persistence.table().version().unwrap_or(0))
+            .map_err(|_| StewardError::DeltaLake("Delta table version exceeds i64".to_string()))?;
         // Keep the in-memory persistence allocator in step with the
         // committed compaction seq (the optimize commit already carries it
         // on disk via `pond_txn`), so a subsequent read/write in this same
@@ -2939,7 +2941,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let control_table = ship.control_table.table().clone();
-        let pre_version = control_table.version().unwrap_or(-1);
+        let pre_version = control_table.version();
         let (cleaned_table, result) = maintenance::maintain_table(
             control_table,
             "control",
@@ -2956,7 +2958,7 @@ mod tests {
             "expected expired control logs to be cleaned"
         );
         assert_eq!(
-            cleaned_table.version().unwrap_or(-1),
+            cleaned_table.version(),
             pre_version,
             "cleanup must not change the table version"
         );

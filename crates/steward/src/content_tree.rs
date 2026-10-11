@@ -35,7 +35,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::SeekFrom;
-use std::sync::Arc;
 
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use futures::StreamExt;
@@ -1875,8 +1874,12 @@ pub(crate) async fn spool_series_inline_content(
         .parquet
         .reorder_filters = true;
     let ctx = SessionContext::new_with_config(session_config);
+    let provider = table
+        .table_provider()
+        .await
+        .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
     let _previous = ctx
-        .register_table("series_live", Arc::new(table))
+        .register_table("series_live", provider)
         .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
     let sql = format!(
         "SELECT node_id, version, content FROM series_live \
@@ -1975,8 +1978,12 @@ pub(crate) async fn read_series_live_metadata_ordered(
     node_id: &str,
 ) -> Result<Vec<SeriesVersionData>, StewardError> {
     let ctx = SessionContext::new();
+    let provider = table
+        .table_provider()
+        .await
+        .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
     let _previous = ctx
-        .register_table("series_live", Arc::new(table))
+        .register_table("series_live", provider)
         .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
     let sql = format!(
         "SELECT version, timestamp, blake3, collapsed_from, collapsed_through, \
@@ -2065,8 +2072,12 @@ pub(crate) async fn read_log_leaves(
     pond_id: &str,
 ) -> Result<Vec<Vec<u8>>, StewardError> {
     let ctx = SessionContext::new();
+    let provider = table
+        .table_provider()
+        .await
+        .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
     let _previous = ctx
-        .register_table("log_live", Arc::new(table))
+        .register_table("log_live", provider)
         .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
     let sql = format!(
         "SELECT version, content, blake3 FROM log_live \
@@ -2130,8 +2141,12 @@ pub(crate) async fn index_root_pointer_bytes(
     pond_id: &str,
 ) -> Result<Option<Vec<u8>>, StewardError> {
     let ctx = SessionContext::new();
+    let provider = table
+        .table_provider()
+        .await
+        .map_err(|error| StewardError::DeltaLake(error.to_string()))?;
     let _ = ctx
-        .register_table("index_tip", Arc::new(table))
+        .register_table("index_tip", provider)
         .map_err(|error| StewardError::DeltaLake(error.to_string()))?;
     let sql = format!(
         "SELECT version, content FROM index_tip WHERE pond_id = '{pond_id}' \
@@ -2175,8 +2190,12 @@ pub(crate) async fn log_tip_commit_hash(
     pond_id: &str,
 ) -> Result<Option<ObjectHash>, StewardError> {
     let ctx = SessionContext::new();
+    let provider = table
+        .table_provider()
+        .await
+        .map_err(|error| StewardError::DeltaLake(error.to_string()))?;
     let _ = ctx
-        .register_table("log_tip", Arc::new(table))
+        .register_table("log_tip", provider)
         .map_err(|error| StewardError::DeltaLake(error.to_string()))?;
     let sql = format!(
         "SELECT version, content, blake3 FROM log_tip WHERE pond_id = '{pond_id}' \
@@ -2655,8 +2674,12 @@ async fn scan_live_rows(
     want_content: bool,
 ) -> Result<Vec<OplogEntry>, StewardError> {
     let ctx = SessionContext::new();
+    let provider = table
+        .table_provider()
+        .await
+        .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
     let _previous = ctx
-        .register_table("content_live", Arc::new(table))
+        .register_table("content_live", provider)
         .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
     scan_live_rows_ctx(&ctx, want_content).await
 }
@@ -3654,7 +3677,7 @@ mod tests {
             datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).expect("memtable");
         let ctx = SessionContext::new();
         let _ = ctx
-            .register_table("content_live", Arc::new(mem))
+            .register_table("content_live", std::sync::Arc::new(mem))
             .expect("register");
         ctx
     }

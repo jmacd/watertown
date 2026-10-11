@@ -825,7 +825,7 @@ async fn execute_direct_copy_query(
 
                         _ = ctx
                             .register_table(
-                                datafusion::sql::TableReference::bare(unique_table_name),
+                                datafusion::common::TableReference::bare(unique_table_name),
                                 table_provider,
                             )
                             .map_err(|e| {
@@ -910,8 +910,9 @@ async fn execute_direct_copy_query(
                     );
 
                     // Deregister the table to prevent stale bindings
-                    let _ = ctx
-                        .deregister_table(datafusion::sql::TableReference::bare(unique_table_name));
+                    let _ = ctx.deregister_table(datafusion::common::TableReference::bare(
+                        unique_table_name,
+                    ));
 
                     Ok(total_rows)
                 }

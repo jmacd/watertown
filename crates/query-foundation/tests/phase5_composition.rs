@@ -110,7 +110,10 @@ async fn transforms_compose_over_physical_and_derived_sources() -> Result<()> {
 
     let display = physical_plan(result).await?;
     assert_eq!(display.matches("DataSourceExec").count(), 1, "{display}");
-    assert!(display.contains("projection=[ts, value]"), "{display}");
+    assert!(
+        display.contains("projection=[ts, value@2 as pond.reading]"),
+        "{display}"
+    );
     assert!(!display.contains("unused"), "{display}");
     assert!(!display.contains("site"), "{display}");
 
@@ -175,7 +178,14 @@ async fn same_scope_combine_composes_before_cross_scope_join() -> Result<()> {
 
     let display = physical_plan(joined).await?;
     assert_eq!(display.matches("DataSourceExec").count(), 3, "{display}");
-    assert_eq!(display.matches("projection=[ts, value]").count(), 3);
+    assert!(display.contains("composition/archive.parquet"), "{display}");
+    assert!(display.contains("composition/live.parquet"), "{display}");
+    assert!(
+        display.contains("composition/reference.parquet"),
+        "{display}"
+    );
+    assert_eq!(display.matches("projection=[ts, value]").count(), 2);
+    assert!(display.contains("value@2 as reference.value"), "{display}");
     assert_eq!(display.matches("HashJoinExec").count(), 1, "{display}");
     assert!(!display.contains("unused"), "{display}");
     assert!(!display.contains("site"), "{display}");
@@ -238,8 +248,11 @@ async fn join_pivot_and_reduce_remain_one_composed_plan() -> Result<()> {
 
     let display = physical_plan(reduced).await?;
     assert_eq!(display.matches("DataSourceExec").count(), 2, "{display}");
-    assert_eq!(display.matches("projection=[ts, value]").count(), 1);
-    assert_eq!(display.matches("projection=[ts]").count(), 1);
+    assert!(
+        display.contains("value@2 as temperature.value"),
+        "{display}"
+    );
+    assert!(!display.contains("pressure.value"), "{display}");
     assert_eq!(display.matches("HashJoinExec").count(), 1, "{display}");
     assert!(display.contains("AggregateExec"), "{display}");
     assert!(!display.contains("unused"), "{display}");

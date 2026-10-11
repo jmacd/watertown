@@ -3345,6 +3345,8 @@ async fn commit_returns_assigned_version() {
         .table()
         .version()
         .expect("post-commit table must have a version");
+    let returned_version =
+        u64::try_from(returned_version).expect("committed Delta version must be nonnegative");
 
     assert_eq!(
         returned_version, post_version,

@@ -91,12 +91,12 @@ pub async fn execute_sql_on_file(
 
                         // Deregister any stale "source" table from a previous call
                         // in the same session before registering the new one
-                        let _ =
-                            ctx.deregister_table(datafusion::sql::TableReference::bare("source"));
+                        let _ = ctx
+                            .deregister_table(datafusion::common::TableReference::bare("source"));
 
                         _ = ctx
                             .register_table(
-                                datafusion::sql::TableReference::bare("source"),
+                                datafusion::common::TableReference::bare("source"),
                                 table_provider,
                             )
                             .map_err(|e| {
@@ -126,7 +126,8 @@ pub async fn execute_sql_on_file(
                     // Deregister "source" now that the execution plan holds its
                     // own Arc to the table provider -- prevents stale bindings
                     // from leaking into later queries within the same session
-                    let _ = ctx.deregister_table(datafusion::sql::TableReference::bare("source"));
+                    let _ =
+                        ctx.deregister_table(datafusion::common::TableReference::bare("source"));
 
                     Ok(stream)
                 }

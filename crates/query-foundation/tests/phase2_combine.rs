@@ -452,7 +452,14 @@ async fn prefer_sequence_is_deterministic_and_keeps_predicates_above_reconciliat
         .indent(true)
         .to_string();
     assert_eq!(display.matches("DataSourceExec").count(), 2, "{display}");
-    assert_eq!(display.matches("projection=[ts]").count(), 2, "{display}");
+    assert!(
+        display.contains("projection=[ts, 1 as __watertown_combine_sequence]"),
+        "{display}"
+    );
+    assert!(
+        display.contains("projection=[ts, 2 as __watertown_combine_sequence]"),
+        "{display}"
+    );
     assert!(!display.contains("projection=[ts, value]"), "{display}");
 
     let (_fixture, archive, live) = series_frames(

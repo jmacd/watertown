@@ -394,7 +394,7 @@ impl StreamingSeriesWriter {
         let metadata = Arc::new(Mutex::new(WriterMetadata::default()));
         let proxy = MetadataWriterProxy::new(tinyfs_writer, Arc::clone(&metadata));
         let props = WriterProperties::builder()
-            .set_max_row_group_size(max_row_group_rows)
+            .set_max_row_group_row_count(Some(max_row_group_rows))
             .build();
         let writer = parquet::arrow::AsyncArrowWriter::try_new(proxy, schema, Some(props))
             .map_other_context("Arrow writer error")?;

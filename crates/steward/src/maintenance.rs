@@ -25,13 +25,13 @@
 //!   (only on explicit request via `pond maintain --compact`).
 
 use chrono::{Duration, Utc};
-use deltalake::DeltaTable;
 use deltalake::checkpoints;
-use deltalake::kernel::schema::partitions::{PartitionFilter, PartitionValue};
 use deltalake::kernel::transaction::CommitProperties;
 use deltalake::operations::optimize::OptimizeType;
+use deltalake::{DeltaTable, FilterOp, FilterValue};
 use log::{debug, info, warn};
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use uuid::Uuid;
 
 /// How often to create checkpoints (every N versions).
@@ -69,7 +69,7 @@ pub const KEY_CONTROL_LOG_RETENTION_MINUTES: &str = "maintenance.control_log_ret
 pub const KEY_DATA_LOG_RETENTION_MINUTES: &str = "maintenance.data_log_retention_minutes";
 
 /// Default target size for compaction (128 MB).
-const COMPACT_TARGET_SIZE: u64 = 128 * 1024 * 1024;
+const COMPACT_TARGET_SIZE: NonZeroU64 = NonZeroU64::new(128 * 1024 * 1024).unwrap();
 
 /// Result of a maintenance run on a single table.
 #[derive(Debug, Default)]
@@ -174,7 +174,9 @@ pub async fn maintain_table(
 ) -> Result<(DeltaTable, MaintenanceResult), crate::StewardError> {
     let mut result = MaintenanceResult {
         table_name: table_name.to_string(),
-        version: table.version().unwrap_or(-1),
+        version: i64::try_from(table.version().unwrap_or(0)).map_err(|_| {
+            crate::StewardError::DeltaLake("Delta table version exceeds i64".to_string())
+        })?,
         ..Default::default()
     };
 
@@ -182,8 +184,7 @@ pub async fn maintain_table(
 
     // 1. Checkpoint if needed (or forced)
     let version = table.version().unwrap_or(0);
-    let should_checkpoint =
-        version > 0 && (force || (version as u64).is_multiple_of(CHECKPOINT_INTERVAL));
+    let should_checkpoint = version > 0 && (force || version.is_multiple_of(CHECKPOINT_INTERVAL));
     if should_checkpoint {
         debug!(
             "[MAINTAIN] Creating checkpoint for {} at version {}",
@@ -272,13 +273,17 @@ pub async fn maintain_table(
 
     // 3. Vacuum stale data files (gated: only when needed)
     let should_vacuum =
-        force || has_remove_actions(&table) || (version as u64).is_multiple_of(VACUUM_INTERVAL);
+        force || has_remove_actions(&table) || version.is_multiple_of(VACUUM_INTERVAL);
 
     if should_vacuum {
         match table
             .clone()
             .vacuum()
-            .with_retention_period(Duration::hours(VACUUM_RETENTION_HOURS as i64))
+            .with_retention_period(Duration::hours(
+                i64::try_from(VACUUM_RETENTION_HOURS).map_err(|_| {
+                    crate::StewardError::DeltaLake("vacuum retention exceeds i64".to_string())
+                })?,
+            ))
             .with_enforce_retention_duration(false)
             .await
         {
@@ -341,7 +346,9 @@ pub async fn maintain_table(
         }
     }
 
-    result.version = table.version().unwrap_or(-1);
+    result.version = i64::try_from(table.version().unwrap_or(0)).map_err(|_| {
+        crate::StewardError::DeltaLake("Delta table version exceeds i64".to_string())
+    })?;
     Ok((table, result))
 }
 
@@ -402,10 +409,12 @@ pub async fn compact_pond_partitions(
     pond_id: Uuid,
     app_metadata: HashMap<String, serde_json::Value>,
 ) -> Result<(DeltaTable, CompactStats), deltalake::DeltaTableError> {
-    let filters = [PartitionFilter {
-        key: "pond_id".to_string(),
-        value: PartitionValue::Equal(pond_id.to_string()),
-    }];
+    let pond_id_string = pond_id.to_string();
+    let filters = [(
+        "pond_id",
+        FilterOp::Eq,
+        FilterValue::Scalar(pond_id_string.as_str()),
+    )];
     let (new_table, metrics) = table
         .optimize()
         .with_type(OptimizeType::Compact)

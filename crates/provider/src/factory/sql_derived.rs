@@ -1422,7 +1422,7 @@ impl SqlDerivedFile {
 
         _ = ctx
             .register_table(
-                datafusion::sql::TableReference::bare(unique_table_name.as_str()),
+                datafusion::common::TableReference::bare(unique_table_name.as_str()),
                 final_table_provider,
             )
             .map_err(|e| {
@@ -1517,7 +1517,7 @@ impl SqlDerivedFile {
         let empty = MemTable::try_new(schema, vec![vec![]]).map_other()?;
         _ = ctx
             .register_table(
-                datafusion::sql::TableReference::bare(table_name.as_str()),
+                datafusion::common::TableReference::bare(table_name.as_str()),
                 Arc::new(empty),
             )
             .map_other()?;

@@ -115,7 +115,10 @@ async fn one_measurement_pivot_is_only_a_projected_scan() -> Result<()> {
         .indent(true)
         .to_string();
     assert_eq!(display.matches("DataSourceExec").count(), 1, "{display}");
-    assert!(display.contains("projection=[ts, value]"), "{display}");
+    assert!(
+        display.contains("projection=[ts, value@1 as temperature]"),
+        "{display}"
+    );
     assert!(!display.contains("HashJoinExec"), "{display}");
     assert!(!display.contains("unused"), "{display}");
 
@@ -167,7 +170,9 @@ async fn sparse_pivot_aligns_measurements_and_pads_absent_columns() -> Result<()
         .indent(true)
         .to_string();
     assert_eq!(display.matches("DataSourceExec").count(), 2, "{display}");
-    assert_eq!(display.matches("projection=[ts, value]").count(), 2);
+    assert_eq!(display.matches("value@1 as").count(), 2, "{display}");
+    assert!(display.contains("value@1 as temperature"), "{display}");
+    assert!(display.contains("value@1 as oxygen"), "{display}");
     assert_eq!(display.matches("HashJoinExec").count(), 1, "{display}");
     assert!(!display.contains("unused"), "{display}");
 
@@ -251,8 +256,16 @@ async fn empty_measurement_and_downstream_projection_do_not_add_spine_scans() ->
         .indent(true)
         .to_string();
     assert_eq!(display.matches("DataSourceExec").count(), 2, "{display}");
-    assert!(display.contains("projection=[ts, value]"), "{display}");
-    assert!(display.contains("projection=[ts]"), "{display}");
+    assert!(
+        display.contains(
+            "projection=[ts@0 as __watertown_join_accumulated_time, value@1 as temperature]"
+        ),
+        "{display}"
+    );
+    assert!(
+        display.contains("projection=[ts@0 as __watertown_join_input_time_1]"),
+        "{display}"
+    );
     assert!(!display.contains("unused"), "{display}");
 
     let reduced = pivot.aggregate(

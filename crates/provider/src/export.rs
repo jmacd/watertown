@@ -419,7 +419,7 @@ pub async fn export_table_provider_to_parquet(
     );
     _ = ctx
         .register_table(
-            datafusion::sql::TableReference::bare(unique_table_name.as_str()),
+            datafusion::common::TableReference::bare(unique_table_name.as_str()),
             table_provider,
         )
         .map_err(|e| anyhow::anyhow!("Failed to register table: {}", e))?;
@@ -439,7 +439,7 @@ pub async fn export_table_provider_to_parquet(
         )
         .await?;
 
-        _ = ctx.deregister_table(datafusion::sql::TableReference::bare(
+        _ = ctx.deregister_table(datafusion::common::TableReference::bare(
             unique_table_name.as_str(),
         ));
         write_series_manifest(&manifest_path, &manifest)?;
@@ -473,7 +473,7 @@ pub async fn export_table_provider_to_parquet(
     )
     .await?;
 
-    _ = ctx.deregister_table(datafusion::sql::TableReference::bare(
+    _ = ctx.deregister_table(datafusion::common::TableReference::bare(
         unique_table_name.as_str(),
     ));
 
@@ -1494,7 +1494,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::factory::test_support::create_provider_context;
-    use std::any::Any;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1533,10 +1532,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl datafusion::catalog::TableProvider for ScanCountingTableProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> arrow::datatypes::SchemaRef {
             self.inner.schema()
         }

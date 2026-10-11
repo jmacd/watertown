@@ -127,6 +127,7 @@ impl TestSetup {
         txn_seq: i64,
     ) -> Result<Vec<TransactionRecordSummary>> {
         use arrow::array::{Array, BooleanArray, Int64Array, StringArray};
+        use arrow::datatypes::DataType;
 
         let ship = self.ship_context.open_pond().await?;
         let control_table = ship.control_table();
@@ -169,9 +170,12 @@ impl TestSetup {
                 continue;
             }
 
-            let record_kinds = batch
-                .column_by_name("record_kind")
-                .unwrap()
+            let record_kind_col = batch.column_by_name("record_kind").unwrap();
+            let record_kind_utf8 = match record_kind_col.data_type() {
+                DataType::Utf8 => record_kind_col.clone(),
+                _ => arrow_cast::cast(record_kind_col.as_ref(), &DataType::Utf8)?,
+            };
+            let record_kinds = record_kind_utf8
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .unwrap();
@@ -187,9 +191,12 @@ impl TestSetup {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap();
-            let metadatas = batch
-                .column_by_name("metadata_json")
-                .unwrap()
+            let metadata_col = batch.column_by_name("metadata_json").unwrap();
+            let metadata_utf8 = match metadata_col.data_type() {
+                DataType::Utf8 => metadata_col.clone(),
+                _ => arrow_cast::cast(metadata_col.as_ref(), &DataType::Utf8)?,
+            };
+            let metadatas = metadata_utf8
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .unwrap();

@@ -190,37 +190,21 @@ impl ControlTable {
     /// produces a new table reference.  Best-effort: a failure to
     /// re-register only affects subsequent SQL queries on the cached
     /// session context.
-    pub fn set_table(&mut self, table: DeltaTable) {
-        if let Err(e) = self.inner.set_delta_table(table) {
+    pub async fn set_table(&mut self, table: DeltaTable) {
+        if let Err(e) = self.inner.set_delta_table(table).await {
             log::warn!("control_table set_table: re-register failed: {}", e);
         }
     }
 
     /// Shared DataFusion session context with the control table
-    /// registered under [`crate::inner_control::TABLE_NAME`] (`"control"`).
+    /// registered under [`crate::inner_control::table::TABLE_NAME`] (`"control"`).
     /// JSON helper functions are registered so callers can query
     /// `metadata_json` via `json_get_str` and friends.  A fresh
     /// context is built on every call so callers always see the
     /// latest Delta version of the table.
     #[must_use]
     pub fn session_context(&self) -> Arc<SessionContext> {
-        let mut ctx = SessionContext::new();
-        if let Err(e) = datafusion_functions_json::register_all(&mut ctx) {
-            log::warn!(
-                "control_table session_context: register JSON functions failed: {}",
-                e
-            );
-        }
-        if let Err(e) = ctx.register_table(
-            crate::inner_control::TABLE_NAME,
-            Arc::new(self.inner.delta_table().clone()),
-        ) {
-            log::warn!(
-                "control_table session_context: register table failed: {}",
-                e
-            );
-        }
-        Arc::new(ctx)
+        Arc::clone(self.inner.session_ctx())
     }
 
     /// Cached pond identity (immutable for the lifetime of the pond).
