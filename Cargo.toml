@@ -45,7 +45,7 @@ arrow = { version = "59", default-features = false, features = ["prettyprint", "
 arrow-arith = "59"
 arrow-array = "59"
 arrow-buffer = "59"
-arrow-cast = { version = "59", features = ["prettyprint"] }
+arrow-cast = { version = "60", features = ["prettyprint"] }
 arrow-csv = "59"
 arrow-schema = "59"
 arrow-select = "59"
