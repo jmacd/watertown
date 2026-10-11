@@ -11,7 +11,7 @@
 
 # Vendor stage — download JS/WASM dependencies for sitegen.
 # Same mechanism as the production Dockerfile.
-FROM node:22-slim AS vendor
+FROM node:25-slim AS vendor
 WORKDIR /vendor
 COPY vendor-download.sh download.sh
 RUN bash download.sh
