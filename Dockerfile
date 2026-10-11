@@ -1,6 +1,6 @@
 # Vendor stage — download JS/WASM dependencies for sitegen (DuckDB-WASM,
 # Observable Plot, D3).  Runs in parallel with the Rust build.
-FROM node:22-slim AS vendor
+FROM node:25-slim AS vendor
 WORKDIR /vendor
 COPY crates/sitegen/vendor/download.sh .
 RUN bash download.sh
