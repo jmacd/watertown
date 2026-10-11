@@ -94,7 +94,7 @@ sea-query = { version = "0", features = ["with-chrono"] }
 serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
 serde_arrow = { version = "0.15", features = ["arrow-59"] }
 serde_json = "1.0.116"
-serde_qs = "0.15"
+serde_qs = "1.1"
 serde_repr = "0.1.19"
 serde_yaml = "0.9.34-deprecated"
 sha2 = "0.10"
