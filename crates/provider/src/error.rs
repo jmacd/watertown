@@ -5,6 +5,10 @@
 /// Provider error types
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Spreadsheet parsing or tabular conversion error
+    #[error("XLS error: {0}")]
+    Xls(String),
+
     /// Invalid URL format
     #[error("Invalid URL: {0}")]
     InvalidUrl(String),

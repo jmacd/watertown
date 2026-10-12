@@ -25,7 +25,7 @@ pub async fn run_command(
     );
 
     // Classify the config path to determine pond vs host context
-    let target = classify_target(config_path);
+    let target = classify_target(config_path)?;
 
     match target {
         TargetContext::Host(_) => run_host_command(ship_context, config_path, extra_args).await,
