@@ -847,6 +847,17 @@ impl Provider {
             return Ok(table_providers.into_iter().next().expect("len == 1").1);
         }
 
+        if scheme == "hledger" {
+            let schemas = table_providers
+                .iter()
+                .map(|(_, table)| table.schema().as_ref().clone());
+            _ = arrow::datatypes::Schema::try_merge(schemas).map_err(|e| {
+                Error::Hledger(format!(
+                    "Incompatible annotation schemas for '{url_str}': {e}"
+                ))
+            })?;
+        }
+
         let inputs = table_providers
             .into_iter()
             .enumerate()

@@ -283,6 +283,12 @@ freshly built binary is the only way to validate a chart change before merge.
    $ (cd ./out && python3 -m http.server 8080)
    ```
 
+Unchanged builds should reuse `sitegen` and `cmd`. The sitegen build identifier
+tracks Git's resolved HEAD and ref paths, including submodule/worktree metadata,
+rather than assuming `.git` is a directory. On macOS, Cargo may replay a cached
+`__eh_frame` linker warning even when no compilation or linking occurs; use
+`cargo build -vv -p cmd --bin pond` to check for `Fresh` versus `Compiling`.
+
 When the page under test is driven by a **derived series computed in a
 separate data pond** (e.g. the caspar.water `analysis` exports are computed
 in the *water* pond), you need not import that whole source.  Export each

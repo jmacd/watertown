@@ -451,8 +451,9 @@ pub async fn create_memtable_from_host_url(
 ) -> Result<std::sync::Arc<dyn datafusion::catalog::TableProvider>> {
     let format_provider = FormatRegistry::get_provider(url.scheme()).ok_or_else(|| {
         Error::InvalidUrl(format!(
-            "Unknown format '{}' in host URL. Known formats: csv, oteljson, excelhtml",
-            url.scheme()
+            "Unknown format '{}' in host URL. Known formats: {}",
+            url.scheme(),
+            FormatRegistry::list_providers().join(", ")
         ))
     })?;
 
