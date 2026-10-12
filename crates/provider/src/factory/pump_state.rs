@@ -127,7 +127,7 @@ impl PumpStateFile {
         bounds: tinyfs::SeriesReadBounds,
     ) -> TinyFSResult<Arc<dyn TableProvider>> {
         let fs = context.filesystem();
-        let root = fs.root().await?;
+        let root = self.context.root().await?;
         let provider =
             crate::Provider::with_context(Arc::new(fs), Arc::new(context.clone())).with_root(root);
         provider
@@ -429,7 +429,7 @@ impl tinyfs::QueryableFile for PumpStateFile {
             return Ok(None);
         }
         let fs = context.filesystem();
-        let root = fs.root().await?;
+        let root = self.context.root().await?;
         let provider =
             crate::Provider::with_context(Arc::new(fs), Arc::new(context.clone())).with_root(root);
         let Some(nested) = provider
@@ -1031,6 +1031,56 @@ ORDER BY d.ts
                 .non_incremental_plans,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn resolves_source_within_effective_root() {
+        let (fs, provider_context) = crate::factory::test_support::create_test_environment().await;
+        let root = fs.root().await.unwrap();
+        _ = root.create_dir_all("/sources/water").await.unwrap();
+        let imported = root.open_dir_path("/sources/water").await.unwrap();
+        _ = root
+            .write_series_from_batch(
+                "/sources/water/depth.series",
+                &source_batch(),
+                Some("timestamp"),
+            )
+            .await
+            .unwrap();
+
+        let config = br#"
+source: series:///depth.series
+time_column: timestamp
+depth_column: well_depth_value.avg
+lookback: 60m
+disturbance_drop: 0.3
+valid_depth_min: 10.0
+valid_depth_max: 60.0
+"#;
+        let factory_context = FactoryContext::new(provider_context.clone(), FileID::root())
+            .with_effective_root(imported.node_path());
+        let handle =
+            crate::FactoryRegistry::create_file("pump-state-series", config, factory_context)
+                .await
+                .unwrap();
+        let file = handle.get_file().await;
+        let guard = file.lock().await;
+        let provider = guard
+            .as_queryable()
+            .unwrap()
+            .as_table_provider(FileID::root(), &provider_context)
+            .await
+            .unwrap();
+        drop(guard);
+
+        let batches = provider_context
+            .datafusion_session
+            .read_table(provider)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 67);
     }
 
     #[tokio::test]
