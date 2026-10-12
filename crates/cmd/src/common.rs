@@ -168,10 +168,9 @@ pub enum TargetContext {
 
 /// Classify a CLI argument string as pond or host-targeted.
 ///
-/// Uses `provider::Url::parse` for proper URL classification when the
-/// argument looks like a URL (contains `://`). Falls back to string-level
-/// detection for bare paths and glob patterns that may not survive URL
-/// parsing (e.g., `**/*` with no scheme).
+/// Uses `provider::Url::parse` for URL classification and string-level
+/// detection for bare paths and glob patterns (e.g., `**/*` with no scheme).
+/// Invalid URLs return errors rather than falling back to pond paths.
 ///
 /// # Examples
 ///
@@ -182,36 +181,29 @@ pub enum TargetContext {
 /// "host+csv:///tmp/data.csv"      -> Host("/tmp/data.csv")
 /// "csv:///pond/data.csv"          -> Pond("csv:///pond/data.csv")
 ///     ```
-#[must_use]
-pub fn classify_target(arg: &str) -> TargetContext {
+pub fn classify_target(arg: &str) -> Result<TargetContext> {
     // If the argument contains "://", parse it as a proper URL.
     // This handles both `host+scheme:///path` and `scheme:///path`.
     if arg.contains("://") {
-        match provider::Url::parse(arg) {
-            Ok(url) => {
-                if url.is_host() {
-                    let path = url.path();
-                    if path.is_empty() {
-                        TargetContext::Host("/".to_string())
-                    } else {
-                        TargetContext::Host(path.to_string())
-                    }
-                } else {
-                    // Non-host URL (e.g., csv:///path) -- stays in pond context
-                    TargetContext::Pond(arg.to_string())
-                }
+        let url =
+            provider::Url::parse(arg).map_err(|e| anyhow!("Invalid target URL '{arg}': {e}"))?;
+        if url.is_host() {
+            let path = url.path();
+            if path.is_empty() {
+                Ok(TargetContext::Host("/".to_string()))
+            } else {
+                Ok(TargetContext::Host(path.to_string()))
             }
-            Err(_) => {
-                // URL parse failed -- treat as pond path
-                TargetContext::Pond(arg.to_string())
-            }
+        } else {
+            // Non-host URL (e.g., csv:///path) -- stays in pond context
+            Ok(TargetContext::Pond(arg.to_string()))
         }
     } else if let Some(rest) = arg.strip_prefix("host+") {
         // `host+` without `://` -- bare host path
-        TargetContext::Host(rest.to_string())
+        Ok(TargetContext::Host(rest.to_string()))
     } else {
         // Bare path or glob pattern -- pond context
-        TargetContext::Pond(arg.to_string())
+        Ok(TargetContext::Pond(arg.to_string()))
     }
 }
 
@@ -631,13 +623,16 @@ mod tests {
 
     #[test]
     fn test_classify_bare_glob_is_pond() {
-        assert_eq!(classify_target("**/*"), TargetContext::Pond("**/*".into()));
+        assert_eq!(
+            classify_target("**/*").expect("valid target"),
+            TargetContext::Pond("**/*".into())
+        );
     }
 
     #[test]
     fn test_classify_absolute_path_is_pond() {
         assert_eq!(
-            classify_target("/data/file.csv"),
+            classify_target("/data/file.csv").expect("valid target"),
             TargetContext::Pond("/data/file.csv".into())
         );
     }
@@ -645,7 +640,7 @@ mod tests {
     #[test]
     fn test_classify_host_file_url() {
         assert_eq!(
-            classify_target("host+file:///tmp/data/**/*"),
+            classify_target("host+file:///tmp/data/**/*").expect("valid target"),
             TargetContext::Host("/tmp/data/**/*".into())
         );
     }
@@ -653,7 +648,7 @@ mod tests {
     #[test]
     fn test_classify_host_csv_url() {
         assert_eq!(
-            classify_target("host+csv:///tmp/data.csv"),
+            classify_target("host+csv:///tmp/data.csv").expect("valid target"),
             TargetContext::Host("/tmp/data.csv".into())
         );
     }
@@ -661,7 +656,7 @@ mod tests {
     #[test]
     fn test_classify_host_empty_path() {
         assert_eq!(
-            classify_target("host+file:///"),
+            classify_target("host+file:///").expect("valid target"),
             TargetContext::Host("/".into())
         );
     }
@@ -670,7 +665,7 @@ mod tests {
     fn test_classify_host_no_scheme_separator() {
         // host+ without :// -- bare path after host+
         assert_eq!(
-            classify_target("host+somepath"),
+            classify_target("host+somepath").expect("valid target"),
             TargetContext::Host("somepath".into())
         );
     }
@@ -678,8 +673,22 @@ mod tests {
     #[test]
     fn test_classify_pond_url_no_host_prefix() {
         assert_eq!(
-            classify_target("csv:///pond/data.csv"),
+            classify_target("csv:///pond/data.csv").expect("valid target"),
             TargetContext::Pond("csv:///pond/data.csv".into())
         );
+    }
+
+    #[test]
+    fn test_classify_invalid_urls_fail_instead_of_becoming_pond_paths() {
+        for target in [
+            "hostfs+xls://../../caspar_water_bank/sbmc_register.xls",
+            "host+xls://../../caspar_water_bank/sbmc_register.xls",
+            "csv:///data.csv#fragment",
+        ] {
+            let error = classify_target(target)
+                .expect_err("invalid URL")
+                .to_string();
+            assert!(error.contains("Invalid target URL"), "{error}");
+        }
     }
 }

@@ -20,11 +20,7 @@ where
 {
     log::debug!("describe_command called with pattern {pattern}");
 
-    if pattern.contains("://") {
-        _ = provider::Url::parse(pattern)
-            .map_err(|e| anyhow::anyhow!("Invalid URL '{}': {}", pattern, e))?;
-    }
-    let (mut ship, pattern) = match classify_target(pattern) {
+    let (mut ship, pattern) = match classify_target(pattern)? {
         TargetContext::Host(path) => (
             ship_context.open_host()?,
             if pattern.contains("://") {
@@ -674,6 +670,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_describe_host_xls_single_and_glob_without_pond() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        for name in ["first.xls", "second.xls"] {
+            tokio::fs::write(
+                dir.path().join(name),
+                include_bytes!("../../../provider/tests/fixtures/single.xls"),
+            )
+            .await?;
+        }
+        let context = ShipContext::new(
+            Some(dir.path().join("must-not-open-pond")),
+            Some(dir.path()),
+            Vec::new(),
+            Vec::new(),
+        );
+        for (pattern, count) in [
+            ("host+xls:///first.xls", 1),
+            ("host+xls:///*.xls?batch_size=2", 2),
+        ] {
+            let mut output = String::new();
+            describe_command(&context, pattern, |s| output.push_str(s)).await?;
+            assert_eq!(output.matches("Provider: xls").count(), count);
+            assert_eq!(output.matches("Schema: 7 fields").count(), count);
+            assert!(output.contains("value: Float64"), "{output}");
+            assert!(output.contains("active: Boolean"), "{output}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_describe_host_errors_propagate_without_pond() -> Result<()> {
         let dir = tempfile::tempdir()?;
         tokio::fs::write(
@@ -689,7 +715,8 @@ mod tests {
         );
         for (pattern, diagnostic) in [
             ("host+hledger:///books.journal", "unsupported include"),
-            ("host+hledger://[", "Invalid URL"),
+            ("host+hledger://[", "Invalid target URL"),
+            ("hostfs+xls://../../book.xls", "Invalid target URL"),
         ] {
             let error = describe_command(&context, pattern, |_| {})
                 .await

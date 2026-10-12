@@ -170,6 +170,13 @@ impl Url {
     /// If the string doesn't contain "://", defaults to "file://" scheme.
     /// The actual file type is determined by EntryType when the file is accessed.
     pub fn parse(url_str: &str) -> Result<Self> {
+        if url_str.starts_with("hostfs+") {
+            return Err(Error::InvalidUrl(
+                "'hostfs+' is not supported; use 'host+' with an absolute URL path, \
+                 or use -d <directory> with a path relative to that root"
+                    .into(),
+            ));
+        }
         // Strip leading `host+` before handing to the url crate.
         // We do this at the string level so the url crate never sees `host+oteljson`
         // as an opaque compound scheme.
@@ -205,7 +212,8 @@ impl Url {
         if let Some(host) = inner.host_str().filter(|h| !h.is_empty()) {
             return Err(Error::InvalidUrl(format!(
                 "non-empty host '{}' is not allowed in provider URLs; \
-                 use host+ prefix instead (e.g., host+csv:///path)",
+                 use an empty host and an absolute URL path (e.g., host+csv:///path); \
+                 for relative host paths use -d <directory> with host+csv:///file.csv",
                 host
             )));
         }

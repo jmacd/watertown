@@ -43,6 +43,7 @@ clap.workspace = true
 log.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
+calamine.workspace = true
 object_store.workspace = true
 parquet.workspace = true
 async-stream.workspace = true

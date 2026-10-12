@@ -38,7 +38,7 @@ where
     F: FnMut(&str),
 {
     // Classify the pattern to determine pond vs host context
-    let target = classify_target(pattern);
+    let target = classify_target(pattern)?;
 
     let (normalized_pattern, mut ship) = match target {
         TargetContext::Host(ref host_path) => {
