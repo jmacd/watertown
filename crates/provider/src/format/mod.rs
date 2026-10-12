@@ -5,8 +5,8 @@
 //! Layer 2: Format Provider Traits
 //!
 //! Converts AsyncRead streams to Arrow RecordBatches for tabular formats.
-//! Streaming formats decode incrementally; buffered formats such as XLS read
-//! their input into memory first. Parquet uses the TinyFS ObjectStore path.
+//! Streaming formats decode incrementally; buffered formats such as XLS and hledger
+//! parse their entire input first. Parquet uses the TinyFS ObjectStore path.
 //!
 //! Uses arrow-csv/arrow-json Decoder pattern for truly async streaming.
 
@@ -22,6 +22,7 @@ pub(crate) mod batch;
 pub mod compression;
 pub mod csv;
 pub mod excelhtml;
+pub mod hledger;
 pub mod jsonlogs;
 pub mod oteljson;
 pub mod weblog;
@@ -29,7 +30,7 @@ pub mod xls;
 
 /// Format provider trait - converts file data to Arrow RecordBatches
 ///
-/// Providers may decode incrementally or buffer inputs that require seeking.
+/// Providers may decode incrementally or buffer their input for parsing.
 /// Parquet uses the existing TinyFS ObjectStore path.
 #[allow(clippy::double_must_use)]
 #[async_trait]

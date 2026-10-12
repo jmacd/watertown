@@ -289,6 +289,7 @@ Provides unified data access and the factory plugin system:
 - `csv:///pattern` - CSV files with format conversion
 - `csv+gzip:///pattern` - Compressed CSV with automatic decompression
 - `excelhtml:///pattern` - HydroVu Excel HTML exports
+- `hledger:///pattern` - Single-file journal postings for financial DataFusion queries and sitegen exports
 - `xls:///pattern?sheet=Name` - Binary Excel worksheets (also `host+xls:///path` without a pond)
 
 **Factory Subdirectories**:

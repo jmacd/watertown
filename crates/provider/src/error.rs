@@ -5,6 +5,10 @@
 /// Provider error types
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Journal parsing or unsupported accounting semantics
+    #[error("Hledger error: {0}")]
+    Hledger(String),
+
     /// Spreadsheet parsing or tabular conversion error
     #[error("XLS error: {0}")]
     Xls(String),

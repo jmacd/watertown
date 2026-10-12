@@ -57,6 +57,8 @@ base64 = "0.22"
 bytes = "1.6.0"
 calamine = { version = "0.36.1", features = ["chrono"] }
 chrono = { version = "0.4" }
+# hledger-parser beta.2 is incompatible with Chumsky alpha.8.
+chumsky = "=1.0.0-alpha.7"
 clap = { version = "4.5.4", features = ["derive"] }
 bao-tree = { version = "0.16", features = ["validate"] }
 blake3 = "1.8"
@@ -74,6 +76,7 @@ file-rotate = "0.8"
 fs2 = "0.4"
 futures = "0.3"
 hex = "0.4.3"
+hledger-parser = "=1.0.0-beta.2"
 hmac = "0.12"
 httpdate = "1.0"
 humantime = "2.1"
@@ -99,6 +102,7 @@ serde_qs = "0.15"
 serde_repr = "0.1.19"
 serde_yaml = "0.9.34-deprecated"
 sha2 = "0.10"
+stacker = "0.1"
 tempfile = "3.8"
 
 thiserror = "2.0.12"

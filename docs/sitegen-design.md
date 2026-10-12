@@ -139,6 +139,37 @@ This single command:
 4. Renders all routes with manifest context
 5. Outputs HTML + data files to `./dist`
 
+### Financial journal data
+
+Use the `hledger` format provider to expose individual journal files through
+DataFusion and the existing format-provider export path:
+
+```yaml
+exports:
+  - name: ledger
+    pattern: "hledger:///finance/cycles/*.journal"
+    timestamp_column: date
+```
+
+Each file is parsed independently into posting rows and exported as Parquet,
+retaining exact decimal amounts and transaction dates. `source` together with
+the file-local `transaction_sequence` correlates a transaction's postings.
+Comment annotations become nullable string columns such as `tag_party`,
+`tag_billing_account`, and `tag_cycle`. Transaction and exact-account tags are
+inherited by posting rows; conflicting values fail rather than overriding.
+Files can have different annotation columns. The SQL explorer already reads
+Parquet sets with `union_by_name=true`, filling missing columns with NULL; use
+the same option when assembling these files directly in DuckDB.
+For example, SQL against the posting table can aggregate
+`sum(amount)` grouped by `account` and `commodity`; do not sum different
+commodities together as if they were the same currency.
+
+Includes and unsupported accounting features fail the export rather than
+publishing partial financial data. The provider infers an unambiguous missing
+posting amount but computes no running balances or valuation. Future factories
+can assemble file sets through YAML; journal includes are not followed.
+See [the journal provider schema and limitations](cli-reference.md#hledger-journal-provider).
+
 ### Route Types
 
 | Type | Has `pattern` | Has `slug` | Produces |
