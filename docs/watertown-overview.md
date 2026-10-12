@@ -277,7 +277,7 @@ foundation does not depend on those production crates.
 Provides unified data access and the factory plugin system:
 
 - **URL-Based Access**: `scheme:///path/pattern` for format conversion and filtering
-- **Format Registry**: Pluggable format providers (CSV, Parquet, JSON, Excel HTML)
+- **Format Registry**: Pluggable format providers (CSV, Parquet, JSON, Excel HTML, binary Excel)
 - **Factory Registry**: Compile-time registration with `linkme` distributed slices
 - **TinyFS ObjectStore**: DataFusion ObjectStore implementation for seamless integration
 - **TableProvider Creation**: Unified interface for creating queryable tables
@@ -289,6 +289,7 @@ Provides unified data access and the factory plugin system:
 - `csv:///pattern` - CSV files with format conversion
 - `csv+gzip:///pattern` - Compressed CSV with automatic decompression
 - `excelhtml:///pattern` - HydroVu Excel HTML exports
+- `xls:///pattern?sheet=Name` - Binary Excel worksheets (also `host+xls:///path` without a pond)
 
 **Factory Subdirectories**:
 - `factory/sql_derived.rs`: SQL transformation factories (table and series modes)

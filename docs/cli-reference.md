@@ -234,6 +234,13 @@ pond cat host+csv:///tmp/data.csv --format=table --sql "SELECT * FROM source WHE
 # Query a host zstd-compressed CSV
 pond cat host+csv+zstd:///tmp/data.csv.zst --format=table
 
+# View or query a binary Excel workbook (no pond needed)
+pond cat 'host+xls:///tmp/readings.xls?sheet=Readings' --format=table
+pond cat 'host+xls:///tmp/readings.xls?sheet=Readings' --format=table --sql "SELECT * FROM source WHERE value > 20"
+
+# Read relative to a host directory (the URL path is relative to this root)
+pond -d ../../caspar_water_bank cat 'host+xls:///sbmc_register.xls' --format=table
+
 # Query a host Parquet file directly as a table (no pond needed)
 pond cat host+table:///tmp/snapshot.parquet --format=table
 pond cat host+table:///tmp/snapshot.parquet --sql "SELECT count(*) FROM source"
@@ -290,6 +297,8 @@ use the same format/compression/entry-type syntax — host files just add the
 | `host+csv+series://` | CSV as time-series (host) | `pond cat host+csv+series:///tmp/ts.csv --format=table` |
 | `oteljson://` | Parse as OtelJSON Lines | `pond cat oteljson:///logs/metrics.json --sql "..."` |
 | `excelhtml://` | Parse as Excel HTML | `pond cat excelhtml:///data/export.html --sql "..."` |
+| `xls://` | Parse a binary Excel worksheet (pond) | `pond cat 'xls:///data/book.xls?sheet=Readings' --format=table` |
+| `host+xls://` | Parse a binary Excel worksheet (host) | `pond cat 'host+xls:///tmp/book.xls?sheet=Readings' --format=table` |
 | `host+file://` | Raw bytes (host) | `pond cat host+file:///tmp/readme.txt` |
 | `file://` | Raw bytes or Parquet (pond) | `pond cat file:///data/file.parquet` |
 | (none) | Auto-detect (pond) | `pond cat /data/file.csv` |
@@ -302,7 +311,45 @@ use the same format/compression/entry-type syntax — host files just add the
 - Parquet files (stored as table or series entry types)
 - CSV files when using `csv://` or `host+csv://` prefix
 - OtelJSON Lines files when using `oteljson://` prefix (two-pass: discovers all metric names as columns)
+- Binary Excel worksheets when using `xls://` or `host+xls://` prefix
 - Raw data files without a scheme will output raw bytes, ignoring `--sql`
+
+#### Binary Excel (`xls`)
+
+The Calamine-backed `xls` provider reads **binary `.xls` workbooks**, not `.xlsx`
+files or Excel-compatible HTML (use `excelhtml` for HydroVu HTML exports).
+It works through the normal format-provider paths, including pond files,
+host files, and SQL-derived tables. Use `pond cat`, not `pond run`.
+The host prefix is `host+`, not `hostfs+`. Provider URLs have an empty host
+component and a `/`-prefixed path: `host+xls://../../file.xls` is invalid.
+Use an absolute path, or set `-d <directory>` and use a URL path relative to
+that directory. Neither form requires `$POND`.
+
+| Query parameter | Default | Meaning |
+|-----------------|---------|---------|
+| `sheet` | Sole worksheet | Exact worksheet name. Required for workbooks with multiple worksheets; errors list available names. URL-encode spaces and other reserved characters. |
+| `header` | `true` | First populated row supplies column names. `false` keeps it as data and generates `column_1`, `column_2`, etc. |
+| `batch_size` | `8192` | Positive maximum rows per Arrow batch. |
+
+Blank headers receive generated names; duplicate names are rejected (use
+`header=false` to read them as data). Inference examines the entire selected
+worksheet: numeric columns become `Int64` or `Float64`, booleans become `Boolean`,
+and Excel datetimes become timezone-free microsecond timestamps. Integer/float
+mixtures become `Float64`; other mixed-type columns become text without dropping
+values. Datetimes in text columns use ISO-style date/time strings; Excel durations
+remain text containing their serial-day values. Empty cells are nulls, empty-only
+columns are text, and internal blank rows are retained. Leading unused rows and
+columns outside the populated range are omitted.
+
+Spreadsheet error cells, invalid options, unreadable workbooks, and empty
+worksheets fail explicitly. Header-only worksheets expose their schema with zero
+data rows. Formulas use the workbook's cached cell values; this provider does not
+recalculate formulas.
+
+Calamine requires seekable input, so the provider buffers the workbook and
+retains the selected worksheet in memory. Parsing and inference run on a blocking
+worker; batching does **not** make workbook reads streaming or bounded-memory,
+and SQL filters do not avoid parsing the worksheet.
 
 #### Schema Discovery with `information_schema`
 
