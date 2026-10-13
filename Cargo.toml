@@ -53,7 +53,7 @@ async-compression = { version = "0.4", features = ["tokio", "zstd"] }
 async-stream = "0.3"
 async-trait = "0.1.88"
 backon = { version = "1.3.0", features = ["std-blocking-sleep"] }
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1.6.0"
 calamine = { version = "0.36.1", features = ["chrono"] }
 chrono = { version = "0.4" }
@@ -62,14 +62,13 @@ chumsky = "=1.0.0-alpha.7"
 clap = { version = "4.5.4", features = ["derive"] }
 bao-tree = { version = "0.16", features = ["validate"] }
 blake3 = "1.8"
-data_privacy = { version = "0.5.0", default-features = false, features = ["serde"] }
-data_privacy_macros = { version = "0.3.0", default-features = false }
+data_privacy = { version = "0.13", default-features = false, features = ["serde"] }
 datafusion = "55"
 datafusion-common = "55"
 datafusion-common-runtime = "55"
 datafusion-expr = "55"
 datafusion-functions-json = "0.55"
-deltalake = { version = "1.1", default-features = false, features = ["datafusion", "rustls"] }
+deltalake = { version = "1.1.1", default-features = false, features = ["datafusion", "rustls"] }
 duckdb = { version = "1.3", features = ["bundled"] }
 env_logger = "0.11.3"
 file-rotate = "0.8"
@@ -77,31 +76,31 @@ fs2 = "0.4"
 futures = "0.3"
 hex = "0.4.3"
 hledger-parser = "=1.0.0-beta.2"
-hmac = "0.12"
+hmac = "0.13"
 httpdate = "1.0"
 humantime = "2.1"
 linkme = "0.3"
 log = "0.4.17"
 oauth2 = { version = "5.0", default-features = false, features = ["reqwest", "rustls-tls"] }
 object_store = { version = "0.13", features = ["aws", "azure"] }
-opentelemetry-proto = { version = "0.27.0", features = ["gen-tonic-messages", "metrics", "with-serde"] }
+opentelemetry-proto = { version = "0.33", features = ["gen-tonic-messages", "metrics", "with-serde"] }
 parquet = { version = "59", features = ["async", "arrow"] }
 parse_duration = "2.1.1"
 paste = "1.0"
 peak_alloc = "0.3.0"
 pin-project = "1.0"
-rand = "0.8.5"
 regex = "1.11.1"
-reqwest = { version = "0.12.4", default-features = false, features = ["blocking", "gzip", "cookies", "json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "gzip", "cookies", "json", "rustls"] }
+reqwest-oauth2 = { package = "reqwest", version = "0.12.28", default-features = false, features = ["gzip", "cookies", "json", "rustls-tls"] }
 rustix = { version = "1.1", features = ["fs"] }
 sea-query = { version = "0", features = ["with-chrono"] }
 serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
 serde_arrow = { version = "0.15", features = ["arrow-59"] }
 serde_json = "1.0.116"
-serde_qs = "0.15"
+serde_qs = "1.1"
 serde_repr = "0.1.19"
 serde_yaml = "0.9.34-deprecated"
-sha2 = "0.10"
+sha2 = "0.11"
 stacker = "0.1"
 tempfile = "3.8"
 
@@ -113,12 +112,9 @@ url = "2.5"
 percent-encoding = "2.3"
 uuid = { version = "1.10", features = ["v4", "serde"] }
 uuid7 = { version = "1.0", features = ["serde"] }
-num-bigint = "0.4"
-num-traits = "0.2"
-proptest = "1.4"
-pulldown-cmark = "0.12"
+pulldown-cmark = "0.13"
 maud = "0.27.0"
-png = "0.17"
+png = "0.18"
 rss = "2"
 
 [workspace.lints.rust]

@@ -60,8 +60,8 @@ pub fn recovery_recipe_watertown_commit_v1() -> Vec<u8> {
             "cat > \"$DEST/{name}\" <<'{delimiter}'\n{contents}{delimiter}\n"
         ));
         checksums.push_str(&format!(
-            "{:x}  {name}\n",
-            Sha256::digest(contents.as_bytes())
+            "{}  {name}\n",
+            hex::encode(Sha256::digest(contents.as_bytes()))
         ));
     }
     script.push_str(&format!(

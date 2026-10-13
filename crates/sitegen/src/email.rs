@@ -5,7 +5,7 @@
 use crate::SiteConfig;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use clap::Parser;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use provider::registry::{ExecutionContext, ExecutionMode, FactoryCommand};
 use provider::{FactoryContext, register_executable_factory};
 use reqwest::{Method, Response, StatusCode};

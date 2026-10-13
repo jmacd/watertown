@@ -23,19 +23,13 @@
 //! of the actual value. This ensures that when configurations are displayed via
 //! `pond cat` or similar commands, sensitive data is not exposed.
 
-use data_privacy::taxonomy;
+use data_privacy::{classified, taxonomy};
+use serde::{Deserialize, Serialize};
 
 /// Watertown data taxonomy for sensitive configuration fields
 ///
-/// This enum defines the data classification categories. The `#[taxonomy]` macro
-/// generates wrapper types (ApiKey<T>, ApiSecret<T>, ServiceEndpoint<T>) for each variant.
-///
-/// The macro generates:
-/// - `Debug` trait: Shows `<watertown/api_key:REDACTED>` to prevent leaking in logs
-/// - `Serialize`/`Deserialize` traits: Pass through actual values for config file I/O
-///
-/// This means config files contain real credentials (as needed), but debug/log output
-/// is automatically redacted to prevent accidental exposure.
+/// This enum defines the data classification categories used by the classified
+/// wrappers below.
 #[taxonomy(watertown)]
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum WatertownTaxonomy {
@@ -48,6 +42,36 @@ pub enum WatertownTaxonomy {
     /// Service endpoints that may reveal infrastructure details
     ServiceEndpoint,
 }
+
+macro_rules! classified_type {
+    ($name:ident, $class:ident) => {
+        #[classified(WatertownTaxonomy::$class)]
+        #[derive(Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name<T>(T);
+
+        impl<T> $name<T> {
+            /// Classify a value.
+            pub fn new(value: T) -> Self {
+                Self(value)
+            }
+
+            /// Borrow the classified value for authorized use.
+            pub fn as_declassified(&self) -> &T {
+                &self.0
+            }
+
+            /// Remove the classification wrapper.
+            pub fn declassify(self) -> T {
+                self.0
+            }
+        }
+    };
+}
+
+classified_type!(ApiKey, ApiKey);
+classified_type!(ApiSecret, ApiSecret);
+classified_type!(ServiceEndpoint, ServiceEndpoint);
 
 #[cfg(test)]
 mod tests {
@@ -143,8 +167,8 @@ public_field: public-data
         let api_key = ApiKey::new("my-secret-key".to_string());
         let debug_output = format!("{:?}", api_key);
 
-        // Debug output should show the taxonomy and "REDACTED", not the actual value
-        assert!(debug_output.contains("REDACTED"));
+        // Debug output should show only the classification, not the actual value.
+        assert!(debug_output.contains("CLASSIFIED:watertown/api_key"));
         assert!(!debug_output.contains("my-secret-key"));
     }
 }
