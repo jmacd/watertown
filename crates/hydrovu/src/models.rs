@@ -11,10 +11,10 @@ use tlogfs::data_taxonomy::{ApiKey, ApiSecret};
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct HydroVuConfig {
-    /// OAuth client ID (sensitive - will show as [REDACTED] when serialized)
+    /// OAuth client ID (sensitive - redacted from debug output)
     pub client_id: ApiKey<String>,
 
-    /// OAuth client secret (sensitive - will show as [REDACTED] when serialized)
+    /// OAuth client secret (sensitive - redacted from debug output)
     pub client_secret: ApiSecret<String>,
 
     pub max_points_per_run: usize,
