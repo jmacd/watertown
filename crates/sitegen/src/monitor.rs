@@ -37,6 +37,7 @@ enum CheckConfig {
     AnyObservedBelow(AnyObservedBelowCheckConfig),
     AverageRange(AverageRangeCheckConfig),
     AllObservedBelow(BelowCheckConfig),
+    StaleAfter(StaleAfterCheckConfig),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -107,6 +108,34 @@ struct AverageRangeCheckConfig {
     window: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+enum StaleAfterType {
+    #[serde(rename = "stale-after")]
+    StaleAfter,
+}
+
+/// Alarms when a source has produced zero non-null samples within `window`.
+/// Unlike the other scalar checks, an empty sample set here *is* the alarm
+/// condition rather than an unknown/indeterminate state: it means the data
+/// source has stopped producing new data.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StaleAfterCheckConfig {
+    id: String,
+    label: String,
+    description: String,
+    href: String,
+    #[serde(rename = "type")]
+    check_type: StaleAfterType,
+    source: String,
+    #[serde(default = "default_timestamp_column")]
+    timestamp_column: String,
+    value_column: String,
+    #[serde(default)]
+    unit: String,
+    window: String,
+}
+
 trait ScalarCheck {
     fn id(&self) -> &str;
     fn label(&self) -> &str;
@@ -159,6 +188,7 @@ macro_rules! impl_scalar_check {
 impl_scalar_check!(BelowCheckConfig);
 impl_scalar_check!(AnyObservedBelowCheckConfig);
 impl_scalar_check!(AverageRangeCheckConfig);
+impl_scalar_check!(StaleAfterCheckConfig);
 
 fn default_timestamp_column() -> String {
     "timestamp".to_string()
@@ -395,6 +425,7 @@ fn validate(config: &MonitorConfig) -> tinyfs::Result<()> {
             CheckConfig::AnyObservedBelow(check) => validate_any_observed_below_check(check)?,
             CheckConfig::AverageRange(check) => validate_average_range_check(check)?,
             CheckConfig::RateWhile(check) => validate_rate_while_check(check)?,
+            CheckConfig::StaleAfter(check) => validate_stale_after_check(check)?,
         }
     }
     Ok(())
@@ -407,6 +438,7 @@ impl CheckConfig {
             Self::AnyObservedBelow(check) => &check.id,
             Self::AverageRange(check) => &check.id,
             Self::RateWhile(check) => &check.id,
+            Self::StaleAfter(check) => &check.id,
         }
     }
 }
@@ -448,6 +480,10 @@ fn validate_average_range_check(check: &AverageRangeCheckConfig) -> tinyfs::Resu
         )));
     }
     Ok(())
+}
+
+fn validate_stale_after_check(check: &StaleAfterCheckConfig) -> tinyfs::Result<()> {
+    validate_scalar_check(check)
 }
 
 fn validate_scalar_check(check: &impl ScalarCheck) -> tinyfs::Result<()> {
@@ -608,6 +644,9 @@ async fn evaluate_check(
         CheckConfig::RateWhile(config) => {
             evaluate_rate_while_check(config, root, provider_context, period_end).await
         }
+        CheckConfig::StaleAfter(config) => {
+            evaluate_stale_after_check(config, root, provider_context, period_end).await
+        }
     }
 }
 
@@ -650,6 +689,17 @@ async fn evaluate_average_range_check(
     let (window_seconds, samples) =
         collect_scalar_window(config, root, provider_context, period_end).await?;
     classify_average_range(config, window_seconds, &samples)
+}
+
+async fn evaluate_stale_after_check(
+    config: &StaleAfterCheckConfig,
+    root: &tinyfs::WD,
+    provider_context: &tinyfs::ProviderContext,
+    period_end: DateTime<Utc>,
+) -> tinyfs::Result<CheckStatus> {
+    let (window_seconds, samples) =
+        collect_scalar_window(config, root, provider_context, period_end).await?;
+    Ok(classify_stale_after(config, window_seconds, &samples))
 }
 
 async fn collect_scalar_window(
@@ -1235,6 +1285,57 @@ fn classify_any_observed_below(
     }
 }
 
+fn classify_stale_after(
+    config: &StaleAfterCheckConfig,
+    window_seconds: u64,
+    samples: &[Sample],
+) -> CheckStatus {
+    // Absence of samples is itself the alarm condition for a staleness
+    // check: unlike the other scalar checks, "no data in the window" means
+    // the source has stopped producing new data, not that nothing can be
+    // concluded.
+    let state = if samples.is_empty() {
+        CheckState::Alarm
+    } else {
+        CheckState::Healthy
+    };
+    let minimum = samples.iter().map(|sample| sample.value).reduce(f64::min);
+    let maximum = samples.iter().map(|sample| sample.value).reduce(f64::max);
+    CheckStatus {
+        id: config.id.clone(),
+        label: config.label.clone(),
+        description: config.description.clone(),
+        href: config.href.clone(),
+        state,
+        rule: "stale-after",
+        source: config.source.clone(),
+        value_column: config.value_column.clone(),
+        unit: config.unit.clone(),
+        threshold: None,
+        lower_bound: None,
+        upper_bound: None,
+        window_seconds,
+        sample_count: samples.len(),
+        observed_start: samples
+            .first()
+            .map(|sample| format_timestamp(sample.timestamp)),
+        observed_end: samples
+            .last()
+            .map(|sample| format_timestamp(sample.timestamp)),
+        latest_value: samples.last().map(|sample| sample.value),
+        minimum,
+        maximum,
+        average: None,
+        condition_source: None,
+        active_seconds: None,
+        minimum_active_seconds: None,
+        accumulated_change: None,
+        rate: None,
+        aligned_interval_count: None,
+        unaligned_interval_count: None,
+    }
+}
+
 fn classify_average_range(
     config: &AverageRangeCheckConfig,
     window_seconds: u64,
@@ -1621,6 +1722,21 @@ mod tests {
         }
     }
 
+    fn stale_after_config() -> StaleAfterCheckConfig {
+        StaleAfterCheckConfig {
+            id: "septic-data-stale".to_string(),
+            label: "Septic station is reporting data".to_string(),
+            description: "At least one reading must arrive in the trailing 24 hours.".to_string(),
+            href: "/septic/pumps.html".to_string(),
+            check_type: StaleAfterType::StaleAfter,
+            source: "oteljson:///ingest/septicstation*.json".to_string(),
+            timestamp_column: "timestamp".to_string(),
+            value_column: "orenco_RT_Pump1".to_string(),
+            unit: String::new(),
+            window: "24h".to_string(),
+        }
+    }
+
     fn rate_sample(seconds: i64, value: f64, positive_delta: Option<f64>) -> RateSample {
         RateSample {
             timestamp: DateTime::from_timestamp(seconds, 0).expect("valid timestamp"),
@@ -1674,6 +1790,23 @@ mod tests {
             classify_any_observed_below(&check, 10_800, &[sample(1, 3.0), sample(2, 3.2)]).state,
             CheckState::Healthy
         );
+    }
+
+    #[test]
+    fn stale_after_alarms_when_no_samples_observed() {
+        let check = stale_after_config();
+        let status = classify_stale_after(&check, 86_400, &[]);
+        assert_eq!(status.state, CheckState::Alarm);
+        assert_eq!(status.rule, "stale-after");
+        assert_eq!(status.sample_count, 0);
+    }
+
+    #[test]
+    fn stale_after_is_healthy_with_any_recent_sample() {
+        let check = stale_after_config();
+        let status = classify_stale_after(&check, 86_400, &[sample(1, 0.0)]);
+        assert_eq!(status.state, CheckState::Healthy);
+        assert_eq!(status.sample_count, 1);
     }
 
     #[test]
@@ -1817,12 +1950,22 @@ checks:
       operator: lt
       value: 2.5
       unit: sensor-units-per-pump-hour
+  - id: septic-data-stale
+    label: Septic station is reporting data
+    description: At least one reading must arrive in the trailing 24 hours.
+    href: /septic/pumps.html
+    type: stale-after
+    source: oteljson:///ingest/septicstation*.json
+    timestamp_column: timestamp
+    value_column: orenco_RT_Pump1
+    window: 24h
 "#;
         let config: MonitorConfig = serde_yaml::from_slice(yaml).expect("rate-while config");
         validate(&config).expect("valid config");
         assert!(matches!(config.checks[0], CheckConfig::AnyObservedBelow(_)));
         assert!(matches!(config.checks[1], CheckConfig::AverageRange(_)));
         assert!(matches!(config.checks[2], CheckConfig::RateWhile(_)));
+        assert!(matches!(config.checks[3], CheckConfig::StaleAfter(_)));
     }
 
     #[test]
