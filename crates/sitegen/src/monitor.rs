@@ -39,6 +39,7 @@ enum CheckConfig {
     AllObservedBelow(BelowCheckConfig),
     StaleAfter(StaleAfterCheckConfig),
     GradedScore(GradedScoreCheckConfig),
+    StaleOrBelow(StaleOrBelowCheckConfig),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -73,6 +74,35 @@ struct AnyObservedBelowCheckConfig {
     href: String,
     #[serde(rename = "type")]
     check_type: AnyObservedBelowType,
+    source: String,
+    #[serde(default = "default_timestamp_column")]
+    timestamp_column: String,
+    value_column: String,
+    #[serde(default)]
+    unit: String,
+    threshold: f64,
+    window: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+enum StaleOrBelowType {
+    #[serde(rename = "stale-or-below")]
+    StaleOrBelow,
+}
+
+/// Alarms if the source has produced zero samples in `window` (stale or
+/// missing), or if any observed sample is below `threshold` -- combining
+/// the staleness and low-value failure modes of a single instrument (e.g. a
+/// pH probe) into one check instead of requiring two separate cards.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StaleOrBelowCheckConfig {
+    id: String,
+    label: String,
+    description: String,
+    href: String,
+    #[serde(rename = "type")]
+    check_type: StaleOrBelowType,
     source: String,
     #[serde(default = "default_timestamp_column")]
     timestamp_column: String,
@@ -227,6 +257,7 @@ impl_scalar_check!(AnyObservedBelowCheckConfig);
 impl_scalar_check!(AverageRangeCheckConfig);
 impl_scalar_check!(StaleAfterCheckConfig);
 impl_scalar_check!(GradedScoreCheckConfig);
+impl_scalar_check!(StaleOrBelowCheckConfig);
 
 fn default_timestamp_column() -> String {
     "timestamp".to_string()
@@ -481,6 +512,7 @@ fn validate(config: &MonitorConfig) -> tinyfs::Result<()> {
             CheckConfig::RateWhile(check) => validate_rate_while_check(check)?,
             CheckConfig::StaleAfter(check) => validate_stale_after_check(check)?,
             CheckConfig::GradedScore(check) => validate_graded_score_check(check)?,
+            CheckConfig::StaleOrBelow(check) => validate_stale_or_below_check(check)?,
         }
     }
     Ok(())
@@ -495,6 +527,7 @@ impl CheckConfig {
             Self::RateWhile(check) => &check.id,
             Self::StaleAfter(check) => &check.id,
             Self::GradedScore(check) => &check.id,
+            Self::StaleOrBelow(check) => &check.id,
         }
     }
 }
@@ -540,6 +573,17 @@ fn validate_average_range_check(check: &AverageRangeCheckConfig) -> tinyfs::Resu
 
 fn validate_stale_after_check(check: &StaleAfterCheckConfig) -> tinyfs::Result<()> {
     validate_scalar_check(check)
+}
+
+fn validate_stale_or_below_check(check: &StaleOrBelowCheckConfig) -> tinyfs::Result<()> {
+    validate_scalar_check(check)?;
+    if !check.threshold.is_finite() {
+        return Err(tinyfs::Error::Other(format!(
+            "monitor-report check '{}' threshold must be finite",
+            check.id
+        )));
+    }
+    Ok(())
 }
 
 fn validate_graded_score_check(check: &GradedScoreCheckConfig) -> tinyfs::Result<()> {
@@ -724,6 +768,9 @@ async fn evaluate_check(
         CheckConfig::GradedScore(config) => {
             evaluate_graded_score_check(config, root, provider_context, period_end).await
         }
+        CheckConfig::StaleOrBelow(config) => {
+            evaluate_stale_or_below_check(config, root, provider_context, period_end).await
+        }
     }
 }
 
@@ -788,6 +835,17 @@ async fn evaluate_graded_score_check(
     let (window_seconds, samples) =
         collect_scalar_window(config, root, provider_context, period_end).await?;
     Ok(classify_graded_score(config, window_seconds, &samples))
+}
+
+async fn evaluate_stale_or_below_check(
+    config: &StaleOrBelowCheckConfig,
+    root: &tinyfs::WD,
+    provider_context: &tinyfs::ProviderContext,
+    period_end: DateTime<Utc>,
+) -> tinyfs::Result<CheckStatus> {
+    let (window_seconds, samples) =
+        collect_scalar_window(config, root, provider_context, period_end).await?;
+    Ok(classify_stale_or_below(config, window_seconds, &samples))
 }
 
 async fn collect_scalar_window(
@@ -1347,6 +1405,59 @@ fn classify_any_observed_below(
         state,
         tone: None,
         rule: "any-observed-below",
+        source: config.source.clone(),
+        value_column: config.value_column.clone(),
+        unit: config.unit.clone(),
+        threshold: Some(config.threshold),
+        lower_bound: None,
+        upper_bound: None,
+        window_seconds,
+        sample_count: samples.len(),
+        observed_start: samples
+            .first()
+            .map(|sample| format_timestamp(sample.timestamp)),
+        observed_end: samples
+            .last()
+            .map(|sample| format_timestamp(sample.timestamp)),
+        latest_value: samples.last().map(|sample| sample.value),
+        minimum,
+        maximum,
+        average: None,
+        condition_source: None,
+        active_seconds: None,
+        minimum_active_seconds: None,
+        accumulated_change: None,
+        rate: None,
+        aligned_interval_count: None,
+        unaligned_interval_count: None,
+    }
+}
+
+fn classify_stale_or_below(
+    config: &StaleOrBelowCheckConfig,
+    window_seconds: u64,
+    samples: &[Sample],
+) -> CheckStatus {
+    // Combines staleness and a low-value threshold into one check: absence
+    // of samples in the window is itself an alarm (same reasoning as
+    // stale-after), and so is any observed value below the threshold.
+    let state = if samples.is_empty()
+        || samples.iter().any(|sample| sample.value < config.threshold)
+    {
+        CheckState::Alarm
+    } else {
+        CheckState::Healthy
+    };
+    let minimum = samples.iter().map(|sample| sample.value).reduce(f64::min);
+    let maximum = samples.iter().map(|sample| sample.value).reduce(f64::max);
+    CheckStatus {
+        id: config.id.clone(),
+        label: config.label.clone(),
+        description: config.description.clone(),
+        href: config.href.clone(),
+        state,
+        tone: None,
+        rule: "stale-or-below",
         source: config.source.clone(),
         value_column: config.value_column.clone(),
         unit: config.unit.clone(),
@@ -2025,6 +2136,49 @@ mod tests {
         );
     }
 
+    fn stale_or_below_config() -> StaleOrBelowCheckConfig {
+        StaleOrBelowCheckConfig {
+            id: "ph-stale-or-low".to_string(),
+            label: "pH stays above 6.5".to_string(),
+            description: "Every pH reading must remain at or above 6.5; a 3-hour gap counts as a failure too."
+                .to_string(),
+            href: "/data/ph.html".to_string(),
+            check_type: StaleOrBelowType::StaleOrBelow,
+            source: "oteljson:///ingest/casparwater*.json".to_string(),
+            timestamp_column: "timestamp".to_string(),
+            value_column: "atlasph_ph".to_string(),
+            unit: String::new(),
+            threshold: 6.5,
+            window: "3h".to_string(),
+        }
+    }
+
+    #[test]
+    fn stale_or_below_alarms_when_no_samples_observed() {
+        let check = stale_or_below_config();
+        let status = classify_stale_or_below(&check, 10_800, &[]);
+        assert_eq!(status.state, CheckState::Alarm);
+        assert_eq!(status.rule, "stale-or-below");
+        assert_eq!(status.sample_count, 0);
+    }
+
+    #[test]
+    fn stale_or_below_alarms_on_one_low_sample() {
+        let check = stale_or_below_config();
+        assert_eq!(
+            classify_stale_or_below(&check, 10_800, &[sample(1, 7.0), sample(2, 6.1)]).state,
+            CheckState::Alarm
+        );
+    }
+
+    #[test]
+    fn stale_or_below_is_healthy_with_recent_samples_above_threshold() {
+        let check = stale_or_below_config();
+        let status = classify_stale_or_below(&check, 10_800, &[sample(1, 6.9), sample(2, 7.1)]);
+        assert_eq!(status.state, CheckState::Healthy);
+        assert_eq!(status.sample_count, 2);
+    }
+
     #[test]
     fn average_range_is_inclusive_and_requires_samples() {
         let check = average_range_config();
@@ -2187,6 +2341,16 @@ checks:
     watch_max: 0.5
     concern_max: 0.75
     window: 3d
+  - id: ph-stale-or-low
+    label: pH stays above 6.5
+    description: Every pH reading must remain at or above 6.5; a 3-hour gap counts as a failure too.
+    href: /data/ph.html
+    type: stale-or-below
+    source: oteljson:///ingest/casparwater*.json
+    timestamp_column: timestamp
+    value_column: atlasph_ph
+    threshold: 6.5
+    window: 3h
 "#;
         let config: MonitorConfig = serde_yaml::from_slice(yaml).expect("rate-while config");
         validate(&config).expect("valid config");
@@ -2195,6 +2359,7 @@ checks:
         assert!(matches!(config.checks[2], CheckConfig::RateWhile(_)));
         assert!(matches!(config.checks[3], CheckConfig::StaleAfter(_)));
         assert!(matches!(config.checks[4], CheckConfig::GradedScore(_)));
+        assert!(matches!(config.checks[5], CheckConfig::StaleOrBelow(_)));
     }
 
     #[test]
