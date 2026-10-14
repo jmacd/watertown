@@ -1441,13 +1441,12 @@ fn classify_stale_or_below(
     // Combines staleness and a low-value threshold into one check: absence
     // of samples in the window is itself an alarm (same reasoning as
     // stale-after), and so is any observed value below the threshold.
-    let state = if samples.is_empty()
-        || samples.iter().any(|sample| sample.value < config.threshold)
-    {
-        CheckState::Alarm
-    } else {
-        CheckState::Healthy
-    };
+    let state =
+        if samples.is_empty() || samples.iter().any(|sample| sample.value < config.threshold) {
+            CheckState::Alarm
+        } else {
+            CheckState::Healthy
+        };
     let minimum = samples.iter().map(|sample| sample.value).reduce(f64::min);
     let maximum = samples.iter().map(|sample| sample.value).reduce(f64::max);
     CheckStatus {
