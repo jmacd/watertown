@@ -2,14 +2,14 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::common::{FileInfoVisitor, ShipContext};
+use crate::common::{FileInfoVisitor, ShipContext, TargetContext, classify_target};
 use anyhow::Result;
 use std::sync::Arc;
 
 /// Describe command - shows file types and schemas for files matching the pattern
 ///
-/// This command operates on an existing pond via the provided Ship.
-/// Uses scoped transactions for consistent filesystem access.
+/// Host targets do not require a pond. Scoped transactions provide consistent
+/// filesystem access for both target types.
 pub async fn describe_command<F>(
     ship_context: &ShipContext,
     pattern: &str,
@@ -20,12 +20,22 @@ where
 {
     log::debug!("describe_command called with pattern {pattern}");
 
-    let mut ship = ship_context.open_pond().await?;
+    let (mut ship, pattern) = match classify_target(pattern)? {
+        TargetContext::Host(path) => (
+            ship_context.open_host()?,
+            if pattern.contains("://") {
+                pattern.to_string()
+            } else {
+                path
+            },
+        ),
+        TargetContext::Pond(_) => (ship_context.open_pond().await?, pattern.to_string()),
+    };
 
     let output = crate::common::with_read_transaction(
         &mut ship,
         vec!["describe".to_string(), pattern.to_string()],
-        async |tx| describe_command_impl(tx, ship_context, pattern).await,
+        async |tx| describe_command_impl(tx, &pattern).await,
     )
     .await?;
 
@@ -34,11 +44,7 @@ where
 }
 
 /// Describe a provider URL (e.g., "oteljson:///otel/file.json" or "excelhtml:///data/*.htm")
-async fn describe_provider_url(
-    tx: &mut steward::Transaction<'_>,
-    _ship_context: &ShipContext,
-    url: &str,
-) -> Result<String> {
+async fn describe_provider_url(tx: &mut steward::Transaction<'_>, url: &str) -> Result<String> {
     log::debug!("Describing provider URL: {}", url);
 
     // Get TinyFS from transaction
@@ -46,7 +52,8 @@ async fn describe_provider_url(
     let fs_arc = Arc::new(fs.clone());
 
     // Create Provider instance
-    let provider = provider::Provider::new(fs_arc);
+    let provider =
+        provider::Provider::with_context(fs_arc, Arc::new(tx.provider_context()?.clone()));
 
     use std::cell::RefCell;
     let results = RefCell::new(Vec::new());
@@ -112,14 +119,10 @@ async fn describe_provider_url(
 }
 
 /// Implementation of describe command
-async fn describe_command_impl(
-    tx: &mut steward::Transaction<'_>,
-    ship_context: &ShipContext,
-    pattern: &str,
-) -> Result<String> {
+async fn describe_command_impl(tx: &mut steward::Transaction<'_>, pattern: &str) -> Result<String> {
     // Check for provider URL syntax (e.g., "oteljson:///path")
     if pattern.contains("://") {
-        return describe_provider_url(tx, ship_context, pattern).await;
+        return describe_provider_url(tx, pattern).await;
     }
 
     let fs = &**tx;
@@ -154,7 +157,7 @@ async fn describe_command_impl(
         match file_info.metadata.entry_type {
             tinyfs::EntryType::TablePhysicalSeries | tinyfs::EntryType::TableDynamic => {
                 output.push_str("   Format: Parquet series\n");
-                match describe_file_series_schema(ship_context, &file_info.path).await {
+                match describe_file_series_schema(tx, &file_info.path).await {
                     Ok(schema_info) => {
                         output
                             .push_str(&format!("   Schema: {} fields\n", schema_info.field_count));
@@ -245,7 +248,7 @@ async fn describe_command_impl(
             }
             tinyfs::EntryType::TablePhysicalVersion => {
                 output.push_str("   Format: Parquet table\n");
-                match describe_file_table_schema(ship_context, &file_info.path).await {
+                match describe_file_table_schema(tx, &file_info.path).await {
                     Ok(schema_info) => {
                         output
                             .push_str(&format!("   Schema: {} fields\n", schema_info.field_count));
@@ -313,25 +316,7 @@ pub struct FieldInfo {
 }
 
 /// Describe the schema of a file:series using tlogfs schema API
-async fn describe_file_series_schema(ship_context: &ShipContext, path: &str) -> Result<SchemaInfo> {
-    let mut ship = ship_context.open_pond().await?;
-    let mut tx = ship
-        .begin_read(&steward::PondUserMetadata::new(vec![
-            "describe-schema".to_string(),
-        ]))
-        .await?;
-
-    match describe_file_series_schema_impl(&mut tx, path).await {
-        Ok(schema_info) => {
-            _ = tx.commit().await?;
-            Ok(schema_info)
-        }
-        Err(e) => Err(tx.abort(&e).await.into()),
-    }
-}
-
-/// Implementation of file series schema description
-async fn describe_file_series_schema_impl(
+async fn describe_file_series_schema(
     tx: &mut steward::Transaction<'_>,
     path: &str,
 ) -> Result<SchemaInfo> {
@@ -347,25 +332,7 @@ async fn describe_file_series_schema_impl(
 }
 
 /// Describe the schema of a file:table using tlogfs schema API
-async fn describe_file_table_schema(ship_context: &ShipContext, path: &str) -> Result<SchemaInfo> {
-    let mut ship = ship_context.open_pond().await?;
-    let mut tx = ship
-        .begin_read(&steward::PondUserMetadata::new(vec![
-            "describe-schema".to_string(),
-        ]))
-        .await?;
-
-    match describe_file_table_schema_impl(&mut tx, path).await {
-        Ok(schema_info) => {
-            _ = tx.commit().await?;
-            Ok(schema_info)
-        }
-        Err(e) => Err(tx.abort(&e).await.into()),
-    }
-}
-
-/// Implementation of file table schema description
-async fn describe_file_table_schema_impl(
+async fn describe_file_table_schema(
     tx: &mut steward::Transaction<'_>,
     path: &str,
 ) -> Result<SchemaInfo> {
@@ -647,6 +614,118 @@ mod tests {
     use anyhow::Result;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_describe_host_hledger_single_and_glob_without_pond() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        tokio::fs::create_dir(dir.path().join("cycles")).await?;
+        let journal = "2026-01-01 Example\n    Expenses:Office  $10.10\n    Assets:Bank\n";
+        for name in ["first.journal", "second.journal"] {
+            tokio::fs::write(dir.path().join("cycles").join(name), journal).await?;
+        }
+        let context = ShipContext::new(
+            Some(dir.path().join("must-not-open-pond")),
+            Some(dir.path()),
+            Vec::new(),
+            Vec::new(),
+        );
+        for (pattern, count) in [
+            ("host+hledger:///cycles/first.journal", 1),
+            ("host+hledger:///cycles/*.journal", 2),
+        ] {
+            let mut output = String::new();
+            describe_command(&context, pattern, |s| output.push_str(s)).await?;
+            assert_eq!(output.matches("Provider: hledger").count(), count);
+            assert_eq!(output.matches("Schema: 14 fields").count(), count);
+            assert!(output.contains("File: /cycles/first.journal"), "{output}");
+            assert!(output.contains("amount: Decimal128(38, 18)"), "{output}");
+            assert!(output.contains("date: Date32"), "{output}");
+            assert!(output.contains("transaction_sequence: UInt64"), "{output}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_describe_host_csv_and_bare_files_without_pond() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        tokio::fs::write(
+            dir.path().join("example.csv"),
+            "account,amount\nOffice,10\n",
+        )
+        .await?;
+        let context = ShipContext::new(
+            Some(dir.path().join("must-not-open-pond")),
+            Some(dir.path()),
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut output = String::new();
+        describe_command(&context, "host+csv:///example.csv", |s| output.push_str(s)).await?;
+        assert!(output.contains("Provider: csv"), "{output}");
+        assert!(output.contains("Schema: 2 fields"), "{output}");
+        output.clear();
+        describe_command(&context, "host+/example.csv", |s| output.push_str(s)).await?;
+        assert!(output.contains("[FILE] /example.csv"), "{output}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_describe_host_xls_single_and_glob_without_pond() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        for name in ["first.xls", "second.xls"] {
+            tokio::fs::write(
+                dir.path().join(name),
+                include_bytes!("../../../provider/tests/fixtures/single.xls"),
+            )
+            .await?;
+        }
+        let context = ShipContext::new(
+            Some(dir.path().join("must-not-open-pond")),
+            Some(dir.path()),
+            Vec::new(),
+            Vec::new(),
+        );
+        for (pattern, count) in [
+            ("host+xls:///first.xls", 1),
+            ("host+xls:///*.xls?batch_size=2", 2),
+        ] {
+            let mut output = String::new();
+            describe_command(&context, pattern, |s| output.push_str(s)).await?;
+            assert_eq!(output.matches("Provider: xls").count(), count);
+            assert_eq!(output.matches("Schema: 7 fields").count(), count);
+            assert!(output.contains("value: Float64"), "{output}");
+            assert!(output.contains("active: Boolean"), "{output}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_describe_host_errors_propagate_without_pond() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        tokio::fs::write(
+            dir.path().join("books.journal"),
+            "include cycles/*.journal\n",
+        )
+        .await?;
+        let context = ShipContext::new(
+            Some(dir.path().join("must-not-open-pond")),
+            Some(dir.path()),
+            Vec::new(),
+            Vec::new(),
+        );
+        for (pattern, diagnostic) in [
+            ("host+hledger:///books.journal", "unsupported include"),
+            ("host+hledger://[", "Invalid target URL"),
+            ("hostfs+xls://../../book.xls", "Invalid target URL"),
+        ] {
+            let error = describe_command(&context, pattern, |_| {})
+                .await
+                .expect_err("description must fail")
+                .to_string();
+            assert!(error.contains(diagnostic), "{error}");
+        }
+        Ok(())
+    }
 
     struct TestSetup {
         temp_dir: TempDir,

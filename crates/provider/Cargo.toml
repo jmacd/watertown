@@ -43,6 +43,7 @@ clap.workspace = true
 log.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
+calamine.workspace = true
 object_store.workspace = true
 parquet.workspace = true
 async-stream.workspace = true
@@ -52,6 +53,10 @@ tl.workspace = true
 opentelemetry-proto.workspace = true
 utilities.workspace = true
 blake3.workspace = true
+hledger-parser.workspace = true
+# Constrain the parser's otherwise permissive prerelease dependency.
+chumsky.workspace = true
+stacker.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

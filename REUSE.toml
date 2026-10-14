@@ -28,6 +28,12 @@ SPDX-FileCopyrightText = "Caspar Water Company"
 SPDX-License-Identifier = "Apache-2.0"
 
 [[annotations]]
+path = ["crates/provider/tests/fixtures/*.xls"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Caspar Water Company"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
 path = ["**.jpg", "**.png", "**.svg", "**/**.svg", "**.parquet", "**.proptest-regressions", "**/**.proptest-regressions", "OUT**", "CLIPPY", "DIFF", "ORIG", "WHATIS", ".dockerignore", "**/.dockerignore", ".gitignore", "**/.gitignore", "VERSION"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "Caspar Water Company"

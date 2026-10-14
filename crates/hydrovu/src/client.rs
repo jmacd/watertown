@@ -14,7 +14,7 @@ const TIMEOUT_SECONDS: u64 = 60;
 /// Async HydroVu API client
 #[derive(Clone)]
 pub struct Client {
-    http_client: reqwest::Client,
+    http_client: reqwest_oauth2::Client,
     token: String,
 }
 
@@ -31,7 +31,7 @@ impl Client {
                 TokenUrl::new(Self::token_url()).with_context(|| "Failed to create token URL")?,
             );
 
-        let http_client = reqwest::Client::new();
+        let http_client = reqwest_oauth2::Client::new();
 
         let token_result = oauth_client
             .exchange_client_credentials()
@@ -58,7 +58,7 @@ impl Client {
             }
         };
 
-        let http_client = reqwest::Client::builder()
+        let http_client = reqwest_oauth2::Client::builder()
             .timeout(Duration::from_secs(TIMEOUT_SECONDS))
             .build()
             .with_context(|| "Failed to create HTTP client")?;

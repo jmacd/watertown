@@ -187,7 +187,7 @@ pub async fn cat_command(
     );
 
     // Classify the path to determine pond vs host context
-    let target = classify_target(path);
+    let target = classify_target(path)?;
 
     let mut ship = match &target {
         TargetContext::Host(_) => ship_context.open_host()?,
@@ -1293,6 +1293,60 @@ mod tests {
             "Host cat should stream raw bytes for data files"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cat_invalid_host_xls_url_fails_before_opening_pond() {
+        let ship_context = ShipContext::pond_only(Some("/does/not/exist"), Vec::new());
+        for url in [
+            "hostfs+xls://../../caspar_water_bank/sbmc_register.xls",
+            "host+xls://../../caspar_water_bank/sbmc_register.xls",
+        ] {
+            let error = cat_command(&ship_context, url, "table", None, None, None, None, false)
+                .await
+                .expect_err("invalid URL")
+                .to_string();
+            assert!(error.contains("Invalid target URL"), "{error}");
+            assert!(!error.contains("POND"), "{error}");
+            assert!(!error.contains("Failed to initialize ship"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cat_host_xls_table_and_sql() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        std::fs::write(
+            temp_dir.path().join("book.xls"),
+            include_bytes!("../../../provider/tests/fixtures/multiple.xls"),
+        )?;
+        let ship_context = ShipContext::new(
+            None::<&std::path::Path>,
+            Some(temp_dir.path()),
+            Vec::new(),
+            vec!["pond".to_string(), "cat".to_string()],
+        );
+        for (sql, expected_rows) in [
+            (None, 3),
+            (Some("SELECT name, value FROM source WHERE value > 15"), 2),
+        ] {
+            let mut output = String::new();
+            cat_command(
+                &ship_context,
+                "host+xls:///book.xls?sheet=Readings&batch_size=2",
+                "table",
+                Some(&mut output),
+                None,
+                None,
+                sql,
+                false,
+            )
+            .await?;
+            assert!(output.contains("beta"));
+            assert!(output.contains("gamma"));
+            assert_eq!(output.contains("alpha"), sql.is_none());
+            assert!(output.contains(&format!("Summary: {expected_rows} total rows")));
+        }
         Ok(())
     }
 

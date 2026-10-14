@@ -658,6 +658,7 @@ async fn run_format_provider_export(
 
     let mut by_key: BTreeMap<String, Vec<shortcodes::ExportedFile>> = BTreeMap::new();
     let mut columns: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut journal_schema = None::<datafusion::arrow::datatypes::Schema>;
     let base = config.site.base_url.trim_end_matches('/');
 
     for matched in &matched_files {
@@ -681,6 +682,22 @@ async fn run_format_provider_export(
                     file_url_str, e
                 ))
             })?;
+
+        if scheme == "hledger" {
+            let current = table_provider.schema().as_ref().clone();
+            let schemas = match journal_schema.take() {
+                Some(previous) => vec![previous, current],
+                None => vec![current],
+            };
+            journal_schema = Some(
+                datafusion::arrow::datatypes::Schema::try_merge(schemas).map_err(|e| {
+                    tinyfs::Error::Other(format!(
+                        "Incompatible journal annotation schemas in export '{}': {e}",
+                        stage.name
+                    ))
+                })?,
+            );
+        }
 
         let (export_outputs, schema) = provider::export::export_table_provider_to_parquet(
             table_provider,
@@ -3381,5 +3398,262 @@ mod tests {
         // Should error because site_url is missing
         let result = generate_feed(&config, &content, output_dir.path());
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_hledger_financial_export_preserves_exact_amounts() {
+        use datafusion::arrow::array::{Date32Array, Decimal128Array, StringArray};
+        use datafusion::prelude::{ParquetReadOptions, SessionContext};
+
+        let journal = b"2026-01-01 Example ; party: party-0042, cycle: 2026-01\n    Expenses:Office  $10.10\n    Assets:Bank\n";
+        let persistence: Arc<dyn tinyfs::PersistenceLayer> =
+            Arc::new(tinyfs::MemoryPersistence::default());
+        let fs = tinyfs::FS::from_arc(persistence.clone());
+        let root = fs.root().await.expect("root");
+        root.write_file_path_from_slice("/demo.journal", journal)
+            .await
+            .expect("journal");
+        let output = tempfile::tempdir().expect("output");
+        let cache = tempfile::tempdir().expect("cache");
+        let session = Arc::new(SessionContext::new());
+        let provider_ctx = tinyfs::ProviderContext::new(session.clone(), persistence)
+            .with_cache_dir(cache.path().to_path_buf());
+        let config: SiteConfig = serde_yaml::from_str(
+            "site:\n  title: Finance\n  base_url: /\nexports:\n  - name: ledger\n    pattern: 'hledger:///*.journal'\n    timestamp_column: date\n",
+        ).expect("config");
+        let data_dir = output.path().join("data");
+        let (files, columns) = run_format_provider_export(
+            &config.exports[0],
+            &root,
+            &provider_ctx,
+            &data_dir,
+            &config,
+        )
+        .await
+        .expect("financial export");
+        assert!(columns.contains(&"amount".to_string()));
+        assert!(columns.contains(&"transaction_sequence".to_string()));
+        assert!(columns.contains(&"tag_party".to_string()));
+        assert!(columns.contains(&"tag_cycle".to_string()));
+        let files: Vec<_> = files.values().flatten().collect();
+        assert_eq!(files.len(), 1);
+        let file = output.path().join(files[0].file.trim_start_matches('/'));
+        session
+            .register_parquet(
+                "exported",
+                file.to_str().expect("path"),
+                ParquetReadOptions::default(),
+            )
+            .await
+            .expect("read exported parquet");
+        let result = session
+            .sql("SELECT date, amount, tag_party, tag_cycle FROM exported WHERE account = 'Assets:Bank'")
+            .await
+            .expect("query")
+            .collect()
+            .await
+            .expect("result");
+        let amount = result[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal");
+        assert_eq!(amount.scale(), 18);
+        assert_eq!(amount.value(0), -10_100_000_000_000_000_000);
+        assert!(result[0].column(0).as_any().is::<Date32Array>());
+        let party = datafusion::arrow::compute::cast(
+            result[0].column(2),
+            &datafusion::arrow::datatypes::DataType::Utf8,
+        )
+        .expect("party as Utf8");
+        let cycle = datafusion::arrow::compute::cast(
+            result[0].column(3),
+            &datafusion::arrow::datatypes::DataType::Utf8,
+        )
+        .expect("cycle as Utf8");
+        assert_eq!(
+            party
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("party")
+                .value(0),
+            "party-0042"
+        );
+        assert_eq!(
+            cycle
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("cycle")
+                .value(0),
+            "2026-01"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hledger_sitegen_rejects_unsupported_includes() {
+        let persistence: Arc<dyn tinyfs::PersistenceLayer> =
+            Arc::new(tinyfs::MemoryPersistence::default());
+        let fs = tinyfs::FS::from_arc(persistence.clone());
+        let root = fs.root().await.expect("root");
+        root.write_file_path_from_slice("/books.journal", b"include cycles/*.journal\n")
+            .await
+            .expect("journal");
+        let output = tempfile::tempdir().expect("output");
+        let provider_ctx = tinyfs::ProviderContext::new_for_testing(persistence);
+        let config: SiteConfig = serde_yaml::from_str(
+            "site:\n  title: Finance\n  base_url: /\nexports:\n  - name: ledger\n    pattern: 'hledger:///*.journal'\n    timestamp_column: date\n",
+        ).expect("config");
+        let error = run_format_provider_export(
+            &config.exports[0],
+            &root,
+            &provider_ctx,
+            output.path(),
+            &config,
+        )
+        .await
+        .expect_err("includes must fail")
+        .to_string();
+        assert!(error.contains("unsupported include"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_hledger_sitegen_annotation_schema_drift_and_conflicts() {
+        use datafusion::arrow::array::{Array, StringArray};
+        use datafusion::prelude::{ParquetReadOptions, SessionContext};
+
+        for collision in [false, true] {
+            let persistence: Arc<dyn tinyfs::PersistenceLayer> =
+                Arc::new(tinyfs::MemoryPersistence::default());
+            let fs = tinyfs::FS::from_arc(persistence.clone());
+            let root = fs.root().await.expect("root");
+            let first_tag = if collision {
+                "party-id: first"
+            } else {
+                "party: first"
+            };
+            let second_tag = if collision {
+                "party_id: second"
+            } else {
+                "cycle: 2026-02"
+            };
+            for (name, annotation) in [("first", first_tag), ("second", second_tag)] {
+                let journal = format!("2026-01-01 Example ; {annotation}\n    A  $1\n    B\n");
+                root.write_file_path_from_slice(&format!("/{name}.journal"), journal.as_bytes())
+                    .await
+                    .expect("journal");
+            }
+            let output = tempfile::tempdir().expect("output");
+            let session = Arc::new(SessionContext::new());
+            let provider_ctx = tinyfs::ProviderContext::new(session.clone(), persistence);
+            let config: SiteConfig = serde_yaml::from_str(
+                "site:\n  title: Finance\n  base_url: /\nexports:\n  - name: ledger\n    pattern: 'hledger:///*.journal'\n    timestamp_column: date\n",
+            ).expect("config");
+            let result = run_format_provider_export(
+                &config.exports[0],
+                &root,
+                &provider_ctx,
+                &output.path().join("data"),
+                &config,
+            )
+            .await;
+            if collision {
+                let error = result.expect_err("annotation name collision").to_string();
+                assert!(error.contains("annotation schemas"), "{error}");
+            } else {
+                let (files, columns) = result.expect("export");
+                assert!(columns.contains(&"tag_party".to_string()));
+                assert!(columns.contains(&"tag_cycle".to_string()));
+                let paths: Vec<_> = files
+                    .values()
+                    .flatten()
+                    .map(|file| {
+                        output
+                            .path()
+                            .join(file.file.trim_start_matches('/'))
+                            .to_str()
+                            .expect("path")
+                            .to_string()
+                    })
+                    .collect();
+                let mut schemas = Vec::new();
+                for path in &paths {
+                    let frame = session
+                        .read_parquet(path.as_str(), ParquetReadOptions::default())
+                        .await
+                        .expect("read file schema");
+                    schemas.push(frame.schema().as_arrow().clone());
+                }
+                let merged = datafusion::arrow::datatypes::Schema::try_merge(schemas)
+                    .expect("merge exported annotation schemas");
+                let frame = session
+                    .read_parquet(paths, ParquetReadOptions::default().schema(&merged))
+                    .await
+                    .expect("read schemas with different annotation columns");
+                _ = session
+                    .register_table("journals", frame.into_view())
+                    .expect("register");
+                let batches = session.sql("SELECT tag_party, tag_cycle FROM journals WHERE account = 'A' ORDER BY source")
+                    .await.expect("query").collect().await.expect("rows");
+                let batch =
+                    datafusion::arrow::compute::concat_batches(&batches[0].schema(), &batches)
+                        .expect("concatenate");
+                let party_values = datafusion::arrow::compute::cast(
+                    batch.column(0),
+                    &datafusion::arrow::datatypes::DataType::Utf8,
+                )
+                .expect("parties as Utf8");
+                let cycle_values = datafusion::arrow::compute::cast(
+                    batch.column(1),
+                    &datafusion::arrow::datatypes::DataType::Utf8,
+                )
+                .expect("cycles as Utf8");
+                let parties = party_values
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("parties");
+                let cycles = cycle_values
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("cycles");
+                assert_eq!(batch.num_rows(), 2);
+                assert_eq!(parties.value(0), "first");
+                assert!(parties.is_null(1));
+                assert!(cycles.is_null(0));
+                assert_eq!(cycles.value(1), "2026-02");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hledger_sitegen_rejects_conflicting_annotation_values() {
+        let persistence: Arc<dyn tinyfs::PersistenceLayer> =
+            Arc::new(tinyfs::MemoryPersistence::default());
+        let fs = tinyfs::FS::from_arc(persistence.clone());
+        let root = fs.root().await.expect("root");
+        root.write_file_path_from_slice(
+            "/conflicting.journal",
+            b"2026-01-01 Example ; party: first\n    A  $1 ; party: second\n    B\n",
+        )
+        .await
+        .expect("journal");
+        let output = tempfile::tempdir().expect("output");
+        let provider_ctx = tinyfs::ProviderContext::new_for_testing(persistence);
+        let config: SiteConfig = serde_yaml::from_str(
+            "site:\n  title: Finance\n  base_url: /\nexports:\n  - name: ledger\n    pattern: 'hledger:///*.journal'\n    timestamp_column: date\n",
+        ).expect("config");
+        let error = run_format_provider_export(
+            &config.exports[0],
+            &root,
+            &provider_ctx,
+            output.path(),
+            &config,
+        )
+        .await
+        .expect_err("conflicting values must fail")
+        .to_string();
+        assert!(
+            error.contains("conflicting values for annotation 'party'"),
+            "{error}"
+        );
     }
 }

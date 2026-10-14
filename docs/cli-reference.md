@@ -234,6 +234,13 @@ pond cat host+csv:///tmp/data.csv --format=table --sql "SELECT * FROM source WHE
 # Query a host zstd-compressed CSV
 pond cat host+csv+zstd:///tmp/data.csv.zst --format=table
 
+# View or query a binary Excel workbook (no pond needed)
+pond cat 'host+xls:///tmp/readings.xls?sheet=Readings' --format=table
+pond cat 'host+xls:///tmp/readings.xls?sheet=Readings' --format=table --sql "SELECT * FROM source WHERE value > 20"
+
+# Read relative to a host directory (the URL path is relative to this root)
+pond -d ../../caspar_water_bank cat 'host+xls:///sbmc_register.xls' --format=table
+
 # Query a host Parquet file directly as a table (no pond needed)
 pond cat host+table:///tmp/snapshot.parquet --format=table
 pond cat host+table:///tmp/snapshot.parquet --sql "SELECT count(*) FROM source"
@@ -290,6 +297,10 @@ use the same format/compression/entry-type syntax — host files just add the
 | `host+csv+series://` | CSV as time-series (host) | `pond cat host+csv+series:///tmp/ts.csv --format=table` |
 | `oteljson://` | Parse as OtelJSON Lines | `pond cat oteljson:///logs/metrics.json --sql "..."` |
 | `excelhtml://` | Parse as Excel HTML | `pond cat excelhtml:///data/export.html --sql "..."` |
+| `hledger://` | Journal postings for DataFusion | `pond cat hledger:///finance/cycle.journal --format=table` |
+| `host+hledger://` | Journal postings from a host file | `pond -d /tmp/ledger-history cat host+hledger:///cycles/2026-09.journal --format=table` |
+| `xls://` | Parse a binary Excel worksheet (pond) | `pond cat 'xls:///data/book.xls?sheet=Readings' --format=table` |
+| `host+xls://` | Parse a binary Excel worksheet (host) | `pond cat 'host+xls:///tmp/book.xls?sheet=Readings' --format=table` |
 | `host+file://` | Raw bytes (host) | `pond cat host+file:///tmp/readme.txt` |
 | `file://` | Raw bytes or Parquet (pond) | `pond cat file:///data/file.parquet` |
 | (none) | Auto-detect (pond) | `pond cat /data/file.csv` |
@@ -302,7 +313,148 @@ use the same format/compression/entry-type syntax — host files just add the
 - Parquet files (stored as table or series entry types)
 - CSV files when using `csv://` or `host+csv://` prefix
 - OtelJSON Lines files when using `oteljson://` prefix (two-pass: discovers all metric names as columns)
+- Journal postings when using `hledger://` or `host+hledger://` prefix
+- Binary Excel worksheets when using `xls://` or `host+xls://` prefix
 - Raw data files without a scheme will output raw bytes, ignoring `--sql`
+
+#### Hledger journal provider
+
+The `hledger` provider makes a **single journal file** available as a DataFusion
+table, principally for financial queries and sitegen exports. `pond cat` is a
+convenient smoke test, not the intended accounting frontend:
+
+```sh
+pond -d /tmp/ledger-history cat \
+  'host+hledger:///cycles/2026-09.journal' --format=table \
+  --sql "SELECT account, commodity, sum(amount) AS total FROM source GROUP BY account, commodity"
+```
+
+It emits one row per posting, preserving file order:
+
+| Column | Type | Meaning |
+|--------|------|---------|
+| `source` | Utf8 | Source file path; use with transaction sequence when combining files. |
+| `transaction_sequence` | UInt64 | One-based transaction ordinal within that file, shared by its postings. Not a durable ID across edits. |
+| `date` | Date32 | Transaction date. |
+| `status` | Utf8 | Transaction status: `unmarked`, `pending`, or `cleared`. |
+| `posting_status` | Utf8 | Explicit posting status, otherwise inherited from the transaction. |
+| `code` | Nullable Utf8 | Optional transaction code. |
+| `payee` | Utf8 | Transaction payee/header text before `|`. |
+| `description` | Nullable Utf8 | Optional header text after `|`. |
+| `account` | Utf8 | Full colon-separated account name. |
+| `commodity` | Utf8 | Written or inferred commodity; an empty string denotes a commodityless amount. |
+| `amount` | Decimal128(38,18) | Exact signed posting quantity, never a floating-point value. |
+| `amount_inferred` | Boolean | Whether the provider filled an omitted amount. |
+| `transaction_comment` | Nullable Utf8 | Header and leading indented semicolon comments, joined with newlines. |
+| `posting_comment` | Nullable Utf8 | Posting and continuation semicolon comments, joined with newlines. |
+
+Annotation tags are discovered automatically and appended as nullable Utf8
+columns. For example, `; party: party-0042` creates `tag_party`, and
+`; billing-account: billing-0017` creates `tag_billing_account`. Columns are
+ordered by name after the base fields. Non-ASCII-alphanumeric characters other
+than underscores in tag names become underscores in column names. Different
+tag names mapping to the same column fail rather than silently merging.
+
+Tags use hledger's comment syntax: one per line or comma-separated pairs on a
+line. The tag name is the word immediately before a colon, and its value extends
+to the next comma or end of line, with surrounding whitespace trimmed. Values
+are strings, not inferred numbers/dates; valueless tags are empty strings,
+whereas missing tags are NULL. Colons inside a value are preserved. As in
+hledger, prose containing `https:` can be recognized as a tag.
+On an `account` declaration or an amount-less posting, separate an inline
+comment from the account name with at least two spaces; a semicolon before
+that separator is part of the account name, not an annotation.
+
+Each posting inherits its transaction tags and any tags on an exact matching
+`account` declaration in this file; parent-account tags are not inherited.
+Posting comments add posting-specific tags. **Conflicting values for the same
+key in a posting's effective annotations fail**, including conflicts within one
+comment or across inherited/posting tags. Different postings or transactions
+may carry different values when they do not contradict inherited values.
+Repeated identical values are accepted. This is intentionally stricter
+than hledger's support for multiple values: no value is silently selected or
+overridden. Both raw comment columns remain available.
+
+Schemas include tags found on posting rows anywhere in the file, so a tag found
+late in the journal is also present as NULL in earlier batches. Different files
+may have different annotation columns; cached and uncached DataFusion glob
+reads merge them by name and fill missing values with NULL.
+
+```sql
+SELECT tag_party, tag_cycle, commodity, sum(amount) AS assessed
+FROM source
+WHERE account LIKE 'Assets:Accounts Receivable%'
+GROUP BY tag_party, tag_cycle, commodity
+```
+
+Each transaction must balance exactly per commodity. One omitted amount is
+filled when its commodity and quantity are unambiguous; more than one omitted
+amount or an unresolved multi-commodity residual fails. Independently balanced
+commodities are supported, but implicit currency conversions are not.
+No running balances, valuations, statement generation, or cross-file
+accounting state are computed.
+
+`include` directives are **forbidden**: read each file independently and assemble
+sources through factory YAML or DataFusion. Automatic and periodic rules,
+posting costs, market prices, balance assertions/assignments, virtual postings,
+lot annotations, decimal-mark/commodity-formatting directives, and comment-based
+date overrides are rejected rather than ignored. Account, payee, tag, plain
+commodity, and year declarations do not become posting rows. Indented commodity
+format subdirectives are unsupported.
+
+Dates require an explicit four-digit year or a preceding `Y2026`/`year 2026`
+directive; the current year is never used implicitly. Numeric input uses `.`
+for decimals and may use comma grouping when a decimal point is also present,
+such as `1,000.00`. The upstream parser ambiguously interprets `1,000`, so use
+`1000` instead. Malformed grouping, quantities beyond the parser's integer
+mantissa range, and quantities needing more than 18 fractional digits fail
+explicitly; no amounts are rounded to fit the table.
+Use at least two spaces between a posting account and amount; tab-separated
+fields are rejected because the upstream parser does not distinguish them safely.
+
+The only query option is `?batch_size=8192` (positive rows per batch).
+Unknown or invalid options fail. The fixed decimal type allows journals with
+different written precisions to be combined. Empty or declaration-only files
+expose the base schema with zero posting rows.
+Parsing buffers the file and runs on a blocking worker; SQL filters and batch
+size do not reduce input parsing or make the reader bounded-memory.
+
+#### Binary Excel (`xls`)
+
+The Calamine-backed `xls` provider reads **binary `.xls` workbooks**, not `.xlsx`
+files or Excel-compatible HTML (use `excelhtml` for HydroVu HTML exports).
+It works through the normal format-provider paths, including pond files,
+host files, and SQL-derived tables. Use `pond cat`, not `pond run`.
+The host prefix is `host+`, not `hostfs+`. Provider URLs have an empty host
+component and a `/`-prefixed path: `host+xls://../../file.xls` is invalid.
+Use an absolute path, or set `-d <directory>` and use a URL path relative to
+that directory. Neither form requires `$POND`.
+
+| Query parameter | Default | Meaning |
+|-----------------|---------|---------|
+| `sheet` | Sole worksheet | Exact worksheet name. Required for workbooks with multiple worksheets; errors list available names. URL-encode spaces and other reserved characters. |
+| `header` | `true` | First populated row supplies column names. `false` keeps it as data and generates `column_1`, `column_2`, etc. |
+| `batch_size` | `8192` | Positive maximum rows per Arrow batch. |
+
+Blank headers receive generated names; duplicate names are rejected (use
+`header=false` to read them as data). Inference examines the entire selected
+worksheet: numeric columns become `Int64` or `Float64`, booleans become `Boolean`,
+and Excel datetimes become timezone-free microsecond timestamps. Integer/float
+mixtures become `Float64`; other mixed-type columns become text without dropping
+values. Datetimes in text columns use ISO-style date/time strings; Excel durations
+remain text containing their serial-day values. Empty cells are nulls, empty-only
+columns are text, and internal blank rows are retained. Leading unused rows and
+columns outside the populated range are omitted.
+
+Spreadsheet error cells, invalid options, unreadable workbooks, and empty
+worksheets fail explicitly. Header-only worksheets expose their schema with zero
+data rows. Formulas use the workbook's cached cell values; this provider does not
+recalculate formulas.
+
+Calamine requires seekable input, so the provider buffers the workbook and
+retains the selected worksheet in memory. Parsing and inference run on a blocking
+worker; batching does **not** make workbook reads streaming or bounded-memory,
+and SQL filters do not avoid parsing the worksheet.
 
 #### Schema Discovery with `information_schema`
 
@@ -331,7 +483,14 @@ Show schema information for files.
 ```bash
 pond describe /data/readings.csv
 pond describe '/sensors/**/*.parquet'
+pond -d /tmp/ledger-history describe 'host+hledger:///cycles/2023-03.journal'
+pond -d /tmp/ledger-history describe 'host+hledger:///cycles/*.journal'
 ```
+
+`host+` targets use the host filesystem rooted at `-d` (or `/` by default)
+without requiring `POND`. Format-provider URLs report the decoded Arrow schema;
+single files and glob patterns are supported. Targets without `host+` still use
+the pond. Parsing and unsupported-feature errors propagate from the provider.
 
 ---
 
