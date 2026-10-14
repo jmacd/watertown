@@ -15,6 +15,8 @@ on:
         required: true
         default: 'latest'
 
+permissions: read-all
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}/watertown
@@ -31,10 +33,10 @@ jobs:
 
     steps:
       - name: Install crane
-        uses: imjasonh/setup-crane@v0.4
+        uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
 
       - name: Install Cosign
-        uses: sigstore/cosign-installer@v3.6.0
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Log in to Container Registry
         run: echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
@@ -46,13 +48,15 @@ jobs:
         id: refs
         run: |
           IMAGE_ID=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          IMAGE_ID=$(echo $IMAGE_ID | tr '[A-Z]' '[a-z]')
+          IMAGE_ID=$(printf '%s\n' "$IMAGE_ID" | tr '[:upper:]' '[:lower:]')
           DEB_ID=${{ env.REGISTRY }}/${{ env.DEB_PACKAGE }}
-          DEB_ID=$(echo $DEB_ID | tr '[A-Z]' '[a-z]')
+          DEB_ID=$(printf '%s\n' "$DEB_ID" | tr '[:upper:]' '[:lower:]')
           STAMP=$(date -u +%Y%m%d-%H%M%S)
-          echo "image_id=$IMAGE_ID" >> $GITHUB_OUTPUT
-          echo "deb_id=$DEB_ID" >> $GITHUB_OUTPUT
-          echo "stamp=$STAMP" >> $GITHUB_OUTPUT
+          {
+            echo "image_id=$IMAGE_ID"
+            echo "deb_id=$DEB_ID"
+            echo "stamp=$STAMP"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Promote (retag by digest)
         run: |
@@ -69,7 +73,7 @@ jobs:
             echo "    digest: ${DIGEST}"
             crane cp "${SRC_REF}" "${PROD_REF}"
             crane cp "${SRC_REF}" "${STAMPED_REF}"
-            echo "prod_${ARCH}_digest=${DIGEST}" >> $GITHUB_OUTPUT
+            echo "prod_${ARCH}_digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           done
 
       - name: Promote deb artifact (retag by digest)
@@ -115,4 +119,4 @@ jobs:
             echo ""
             echo "Prod container hosts pull the new image on their next systemd timer tick (\`pond.sh --pull-image\`)."
             echo "Selfmon hosts on \`DEB_CHANNEL=prod\` pull the new deb on their next hourly update-selfmon tick."
-          } >> $GITHUB_STEP_SUMMARY
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -862,7 +862,7 @@ when identical rows are repacked into different Parquet row-group layouts.
 work remains bounded by selected chunks and row groups.
 
 The Phase 8 cross-persistence contract runs exact snapshot, projected scan,
-append, no-output progress, repair rejection, stream failure, commit, abort,
+append, append-only no-output, repair rejection, stream failure, commit, abort,
 and stale-context cases on both memory and TLogFS. TLogFS committed lookups
 are scoped by pond, partition, and node rather than loading a whole directory.
 Delta commits write node-isolated Parquet objects with node and version
@@ -900,8 +900,14 @@ registration, partial recipe, and reconstruction; generated reduction SQL
 remains only as a test oracle. Production `materialize-series` streams the
 ordered suffix into the transactional TinyFS sink, atomically publishing exact
 output metadata and recipe/source/frontier progress; it does not collect or
-concatenate the result, and a no-row run publishes progress without an empty
-series version. Visibility of intentionally global/non-incremental paths
+concatenate the result. Its configured sources are monotonic append-only logs,
+so the target maximum is the checkpoint and a no-row run is a successful no-op:
+it publishes neither an empty series version nor independent progress. A
+no-row observation cannot settle a frontier because source writes may merely
+be idle or delayed. The generic foundation retains progress-only publication
+for sinks whose sources explicitly declare and consume such a frontier.
+Legacy TinyFS progress sidecars are ignored and left unchanged.
+Visibility of intentionally global/non-incremental paths
 is explicit: arbitrary SQL is conservatively declared global, cacheless
 temporal reduction and first-run materialization are declared
 non-incremental, and each decision emits an info log plus shared provider

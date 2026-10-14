@@ -46,7 +46,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::Arc;
 
 use bytes::Bytes;
 use datafusion::execution::context::SessionContext;
@@ -157,8 +156,12 @@ pub async fn fsck(ship: &Ship, opts: FsckOptions) -> Result<FsckReport, StewardE
     let data_dir = get_data_path(ship.pond_path());
 
     let ctx = SessionContext::new();
+    let provider = table
+        .table_provider()
+        .await
+        .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
     let _previous = ctx
-        .register_table("fsck_live", Arc::new(table.clone()))
+        .register_table("fsck_live", provider)
         .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
 
     // The set of ponds whose live content this check commits to: the local

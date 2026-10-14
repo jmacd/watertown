@@ -10,7 +10,7 @@
 //! traced push of a production pond spent 609 of its 1198 requests doing
 //! exactly that, and the count grows forever.  These tests hold the line.
 
-use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use sync_store::Store;
 use sync_store::testing::in_memory_remote_url;
 use uuid::Uuid;

@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2026 Caspar Water Company
+# SPDX-License-Identifier: Apache-2.0
+#
+# The exec factory's simplest possible program: copy a staged input straight
+# to its declared output. Used by scripts/try-exec-factory.sh's built-in
+# demo; see docs/exec-factory-design.md §6.
+program: /bin/sh
+args: ["-c", "cat data/in.txt > data/out.txt"]
+inputs: ["/data/in.txt"]
+outputs: ["/data/out.txt"]

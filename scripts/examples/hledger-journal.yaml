@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: 2026 Caspar Water Company
+# SPDX-License-Identifier: Apache-2.0
+#
+# Interactive hledger-ui session against a pond-backed Ledger journal. The
+# journal is a FilePhysicalSeries (series_outputs), so only the new bytes
+# added by hledger-ui's `a` (add transaction) workflow are committed as
+# its next version -- the prior history is never rewritten. The stable
+# Debian hledger 1.x package does not provide the newer `hledger repl`
+# command; hledger-ui is its supported interactive terminal interface.
+# See docs/exec-factory-design.md §6b.
+program: /usr/bin/hledger-ui
+args: ["-f", "accounting/journal.ledger"]
+inputs: []
+series_outputs: ["/accounting/journal.ledger"]
+interactive: true

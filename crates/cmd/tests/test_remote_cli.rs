@@ -12,6 +12,7 @@ use cmd::commands::{
     remote::remote_config_path, status_command, verify_command,
 };
 use cmd::common::ShipContext;
+use object_store::ObjectStoreExt;
 use std::sync::Once;
 use steward::{PondUserMetadata, REMOTE_MODE_PREFIX, REMOTE_MOUNT_PATH_PREFIX, read_pull_ack};
 use tempfile::TempDir;

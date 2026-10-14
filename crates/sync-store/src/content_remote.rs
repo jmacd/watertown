@@ -20,7 +20,7 @@ use std::path::Path;
 
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use object_store::{ObjectMeta, PutMode, PutOptions, PutResult};
+use object_store::{ObjectMeta, ObjectStoreExt, PutMode, PutOptions, PutResult};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -443,7 +443,7 @@ impl ContentRemote {
 
     /// Current dedicated publication-table version.
     #[must_use]
-    pub fn publication_version(&self) -> i64 {
+    pub fn publication_version(&self) -> u64 {
         self.publication.version()
     }
 
@@ -1581,7 +1581,7 @@ impl ContentRemote {
 
     /// The current Delta table version, so a caller can prove an operation
     /// (such as [`Self::publish_pack`]) advanced no commit.
-    pub fn delta_version(&self) -> i64 {
+    pub fn delta_version(&self) -> u64 {
         self.store.delta_version()
     }
 

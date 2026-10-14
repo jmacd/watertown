@@ -416,7 +416,7 @@ impl HybridWriter {
 
             // Optionally set max_row_group_size (used in tests for per-chunk isolation)
             if let Some(max_size) = self.options.max_row_group_size {
-                props_builder = props_builder.set_max_row_group_size(max_size);
+                props_builder = props_builder.set_max_row_group_row_count(Some(max_size));
             }
 
             let props = props_builder.build();

@@ -244,6 +244,16 @@ if [[ -n "${SCRIPT_FILE}" ]]; then
         exec timeout "${TIMEOUT}" bash "${SCRIPT_FILE}" "$@"
     fi
 
+    # Tests marked '# REQUIRES: privileged' need user namespaces (e.g. the
+    # `exec` factory's bwrap sandbox), which Docker's default container
+    # profile blocks. `--privileged` is coarse but this harness is a
+    # throwaway container with no secrets, so it's an acceptable trade for
+    # not hand-picking the exact capability/seccomp set bwrap needs.
+    PRIVILEGED_FLAG=()
+    if head -25 "${SCRIPT_FILE}" | grep -q '# REQUIRES: privileged'; then
+        PRIVILEGED_FLAG=(--privileged)
+    fi
+
     # Always capture output to /tmp/test-output for inspection
     # (--output overrides this if the user specifies a custom dir)
     if [[ -z "${OUTPUT_DIR}" ]]; then
@@ -311,6 +321,7 @@ if [[ -n "${SCRIPT_FILE}" ]]; then
     else
         timeout --foreground "${TIMEOUT}" \
             ${CONTAINER_RT} run --rm \
+            "${PRIVILEGED_FLAG[@]}" \
             -e POND=/pond \
             -e RUST_LOG=info \
             -v "${SCRIPT_FILE}:/test/run.sh:ro" \

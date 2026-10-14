@@ -9,7 +9,7 @@ use super::symlink::OpLogSymlink;
 use super::transaction_guard::TransactionGuard;
 use crate::txn_metadata::{PondTxnMetadata, PondUserMetadata};
 use arrow::array::{Array, DictionaryArray};
-use arrow::array::{Int64Array, StringArray};
+use arrow::array::{Int64Array, LargeStringArray, StringArray, StringViewArray};
 use arrow::datatypes::UInt16Type;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -18,7 +18,9 @@ use datafusion::execution::context::{SessionConfig, SessionContext};
 use deltalake::DeltaTable;
 use deltalake::kernel::CommitInfo;
 use deltalake::protocol::SaveMode;
+use futures::TryStreamExt;
 use log::{debug, info, warn};
+use object_store::ObjectStoreExt;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use provider::{FactoryContext, FactoryRegistry};
 use serde::{Deserialize, Serialize};
@@ -448,11 +450,11 @@ impl OpLogPersistence {
                 // looking for a commit whose user.args do NOT mark it
                 // as `apply_pulled_bundle` -- that's a local-origin
                 // commit and its stamped pond_id is the local one.
-                let history = table.history(None).await?;
+                let history: Vec<CommitInfo> = table.history(None).try_collect().await?;
                 // history is an iterator newest-first; collect so we
                 // can scan in reverse order (oldest-first) for the
                 // first local-origin commit.
-                let mut commits: Vec<CommitInfo> = history.collect();
+                let mut commits = history;
                 commits.reverse();
                 for commit in &commits {
                     let Some(meta) = PondTxnMetadata::from_delta_metadata(&commit.info) else {
@@ -517,10 +519,18 @@ impl OpLogPersistence {
 
         // `history` is newest-first; the i-th entry is at version
         // `latest - i` (every Delta version has exactly one commit).
-        let history: Vec<CommitInfo> = table.history(None).await?.collect();
+        let history: Vec<CommitInfo> = table.history(None).try_collect().await?;
         let mut out = Vec::new();
         for (i, commit) in history.iter().enumerate() {
-            let version = latest - i as i64;
+            let version = latest
+                .checked_sub(u64::try_from(i).map_err(|_| {
+                    TLogFSError::Internal("Delta history index exceeds u64".to_string())
+                })?)
+                .ok_or_else(|| {
+                    TLogFSError::Internal(format!(
+                        "Delta history index {i} exceeds latest version {latest}"
+                    ))
+                })?;
             let Some(meta) = PondTxnMetadata::from_delta_metadata(&commit.info) else {
                 continue;
             };
@@ -529,7 +539,9 @@ impl OpLogPersistence {
             let timestamp_micros = commit.timestamp.unwrap_or(0).saturating_mul(1000);
             out.push(ReconstructedTxn {
                 meta,
-                delta_version: version,
+                delta_version: i64::try_from(version).map_err(|_| {
+                    TLogFSError::Internal(format!("Delta version {version} exceeds i64"))
+                })?,
                 timestamp_micros,
             });
         }
@@ -677,7 +689,7 @@ impl OpLogPersistence {
                 let part_cols: Vec<String> = existing_table
                     .snapshot()
                     .ok()
-                    .map(|s| s.metadata().partition_columns().clone())
+                    .map(|s| s.metadata().partition_columns().to_vec())
                     .unwrap_or_default();
                 if part_cols.as_slice() != ["pond_id".to_string(), "part_id".to_string()] {
                     return Err(TLogFSError::LegacyPartitionLayout {
@@ -796,7 +808,7 @@ impl OpLogPersistence {
             // an empty pond_id (defensive; current ponds always stamp one)
             // is attributed to the local pond so the local allocator is
             // never under-recovered (which could collide on the next write).
-            let history = table.history(None).await?;
+            let history: Vec<CommitInfo> = table.history(None).try_collect().await?;
             let mut seqs: HashMap<String, i64> = HashMap::new();
             for commit in history {
                 if let Some(meta) = PondTxnMetadata::from_delta_metadata(&commit.info) {
@@ -835,8 +847,8 @@ impl OpLogPersistence {
     ) -> Result<Vec<CommitInfo>, TLogFSError> {
         self.table
             .history(limit)
+            .try_collect()
             .await
-            .map(|iter| iter.collect())
             .map_err(TLogFSError::Delta)
     }
 
@@ -1019,7 +1031,9 @@ impl OpLogPersistence {
                     "[SYNC] Installed post-commit snapshot, version: {}",
                     version
                 );
-                Some(version)
+                Some(i64::try_from(version).map_err(|_| {
+                    TLogFSError::Internal(format!("Delta version {version} exceeds i64"))
+                })?)
             }
             None => None,
         };
@@ -1086,11 +1100,10 @@ impl OpLogPersistence {
     ) -> Result<Vec<(String, String, i64)>, TLogFSError> {
         // Create SessionContext and register the oplog table
         let ctx = SessionContext::new();
-        _ = ctx
-            .register_table("oplog", Arc::new(self.table.clone()))
-            .map_err(|e| {
-                TLogFSError::ArrowMessage(format!("Failed to register oplog table: {}", e))
-            })?;
+        let provider = self.table.table_provider().await?;
+        _ = ctx.register_table("oplog", provider).map_err(|e| {
+            TLogFSError::ArrowMessage(format!("Failed to register oplog table: {}", e))
+        })?;
 
         // Build query - select node_id, part_id, version
         let sql = if let Some(seq) = txn_seq {
@@ -1116,38 +1129,34 @@ impl OpLogPersistence {
         let mut records = Vec::new();
 
         for batch in batches.iter() {
-            // Helper to extract string from either StringArray or DictionaryArray
-            let get_string_value = |col_idx: usize,
-                                    row_idx: usize|
-             -> Result<String, TLogFSError> {
-                let column = batch.column(col_idx);
-
-                // Try dictionary-encoded first (most common in DataFusion)
+            fn get_string_value(column: &dyn Array, row_idx: usize) -> Result<String, TLogFSError> {
+                if column.is_null(row_idx) {
+                    return Err(TLogFSError::ArrowMessage(
+                        "String column contains a null value".to_string(),
+                    ));
+                }
+                if let Some(string_array) = column.as_any().downcast_ref::<StringArray>() {
+                    return Ok(string_array.value(row_idx).to_string());
+                }
+                if let Some(string_array) = column.as_any().downcast_ref::<StringViewArray>() {
+                    return Ok(string_array.value(row_idx).to_string());
+                }
+                if let Some(string_array) = column.as_any().downcast_ref::<LargeStringArray>() {
+                    return Ok(string_array.value(row_idx).to_string());
+                }
                 if let Some(dict_array) = column
                     .as_any()
                     .downcast_ref::<DictionaryArray<UInt16Type>>()
                 {
-                    let values = dict_array
-                        .values()
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .ok_or_else(|| {
-                            TLogFSError::ArrowMessage("Failed to get dictionary values".to_string())
-                        })?;
-                    let key = dict_array.keys().value(row_idx);
-                    return Ok(values.value(key as usize).to_string());
-                }
-
-                // Fall back to plain string array
-                if let Some(string_array) = column.as_any().downcast_ref::<StringArray>() {
-                    return Ok(string_array.value(row_idx).to_string());
+                    let key = dict_array.keys().value(row_idx) as usize;
+                    return get_string_value(dict_array.values().as_ref(), key);
                 }
 
                 Err(TLogFSError::ArrowMessage(format!(
                     "Unsupported column type: {:?}",
                     column.data_type()
                 )))
-            };
+            }
 
             let version_array = batch
                 .column(2)
@@ -1161,8 +1170,8 @@ impl OpLogPersistence {
                 })?;
 
             for row_idx in 0..batch.num_rows() {
-                let node_id = get_string_value(0, row_idx)?;
-                let part_id = get_string_value(1, row_idx)?;
+                let node_id = get_string_value(batch.column(0).as_ref(), row_idx)?;
+                let part_id = get_string_value(batch.column(1).as_ref(), row_idx)?;
                 let version = version_array.value(row_idx);
 
                 records.push((node_id, part_id, version));
@@ -2442,21 +2451,14 @@ impl InnerState {
     ) -> Result<Self, TLogFSError> {
         // Create the SessionContext with caching enabled (64MiB limit)
         use datafusion::execution::{
-            cache::{
-                cache_manager::CacheManagerConfig,
-                cache_unit::{DefaultFileStatisticsCache, DefaultListFilesCache},
-            },
-            memory_pool::FairSpillPool,
+            cache::cache_manager::CacheManagerConfig, memory_pool::FairSpillPool,
             runtime_env::RuntimeEnvBuilder,
         };
 
         // Enable DataFusion file statistics and list files caching (64MiB total)
-        let file_stats_cache = Arc::new(DefaultFileStatisticsCache::default());
-        let list_files_cache = Arc::new(DefaultListFilesCache::default());
-
         let cache_config = CacheManagerConfig::default()
-            .with_files_statistics_cache(Some(file_stats_cache))
-            .with_list_files_cache(Some(list_files_cache));
+            .with_file_statistics_cache_limit(32 * 1024 * 1024)
+            .with_list_files_cache_limit(32 * 1024 * 1024);
 
         // Use FairSpillPool instead of GreedyMemoryPool: divides memory fairly
         // among all spillable consumers, triggering spill-to-disk instead of OOM
@@ -2527,11 +2529,10 @@ impl InnerState {
             "[LIST] REGISTERING fundamental table 'delta_table' in State constructor, Delta table version={:?}",
             table.version()
         );
-        _ = ctx
-            .register_table("delta_table", Arc::new(table.clone()))
-            .map_err(|e| {
-                TLogFSError::ArrowMessage(format!("Failed to register delta_table: {}", e))
-            })?;
+        let provider = table.table_provider().await?;
+        _ = ctx.register_table("delta_table", provider).map_err(|e| {
+            TLogFSError::ArrowMessage(format!("Failed to register delta_table: {}", e))
+        })?;
 
         // Note: TinyFS ObjectStore registration will be done later when State is available
 

@@ -556,7 +556,6 @@ pub async fn listing_table_for_files(
     // min/max it needs to order the file groups.
     let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()))
         .with_file_extension(".parquet")
-        .with_collect_stat(true)
         .with_file_sort_order(vec![vec![
             datafusion::prelude::col(ts_column).sort(true, false),
         ]]);

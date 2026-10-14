@@ -145,8 +145,14 @@ async fn two_way_join_preserves_sparse_many_to_many_rows_and_leaf_projection() -
         .indent(true)
         .to_string();
     assert_eq!(display.matches("DataSourceExec").count(), 2, "{display}");
-    assert!(display.contains("projection=[ts, A.value]"), "{display}");
-    assert!(display.contains("projection=[time]"), "{display}");
+    assert!(
+        display.contains("projection=[ts@0 as __watertown_join_accumulated_time, A.value]"),
+        "{display}"
+    );
+    assert!(
+        display.contains("projection=[time@0 as __watertown_join_input_time_1]"),
+        "{display}"
+    );
     assert!(!display.contains("B.value"), "{display}");
     assert!(!display.contains("unused"), "{display}");
     assert!(!display.contains("Distinct"), "{display}");

@@ -20,7 +20,6 @@
 
 use anyhow::Result;
 use datafusion::prelude::SessionContext;
-use std::sync::Arc;
 use steward::{PondUserMetadata, Ship, StewardError};
 use tempfile::tempdir;
 
@@ -31,7 +30,7 @@ async fn count_control_rows(control_path: &std::path::Path) -> Result<usize> {
         .map_err(|_| anyhow::anyhow!("invalid control path"))?;
     let table = deltalake::open_table(url).await?;
     let ctx = SessionContext::new();
-    let _ = ctx.register_table("control", Arc::new(table))?;
+    let _ = ctx.register_table("control", table.table_provider().await?)?;
     let df = ctx.sql("SELECT COUNT(*) AS c FROM control").await?;
     let batches = df.collect().await?;
     let arr = batches[0]

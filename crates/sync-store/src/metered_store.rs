@@ -86,8 +86,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use object_store::{
-    Error as ObjectStoreError, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    CopyOptions, Error as ObjectStoreError, GetOptions, GetResult, ListResult, MultipartUpload,
+    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     Result as ObjectStoreResult, UploadPart, path::Path as ObjectPath,
 };
 use std::collections::HashMap;
@@ -1138,11 +1138,22 @@ impl ObjectStore for MeteredStore {
         Ok(result)
     }
 
-    async fn delete(&self, location: &ObjectPath) -> ObjectStoreResult<()> {
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, ObjectStoreResult<ObjectPath>>,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjectPath>> {
+        let key = self.key.clone();
         let meter = self.meter();
-        let event = AccessEvent::new(AccessOperation::Delete, location, self.prefix.as_ref());
-        admit(&self.key, meter.as_ref(), event, 1, 0)?;
-        self.inner.delete(location).await
+        let prefix = self.prefix.clone();
+        let admitted = locations
+            .map(move |location| {
+                let location = location?;
+                let event = AccessEvent::new(AccessOperation::Delete, &location, prefix.as_ref());
+                admit(&key, meter.as_ref(), event, 1, 0)?;
+                Ok(location)
+            })
+            .boxed();
+        self.inner.delete_stream(admitted)
     }
 
     fn list(
@@ -1203,22 +1214,16 @@ impl ObjectStore for MeteredStore {
         Ok(result)
     }
 
-    async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> ObjectStoreResult<()> {
-        let meter = self.meter();
-        let event = AccessEvent::new(AccessOperation::Copy, to, self.prefix.as_ref());
-        admit(&self.key, meter.as_ref(), event, 1, 0)?;
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(
+    async fn copy_opts(
         &self,
         from: &ObjectPath,
         to: &ObjectPath,
+        options: CopyOptions,
     ) -> ObjectStoreResult<()> {
         let meter = self.meter();
         let event = AccessEvent::new(AccessOperation::Copy, to, self.prefix.as_ref());
         admit(&self.key, meter.as_ref(), event, 1, 0)?;
-        self.inner.copy_if_not_exists(from, to).await
+        self.inner.copy_opts(from, to, options).await
     }
 }
 
@@ -1272,6 +1277,7 @@ impl MultipartUpload for MeteredUpload {
 mod tests {
     use super::*;
     use object_store::GetRange;
+    use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
     use std::sync::Mutex;
 

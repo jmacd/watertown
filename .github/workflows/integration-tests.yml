@@ -7,6 +7,8 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 
+permissions: read-all
+
 env:
   RUST_BACKTRACE: 1
   TEST_TIMEOUT: 300
@@ -16,7 +18,7 @@ jobs:
     name: Container Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Free up disk space
         run: |
@@ -26,7 +28,7 @@ jobs:
           df -h
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
 
       - name: Install cargo-zigbuild
         run: |
@@ -46,7 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: integration-tests
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Free up disk space
         run: |
@@ -54,7 +56,7 @@ jobs:
           df -h
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
 
       - name: Install cargo-zigbuild
         run: |
@@ -70,7 +72,7 @@ jobs:
         run: |
           for test in tests/*; do
             if head -25 "$test" | grep -q '# REQUIRES: compose'; then
-              echo "--- Running: $(basename $test) ---"
+              echo "--- Running: $(basename "$test") ---"
               ./run-test.sh --no-rebuild --compose "$test"
             fi
           done
@@ -80,7 +82,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: integration-tests
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Free up disk space
         run: |
@@ -88,7 +90,7 @@ jobs:
           df -h
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
 
@@ -96,12 +98,16 @@ jobs:
         working-directory: testsuite/browser
         run: npm ci
 
+      - name: Audit browser test dependencies
+        working-directory: testsuite/browser
+        run: npm audit --audit-level=high
+
       - name: Install Chromium for Puppeteer
         working-directory: testsuite/browser
         run: npx puppeteer browsers install chrome
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
 
       - name: Install cargo-zigbuild
         run: |

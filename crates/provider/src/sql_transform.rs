@@ -149,8 +149,10 @@ fn replace_table_name(
                 // This allows column references like "sensor_a.timestamp" to still work
                 if alias.is_none() {
                     *alias = Some(TableAlias {
+                        explicit: true,
                         name: Ident::new(&table_name),
                         columns: vec![],
+                        at: None,
                     });
                 }
 

@@ -6,8 +6,8 @@
 
 use anyhow::{Result, anyhow};
 use futures::TryStreamExt;
-use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
+use object_store::{ObjectStore, ObjectStoreExt};
 use std::sync::Arc;
 
 /// Erase all objects in an S3 bucket.

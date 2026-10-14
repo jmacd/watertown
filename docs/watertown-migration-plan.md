@@ -99,7 +99,6 @@ Captured from the active tree at plan time:
   `crates/sync-store/src/content/mod.rs`.
 - Test literals in `steward/tests/{fsck_test,tlog_materialize_test}.rs`,
   `provider/tests/excel_html_integration_tests.rs`.
-- `crates/billing/README.md`.
 
 ### F. Sitegen generated-site branding (JS/CSS assets)
 - `crates/sitegen/assets/{chart.js,duckdb-shared.js,explore.js,log-viewer.js,

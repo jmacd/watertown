@@ -6,7 +6,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use datafusion::arrow::array::{Array, Float64Array, StringArray, TimestampMicrosecondArray};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use provider::{ExecutionContext, ExecutionMode, FactoryContext, register_executable_factory};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

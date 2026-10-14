@@ -316,7 +316,7 @@ async fn appends_output_and_progress_in_one_tinyfs_version() -> Result<()> {
 }
 
 #[tokio::test]
-async fn no_rows_publish_one_progress_record_without_output() -> Result<()> {
+async fn consecutive_no_rows_publish_nothing() -> Result<()> {
     let persistence = MemoryPersistence::default();
     let filesystem = FS::new(persistence.clone())
         .await
@@ -325,41 +325,87 @@ async fn no_rows_publish_one_progress_record_without_output() -> Result<()> {
     let root = filesystem.root().await.expect("memory root");
     let sink = TinyFsMaterializationSink::new(root.clone(), &context, "ts");
 
-    let outcome = materialize_stream(
-        &sink,
-        "/empty-materialized.series",
-        "ts",
-        progress("source-0002", Some(10))?,
-        MaterializationPublication::Append { after: Some(3) },
-        record_stream(Vec::new()),
-    )
-    .await?;
-    assert!(outcome.output.is_none());
-    assert!(matches!(
-        outcome.publication,
-        MaterializationPublication::NoOutput
-    ));
+    for source_state in ["source-0002", "source-0003"] {
+        let outcome = materialize_stream(
+            &sink,
+            "/empty-materialized.series",
+            "ts",
+            progress(source_state, Some(10))?,
+            MaterializationPublication::Append { after: Some(3) },
+            record_stream(Vec::new()),
+        )
+        .await?;
+        assert!(outcome.output.is_none());
+        assert!(matches!(
+            outcome.publication,
+            MaterializationPublication::NoOutput
+        ));
+    }
     assert!(
         !root
             .exists(std::path::Path::new("/empty-materialized.series"))
             .await
     );
-    let progress = root
-        .read_file_path_to_vec("/empty-materialized.series.materialization-progress")
+    assert!(
+        !root
+            .exists(std::path::Path::new(
+                "/empty-materialized.series.materialization-progress"
+            ))
+            .await,
+        "append-only no-output runs must not advance independent progress"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn consecutive_no_rows_ignore_a_legacy_progress_sidecar() -> Result<()> {
+    let persistence = MemoryPersistence::default();
+    let filesystem = FS::new(persistence.clone())
         .await
-        .expect("progress record");
-    let progress: serde_json::Value =
-        serde_json::from_slice(&progress).expect("valid progress JSON");
-    assert_eq!(
-        progress["watertown.materialization.source_state_id"],
-        "source-0002"
+        .expect("memory filesystem");
+    let context = ProviderContext::new(Arc::new(SessionContext::new()), Arc::new(persistence));
+    let root = filesystem.root().await.expect("memory root");
+    let sink = TinyFsMaterializationSink::new(root.clone(), &context, "ts");
+    let progress_path = "/empty-materialized.series.materialization-progress";
+    root.write_file_path_from_slice(progress_path, b"legacy progress")
+        .await
+        .expect("seed legacy progress sidecar");
+
+    for source_state in ["source-0002", "source-0003"] {
+        let outcome = materialize_stream(
+            &sink,
+            "/empty-materialized.series",
+            "ts",
+            progress(source_state, Some(10))?,
+            MaterializationPublication::Append { after: Some(3) },
+            record_stream(Vec::new()),
+        )
+        .await?;
+        assert!(outcome.output.is_none());
+        assert!(matches!(
+            outcome.publication,
+            MaterializationPublication::NoOutput
+        ));
+    }
+
+    assert!(
+        !root
+            .exists(std::path::Path::new("/empty-materialized.series"))
+            .await
     );
     assert_eq!(
-        root.list_file_versions("/empty-materialized.series.materialization-progress")
+        root.read_file_path_to_vec(progress_path)
             .await
-            .expect("progress versions")
+            .expect("read legacy progress sidecar"),
+        b"legacy progress"
+    );
+    assert_eq!(
+        root.list_file_versions(progress_path)
+            .await
+            .expect("list legacy progress versions")
             .len(),
-        1
+        1,
+        "no-output runs must not update a legacy sidecar"
     );
     Ok(())
 }

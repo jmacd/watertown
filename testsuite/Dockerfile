@@ -11,7 +11,7 @@
 
 # Vendor stage — download JS/WASM dependencies for sitegen.
 # Same mechanism as the production Dockerfile.
-FROM node:18-slim AS vendor
+FROM node:22-slim AS vendor
 WORKDIR /vendor
 COPY vendor-download.sh download.sh
 RUN bash download.sh
@@ -80,6 +80,14 @@ RUN apt-get update && \
         unzip \
         # Git for git-ingest factory testing
         git \
+        # Sandbox for the exec factory (requires --privileged, see
+        # testsuite/run-test.sh's '# REQUIRES: privileged' handling)
+        bubblewrap \
+        # Plaintext-accounting tool exercised by the exec factory's
+        # series_outputs (append-only Ledger-format journal), see
+        # docs/exec-factory-design.md
+        hledger \
+        hledger-ui \
     && rm -rf /var/lib/apt/lists/*
 
 # Install the last open-source MinIO client release from its immutable GitHub

@@ -19,14 +19,15 @@ use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::TableProvider;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::datasource::TableType;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use futures::stream::StreamExt;
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -174,10 +175,6 @@ impl fmt::Debug for ColumnRenameTableProvider {
 
 #[async_trait]
 impl TableProvider for ColumnRenameTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -237,7 +234,7 @@ pub struct ColumnRenameExec {
     output_schema: SchemaRef,
     rename_fn: ColumnRenameFunc,
     cast_map: ColumnCastMap,
-    properties: datafusion::physical_plan::PlanProperties,
+    properties: Arc<datafusion::physical_plan::PlanProperties>,
 }
 
 impl ColumnRenameExec {
@@ -260,18 +257,18 @@ impl ColumnRenameExec {
     fn compute_properties(
         schema: &SchemaRef,
         inner: &Arc<dyn ExecutionPlan>,
-    ) -> datafusion::physical_plan::PlanProperties {
+    ) -> Arc<datafusion::physical_plan::PlanProperties> {
         use datafusion::physical_expr::EquivalenceProperties;
         use datafusion::physical_plan::{Partitioning, PlanProperties};
 
         let inner_props = inner.properties();
         let partition_count = inner_props.output_partitioning().partition_count();
-        PlanProperties::new(
+        Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(partition_count),
             inner_props.emission_type,
             inner_props.boundedness,
-        )
+        ))
     }
 }
 
@@ -292,20 +289,23 @@ impl ExecutionPlan for ColumnRenameExec {
         "ColumnRenameExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.output_schema.clone()
     }
 
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
         &self.properties
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.inner]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(

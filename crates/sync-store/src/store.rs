@@ -9,15 +9,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, BinaryArray, BooleanArray, Int64Array, RecordBatch, StringArray, StringViewArray,
+    Array, BinaryArray, BinaryViewArray, BooleanArray, Int64Array, LargeBinaryArray,
+    LargeStringArray, RecordBatch, StringArray, StringViewArray,
 };
 use chrono::Utc;
 use datafusion::execution::context::SessionContext;
-use deltalake::DeltaTable;
 use deltalake::kernel::StructType as DeltaStructType;
-use deltalake::kernel::schema::partitions::{PartitionFilter, PartitionValue};
 use deltalake::operations::optimize::OptimizeType;
 use deltalake::protocol::SaveMode;
+use deltalake::{DeltaTable, FilterOp, FilterValue};
 use log::{debug, warn};
 use url::Url;
 use uuid::Uuid;
@@ -108,7 +108,7 @@ impl Store {
         Ok(self.table.version() == Some(0)
             && self.table.get_file_uris()?.next().is_none()
             && snapshot.schema().as_ref() == &expected_schema
-            && snapshot.metadata().partition_columns() == &expected_partitions)
+            && snapshot.metadata().partition_columns() == expected_partitions)
     }
 
     /// Create a new store at `path`.  The directory is created if missing.
@@ -128,7 +128,7 @@ impl Store {
             .with_save_mode(SaveMode::ErrorIfExists)
             .await?;
 
-        let session_ctx = build_session_ctx(&table)?;
+        let session_ctx = build_session_ctx(&table).await?;
 
         Ok(Self {
             path,
@@ -145,7 +145,7 @@ impl Store {
         debug!("opening store at {}", url);
 
         let table = deltalake::open_table(url).await?;
-        let session_ctx = build_session_ctx(&table)?;
+        let session_ctx = build_session_ctx(&table).await?;
 
         Ok(Self {
             path,
@@ -176,7 +176,7 @@ impl Store {
             .with_partition_columns(schema::partition_columns())
             .with_save_mode(SaveMode::ErrorIfExists)
             .await?;
-        let session_ctx = build_session_ctx(&table)?;
+        let session_ctx = build_session_ctx(&table).await?;
         Ok(Self {
             path: PathBuf::from(url),
             table,
@@ -192,7 +192,7 @@ impl Store {
         let parsed = Url::parse(url).map_err(|_| StoreError::InvalidPath(url.to_string()))?;
         debug!("opening store at {}", parsed);
         let table = deltalake::open_table_with_storage_options(parsed, storage_options).await?;
-        let session_ctx = build_session_ctx(&table)?;
+        let session_ctx = build_session_ctx(&table).await?;
         Ok(Self {
             path: PathBuf::from(url),
             table,
@@ -224,7 +224,7 @@ impl Store {
 
     /// Current Delta table version (incremented on every successful
     /// commit, including writes that resulted in zero new rows).
-    pub fn delta_version(&self) -> i64 {
+    pub fn delta_version(&self) -> u64 {
         self.table.version().unwrap_or(0)
     }
 
@@ -406,7 +406,7 @@ impl Store {
         self.table = new_table;
 
         // Re-build session context against the new table version.
-        self.session_ctx = build_session_ctx(&self.table)?;
+        self.session_ctx = build_session_ctx(&self.table).await?;
         self.checkpoint_if_due().await;
         self.compact_if_due(pond_id).await;
 
@@ -427,7 +427,7 @@ impl Store {
     /// must not fail the commit that earned it.
     async fn checkpoint_if_due(&mut self) {
         let version = self.table.version().unwrap_or(0);
-        if version <= 0 || !(version as u64).is_multiple_of(CHECKPOINT_INTERVAL) {
+        if version == 0 || !version.is_multiple_of(CHECKPOINT_INTERVAL) {
             return;
         }
         match deltalake::checkpoints::create_checkpoint(&self.table, None).await {
@@ -453,8 +453,7 @@ impl Store {
     /// them must not fail the commit that earned the attempt.
     async fn compact_if_due(&mut self, pond_id: Uuid) {
         let version = self.delta_version();
-        if version <= 0 || !u64::try_from(version).is_ok_and(|v| v.is_multiple_of(COMPACT_INTERVAL))
-        {
+        if version == 0 || !version.is_multiple_of(COMPACT_INTERVAL) {
             return;
         }
         match self.compact(pond_id, None).await {
@@ -534,11 +533,6 @@ impl Store {
             if batch.num_rows() == 0 {
                 continue;
             }
-            let value = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| StoreError::Invariant("get: value is not Binary".into()))?;
             let deleted = batch
                 .column(1)
                 .as_any()
@@ -547,7 +541,9 @@ impl Store {
             if deleted.value(0) {
                 return Ok(None);
             }
-            return Ok(Some(value.value(0).to_vec()));
+            return Ok(Some(
+                binary_value(batch.column(0).as_ref(), 0, "get: value")?.to_vec(),
+            ));
         }
         Ok(None)
     }
@@ -600,18 +596,11 @@ impl Store {
         let batches = self.session_ctx.sql(&sql).await?.collect().await?;
         let mut out = HashMap::new();
         for batch in batches {
-            let item_keys = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| StoreError::Invariant("get_many: item_key is not Utf8".into()))?;
-            let values = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| StoreError::Invariant("get_many: value is not Binary".into()))?;
             for i in 0..batch.num_rows() {
-                let _ = out.insert(item_keys.value(i).to_string(), values.value(i).to_vec());
+                let _ = out.insert(
+                    string_value(batch.column(0).as_ref(), i, "get_many: item_key")?.to_string(),
+                    binary_value(batch.column(1).as_ref(), i, "get_many: value")?.to_vec(),
+                );
             }
         }
         Ok(out)
@@ -646,18 +635,11 @@ impl Store {
         let batches = self.session_ctx.sql(&sql).await?.collect().await?;
         let mut out = Vec::new();
         for batch in batches {
-            let keys = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| StoreError::Invariant("list: item_key is not Utf8".into()))?;
-            let values = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| StoreError::Invariant("list: value is not Binary".into()))?;
             for i in 0..batch.num_rows() {
-                out.push((keys.value(i).to_string(), values.value(i).to_vec()));
+                out.push((
+                    string_value(batch.column(0).as_ref(), i, "list: item_key")?.to_string(),
+                    binary_value(batch.column(1).as_ref(), i, "list: value")?.to_vec(),
+                ));
             }
         }
         Ok(out)
@@ -751,23 +733,10 @@ impl Store {
         let batches = self.session_ctx.sql(&sql).await?.collect().await?;
         let mut out: Vec<(String, [u8; 32])> = Vec::new();
         for batch in batches {
-            let keys = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    StoreError::Invariant("partition_leaves: item_key not Utf8".into())
-                })?;
-            let blake3s = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| {
-                    StoreError::Invariant("partition_leaves: blake3 not Binary".into())
-                })?;
             for i in 0..batch.num_rows() {
-                let key = keys.value(i).to_string();
-                let bytes = blake3s.value(i);
+                let key = string_value(batch.column(0).as_ref(), i, "partition_leaves: item_key")?
+                    .to_string();
+                let bytes = binary_value(batch.column(1).as_ref(), i, "partition_leaves: blake3")?;
                 let arr = checksum::array_from_slice(bytes).ok_or_else(|| {
                     StoreError::Invariant(format!(
                         "partition_leaves: value_blake3 has length {} (expected 32)",
@@ -854,15 +823,18 @@ impl Store {
     /// Both being zero means optimize found nothing to do (no rows for
     /// this pond_id, nonexistent filter, or already-optimal layout).
     pub async fn compact(&mut self, pond_id: Uuid, filter: Option<&str>) -> Result<CompactMetrics> {
-        let mut filters: Vec<PartitionFilter> = vec![PartitionFilter {
-            key: schema::col::POND_ID.to_string(),
-            value: PartitionValue::Equal(pond_id.to_string()),
-        }];
+        let pond_id = pond_id.to_string();
+        let mut filters = vec![(
+            schema::col::POND_ID,
+            FilterOp::Eq,
+            FilterValue::Scalar(pond_id.as_str()),
+        )];
         if let Some(value) = filter {
-            filters.push(PartitionFilter {
-                key: schema::col::PARTITION_KEY.to_string(),
-                value: PartitionValue::Equal(value.to_string()),
-            });
+            filters.push((
+                schema::col::PARTITION_KEY,
+                FilterOp::Eq,
+                FilterValue::Scalar(value),
+            ));
         }
 
         let (new_table, metrics) = self
@@ -884,7 +856,7 @@ impl Store {
         );
 
         self.table = new_table;
-        self.session_ctx = build_session_ctx(&self.table)?;
+        self.session_ctx = build_session_ctx(&self.table).await?;
         self.checkpoint_if_due().await;
 
         Ok(CompactMetrics {
@@ -918,7 +890,7 @@ impl Store {
     /// into `object_store::path::Path::from`).
     pub async fn actions_at_version(
         &self,
-        version: i64,
+        version: u64,
     ) -> Result<(Vec<AddPath>, Vec<RemovePath>)> {
         let bytes = self
             .table
@@ -963,7 +935,7 @@ impl Store {
         &mut self,
         actions: Vec<deltalake::kernel::Action>,
         op: deltalake::protocol::DeltaOperation,
-    ) -> Result<i64> {
+    ) -> Result<u64> {
         use deltalake::kernel::transaction::CommitBuilder;
         let snapshot = self.table.snapshot()?;
         let log_store = self.table.log_store();
@@ -972,7 +944,7 @@ impl Store {
             .build(Some(snapshot), log_store, op)
             .await?;
         self.table.update_state().await?;
-        self.session_ctx = build_session_ctx(&self.table)?;
+        self.session_ctx = build_session_ctx(&self.table).await?;
         self.checkpoint_if_due().await;
         Ok(self.table.version().unwrap_or(0))
     }
@@ -997,7 +969,7 @@ impl Store {
             .with_enforce_retention_duration(false)
             .await?;
         self.table = new_table;
-        self.session_ctx = build_session_ctx(&self.table)?;
+        self.session_ctx = build_session_ctx(&self.table).await?;
         Ok(metrics.files_deleted.len())
     }
 
@@ -1012,7 +984,7 @@ impl Store {
     /// pond_ids' files are not touched.
     ///
     /// Returns the new Delta version after the delete commit.
-    pub async fn drop_pond_data(&mut self, pond_id: Uuid) -> Result<i64> {
+    pub async fn drop_pond_data(&mut self, pond_id: Uuid) -> Result<u64> {
         let predicate = format!("{} = '{}'", schema::col::POND_ID, pond_id);
         let (new_table, _metrics) = self
             .table
@@ -1021,7 +993,7 @@ impl Store {
             .with_predicate(predicate)
             .await?;
         self.table = new_table;
-        self.session_ctx = build_session_ctx(&self.table)?;
+        self.session_ctx = build_session_ctx(&self.table).await?;
         self.checkpoint_if_due().await;
         Ok(self.table.version().unwrap_or(0))
     }
@@ -1067,9 +1039,9 @@ fn url_from_path(path: &Path) -> Result<Url> {
         .map_err(|_| StoreError::InvalidPath(path.display().to_string()))
 }
 
-fn build_session_ctx(table: &DeltaTable) -> Result<Arc<SessionContext>> {
+async fn build_session_ctx(table: &DeltaTable) -> Result<Arc<SessionContext>> {
     let ctx = SessionContext::new();
-    _ = ctx.register_table(TABLE_NAME, Arc::new(table.clone()))?;
+    _ = ctx.register_table(TABLE_NAME, table.table_provider().await?)?;
     Ok(Arc::new(ctx))
 }
 
@@ -1081,9 +1053,43 @@ fn sql_escape(s: &str) -> String {
     s.replace('\'', "''")
 }
 
-/// Append the contents of a string column to `out`, accepting both the
-/// `Utf8` (`StringArray`) and `Utf8View` (`StringViewArray`) Arrow
-/// representations that DataFusion may produce for `CAST AS VARCHAR`.
+fn binary_value<'a>(array: &'a dyn Array, row: usize, field: &str) -> Result<&'a [u8]> {
+    if let Some(values) = array.as_any().downcast_ref::<BinaryArray>() {
+        return Ok(values.value(row));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<BinaryViewArray>() {
+        return Ok(values.value(row));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<LargeBinaryArray>() {
+        return Ok(values.value(row));
+    }
+    Err(StoreError::Invariant(format!(
+        "{field} has unsupported Arrow type {}",
+        array.data_type()
+    )))
+}
+
+fn string_value<'a>(array: &'a dyn Array, row: usize, field: &str) -> Result<&'a str> {
+    if array.is_null(row) {
+        return Err(StoreError::Invariant(format!("{field} is null")));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
+        return Ok(values.value(row));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<StringViewArray>() {
+        return Ok(values.value(row));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return Ok(values.value(row));
+    }
+    Err(StoreError::Invariant(format!(
+        "{field} has unsupported Arrow type {}",
+        array.data_type()
+    )))
+}
+
+/// Append the contents of a string column to `out`, accepting the Arrow
+/// string representations that DataFusion may produce for `CAST AS VARCHAR`.
 fn collect_string_column(col: &dyn Array, out: &mut Vec<String>) -> Result<()> {
     if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
         for i in 0..arr.len() {
@@ -1101,8 +1107,16 @@ fn collect_string_column(col: &dyn Array, out: &mut Vec<String>) -> Result<()> {
         }
         return Ok(());
     }
+    if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
+        for i in 0..arr.len() {
+            if !arr.is_null(i) {
+                out.push(arr.value(i).to_string());
+            }
+        }
+        return Ok(());
+    }
     Err(StoreError::Invariant(format!(
-        "expected Utf8 or Utf8View column, got {:?}",
+        "expected Utf8, Utf8View, or LargeUtf8 column, got {:?}",
         col.data_type()
     )))
 }

@@ -9,7 +9,7 @@
 //! See `docs/rate-limiter-design.md`.
 
 use object_store::memory::InMemory;
-use object_store::{ObjectStore, PutPayload, path::Path as ObjectPath};
+use object_store::{ObjectStoreExt, PutPayload, path::Path as ObjectPath};
 use provider::factory::rate_limit::LimitUnit;
 use std::sync::Arc;
 use steward::{

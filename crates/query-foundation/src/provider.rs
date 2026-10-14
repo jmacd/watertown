@@ -4,7 +4,6 @@
 
 //! DataFusion provider over exact immutable chunk membership.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
@@ -16,6 +15,7 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result;
 use datafusion::logical_expr::{Expr, SortExpr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
+use object_store::ObjectStoreExt;
 
 use crate::metrics::ChunkPruningMetrics;
 use crate::snapshot::{ChunkDescriptor, DatasetSnapshot};
@@ -44,10 +44,6 @@ impl ChunkTableProvider {
 
 #[async_trait]
 impl TableProvider for ChunkTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(self.snapshot.schema())
     }

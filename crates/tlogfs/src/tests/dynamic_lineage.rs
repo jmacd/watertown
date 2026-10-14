@@ -210,13 +210,25 @@ async fn query_direct_reduced(
         vec!["timestamp", "gallons", "pump_minutes"]
     );
     drop(guard);
-    let batches = context
-        .datafusion_session
-        .read_table(table)
-        .unwrap()
-        .collect()
-        .await
+    let ordered = context.datafusion_session.read_table(table).unwrap();
+    let ordered = ordered
+        .sort(vec![
+            datafusion::prelude::col("timestamp").sort(true, false),
+        ])
         .unwrap();
+    let plan = ordered.clone().create_physical_plan().await.unwrap();
+    let display = datafusion::physical_plan::displayable(plan.as_ref())
+        .indent(true)
+        .to_string();
+    assert!(
+        display.contains("SortPreservingMergeExec"),
+        "ordered dynamic reduction must use a streaming merge:\n{display}"
+    );
+    assert!(
+        !display.contains("SortExec"),
+        "ordered dynamic reduction must not globally sort:\n{display}"
+    );
+    let batches = ordered.collect().await.unwrap();
     let mut rows = Vec::new();
     for batch in batches {
         let gallons = batch

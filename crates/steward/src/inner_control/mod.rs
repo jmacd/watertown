@@ -17,6 +17,5 @@ pub mod table;
 
 pub use error::StewardError;
 pub use table::{
-    CommitKind, ControlRecord, ControlTable, DataCommittedMetadata, RecordKind, TABLE_NAME,
-    new_txn_id,
+    CommitKind, ControlRecord, ControlTable, DataCommittedMetadata, RecordKind, new_txn_id,
 };

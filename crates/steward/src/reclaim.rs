@@ -23,7 +23,6 @@ use deltalake::DeltaTable;
 use deltalake::kernel::transaction::CommitProperties;
 use log::debug;
 
-use std::sync::Arc;
 use tlogfs::schema::{CollapseRange, live_series_versions};
 
 use crate::StewardError;
@@ -119,8 +118,12 @@ async fn query_rows<T: serde::de::DeserializeOwned>(
     sql: &str,
 ) -> Result<Vec<T>, StewardError> {
     let ctx = SessionContext::new();
+    let provider = table
+        .table_provider()
+        .await
+        .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
     let _previous = ctx
-        .register_table("reclaim_scan", Arc::new(table.clone()))
+        .register_table("reclaim_scan", provider)
         .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
     let batches = ctx
         .sql(sql)
@@ -237,7 +240,7 @@ async fn flush_delete(
         .with_commit_properties(CommitProperties::default().with_metadata(app_metadata.clone()))
         .await
         .map_err(|e| StewardError::DeltaLake(format!("reclaim: delete superseded rows: {e}")))?;
-    stats.rows_deleted += metrics.num_deleted_rows;
+    stats.rows_deleted += metrics.num_deleted_rows.unwrap_or(0);
     Ok(new_table)
 }
 

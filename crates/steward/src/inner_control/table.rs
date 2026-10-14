@@ -288,7 +288,7 @@ impl ControlTable {
             .with_save_mode(SaveMode::ErrorIfExists)
             .await?;
 
-        let session_ctx = build_session_ctx(&table)?;
+        let session_ctx = build_session_ctx(&table).await?;
         Ok(Self {
             path,
             table,
@@ -301,7 +301,7 @@ impl ControlTable {
         let path = path.as_ref().to_path_buf();
         let url = url_from_path(&path)?;
         let table = deltalake::open_table(url).await?;
-        let session_ctx = build_session_ctx(&table)?;
+        let session_ctx = build_session_ctx(&table).await?;
         Ok(Self {
             path,
             table,
@@ -330,9 +330,9 @@ impl ControlTable {
     /// session context registration.  Used by external maintenance flows
     /// (compact/vacuum) that produced a new table handle through other
     /// means.
-    pub fn set_delta_table(&mut self, table: DeltaTable) -> Result<()> {
+    pub async fn set_delta_table(&mut self, table: DeltaTable) -> Result<()> {
         self.table = table;
-        self.session_ctx = build_session_ctx(&self.table)?;
+        self.session_ctx = build_session_ctx(&self.table).await?;
         Ok(())
     }
 
@@ -350,7 +350,7 @@ impl ControlTable {
             .with_type(OptimizeType::Compact)
             .await?;
         self.table = new_table;
-        self.session_ctx = build_session_ctx(&self.table)?;
+        self.session_ctx = build_session_ctx(&self.table).await?;
         Ok((metrics.num_files_added, metrics.num_files_removed))
     }
 
@@ -368,7 +368,7 @@ impl ControlTable {
             .with_enforce_retention_duration(false)
             .await?;
         self.table = new_table;
-        self.session_ctx = build_session_ctx(&self.table)?;
+        self.session_ctx = build_session_ctx(&self.table).await?;
         Ok(metrics.files_deleted.len())
     }
 
@@ -388,7 +388,7 @@ impl ControlTable {
             .with_predicate(predicate)
             .await?;
         self.table = new_table;
-        self.session_ctx = build_session_ctx(&self.table)?;
+        self.session_ctx = build_session_ctx(&self.table).await?;
         Ok(())
     }
 
@@ -420,8 +420,8 @@ impl ControlTable {
             .with_predicate(predicate)
             .await?;
         self.table = new_table;
-        self.session_ctx = build_session_ctx(&self.table)?;
-        Ok(metrics.num_deleted_rows)
+        self.session_ctx = build_session_ctx(&self.table).await?;
+        Ok(metrics.num_deleted_rows.unwrap_or(0))
     }
 
     /// Append a single record to the control table.
@@ -497,7 +497,7 @@ impl ControlTable {
 
         let new_table = self.table.clone().write(vec![batch]).await?;
         self.table = new_table;
-        self.session_ctx = build_session_ctx(&self.table)?;
+        self.session_ctx = build_session_ctx(&self.table).await?;
         Ok(())
     }
 
@@ -873,9 +873,10 @@ fn url_from_path(path: &Path) -> Result<Url> {
         .map_err(|_| StewardError::InvalidPath(path.display().to_string()))
 }
 
-fn build_session_ctx(table: &DeltaTable) -> Result<Arc<SessionContext>> {
-    let ctx = SessionContext::new();
-    _ = ctx.register_table(TABLE_NAME, Arc::new(table.clone()))?;
+async fn build_session_ctx(table: &DeltaTable) -> Result<Arc<SessionContext>> {
+    let mut ctx = SessionContext::new();
+    datafusion_functions_json::register_all(&mut ctx)?;
+    _ = ctx.register_table(TABLE_NAME, table.table_provider().await?)?;
     Ok(Arc::new(ctx))
 }
 

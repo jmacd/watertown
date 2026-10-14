@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use datafusion::arrow::array::{Array, Float64Array, TimestampMicrosecondArray};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

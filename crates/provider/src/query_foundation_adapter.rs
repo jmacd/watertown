@@ -32,10 +32,7 @@ use query_foundation::snapshot::{
 };
 use query_foundation::statistics::TimeInterval;
 use tinyfs::arrow::parquet::StreamingSeriesWriter;
-use tinyfs::{
-    CoherenceState, EntryType, FileID, FileVersionInfo, PersistenceLayer, ProviderContext, WD,
-};
-use tokio::io::AsyncWriteExt;
+use tinyfs::{CoherenceState, FileID, FileVersionInfo, PersistenceLayer, ProviderContext, WD};
 
 use crate::TinyFsPathBuilder;
 
@@ -67,6 +64,9 @@ impl TinyFsDatasetSnapshot {
 }
 
 /// Transactional append-only materialization sink backed by TinyFS versions.
+///
+/// Output metadata is the durable checkpoint. A no-output commit therefore
+/// writes nothing; an empty source observation cannot settle delayed logs.
 pub struct TinyFsMaterializationSink {
     root: WD,
     coherence: Option<Arc<CoherenceState>>,
@@ -236,12 +236,7 @@ impl TransactionalBatchWriter for TinyFsMaterializationWriter {
                         "TinyFS empty materialization requires NoOutput publication".to_owned(),
                     ));
                 }
-                publish_progress_only(
-                    &self.root,
-                    &self.output_id,
-                    materialization_attributes(&commit.progress, &self.event_time)?,
-                )
-                .await
+                Ok(())
             }
             (Some(_), None) => Err(DataFusionError::Execution(
                 "TinyFS materialization commit names output but no rows were staged".to_owned(),
@@ -281,16 +276,6 @@ fn materialization_attributes(
     );
     _ = attributes.insert("watertown.timestamp_column", serde_json::json!(event_time));
     serde_json::to_vec(&attributes).map_err(external_error)
-}
-
-async fn publish_progress_only(root: &WD, output_id: &str, progress: Vec<u8>) -> Result<()> {
-    let path = format!("{output_id}.materialization-progress");
-    let (_, mut writer) = root
-        .create_file_path_streaming_with_type(path, EntryType::FilePhysicalVersion)
-        .await
-        .map_err(external_error)?;
-    writer.write_all(&progress).await.map_err(external_error)?;
-    writer.shutdown().await.map_err(external_error)
 }
 
 /// Capture exact live TinyFS Parquet versions using footer-only metadata

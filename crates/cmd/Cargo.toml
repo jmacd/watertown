@@ -80,12 +80,12 @@ arrow-cast = { workspace = true }
 arrow-csv = { workspace = true }
 arrow-schema = { workspace = true }
 async-trait = { workspace = true }
-billing = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 datafusion = { workspace = true }
+exec-factory = { workspace = true }
 hex = { workspace = true }
 datafusion-common = { workspace = true }
 datafusion-common-runtime = { workspace = true }

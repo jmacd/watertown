@@ -737,13 +737,15 @@ mod tests {
             "first-run full-history materialization must be visible"
         );
 
-        execute(
-            config,
-            context,
-            ExecutionContext::pond_readwriter(vec!["push".to_owned()]),
-        )
-        .await
-        .unwrap();
+        for _ in 0..2 {
+            execute(
+                config.clone(),
+                context.clone(),
+                ExecutionContext::pond_readwriter(vec!["push".to_owned()]),
+            )
+            .await
+            .unwrap();
+        }
         assert_eq!(
             root.list_file_versions("/target.series")
                 .await
@@ -753,32 +755,12 @@ mod tests {
             "an empty suffix must not create an empty target version"
         );
         assert!(
-            root.exists(std::path::Path::new(
-                "/target.series.materialization-progress"
-            ))
-            .await
-        );
-        let progress: Value = serde_json::from_slice(
-            &root
-                .read_file_path_to_vec("/target.series.materialization-progress")
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            progress["watertown.materialization.observed_through"], 3,
-            "an empty suffix must retain the prior observed frontier"
-        );
-        assert_eq!(
-            progress["watertown.materialization.settled_through"], 3,
-            "an empty suffix must retain the prior settled frontier"
-        );
-        assert!(
-            progress["watertown.materialization.source_state_id"]
-                .as_str()
-                .unwrap()
-                .contains("observed=Some(3)"),
-            "an empty suffix must not publish a rewound source-state identity"
+            !root
+                .exists(std::path::Path::new(
+                    "/target.series.materialization-progress"
+                ))
+                .await,
+            "empty suffixes must not publish independent progress"
         );
         assert_eq!(
             provider_context

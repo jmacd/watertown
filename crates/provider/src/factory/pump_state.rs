@@ -14,13 +14,13 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::Column;
+use datafusion::common::{Column, tree_node::TreeNodeRecursion};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Expr, cast, col, lit};
-use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_expr::expressions::Column as PhysicalColumn;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_expr_common::sort_expr::{
     LexRequirement, OrderingRequirements, PhysicalSortRequirement,
 };
@@ -478,10 +478,6 @@ impl PumpStateTableProvider {
 
 #[async_trait]
 impl TableProvider for PumpStateTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -518,7 +514,7 @@ struct PumpStateExec {
     recipe: PumpStateRecipe,
     projection: Option<Vec<usize>>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     publication: Option<ManifestPublication>,
 }
 
@@ -534,12 +530,12 @@ impl PumpStateExec {
             Some(projection) => Arc::new(full_schema.project(projection)?),
             None => full_schema,
         };
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
             source.properties().emission_type,
             source.properties().boundedness,
-        );
+        ));
         Ok(Self {
             source,
             recipe,
@@ -572,16 +568,19 @@ impl ExecutionPlan for PumpStateExec {
         "PumpStateExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.source]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {

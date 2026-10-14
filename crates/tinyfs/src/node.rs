@@ -334,7 +334,10 @@ impl FileID {
         let rand_b = ((bits >> 4) & 0x3FFF_FFFF_FFFF_FFFF) as u64; // 62 bits
 
         // Create UUID7 with our timestamp and random bits
-        let uuid = Uuid::from_fields_v7(timestamp, rand_a, rand_b);
+        let uuid = match Uuid::try_from_fields_v7(timestamp, rand_a, rand_b) {
+            Ok(uuid) => uuid,
+            Err(error) => unreachable!("masked UUIDv7 fields must be valid: {error}"),
+        };
 
         // Set the EntryType in byte 6's lower nibble
         let mut bytes: [u8; 16] = uuid.into();

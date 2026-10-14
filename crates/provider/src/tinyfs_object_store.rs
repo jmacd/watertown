@@ -11,17 +11,15 @@
 //! Path format: "/node/{node_id}" maps to TinyFS node ID
 
 use std::fmt;
-use std::ops::Range;
 use std::sync::Arc;
 
 use crate::tinyfs_path::TinyFsPathBuilder;
 use async_trait::async_trait;
-use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use log::debug;
 use object_store::{
-    GetOptions, GetResult, ListResult, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions,
-    PutPayload, PutResult, Result as ObjectStoreResult, path::Path as ObjectPath,
+    CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, ObjectStore, PutMultipartOptions,
+    PutOptions, PutPayload, PutResult, Result as ObjectStoreResult, path::Path as ObjectPath,
 };
 use tinyfs::PersistenceLayer;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -281,6 +279,36 @@ impl<P: PersistenceLayer + Clone + 'static> ObjectStore for TinyFsObjectStore<P>
             None => 0..size,
         };
 
+        if options.range.is_some() {
+            debug!(
+                "ObjectStore reading version {version_to_read} range {response_range:?} from {}",
+                series_info.file_id
+            );
+            let bytes = self
+                .persistence
+                .read_file_version_range(
+                    series_info.file_id,
+                    version_to_read,
+                    response_range.clone(),
+                )
+                .await
+                .map_err(|e| object_store::Error::Generic {
+                    store: "TinyFS",
+                    source: format!(
+                        "Failed to read version {version_to_read} range {response_range:?}: {e}"
+                    )
+                    .into(),
+                })?;
+            return Ok(GetResult {
+                meta: object_meta,
+                payload: object_store::GetResultPayload::Stream(
+                    futures::stream::once(async move { Ok(bytes) }).boxed(),
+                ),
+                range: response_range,
+                attributes: Default::default(),
+            });
+        }
+
         let mut reader = self
             .persistence
             .open_file_version(series_info.file_id, version_to_read)
@@ -322,54 +350,24 @@ impl<P: PersistenceLayer + Clone + 'static> ObjectStore for TinyFsObjectStore<P>
         })
     }
 
-    async fn get_range(
+    fn delete_stream(
         &self,
-        location: &ObjectPath,
-        range: Range<u64>,
-    ) -> ObjectStoreResult<Bytes> {
-        object_store::GetRange::Bounded(range.clone())
-            .is_valid()
-            .map_err(|source| object_store::Error::Generic {
-                store: "TinyFS",
-                source: format!("Invalid range: {source}").into(),
-            })?;
-        let parsed_path = parse_tinyfs_path(location.as_ref(), self.persistence.pond_uuid())
-            .map_err(|err| object_store::Error::Generic {
-                store: "TinyFS",
-                source: err.into(),
-            })?;
-        let version = parsed_path
-            .version
-            .ok_or_else(|| object_store::Error::Generic {
-                store: "TinyFS",
-                source: format!(
-                    "File series path '{}' must identify a specific version",
-                    location
-                )
-                .into(),
-            })?;
-
-        debug!(
-            "ObjectStore reading version {version} range {range:?} from {}",
-            parsed_path.file_id
-        );
-        self.persistence
-            .read_file_version_range(parsed_path.file_id, version, range)
-            .await
-            .map_err(|e| object_store::Error::Generic {
-                store: "TinyFS",
-                source: format!("Failed to read version {version} range: {e}").into(),
+        locations: BoxStream<'static, ObjectStoreResult<ObjectPath>>,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjectPath>> {
+        locations
+            .map(|location| match location {
+                Ok(location) => {
+                    debug!("ObjectStore delete called for location: {location}");
+                    Err(object_store::Error::Generic {
+                        store: "TinyFS",
+                        source:
+                            "TinyFS ObjectStore is read-only. Use TinyFS transactions to delete data."
+                                .into(),
+                    })
+                }
+                Err(error) => Err(error),
             })
-    }
-
-    async fn delete(&self, location: &ObjectPath) -> ObjectStoreResult<()> {
-        debug!("ObjectStore delete called for location: {location}");
-        // TinyFS ObjectStore is read-only - data is managed through TinyFS transactions
-        Err(object_store::Error::Generic {
-            store: "TinyFS",
-            source: "TinyFS ObjectStore is read-only. Use TinyFS transactions to delete data."
-                .into(),
-        })
+            .boxed()
     }
 
     fn list(
@@ -465,21 +463,13 @@ impl<P: PersistenceLayer + Clone + 'static> ObjectStore for TinyFsObjectStore<P>
         })
     }
 
-    async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> ObjectStoreResult<()> {
-        debug!("ObjectStore copy called from: {from} to: {to}");
-        // TinyFS ObjectStore is read-only - data is managed through TinyFS transactions
-        Err(object_store::Error::Generic {
-            store: "TinyFS",
-            source: "TinyFS ObjectStore is read-only. Use TinyFS transactions to copy data.".into(),
-        })
-    }
-
-    async fn copy_if_not_exists(
+    async fn copy_opts(
         &self,
         from: &ObjectPath,
         to: &ObjectPath,
+        _options: CopyOptions,
     ) -> ObjectStoreResult<()> {
-        debug!("ObjectStore copy_if_not_exists called from: {from} to: {to}");
+        debug!("ObjectStore copy called from: {from} to: {to}");
         // TinyFS ObjectStore is read-only - data is managed through TinyFS transactions
         Err(object_store::Error::Generic {
             store: "TinyFS",
@@ -615,7 +605,7 @@ pub fn register_tinyfs_object_store<P: PersistenceLayer + Clone + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use object_store::GetRange;
+    use object_store::{GetRange, ObjectStoreExt};
     use tinyfs::{EntryType, FileID, MemoryPersistence, PartID};
 
     async fn test_store() -> (TinyFsObjectStore<MemoryPersistence>, ObjectPath, Vec<u8>) {

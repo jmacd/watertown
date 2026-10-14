@@ -143,11 +143,12 @@ pub struct SiteConfig {
 /// cards by the `pond_status_grid` shortcode; refresh requires
 /// re-running sitegen.
 ///
-/// When `perf_pattern` is set, sitegen ALSO queries each unit's perf
-/// series for the latest `(timer.active, last_run.seconds_ago,
-/// timer.interval_s)` tuple.  Those values feed the per-card health
-/// classification (green/yellow/red) and Timer/Period/Last-run
-/// metadata lines in the rendered HTML.
+/// When `perf_pattern` is set, sitegen ALSO queries each unit's perf series
+/// within `hot_window` for the latest `(timer.active, last_run.seconds_ago,
+/// timer.interval_s, run.wall_s)` tuple. Those values feed the per-card health
+/// classification (green/yellow/red) and Timer/Period/Last-run metadata lines
+/// in the rendered HTML. All four values come from one latest-row provider scan
+/// per card.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StatusGridConfig {
@@ -172,19 +173,20 @@ pub struct StatusGridConfig {
     /// far back the per-unit status/tail scan reads the append-only journal
     /// series. Journal versions whose newest event predates
     /// `now - hot_window` are pruned before the reader materializes them, so
-    /// per-render memory stays bounded regardless of retained history. All
-    /// history remains on disk and queryable; only this default status render
-    /// is windowed. Unset defaults to [`DEFAULT_STATUS_HOT_WINDOW`] (1 day).
+    /// per-render memory stays bounded regardless of retained history. The
+    /// bound also applies to `perf_pattern` enrichment. All history remains on
+    /// disk and queryable; only this default status render is windowed. Unset
+    /// defaults to [`DEFAULT_STATUS_HOT_WINDOW`] (1 day).
     #[serde(default)]
     pub hot_window: Option<String>,
 
     /// Optional URL pattern (with `{pond}` placeholder) resolving to
     /// the per-pond perf series produced by `measure-pond.sh` +
-    /// `sql-derived-series`.  When set, sitegen reads the latest
-    /// `(timer.active, last_run.seconds_ago, timer.interval_s)` row
-    /// per unit and uses it for health classification.  When the
-    /// lookup fails for an individual unit (missing series, unparsable
-    /// data, etc.) the card stays at `Health::Unknown` rather than
+    /// `sql-derived-series`. When set, sitegen reads the latest
+    /// `(timer.active, last_run.seconds_ago, timer.interval_s, run.wall_s)` row
+    /// per unit within `hot_window` and uses it for health classification.
+    /// When the lookup fails for an individual unit (missing series,
+    /// unparsable data, etc.) the card stays at `Health::Unknown` rather than
     /// failing the build.
     ///
     /// `{pond}` is the unit's bare pond name -- the basename with

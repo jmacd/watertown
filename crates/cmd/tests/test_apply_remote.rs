@@ -18,6 +18,7 @@ use cmd::commands::{
     remote::list_remote_names, remote::load_remote_attachment, status_command,
 };
 use cmd::common::ShipContext;
+use object_store::ObjectStoreExt;
 use provider::factory::rate_limit::LimitUnit;
 use std::{collections::HashMap, sync::Once};
 use steward::{PondUserMetadata, REMOTE_MODE_PREFIX, RemoteMode};

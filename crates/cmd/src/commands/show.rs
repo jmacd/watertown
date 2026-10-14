@@ -742,7 +742,13 @@ fn format_operations_from_batches(
         let content_col = batch
             .column_by_name("content")
             .ok_or_else(|| steward::StewardError::Dyn("Missing content column".into()))?;
-        let contents = content_col
+        let content_binary_col = match content_col.data_type() {
+            DataType::Binary => content_col.clone(),
+            _ => cast(content_col.as_ref(), &DataType::Binary).map_err(|e| {
+                steward::StewardError::Dyn(format!("Failed to cast content: {}", e).into())
+            })?,
+        };
+        let contents = content_binary_col
             .as_any()
             .downcast_ref::<BinaryArray>()
             .ok_or_else(|| {
