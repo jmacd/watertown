@@ -40,6 +40,8 @@ enum CheckConfig {
     StaleAfter(StaleAfterCheckConfig),
     GradedScore(GradedScoreCheckConfig),
     StaleOrBelow(StaleOrBelowCheckConfig),
+    StaleOrAllBelow(StaleOrAllBelowCheckConfig),
+    StaleOrBelowAnyColumn(StaleOrBelowAnyColumnCheckConfig),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -107,6 +109,76 @@ struct StaleOrBelowCheckConfig {
     #[serde(default = "default_timestamp_column")]
     timestamp_column: String,
     value_column: String,
+    #[serde(default)]
+    unit: String,
+    threshold: f64,
+    window: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+enum StaleOrAllBelowType {
+    #[serde(rename = "stale-or-all-below")]
+    StaleOrAllBelow,
+}
+
+/// Alarms if the source has produced zero samples at all in the longer
+/// `stale_window` (ingestion has stalled), or if every sample observed
+/// within the shorter `window` is below `threshold` -- combining the
+/// staleness and sustained-low-value failure modes of a single instrument
+/// (e.g. well depth) into one check instead of requiring two separate
+/// cards. Unlike `stale-or-below`, this uses "all observed" polarity: a
+/// single recent reading at or above `threshold` is enough to stay healthy.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StaleOrAllBelowCheckConfig {
+    id: String,
+    label: String,
+    description: String,
+    href: String,
+    #[serde(rename = "type")]
+    check_type: StaleOrAllBelowType,
+    source: String,
+    #[serde(default = "default_timestamp_column")]
+    timestamp_column: String,
+    value_column: String,
+    #[serde(default)]
+    unit: String,
+    threshold: f64,
+    window: String,
+    stale_window: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+enum StaleOrBelowAnyColumnType {
+    #[serde(rename = "stale-or-below-any-column")]
+    StaleOrBelowAnyColumn,
+}
+
+/// Combines a staleness check on `value_column` (zero samples within
+/// `window` means the source has stopped reporting, same polarity as
+/// `stale-after`) with a threshold check spread across one or more
+/// secondary `threshold_columns` -- alarm if ANY sample on ANY of those
+/// columns is below `threshold` within the same window -- into a single
+/// check/card. Useful when a device's primary signal and some auxiliary
+/// signals (e.g. two redundant radio batteries) should be reported as one
+/// pass/fail instead of three separate cards. Staleness on the primary
+/// column is checked first and takes priority: if the device has stopped
+/// reporting at all, the secondary columns (which live on the same stalled
+/// device) aren't evaluated separately.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StaleOrBelowAnyColumnCheckConfig {
+    id: String,
+    label: String,
+    description: String,
+    href: String,
+    #[serde(rename = "type")]
+    check_type: StaleOrBelowAnyColumnType,
+    source: String,
+    #[serde(default = "default_timestamp_column")]
+    timestamp_column: String,
+    value_column: String,
+    threshold_columns: Vec<String>,
     #[serde(default)]
     unit: String,
     threshold: f64,
@@ -258,6 +330,7 @@ impl_scalar_check!(AverageRangeCheckConfig);
 impl_scalar_check!(StaleAfterCheckConfig);
 impl_scalar_check!(GradedScoreCheckConfig);
 impl_scalar_check!(StaleOrBelowCheckConfig);
+impl_scalar_check!(StaleOrAllBelowCheckConfig);
 
 fn default_timestamp_column() -> String {
     "timestamp".to_string()
@@ -513,6 +586,10 @@ fn validate(config: &MonitorConfig) -> tinyfs::Result<()> {
             CheckConfig::StaleAfter(check) => validate_stale_after_check(check)?,
             CheckConfig::GradedScore(check) => validate_graded_score_check(check)?,
             CheckConfig::StaleOrBelow(check) => validate_stale_or_below_check(check)?,
+            CheckConfig::StaleOrAllBelow(check) => validate_stale_or_all_below_check(check)?,
+            CheckConfig::StaleOrBelowAnyColumn(check) => {
+                validate_stale_or_below_any_column_check(check)?
+            }
         }
     }
     Ok(())
@@ -528,6 +605,8 @@ impl CheckConfig {
             Self::StaleAfter(check) => &check.id,
             Self::GradedScore(check) => &check.id,
             Self::StaleOrBelow(check) => &check.id,
+            Self::StaleOrAllBelow(check) => &check.id,
+            Self::StaleOrBelowAnyColumn(check) => &check.id,
         }
     }
 }
@@ -583,6 +662,62 @@ fn validate_stale_or_below_check(check: &StaleOrBelowCheckConfig) -> tinyfs::Res
             check.id
         )));
     }
+    Ok(())
+}
+
+fn validate_stale_or_all_below_check(check: &StaleOrAllBelowCheckConfig) -> tinyfs::Result<()> {
+    validate_scalar_check(check)?;
+    if !check.threshold.is_finite() {
+        return Err(tinyfs::Error::Other(format!(
+            "monitor-report check '{}' threshold must be finite",
+            check.id
+        )));
+    }
+    let window = validate_duration(&check.id, "window", &check.window)?;
+    let stale_window = validate_duration(&check.id, "stale_window", &check.stale_window)?;
+    if stale_window < window {
+        return Err(tinyfs::Error::Other(format!(
+            "monitor-report check '{}' stale_window must be at least as long as window",
+            check.id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_stale_or_below_any_column_check(
+    check: &StaleOrBelowAnyColumnCheckConfig,
+) -> tinyfs::Result<()> {
+    if check.label.trim().is_empty()
+        || check.description.trim().is_empty()
+        || check.href.trim().is_empty()
+        || check.source.trim().is_empty()
+        || check.timestamp_column.trim().is_empty()
+        || check.value_column.trim().is_empty()
+    {
+        return Err(tinyfs::Error::Other(format!(
+            "monitor-report check '{}' has an empty label, description, href, source, timestamp_column, or value_column",
+            check.id
+        )));
+    }
+    if check.threshold_columns.is_empty()
+        || check
+            .threshold_columns
+            .iter()
+            .any(|column| column.trim().is_empty())
+    {
+        return Err(tinyfs::Error::Other(format!(
+            "monitor-report check '{}' threshold_columns must be non-empty and contain no empty entries",
+            check.id
+        )));
+    }
+    if !check.threshold.is_finite() {
+        return Err(tinyfs::Error::Other(format!(
+            "monitor-report check '{}' threshold must be finite",
+            check.id
+        )));
+    }
+    validate_href(&check.id, &check.href)?;
+    let _ = validate_duration(&check.id, "window", &check.window)?;
     Ok(())
 }
 
@@ -771,6 +906,13 @@ async fn evaluate_check(
         CheckConfig::StaleOrBelow(config) => {
             evaluate_stale_or_below_check(config, root, provider_context, period_end).await
         }
+        CheckConfig::StaleOrAllBelow(config) => {
+            evaluate_stale_or_all_below_check(config, root, provider_context, period_end).await
+        }
+        CheckConfig::StaleOrBelowAnyColumn(config) => {
+            evaluate_stale_or_below_any_column_check(config, root, provider_context, period_end)
+                .await
+        }
     }
 }
 
@@ -846,6 +988,152 @@ async fn evaluate_stale_or_below_check(
     let (window_seconds, samples) =
         collect_scalar_window(config, root, provider_context, period_end).await?;
     Ok(classify_stale_or_below(config, window_seconds, &samples))
+}
+
+async fn evaluate_stale_or_all_below_check(
+    config: &StaleOrAllBelowCheckConfig,
+    root: &tinyfs::WD,
+    provider_context: &tinyfs::ProviderContext,
+    period_end: DateTime<Utc>,
+) -> tinyfs::Result<CheckStatus> {
+    // Collect over the longer stale_window first: its sample set is a
+    // superset of the eval window's, so filtering client-side avoids a
+    // second query.
+    let stale_window = humantime::parse_duration(&config.stale_window).map_err(|error| {
+        tinyfs::Error::Other(format!(
+            "invalid monitor stale_window '{}': {error}",
+            config.stale_window
+        ))
+    })?;
+    let stale_chrono = chrono::Duration::from_std(stale_window).map_err(|error| {
+        tinyfs::Error::Other(format!("monitor stale_window is too large: {error}"))
+    })?;
+    let stale_start = period_end.checked_sub_signed(stale_chrono).ok_or_else(|| {
+        tinyfs::Error::Other(format!(
+            "monitor stale_window '{}' exceeds the timestamp range",
+            config.stale_window
+        ))
+    })?;
+    let all_samples =
+        collect_samples(config, root, provider_context, stale_start, period_end).await?;
+
+    let window = humantime::parse_duration(&config.window).map_err(|error| {
+        tinyfs::Error::Other(format!(
+            "invalid monitor window '{}': {error}",
+            config.window
+        ))
+    })?;
+    let chrono_window = chrono::Duration::from_std(window)
+        .map_err(|error| tinyfs::Error::Other(format!("monitor window is too large: {error}")))?;
+    let eval_start = period_end
+        .checked_sub_signed(chrono_window)
+        .ok_or_else(|| {
+            tinyfs::Error::Other(format!(
+                "monitor window '{}' exceeds the timestamp range",
+                config.window
+            ))
+        })?;
+    let eval_samples: Vec<Sample> = all_samples
+        .iter()
+        .filter(|sample| sample.timestamp >= eval_start)
+        .cloned()
+        .collect();
+
+    Ok(classify_stale_or_all_below(
+        config,
+        window.as_secs(),
+        &all_samples,
+        &eval_samples,
+    ))
+}
+
+async fn evaluate_stale_or_below_any_column_check(
+    config: &StaleOrBelowAnyColumnCheckConfig,
+    root: &tinyfs::WD,
+    provider_context: &tinyfs::ProviderContext,
+    period_end: DateTime<Utc>,
+) -> tinyfs::Result<CheckStatus> {
+    let window = humantime::parse_duration(&config.window).map_err(|error| {
+        tinyfs::Error::Other(format!(
+            "invalid monitor window '{}': {error}",
+            config.window
+        ))
+    })?;
+    let chrono_window = chrono::Duration::from_std(window)
+        .map_err(|error| tinyfs::Error::Other(format!("monitor window is too large: {error}")))?;
+    let period_start = period_end
+        .checked_sub_signed(chrono_window)
+        .ok_or_else(|| {
+            tinyfs::Error::Other(format!(
+                "monitor window '{}' exceeds the timestamp range",
+                config.window
+            ))
+        })?;
+
+    let Some((table_name, table_ref)) = register_monitor_source(
+        &config.id,
+        &config.source,
+        root,
+        provider_context,
+        period_start,
+    )
+    .await?
+    else {
+        return Ok(classify_stale_or_below_any_column(
+            config,
+            window.as_secs(),
+            &[],
+            &[],
+        ));
+    };
+
+    let result: tinyfs::Result<(Vec<Sample>, Vec<Sample>)> = async {
+        let primary_samples = query_samples(
+            &provider_context.datafusion_session,
+            &table_name,
+            &config.timestamp_column,
+            &config.value_column,
+            period_start,
+            period_end,
+        )
+        .await?;
+
+        // Pool samples from every threshold_columns entry: the check
+        // alarms if ANY of them has ANY low reading, so the columns don't
+        // need to be distinguished once gathered.
+        let mut threshold_samples = Vec::new();
+        for column in &config.threshold_columns {
+            let mut samples = query_samples(
+                &provider_context.datafusion_session,
+                &table_name,
+                &config.timestamp_column,
+                column,
+                period_start,
+                period_end,
+            )
+            .await?;
+            threshold_samples.append(&mut samples);
+        }
+        threshold_samples.sort_by_key(|sample| sample.timestamp);
+
+        Ok((primary_samples, threshold_samples))
+    }
+    .await;
+
+    let (primary_samples, threshold_samples) = finish_monitor_query(
+        &config.id,
+        result,
+        provider_context
+            .datafusion_session
+            .deregister_table(table_ref),
+    )?;
+
+    Ok(classify_stale_or_below_any_column(
+        config,
+        window.as_secs(),
+        &primary_samples,
+        &threshold_samples,
+    ))
 }
 
 async fn collect_scalar_window(
@@ -1472,6 +1760,145 @@ fn classify_stale_or_below(
             .last()
             .map(|sample| format_timestamp(sample.timestamp)),
         latest_value: samples.last().map(|sample| sample.value),
+        minimum,
+        maximum,
+        average: None,
+        condition_source: None,
+        active_seconds: None,
+        minimum_active_seconds: None,
+        accumulated_change: None,
+        rate: None,
+        aligned_interval_count: None,
+        unaligned_interval_count: None,
+    }
+}
+
+fn classify_stale_or_all_below(
+    config: &StaleOrAllBelowCheckConfig,
+    window_seconds: u64,
+    all_samples: &[Sample],
+    eval_samples: &[Sample],
+) -> CheckStatus {
+    // Combines staleness (zero samples at all within the longer
+    // stale_window) and a sustained-low-value threshold (every sample
+    // within the shorter eval window below threshold) into one check,
+    // mirroring stale-or-below but with "all observed" polarity: a single
+    // recent reading at or above threshold keeps it healthy. A gap that
+    // empties the eval window but not the wider stale_window is reported as
+    // unknown rather than alarm or healthy, since neither failure mode has
+    // actually been observed yet.
+    let state = if all_samples.is_empty() {
+        CheckState::Alarm
+    } else if eval_samples.is_empty() {
+        CheckState::Unknown
+    } else if eval_samples
+        .iter()
+        .all(|sample| sample.value < config.threshold)
+    {
+        CheckState::Alarm
+    } else {
+        CheckState::Healthy
+    };
+    let minimum = eval_samples
+        .iter()
+        .map(|sample| sample.value)
+        .reduce(f64::min);
+    let maximum = eval_samples
+        .iter()
+        .map(|sample| sample.value)
+        .reduce(f64::max);
+    CheckStatus {
+        id: config.id.clone(),
+        label: config.label.clone(),
+        description: config.description.clone(),
+        href: config.href.clone(),
+        state,
+        tone: None,
+        rule: "stale-or-all-below",
+        source: config.source.clone(),
+        value_column: config.value_column.clone(),
+        unit: config.unit.clone(),
+        threshold: Some(config.threshold),
+        lower_bound: None,
+        upper_bound: None,
+        window_seconds,
+        sample_count: eval_samples.len(),
+        observed_start: eval_samples
+            .first()
+            .map(|sample| format_timestamp(sample.timestamp)),
+        observed_end: eval_samples
+            .last()
+            .map(|sample| format_timestamp(sample.timestamp)),
+        latest_value: all_samples.last().map(|sample| sample.value),
+        minimum,
+        maximum,
+        average: None,
+        condition_source: None,
+        active_seconds: None,
+        minimum_active_seconds: None,
+        accumulated_change: None,
+        rate: None,
+        aligned_interval_count: None,
+        unaligned_interval_count: None,
+    }
+}
+
+fn classify_stale_or_below_any_column(
+    config: &StaleOrBelowAnyColumnCheckConfig,
+    window_seconds: u64,
+    primary_samples: &[Sample],
+    threshold_samples: &[Sample],
+) -> CheckStatus {
+    // Staleness on the primary column takes priority: an empty primary
+    // sample set means the whole device has stopped reporting, regardless
+    // of what the (possibly also-empty) threshold columns show. Otherwise
+    // the check alarms if any pooled threshold-column sample is below
+    // threshold, mirroring stale-or-below's single-column polarity but
+    // spread across several columns.
+    let state = if primary_samples.is_empty()
+        || threshold_samples
+            .iter()
+            .any(|sample| sample.value < config.threshold)
+    {
+        CheckState::Alarm
+    } else {
+        CheckState::Healthy
+    };
+    let minimum = threshold_samples
+        .iter()
+        .map(|sample| sample.value)
+        .reduce(f64::min);
+    let maximum = threshold_samples
+        .iter()
+        .map(|sample| sample.value)
+        .reduce(f64::max);
+    let observed_start = threshold_samples
+        .first()
+        .or(primary_samples.first())
+        .map(|sample| format_timestamp(sample.timestamp));
+    let observed_end = threshold_samples
+        .last()
+        .or(primary_samples.last())
+        .map(|sample| format_timestamp(sample.timestamp));
+    CheckStatus {
+        id: config.id.clone(),
+        label: config.label.clone(),
+        description: config.description.clone(),
+        href: config.href.clone(),
+        state,
+        tone: None,
+        rule: "stale-or-below-any-column",
+        source: config.source.clone(),
+        value_column: config.threshold_columns.join(","),
+        unit: config.unit.clone(),
+        threshold: Some(config.threshold),
+        lower_bound: None,
+        upper_bound: None,
+        window_seconds,
+        sample_count: threshold_samples.len(),
+        observed_start,
+        observed_end,
+        latest_value: threshold_samples.last().map(|sample| sample.value),
         minimum,
         maximum,
         average: None,
@@ -2152,6 +2579,24 @@ mod tests {
         }
     }
 
+    fn stale_or_all_below_config() -> StaleOrAllBelowCheckConfig {
+        StaleOrAllBelowCheckConfig {
+            id: "well-depth-healthy".to_string(),
+            label: "Well depth healthy".to_string(),
+            description: "At least one well-depth reading must reach 40 m in the trailing three hours; a 24-hour gap counts as a failure too."
+                .to_string(),
+            href: "/data/well-depth.html".to_string(),
+            check_type: StaleOrAllBelowType::StaleOrAllBelow,
+            source: "oteljson:///ingest/casparwater*.json".to_string(),
+            timestamp_column: "timestamp".to_string(),
+            value_column: "well_depth_value".to_string(),
+            unit: "m".to_string(),
+            threshold: 40.0,
+            window: "3h".to_string(),
+            stale_window: "24h".to_string(),
+        }
+    }
+
     #[test]
     fn stale_or_below_alarms_when_no_samples_observed() {
         let check = stale_or_below_config();
@@ -2176,6 +2621,109 @@ mod tests {
         let status = classify_stale_or_below(&check, 10_800, &[sample(1, 6.9), sample(2, 7.1)]);
         assert_eq!(status.state, CheckState::Healthy);
         assert_eq!(status.sample_count, 2);
+    }
+
+    #[test]
+    fn stale_or_all_below_alarms_when_wholly_stale() {
+        let check = stale_or_all_below_config();
+        let status = classify_stale_or_all_below(&check, 10_800, &[], &[]);
+        assert_eq!(status.state, CheckState::Alarm);
+        assert_eq!(status.rule, "stale-or-all-below");
+        assert_eq!(status.sample_count, 0);
+    }
+
+    #[test]
+    fn stale_or_all_below_is_unknown_when_eval_window_empty_but_not_stale() {
+        let check = stale_or_all_below_config();
+        // A reading exists somewhere in the wider stale_window (e.g. 10
+        // hours ago) but not within the shorter eval window: neither
+        // failure mode has actually been observed yet.
+        let all_samples = [sample(1, 41.0)];
+        let status = classify_stale_or_all_below(&check, 10_800, &all_samples, &[]);
+        assert_eq!(status.state, CheckState::Unknown);
+        assert_eq!(status.latest_value, Some(41.0));
+    }
+
+    #[test]
+    fn stale_or_all_below_alarms_when_all_eval_samples_below_threshold() {
+        let check = stale_or_all_below_config();
+        let all_samples = [sample(1, 39.0), sample(2, 39.5)];
+        let status = classify_stale_or_all_below(&check, 10_800, &all_samples, &all_samples);
+        assert_eq!(status.state, CheckState::Alarm);
+    }
+
+    #[test]
+    fn stale_or_all_below_is_healthy_with_one_eval_sample_at_or_above_threshold() {
+        let check = stale_or_all_below_config();
+        let all_samples = [sample(1, 39.0), sample(2, 40.5)];
+        let status = classify_stale_or_all_below(&check, 10_800, &all_samples, &all_samples);
+        assert_eq!(status.state, CheckState::Healthy);
+        assert_eq!(status.sample_count, 2);
+    }
+
+    fn stale_or_below_any_column_config() -> StaleOrBelowAnyColumnCheckConfig {
+        StaleOrBelowAnyColumnCheckConfig {
+            id: "field-station-healthy".to_string(),
+            label: "Field Station healthy".to_string(),
+            description: "At least one Field Station reading must arrive in the trailing 24 hours, and both radio batteries must stay above 20%."
+                .to_string(),
+            href: "/noyo-harbor/params/Battery.html".to_string(),
+            check_type: StaleOrBelowAnyColumnType::StaleOrBelowAnyColumn,
+            source: "/combined/FieldStation".to_string(),
+            timestamp_column: "timestamp".to_string(),
+            value_column: "AT500_Surface.Temperature.C".to_string(),
+            threshold_columns: vec![
+                "Vulink1.Battery Level.%".to_string(),
+                "Vulink2.Battery Level.%".to_string(),
+            ],
+            unit: "%".to_string(),
+            threshold: 20.0,
+            window: "24h".to_string(),
+        }
+    }
+
+    #[test]
+    fn stale_or_below_any_column_alarms_when_primary_is_stale() {
+        let check = stale_or_below_any_column_config();
+        // Even if the (pooled) threshold samples look fine, an empty
+        // primary sample set means the device itself has stopped
+        // reporting, which takes priority.
+        let status = classify_stale_or_below_any_column(
+            &check,
+            86_400,
+            &[],
+            &[sample(1, 85.0), sample(2, 90.0)],
+        );
+        assert_eq!(status.state, CheckState::Alarm);
+        assert_eq!(status.rule, "stale-or-below-any-column");
+    }
+
+    #[test]
+    fn stale_or_below_any_column_alarms_on_one_low_threshold_sample() {
+        let check = stale_or_below_any_column_config();
+        let status = classify_stale_or_below_any_column(
+            &check,
+            86_400,
+            &[sample(1, 13.0)],
+            &[sample(1, 85.0), sample(2, 15.0)],
+        );
+        assert_eq!(status.state, CheckState::Alarm);
+        assert_eq!(status.minimum, Some(15.0));
+        assert_eq!(status.maximum, Some(85.0));
+    }
+
+    #[test]
+    fn stale_or_below_any_column_is_healthy_with_all_columns_above_threshold() {
+        let check = stale_or_below_any_column_config();
+        let status = classify_stale_or_below_any_column(
+            &check,
+            86_400,
+            &[sample(1, 13.0)],
+            &[sample(1, 85.0), sample(2, 90.0)],
+        );
+        assert_eq!(status.state, CheckState::Healthy);
+        assert_eq!(status.sample_count, 2);
+        assert_eq!(status.latest_value, Some(90.0));
     }
 
     #[test]
@@ -2350,6 +2898,32 @@ checks:
     value_column: atlasph_ph
     threshold: 6.5
     window: 3h
+  - id: well-depth-healthy
+    label: Well depth healthy
+    description: At least one well-depth reading must reach 40 m in the trailing three hours; a 24-hour gap counts as a failure too.
+    href: /data/well-depth.html
+    type: stale-or-all-below
+    source: oteljson:///ingest/casparwater*.json
+    timestamp_column: timestamp
+    value_column: well_depth_value
+    unit: m
+    threshold: 40
+    window: 3h
+    stale_window: 24h
+  - id: field-station-healthy
+    label: Field Station healthy
+    description: At least one Field Station reading must arrive in the trailing 24 hours, and both radio batteries must stay above 20%.
+    href: /noyo-harbor/params/Battery.html
+    type: stale-or-below-any-column
+    source: /combined/FieldStation
+    timestamp_column: timestamp
+    value_column: AT500_Surface.Temperature.C
+    threshold_columns:
+      - "Vulink1.Battery Level.%"
+      - "Vulink2.Battery Level.%"
+    unit: "%"
+    threshold: 20
+    window: 24h
 "#;
         let config: MonitorConfig = serde_yaml::from_slice(yaml).expect("rate-while config");
         validate(&config).expect("valid config");
@@ -2359,6 +2933,11 @@ checks:
         assert!(matches!(config.checks[3], CheckConfig::StaleAfter(_)));
         assert!(matches!(config.checks[4], CheckConfig::GradedScore(_)));
         assert!(matches!(config.checks[5], CheckConfig::StaleOrBelow(_)));
+        assert!(matches!(config.checks[6], CheckConfig::StaleOrAllBelow(_)));
+        assert!(matches!(
+            config.checks[7],
+            CheckConfig::StaleOrBelowAnyColumn(_)
+        ));
     }
 
     #[test]
