@@ -466,7 +466,8 @@ tr:hover td {
   color: #ffffff;
 }
 
-.reset-zoom {
+.reset-zoom,
+.reload-data {
   padding: 0.4rem 0.9rem;
   border: 1px solid var(--accent-light);
   background: transparent;
@@ -478,7 +479,8 @@ tr:hover td {
   transition: all 0.15s;
 }
 
-.reset-zoom:hover:not(:disabled) {
+.reset-zoom:hover:not(:disabled),
+.reload-data:hover {
   background: var(--accent);
   border-color: var(--accent);
   color: #ffffff;

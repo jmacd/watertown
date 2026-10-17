@@ -126,6 +126,31 @@ static:
   - pattern: "/etc/static/*"
 ```
 
+### Timeseries navigation windows
+
+Append `?range=<duration>` to a timeseries URL to open a trailing window ending
+at page-load time, for example `/data/well-depth.html?range=24h` or
+`/data/system-pressure.html?range=7d`. Monitor-report check `href` values can use
+these URLs directly.
+
+Supported durations match the chart buttons: `12h`, `24h`, `2d`, `7d`, `2W`,
+`1M`, `3M`, `6M`, `1Y`, `2Y`, `5Y`, and `10Y` (case-sensitive).
+An explicit duration overrides `site.default_range` and the adaptive default,
+even when the dataset is younger than the requested window. Unknown values
+produce a browser-console warning and retain the normal default.
+
+The **Copy link** button still captures an absolute window as
+`#t=<begin-epoch-ms>,<end-epoch-ms>`. A valid `#t` takes precedence over `?range`,
+so shared incident links reopen the same historical interval rather than moving
+forward with time.
+
+Duration-button selections, brush zooms, and edited windows are saved in the
+address bar, so an ordinary browser reload preserves them. **Reload data**
+reloads the page and its data manifest with the same settings: duration windows
+advance to the current time, while absolute windows retain their start and end.
+**Reset zoom** clears the absolute window and returns to the selected trailing
+duration.
+
 ### Build Command
 
 ```bash
