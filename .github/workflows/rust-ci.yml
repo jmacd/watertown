@@ -20,6 +20,21 @@ env:
   ORAS_SHA256_ARM64: 8db4a223bd6034deff198e791ea7cb3af0840df25b7e9f370e2f1f3fd20d389b
 
 jobs:
+  audit:
+    name: Audit Rust dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Audit Rust dependencies
+        run: cargo audit
+
   check:
     name: Check, Build & Test
     runs-on: ubuntu-latest
@@ -53,18 +68,6 @@ jobs:
       
       - name: Run clippy
         run: cargo clippy --workspace --all-features -- -D warnings
-
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --version 0.22.2 --locked
-
-      - name: Audit Rust dependencies
-        id: audit
-        continue-on-error: true
-        run: cargo audit
-
-      - name: Report dependency audit failure
-        if: steps.audit.outcome == 'failure'
-        run: echo "::warning::Dependency audit failed. Findings are advisory and do not block CI; see the Audit Rust dependencies step for details."
 
       - name: Install exec-factory runtime dependencies
         run: |
