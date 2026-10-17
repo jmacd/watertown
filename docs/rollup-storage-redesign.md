@@ -132,15 +132,18 @@ None of those guards would have anything to guard if the key were the covered
 time range. Two builds that summarize the same time range from the same content
 would produce the same key whether or not a collapse happened in between.
 
-**M2 — sealing is triggered by the watermark advancing, not by having enough
-data to justify a file.**
+**M2 — sealing is triggered by the watermark advancing, not by enough active
+work to justify a file.**
 
 `seal_and_recompute` seals on `wm > m.sealed_hi_secs`. That is a *time* trigger.
-The correct trigger for "should this become a file" is *size*. This is entirely
-independent of M1: even with a perfect key, sealing once per build produces one
-file per build.
+The corrected policy batches by compressed size, with an event-time-span
+backstop for sparse derived output. Size alone is not a sufficient proxy for
+active work: a compact result can still require an expensive historical graph
+to recreate. This is entirely independent of M1: even with a perfect key,
+sealing once per build produces one file per build.
 
-M2 is currently doing more damage than M1, and is much cheaper to fix.
+At the time of this analysis, M2 was doing more damage than M1 and was much
+cheaper to fix.
 
 ## 4. What conventional systems do
 

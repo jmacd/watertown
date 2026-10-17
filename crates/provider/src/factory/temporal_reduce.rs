@@ -1446,20 +1446,19 @@ impl TemporalReduceSqlFile {
         Ok(Some(table_provider))
     }
 
-    /// Newest output-bucket start (epoch seconds) over `table`, re-binning its
-    /// `bucket_col` to `output_interval` -- the event-time frontier that drives
-    /// the watermark. A single bounded MAX scan; no per-bucket accumulator.
-    /// `None` when the table holds no rows. `bucket_col` is `time_bucket` for the
-    /// shared finest partials or the output `ts` column for a finer resolution's
-    /// segments+hot.
-    async fn max_output_bucket_secs(
+    /// Oldest and newest output-bucket starts (epoch seconds) over `table`.
+    ///
+    /// The newest drives the watermark; the oldest bounds how much history is
+    /// still active before the first seal. A single aggregate scan computes
+    /// both without a per-bucket accumulator.
+    async fn output_bucket_bounds_secs(
         &self,
         ctx: &datafusion::prelude::SessionContext,
         table: &str,
         bucket_col: &str,
         output_interval: Duration,
-    ) -> TinyFSResult<Option<i64>> {
-        let frame = query_foundation::plans::reduce::max_timestamp_bucket(
+    ) -> TinyFSResult<Option<(i64, i64)>> {
+        let frame = query_foundation::plans::reduce::timestamp_bucket_bounds(
             ctx.table(table).await.map_other()?,
             bucket_col,
             output_interval,
@@ -1473,23 +1472,13 @@ impl TemporalReduceSqlFile {
             if batch.num_rows() == 0 {
                 continue;
             }
-            let value =
-                datafusion::common::ScalarValue::try_from_array(batch.column(0), 0).map_other()?;
-            return match value {
-                datafusion::common::ScalarValue::TimestampSecond(value, _) => Ok(value),
-                datafusion::common::ScalarValue::TimestampMillisecond(value, _) => {
-                    Ok(value.map(|value| value.div_euclid(1_000)))
-                }
-                datafusion::common::ScalarValue::TimestampMicrosecond(value, _) => {
-                    Ok(value.map(|value| value.div_euclid(1_000_000)))
-                }
-                datafusion::common::ScalarValue::TimestampNanosecond(value, _) => {
-                    Ok(value.map(|value| value.div_euclid(1_000_000_000)))
-                }
-                other => Err(tinyfs::Error::Other(format!(
-                    "max-output-bucket produced non-timestamp value {other:?}"
-                ))),
-            };
+            let lo = timestamp_scalar_secs(
+                datafusion::common::ScalarValue::try_from_array(batch.column(0), 0).map_other()?,
+            )?;
+            let hi = timestamp_scalar_secs(
+                datafusion::common::ScalarValue::try_from_array(batch.column(1), 0).map_other()?,
+            )?;
+            return Ok(lo.zip(hi));
         }
         Ok(None)
     }
@@ -1516,28 +1505,40 @@ impl TemporalReduceSqlFile {
     ) -> TinyFSResult<Vec<std::path::PathBuf>> {
         // Event-time frontier: newest output bucket over the input (epoch
         // seconds). Bounded MAX scan, no per-bucket state.
-        let data_hi_secs = self
-            .max_output_bucket_secs(ctx, input_table, in_bucket_col, output_interval)
+        let data_bounds = self
+            .output_bucket_bounds_secs(ctx, input_table, in_bucket_col, output_interval)
             .await?;
         let interval_secs = output_interval.as_secs() as i64;
-        let watermark = data_hi_secs
+        let watermark = data_bounds
+            .map(|(_, hi)| hi)
             .map(|hi| (hi - m.allowed_lateness_secs).div_euclid(interval_secs) * interval_secs);
 
         // Seal buckets [sealed_hi, watermark) into a new immutable segment once
         // enough has accumulated to be worth freezing. Bounded to the
         // newly-frozen span.
         //
-        // The size gate is what keeps the segment count proportional to data rather
-        // than to build frequency. `hot` currently spans [sealed_hi, inf), which
+        // The size gate keeps the segment count proportional to data rather
+        // than build frequency. `hot` currently spans [sealed_hi, inf), which
         // contains the frozen span [sealed_hi, wm) a seal would write, so
         // `hot_bytes` from the previous build is an upper bound on the seal's
-        // size: under target, there is nothing worth sealing and we skip without
-        // writing a candidate to find out. The buckets are not lost -- they stay
-        // in `hot`, which is recomputed from the input below, and are sealed in
-        // one larger segment on a later build.
+        // size. Sparse derived output can remain below that target while its
+        // upstream graph grows expensive to recreate, so event-time span is a
+        // second trigger. The active lower bound is the prior watermark after a
+        // seal, or the oldest bucket before the first seal.
+        let active_lo_secs = match (m.sealed_hi_secs, data_bounds) {
+            (Some(sealed_hi), _) => Some(sealed_hi),
+            (None, Some((data_lo, _))) => Some(data_lo),
+            (None, None) => None,
+        };
+        let active_span_large = match (active_lo_secs, watermark) {
+            (Some(active_lo), Some(wm)) => {
+                wm.saturating_sub(active_lo) >= crate::partial_aggregate_cache::MAX_ACTIVE_SPAN_SECS
+            }
+            _ => false,
+        };
         if let Some(wm) = watermark
             && m.sealed_hi_secs.is_none_or(|sh| wm > sh)
-            && m.hot_bytes >= policy.target_bytes
+            && (m.hot_bytes >= policy.target_bytes || active_span_large)
         {
             let seal = pieces
                 .merge_partials_frame(
@@ -4226,6 +4227,24 @@ fn require_complete_coverage(set: &crate::version_cache::CachedSet) -> TinyFSRes
         set.missing().len(),
         set.missing()[0].display(),
     )))
+}
+
+fn timestamp_scalar_secs(value: datafusion::common::ScalarValue) -> TinyFSResult<Option<i64>> {
+    match value {
+        datafusion::common::ScalarValue::TimestampSecond(value, _) => Ok(value),
+        datafusion::common::ScalarValue::TimestampMillisecond(value, _) => {
+            Ok(value.map(|value| value.div_euclid(1_000)))
+        }
+        datafusion::common::ScalarValue::TimestampMicrosecond(value, _) => {
+            Ok(value.map(|value| value.div_euclid(1_000_000)))
+        }
+        datafusion::common::ScalarValue::TimestampNanosecond(value, _) => {
+            Ok(value.map(|value| value.div_euclid(1_000_000_000)))
+        }
+        other => Err(tinyfs::Error::Other(format!(
+            "output-bucket bounds produced non-timestamp value {other:?}"
+        ))),
+    }
 }
 
 /// Epoch microseconds -> epoch seconds, rounding DOWN (toward -inf, so it holds
@@ -7677,14 +7696,14 @@ output_aliases:
         assert_eq!(on_disk.len(), live, "disk and manifest must agree");
     }
 
-    /// Under the DEFAULT seal target, four days of a handful of rows each never
-    /// accumulate enough bytes to be worth freezing, so no segment file is written
-    /// at all -- yet the query still returns every day correctly, because the
-    /// unsealed buckets simply stay in the recomputed hot window.
+    /// Four days of a handful of rows stay below both default seal triggers:
+    /// the byte target and the maximum active event-time span. No segment file
+    /// is written, yet the query still returns every day correctly from hot.
     ///
-    /// This is the point of the size gate. Sealing used to fire whenever the
-    /// watermark moved, so a pond rebuilt on a timer grew one small file per
-    /// build regardless of how little data had arrived. The companion test
+    /// This is the point of delaying small seals until the active span grows
+    /// large. Sealing used to fire whenever the watermark moved, so a pond
+    /// rebuilt on a timer grew one small file per build regardless of how little
+    /// data had arrived. The companion test
     /// `test_sealed_runs_advance_as_history_grows` pins the mechanics with the
     /// gate disabled; this one pins the policy, and together they show that
     /// whether a bucket is sealed or hot is invisible to the answer.
@@ -7741,8 +7760,8 @@ output_aliases:
             );
         }
 
-        // And the watermark still advanced: the buckets are frozen-but-unsealed,
-        // waiting to be written as one larger run rather than four tiny ones.
+        // The buckets remain active, waiting to be written as one larger run
+        // rather than four tiny ones.
         let manifests = walk_find(&cache_dir, &|n| n == "manifest.json");
         assert_eq!(manifests.len(), 1, "one manifest for the single resolution");
         let m: Value = serde_json::from_slice(&std::fs::read(&manifests[0]).unwrap()).unwrap();

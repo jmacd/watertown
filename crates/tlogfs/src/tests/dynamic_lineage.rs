@@ -251,6 +251,124 @@ async fn query_direct_reduced(
 }
 
 #[tokio::test]
+async fn sparse_dynamic_reduction_seals_by_active_span_and_bounds_the_next_append() {
+    const DAY_US: i64 = 24 * 60 * 60 * 1_000_000;
+    let store_path = test_dir();
+    let mut persistence = OpLogPersistence::create_test(&store_path).await.unwrap();
+
+    {
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        _ = root.create_dir_path("/sources").await.unwrap();
+        _ = root.create_dir_path("/combined").await.unwrap();
+        _ = root.create_dir_path("/singled").await.unwrap();
+        let samples_a = source_samples(&[(DAY_US, 10.0), (20 * DAY_US, 11.0), (40 * DAY_US, 12.0)]);
+        let samples_b = source_samples(&[(DAY_US, 20.0), (20 * DAY_US, 21.0), (40 * DAY_US, 22.0)]);
+        _ = root
+            .create_series_from_batch("/sources/a.series", &samples_a, Some("timestamp"))
+            .await
+            .unwrap();
+        _ = root
+            .create_series_from_batch("/sources/b.series", &samples_b, Some("timestamp"))
+            .await
+            .unwrap();
+        _ = root
+            .create_dynamic_path(
+                "/combined/site",
+                tinyfs::EntryType::TableDynamic,
+                "timeseries-join",
+                yaml(&join_config()),
+            )
+            .await
+            .unwrap();
+        let pivot = TimeseriesPivotConfig {
+            pattern: provider::Url::parse("file+series:///combined/*").unwrap(),
+            columns: vec!["A.value".to_owned(), "B.value".to_owned()],
+            time_column: "timestamp".to_owned(),
+            transforms: None,
+        };
+        _ = root
+            .create_dynamic_path(
+                "/singled/metric",
+                tinyfs::EntryType::TableDynamic,
+                "timeseries-pivot",
+                yaml(&pivot),
+            )
+            .await
+            .unwrap();
+        let reduce = TemporalReduceConfig {
+            in_pattern: provider::Url::parse("file+series:///singled/*").unwrap(),
+            out_pattern: "$0".to_owned(),
+            time_column: "timestamp".to_owned(),
+            resolutions: vec!["1h".to_owned()],
+            aggregations: vec![AggregationConfig {
+                agg_type: AggregationType::Avg,
+                columns: None,
+            }],
+            output_aliases: None,
+            transforms: None,
+            allowed_lateness: Some("1d".to_owned()),
+            seal_target_bytes: None,
+            max_live_segments: None,
+        };
+        _ = root
+            .create_dynamic_path(
+                "/reduced",
+                tinyfs::EntryType::DirectoryDynamic,
+                "temporal-reduce",
+                yaml(&reduce),
+            )
+            .await
+            .unwrap();
+        tx.commit_test().await.unwrap();
+    }
+
+    let (cold_rows, cold_columns, cold_metrics) = query_reduced(&mut persistence).await;
+    assert_eq!(cold_rows, 3);
+    assert_eq!(cold_columns, 3);
+    assert_eq!(cold_metrics.dynamic_source_executions, 1);
+    assert_eq!(cold_metrics.bounded_dynamic_source_executions, 0);
+
+    let cache_dir = Path::new(&store_path).parent().unwrap().join("cache");
+    let manifests = segment_manifests(&cache_snapshot(&cache_dir));
+    assert_eq!(manifests.len(), 1);
+    let manifest: provider::partial_aggregate_cache::SegmentManifest =
+        serde_json::from_slice(manifests.values().next().unwrap()).unwrap();
+    assert!(
+        manifest.hot_bytes < provider::partial_aggregate_cache::SEAL_TARGET_BYTES,
+        "test requires sparse output below the byte seal target, got {} bytes",
+        manifest.hot_bytes
+    );
+    assert!(
+        !manifest.segments.is_empty(),
+        "a sparse graph spanning more than the active-span limit must seal history"
+    );
+    assert!(
+        manifest.sealed_hi_secs.is_some(),
+        "sealing must establish the lower bound for the next source execution"
+    );
+
+    {
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        append_source(&root, "/sources/a.series", 41 * DAY_US, 30.0).await;
+        tx.commit_test().await.unwrap();
+    }
+    let (append_rows, append_columns, append_metrics) = query_reduced(&mut persistence).await;
+    assert_eq!(append_rows, 4);
+    assert_eq!(append_columns, cold_columns);
+    assert_eq!(append_metrics.dynamic_source_executions, 1);
+    assert_eq!(append_metrics.bounded_dynamic_source_executions, 1);
+    let read_lo = append_metrics
+        .minimum_dynamic_event_time_lo
+        .expect("sparse append must carry an event-time lower bound");
+    assert!(
+        read_lo > DAY_US && read_lo <= 41 * DAY_US,
+        "bounded sparse append must exclude old history, got lower bound {read_lo}"
+    );
+}
+
+#[tokio::test]
 async fn pump_state_manifest_bounds_incremental_daily_usage() {
     let store_path = test_dir();
     let mut persistence = OpLogPersistence::create_test(&store_path).await.unwrap();

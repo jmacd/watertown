@@ -1677,7 +1677,7 @@ config:
 | `output_aliases` | no | Map default `<column>.<aggregate>` names to stable public names. |
 | `transforms` | no | List of paths to table-transform factories applied to each input before aggregation. |
 | `allowed_lateness` | no | Width of the unsealed repair window; defaults to one day. |
-| `seal_target_bytes` | no | Minimum frozen partial bytes to accumulate before sealing a segment. |
+| `seal_target_bytes` | no | Preferred minimum frozen partial bytes before sealing. Sparse output also seals when its active event-time span reaches 30 days, bounding recomputation. |
 | `max_live_segments` | no | Segment-count compaction backstop. |
 
 **Aggregation operations:**
