@@ -18,6 +18,8 @@ TESTS_DIR="${SCRIPT_DIR}/tests"
 PORT=4174
 VITE_PID=""
 
+node --test "${TESTS_DIR}/chart-copy-link.test.mjs"
+
 # Forward --no-rebuild to run-test.sh calls
 RUN_TEST_EXTRA_ARGS=()
 for arg in "$@"; do

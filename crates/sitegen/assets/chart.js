@@ -324,6 +324,10 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
   copyBtn.className = "copy-link";
   copyBtn.textContent = "Copy link";
 
+  const copyStatus = document.createElement("span");
+  copyStatus.className = "copy-link-status";
+  copyStatus.setAttribute("role", "status");
+
   const downloadBtn = document.createElement("button");
   downloadBtn.type = "button";
   downloadBtn.className = "download-csv";
@@ -346,6 +350,7 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
 
   windowBar.append(winLabel, startInput, arrow, endInput, copyBtn, downloadBtn);
   if (exploreBtn) windowBar.append(exploreBtn);
+  windowBar.append(copyStatus);
   toolbar.after(windowBar);
 
   function pad2(n) { return String(n).padStart(2, "0"); }
@@ -385,18 +390,22 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
     if (curBegin == null) return;
     const url = `${location.origin}${location.pathname}` +
       `#t=${Math.round(curBegin)},${Math.round(curEnd)}`;
-    let ok = false;
+    clearTimeout(copyResetTimer);
+    copyBtn.classList.remove("copied");
+    copyStatus.textContent = "";
     try {
       await navigator.clipboard.writeText(url);
-      ok = true;
     } catch (e) {
-      // Clipboard unavailable (e.g. non-secure context): reflect the range in
-      // the address bar so the user can copy it manually.
+      console.error("Copy link failed:", e);
       history.replaceState(null, "", url);
+      copyBtn.textContent = "Copy failed";
+      copyStatus.textContent = window.isSecureContext
+        ? "Could not copy the link. Copy it from the address bar instead."
+        : "Could not copy the link: clipboard access requires HTTPS. Copy it from the address bar instead.";
+      return;
     }
-    copyBtn.textContent = ok ? "Copied!" : "Link in URL";
+    copyBtn.textContent = "Copied!";
     copyBtn.classList.add("copied");
-    clearTimeout(copyResetTimer);
     copyResetTimer = setTimeout(() => {
       copyBtn.textContent = "Copy link";
       copyBtn.classList.remove("copied");
