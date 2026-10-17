@@ -18,7 +18,7 @@ TESTS_DIR="${SCRIPT_DIR}/tests"
 PORT=4174
 VITE_PID=""
 
-node --test "${TESTS_DIR}/chart-copy-link.test.mjs"
+node --test "${TESTS_DIR}"/*.test.mjs
 
 # Forward --no-rebuild to run-test.sh calls
 RUN_TEST_EXTRA_ARGS=()
