@@ -354,9 +354,13 @@ forever.
     order + `BTreeSet` for `covered`).
 - **Watermark.** `watermark = align_down(max_output_bucket_secs − allowed_lateness,
   interval)`, using `div_euclid` so negative watermarks (short history) align
-  correctly. Buckets that start `< watermark` are sealed; buckets `>= watermark`
-  are hot. `max_output_bucket_secs` is a single bounded `MAX(EXTRACT(EPOCH …))`
-  scan over the partials — no per-bucket state.
+  correctly. Buckets that start `< watermark` are eligible to seal; buckets
+  `>= watermark` are hot. One aggregate scan obtains the oldest and newest
+  output buckets — no per-bucket state.
+- **Seal triggers.** Eligible history seals when its compressed hot output
+  reaches the preferred byte target or its active event-time span reaches 30
+  days. The span backstop covers sparse derived series whose output remains
+  small while recreating it requires an expensive historical source graph.
 - **Build classification** (against `manifest.covered` vs the current partial set):
   *Reuse* (equal → serve as-is), *Incremental* (superset → advance watermark,
   seal `[old_sealed_hi, watermark)` into a new run if non-empty, recompute

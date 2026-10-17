@@ -145,9 +145,9 @@ pub fn merged_dir(cache_dir: &Path, cfg_hash: &str, node_id: &tinyfs::NodeID) ->
 //
 // Buckets below sealed_hi are frozen once and never rescanned, so per-build cost
 // is bounded to the hot window: the allowed-lateness tail plus whatever has
-// frozen since the last seal, which SEAL_TARGET_BYTES bounds. The alternative --
-// one mutable Parquet whose sealed prefix is rewritten every build -- costs
-// O(history) I/O per build.
+// frozen since the last seal, bounded by output size or event-time span. The
+// alternative -- one mutable Parquet whose sealed prefix is rewritten every
+// build -- costs O(history) I/O per build.
 //
 // Because a segment is identified by the bucket range it covers, late data below the
 // watermark is answerable: the segments holding those buckets are found by lookup,
@@ -171,6 +171,13 @@ pub fn merged_dir(cache_dir: &Path, cfg_hash: &str, node_id: &tinyfs::NodeID) ->
 /// collapsing hundreds of builds into one segment. Compaction is the right tool for
 /// making files genuinely large; this only has to stop the bleeding.
 pub const SEAL_TARGET_BYTES: u64 = 1024 * 1024;
+
+/// Maximum event-time span that may remain active below the byte target.
+///
+/// Sparse derived output can stay small while remaining expensive to recreate
+/// from a much larger upstream graph. This backstop prevents compressed output
+/// size from leaving years of history in the recomputed hot window.
+pub const MAX_ACTIVE_SPAN_SECS: i64 = 30 * 24 * 60 * 60;
 
 /// The event-time span covered by one source version, in epoch MICROSECONDS.
 ///
@@ -267,11 +274,11 @@ pub struct SegmentManifest {
     pub hot_digest: Option<String>,
     /// On-disk size of `hot.parquet` as of the last build, in bytes.
     ///
-    /// This is the seal trigger. `hot` spans `[sealed_hi, inf)`, which strictly
+    /// This is one seal trigger. `hot` spans `[sealed_hi, inf)`, which strictly
     /// contains the frozen span `[sealed_hi, watermark)` that a seal would
     /// write, so this is a conservative upper bound on how much a seal would
-    /// produce: below the target, sealing cannot be worthwhile, and we can skip
-    /// it without writing anything to find out.
+    /// produce. The event-time span backstop may still seal smaller sparse
+    /// output when leaving its upstream computation active would be unbounded.
     #[serde(default)]
     pub hot_bytes: u64,
     /// The source content this cache reflects: blake3 of each LIVE source
