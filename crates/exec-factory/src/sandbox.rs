@@ -10,7 +10,7 @@
 //! always an absolute path from `ExecConfig`, never `$PATH`-searched.
 
 use crate::config::ExecConfig;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::Duration;
 
@@ -33,11 +33,19 @@ pub enum SandboxError {
     Timeout(Duration),
     #[error("failed to wait for sandboxed process: {0}")]
     Wait(#[source] std::io::Error),
+    #[error("host input requires an explicit pond -d hostmount root")]
+    MissingHostRoot,
+    #[error("invalid host input '{0}': {1}")]
+    InvalidHostInput(String, String),
 }
 
 /// Build the `bwrap` argument vector for running `cfg.program` with
 /// `cfg.args` inside `staging`, per the design doc's §4 invocation.
-fn build_bwrap_args(cfg: &ExecConfig, staging: &Path) -> Vec<String> {
+fn build_bwrap_args(
+    cfg: &ExecConfig,
+    staging: &Path,
+    host_inputs: &[(PathBuf, String)],
+) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
 
     for dir in READONLY_SYSTEM_DIRS {
@@ -52,6 +60,8 @@ fn build_bwrap_args(cfg: &ExecConfig, staging: &Path) -> Vec<String> {
     args.push("/dev".to_string());
     args.push("--proc".to_string());
     args.push("/proc".to_string());
+    args.push("--tmpfs".to_string());
+    args.push("/tmp".to_string());
 
     let staging_str = staging.to_string_lossy().to_string();
     args.push("--bind".to_string());
@@ -59,6 +69,12 @@ fn build_bwrap_args(cfg: &ExecConfig, staging: &Path) -> Vec<String> {
     args.push(staging_str.clone());
     args.push("--chdir".to_string());
     args.push(staging_str);
+
+    for (source, target) in host_inputs {
+        args.push("--ro-bind".to_string());
+        args.push(source.to_string_lossy().to_string());
+        args.push(target.clone());
+    }
 
     args.push("--unshare-pid".to_string());
     args.push("--die-with-parent".to_string());
@@ -101,8 +117,13 @@ fn build_bwrap_args(cfg: &ExecConfig, staging: &Path) -> Vec<String> {
 /// elapsed. stdin/stdout/stderr are inherited from the `pond` process by
 /// default (standard `tokio::process::Command` behavior), so an
 /// `interactive: true` program talking to a real terminal just works.
-pub async fn run_sandboxed(cfg: &ExecConfig, staging: &Path) -> Result<ExitStatus, SandboxError> {
-    let args = build_bwrap_args(cfg, staging);
+pub async fn run_sandboxed(
+    cfg: &ExecConfig,
+    staging: &Path,
+    host_root: Option<&Path>,
+) -> Result<ExitStatus, SandboxError> {
+    let host_inputs = resolve_host_inputs(cfg, host_root)?;
+    let args = build_bwrap_args(cfg, staging, &host_inputs);
 
     let mut child = tokio::process::Command::new("bwrap")
         .args(&args)
@@ -131,6 +152,46 @@ pub async fn run_sandboxed(cfg: &ExecConfig, staging: &Path) -> Result<ExitStatu
     }
 }
 
+fn resolve_host_inputs(
+    cfg: &ExecConfig,
+    host_root: Option<&Path>,
+) -> Result<Vec<(PathBuf, String)>, SandboxError> {
+    if cfg.host_inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let root = host_root.ok_or(SandboxError::MissingHostRoot)?;
+    let root = std::fs::canonicalize(root).map_err(|error| {
+        SandboxError::InvalidHostInput(root.display().to_string(), error.to_string())
+    })?;
+    if !root.is_dir() {
+        return Err(SandboxError::InvalidHostInput(
+            root.display().to_string(),
+            "hostmount root is not a directory".to_string(),
+        ));
+    }
+
+    cfg.host_inputs
+        .iter()
+        .map(|mount| {
+            let relative = mount
+                .source
+                .strip_prefix('/')
+                .expect("validated absolute host input");
+            let requested = root.join(relative);
+            let resolved = std::fs::canonicalize(&requested).map_err(|error| {
+                SandboxError::InvalidHostInput(mount.source.clone(), error.to_string())
+            })?;
+            if !resolved.starts_with(&root) {
+                return Err(SandboxError::InvalidHostInput(
+                    mount.source.clone(),
+                    "path escapes the explicit hostmount root".to_string(),
+                ));
+            }
+            Ok((resolved, mount.target.clone()))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,6 +203,7 @@ mod tests {
             inputs: vec!["/in.txt".to_string()],
             outputs: vec![],
             series_outputs: vec![],
+            host_inputs: vec![],
             env: Default::default(),
             network: false,
             interactive: false,
@@ -152,7 +214,7 @@ mod tests {
     #[test]
     fn bwrap_args_scope_network_and_pid_by_default() {
         let cfg = test_config();
-        let args = build_bwrap_args(&cfg, Path::new("/tmp/staging-test"));
+        let args = build_bwrap_args(&cfg, Path::new("/tmp/staging-test"), &[]);
         assert!(args.contains(&"--unshare-net".to_string()));
         assert!(args.contains(&"--unshare-pid".to_string()));
         assert!(args.contains(&"--die-with-parent".to_string()));
@@ -164,7 +226,7 @@ mod tests {
     fn bwrap_args_allow_network_when_configured() {
         let mut cfg = test_config();
         cfg.network = true;
-        let args = build_bwrap_args(&cfg, Path::new("/tmp/staging-test"));
+        let args = build_bwrap_args(&cfg, Path::new("/tmp/staging-test"), &[]);
         assert!(!args.contains(&"--unshare-net".to_string()));
     }
 
@@ -172,7 +234,7 @@ mod tests {
     fn bwrap_args_drop_new_session_when_interactive() {
         let mut cfg = test_config();
         cfg.interactive = true;
-        let args = build_bwrap_args(&cfg, Path::new("/tmp/staging-test"));
+        let args = build_bwrap_args(&cfg, Path::new("/tmp/staging-test"), &[]);
         assert!(!args.contains(&"--new-session".to_string()));
     }
 
@@ -191,13 +253,14 @@ mod tests {
             inputs: vec!["/in.txt".to_string()],
             outputs: vec!["/out.txt".to_string()],
             series_outputs: vec![],
+            host_inputs: vec![],
             env: Default::default(),
             network: false,
             interactive: false,
             timeout_seconds: Some(10),
         };
 
-        let status = run_sandboxed(&cfg, dir.path())
+        let status = run_sandboxed(&cfg, dir.path(), None)
             .await
             .expect("bwrap should run (install bubblewrap on this Linux host)");
         assert!(status.success());
@@ -220,6 +283,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![],
             series_outputs: vec![],
+            host_inputs: vec![],
             env: Default::default(),
             network: false,
             interactive: true,
@@ -227,9 +291,75 @@ mod tests {
         };
         assert_eq!(cfg.effective_timeout(), None);
 
-        let status = run_sandboxed(&cfg, dir.path())
+        let status = run_sandboxed(&cfg, dir.path(), None)
             .await
             .expect("bwrap should run (install bubblewrap on this Linux host)");
         assert!(status.success());
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn host_input_is_visible_and_read_only() {
+        let host_root = tempfile::tempdir().expect("host root");
+        let staging = tempfile::tempdir().expect("staging");
+        std::fs::create_dir(host_root.path().join("statements")).expect("statement dir");
+        std::fs::write(
+            host_root.path().join("statements/bank.pdf"),
+            b"statement bytes",
+        )
+        .expect("statement");
+        let cfg = ExecConfig {
+            program: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "cat /inbox/bank.pdf > copied.pdf; ! echo changed > /inbox/bank.pdf".to_string(),
+            ],
+            inputs: vec![],
+            outputs: vec!["/copied.pdf".to_string()],
+            series_outputs: vec![],
+            host_inputs: vec![crate::config::HostInput {
+                source: "/statements".to_string(),
+                target: "/inbox".to_string(),
+            }],
+            env: Default::default(),
+            network: false,
+            interactive: false,
+            timeout_seconds: Some(10),
+        };
+
+        let status = run_sandboxed(&cfg, staging.path(), Some(host_root.path()))
+            .await
+            .expect("host input sandbox run");
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read(staging.path().join("copied.pdf")).expect("copied output"),
+            b"statement bytes"
+        );
+        assert_eq!(
+            std::fs::read(host_root.path().join("statements/bank.pdf")).expect("host statement"),
+            b"statement bytes"
+        );
+    }
+
+    #[test]
+    fn host_input_requires_explicit_root_and_stays_within_it() {
+        let root = tempfile::tempdir().expect("host root");
+        std::fs::create_dir(root.path().join("statements")).expect("statement dir");
+        let mut cfg = test_config();
+        cfg.host_inputs.push(crate::config::HostInput {
+            source: "/statements".to_string(),
+            target: "/inbox".to_string(),
+        });
+
+        assert!(matches!(
+            resolve_host_inputs(&cfg, None),
+            Err(SandboxError::MissingHostRoot)
+        ));
+        let mounts = resolve_host_inputs(&cfg, Some(root.path())).expect("resolve mount");
+        assert_eq!(
+            mounts[0].0,
+            std::fs::canonicalize(root.path().join("statements")).expect("canonical statement dir")
+        );
+        assert_eq!(mounts[0].1, "/inbox");
     }
 }

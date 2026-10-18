@@ -23,6 +23,20 @@ use tinyfs::ResultExt;
 /// Default wall-clock timeout for ordinary (non-interactive) runs. See
 /// [`ExecConfig::effective_timeout`] for how `interactive` changes this.
 const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
+const RESERVED_SANDBOX_TARGETS: &[&str] = &[
+    "/bin", "/dev", "/etc", "/lib", "/lib64", "/proc", "/sbin", "/tmp", "/usr",
+];
+
+/// A read-only path projected from the operator-selected hostmount root into
+/// the external program's bubblewrap sandbox.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostInput {
+    /// Absolute path within the `pond -d` hostmount namespace.
+    pub source: String,
+    /// Absolute path at which the source is visible inside the sandbox.
+    pub target: String,
+}
 
 /// Configuration for one `exec` factory mount.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +77,12 @@ pub struct ExecConfig {
     /// output error.
     #[serde(default)]
     pub series_outputs: Vec<String>,
+
+    /// Read-only paths from the explicit `pond -d` hostmount root. The exec
+    /// run fails unless the operator supplied `-d`; pond-stored configuration
+    /// can never select an ambient host filesystem root by itself.
+    #[serde(default)]
+    pub host_inputs: Vec<HostInput>,
 
     /// Explicit environment variables set inside the sandbox. Empty by
     /// default -- nothing is inherited from the `pond` process environment.
@@ -120,9 +140,14 @@ pub fn validate_exec_config(config_bytes: &[u8]) -> TinyFSResult<serde_json::Val
             config.program
         )));
     }
-    if config.inputs.is_empty() && config.outputs.is_empty() && config.series_outputs.is_empty() {
+    if config.inputs.is_empty()
+        && config.outputs.is_empty()
+        && config.series_outputs.is_empty()
+        && config.host_inputs.is_empty()
+    {
         return Err(tinyfs::Error::Other(
-            "exec config: at least one of 'inputs', 'outputs', or 'series_outputs' must be set"
+            "exec config: at least one of 'inputs', 'outputs', 'series_outputs', or \
+             'host_inputs' must be set"
                 .to_string(),
         ));
     }
@@ -140,8 +165,52 @@ pub fn validate_exec_config(config_bytes: &[u8]) -> TinyFSResult<serde_json::Val
             )));
         }
     }
+    for (index, mount) in config.host_inputs.iter().enumerate() {
+        validate_absolute_path("host_inputs source", &mount.source, true)?;
+        validate_absolute_path("host_inputs target", &mount.target, false)?;
+        if RESERVED_SANDBOX_TARGETS
+            .iter()
+            .any(|reserved| path_contains(reserved, &mount.target))
+        {
+            return Err(tinyfs::Error::Other(format!(
+                "exec config: host_inputs target '{}' overlaps reserved sandbox path",
+                mount.target
+            )));
+        }
+        for prior in &config.host_inputs[..index] {
+            if path_contains(&prior.target, &mount.target)
+                || path_contains(&mount.target, &prior.target)
+            {
+                return Err(tinyfs::Error::Other(format!(
+                    "exec config: host_inputs targets '{}' and '{}' overlap",
+                    prior.target, mount.target
+                )));
+            }
+        }
+    }
 
     serde_json::to_value(config).map_other_context("Failed to convert exec config")
+}
+
+fn validate_absolute_path(label: &str, value: &str, allow_root: bool) -> TinyFSResult<()> {
+    if !value.starts_with('/')
+        || (!allow_root && value == "/")
+        || (value.len() > 1 && value.ends_with('/'))
+        || value.contains("//")
+        || value.split('/').any(|part| part == "." || part == "..")
+    {
+        return Err(tinyfs::Error::Other(format!(
+            "exec config: {label} must be a clean absolute path, got '{value}'"
+        )));
+    }
+    Ok(())
+}
+
+fn path_contains(parent: &str, child: &str) -> bool {
+    child == parent
+        || child
+            .strip_prefix(parent)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 #[cfg(test)]
@@ -175,6 +244,7 @@ outputs: ["/data/out.txt"]
         assert_eq!(config.program, "/bin/cat");
         assert_eq!(config.effective_timeout(), Some(Duration::from_secs(60)));
         assert!(!config.network);
+        assert!(config.host_inputs.is_empty());
     }
 
     #[test]
@@ -218,5 +288,27 @@ outputs: ["/data/out.txt"]
         let config: ExecConfig = serde_json::from_value(value).expect("round-trip");
         assert!(!config.interactive);
         assert_eq!(config.effective_timeout(), None);
+    }
+
+    #[test]
+    fn accepts_confined_host_input() {
+        let yaml = b"program: /bin/cat\ninputs: []\noutputs: []\nhost_inputs:\n  - source: /\n    target: /inbox\n";
+        let value = validate_exec_config(yaml).expect("valid host input should parse");
+        let config: ExecConfig = serde_json::from_value(value).expect("round-trip");
+        assert_eq!(config.host_inputs.len(), 1);
+        assert_eq!(config.host_inputs[0].target, "/inbox");
+    }
+
+    #[test]
+    fn rejects_unsafe_host_input_paths() {
+        for yaml in [
+            "program: /bin/cat\nhost_inputs: [{source: ../secret, target: /inbox}]\n",
+            "program: /bin/cat\nhost_inputs: [{source: /, target: /}]\n",
+            "program: /bin/cat\nhost_inputs: [{source: /, target: /etc/inbox}]\n",
+            "program: /bin/cat\nhost_inputs: [{source: /a/../b, target: /inbox}]\n",
+            "program: /bin/cat\nhost_inputs:\n  - {source: /a, target: /inbox}\n  - {source: /b, target: /inbox/nested}\n",
+        ] {
+            let _ = validate_exec_config(yaml.as_bytes()).expect_err("unsafe host input must fail");
+        }
     }
 }
