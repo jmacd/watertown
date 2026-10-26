@@ -234,8 +234,9 @@ pond cat host+csv:///tmp/data.csv --format=table --sql "SELECT * FROM source WHE
 # Query a host zstd-compressed CSV
 pond cat host+csv+zstd:///tmp/data.csv.zst --format=table
 
-# View or query a binary Excel workbook (no pond needed)
+# View or query an Excel workbook (no pond needed)
 pond cat 'host+xls:///tmp/readings.xls?sheet=Readings' --format=table
+pond cat 'host+xls:///tmp/Account%20QuickReport.xlsx' --format=table
 pond cat 'host+xls:///tmp/readings.xls?sheet=Readings' --format=table --sql "SELECT * FROM source WHERE value > 20"
 
 # Read relative to a host directory (the URL path is relative to this root)
@@ -261,8 +262,9 @@ The table is always named `source` in SQL queries.
 
 | Flag | Output | When to use |
 |------|--------|-------------|
-| `--format=raw` (default) | Parquet bytes (binary) | Piping to files, downstream tools |
-| `--format=table` | Human-readable text table | Terminal display, debugging |
+| `--format=auto` (default) | Text table for queryable data; original bytes for non-queryable files | Terminal display and text pagers |
+| `--format=raw` | Parquet bytes for queryable data; original bytes otherwise | Binary export to files and downstream Parquet tools |
+| `--format=table` | Human-readable text table | Explicit human-readable display |
 
 > **Note**: `--format` on `pond cat` controls **output display** (raw bytes vs ASCII table).
 > `pond copy` does not have a `--format` flag — entry type is encoded in the source URL
@@ -271,11 +273,11 @@ The table is always named `source` in SQL queries.
 `--sql` controls **what** data is queried; `--format` controls **how** it's displayed.
 
 ```bash
-# Parquet bytes to file (default)
-pond cat oteljson:///ingest/data.json --sql "SELECT * FROM source" > output.parquet
+# Parquet bytes to file
+pond cat oteljson:///ingest/data.json --format=raw --sql "SELECT * FROM source" > output.parquet
 
-# Human-readable table to terminal
-pond cat oteljson:///ingest/data.json --format=table --sql "SELECT * FROM source LIMIT 5"
+# Human-readable table to a terminal or pager
+pond cat oteljson:///ingest/data.json --sql "SELECT * FROM source LIMIT 5" | less
 
 # Human-readable table, no SQL (full SELECT * ORDER BY timestamp)
 pond cat oteljson:///ingest/data.json --format=table
@@ -419,10 +421,10 @@ expose the base schema with zero posting rows.
 Parsing buffers the file and runs on a blocking worker; SQL filters and batch
 size do not reduce input parsing or make the reader bounded-memory.
 
-#### Binary Excel (`xls`)
+#### Excel (`xls`)
 
-The Calamine-backed `xls` provider reads **binary `.xls` workbooks**, not `.xlsx`
-files or Excel-compatible HTML (use `excelhtml` for HydroVu HTML exports).
+The Calamine-backed `xls` provider reads `.xls` and `.xlsx` workbooks, but not
+Excel-compatible HTML (use `excelhtml` for HydroVu HTML exports).
 It works through the normal format-provider paths, including pond files,
 host files, and SQL-derived tables. Use `pond cat`, not `pond run`.
 The host prefix is `host+`, not `hostfs+`. Provider URLs have an empty host
@@ -433,18 +435,29 @@ that directory. Neither form requires `$POND`.
 | Query parameter | Default | Meaning |
 |-----------------|---------|---------|
 | `sheet` | Sole worksheet | Exact worksheet name. Required for workbooks with multiple worksheets; errors list available names. URL-encode spaces and other reserved characters. |
-| `header` | `true` | First populated row supplies column names. `false` keeps it as data and generates `column_1`, `column_2`, etc. |
+| `table` | Sole Excel Table | Optional Excel Table name. A sole table in the selected `.xlsx` worksheet is used automatically; multiple tables require selection. Cannot be combined with `header=false` or `header_row`. |
+| `header` | `true` | The selected header row supplies column names. `false` keeps every row as data and generates `column_1`, `column_2`, etc. |
+| `header_row` | Auto-detected | Optional one-based worksheet row containing column names. Earlier report-preamble rows are excluded from output and type inference. Requires `header=true`. |
 | `batch_size` | `8192` | Positive maximum rows per Arrow batch. |
 
-Blank headers receive generated names; duplicate names are rejected (use
-`header=false` to read them as data). Inference examines the entire selected
-worksheet: numeric columns become `Int64` or `Float64`, booleans become `Boolean`,
-and Excel datetimes become timezone-free microsecond timestamps. Integer/float
-mixtures become `Float64`; other mixed-type columns become text without dropping
-values. Datetimes in text columns use ISO-style date/time strings; Excel durations
-remain text containing their serial-day values. Empty cells are nulls, empty-only
-columns are text, and internal blank rows are retained. Leading unused rows and
-columns outside the populated range are omitted.
+For `.xlsx`, a declared Excel Table supplies its exact range and column names.
+Without a declared table, header detection normally selects the first populated
+row. It also recognizes report exports consisting of one-cell title rows, a blank
+separator row, and a multi-column text header; the title material is then excluded
+automatically. Use `header_row` only to override an ambiguous or unusual worksheet
+layout.
+Blank headers receive generated names when their columns contain data; unnamed
+columns that are empty in every data row are omitted as worksheet layout. Named
+empty columns remain in the schema. Duplicate names are rejected (use
+`header=false` to read them as data). Inference examines rows after the selected
+header row, or the entire worksheet when `header=false`: numeric columns become
+`Int64` or `Float64`, booleans become `Boolean`, and Excel datetimes become
+timezone-free microsecond timestamps. Integer/float mixtures become `Float64`;
+other mixed-type columns become text without dropping values. Datetimes in text
+columns use ISO-style date/time strings; Excel durations remain text containing
+their serial-day values. Empty cells are nulls, and internal blank rows are
+retained. Leading unused rows and columns outside the populated range are
+omitted.
 
 Spreadsheet error cells, invalid options, unreadable workbooks, and empty
 worksheets fail explicitly. Header-only worksheets expose their schema with zero
@@ -2534,15 +2547,16 @@ are derived state rather than independently authoritative data.
 
 ### `pond cat` outputs binary garbage
 
-**Cause**: You're catting a table/series entry without `--format=table` or `--sql`.
-The default output format is Parquet bytes (binary).
-**Fix**: Add `--format=table` for human-readable output, or `--sql "SELECT * FROM source LIMIT 10"`.
+**Cause**: `--format=raw` was selected for a queryable source, producing Parquet
+bytes.
+**Fix**: Omit `--format` or use `--format=table` for human-readable output.
 
 ### `--format` does the wrong thing
 
 **Cause**: `--format` on `pond cat` controls output display (raw vs table).
 `pond copy` does not use `--format` — entry type is in the source URL.
-**Fix**: For `pond cat`, use `--format=raw` (default, binary) or `--format=table` (ASCII).
+**Fix**: For `pond cat`, use the default `--format=auto`, explicit
+`--format=raw` for binary Parquet, or `--format=table` for ASCII.
 For `pond copy`, use `host:///` (data), `host+table:///` (Parquet), or `host+series:///` (time-series).
 
 ### `host+table:///` errors on CSV

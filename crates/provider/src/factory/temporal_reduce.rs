@@ -2324,10 +2324,7 @@ impl TemporalReduceSqlFile {
         // partial SQL would reference columns absent from those siblings.
         let url = crate::Url::parse(&self.pattern_url)
             .map_other_context(format!("Invalid pattern URL '{}'", self.pattern_url))?;
-        let tinyfs_path = percent_encoding::percent_decode_str(url.path())
-            .decode_utf8()
-            .map_other_context(format!("Invalid UTF-8 in URL path '{}'", url.path()))?
-            .to_string();
+        let tinyfs_path = url.path().to_string();
 
         let tinyfs_root = self
             .context

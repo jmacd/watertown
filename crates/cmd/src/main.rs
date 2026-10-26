@@ -491,7 +491,7 @@ enum Commands {
         /// File path to read
         path: String,
         /// Output format [default: auto] [possible values: auto, raw, table]
-        /// auto: table for queryable types when stdout is a TTY, raw otherwise
+        /// auto: table for queryable types, raw for non-queryable files
         #[arg(long, default_value = "auto")]
         format: String,
         /// Time range start (Unix timestamp in milliseconds, optional)

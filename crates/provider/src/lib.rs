@@ -81,6 +81,8 @@ use tokio::io::AsyncRead;
 #[derive(Debug, Clone)]
 pub struct Url {
     inner: url::Url,
+    /// Decoded filesystem/TinyFS path. `inner` retains the encoded form for display.
+    path: String,
     /// The base format scheme (e.g., "csv", "oteljson"), without host prefix, compression, or entry type
     format_scheme: String,
     /// The full scheme including compression and entry type suffixes (e.g., "csv+gzip+series")
@@ -100,7 +102,7 @@ impl PartialEq for Url {
             && self.compression == other.compression
             && self.entry_type == other.entry_type
             && self.is_host == other.is_host
-            && self.inner.path() == other.inner.path()
+            && self.path == other.path
             && self.inner.query() == other.inner.query()
     }
 }
@@ -218,6 +220,11 @@ impl Url {
             )));
         }
 
+        let path = percent_encoding::percent_decode_str(inner.path())
+            .decode_utf8()
+            .map_err(|e| Error::InvalidUrl(format!("URL path is not valid UTF-8: {e}")))?
+            .into_owned();
+
         // Classify scheme segments: split on '+' and assign each to its category.
         // The first segment is the format scheme UNLESS it is itself a known entry
         // type (e.g., `table:///path` or `series:///path`), in which case format
@@ -288,6 +295,7 @@ impl Url {
 
         Ok(Self {
             inner,
+            path,
             format_scheme,
             full_scheme_str,
             compression,
@@ -345,12 +353,13 @@ impl Url {
     /// Get TinyFS path or pattern (also used for host filesystem paths)
     #[must_use]
     pub fn path(&self) -> &str {
-        self.inner.path()
+        &self.path
     }
 
     pub(crate) fn with_path(&self, path: &str) -> Self {
         let mut url = self.clone();
         url.inner.set_path(path);
+        url.path = path.to_string();
         url
     }
 
@@ -493,6 +502,17 @@ mod tests {
         assert_eq!(url.path(), "/tmp/traces.json");
         assert_eq!(url.compression(), None);
         assert_eq!(url.to_string(), "host+oteljson:///tmp/traces.json");
+    }
+
+    #[test]
+    fn test_url_path_is_decoded_but_display_is_encoded() {
+        let url = Url::parse("host+xls:///tmp/My Workbook.xlsx").unwrap();
+        assert_eq!(url.path(), "/tmp/My Workbook.xlsx");
+        assert_eq!(url.to_string(), "host+xls:///tmp/My%20Workbook.xlsx");
+
+        let encoded = Url::parse("host+xls:///tmp/My%20Workbook.xlsx").unwrap();
+        assert_eq!(encoded.path(), "/tmp/My Workbook.xlsx");
+        assert_eq!(encoded, url);
     }
 
     #[test]

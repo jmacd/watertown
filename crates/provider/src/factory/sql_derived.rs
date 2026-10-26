@@ -548,14 +548,7 @@ impl SqlDerivedFile {
             vec![entry_type]
         };
 
-        // Extract TinyFS path from URL, percent-decoding so that URL-encoded
-        // characters (e.g., %20 for spaces) are converted back to their literal
-        // form for tinyfs path matching.
-        let tinyfs_path_decoded = percent_encoding::percent_decode_str(url.path())
-            .decode_utf8()
-            .map_other_context(format!("Invalid UTF-8 in URL path '{}'", url.path()))?
-            .to_string();
-        let tinyfs_path = tinyfs_path_decoded.as_str();
+        let tinyfs_path = url.path();
 
         // STEP 1: Get root from FactoryContext (respects effective_root
         // for cross-pond imports where "/" means the foreign root).
