@@ -4,7 +4,10 @@
 
 Test Watertown -> Classify results -> Fix the right layer -> Save passing tests
 
-**Living documentation**: `docs/cli-reference.md` is THE source of truth. Update it when you learn something.
+**Living documentation**: the four migrated pilot topics in `docs/manual/`
+are authoritative; follow `docs/README.md` and execute the exact fixtures in
+`testsuite/examples/`. For topics not yet migrated, update
+`docs/cli-reference.md`. Do not maintain two complete copies.
 
 ---
 

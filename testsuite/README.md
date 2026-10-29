@@ -2,6 +2,11 @@
 
 > See [AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md) for the full testing workflow.
 
+The [manual authoring workflow](../docs/README.md) maps the four pilot pages
+to reusable [example packages](examples/README.md) and numbered assertions.
+Update migrated topics in `docs/manual/`; other topics remain in the existing
+reference until individually reviewed and migrated.
+
 ## Quick Start
 
 ```bash

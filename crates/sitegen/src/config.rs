@@ -35,6 +35,12 @@ use std::collections::BTreeMap;
 #[serde(deny_unknown_fields)]
 pub struct SiteConfig {
     pub site: SiteMeta,
+    /// Opt in to source-relative manual paths, literal code, and lean assets.
+    #[serde(default)]
+    pub documentation: Option<DocumentationConfig>,
+    /// Reject incomplete routes, navigation, includes, and local links.
+    #[serde(default)]
+    pub strict: bool,
     #[serde(default)]
     pub content: Vec<ContentStage>,
     #[serde(default)]
@@ -131,6 +137,19 @@ pub struct SiteConfig {
     /// See `StatusGridConfig` for fields.
     #[serde(default)]
     pub status_grid: Option<StatusGridConfig>,
+}
+
+/// Bounded documentation capabilities; paths are relative to the input root.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentationConfig {
+    /// Required renderer contract. Unsupported revisions fail explicitly.
+    pub version: u32,
+    /// Markdown root used to derive nested slugs (excluding `_generated`).
+    pub source_root: String,
+    /// Approved directories for literal source inclusions.
+    #[serde(default)]
+    pub include_roots: Vec<String>,
 }
 
 /// Config for the per-pond systemd status card grid.

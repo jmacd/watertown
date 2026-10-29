@@ -1,13 +1,28 @@
 # Documentation system design and work sequence
 
-Status: proposed; implementation has not started.
+Status: D01-D05 implemented and verified. D06-D11 remain unimplemented.
 
-The manual will be built with Watertown sitegen and published through GitHub
-Pages. A bounded four-page pilot establishes implementation readiness before
+The manual is built with Watertown sitegen; GitHub Pages publication remains
+D10 work. A bounded four-page pilot establishes implementation readiness before
 broad migration; it does not select the publishing tool. There is no fallback
 to MkDocs or another generator. Search is deferred. This document defines the
 design, migration strategy, work dependencies, and acceptance criteria. Paths
 below are relative to the repository root.
+
+The pilot includes the source-reviewed inventory, shared executable fixtures,
+strict documentation renderer contract 1, and all four reference/guide pages.
+`docs/README.md` documents the cached-binary authoring workflow. Sitegen unit
+tests, Clippy, and numbered tests 057, 100, 210, and 213 pass with the current
+native binary. Ordinary and Compose fixture mounts were also exercised.
+Test 213 verifies strict failures, literal syntax, lean assets, preview
+preservation, and prose rebuilding with Cargo unavailable. The generated
+preview was checked over localhost HTTP without opening a browser.
+
+The current container image predates the renderer changes; the documentation
+gate was verified natively, not against that image. CI must rebuild the image
+from this revision. The inventory retains 125 pending public entries; compiled
+discovery, generated-reference freshness, broad migration, deployment, and
+README redesign are intentionally outside this completed pilot.
 
 ## 1. Goals
 
@@ -138,7 +153,7 @@ explicitly recorded exclusions, not accidental omissions.
 
 ## 4. Source layout and ownership
 
-Proposed layout:
+Target layout (the pilot subset is implemented; later directories follow):
 
 ```text
 docs/
@@ -176,15 +191,16 @@ testsuite/
     ...
 ```
 
-Build from the repository root using the existing command mechanism:
+Build from the repository root using a compatible cached binary:
 
 ```bash
-pond run -d "$PWD" host+sitegen:///docs/site.yaml build ./site
+make docs-build POND_BIN="$PWD/target/debug/pond"
 ```
 
-The configuration and source layout are proposed, not implemented. Strict mode
-will be added before this command is used for publication. The repository is a
-host filesystem input, not a pond to initialize or ingest.
+The wrapper prepares fixture downloads and invokes the existing host-mode
+sitegen command with `-- build OUTPUT --strict`. The repository is a host
+filesystem input, not a pond to initialize or ingest. Generated HTML remains
+outside the selected source tree and is not committed.
 
 | Content | Authoritative source |
 |---|---|
@@ -220,7 +236,7 @@ reference generation separate: the renderer reads declared inputs but does not
 run the tests or generate the Rust catalog as a side effect of rendering.
 
 Introduce behavior that could affect existing sites through explicit opt-in
-configuration or flags, such as a proposed documentation layout and `--strict`
+configuration or flags, such as the documentation configuration and `--strict`
 build flag. Check existing sitegen behavior before changing global shortcode,
 slug, or asset rules.
 
@@ -248,8 +264,7 @@ or host-required tests as well.
 
 ### Inclusion in documentation
 
-Add a literal-source inclusion facility to sitegen. For example, the following
-is proposed syntax, not an existing shortcode:
+The implemented contract 1 literal-source inclusion syntax is:
 
 ```text
 {{ source path="/testsuite/examples/synthetic-timeseries/config.yaml" language="yaml" /}}
@@ -407,13 +422,14 @@ identifying the component, page, or example requiring attention.
 
 Document how to obtain or select a compatible `pond` binary, then add Make
 targets for build, preview, reference freshness checks, and example execution.
-Target names are proposed:
+The pilot targets are implemented; compiled-reference freshness and complete
+coverage remain D06 and later work:
 
 | Target | Responsibility |
 |---|---|
 | `make docs-build` | Build the manual with sitegen in strict mode, without executing examples or unconditionally rebuilding Rust |
 | `make docs-serve` | Serve the generated site with an existing static HTTP server, without opening a browser automatically |
-| `make docs-check` | Check reference freshness and documentation coverage |
+| `make docs-check` | Check pilot mappings now; compiled-reference freshness and coverage begin at D06 |
 | `make docs-examples` | Run the documented-example selection through the existing harness |
 
 Document which targets require Rust, containers, or extra services. Keep

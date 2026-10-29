@@ -27,6 +27,8 @@ services:
   test:
     image: watertown-test:latest
     environment:
+      EXAMPLES_ROOT: /examples
+      REPO_ROOT: /repo
       POND: /pond
       POND1: /pond1
       POND2: /pond2

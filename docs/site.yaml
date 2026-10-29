@@ -1,0 +1,57 @@
+site:
+  title: Watertown development manual
+  base_url: "/watertown/"
+  github_url: https://github.com/jmacd/watertown
+documentation:
+  version: 1
+  source_root: /docs/manual
+  include_roots:
+    - /testsuite/examples
+strict: true
+content:
+  - name: reference
+    pattern: "/docs/manual/reference/**/*.md"
+  - name: guides
+    pattern: "/docs/manual/guides/**/*.md"
+routes:
+  - name: home
+    type: static
+    slug: ""
+    page: /docs/manual/index.md
+    routes:
+      - name: reference
+        type: content
+        slug: ""
+        content: reference
+      - name: guides
+        type: content
+        slug: ""
+        content: guides
+partials:
+  sidebar: /docs/templates/sidebar.md
+sidebar:
+  - label: Manual home
+    href: /index.html
+  - label: Guides
+    children:
+      - label: Timeseries
+        href: /guides/timeseries.html
+  - label: Reference
+    children:
+      - label: Factories
+        children:
+          - label: Synthetic timeseries
+            href: /reference/factories/synthetic-timeseries.html
+      - label: Formats
+        children:
+          - label: CSV
+            href: /reference/formats/csv.html
+      - label: Sitegen
+        children:
+          - label: Shortcodes
+            href: /reference/sitegen/shortcodes.html
+static:
+  - pattern: "/testsuite/examples/csv-query/*"
+  - pattern: "/testsuite/examples/synthetic-timeseries/*"
+  - pattern: "/testsuite/examples/documentation-pilot/*"
+footer: Development documentation; four-page pilot, not a complete interface reference.

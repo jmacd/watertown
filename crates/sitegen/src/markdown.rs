@@ -228,7 +228,7 @@ fn restore_scripts(html: &mut String, scripts: &[String]) {
 // --- Shortcodes --------------------------------------------------------------
 
 /// A registered shortcode function.
-pub type ShortcodeFn = Box<dyn Fn(&ShortcodeArgs) -> String + Send + Sync>;
+pub type ShortcodeFn = Box<dyn Fn(&ShortcodeArgs) -> Result<String, String> + Send + Sync>;
 
 /// Registry of named shortcode functions.
 #[derive(Default)]
@@ -242,6 +242,13 @@ impl Shortcodes {
     pub fn register<F>(&mut self, name: &str, func: F)
     where
         F: Fn(&ShortcodeArgs) -> String + Send + Sync + 'static,
+    {
+        self.register_fallible(name, move |args| Ok(func(args)));
+    }
+
+    pub fn register_fallible<F>(&mut self, name: &str, func: F)
+    where
+        F: Fn(&ShortcodeArgs) -> Result<String, String> + Send + Sync + 'static,
     {
         self.0.insert(name.to_string(), Box::new(func));
     }
@@ -334,7 +341,7 @@ pub fn preprocess_shortcodes(
 
         if is_self_closing {
             if let Some(func) = shortcodes.get(name) {
-                output.push_str(&func(&ShortcodeArgs(args)));
+                output.push_str(&func(&ShortcodeArgs(args))?);
             } else {
                 return Err(format!("Unknown shortcode: '{}'", name));
             }
@@ -360,7 +367,7 @@ pub fn preprocess_shortcodes(
                 block_args.insert("body".to_string(), body);
 
                 if let Some(func) = shortcodes.get(name) {
-                    output.push_str(&func(&ShortcodeArgs(block_args)));
+                    output.push_str(&func(&ShortcodeArgs(block_args))?);
                 } else {
                     return Err(format!("Unknown shortcode: '{}'", name));
                 }
@@ -394,7 +401,7 @@ fn is_valid_name(name: &str) -> bool {
 }
 
 /// Parse `key="value" key2="value2"` into a HashMap.
-fn parse_args(input: &str) -> Result<HashMap<String, String>, String> {
+pub(crate) fn parse_args(input: &str) -> Result<HashMap<String, String>, String> {
     let mut args = HashMap::new();
     if input.is_empty() {
         return Ok(args);

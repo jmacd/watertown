@@ -1324,91 +1324,11 @@ config:
 
 ### synthetic-timeseries
 
-Generate synthetic timeseries with configurable waveforms. Produces Arrow
-RecordBatches in memory (no files on disk) — useful for testing, demos, and
-development with deterministic, visually distinct data.
-
-Each named **point** becomes a Float64 column. Its value at every timestamp is the
-**sum** of one or more waveform **components**, so you can layer signals to create
-complex but predictable shapes.
-
-```yaml
-start: "2024-01-01T00:00:00Z"
-end: "2024-01-02T00:00:00Z"
-interval: "15m"
-time_column: "timestamp"          # optional, default: "timestamp"
-points:
-  - name: "temperature"
-    components:
-      - type: sine
-        amplitude: 10.0
-        period: "24h"
-        offset: 20.0              # baseline value
-      - type: line
-        slope: 0.0002             # slow upward drift
-
-  - name: "pressure"
-    components:
-      - type: sine
-        amplitude: 5.0
-        period: "12h"
-        offset: 1013.0
-      - type: square
-        amplitude: 2.0
-        period: "6h"
-
-  - name: "humidity"
-    components:
-      - type: triangle
-        amplitude: 15.0
-        period: "8h"
-        offset: 60.0
-      - type: sine
-        amplitude: 3.0
-        period: "3h"
-        phase: 1.57               # phase offset in radians
-```
-
-**Component types:**
-
-| Type | Formula | Parameters |
-|------|---------|------------|
-| `sine` | `offset + amplitude × sin(2π·t/period + phase)` | `amplitude`, `period`, `offset`, `phase` |
-| `triangle` | `offset + amplitude × tri(t/period + phase)` | `amplitude`, `period`, `offset`, `phase` |
-| `square` | `offset + amplitude × sign(sin(2π·t/period + phase))` | `amplitude`, `period`, `offset`, `phase` |
-| `line` | `offset + slope × t` | `slope`, `offset` |
-
-- `t` is seconds elapsed since `start`.
-- `period` and `interval` accept human-readable durations: `30s`, `15m`, `1h`, `2d`, `1h30m`, etc.
-- All parameters default to `0.0` if omitted.
-
-**Usage:**
-
-```bash
-# Create the factory node
-pond mkdir /sensors
-pond mknod synthetic-timeseries /sensors/synth --config-path synth.yaml
-
-# Query with SQL (table is always named "source")
-pond cat /sensors/synth --sql "SELECT MIN(timestamp), MAX(timestamp), COUNT(*) FROM source"
-pond cat /sensors/synth --sql "SELECT * FROM source ORDER BY timestamp LIMIT 10"
-
-# Check value ranges
-pond cat /sensors/synth --sql "
-  SELECT
-    MIN(temperature) AS temp_min, MAX(temperature) AS temp_max,
-    MIN(pressure)    AS pres_min, MAX(pressure)    AS pres_max
-  FROM source
-"
-```
-
-**Notes:**
-- Data is generated on every query from the config — there is no stored state.
-- The node appears as `TableDynamic` in `pond list` output.
-- The timestamp column is `Timestamp(Millisecond, UTC)`.
-- Point names must be unique; at least one point with at least one component is required.
-- Works with `pond describe`, `pond cat --sql`, and any downstream factory
-  that reads `series:///` or `file:///` patterns.
+This topic has moved to the authoritative
+[synthetic-timeseries factory reference](manual/reference/factories/synthetic-timeseries.md),
+including configuration fields, waveform variants, current validation limits,
+and the exact executable fixture asserted by test `100`. Start with the
+[timeseries guide](manual/guides/timeseries.md) for a complete workflow.
 
 ---
 

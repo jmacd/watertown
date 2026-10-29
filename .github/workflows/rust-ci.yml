@@ -65,6 +65,9 @@ jobs:
       
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+      - name: Check documentation pilot mappings
+        run: make docs-check
       
       - name: Run clippy
         run: cargo clippy --workspace --all-features -- -D warnings

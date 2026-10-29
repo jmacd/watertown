@@ -460,6 +460,8 @@ mod tests {
 
     fn test_config() -> SiteConfig {
         SiteConfig {
+            documentation: None,
+            strict: false,
             site: SiteMeta {
                 title: "Test".to_string(),
                 base_url: "/test/".to_string(),
@@ -651,6 +653,8 @@ mod tests {
         );
 
         let config = SiteConfig {
+            documentation: None,
+            strict: false,
             site: SiteMeta {
                 title: "Test".to_string(),
                 base_url: "/".to_string(),

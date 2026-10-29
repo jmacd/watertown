@@ -1,5 +1,9 @@
 # Watertown Test Iteration Workflow
 
+For the documentation pilot, use the exact fixtures under `testsuite/examples/`
+and the authoring/migration boundaries in [docs/README.md](../docs/README.md).
+The numbered tests, not copied Markdown commands, assert documented results.
+
 ## ⛔ CRITICAL: NO "SIMPLE FIXES"
 
 **NEVER propose or implement "the simplest fix" or "a quick patch."**

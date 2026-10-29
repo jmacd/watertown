@@ -14,6 +14,7 @@
 //! ```
 
 mod config;
+mod documentation;
 mod email;
 mod factory;
 mod layouts;

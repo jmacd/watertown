@@ -42,6 +42,8 @@ png.workspace = true
 rss.workspace = true
 regex.workspace = true
 uuid.workspace = true
+tl.workspace = true
+percent-encoding.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
