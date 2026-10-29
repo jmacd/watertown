@@ -15,7 +15,11 @@ categories.workspace = true
 keywords.workspace = true
 description.workspace = true
 
+[features]
+documentation = ["dep:schemars"]
+
 [dependencies]
+schemars = { workspace = true, optional = true }
 url.workspace = true
 percent-encoding.workspace = true
 serde_qs.workspace = true

@@ -28,6 +28,7 @@ use tinyfs::{FileHandle, FileID, Result as TinyFSResult};
 /// Time range bounds for filtering
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct TimeRange {
     /// Optional start time (ISO 8601 format)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -41,6 +42,7 @@ pub struct TimeRange {
 /// Input source with URL pattern and optional time range
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct TimeseriesInput {
     /// URL pattern for matching time series files
     ///
@@ -73,6 +75,7 @@ pub struct TimeseriesInput {
 /// Configuration for the timeseries-join factory
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct TimeseriesJoinConfig {
     /// Name of the timestamp column (defaults to "timestamp")
     #[serde(default = "default_time_column")]

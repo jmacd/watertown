@@ -1,106 +1,676 @@
 {
   "version": 1,
-  "status": "D01 source-reviewed baseline; compiled discovery and new-interface enforcement begin at D06",
+  "status": "Reviewed compiled reference covers public interfaces; D11 migration cleanup remains. Coverage levels describe evidence, not completeness of service/browser testing.",
   "metadata_contract": {
     "component_ids": "namespace:name; CLI subcommands use slash-separated paths",
     "page_frontmatter": "doc_id is a plain scalar matching the page key below",
-    "coverage_levels": ["offline-e2e", "local-service-e2e", "live-service-e2e", "validation-only", "unverified"],
-    "pending": "All public IDs without a completed page mapping remain migration work, not exclusions.",
+    "coverage_levels": [
+      "offline-e2e",
+      "local-service-e2e",
+      "live-service-e2e",
+      "validation-only",
+      "unverified"
+    ],
+    "pending": "Explicit grandfathered IDs only. New compiled interfaces require documentation or an internal exclusion; completed entries cannot re-enter this list as part of ordinary reference generation.",
     "evidence": "Existing tests are seeds, not proof of asserted results unless coverage is explicitly recorded."
   },
   "public": {
     "cli": {
-      "source": "crates/cmd/src/main.rs",
+      "source": "crates/cmd/src/cli.rs",
       "ids": [
-        "cli:init", "cli:recover", "cli:maintain", "cli:show", "cli:log",
-        "cli:push", "cli:pull", "cli:restore", "cli:verify", "cli:status",
-        "cli:limits", "cli:tlog", "cli:tlog/show", "cli:tlog/verify", "cli:fsck",
-        "cli:rebuild-control", "cli:remote", "cli:remote/add", "cli:remote/remove",
-        "cli:remote/list", "cli:backup", "cli:backup/add", "cli:backup/remove",
-        "cli:backup/cleanup-uploads", "cli:backup/publish-consolidated", "cli:backup/list",
-        "cli:capsule", "cli:capsule/publish", "cli:capsule/recipe",
-        "cli:capsule/recipe/publish", "cli:capsule/recipe/inspect",
-        "cli:capsule/inspect", "cli:capsule/verify", "cli:capsule/import",
-        "cli:capsule/activate", "cli:freeze", "cli:freeze/enable", "cli:freeze/status",
-        "cli:freeze/disable", "cli:config", "cli:config/set", "cli:list", "cli:describe",
-        "cli:cat", "cli:copy", "cli:mkdir", "cli:mknod", "cli:apply",
-        "cli:list-factories", "cli:run", "cli:export", "cli:emergency",
-        "cli:emergency/erase-bucket", "cli:global-options"
+        "cli:init",
+        "cli:recover",
+        "cli:maintain",
+        "cli:show",
+        "cli:log",
+        "cli:push",
+        "cli:pull",
+        "cli:restore",
+        "cli:verify",
+        "cli:status",
+        "cli:limits",
+        "cli:tlog",
+        "cli:tlog/show",
+        "cli:tlog/verify",
+        "cli:fsck",
+        "cli:rebuild-control",
+        "cli:remote",
+        "cli:remote/add",
+        "cli:remote/remove",
+        "cli:remote/list",
+        "cli:backup",
+        "cli:backup/add",
+        "cli:backup/remove",
+        "cli:backup/cleanup-uploads",
+        "cli:backup/publish-consolidated",
+        "cli:backup/list",
+        "cli:capsule",
+        "cli:capsule/publish",
+        "cli:capsule/recipe",
+        "cli:capsule/recipe/publish",
+        "cli:capsule/recipe/inspect",
+        "cli:capsule/inspect",
+        "cli:capsule/verify",
+        "cli:capsule/import",
+        "cli:capsule/activate",
+        "cli:freeze",
+        "cli:freeze/enable",
+        "cli:freeze/status",
+        "cli:freeze/disable",
+        "cli:config",
+        "cli:config/set",
+        "cli:list",
+        "cli:describe",
+        "cli:cat",
+        "cli:copy",
+        "cli:mkdir",
+        "cli:mknod",
+        "cli:apply",
+        "cli:list-factories",
+        "cli:run",
+        "cli:export",
+        "cli:emergency",
+        "cli:emergency/erase-bucket",
+        "cli:global-options"
       ],
-      "evidence": ["testsuite/tests/001-basic-init.sh", "testsuite/tests/020-cat-with-sql.sh", "testsuite/tests/042-apply-init.sh", "testsuite/tests/710-remote-backup-lifecycle.sh", "testsuite/tests/724-restore-full-pond.sh"],
-      "gaps": "Most interfaces still have monolithic prose only; CLI flags/defaults/environment need compiled D06 reference and D09 review."
+      "evidence": [
+        "testsuite/tests/001-basic-init.sh",
+        "testsuite/tests/020-cat-with-sql.sh",
+        "testsuite/tests/042-apply-init.sh",
+        "testsuite/tests/710-remote-backup-lifecycle.sh",
+        "testsuite/tests/724-restore-full-pond.sh"
+      ],
+      "gaps": "Compiled parser reference and reviewed operational notes; destructive/cloud commands are not claimed offline end-to-end tested."
     },
     "factory": {
       "source": "crates/provider/src/registry.rs",
       "ids": [
-        "factory:hydrovu", "factory:git-ingest", "factory:logfile-ingest",
-        "factory:journal-ingest", "factory:sql-derived-table", "factory:sql-derived-series",
-        "factory:synthetic-timeseries", "factory:timeseries-join", "factory:timeseries-pivot",
-        "factory:temporal-reduce", "factory:temporal-reduce-series", "factory:materialize-series",
-        "factory:pump-state-series", "factory:dynamic-dir", "factory:column-rename",
-        "factory:exec", "factory:sitegen", "factory:monitor-report", "factory:email-report",
-        "factory:storage-minio", "factory:storage-azure", "factory:rate-limit"
+        "factory:hydrovu",
+        "factory:git-ingest",
+        "factory:logfile-ingest",
+        "factory:journal-ingest",
+        "factory:sql-derived-table",
+        "factory:sql-derived-series",
+        "factory:synthetic-timeseries",
+        "factory:timeseries-join",
+        "factory:timeseries-pivot",
+        "factory:temporal-reduce",
+        "factory:temporal-reduce-series",
+        "factory:materialize-series",
+        "factory:pump-state-series",
+        "factory:dynamic-dir",
+        "factory:column-rename",
+        "factory:exec",
+        "factory:sitegen",
+        "factory:monitor-report",
+        "factory:email-report",
+        "factory:storage-minio",
+        "factory:storage-azure",
+        "factory:rate-limit"
       ],
-      "registration_sources": ["crates/provider/src/factory", "crates/hydrovu/src/factory.rs", "crates/gitpond/src/factory.rs", "crates/exec-factory/src/factory.rs", "crates/sitegen/src/factory.rs", "crates/sitegen/src/monitor.rs", "crates/sitegen/src/email.rs"],
-      "evidence": ["testsuite/tests/100-synthetic-timeseries-basic.sh", "testsuite/tests/101-timeseries-join-synthetic.sh", "testsuite/tests/102-timeseries-pivot-synthetic.sh", "testsuite/tests/103-temporal-reduce-synthetic.sh", "testsuite/tests/600-git-ingest-basic-pull.sh", "testsuite/tests/730-materialize-series.sh", "testsuite/tests/740-exec-factory-basic.sh"],
-      "gaps": "Capabilities differ by registration: executable, dynamic file/directory, and table transform are not interchangeable. Cloud collectors, journal ingestion, monitoring/email and storage profiles need declared service/platform prerequisites; no offline claim."
+      "registration_sources": [
+        "crates/provider/src/factory",
+        "crates/hydrovu/src/factory.rs",
+        "crates/gitpond/src/factory.rs",
+        "crates/exec-factory/src/factory.rs",
+        "crates/sitegen/src/factory.rs",
+        "crates/sitegen/src/monitor.rs",
+        "crates/sitegen/src/email.rs"
+      ],
+      "evidence": [
+        "testsuite/tests/100-synthetic-timeseries-basic.sh",
+        "testsuite/tests/101-timeseries-join-synthetic.sh",
+        "testsuite/tests/102-timeseries-pivot-synthetic.sh",
+        "testsuite/tests/103-temporal-reduce-synthetic.sh",
+        "testsuite/tests/600-git-ingest-basic-pull.sh",
+        "testsuite/tests/730-materialize-series.sh",
+        "testsuite/tests/740-exec-factory-basic.sh"
+      ],
+      "gaps": "All public factory schemas and prerequisites are documented. Service/Linux-dependent configurations remain explicitly unverified unless mapped to executable evidence."
     },
     "format": {
       "source": "crates/provider/src/format_registry.rs",
-      "ids": ["format:csv", "format:oteljson", "format:jsonlogs", "format:weblog", "format:xls", "format:excelhtml", "format:hledger"],
-      "evidence": ["testsuite/tests/024-csv-url-scheme.sh", "testsuite/tests/025-csv-workflow.sh", "testsuite/tests/034-oteljson-url-scheme.sh", "testsuite/tests/041-weblog-format-provider.sh", "testsuite/tests/744-exec-factory-hledger-journal.sh"],
-      "gaps": "CSV pilot is asserted; old 024/025 are exploratory seeds. Other URL options, inference, malformed input, compression, and buffering remain pending."
+      "ids": [
+        "format:csv",
+        "format:oteljson",
+        "format:jsonlogs",
+        "format:weblog",
+        "format:xls",
+        "format:excelhtml",
+        "format:hledger"
+      ],
+      "evidence": [
+        "testsuite/tests/024-csv-url-scheme.sh",
+        "testsuite/tests/025-csv-workflow.sh",
+        "testsuite/tests/034-oteljson-url-scheme.sh",
+        "testsuite/tests/041-weblog-format-provider.sh",
+        "testsuite/tests/744-exec-factory-hledger-journal.sh"
+      ],
+      "gaps": "CSV has an asserted package. Other parsers have source-reviewed contracts; all format/compression combinations are not end-to-end verified."
     },
     "scheme": {
       "source": "crates/provider/src/lib.rs",
-      "ids": ["scheme:file", "scheme:host", "scheme:table", "scheme:series", "compression:gzip", "compression:zstd", "compression:bzip2", "scheme:factory-hostmount"],
-      "evidence": ["testsuite/tests/027-data-node-entry-type-cast.sh", "testsuite/tests/300-hostmount-list-proof-of-life.sh", "testsuite/tests/301-hostmount-cat-variations.sh", "testsuite/tests/304-hostmount-overlay-dyndir.sh"],
-      "gaps": "Native Parquet and entry types, host+ composition, factory URLs, path roots, globs/captures, and compression are separate from registered formats."
+      "ids": [
+        "scheme:file",
+        "scheme:host",
+        "scheme:table",
+        "scheme:series",
+        "compression:gzip",
+        "compression:zstd",
+        "compression:bzip2",
+        "scheme:factory-hostmount",
+        "scheme:data"
+      ],
+      "evidence": [
+        "testsuite/tests/027-data-node-entry-type-cast.sh",
+        "testsuite/tests/300-hostmount-list-proof-of-life.sh",
+        "testsuite/tests/301-hostmount-cat-variations.sh",
+        "testsuite/tests/304-hostmount-overlay-dyndir.sh"
+      ],
+      "gaps": "Shared URL/root/compression rules are documented; registry membership does not imply host execution support."
     },
     "sitegen": {
       "source": "crates/sitegen/src/config.rs",
       "ids": [
-        "sitegen:configuration", "sitegen:frontmatter", "sitegen:routes", "sitegen:exports",
-        "sitegen:content", "sitegen:navigation", "sitegen:themes", "sitegen:feeds",
-        "sitegen:reports", "sitegen:subsites", "sitegen:browser", "sitegen:build",
-        "sitegen:report", "sitegen:documentation",
-        "shortcode:cap0-cap9", "shortcode:chart", "shortcode:overlay_chart",
-        "shortcode:log_viewer", "shortcode:viz", "shortcode:explore",
-        "shortcode:nav_list", "shortcode:breadcrumb", "shortcode:site_title",
-        "shortcode:base_url", "shortcode:content_nav", "shortcode:figure",
-        "shortcode:blog_grid", "shortcode:pond_status_grid", "shortcode:source"
+        "sitegen:configuration",
+        "sitegen:frontmatter",
+        "sitegen:routes",
+        "sitegen:exports",
+        "sitegen:content",
+        "sitegen:navigation",
+        "sitegen:themes",
+        "sitegen:feeds",
+        "sitegen:reports",
+        "sitegen:subsites",
+        "sitegen:browser",
+        "sitegen:build",
+        "sitegen:report",
+        "sitegen:documentation",
+        "shortcode:cap0",
+        "shortcode:cap1",
+        "shortcode:cap2",
+        "shortcode:cap3",
+        "shortcode:cap4",
+        "shortcode:cap5",
+        "shortcode:cap6",
+        "shortcode:cap7",
+        "shortcode:cap8",
+        "shortcode:cap9",
+        "shortcode:chart",
+        "shortcode:overlay_chart",
+        "shortcode:log_viewer",
+        "shortcode:viz",
+        "shortcode:explore",
+        "shortcode:nav_list",
+        "shortcode:breadcrumb",
+        "shortcode:site_title",
+        "shortcode:base_url",
+        "shortcode:content_nav",
+        "shortcode:figure",
+        "shortcode:blog_grid",
+        "shortcode:pond_status_grid",
+        "shortcode:source"
       ],
-      "evidence": ["crates/sitegen/src/shortcodes.rs", "crates/sitegen/src/documentation.rs", "testsuite/tests/205-sitegen-base-url.sh", "testsuite/tests/207-sitegen-content-pages.sh", "testsuite/tests/208-sitegen-rss-feed.sh", "testsuite/tests/210-sitegen-nested-sidebar.sh", "testsuite/tests/213-sitegen-documentation-pilot.sh"],
-      "gaps": "Pilot shortcode page covers literal syntax and source inclusion, not complete chart/browser/report reference. Other sitegen IDs remain pending."
+      "evidence": [
+        "crates/sitegen/src/shortcodes.rs",
+        "crates/sitegen/src/documentation.rs",
+        "testsuite/tests/205-sitegen-base-url.sh",
+        "testsuite/tests/207-sitegen-content-pages.sh",
+        "testsuite/tests/208-sitegen-rss-feed.sh",
+        "testsuite/tests/210-sitegen-nested-sidebar.sh",
+        "testsuite/tests/213-sitegen-documentation-pilot.sh"
+      ],
+      "gaps": "Configuration, frontmatter, registered shortcodes, and browser behavior are documented. CLI artifacts/feeds are asserted; full browser/service interactions have separate prerequisites."
     },
     "shared": {
-      "source": "docs/cli-reference.md",
-      "ids": ["shared:environment", "shared:credentials", "shared:paths", "shared:patterns", "shared:durations", "shared:export", "shared:transactions", "shared:versions"],
-      "evidence": ["testsuite/tests/502-remote-storage-options-env-expansion.sh", "testsuite/tests/003-list-patterns.sh"],
-      "gaps": "Shared conceptual rules require focused pages during D08/D09; archives/design history are not current reference."
+      "source": "docs/manual/reference/concepts.md",
+      "ids": [
+        "shared:environment",
+        "shared:credentials",
+        "shared:paths",
+        "shared:patterns",
+        "shared:durations",
+        "shared:export",
+        "shared:transactions",
+        "shared:versions"
+      ],
+      "evidence": [
+        "testsuite/tests/502-remote-storage-options-env-expansion.sh",
+        "testsuite/tests/003-list-patterns.sh"
+      ],
+      "gaps": "Shared concepts and recovery guide are authoritative; D11 retains final historical/duplicate migration cleanup."
     }
   },
   "exclusions": [
-    {"id": "cli:control", "reason": "Hidden legacy compatibility interface, including recent/detail/incomplete/show-config/set-config/prune; not a public reference entry.", "source": "crates/cmd/src/main.rs"},
-    {"id": "factory:test-executor", "reason": "Internal harness probe, not a supported product factory.", "source": "crates/provider/src/factory/test_factory.rs"},
-    {"id": "factory:test-dir", "reason": "Internal directory test fixture.", "source": "crates/provider/src/factory/test_factory.rs"},
-    {"id": "factory:test-file", "reason": "Internal file test fixture.", "source": "crates/provider/src/factory/test_factory.rs"},
-    {"id": "factory:infinite-csv", "reason": "Unbounded streaming stress-test fixture, not a user workflow.", "source": "crates/provider/src/factory/test_factory.rs"}
+    {
+      "id": "cli:control",
+      "reason": "Hidden legacy compatibility interface, including recent/detail/incomplete/show-config/set-config/prune; not a public reference entry.",
+      "source": "crates/cmd/src/cli.rs"
+    },
+    {
+      "id": "factory:test-executor",
+      "reason": "Internal harness probe, not a supported product factory.",
+      "source": "crates/provider/src/factory/test_factory.rs"
+    },
+    {
+      "id": "factory:test-dir",
+      "reason": "Internal directory test fixture.",
+      "source": "crates/provider/src/factory/test_factory.rs"
+    },
+    {
+      "id": "factory:test-file",
+      "reason": "Internal file test fixture.",
+      "source": "crates/provider/src/factory/test_factory.rs"
+    },
+    {
+      "id": "factory:infinite-csv",
+      "reason": "Unbounded streaming stress-test fixture, not a user workflow.",
+      "source": "crates/provider/src/factory/test_factory.rs"
+    }
   ],
   "pages": {
-    "factory:synthetic-timeseries": {"path": "docs/manual/reference/factories/synthetic-timeseries.md", "components": ["factory:synthetic-timeseries"], "examples": ["synthetic-timeseries"], "coverage": "offline-e2e"},
-    "format:csv": {"path": "docs/manual/reference/formats/csv.md", "components": ["format:csv"], "examples": ["csv-query"], "coverage": "offline-e2e"},
-    "guide:timeseries": {"path": "docs/manual/guides/timeseries.md", "components": [], "examples": ["csv-query", "synthetic-timeseries"], "coverage": "offline-e2e"},
-    "reference:shortcodes": {"path": "docs/manual/reference/sitegen/shortcodes.md", "components": ["shortcode:source"], "examples": ["documentation-pilot"], "coverage": "offline-e2e"}
+    "guide:blog": {
+      "path": "docs/manual/guides/blog.md",
+      "components": [],
+      "examples": [
+        "blog-rss"
+      ],
+      "coverage": "offline-e2e"
+    },
+    "guide:operations": {
+      "path": "docs/manual/guides/operations.md",
+      "components": [],
+      "examples": [
+        "pond-recovery"
+      ],
+      "coverage": "offline-e2e"
+    },
+    "guide:timeseries-site": {
+      "path": "docs/manual/guides/timeseries-site.md",
+      "components": [],
+      "examples": [
+        "timeseries-site"
+      ],
+      "coverage": "offline-e2e"
+    },
+    "guide:timeseries": {
+      "path": "docs/manual/guides/timeseries.md",
+      "components": [],
+      "examples": [
+        "csv-query",
+        "synthetic-timeseries"
+      ],
+      "coverage": "offline-e2e"
+    },
+    "reference:cli": {
+      "path": "docs/manual/reference/cli/commands.md",
+      "components": [
+        "cli:apply",
+        "cli:backup",
+        "cli:backup/add",
+        "cli:backup/cleanup-uploads",
+        "cli:backup/list",
+        "cli:backup/publish-consolidated",
+        "cli:backup/remove",
+        "cli:capsule",
+        "cli:capsule/activate",
+        "cli:capsule/import",
+        "cli:capsule/inspect",
+        "cli:capsule/publish",
+        "cli:capsule/recipe",
+        "cli:capsule/recipe/inspect",
+        "cli:capsule/recipe/publish",
+        "cli:capsule/verify",
+        "cli:cat",
+        "cli:config",
+        "cli:config/set",
+        "cli:copy",
+        "cli:describe",
+        "cli:emergency",
+        "cli:emergency/erase-bucket",
+        "cli:export",
+        "cli:freeze",
+        "cli:freeze/disable",
+        "cli:freeze/enable",
+        "cli:freeze/status",
+        "cli:fsck",
+        "cli:init",
+        "cli:limits",
+        "cli:list",
+        "cli:list-factories",
+        "cli:log",
+        "cli:maintain",
+        "cli:mkdir",
+        "cli:mknod",
+        "cli:pull",
+        "cli:push",
+        "cli:rebuild-control",
+        "cli:recover",
+        "cli:remote",
+        "cli:remote/add",
+        "cli:remote/list",
+        "cli:remote/remove",
+        "cli:restore",
+        "cli:run",
+        "cli:show",
+        "cli:status",
+        "cli:tlog",
+        "cli:tlog/show",
+        "cli:tlog/verify",
+        "cli:verify"
+      ],
+      "examples": [
+        "csv-query",
+        "synthetic-timeseries",
+        "pond-recovery"
+      ],
+      "coverage": "validation-only"
+    },
+    "cli:global-options": {
+      "path": "docs/manual/reference/cli/global-options.md",
+      "components": [
+        "cli:global-options"
+      ],
+      "examples": [
+        "csv-query"
+      ],
+      "coverage": "validation-only"
+    },
+    "reference:concepts": {
+      "path": "docs/manual/reference/concepts.md",
+      "components": [
+        "compression:bzip2",
+        "compression:gzip",
+        "compression:zstd",
+        "scheme:data",
+        "scheme:factory-hostmount",
+        "scheme:file",
+        "scheme:host",
+        "scheme:series",
+        "scheme:table",
+        "shared:credentials",
+        "shared:durations",
+        "shared:environment",
+        "shared:paths",
+        "shared:patterns",
+        "shared:transactions",
+        "shared:versions"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "reference:export": {
+      "path": "docs/manual/reference/export.md",
+      "components": [
+        "shared:export"
+      ],
+      "examples": [
+        "timeseries-site"
+      ],
+      "coverage": "offline-e2e"
+    },
+    "factory:exec": {
+      "path": "docs/manual/reference/factories/exec.md",
+      "components": [
+        "factory:exec"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "reference:ingestion": {
+      "path": "docs/manual/reference/factories/ingestion.md",
+      "components": [
+        "factory:git-ingest",
+        "factory:hydrovu",
+        "factory:journal-ingest",
+        "factory:logfile-ingest"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "reference:reporting": {
+      "path": "docs/manual/reference/factories/reporting.md",
+      "components": [
+        "factory:email-report",
+        "factory:monitor-report"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "reference:sql": {
+      "path": "docs/manual/reference/factories/sql.md",
+      "components": [
+        "factory:column-rename",
+        "factory:dynamic-dir",
+        "factory:sql-derived-series",
+        "factory:sql-derived-table"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "reference:storage": {
+      "path": "docs/manual/reference/factories/storage.md",
+      "components": [
+        "factory:rate-limit",
+        "factory:storage-azure",
+        "factory:storage-minio"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "factory:synthetic-timeseries": {
+      "path": "docs/manual/reference/factories/synthetic-timeseries.md",
+      "components": [
+        "factory:synthetic-timeseries"
+      ],
+      "examples": [
+        "synthetic-timeseries"
+      ],
+      "coverage": "offline-e2e"
+    },
+    "reference:timeseries-factories": {
+      "path": "docs/manual/reference/factories/timeseries.md",
+      "components": [
+        "factory:materialize-series",
+        "factory:pump-state-series",
+        "factory:temporal-reduce",
+        "factory:temporal-reduce-series",
+        "factory:timeseries-join",
+        "factory:timeseries-pivot"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "format:csv": {
+      "path": "docs/manual/reference/formats/csv.md",
+      "components": [
+        "format:csv"
+      ],
+      "examples": [
+        "csv-query"
+      ],
+      "coverage": "offline-e2e"
+    },
+    "reference:formats": {
+      "path": "docs/manual/reference/formats/providers.md",
+      "components": [
+        "format:excelhtml",
+        "format:hledger",
+        "format:jsonlogs",
+        "format:oteljson",
+        "format:weblog",
+        "format:xls"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "sitegen:browser": {
+      "path": "docs/manual/reference/sitegen/browser.md",
+      "components": [
+        "sitegen:browser"
+      ],
+      "examples": [
+        "timeseries-site"
+      ],
+      "coverage": "unverified"
+    },
+    "sitegen:configuration": {
+      "path": "docs/manual/reference/sitegen/configuration.md",
+      "components": [
+        "factory:sitegen",
+        "sitegen:build",
+        "sitegen:configuration",
+        "sitegen:content",
+        "sitegen:documentation",
+        "sitegen:exports",
+        "sitegen:feeds",
+        "sitegen:navigation",
+        "sitegen:report",
+        "sitegen:reports",
+        "sitegen:routes",
+        "sitegen:subsites",
+        "sitegen:themes"
+      ],
+      "examples": [
+        "timeseries-site",
+        "blog-rss"
+      ],
+      "coverage": "validation-only"
+    },
+    "sitegen:frontmatter": {
+      "path": "docs/manual/reference/sitegen/frontmatter.md",
+      "components": [
+        "sitegen:frontmatter"
+      ],
+      "examples": [
+        "blog-rss"
+      ],
+      "coverage": "offline-e2e"
+    },
+    "reference:shortcodes": {
+      "path": "docs/manual/reference/sitegen/shortcodes.md",
+      "components": [
+        "shortcode:base_url",
+        "shortcode:blog_grid",
+        "shortcode:breadcrumb",
+        "shortcode:cap0",
+        "shortcode:cap1",
+        "shortcode:cap2",
+        "shortcode:cap3",
+        "shortcode:cap4",
+        "shortcode:cap5",
+        "shortcode:cap6",
+        "shortcode:cap7",
+        "shortcode:cap8",
+        "shortcode:cap9",
+        "shortcode:chart",
+        "shortcode:content_nav",
+        "shortcode:explore",
+        "shortcode:figure",
+        "shortcode:log_viewer",
+        "shortcode:nav_list",
+        "shortcode:overlay_chart",
+        "shortcode:pond_status_grid",
+        "shortcode:site_title",
+        "shortcode:source",
+        "shortcode:viz"
+      ],
+      "examples": [
+        "documentation-pilot"
+      ],
+      "coverage": "validation-only"
+    }
   },
   "examples": {
-    "csv-query": {"directory": "testsuite/examples/csv-query", "test": "testsuite/tests/057-documentation-csv-example.sh", "prerequisites": ["bash", "pond"], "coverage": "offline-e2e"},
-    "synthetic-timeseries": {"directory": "testsuite/examples/synthetic-timeseries", "test": "testsuite/tests/100-synthetic-timeseries-basic.sh", "prerequisites": ["bash", "pond"], "coverage": "offline-e2e"},
-    "documentation-pilot": {"directory": "testsuite/examples/documentation-pilot", "test": "testsuite/tests/213-sitegen-documentation-pilot.sh", "prerequisites": ["bash", "pond", "make", "tar"], "coverage": "offline-e2e"}
+    "csv-query": {
+      "directory": "testsuite/examples/csv-query",
+      "test": "testsuite/tests/057-documentation-csv-example.sh",
+      "prerequisites": [
+        "bash",
+        "pond"
+      ],
+      "coverage": "offline-e2e"
+    },
+    "synthetic-timeseries": {
+      "directory": "testsuite/examples/synthetic-timeseries",
+      "test": "testsuite/tests/100-synthetic-timeseries-basic.sh",
+      "prerequisites": [
+        "bash",
+        "pond"
+      ],
+      "coverage": "offline-e2e"
+    },
+    "documentation-pilot": {
+      "directory": "testsuite/examples/documentation-pilot",
+      "test": "testsuite/tests/213-sitegen-documentation-pilot.sh",
+      "prerequisites": [
+        "bash",
+        "pond",
+        "make",
+        "tar"
+      ],
+      "coverage": "offline-e2e"
+    },
+    "timeseries-site": {
+      "directory": "testsuite/examples/timeseries-site",
+      "test": "testsuite/tests/214-documentation-workflows.sh",
+      "prerequisites": [
+        "bash",
+        "pond",
+        "matching sitegen vendor assets"
+      ],
+      "coverage": "offline-e2e"
+    },
+    "blog-rss": {
+      "directory": "testsuite/examples/blog-rss",
+      "test": "testsuite/tests/214-documentation-workflows.sh",
+      "prerequisites": [
+        "bash",
+        "pond",
+        "matching sitegen vendor assets"
+      ],
+      "coverage": "offline-e2e"
+    },
+    "pond-recovery": {
+      "directory": "testsuite/examples/pond-recovery",
+      "test": "testsuite/tests/214-documentation-workflows.sh",
+      "prerequisites": [
+        "bash",
+        "pond"
+      ],
+      "coverage": "offline-e2e"
+    }
   },
   "correctness_followups": [
     "synthetic-timeseries currently warns and falls back to one hour for malformed duration text; period positivity is not fully validated. Documented, not changed by metadata work.",
     "CSV malformed URL-option deserialization currently falls back to all defaults; unknown options are ignored. Documented, not advertised as validation.",
     "Synthetic dynamic metadata is TableDynamic despite historical FileSeries prose; the pilot describes the actual node type."
-  ]
+  ],
+  "explicit_interfaces": [
+    "scheme:factory-hostmount",
+    "scheme:host",
+    "shared:credentials",
+    "shared:durations",
+    "shared:environment",
+    "shared:export",
+    "shared:paths",
+    "shared:patterns",
+    "shared:transactions",
+    "shared:versions",
+    "sitegen:browser",
+    "sitegen:build",
+    "sitegen:configuration",
+    "sitegen:content",
+    "sitegen:documentation",
+    "sitegen:exports",
+    "sitegen:feeds",
+    "sitegen:frontmatter",
+    "sitegen:navigation",
+    "sitegen:report",
+    "sitegen:reports",
+    "sitegen:routes",
+    "sitegen:subsites",
+    "sitegen:themes"
+  ],
+  "pending": []
 }

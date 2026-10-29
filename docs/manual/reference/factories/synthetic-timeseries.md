@@ -28,17 +28,111 @@ inclusive boundaries `00:00:00Z` and `03:00:00Z`, and temperatures
 [complete script](/testsuite/examples/synthetic-timeseries/run.sh),
 [download package](/downloads/synthetic-timeseries.tar).
 
-## Configuration
+<!-- docs:reference factory:synthetic-timeseries -->
+## Configuration reference
 
-| Field | Type / default | Meaning and constraints |
-|---|---|---|
-| `start` | required string | RFC 3339 timestamp, inclusive |
-| `end` | required string | RFC 3339 timestamp, after `start`; included if reached by the interval |
-| `interval` | required duration string | Positive sampling interval, e.g. `1h`; timestamp resolution is milliseconds |
-| `time_column` | string, `timestamp` | Output timestamp column name |
-| `points` | required nonempty list | Named output Float64 columns |
-| `points[].name` | required nonempty string | Unique among point names; choose a name distinct from `time_column` |
-| `points[].components` | required nonempty list | Components summed at each timestamp |
+Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
+
+| Capability | Registered |
+|---|---|
+| directory | no |
+| file | yes |
+| initialize | no |
+| execute | no |
+| table transform | no |
+| raw validation | no |
+
+Automatic post-commit access: `not registered`.
+
+### SyntheticTimeseriesConfig
+
+Top-level configuration for the synthetic-timeseries factory
+
+| Field | Accepted type | Required | Default | Description |
+|---|---|---|---|---|
+| `end` | string | yes | not specified | End time (RFC 3339 / ISO 8601) |
+| `interval` | string | yes | not specified | Sampling interval as a human-readable duration (e.g., "15m", "1h", "30s") |
+| `points` | array of PointConfig | yes | not specified | Named timeseries points (each becomes a Float64 column) |
+| `start` | string | yes | not specified | Start time (RFC 3339 / ISO 8601) |
+| `time_column` | string | no | "timestamp" | Name of the timestamp column (default: "timestamp") |
+
+Unknown fields: **rejected**.
+
+### PointConfig
+
+A named timeseries point -- its value at each timestamp is the sum of its components
+
+| Field | Accepted type | Required | Default | Description |
+|---|---|---|---|---|
+| `components` | array of WaveformComponent | yes | not specified | Waveform components whose values are summed |
+| `name` | string | yes | not specified | Column name for this point |
+
+Unknown fields: **rejected**.
+
+### WaveformComponent
+
+Waveform component type
+
+### WaveformComponent variant 1
+
+Sine wave: offset + amplitude * sin(2pi * t / period + phase)
+
+| Field | Accepted type | Required | Default | Description |
+|---|---|---|---|---|
+| `amplitude` | number | no | 0.0 | Constraints: format="double". |
+| `offset` | number | no | 0.0 | Constraints: format="double". |
+| `period` | string | yes | not specified | Period as a human-readable duration (e.g., "24h", "1h30m", "90s") |
+| `phase` | number | no | 0.0 | Phase offset in radians Constraints: format="double". |
+| `type` | "sine" | yes | not specified |  |
+
+Unknown fields: not rejected by this shape; see runtime notes.
+
+### WaveformComponent variant 2
+
+Triangle wave: offset + amplitude * triangle(t / period + phase)
+
+| Field | Accepted type | Required | Default | Description |
+|---|---|---|---|---|
+| `amplitude` | number | no | 0.0 | Constraints: format="double". |
+| `offset` | number | no | 0.0 | Constraints: format="double". |
+| `period` | string | yes | not specified |  |
+| `phase` | number | no | 0.0 | Constraints: format="double". |
+| `type` | "triangle" | yes | not specified |  |
+
+Unknown fields: not rejected by this shape; see runtime notes.
+
+### WaveformComponent variant 3
+
+Square wave: offset + amplitude * sign(sin(2pi * t / period + phase))
+
+| Field | Accepted type | Required | Default | Description |
+|---|---|---|---|---|
+| `amplitude` | number | no | 0.0 | Constraints: format="double". |
+| `offset` | number | no | 0.0 | Constraints: format="double". |
+| `period` | string | yes | not specified |  |
+| `phase` | number | no | 0.0 | Constraints: format="double". |
+| `type` | "square" | yes | not specified |  |
+
+Unknown fields: not rejected by this shape; see runtime notes.
+
+### WaveformComponent variant 4
+
+Linear ramp: offset + slope * t_seconds
+
+| Field | Accepted type | Required | Default | Description |
+|---|---|---|---|---|
+| `offset` | number | no | 0.0 | Constraints: format="double". |
+| `slope` | number | no | 0.0 | Constraints: format="double". |
+| `type` | "line" | yes | not specified |  |
+
+Unknown fields: not rejected by this shape; see runtime notes.
+<!-- docs:end-reference -->
+
+## Semantic constraints
+
+`start` and `end` are RFC 3339 strings; the end is inclusive if reached by
+the positive interval. Require nonempty points/components and unique point
+names distinct from `time_column`. These constraints exceed JSON shape checks.
 
 Timestamp output is Arrow `Timestamp(Millisecond, UTC)`. Value columns are
 non-null Float64. Top-level and point objects reject unknown fields.

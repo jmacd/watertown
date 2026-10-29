@@ -1,72 +1,108 @@
-# Manual authoring (D01-D05 pilot)
+# Manual authoring
 
-The public source boundary is `docs/manual/`, selected by `docs/site.yaml`.
-Design notes, this workflow, the migration inventory, and `docs/archive/` are
-not page inputs. `_generated` directories are excluded from standalone page
-discovery. The four pilot pages are authoritative only for their migrated
-topics; the existing CLI/operator documents remain entry points elsewhere.
+`docs/manual/` is the public content boundary selected by `docs/site.yaml`.
+Design notes, this workflow, `docs/archive/`, and the reviewed migration
+inventory are not pages. `_generated` directories never become standalone
+pages. The manual is current development documentation, not a multi-version
+stable-release site. D11 retains final historical/duplicate cleanup.
 
-## Cached-binary workflow
+## Obtaining a compatible binary
 
-Obtain a native `pond` with **documentation renderer contract 1** (D04 or
-later). During development, run `make build` once with Rust installed, then:
+Use a native `pond` with **documentation renderer contract 1** (D04 or later).
+Build once with the repository's Rust toolchain using `make build`, or select
+an explicit compatible prebuilt/cached executable. Production images and
+Debian packages include matching sitegen vendor assets; source-built chart
+examples additionally need `make vendor` once. The content-only manual does
+not need vendor downloads.
+
+## Fast prose workflow
 
 ```bash
-make docs-check
 make docs-build
-make docs-serve
-```
-
-Or select an explicit compatible prebuilt/cached binary:
-
-```bash
-make docs-build POND_BIN=/absolute/path/to/pond
 make docs-serve POND_BIN=/absolute/path/to/pond
 ```
 
 `docs-build` invokes no Cargo, examples, services, or network downloads. Bash,
-Make, and `tar` are required. It generates fixture downloads, builds into an
-isolated staging directory, and replaces only marked documentation output
-after a successful strict build. Failures retain the previous preview. By
-default output is `.docs-preview/watertown/`; `DOCS_OUT` can select an absent
-directory or existing marked manual output. Do not select source directories.
-An incompatible binary fails explicitly; there is no fallback renderer.
+Make, and tar are required. It packages the exact shared fixtures, stages a
+strict sitegen build, and replaces only marked documentation output after
+success. Failure preserves the previous preview. Default output is
+`.docs-preview/watertown/`; `DOCS_OUT` can select an absent directory or
+existing marked output, never selected source directories.
 
-`docs-serve` uses Python 3's existing static HTTP server, binds to localhost,
-and does **not** open a browser. Visit
-`http://127.0.0.1:8000/watertown/`. Set `DOCS_PORT` to change the port. The
-preview target uses the default output path so project-prefix URLs work.
-Stop it with Ctrl-C; no watcher or live reload is installed.
+`docs-serve` additionally uses Python 3's existing HTTP server, binds to
+localhost, and **never opens a browser**. Visit
+`http://127.0.0.1:8000/watertown/`; change `DOCS_PORT` if needed. Stop with
+Ctrl-C. No watcher/live reload is installed.
 
-The underlying renderer command, after preparing downloadable packages, is:
+The renderer command after preparing downloads is:
 
 ```bash
-pond run -d "$PWD" host+sitegen:///docs/site.yaml -- build ./site --strict
+pond run -d "$PWD" host+sitegen:///docs/site.yaml -- build OUTPUT --strict
 ```
 
-The repository is host input, not a pond. Choose an output outside selected
-inputs. The `--` passes factory-specific flags through the outer CLI.
-`_generated` reference generation will remain a separate step, never a
-render side effect. D06 introduces compiled discovery and generated-reference
-freshness; today's `docs-check` checks the source-reviewed pilot mappings
-only, and prints the pending count. It does not claim complete public coverage.
+An incompatible binary fails explicitly; no fallback renderer is selected.
+Local footer provenance says `working-tree`; CI supplies the exact source SHA.
+
+## Compiled reference and drift checks
+
+For interface/config changes, use the developer-only exporter:
+
+```bash
+make docs-generate
+make docs-check
+```
+
+These require Rust/Cargo and Python 3 (stdlib only). `docs-export` is gated by
+the `documentation` Cargo feature; ordinary production builds do not ship it
+or schema dependencies. It introspects shared Clap definitions and fully linked
+registries, without creating a pond or executing factories/services.
+
+`scripts/generate-docs.py` writes deterministic metadata/fragments under
+`docs/manual/_generated/` and managed regions in ordinary authored Markdown:
+
+```text
+<!-- docs:reference factory:synthetic-timeseries -->
+... generated fields ...
+<!-- docs:end-reference -->
+```
+
+Edit field descriptions beside their Rust fields, then regenerate. Do not edit
+generated region bodies. Schema is explicitly the **deserialization** contract;
+semantic constraints, side effects, prerequisites, and effective runtime
+defaults still need authored explanation. The renderer never generates
+reference or executes code fences.
+
+`docs-check` rejects stale output, missing/removed compiled interfaces,
+invalid page/example mappings, and regression of completed reference coverage.
+`DOCS_BASE_REF` optionally checks against a Git base revision. Migration pending
+entries are explicit; ordinary generation never expands that baseline. Current
+reviewed public reference has no pending entries, but that does not imply
+every service/platform/browser scenario has end-to-end coverage.
+
+Typed-contract tests:
+
+```bash
+cargo test --locked -p cmd --features documentation --lib documentation::tests
+```
 
 ## Executable examples
 
 `testsuite/examples/` owns runnable YAML, scripts, and data. Include those exact
-files with `source`; do not copy snippets into an independently maintained
-quickstart. Follow [fixture conventions](../testsuite/examples/README.md).
+files with `source`; do not maintain copied quickstarts. Follow
+[fixture conventions](../testsuite/examples/README.md).
 
 ```bash
-# Requires a test image built from this revision; builds may require network.
+# Requires an image built from this revision; initial build needs network.
 bash testsuite/build-image.sh
 make docs-examples
 ```
 
-The existing harness runs tests `057`, `100`, and `213`; it mounts examples and
-repository sources read-only in both ordinary and Compose modes. No services
-or credentials are required by the pilot. Native execution of this selection
-uses the same numbered scripts and helpers:
+Tests `057`, `100`, `213`, and `214` assert CSV/synthetic values, the strict
+renderer contract, timeseries site exports, blog/RSS rules, and file-backed
+replica recovery/updates. The existing harness mounts repository/fixtures
+read-only in ordinary and Compose modes. No live credentials are required.
+
+Native execution uses the same scripts/helpers:
 
 ```bash
 export PATH="$PWD/target/debug:$PWD/testsuite/helpers:$PATH"
@@ -74,32 +110,50 @@ export EXAMPLES_ROOT="$PWD/testsuite/examples" REPO_ROOT="$PWD"
 bash testsuite/tests/057-documentation-csv-example.sh
 bash testsuite/tests/100-synthetic-timeseries-basic.sh
 bash testsuite/tests/213-sitegen-documentation-pilot.sh
+bash testsuite/tests/214-documentation-workflows.sh
 ```
 
-Each script creates an isolated writable workspace. Host-required tests
-receive absolute source roots from the harness; never assume container paths
-when writing native tests. Service/credential-dependent work must declare its
-coverage level and cannot count a skip as a pass.
+Each script creates an isolated writable workspace and honors `TMPDIR`.
+Coverage levels are `offline-e2e`, `local-service-e2e`, `live-service-e2e`,
+`validation-only`, and `unverified`; a missing prerequisite or skipped scenario
+is never a passed test. Cloud/API examples explicitly remain unverified where
+no execution evidence exists. Browser interaction tests remain a separate
+headless suite.
 
-## Metadata and authoring contract
+## Authoring and navigation
 
-`documentation-inventory.json` records stable IDs, pending work, explicit
-internal exclusions, test evidence, correctness follow-ups, and page/example
-mappings. Frontmatter `doc_id` is a plain scalar matching its catalog page
-key. Coverage is one of `offline-e2e`, `local-service-e2e`, `live-service-e2e`,
-`validation-only`, or `unverified`; it describes evidence, not prose quantity.
-Only complete entries leave the migration baseline. New compiled-interface
-enforcement and typed reference generation begin at D06/D07, not in this gate.
+Frontmatter `doc_id` is a plain scalar matching the page key in
+`documentation-inventory.json`. That catalog maps stable public IDs to one
+authoritative page and records examples, evidence levels, exclusions, and
+known correctness gaps.
 
-Use source-relative `.md` links, with fragments when useful. Heading IDs are
-stable unique slugs (`inspect`, `inspect-1`, etc.). Strict builds validate
-actual output, navigation, fragments, and includes under `/watertown/`.
-Source inclusion only reads configured `include_roots`; code blocks and inline
-code remain literal, including shortcode examples. The documentation layout
-uses system fonts and local CSS; data layouts opt in to visualization assets.
+Use source-relative `.md` links and actual heading fragments. Strict builds
+validate output paths, navigation, includes/regions, links, and anchors under
+`/watertown/`. Source inclusion reads only approved `include_roots`; fences,
+inline code, and included source remain literal. Documentation uses system
+fonts/local CSS; data layouts opt in to visualization assets.
 
-Unit checks: `cargo test --locked -p sitegen --lib`, `cargo fmt --all -- --check`,
-and `cargo clippy --locked -p sitegen --all-targets -- -D warnings`.
-Integration test `213` proves the readiness gate's success and failure cases
-and cached-binary prose rebuild. Broad migration (D06 onward), Pages deployment,
-and README redesign are deliberately not part of this pilot.
+## GitHub Pages
+
+Repository Settings -> Pages -> Source must be **GitHub Actions** (already
+configured). Protect the `github-pages` environment for trusted main.
+The existing Rust CI workflow builds/validates PR previews with read-only
+permissions and uploads a preview artifact; PRs do not deploy.
+
+Trusted main waits for audit/check and both production image builds. The AMD64
+matrix job uploads its own image digest/version/revision record, avoiding
+matrix-output architecture ambiguity. Pages pulls that exact digest, verifies
+the OCI source revision and binary version, and runs all documentation
+examples again through `scripts/docs-publish.sh`. Sources mount read-only;
+scratch/output mount writable; containers run without network.
+
+The runner supplies Bash/Make/tar and test helpers; the production image only
+needs pond/runtime/vendor assets, not Make. The final strict artifact contains
+the **contents** of the site root, not an extra `watertown` parent. Only the
+deployment job has Pages/OIDC write permissions and uses `github-pages`.
+No generated HTML is committed.
+
+Local image-backed validation can use an immutable registry digest or local
+`sha256:` image content ID with `DOCS_CONTAINER_IMAGE`, an absent `DOCS_OUT`,
+`DOCS_EXPECTED_VERSION`, and `WATERTOWN_DOCS_REVISION`. Local compatible-image
+checks do not substitute for the first same-revision production CI/deployment.

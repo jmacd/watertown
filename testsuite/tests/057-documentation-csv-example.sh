@@ -3,7 +3,7 @@
 # EXPECTED: Parsed schema, filtered rows, aggregates, and delimiter agree with the manual
 set -euo pipefail
 source check.sh
-WORK="$(mktemp -d)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/watertown-test.XXXXXX")"
 trap 'rm -r -- "${WORK}"' EXIT
 export EXAMPLE_OUTPUT="${WORK}/csv"
 bash "${EXAMPLES_ROOT:-/examples}/csv-query/run.sh"

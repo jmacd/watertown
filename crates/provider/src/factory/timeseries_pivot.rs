@@ -37,6 +37,7 @@ use tokio::sync::Mutex;
 /// Configuration for timeseries-pivot factory
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct TimeseriesPivotConfig {
     /// Pattern to match input files (e.g., "series:///combined/*")
     pub pattern: crate::Url,

@@ -33,14 +33,30 @@ humidity `45`, and semicolon-file total `75`.
 Quote URLs containing query parameters so the shell does not interpret `&`.
 For example, the tested `?delimiter=;` selects a semicolon-separated input.
 
-| Parameter | Type | Default |
-|---|---|---|
-| `delimiter` | character; use ASCII | `,` |
-| `has_header` | boolean | `true` |
-| `batch_size` | unsigned integer | `8192` |
-| `quote` | character; use ASCII | `"` |
-| `escape` | optional character | absent |
-| `schema_infer_max_records` | unsigned integer | `100` |
+The generated shape below describes typed options before URL query decoding;
+URL values are strings parsed by the provider. Use ASCII delimiter/quote/escape
+characters.
+
+<!-- docs:reference format:csv -->
+## Configuration reference
+
+Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
+
+### CsvOptions
+
+CSV format options parsed from query parameters  Based on arrow_csv::reader::Format and ReaderBuilder options. All fields have sensible defaults matching arrow_csv defaults.  # URL Examples  - csv:///data/file.csv - Default settings (comma delimiter, has header) - csv:///data/file.csv?delimiter=; - Semicolon delimiter - csv:///data/file.csv?delimiter=;&amp;has_header=false - No header row - csv:///data/file.csv?batch_size=16384 - Larger batch size
+
+| Field | Accepted type | Required | Default | Description |
+|---|---|---|---|---|
+| `batch_size` | integer | no | 8192 | Number of records per batch (default: 8192) Constraints: format="uint"; minimum=0. |
+| `delimiter` | string | no | "," | Field delimiter (default: ',') Constraints: minLength=1; maxLength=1. |
+| `escape` | string &#124; null | no | not specified | Escape character (default: None) Constraints: minLength=1; maxLength=1. |
+| `has_header` | boolean | no | true | Whether the file has a header row (default: true) |
+| `quote` | string | no | "\"" | Quote character (default: '"') Constraints: minLength=1; maxLength=1. |
+| `schema_infer_max_records` | integer | no | 100 | Number of rows to sample for schema inference (default: 100) Constraints: format="uint"; minimum=0. |
+
+Unknown fields: not rejected by this shape; see runtime notes.
+<!-- docs:end-reference -->
 
 Use positive batch/inference sizes. Unknown options are ignored. **Current
 limitation:** an option-deserialization error falls back to the default options

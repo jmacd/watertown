@@ -23,7 +23,8 @@ static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct MonitorConfig {
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
+pub(crate) struct MonitorConfig {
     pond: String,
     title: String,
     output_dir: String,
@@ -32,6 +33,7 @@ struct MonitorConfig {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(untagged)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 enum CheckConfig {
     RateWhile(RateWhileCheckConfig),
     AnyObservedBelow(AnyObservedBelowCheckConfig),
@@ -46,6 +48,7 @@ enum CheckConfig {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 struct BelowCheckConfig {
     id: String,
     label: String,
@@ -62,6 +65,7 @@ struct BelowCheckConfig {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 enum AnyObservedBelowType {
     #[serde(rename = "any-observed-below")]
     AnyObservedBelow,
@@ -69,6 +73,7 @@ enum AnyObservedBelowType {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 struct AnyObservedBelowCheckConfig {
     id: String,
     label: String,
@@ -87,6 +92,7 @@ struct AnyObservedBelowCheckConfig {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 enum StaleOrBelowType {
     #[serde(rename = "stale-or-below")]
     StaleOrBelow,
@@ -98,6 +104,7 @@ enum StaleOrBelowType {
 /// pH probe) into one check instead of requiring two separate cards.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 struct StaleOrBelowCheckConfig {
     id: String,
     label: String,
@@ -116,6 +123,7 @@ struct StaleOrBelowCheckConfig {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 enum StaleOrAllBelowType {
     #[serde(rename = "stale-or-all-below")]
     StaleOrAllBelow,
@@ -130,6 +138,7 @@ enum StaleOrAllBelowType {
 /// single recent reading at or above `threshold` is enough to stay healthy.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 struct StaleOrAllBelowCheckConfig {
     id: String,
     label: String,
@@ -149,6 +158,7 @@ struct StaleOrAllBelowCheckConfig {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 enum StaleOrBelowAnyColumnType {
     #[serde(rename = "stale-or-below-any-column")]
     StaleOrBelowAnyColumn,
@@ -167,6 +177,7 @@ enum StaleOrBelowAnyColumnType {
 /// device) aren't evaluated separately.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 struct StaleOrBelowAnyColumnCheckConfig {
     id: String,
     label: String,
@@ -186,6 +197,7 @@ struct StaleOrBelowAnyColumnCheckConfig {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 enum AverageRangeType {
     #[serde(rename = "average-range")]
     AverageRange,
@@ -193,6 +205,7 @@ enum AverageRangeType {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 struct AverageRangeCheckConfig {
     id: String,
     label: String,
@@ -212,6 +225,7 @@ struct AverageRangeCheckConfig {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 enum StaleAfterType {
     #[serde(rename = "stale-after")]
     StaleAfter,
@@ -223,6 +237,7 @@ enum StaleAfterType {
 /// source has stopped producing new data.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 struct StaleAfterCheckConfig {
     id: String,
     label: String,
@@ -240,6 +255,7 @@ struct StaleAfterCheckConfig {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 enum GradedScoreType {
     #[serde(rename = "graded-score")]
     GradedScore,
@@ -256,6 +272,7 @@ enum GradedScoreType {
 /// gray card.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 struct GradedScoreCheckConfig {
     id: String,
     label: String,
@@ -337,6 +354,7 @@ fn default_timestamp_column() -> String {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 enum RateWhileType {
     #[serde(rename = "rate-while")]
     RateWhile,
@@ -344,6 +362,7 @@ enum RateWhileType {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 struct RateWhileCheckConfig {
     id: String,
     label: String,
@@ -361,6 +380,7 @@ struct RateWhileCheckConfig {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 struct MeasurementConfig {
     source: String,
     #[serde(default = "default_timestamp_column")]
@@ -371,12 +391,14 @@ struct MeasurementConfig {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 enum Accumulation {
     PositiveDeltas,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 struct ConditionConfig {
     source: String,
     #[serde(default = "default_timestamp_column")]
@@ -386,6 +408,7 @@ struct ConditionConfig {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 struct PredicateConfig {
     column: String,
     operator: PredicateOperator,
@@ -394,12 +417,14 @@ struct PredicateConfig {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 enum PredicateOperator {
     Eq,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 struct AlignmentConfig {
     method: AlignmentMethod,
     tolerance: String,
@@ -407,12 +432,14 @@ struct AlignmentConfig {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 enum AlignmentMethod {
     Previous,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 struct AlarmConfig {
     operator: AlarmOperator,
     value: f64,
@@ -422,6 +449,7 @@ struct AlarmConfig {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 enum AlarmOperator {
     Lt,
 }

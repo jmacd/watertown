@@ -27,3 +27,38 @@ mod shortcodes;
 mod status_summary;
 
 pub use config::SiteConfig;
+
+#[cfg(feature = "documentation")]
+#[must_use]
+pub fn documentation_schemas() -> std::collections::BTreeMap<&'static str, schemars::Schema> {
+    fn schema<T: schemars::JsonSchema>() -> schemars::Schema {
+        schemars::generate::SchemaSettings::draft2020_12()
+            .for_deserialize()
+            .into_generator()
+            .into_root_schema_for::<T>()
+    }
+    std::collections::BTreeMap::from([
+        ("factory:sitegen", schema::<SiteConfig>()),
+        ("factory:monitor-report", schema::<monitor::MonitorConfig>()),
+        ("factory:email-report", schema::<email::EmailReportConfig>()),
+        ("sitegen:frontmatter", schema::<factory::Frontmatter>()),
+    ])
+}
+
+#[cfg(feature = "documentation")]
+#[must_use]
+pub fn documentation_shortcodes() -> Vec<String> {
+    let mut shortcodes = shortcodes::register_shortcodes(std::sync::Arc::new(
+        shortcodes::ShortcodeContext::default(),
+    ));
+    documentation::register_source(
+        &mut shortcodes,
+        config::DocumentationConfig {
+            version: 1,
+            source_root: "/".into(),
+            include_roots: vec![],
+        },
+        std::collections::BTreeMap::new(),
+    );
+    shortcodes.names()
+}

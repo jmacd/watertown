@@ -55,6 +55,7 @@ use tinyfs::{
 
 /// Mode for SQL-derived operations
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub enum SqlDerivedMode {
     /// FileTable mode: single files only, errors if pattern matches >1 file
     Table,
@@ -65,6 +66,7 @@ pub enum SqlDerivedMode {
 /// Explicit locality contract for user-authored SQL.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub enum SqlDerivedLocality {
     /// Unrestricted SQL. The query is visible as global and non-incremental.
     #[default]
@@ -88,6 +90,7 @@ pub struct SqlTransformOptions {
 /// Configuration for SQL-derived file generation
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct SqlDerivedConfig {
     /// Named URL patterns for matching files. Each pattern name becomes a table in the SQL query.
     /// Each pattern can match multiple files which are automatically harmonized with UNION ALL BY NAME.

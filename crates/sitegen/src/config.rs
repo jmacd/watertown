@@ -33,6 +33,7 @@ use std::collections::BTreeMap;
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct SiteConfig {
     pub site: SiteMeta,
     /// Opt in to source-relative manual paths, literal code, and lean assets.
@@ -142,6 +143,7 @@ pub struct SiteConfig {
 /// Bounded documentation capabilities; paths are relative to the input root.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct DocumentationConfig {
     /// Required renderer contract. Unsupported revisions fail explicitly.
     pub version: u32,
@@ -170,6 +172,7 @@ pub struct DocumentationConfig {
 /// per card.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct StatusGridConfig {
     /// URL pattern resolving to the journal `.jsonl` files written by
     /// the `journal-ingest` factory, e.g.
@@ -281,6 +284,7 @@ impl SiteConfig {
 /// Site-wide metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct SiteMeta {
     pub title: String,
     #[serde(default = "default_base_url")]
@@ -304,6 +308,7 @@ pub struct SiteMeta {
 /// RSS feed configuration (optional section in site.yaml).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct FeedConfig {
     /// Content section to include in the feed (default: "Blog").
     #[serde(default = "default_feed_section")]
@@ -331,6 +336,7 @@ fn default_base_url() -> String {
 /// references a stage by name, producing one page per matched file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct ContentStage {
     /// Name referenced by content routes (e.g., "pages")
     pub name: String,
@@ -353,6 +359,7 @@ pub struct ContentStage {
 /// screen width in pixels.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct ExportStage {
     /// Name referenced by routes (e.g., "params", "sites")
     pub name: String,
@@ -381,6 +388,7 @@ pub struct ExportStage {
 /// A named, transport-independent report.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct ReportConfig {
     /// Heading shown in rendered report artifacts.
     pub title: String,
@@ -399,6 +407,7 @@ pub struct ReportConfig {
 /// A numeric series included in a report.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct ReportSectionConfig {
     /// Optional heading override. Defaults to the first capture's configured
     /// site label, then to a title-cased capture value.
@@ -426,6 +435,7 @@ pub struct ReportSectionConfig {
 /// Numeric aggregation shown for a report section.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub enum ReportSummary {
     #[default]
     Range,
@@ -445,6 +455,7 @@ fn default_timestamp_column() -> String {
 /// Lists which export stages to surface as queryable datasets in the explorer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct ExploreConfig {
     /// Datasets exposed in the explorer, in display order.
     pub datasets: Vec<ExploreDataset>,
@@ -459,6 +470,7 @@ pub struct ExploreConfig {
 /// One explorer dataset: an export stage surfaced as a named DuckDB view.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct ExploreDataset {
     /// Name of the `exports:` stage providing this dataset's parquet files.
     pub export: String,
@@ -471,6 +483,7 @@ pub struct ExploreDataset {
 /// A route in the hierarchical route tree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct RouteConfig {
     /// Route name (for logging/debugging)
     pub name: String,
@@ -502,6 +515,7 @@ pub struct RouteConfig {
 /// Route type.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub enum RouteType {
     Static,
     Template,
@@ -511,6 +525,7 @@ pub enum RouteType {
 /// Static asset to copy verbatim.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct StaticAsset {
     pub pattern: String,
 }
@@ -532,6 +547,7 @@ pub struct StaticAsset {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub enum SidebarEntry {
     /// Label with nested sub-navigation items and optional parent href.
     WithChildren {
@@ -583,6 +599,7 @@ impl SidebarEntry {
 /// first descendant leaf.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct SidebarChild {
     /// Display label
     pub label: String,
@@ -606,6 +623,7 @@ pub struct SidebarChild {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct SubsiteConfig {
     /// Display name (used for logging and output directory fallback).
     pub name: String,

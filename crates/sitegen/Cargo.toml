@@ -15,7 +15,11 @@ categories.workspace = true
 keywords.workspace = true
 description.workspace = true
 
+[features]
+documentation = ["dep:schemars"]
+
 [dependencies]
+schemars = { workspace = true, optional = true }
 provider.workspace = true
 tinyfs.workspace = true
 serde.workspace = true

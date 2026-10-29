@@ -5,7 +5,7 @@ set -euo pipefail
 source check.sh
 REPO_ROOT="${REPO_ROOT:-/repo}"
 EXAMPLES_ROOT="${EXAMPLES_ROOT:-/examples}"
-WORK="$(mktemp -d)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/watertown-test.XXXXXX")"
 trap 'rm -r -- "${WORK}"' EXIT
 export EXAMPLE_OUTPUT="${WORK}/pilot"
 export POND_BIN="${POND_BIN:-$(command -v pond)}"

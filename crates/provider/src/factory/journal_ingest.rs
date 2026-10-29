@@ -54,6 +54,7 @@ fn parse_command(ctx: ExecutionContext) -> Result<JournalCommand, tinyfs::Error>
 /// Configuration for the journal ingestion factory
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct JournalIngestConfig {
     /// Destination path within the pond (relative to pond root)
     /// Example: "logs/watershop"

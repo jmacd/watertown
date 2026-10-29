@@ -3,11 +3,35 @@ title: Shortcodes
 doc_id: reference:shortcodes
 ---
 
-# Sitegen shortcode pilot
+# Sitegen shortcodes
 
 Shortcodes expand declared site data into HTML during a build. They do not run
-shell commands or execute Markdown fences. This page covers the pilot's
-literal-source contract, not every chart/report/browser option.
+shell commands or execute Markdown fences. Expansion uses the current page's
+captures, content lists, exports, and configured metadata.
+
+## Registered interfaces
+
+| Shortcode | Arguments and behavior |
+|---|---|
+| `cap0` through `cap9` | Capture by zero-based index; `{{ $0 }}` is rewritten to `cap0` outside literal code. Missing captures produce empty text; configured labels replace display values, not slugs. |
+| `chart` | Optional `range`; time/value chart with page export manifest, metric registry/captions, optional explorer link and annotations. |
+| `overlay_chart` | Pump-cycle overlay using the page's files and optional explorer link; no shortcode arguments. |
+| `log_viewer` | Log viewer for the page's files; no shortcode arguments. |
+| `viz` | `renderer` defaults to `chart`, also `overlay` or `logs`; optional `range`. Unknown renderers produce an explicit error container. |
+| `explore` | `table` defaults to `data`; `label` defaults to that table. Configured multi-dataset exports supersede the fallback page dataset. |
+| `nav_list` | `collection`; `base` (alias `path`) supplies the link prefix. Legacy spelling `nav-list` is normalized outside code. |
+| `breadcrumb` | Current route breadcrumbs; no arguments. |
+| `site_title` | Configured site title; no arguments. |
+| `base_url` | Configured project prefix; no arguments. |
+| `content_nav` | `content` names the content stage; renders ordered, active-page-aware navigation. |
+| `figure` | `src`, optional `caption` and `float` (`left` / `right`); emits a figure, not a file copy. |
+| `blog_grid` | `content` stage and `section` filter; visible dated entries form cards. |
+| `pond_status_grid` | Build-time configured status records and refresh label; no arguments. |
+| `source` | Documentation-only literal inclusion: `path`, optional `region` and `language`, described below. |
+
+[Browser behavior](browser.md) explains data assets and coverage boundaries;
+[configuration](configuration.md) supplies stages/routes and
+[frontmatter](frontmatter.md) supplies page metadata.
 
 ## Literal examples
 

@@ -239,6 +239,14 @@ impl Shortcodes {
         Self(HashMap::new())
     }
 
+    #[cfg(feature = "documentation")]
+    #[must_use]
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.0.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     pub fn register<F>(&mut self, name: &str, func: F)
     where
         F: Fn(&ShortcodeArgs) -> String + Send + Sync + 'static,

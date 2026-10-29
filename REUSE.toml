@@ -4,7 +4,7 @@ SPDX-PackageSupplier = "Caspar Water Company"
 SPDX-PackageDownloadLocation = "https://github.com/jmacd/watertown"
 
 [[annotations]]
-path = ["docs/documentation-inventory.json", "scripts/check-docs.py"]
+path = ["docs/documentation-inventory.json", "docs/manual/_generated/**", "scripts/**.py"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "Caspar Water Company"
 SPDX-License-Identifier = "Apache-2.0"

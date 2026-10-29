@@ -2339,7 +2339,8 @@ register_executable_factory!(
 
 /// Frontmatter parsed from the top of each markdown page.
 #[derive(Debug, Deserialize)]
-struct Frontmatter {
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
+pub(crate) struct Frontmatter {
     #[serde(default)]
     title: String,
     #[serde(default = "default_layout")]

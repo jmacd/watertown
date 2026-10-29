@@ -1,30 +1,63 @@
 # Documentation system design and work sequence
 
-Status: D01-D05 implemented and verified. D06-D11 remain unimplemented.
+Status: D01-D09 implemented and locally verified. D10 publishing automation and
+README redesign are implemented; the first same-revision production-image CI
+run and live Pages deployment remain unverified. D11 is not started.
 
-The manual is built with Watertown sitegen; GitHub Pages publication remains
-D10 work. A bounded four-page pilot establishes implementation readiness before
-broad migration; it does not select the publishing tool. There is no fallback
-to MkDocs or another generator. Search is deferred. This document defines the
-design, migration strategy, work dependencies, and acceptance criteria. Paths
-below are relative to the repository root.
+The manual is built with Watertown sitegen. The four-page pilot established
+renderer readiness before the broader migration; it did not select the
+publishing tool. There is no fallback to MkDocs or another generator. Search
+is deferred. This document defines the design, migration strategy, work
+dependencies, and acceptance criteria. Paths below are relative to the
+repository root.
 
-The pilot includes the source-reviewed inventory, shared executable fixtures,
-strict documentation renderer contract 1, and all four reference/guide pages.
-`docs/README.md` documents the cached-binary authoring workflow. Sitegen unit
-tests, Clippy, and numbered tests 057, 100, 210, and 213 pass with the current
-native binary. Ordinary and Compose fixture mounts were also exercised.
-Test 213 verifies strict failures, literal syntax, lean assets, preview
-preservation, and prose rebuilding with Cargo unavailable. The generated
-preview was checked over localhost HTTP without opening a browser.
+### Implementation and evidence
 
-Linux ARM64 container validation is also complete: the test image built from
-`60a06ff0` contains the exact cross-compiled binary and passes tests 057, 100,
-and 213 (66 checks). Test 213 also passes all 45 checks through Compose's
-read-only source mounts. CI must rebuild the image from the revision under
-test. The inventory retains 125 pending public entries; compiled discovery,
-generated-reference freshness, broad migration, deployment, and README
-redesign are intentionally outside this completed pilot.
+- The reviewed inventory maps all 138 public component IDs to 21 authoritative
+  reference/guide pages, with zero pending entries. The manual renders 22 pages
+  including its homepage. Related components share focused pages rather than
+  requiring one page per command or factory.
+- D06 exports deterministic metadata from shared Clap definitions and fully
+  linked registries without running factories. Generated-reference freshness,
+  unique page authority, explicit exclusions, and base-aware migration checks
+  reject drift. Seven Python regression tests cover discovery, removals,
+  defaults, baseline regressions, side-effect-free export, and schema rendering.
+- D07/D08 derive deserialization schemas for all 22 public factories, three
+  configurable format providers, and frontmatter. Typed tests compare schema
+  acceptance with Serde for representative defaults, tags, unknown fields,
+  optional/null values, nested routes/sidebar, and renamed fields. The command
+  library and binary suites pass 144 and 143 tests respectively. Feature-gated
+  library/binary Clippy and formatting pass. The broader `--all-targets` Clippy
+  attempt also exposed pre-existing integration-test lint violations; these are
+  outside this change and are not the CI Clippy scope.
+- D08/D09 include timeseries-to-site, blog/RSS, and file-backed recovery
+  packages. Numbered tests 057, 100, 213, and 214 pass all 87 assertions through
+  the immutable-image publishing wrapper. Their results cover CSV/synthetic
+  values, strict rendering, exported Parquet, feed eligibility/order/URLs, and
+  recovery integrity, idempotence, subsequent updates, and overwrite refusal.
+  External-service/platform examples retain explicit limited coverage.
+- D10 uses the main CI production image, pinned by its AMD64 digest and checked
+  against the source SHA and expected binary version. PRs validate and upload a
+  read-only preview; only trusted main can deploy. Local image-backed validation
+  used the compatible D05 Linux ARM64 test image, not a rebuilt current
+  production image, so it does not establish same-revision CI or live deployment.
+  A newly built current native renderer also passes all 87 assertions and the
+  final strict manual build. Cargo-free cached rendering and project-prefixed
+  HTTP checks verify all 22 pages, visible provenance, lean assets, downloadable
+  metadata, and all five fixture archives with their shared dependencies.
+  Actionlint, ShellCheck, and REUSE checks pass.
+
+Earlier pilot evidence remains valid: sitegen unit tests and numbered tests
+057, 100, 210, and 213 passed natively, including localhost HTTP checks without
+opening a browser. The Linux ARM64 image built from `60a06ff0` matched the
+cross-compiled binary and passed 66 checks; Compose test 213 passed 45 checks
+with read-only source mounts.
+
+`docs/README.md` documents generation, cached-binary authoring, fixtures, and
+publishing. Verified monolithic reference sections now retain compatibility
+headings with links to the manual. Remaining historical recipes, operator
+material, and duplicate-content review belong to D11. Reference inventory
+completion alone does not imply full behavioral coverage or D11 completion.
 
 ## 1. Goals
 
@@ -85,7 +118,7 @@ The repository already has most of the ingredients:
 | `crates/provider/src/format_registry.rs` | Discover registered format schemes from the compiled registry. |
 | Rust configuration types and Clap definitions | Source mechanical reference details from the implementation. |
 
-Important limitations to address:
+Original limitations addressed by D01-D09 (retained as design context):
 
 - Factory registration provides validation hooks, not complete configuration
   schemas or documentation metadata.
@@ -124,9 +157,9 @@ discovery.
 | Getting started | Installation, querying host files, creating a pond, first timeseries |
 | Concepts | Files/tables/series, versions, transactions, host and pond paths, URL schemes, patterns, factories |
 | Guides | Ingestion, SQL derivation, joins, pivots, downsampling, materialization, exports, sites, blogs |
-| CLI reference | One page per command, with its subcommands, arguments, flags, environment, and examples |
-| Factory reference | One page per public factory, including configuration and execution semantics |
-| Format reference | One page per format provider, plus native Parquet/table/series handling |
+| CLI reference | Focused command/global-options pages, with subcommands, arguments, flags, environment, and examples |
+| Factory reference | Focused pages for related public factories, including configuration and execution semantics |
+| Format reference | CSV and grouped provider pages, plus native Parquet/table/series handling |
 | Export reference | Selection, time boundaries, partitioning, output layout, incremental behavior, sitegen integration |
 | Sitegen reference | Configuration, routes, content, frontmatter, layouts, shortcodes, navigation, charts, feeds, reports, themes |
 | Operations | Automatic execution, monitoring, storage profiles, replication/imports, recovery, maintenance, limits |
@@ -155,7 +188,7 @@ explicitly recorded exclusions, not accidental omissions.
 
 ## 4. Source layout and ownership
 
-Target layout (the pilot subset is implemented; later directories follow):
+Design layout (the implemented reference uses grouped pages where appropriate):
 
 ```text
 docs/
@@ -424,14 +457,15 @@ identifying the component, page, or example requiring attention.
 
 Document how to obtain or select a compatible `pond` binary, then add Make
 targets for build, preview, reference freshness checks, and example execution.
-The pilot targets are implemented; compiled-reference freshness and complete
-coverage remain D06 and later work:
+The build/preview, compiled-reference, coverage, and example targets are
+implemented:
 
 | Target | Responsibility |
 |---|---|
 | `make docs-build` | Build the manual with sitegen in strict mode, without executing examples or unconditionally rebuilding Rust |
 | `make docs-serve` | Serve the generated site with an existing static HTTP server, without opening a browser automatically |
-| `make docs-check` | Check pilot mappings now; compiled-reference freshness and coverage begin at D06 |
+| `make docs-check` | Build the developer exporter; check deterministic generated reference, compiled coverage, migration regressions, and drift tests |
+| `make docs-generate` | Refresh checked-in metadata, field fragments, and managed reference regions after interface changes |
 | `make docs-examples` | Run the documented-example selection through the existing harness |
 
 Document which targets require Rust, containers, or extra services. Keep
@@ -490,6 +524,17 @@ commits to a publishing branch.
 Enable the repository's Pages publishing source as an explicit setup step.
 Initially publish the current development manual with clear labeling; do not
 introduce a multi-version site before a release-documentation policy exists.
+
+The repository's GitHub Actions publishing source is configured. The existing
+Rust CI workflow implements these jobs after production image builds. The
+AMD64 matrix job uploads its digest/version/SHA record as a current-run artifact;
+Pages does not rely on an ambiguous architecture-matrix output or moving tag.
+`scripts/docs-publish.sh` validates examples and builds with that image's `pond`,
+read-only source/root mounts, isolated writable scratch, and no container
+network. Bash/Make/tar stay on the runner; the production image needs no Make.
+The deployment artifact contains the site root contents, not an extra
+`watertown/` directory. First trusted-main execution and live deployment remain
+the outstanding D10 verification gate.
 
 ## 9. README and migration strategy
 

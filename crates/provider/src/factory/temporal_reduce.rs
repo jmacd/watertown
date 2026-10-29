@@ -84,6 +84,7 @@ use tinyfs::{
 /// Aggregation types supported by the temporal reduce factory
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub enum AggregationType {
     Avg,
     Min,
@@ -108,6 +109,7 @@ impl AggregationType {
 /// Configuration for a single aggregation operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct AggregationConfig {
     /// Type of aggregation (avg, min, max, count, sum)
     #[serde(rename = "type")]
@@ -123,6 +125,7 @@ pub struct AggregationConfig {
 /// Configuration for a direct single-resolution temporal-reduce series.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct TemporalReduceSeriesConfig {
     pub in_pattern: crate::Url,
     pub time_column: String,
@@ -160,6 +163,7 @@ impl TemporalReduceSeriesConfig {
 /// Configuration for the temporal-reduce factory
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct TemporalReduceConfig {
     /// Input URL pattern to match source files (supports glob patterns)
     pub in_pattern: crate::Url,

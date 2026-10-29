@@ -45,9 +45,9 @@ RUN TEST → CLASSIFY → DISCUSS → FIX → SAVE
 
 | Result | Action |
 |--------|--------|
-| ✅ Success | Save to `tests/`, update `docs/cli-reference.md` if needed |
+| ✅ Success | Save to `tests/`, update the authoritative `docs/manual/` page if needed |
 | ❌ Bug | Report to user, propose proper fix |
-| ❓ Docs wrong | Fix `docs/cli-reference.md` immediately |
+| ❓ Docs wrong | Fix `docs/manual/` and its shared executable fixture |
 | 🤷 UX confusing | Discuss before changing |
 
 ## Container Environment

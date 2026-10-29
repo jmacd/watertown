@@ -75,6 +75,7 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// On-disk config for a `storage-minio` node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct StorageMinioConfig {
     /// MinIO endpoint URL, e.g. `http://watershop:9000`.  Required: a MinIO
     /// without an endpoint is not a MinIO.

@@ -22,7 +22,14 @@ POND_BIN ?= $(CURDIR)/target/debug/pond
 DOCS_OUT ?= $(CURDIR)/.docs-preview/watertown
 DOCS_PORT ?= 8000
 
-.PHONY: docs-build docs-serve docs-check docs-examples
+.PHONY: docs-build docs-serve docs-check docs-generate docs-export docs-examples
+
+docs-export:
+	cargo build --locked -p cmd --features documentation --bin docs-export
+
+docs-generate: docs-export
+	python3 scripts/generate-docs.py --write
+	python3 scripts/check-docs.py
 
 docs-build:
 	POND_BIN="$(POND_BIN)" DOCS_OUT="$(DOCS_OUT)" bash scripts/docs-build.sh
@@ -32,13 +39,16 @@ docs-serve: docs-build
 	@echo "Preview: http://127.0.0.1:$(DOCS_PORT)/watertown/ (no browser is opened)"
 	python3 -m http.server $(DOCS_PORT) --bind 127.0.0.1 --directory .docs-preview
 
-docs-check:
+docs-check: docs-export
+	python3 scripts/generate-docs.py --check
 	python3 scripts/check-docs.py
+	python3 scripts/test-docs.py
 
 docs-examples:
 	bash testsuite/run-test.sh --no-rebuild 057
 	bash testsuite/run-test.sh --no-rebuild 100
 	bash testsuite/run-test.sh --no-rebuild 213
+	bash testsuite/run-test.sh --no-rebuild 214
 
 # ── Default ──────────────────────────────────────────────────────────────
 
@@ -53,8 +63,8 @@ help:
 	@echo "    make check          All of: fmt, clippy, test"
 	@echo "    make docs-build     Strict manual build using POND_BIN (no Cargo)"
 	@echo "    make docs-serve     Build + serve on localhost, without opening a browser"
-	@echo "    make docs-check     Check pilot metadata (compiled coverage starts at D06)"
-	@echo "    make docs-examples  Run 057, 100, 213 in the existing test image"
+	@echo "    make docs-check     Check compiled reference freshness, mappings, and drift gates"
+	@echo "    make docs-examples  Run 057, 100, 213, 214 in the existing test image"
 	@echo ""
 	@echo "  Vendor (one-time, requires network)"
 	@echo "    make vendor         Download JS deps (DuckDB-WASM, Plot, D3)"

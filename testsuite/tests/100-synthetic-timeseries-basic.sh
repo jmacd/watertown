@@ -3,7 +3,7 @@
 # EXPECTED: The published example asserts inclusive boundaries and deterministic values
 set -euo pipefail
 source check.sh
-WORK="$(mktemp -d)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/watertown-test.XXXXXX")"
 trap 'rm -r -- "${WORK}"' EXIT
 export EXAMPLE_OUTPUT="${WORK}/synthetic"
 bash "${EXAMPLES_ROOT:-/examples}/synthetic-timeseries/run.sh"
