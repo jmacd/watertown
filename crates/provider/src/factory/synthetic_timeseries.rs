@@ -68,6 +68,7 @@ use tokio::sync::Mutex;
 /// Waveform component type
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub enum WaveformComponent {
     /// Sine wave: offset + amplitude * sin(2pi * t / period + phase)
     Sine {
@@ -160,6 +161,7 @@ impl WaveformComponent {
 /// A named timeseries point -- its value at each timestamp is the sum of its components
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct PointConfig {
     /// Column name for this point
     pub name: String,
@@ -170,6 +172,7 @@ pub struct PointConfig {
 /// Top-level configuration for the synthetic-timeseries factory
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct SyntheticTimeseriesConfig {
     /// Start time (RFC 3339 / ISO 8601)
     pub start: String,

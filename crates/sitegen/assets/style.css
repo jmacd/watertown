@@ -1681,3 +1681,17 @@ table.explore-grid th {
   position: sticky;
   top: 0;
 }
+/* Opt-in documentation layout. Navigation remains usable without JavaScript. */
+.documentation { font-family: system-ui, sans-serif; }
+.documentation .sidebar .subnav { display: block; }
+.documentation .manual-article { max-width: 76ch; line-height: 1.65; }
+.documentation pre { overflow-x: auto; padding: 1rem; background: var(--bg-secondary, #f3f4f6); border: 1px solid #8886; border-radius: .3rem; }
+.documentation code { font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
+.documentation pre code { overflow-wrap: normal; }
+.documentation table { border-collapse: collapse; display: block; overflow-x: auto; }
+.documentation th, .documentation td { padding: .5rem; border: 1px solid #8886; text-align: left; }
+.documentation .page-toc { padding: 1rem; border: 1px solid #8886; }
+.documentation .toc-level-3 { margin-left: 1rem; }
+.documentation a:focus-visible { outline: 3px solid currentColor; outline-offset: 3px; }
+.documentation .skip-link { position: absolute; left: -10000px; }
+.documentation .skip-link:focus { left: 1rem; top: 1rem; z-index: 100; background: white; color: black; padding: 1rem; }

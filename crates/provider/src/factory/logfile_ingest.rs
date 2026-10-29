@@ -70,6 +70,7 @@ fn parse_command(ctx: ExecutionContext) -> Result<LogfileCommand, tinyfs::Error>
 /// Configuration for the logfile ingestion factory
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct LogfileIngestConfig {
     /// Glob pattern for archived (immutable) log files
     /// Example: "/var/log/casparwater-*.json"
@@ -107,6 +108,7 @@ pub struct LogfileIngestConfig {
 /// that. Microseconds is the default because it is what tlogfs itself uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub enum TimestampUnit {
     Seconds,
     Milliseconds,

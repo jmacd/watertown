@@ -18,7 +18,11 @@ description.workspace = true
 [lib]
 doctest = false
 
+[features]
+documentation = ["dep:schemars"]
+
 [dependencies]
+schemars = { workspace = true, optional = true }
 # Workspace dependencies
 anyhow.workspace = true
 arrow.workspace = true

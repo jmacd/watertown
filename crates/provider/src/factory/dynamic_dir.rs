@@ -22,6 +22,7 @@ use tinyfs::{
 /// Configuration for a single directory entry
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct DynamicDirEntry {
     /// Name of the entry in the directory
     pub name: String,
@@ -34,6 +35,7 @@ pub struct DynamicDirEntry {
 /// Configuration for the dynamic directory
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct DynamicDirConfig {
     /// List of directory entries to create
     pub entries: Vec<DynamicDirEntry>,

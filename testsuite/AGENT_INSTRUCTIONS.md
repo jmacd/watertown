@@ -4,7 +4,10 @@
 
 Test Watertown -> Classify results -> Fix the right layer -> Save passing tests
 
-**Living documentation**: `docs/cli-reference.md` is THE source of truth. Update it when you learn something.
+**Living documentation**: `docs/manual/` is authoritative for current public
+interfaces. Follow `docs/README.md` and execute the exact fixtures in
+`testsuite/examples/`. `docs/cli-reference.md` retains compatibility links and
+historical context, not a second complete reference.
 
 ---
 
@@ -127,7 +130,7 @@ bare `=== PASSED ===` that tells you nothing about what was actually verified.
 |--------|---------|--------|
 | **Success** | Works as documented | Save test, verify docs accurate |
 | **BUG** | Code error | Report to user, propose proper fix |
-| **DOCS** | Docs wrong/missing | Fix `docs/cli-reference.md` NOW |
+| **DOCS** | Docs wrong/missing | Fix the authoritative `docs/manual/` page and shared fixture |
 | **UX** | Works but confusing | Discuss before changing |
 | **DESIGN** | Fundamental issue | Full discussion needed |
 
@@ -153,7 +156,7 @@ bare `=== PASSED ===` that tells you nothing about what was actually verified.
 | Bare `if/grep/exit 1` assertions | Use `check` / `check_contains` |
 | `echo "PASS: thing works"` | Use `check` (produces counted output) |
 | Forget `check_finish` | Always end with `check_finish` |
-| Guess CLI syntax | Read `docs/cli-reference.md` first |
+| Guess CLI syntax | Read `docs/manual/reference/cli/commands.md` first |
 | Skip verification | Always `pond list` / `pond cat` |
 | Suppress errors | Use `set -e` |
 | Test multiple things | One concept per test |
@@ -163,7 +166,7 @@ bare `=== PASSED ===` that tells you nothing about what was actually verified.
 
 ## Reference Docs
 
-- **CLI syntax**: `docs/cli-reference.md` (always check first)
+- **CLI syntax**: `docs/manual/reference/cli/commands.md` (compiled reference)
 - **Architecture**: `docs/watertown-overview.md`
 - **Transactions**: `docs/watertown-system-patterns.md`
 

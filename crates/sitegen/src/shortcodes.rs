@@ -234,7 +234,7 @@ pub fn classify(
 /// Each template page gets its own `ShortcodeContext`, wrapped in `Arc` and
 /// captured by the shortcode closures. This is the bridge between Watertown's
 /// typed data and the shortcode expansion engine.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ShortcodeContext {
     /// Capture group values for this page ($0, $1, ...)
     pub captures: Vec<String>,

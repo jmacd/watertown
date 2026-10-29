@@ -20,13 +20,15 @@ ARG WATERTOWN_VERSION=""
 ENV WATERTOWN_VERSION=${WATERTOWN_VERSION}
 
 # Build the pond binary
-RUN cargo build --release --bin pond
+RUN cargo build --locked --release --bin pond
 
 # Runtime stage
 FROM debian:bookworm-slim AS runtime
 
 ARG WATERTOWN_VERSION=""
+ARG WATERTOWN_SOURCE_REVISION=""
 LABEL org.opencontainers.image.version=${WATERTOWN_VERSION}
+LABEL org.opencontainers.image.revision=${WATERTOWN_SOURCE_REVISION}
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends libssl3 ca-certificates && \

@@ -1,0 +1,90 @@
+site:
+  title: Watertown development manual
+  base_url: "/watertown/"
+  github_url: https://github.com/jmacd/watertown
+documentation:
+  version: 1
+  source_root: /docs/manual
+  include_roots:
+    - /testsuite/examples
+strict: true
+content:
+  - name: reference
+    pattern: "/docs/manual/reference/**/*.md"
+  - name: guides
+    pattern: "/docs/manual/guides/**/*.md"
+routes:
+  - name: home
+    type: static
+    slug: ""
+    page: /docs/manual/index.md
+    routes:
+      - name: reference
+        type: content
+        slug: ""
+        content: reference
+      - name: guides
+        type: content
+        slug: ""
+        content: guides
+partials:
+  sidebar: /docs/templates/sidebar.md
+sidebar:
+  - label: Manual home
+    href: /index.html
+  - label: Guides
+    children:
+      - label: Timeseries
+        href: /guides/timeseries.html
+      - label: Timeseries site
+        href: /guides/timeseries-site.html
+      - label: Blog and RSS
+        href: /guides/blog.html
+      - label: Operations
+        href: /guides/operations.html
+  - label: Reference
+    children:
+      - label: CLI
+        href: /reference/cli/commands.html
+      - label: Shared concepts
+        href: /reference/concepts.html
+      - label: Export
+        href: /reference/export.html
+      - label: Factories
+        children:
+          - label: Synthetic timeseries
+            href: /reference/factories/synthetic-timeseries.html
+          - label: SQL and transforms
+            href: /reference/factories/sql.html
+          - label: Timeseries transformations
+            href: /reference/factories/timeseries.html
+          - label: Ingestion
+            href: /reference/factories/ingestion.html
+          - label: Storage and budgets
+            href: /reference/factories/storage.html
+          - label: Exec
+            href: /reference/factories/exec.html
+          - label: Reports
+            href: /reference/factories/reporting.html
+      - label: Formats
+        children:
+          - label: CSV
+            href: /reference/formats/csv.html
+          - label: Other providers
+            href: /reference/formats/providers.html
+      - label: Sitegen
+        children:
+          - label: Configuration
+            href: /reference/sitegen/configuration.html
+          - label: Frontmatter
+            href: /reference/sitegen/frontmatter.html
+          - label: Shortcodes
+            href: /reference/sitegen/shortcodes.html
+          - label: Browser behavior
+            href: /reference/sitegen/browser.html
+static:
+  - pattern: "/testsuite/examples/csv-query/*"
+  - pattern: "/testsuite/examples/synthetic-timeseries/*"
+  - pattern: "/testsuite/examples/documentation-pilot/*"
+  - pattern: "/docs/manual/_generated/inventory.json"
+footer: "Development manual; service/browser coverage is limited. Documentation version ${env:WATERTOWN_DOCS_VERSION:-development}; source ${env:WATERTOWN_DOCS_REVISION:-working-tree}."

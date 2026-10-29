@@ -22,6 +22,14 @@ doctest = false
 name = "pond"
 path = "src/main.rs"
 
+[[bin]]
+name = "docs-export"
+path = "src/bin/docs-export.rs"
+required-features = ["documentation"]
+
+[features]
+documentation = ["dep:schemars", "dep:jsonschema", "provider/documentation", "sitegen/documentation", "exec-factory/documentation", "gitpond/documentation", "hydrovu/documentation"]
+
 # Debian package built by `cargo deb -p cmd` on the watertown repo
 # (typically run on watershop natively for the arm64 fleet).  The deb
 # ships the pond binary plus the sitegen vendor blobs (DuckDB-WASM,
@@ -73,6 +81,8 @@ assets = [
 ]
 
 [dependencies]
+schemars = { workspace = true, optional = true }
+jsonschema = { version = "0.33", default-features = false, optional = true }
 anyhow = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }
