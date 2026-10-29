@@ -265,6 +265,7 @@ The table is always named `source` in SQL queries.
 | `--format=auto` (default) | Text table for queryable data; original bytes for non-queryable files | Terminal display and text pagers |
 | `--format=raw` | Parquet bytes for queryable data; original bytes otherwise | Binary export to files and downstream Parquet tools |
 | `--format=table` | Human-readable text table | Explicit human-readable display |
+| `--format=csv` | RFC 4180 CSV with a header row | Scripts and tabular interchange |
 
 > **Note**: `--format` on `pond cat` controls **output display** (raw bytes vs ASCII table).
 > `pond copy` does not have a `--format` flag — entry type is encoded in the source URL

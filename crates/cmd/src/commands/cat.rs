@@ -33,9 +33,7 @@ async fn handle_stream_output(
     output: Option<&mut String>,
     source_desc: &str, // For debug messages: "url" or "path"
 ) -> Result<()> {
-    let use_table_format = display == "table";
-
-    if use_table_format {
+    if display == "table" {
         // Collect batches for table formatting
         let mut batches = Vec::new();
         let mut total_rows = 0;
@@ -65,19 +63,61 @@ async fn handle_stream_output(
         debug!(
             "Successfully formatted {total_rows} rows in {batch_count} batches from: {source_desc}"
         );
-    } else if let Some(output) = output {
-        // Testing mode - collect batches then write to buffer
-        let mut batches = Vec::new();
-        while let Some(batch_result) = stream.next().await {
-            let batch = batch_result.map_err(|e| anyhow::anyhow!("Failed to read batch: {}", e))?;
-            batches.push(batch);
+    } else if display == "csv" {
+        if let Some(output) = output {
+            let mut buffer = Vec::new();
+            write_stream_to_csv(stream, &mut buffer).await?;
+            output.push_str(std::str::from_utf8(&buffer).map_err(|e| {
+                anyhow::anyhow!("CSV output for '{source_desc}' is not valid UTF-8: {e}")
+            })?);
+        } else {
+            write_stream_to_csv(stream, io::stdout()).await?;
         }
-        write_batches_to_buffer(&batches, output)?;
+    } else if display == "raw" {
+        if let Some(output) = output {
+            // Testing mode - collect batches then write to buffer
+            let mut batches = Vec::new();
+            while let Some(batch_result) = stream.next().await {
+                let batch =
+                    batch_result.map_err(|e| anyhow::anyhow!("Failed to read batch: {}", e))?;
+                batches.push(batch);
+            }
+            write_batches_to_buffer(&batches, output)?;
+        } else {
+            // Production mode - stream directly to stdout
+            write_stream_to_stdout(stream).await?;
+        }
     } else {
-        // Production mode - stream directly to stdout
-        write_stream_to_stdout(stream).await?;
+        return Err(anyhow::anyhow!(
+            "unknown cat output format '{display}'; expected auto, raw, table, or csv"
+        ));
     }
 
+    Ok(())
+}
+
+async fn write_stream_to_csv<W: Write>(
+    mut stream: datafusion::physical_plan::SendableRecordBatchStream,
+    output: W,
+) -> Result<()> {
+    let schema = stream.schema();
+    let mut writer = arrow_csv::WriterBuilder::new()
+        .with_header(true)
+        .build(output);
+    let mut wrote_batch = false;
+    while let Some(batch_result) = stream.next().await {
+        let batch =
+            batch_result.map_err(|e| anyhow::anyhow!("Failed to read batch for CSV: {e}"))?;
+        writer
+            .write(&batch)
+            .map_err(|e| anyhow::anyhow!("Failed to write CSV batch: {e}"))?;
+        wrote_batch = true;
+    }
+    if !wrote_batch {
+        writer
+            .write(&RecordBatch::new_empty(schema))
+            .map_err(|e| anyhow::anyhow!("Failed to write empty CSV result: {e}"))?;
+    }
     Ok(())
 }
 
@@ -513,6 +553,7 @@ mod tests {
         assert_eq!(resolve_auto_format("auto", false), "raw");
         assert_eq!(resolve_auto_format("raw", true), "raw");
         assert_eq!(resolve_auto_format("table", false), "table");
+        assert_eq!(resolve_auto_format("csv", true), "csv");
     }
 
     /// Test setup helper - creates pond and returns context for testing
@@ -1347,6 +1388,23 @@ mod tests {
             assert_eq!(output.contains("alpha"), sql.is_none());
             assert!(output.contains(&format!("Summary: {expected_rows} total rows")));
         }
+        let mut output = String::new();
+        cat_command(
+            &ship_context,
+            "host+xls:///book.xls?sheet=Readings",
+            "csv",
+            Some(&mut output),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await?;
+        assert_eq!(
+            output.lines().next(),
+            Some("name,value,active,when,mixed,late_mixed")
+        );
+        assert!(output.contains("alpha,10"));
         Ok(())
     }
 

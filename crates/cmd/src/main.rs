@@ -490,7 +490,7 @@ enum Commands {
     Cat {
         /// File path to read
         path: String,
-        /// Output format [default: auto] [possible values: auto, raw, table]
+        /// Output format [default: auto] [possible values: auto, raw, table, csv]
         /// auto: table for queryable types, raw for non-queryable files
         #[arg(long, default_value = "auto")]
         format: String,

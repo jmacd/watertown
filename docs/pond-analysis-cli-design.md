@@ -83,7 +83,7 @@ Extend `--format` and add explicit stream discipline:
 
 ```
 --format table            # human ASCII (default for queryable content)
---format csv              # RFC-4180, header row
+--format csv              # RFC-4180, header row (implemented)
 --format ndjson           # one JSON object per row (default when piped?)
 --format json             # single JSON array
 --format parquet          # today's `raw`; keep as alias
