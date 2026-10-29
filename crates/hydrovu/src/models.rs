@@ -10,11 +10,14 @@ use tlogfs::data_taxonomy::{ApiKey, ApiSecret};
 /// Configuration for HydroVu OAuth credentials and device list
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct HydroVuConfig {
     /// OAuth client ID (sensitive - redacted from debug output)
+    #[cfg_attr(feature = "documentation", schemars(with = "String"))]
     pub client_id: ApiKey<String>,
 
     /// OAuth client secret (sensitive - redacted from debug output)
+    #[cfg_attr(feature = "documentation", schemars(with = "String"))]
     pub client_secret: ApiSecret<String>,
 
     pub max_points_per_run: usize,
@@ -39,6 +42,7 @@ pub struct HydroVuConfig {
 /// Device configuration specifying which HydroVu location to collect
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct HydroVuDevice {
     pub name: String,
     pub id: i64,

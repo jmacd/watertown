@@ -42,6 +42,7 @@ enum GitIngestSubcommand {
 /// Configuration for the git-ingest factory
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct GitIngestConfig {
     /// Git remote URL (HTTPS or SSH)
     pub url: String,

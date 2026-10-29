@@ -32,3 +32,11 @@ sample-*/
 # Per-site deployment credentials (see deploy.env.example)
 */deploy.env
 linux/remote-pond/
+
+# Reviewed, executable documentation fixtures only.
+!/testsuite/examples/*/run.sh
+!/testsuite/examples/*/*.csv
+!/testsuite/examples/*/*.sql
+!/testsuite/examples/*/*.parquet
+/site/
+/.docs-preview/

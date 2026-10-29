@@ -27,6 +27,7 @@ const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
 /// Configuration for one `exec` factory mount.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct ExecConfig {
     /// Absolute path to the program to execute. Never searched on `$PATH`:
     /// the config is pond-versioned, so the exact binary invoked should be

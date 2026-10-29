@@ -46,6 +46,8 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       
       - name: Free up disk space
         run: |
@@ -65,6 +67,11 @@ jobs:
       
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+      - name: Check compiled documentation reference and coverage
+        env:
+          DOCS_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
+        run: make docs-check
       
       - name: Run clippy
         run: cargo clippy --workspace --all-features -- -D warnings
@@ -84,6 +91,32 @@ jobs:
       
       - name: Run tests
         run: cargo test --workspace
+
+      - name: Validate typed documentation and build same-revision renderer
+        run: |
+          cargo test --locked -p cmd --features documentation --lib documentation::tests
+          cargo build --locked -p cmd --features documentation --bin pond
+
+      - name: Validate documentation examples and strict manual
+        run: |
+          set -euo pipefail
+          make vendor
+          export PATH="$PWD/target/debug:$PWD/testsuite/helpers:$PATH"
+          export REPO_ROOT="$PWD" EXAMPLES_ROOT="$PWD/testsuite/examples"
+          for test in 057-documentation-csv-example 100-synthetic-timeseries-basic \
+            213-sitegen-documentation-pilot 214-documentation-workflows; do
+            bash "testsuite/tests/${test}.sh"
+          done
+          WATERTOWN_DOCS_REVISION="$GITHUB_SHA" make docs-build
+
+      - name: Upload read-only PR documentation preview
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: documentation-preview
+          path: .docs-preview/watertown/
+          if-no-files-found: error
+          retention-days: 7
 
   version:
     name: Compute version
@@ -217,6 +250,7 @@ jobs:
           ARCH="${{ matrix.arch }}"
           podman build \
             --build-arg "WATERTOWN_VERSION=${SEMVER}" \
+            --build-arg "WATERTOWN_SOURCE_REVISION=${{ github.sha }}" \
             -t "${IMAGE}:${VERSION}-${ARCH}" \
             -f Dockerfile .
           # The 0.<build>.<pr> semver is an immutable, human-readable handle
@@ -260,6 +294,86 @@ jobs:
           if [ -n "${{ steps.meta.outputs.extra_tag }}" ]; then
             cosign sign --yes "${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.extra_tag }}-${{ matrix.arch }}"
           fi
+
+      - name: Record immutable documentation image
+        if: matrix.arch == 'amd64' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ steps.meta.outputs.image_id }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          jq -n --arg image "$IMAGE" --arg digest "$DIGEST" \
+            --arg revision "$GITHUB_SHA" --arg version "$VERSION" \
+            '{image:$image,digest:$digest,revision:$revision,version:$version,arch:"amd64"}' \
+            > documentation-image.json
+
+      - name: Upload AMD64 image identity
+        if: matrix.arch == 'amd64' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: documentation-image-${{ github.sha }}
+          path: documentation-image.json
+          if-no-files-found: error
+
+  build-pages:
+    name: Validate production-image manual
+    needs: [audit, check, version, build-container]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: documentation-image-${{ github.sha }}
+          path: ${{ runner.temp }}/documentation-image
+      - name: Pull and verify exact production image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          RECORD="$RUNNER_TEMP/documentation-image/documentation-image.json"
+          jq -e --arg sha "$GITHUB_SHA" --arg version "$EXPECTED_VERSION" \
+            '.revision == $sha and .version == $version and .arch == "amd64"' "$RECORD"
+          IMAGE="$(jq -r .image "$RECORD")@$(jq -r .digest "$RECORD")"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker pull --platform linux/amd64 "$IMAGE"
+          REVISION="$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
+          [[ "$REVISION" == "$GITHUB_SHA" ]]
+          echo "DOCS_CONTAINER_IMAGE=$IMAGE" >> "$GITHUB_ENV"
+      - name: Run same-image examples and build manual without Cargo
+        env:
+          DOCS_OUT: ${{ runner.temp }}/manual
+          DOCS_EXPECTED_VERSION: ${{ needs.version.outputs.version }}
+          WATERTOWN_DOCS_REVISION: ${{ github.sha }}
+        run: bash scripts/docs-publish.sh
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
+        with:
+          path: ${{ runner.temp }}/manual
+
+  deploy-pages:
+    name: Deploy development manual
+    needs: build-pages
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: github-pages
+      cancel-in-progress: false
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy Pages artifact
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
 
   build-deb:
     name: Build & Publish Deb (${{ matrix.arch }})

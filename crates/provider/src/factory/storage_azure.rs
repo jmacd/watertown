@@ -70,6 +70,7 @@ pub const FACTORY_NAME: &str = "storage-azure";
 /// authenticates as an application rather than with a shared secret.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct ServicePrincipal {
     /// Application (client) id.  Must be an `${env:...}` reference.
     pub client_id: String,
@@ -82,6 +83,7 @@ pub struct ServicePrincipal {
 /// On-disk config for a `storage-azure` node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct StorageAzureConfig {
     /// Storage account name, e.g. `casparwater`.  Required: an Azure profile
     /// without an account names nothing.  Not a credential (see module docs).

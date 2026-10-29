@@ -15,7 +15,11 @@ categories.workspace = true
 keywords.workspace = true
 description.workspace = true
 
+[features]
+documentation = ["dep:schemars"]
+
 [dependencies]
+schemars = { workspace = true, optional = true }
 provider.workspace = true
 tinyfs.workspace = true
 serde.workspace = true
@@ -42,6 +46,8 @@ png.workspace = true
 rss.workspace = true
 regex.workspace = true
 uuid.workspace = true
+tl.workspace = true
+percent-encoding.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true

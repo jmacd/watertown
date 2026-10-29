@@ -1,0 +1,10 @@
+start: "2024-01-01T00:00:00Z"
+end: "2024-01-01T03:00:00Z"
+interval: "1h"
+time_column: timestamp
+points:
+  - name: temperature
+    components:
+      - type: line
+        offset: 20.0
+        slope: 0.001

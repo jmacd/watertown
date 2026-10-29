@@ -1,0 +1,18 @@
+site:
+  title: Synthetic sensor site
+  base_url: /sensor-example/
+strict: true
+exports:
+  - name: readings
+    pattern: /sensors/*
+routes:
+  - name: home
+    type: static
+    slug: ""
+    page: /pages/index.md
+    routes:
+      - name: sensor
+        type: template
+        slug: "$0"
+        export: readings
+        page: /pages/sensor.md

@@ -94,6 +94,92 @@ pub struct Url {
     is_host: bool,
 }
 
+#[cfg(feature = "documentation")]
+impl schemars::JsonSchema for Url {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "WatertownUrl".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        <String as schemars::JsonSchema>::json_schema(generator)
+    }
+}
+
+#[cfg(feature = "documentation")]
+pub use format::csv::CsvOptions;
+
+#[cfg(feature = "documentation")]
+#[must_use]
+pub fn documentation_schemas() -> std::collections::BTreeMap<&'static str, schemars::Schema> {
+    fn schema<T: schemars::JsonSchema>() -> schemars::Schema {
+        schemars::generate::SchemaSettings::draft2020_12()
+            .for_deserialize()
+            .into_generator()
+            .into_root_schema_for::<T>()
+    }
+    use factory::*;
+    std::collections::BTreeMap::from([
+        (
+            "factory:synthetic-timeseries",
+            schema::<synthetic_timeseries::SyntheticTimeseriesConfig>(),
+        ),
+        ("factory:sql-derived-table", schema::<SqlDerivedConfig>()),
+        ("factory:sql-derived-series", schema::<SqlDerivedConfig>()),
+        (
+            "factory:timeseries-join",
+            schema::<timeseries_join::TimeseriesJoinConfig>(),
+        ),
+        (
+            "factory:timeseries-pivot",
+            schema::<timeseries_pivot::TimeseriesPivotConfig>(),
+        ),
+        (
+            "factory:temporal-reduce",
+            schema::<temporal_reduce::TemporalReduceConfig>(),
+        ),
+        (
+            "factory:temporal-reduce-series",
+            schema::<temporal_reduce::TemporalReduceSeriesConfig>(),
+        ),
+        (
+            "factory:pump-state-series",
+            schema::<pump_state::PumpStateConfig>(),
+        ),
+        (
+            "factory:materialize-series",
+            schema::<materialize_series::MaterializeSeriesConfig>(),
+        ),
+        (
+            "factory:column-rename",
+            schema::<column_rename::ColumnRenameConfig>(),
+        ),
+        ("factory:dynamic-dir", schema::<DynamicDirConfig>()),
+        (
+            "factory:logfile-ingest",
+            schema::<logfile_ingest::LogfileIngestConfig>(),
+        ),
+        (
+            "factory:journal-ingest",
+            schema::<journal_ingest::JournalIngestConfig>(),
+        ),
+        (
+            "factory:rate-limit",
+            schema::<rate_limit::RateLimitConfig>(),
+        ),
+        (
+            "factory:storage-minio",
+            schema::<storage_minio::StorageMinioConfig>(),
+        ),
+        (
+            "factory:storage-azure",
+            schema::<storage_azure::StorageAzureConfig>(),
+        ),
+        ("format:csv", schema::<CsvOptions>()),
+        ("format:xls", schema::<format::xls::XlsOptions>()),
+        ("format:hledger", schema::<format::hledger::Options>()),
+    ])
+}
+
 impl PartialEq for Url {
     fn eq(&self, other: &Self) -> bool {
         self.format_scheme == other.format_scheme
@@ -151,6 +237,12 @@ impl std::fmt::Display for Url {
 impl Url {
     /// Known compression suffixes that can appear after `+` in the scheme
     const KNOWN_COMPRESSIONS: &[&str] = &["zstd", "gzip", "bzip2"];
+
+    #[cfg(feature = "documentation")]
+    #[must_use]
+    pub fn compression_schemes() -> &'static [&'static str] {
+        Self::KNOWN_COMPRESSIONS
+    }
 
     /// Known entry type suffixes that can appear after `+` in the scheme
     const KNOWN_ENTRY_TYPES: &[&str] = &["table", "series"];

@@ -11,6 +11,9 @@ use gitpond as _;
 use hydrovu as _;
 use sitegen as _;
 
+pub mod cli;
 pub mod commands;
 pub mod common;
+#[cfg(feature = "documentation")]
+pub mod documentation;
 pub mod error_utils;

@@ -67,6 +67,7 @@ fn parse_command(ctx: ExecutionContext) -> Result<MaterializeCommand, tinyfs::Er
 /// Configuration for the materialize-series factory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct MaterializeSeriesConfig {
     /// URL of the signal to materialize, e.g.
     /// `series:///derived/p-water-prod`.  Anything the provider can turn into

@@ -10,5 +10,7 @@
 //! no files are copied into the pond.
 
 mod factory;
+#[cfg(feature = "documentation")]
+pub use factory::GitIngestConfig;
 pub(crate) mod git;
 pub mod tree;

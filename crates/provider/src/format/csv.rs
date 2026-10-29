@@ -34,6 +34,7 @@ use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt};
 /// - `csv:///data/file.csv?delimiter=;&has_header=false` - No header row
 /// - `csv:///data/file.csv?batch_size=16384` - Larger batch size
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct CsvOptions {
     /// Field delimiter (default: ',')
     #[serde(default = "default_delimiter")]

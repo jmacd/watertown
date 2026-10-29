@@ -28,7 +28,8 @@ const SCALE: u32 = 18;
 
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct Options {
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
+pub(crate) struct Options {
     batch_size: usize,
 }
 

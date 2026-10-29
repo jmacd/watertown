@@ -62,6 +62,8 @@ RUN apt-get update && \
         grep \
         sed \
         gawk \
+        # Documentation pilot build/check prerequisites (not a publisher)
+        make \
         # For generating test data
         uuid-runtime \
         # Process supervision (systemd-like)

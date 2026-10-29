@@ -46,6 +46,7 @@ const OUTPUT_BATCH_ROWS: usize = 8 * 1024;
 /// Configuration for a typed adaptive pump-state series.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct PumpStateConfig {
     /// Exact logical source URL.
     pub source: crate::Url,
