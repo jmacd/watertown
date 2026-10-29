@@ -18,11 +18,13 @@ Test 213 verifies strict failures, literal syntax, lean assets, preview
 preservation, and prose rebuilding with Cargo unavailable. The generated
 preview was checked over localhost HTTP without opening a browser.
 
-The current container image predates the renderer changes; the documentation
-gate was verified natively, not against that image. CI must rebuild the image
-from this revision. The inventory retains 125 pending public entries; compiled
-discovery, generated-reference freshness, broad migration, deployment, and
-README redesign are intentionally outside this completed pilot.
+Linux ARM64 container validation is also complete: the test image built from
+`60a06ff0` contains the exact cross-compiled binary and passes tests 057, 100,
+and 213 (66 checks). Test 213 also passes all 45 checks through Compose's
+read-only source mounts. CI must rebuild the image from the revision under
+test. The inventory retains 125 pending public entries; compiled discovery,
+generated-reference freshness, broad migration, deployment, and README
+redesign are intentionally outside this completed pilot.
 
 ## 1. Goals
 
