@@ -154,6 +154,7 @@ pub fn apply_layout(name: &str, ctx: &LayoutContext) -> String {
         "explore" => explore_layout(ctx),
         "page" => page_layout(ctx),
         "blog" => blog_layout(ctx),
+        "documentation" => documentation_layout(ctx),
         other => {
             if other != "default" {
                 log::warn!("Unknown layout '{}', using default layout", other);
@@ -162,6 +163,46 @@ pub fn apply_layout(name: &str, ctx: &LayoutContext) -> String {
         }
     };
     markup.into_string()
+}
+
+fn documentation_layout(ctx: &LayoutContext) -> Markup {
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                meta name="generator" content=(format!("Watertown v{}", VERSION));
+                title { (ctx.title) " -- " (ctx.site_title) }
+                link rel="stylesheet" href=(format!("{}style.css", ctx.root_base_url));
+                link rel="stylesheet" href=(format!("{}theme.css", ctx.base_url));
+            }
+            body class="documentation" {
+                a class="skip-link" href="#manual-content" { "Skip to content" }
+                @if let Some(sidebar) = ctx.sidebar {
+                    nav class="sidebar" aria-label="Manual" { (PreEscaped(sidebar)) }
+                }
+                main id="manual-content" class="content-page" tabindex="-1" {
+                    (top_bar(Some("Manual home"), Some(ctx.base_url), None, ctx.github_url))
+                    article class="manual-article" { (PreEscaped(ctx.content)) }
+                    footer {
+                        small { "Development manual | Watertown v" (VERSION) " | renderer build " (GIT_SHA) }
+                    }
+                }
+                (build_footer(ctx.footer))
+                @for (marker, script) in [
+                    ("chart-data", "chart.js"),
+                    ("overlay-data", "overlay.js"),
+                    ("log-data", "log-viewer.js"),
+                    ("datasets", "explore.js"),
+                ] {
+                    @if ctx.content.contains(&format!("class=\"{}\"", marker)) {
+                        script src=(format!("{}{}", ctx.root_base_url, script)) type="module" {}
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Common `<head>` elements shared by all layouts.
@@ -417,6 +458,32 @@ fn default_layout(ctx: &LayoutContext) -> Markup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn documentation_assets_follow_active_shortcodes_only() {
+        let mut ctx = LayoutContext {
+            title: "Manual",
+            site_title: "Test",
+            base_url: "/watertown/",
+            root_base_url: "/watertown/",
+            content: "<pre>&lt;script class=&quot;chart-data&quot;&gt;</pre>",
+            sidebar: Some("<a href=\"/watertown/index.html\">Home</a>"),
+            date: None,
+            feed_url: None,
+            github_url: None,
+            footer: None,
+            header: None,
+        };
+        let literal = apply_layout("documentation", &ctx);
+        assert!(!literal.contains("fonts.googleapis"));
+        assert!(!literal.contains("chart.js"));
+        assert!(literal.contains("href=\"#manual-content\""));
+        ctx.content = "<div id=\"chart\"><script class=\"chart-data\" type=\"application/json\">[]</script></div>";
+        let active = apply_layout("documentation", &ctx);
+        assert!(active.contains("src=\"/watertown/chart.js\""));
+        assert!(!active.contains("overlay.js"));
+        assert!(!active.contains("explore.js"));
+    }
 
     #[test]
     fn test_default_layout() {

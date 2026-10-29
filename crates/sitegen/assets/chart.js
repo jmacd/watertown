@@ -162,7 +162,8 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
   // in the URL hash (`#t=<begin>,<end>`). Parse it on load so the page opens
   // showing exactly that range.
   {
-    const m = /[#&]t=(\d+),(\d+)/.exec(location.hash);
+    const t = new URLSearchParams(location.hash.slice(1)).get("t");
+    const m = /^(\d+),(\d+)$/.exec(t || "");
     if (m) {
       const a = +m[1], b = +m[2];
       if (isFinite(a) && isFinite(b) && a < b) zoomDomain = [a, b];
@@ -230,6 +231,22 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
     activeDays = visibleRanges[visibleRanges.length - 1][1];
   }
 
+  // Navigation links select a trailing duration; shared #t links still take
+  // precedence through zoomDomain. Honor explicit durations even on young datasets.
+  const requestedRangeLabel = new URLSearchParams(location.search).get("range");
+  if (requestedRangeLabel !== null) {
+    const requestedRange = ranges.find(([label]) => label === requestedRangeLabel);
+    if (requestedRange) {
+      activeDays = requestedRange[1];
+      if (!visibleRanges.includes(requestedRange)) {
+        visibleRanges.push(requestedRange);
+        visibleRanges.sort((a, b) => a[1] - b[1]);
+      }
+    } else {
+      console.warn(`chart.js: unknown range "${requestedRangeLabel}"; using the default duration`);
+    }
+  }
+
   visibleRanges.forEach(([text, days]) => {
     const btn = document.createElement("button");
     btn.textContent = text;
@@ -241,7 +258,7 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
       btnBar.querySelectorAll("button").forEach(b => b.classList.remove("active"));
       btn.classList.add("active");
       activeDays = days;
-      renderChart();
+      return renderChart();
     };
     btnBar.appendChild(btn);
   });
@@ -258,9 +275,35 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
     btnBar.querySelectorAll("button").forEach(b => {
       b.classList.toggle("active", parseFloat(b.dataset.days) === activeDays);
     });
-    renderChart();
+    return renderChart();
   };
   toolbar.appendChild(resetBtn);
+
+  const reloadBtn = document.createElement("button");
+  reloadBtn.type = "button";
+  reloadBtn.className = "reload-data";
+  reloadBtn.textContent = "Reload data";
+  reloadBtn.title = "Reload the page and data while keeping the selected time window";
+  reloadBtn.onclick = () => {
+    syncWindowUrl();
+    location.reload();
+  };
+  toolbar.appendChild(reloadBtn);
+
+  function syncWindowUrl() {
+    const url = new URL(location.href);
+    const [label] = ranges.find(([, days]) => days === activeDays);
+    url.searchParams.set("range", label);
+    const hash = new URLSearchParams(url.hash.slice(1));
+    if (zoomDomain) {
+      hash.set("t", zoomDomain.map(Math.round).join(","));
+      url.hash = hash.toString();
+    } else if (hash.has("t")) {
+      hash.delete("t");
+      url.hash = hash.toString();
+    }
+    history.replaceState(null, "", url.href);
+  }
 
   // Overlay track checkboxes — only when this page has an annotation manifest.
   // Toggling re-renders the chart(s) with the selected tracks and persists the
@@ -324,6 +367,10 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
   copyBtn.className = "copy-link";
   copyBtn.textContent = "Copy link";
 
+  const copyStatus = document.createElement("span");
+  copyStatus.className = "copy-link-status";
+  copyStatus.setAttribute("role", "status");
+
   const downloadBtn = document.createElement("button");
   downloadBtn.type = "button";
   downloadBtn.className = "download-csv";
@@ -346,6 +393,7 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
 
   windowBar.append(winLabel, startInput, arrow, endInput, copyBtn, downloadBtn);
   if (exploreBtn) windowBar.append(exploreBtn);
+  windowBar.append(copyStatus);
   toolbar.after(windowBar);
 
   function pad2(n) { return String(n).padStart(2, "0"); }
@@ -375,7 +423,7 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
     zoomDomain = [s, e];
     btnBar.querySelectorAll("button").forEach(b => b.classList.remove("active"));
     showResetBtn();
-    renderChart();
+    return renderChart();
   }
   startInput.addEventListener("change", applyWindow);
   endInput.addEventListener("change", applyWindow);
@@ -385,18 +433,22 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
     if (curBegin == null) return;
     const url = `${location.origin}${location.pathname}` +
       `#t=${Math.round(curBegin)},${Math.round(curEnd)}`;
-    let ok = false;
+    clearTimeout(copyResetTimer);
+    copyBtn.classList.remove("copied");
+    copyStatus.textContent = "";
     try {
       await navigator.clipboard.writeText(url);
-      ok = true;
     } catch (e) {
-      // Clipboard unavailable (e.g. non-secure context): reflect the range in
-      // the address bar so the user can copy it manually.
+      console.error("Copy link failed:", e);
       history.replaceState(null, "", url);
+      copyBtn.textContent = "Copy failed";
+      copyStatus.textContent = window.isSecureContext
+        ? "Could not copy the link. Copy it from the address bar instead."
+        : "Could not copy the link: clipboard access requires HTTPS. Copy it from the address bar instead.";
+      return;
     }
-    copyBtn.textContent = ok ? "Copied!" : "Link in URL";
+    copyBtn.textContent = "Copied!";
     copyBtn.classList.add("copied");
-    clearTimeout(copyResetTimer);
     copyResetTimer = setTimeout(() => {
       copyBtn.textContent = "Copy link";
       copyBtn.classList.remove("copied");
@@ -1170,6 +1222,8 @@ import { loadVega, buildMetricChartSpec, escapeField } from "./vega-shared.js";
     // (resolution + time filter) and the chart axis.
     const domainEnd = zoomDomain ? zoomDomain[1] : nowMs;
     const domainBegin = zoomDomain ? zoomDomain[0] : (nowMs - activeDays * 86400000);
+
+    syncWindowUrl();
 
     // Reflect the effective window in the start/end inputs (and Copy-link
     // state) before querying, so the readout is correct even if no data

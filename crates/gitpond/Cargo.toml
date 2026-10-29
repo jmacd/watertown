@@ -18,7 +18,11 @@ description.workspace = true
 [lib]
 doctest = false
 
+[features]
+documentation = ["dep:schemars"]
+
 [dependencies]
+schemars = { workspace = true, optional = true }
 # Workspace dependencies
 async-trait.workspace = true
 clap.workspace = true

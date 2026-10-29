@@ -240,6 +240,8 @@ if [[ -n "${SCRIPT_FILE}" ]]; then
     # Tests marked '# REQUIRES: host' run directly on the host (not in Docker).
     # They need tools like Node.js/Puppeteer that aren't in the test container.
     if head -25 "${SCRIPT_FILE}" | grep -q '# REQUIRES: host'; then
+        export EXAMPLES_ROOT="${SCRIPT_DIR}/examples"
+        export REPO_ROOT="${SCRIPT_DIR}/.."
         echo "=== Running Test: ${SCRIPT_NAME} (host, timeout: ${TIMEOUT}s) ==="
         exec timeout "${TIMEOUT}" bash "${SCRIPT_FILE}" "$@"
     fi
@@ -305,6 +307,8 @@ if [[ -n "${SCRIPT_FILE}" ]]; then
 
         # Build volume args for compose run
         COMPOSE_VOLUMES=(-v "${SCRIPT_FILE}:/test/run.sh:ro")
+        COMPOSE_VOLUMES+=(-v "${SCRIPT_DIR}/examples:/examples:ro")
+        COMPOSE_VOLUMES+=(-v "${SCRIPT_DIR}/..:/repo:ro")
         COMPOSE_VOLUMES+=("${OUTPUT_MOUNT[@]}")
         COMPOSE_VOLUMES+=("${DATA_MOUNT[@]}")
 
@@ -324,7 +328,11 @@ if [[ -n "${SCRIPT_FILE}" ]]; then
             "${PRIVILEGED_FLAG[@]}" \
             -e POND=/pond \
             -e RUST_LOG=info \
+            -e EXAMPLES_ROOT=/examples \
+            -e REPO_ROOT=/repo \
             -v "${SCRIPT_FILE}:/test/run.sh:ro" \
+            -v "${SCRIPT_DIR}/examples:/examples:ro" \
+            -v "${SCRIPT_DIR}/..:/repo:ro" \
             "${OUTPUT_MOUNT[@]}" \
             "${DATA_MOUNT[@]}" \
             "${IMAGE_NAME}" \

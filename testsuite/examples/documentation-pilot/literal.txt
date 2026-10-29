@@ -1,0 +1,7 @@
+{{ chart /}}
+{{ source path="/not-read" /}}
+<script>throw new Error("included source is literal")</script>
+$(touch /must-not-run)
+```
+~~~ text
+& < > " '

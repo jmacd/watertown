@@ -292,6 +292,12 @@ pub enum SchemeKind {
 pub struct SchemeRegistry;
 
 impl SchemeRegistry {
+    #[cfg(feature = "documentation")]
+    #[must_use]
+    pub fn builtin_schemes() -> &'static [&'static str] {
+        BUILTIN_SCHEMES
+    }
+
     /// Classify a scheme name by searching builtins, format providers, and factories.
     ///
     /// Returns `None` if the scheme is not recognized by any registry.

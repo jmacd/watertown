@@ -29,6 +29,7 @@ use tinyfs::ResultExt;
 /// A single column rename rule
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub enum RenameRule {
     /// Direct column name mapping
     ///
@@ -66,6 +67,7 @@ pub enum RenameRule {
 /// Configuration for column rename transformation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct ColumnRenameConfig {
     /// List of rename rules applied in order
     pub rules: Vec<RenameRule>,

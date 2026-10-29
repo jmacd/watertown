@@ -16,6 +16,7 @@
 //! 5. Writes the complete site to the output directory
 
 use crate::config::SiteConfig;
+use crate::documentation;
 use crate::layouts::{self, LayoutContext};
 use crate::markdown::{preprocess_shortcodes, render_markdown};
 use crate::routes::{self, ContentContext, ContentPage};
@@ -52,6 +53,9 @@ enum SitegenSubcommand {
         /// Quick mode: skip data exports and subsites (content pages only)
         #[arg(long)]
         quick: bool,
+        /// Fail on incomplete routes, navigation, includes, and local links
+        #[arg(long)]
+        strict: bool,
     },
     /// Render a named report without sending it
     Report {
@@ -69,6 +73,9 @@ enum SitegenSubcommand {
 fn validate_config(config: &[u8]) -> tinyfs::Result<Value> {
     // Try parsing as standalone SiteConfig first
     if let Ok(config) = serde_yaml::from_slice::<SiteConfig>(config) {
+        if let Some(documentation) = &config.documentation {
+            documentation::validate_config(documentation).map_err(tinyfs::Error::Other)?;
+        }
         crate::report::validate_reports(&config).map_err(tinyfs::Error::Other)?;
         return serde_json::to_value(&config).map_other_context("Config serialization error");
     }
@@ -132,7 +139,11 @@ async fn execute(
     context: FactoryContext,
     ctx: ExecutionContext,
 ) -> Result<(), tinyfs::Error> {
-    let config: SiteConfig = serde_json::from_value(config).map_other_context("Invalid config")?;
+    let mut config: SiteConfig =
+        serde_json::from_value(config).map_other_context("Invalid config")?;
+    if let Some(documentation) = &config.documentation {
+        documentation::validate_config(documentation).map_err(tinyfs::Error::Other)?;
+    }
 
     // Parse command
     let args: Vec<String> = std::iter::once("factory".to_string())
@@ -141,7 +152,12 @@ async fn execute(
     let cmd = SitegenCommand::try_parse_from(args).map_other()?;
 
     match cmd.command {
-        SitegenSubcommand::Build { output_dir, quick } => {
+        SitegenSubcommand::Build {
+            output_dir,
+            quick,
+            strict,
+        } => {
+            config.strict |= strict;
             let output_path = std::path::PathBuf::from(&output_dir);
             let root_base_url = config.site.base_url.clone();
             // Ensure the output root exists before any write.  `sitegen build
@@ -157,7 +173,7 @@ async fn execute(
             if quick {
                 info!("Quick mode: skipping exports and subsites");
                 // Clear exports and subsites so build_site_from_root skips them
-                let mut quick_config = config;
+                let mut quick_config = config.clone();
                 quick_config.exports.clear();
                 quick_config.subsites.clear();
 
@@ -170,7 +186,7 @@ async fn execute(
                 )
                 .await?;
 
-                write_shared_assets(&output_path)?;
+                write_shared_assets(&output_path, quick_config.documentation.is_some())?;
                 write_theme_css(&output_path, &quick_config.theme)?;
             } else {
                 // Build the main site
@@ -184,8 +200,6 @@ async fn execute(
                 .await?;
 
                 // Write shared build assets (base CSS, JS, vendor) once
-                write_shared_assets(&output_path)?;
-
                 // Write per-site theme overrides
                 write_theme_css(&output_path, &config.theme)?;
 
@@ -211,6 +225,7 @@ async fn execute(
                                 config_full_path, e
                             ))
                         })?;
+                    sub_config.strict |= config.strict;
 
                     // Override base_url if specified, rewriting sidebar links
                     // to match the new mount point.
@@ -263,9 +278,14 @@ async fn execute(
 
                     info!("Subsite '{}' built at {:?}", subsite.name, subsite_output);
                 }
+                write_shared_assets(&output_path, config.documentation.is_some())?;
             }
 
             validate_local_image_references(&output_path, &root_base_url)?;
+            if config.strict {
+                documentation::validate_output(&output_path, &root_base_url)
+                    .map_err(tinyfs::Error::Other)?;
+            }
             Ok(())
         }
         SitegenSubcommand::Report { name, output_dir } => {
@@ -312,6 +332,9 @@ async fn build_site_from_root(
     // Run content stages
     let phase_started = Instant::now();
     let content = run_content_stages(config, root).await?;
+    if config.strict {
+        documentation::validate_routes(config, &content).map_err(tinyfs::Error::Other)?;
+    }
     log_sitegen_phase(config, output_dir, "content", phase_started);
 
     // Run pond status grid queries (no-op when not configured).
@@ -353,14 +376,43 @@ async fn build_site_from_root(
         if !file_cache.contains_key(path) {
             match root.read_file_path_to_vec(path).await {
                 Ok(data) => {
-                    if let Ok(text) = String::from_utf8(data) {
-                        file_cache.insert(path.clone(), text);
-                    }
+                    let text = String::from_utf8(data)
+                        .map_other_context(format!("Non-UTF8 partial '{path}'"))?;
+                    file_cache.insert(path.clone(), text);
                 }
                 Err(e) => {
+                    if config.strict {
+                        return Err(tinyfs::Error::Other(format!(
+                            "Cannot read partial '{path}': {e}"
+                        )));
+                    }
                     warn!("Cannot read partial '{}': {}", path, e);
                 }
             }
+        }
+    }
+
+    if let Some(documentation) = &config.documentation {
+        let mut requested = BTreeMap::new();
+        for (page, text) in &file_cache {
+            for (path, region) in documentation::source_requests(text, documentation)
+                .map_err(|e| tinyfs::Error::Other(format!("{page}: {e}")))?
+            {
+                requested
+                    .entry(path)
+                    .or_insert_with(|| (page.clone(), region));
+            }
+        }
+        for (path, (page, region)) in requested {
+            let data = root.read_file_path_to_vec(&path).await.map_err(|e| {
+                tinyfs::Error::Other(format!(
+                    "{page}: cannot include source '{path}' region '{}': {e}",
+                    region.as_deref().unwrap_or("<complete file>")
+                ))
+            })?;
+            let text = String::from_utf8(data)
+                .map_other_context(format!("{page}: non-UTF8 source '{path}'"))?;
+            file_cache.insert(path, text);
         }
     }
 
@@ -369,6 +421,12 @@ async fn build_site_from_root(
     for asset in &config.static_assets {
         let matches = root.collect_matches(&asset.pattern).await?;
         if matches.is_empty() {
+            if config.strict {
+                return Err(tinyfs::Error::Other(format!(
+                    "No files matched static pattern '{}'",
+                    asset.pattern
+                )));
+            }
             warn!("No files matched static pattern '{}'", asset.pattern);
         }
         for (node_path, _captures) in &matches {
@@ -381,6 +439,11 @@ async fn build_site_from_root(
                         entry.insert(data);
                     }
                     Err(e) => {
+                        if config.strict {
+                            return Err(tinyfs::Error::Other(format!(
+                                "Cannot read static asset '{path_str}': {e}"
+                            )));
+                        }
                         warn!("Cannot read static asset '{}': {}", path_str, e);
                     }
                 }
@@ -1766,6 +1829,16 @@ async fn run_content_stages(
         let mut pages = Vec::new();
         for (node_path, _captures) in &matches {
             let path_str = node_path.path.to_string_lossy().to_string();
+            let default_slug = if let Some(documentation) = &config.documentation {
+                match documentation::content_slug(documentation, &path_str)
+                    .map_err(tinyfs::Error::Other)?
+                {
+                    Some(slug) => slug,
+                    None => continue,
+                }
+            } else {
+                slug_from_path(&path_str)
+            };
 
             // Read the file to extract frontmatter
             let data = root.read_file_path_to_vec(&path_str).await.map_err(|e| {
@@ -1797,7 +1870,7 @@ async fn run_content_stages(
                 })?
             };
 
-            let slug = fm.slug.unwrap_or_else(|| slug_from_path(&path_str));
+            let slug = fm.slug.unwrap_or(default_slug);
 
             pages.push(ContentPage {
                 title: if fm.title.is_empty() {
@@ -1999,7 +2072,7 @@ fn has_uri_scheme(value: &str) -> bool {
 /// produces a self-contained site without requiring files in the pond.
 /// Written once at the top-level output directory; subsites reference them
 /// via root-relative paths.
-fn write_shared_assets(output_dir: &Path) -> Result<(), tinyfs::Error> {
+fn write_shared_assets(output_dir: &Path, lean: bool) -> Result<(), tinyfs::Error> {
     static STYLE_CSS: &str = include_str!("../assets/style.css");
     static CHART_JS: &str = include_str!("../assets/chart.js");
     static DUCKDB_SHARED_JS: &str = include_str!("../assets/duckdb-shared.js");
@@ -2009,6 +2082,40 @@ fn write_shared_assets(output_dir: &Path) -> Result<(), tinyfs::Error> {
     static LOG_VIEWER_JS: &str = include_str!("../assets/log-viewer.js");
     static RELATIVE_TIME_JS: &str = include_str!("../assets/relative-time.js");
 
+    let mut required = std::collections::BTreeSet::new();
+    if lean {
+        let mut files = Vec::new();
+        collect_html_files(output_dir, &mut files)?;
+        for file in files {
+            let html = std::fs::read_to_string(&file).map_other()?;
+            let dom = tl::parse(&html, tl::ParserOptions::default()).map_other()?;
+            for tag in documentation::html_tags(&dom) {
+                if tag.name().as_utf8_str() == "script"
+                    && let Some(src) = tag.attributes().get("src").flatten()
+                {
+                    required.insert(
+                        src.as_utf8_str()
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or("")
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+    let vega = !lean
+        || ["chart.js", "overlay.js", "explore.js"]
+            .iter()
+            .any(|name| required.contains(*name));
+    let duckdb_shared = !lean
+        || ["chart.js", "explore.js"]
+            .iter()
+            .any(|name| required.contains(*name));
+    let visualization = !lean
+        || ["chart.js", "overlay.js", "log-viewer.js", "explore.js"]
+            .iter()
+            .any(|name| required.contains(*name));
     for (name, content) in [
         ("style.css", STYLE_CSS),
         ("chart.js", CHART_JS),
@@ -2019,6 +2126,14 @@ fn write_shared_assets(output_dir: &Path) -> Result<(), tinyfs::Error> {
         ("log-viewer.js", LOG_VIEWER_JS),
         ("relative-time.js", RELATIVE_TIME_JS),
     ] {
+        if lean
+            && name != "style.css"
+            && !required.contains(name)
+            && !(duckdb_shared && name == "duckdb-shared.js")
+            && !(vega && name == "vega-shared.js")
+        {
+            continue;
+        }
         let path = output_dir.join(name);
         std::fs::write(&path, content.as_bytes()).map_other_context(format!("write {:?}", path))?;
         debug!("wrote shared asset: {}", name);
@@ -2027,7 +2142,15 @@ fn write_shared_assets(output_dir: &Path) -> Result<(), tinyfs::Error> {
     // Copy vendor files (DuckDB-WASM, Observable Plot, D3) for offline use.
     // These are downloaded by vendor/download.sh and are not embedded in the
     // binary due to their size (~35MB, dominated by the DuckDB WASM binary).
-    copy_vendor_assets(output_dir)?;
+    if visualization {
+        if lean && find_vendor_dir().is_none() {
+            return Err(tinyfs::Error::Other(
+                "Visualization assets required but vendor files are missing; run make vendor"
+                    .into(),
+            ));
+        }
+        copy_vendor_assets(output_dir, vega)?;
+    }
 
     Ok(())
 }
@@ -2092,7 +2215,7 @@ const VENDOR_FILES_COMPRESSED: &[&str] = &[
 ///
 /// If no vendor directory is found, warns but does not error -- the site
 /// will not function without network access in that case.
-fn copy_vendor_assets(output_dir: &Path) -> Result<(), tinyfs::Error> {
+fn copy_vendor_assets(output_dir: &Path, vega: bool) -> Result<(), tinyfs::Error> {
     let vendor_dir = find_vendor_dir();
 
     let vendor_dir = match vendor_dir {
@@ -2111,6 +2234,9 @@ fn copy_vendor_assets(output_dir: &Path) -> Result<(), tinyfs::Error> {
 
     // Copy required vendor files (must all exist)
     for name in VENDOR_FILES {
+        if !vega && name.starts_with("vega-") {
+            continue;
+        }
         let src = vendor_dir.join(name);
         let dst = out_vendor.join(name);
         std::fs::copy(&src, &dst).map_err(|e| {
@@ -2121,6 +2247,9 @@ fn copy_vendor_assets(output_dir: &Path) -> Result<(), tinyfs::Error> {
     // Copy pre-compressed variants if they exist (optional)
     let mut compressed_count = 0;
     for name in VENDOR_FILES_COMPRESSED {
+        if !vega && name.starts_with("vega-") {
+            continue;
+        }
         let src = vendor_dir.join(name);
         if src.exists() {
             let dst = out_vendor.join(name);
@@ -2210,7 +2339,8 @@ register_executable_factory!(
 
 /// Frontmatter parsed from the top of each markdown page.
 #[derive(Debug, Deserialize)]
-struct Frontmatter {
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
+pub(crate) struct Frontmatter {
     #[serde(default)]
     title: String,
     #[serde(default = "default_layout")]
@@ -2270,6 +2400,11 @@ fn generate_site(
     let expansion = routes::expand_routes(config, exports, content);
     let jobs = expansion.jobs;
     let content_urls = expansion.content_urls;
+    let page_index = if config.documentation.is_some() || config.strict {
+        documentation::PageIndex::new(&jobs).map_err(GenerateError)?
+    } else {
+        documentation::PageIndex::default()
+    };
     info!("Route expansion: {} pages to generate", jobs.len());
 
     // Build collections for navigation shortcodes
@@ -2349,7 +2484,8 @@ fn generate_site(
             &current_path,
             &pond_statuses,
             generated_at,
-        );
+            &page_index,
+        )?;
         let raw_md = read_pond_file(&job.page_source)
             .map_err(|e| GenerateError(format!("Cannot read '{}': {}", job.page_source, e)))?;
 
@@ -2385,7 +2521,7 @@ fn generate_site(
             current_path: current_path.clone(),
             breadcrumbs: job.breadcrumbs.clone(),
             base_url: config.site.base_url.clone(),
-            sidebar_sections: config.sidebar.clone(),
+            sidebar_sections: documentation::sidebar_entries(config),
             metric_registry: config.metric_registry.clone(),
             metric_captions: config.metric_captions.clone(),
             pond_statuses: pond_statuses.clone(),
@@ -2398,25 +2534,54 @@ fn generate_site(
         });
 
         // Rewrite {{ $0 }} -> {{ cap0 }}, nav-list -> nav_list, etc.
-        let preprocessed = shortcodes::preprocess_variables(&body);
-
-        // Expand shortcodes
-        let sc = shortcodes::register_shortcodes(sc_ctx);
-        let expanded =
-            preprocess_shortcodes(&preprocessed, &sc, Some(&job.page_source)).map_err(|e| {
-                GenerateError(format!("Shortcode error in '{}': {}", job.page_source, e))
-            })?;
-
-        // Render markdown -> HTML
-        let content_html = render_markdown(&expanded);
+        let mut sc = shortcodes::register_shortcodes(sc_ctx);
+        let content_html = if let Some(documentation) = &config.documentation {
+            let mut sources = BTreeMap::new();
+            for path in documentation::source_paths(&body, documentation).map_err(GenerateError)? {
+                sources.insert(path.clone(), read_pond_file(&path).map_err(GenerateError)?);
+            }
+            documentation::register_source(&mut sc, documentation.clone(), sources);
+            let expanded = documentation::preprocess(&body, &sc, &job.page_source)
+                .map_err(|e| GenerateError(format!("{}: {e}", job.page_source)))?;
+            documentation::render(
+                &expanded,
+                &job.page_source,
+                &page_index,
+                &config.site.base_url,
+            )
+            .map_err(GenerateError)?
+        } else {
+            let preprocessed = shortcodes::preprocess_variables(&body);
+            let expanded = preprocess_shortcodes(&preprocessed, &sc, Some(&job.page_source))
+                .map_err(|e| {
+                    GenerateError(format!("Shortcode error in '{}': {}", job.page_source, e))
+                })?;
+            render_markdown(&expanded)
+        };
 
         // Rewrite absolute URLs to include base_url prefix
         let content_html =
             crate::markdown::rewrite_absolute_urls(&content_html, &config.site.base_url);
 
         // Wrap in layout
+        let layout = if config.documentation.is_some() && fm.layout == "default" {
+            "documentation"
+        } else {
+            &fm.layout
+        };
+        if config.strict
+            && !matches!(
+                layout,
+                "default" | "documentation" | "page" | "blog" | "data" | "logs" | "explore"
+            )
+        {
+            return Err(GenerateError(format!(
+                "{}: unknown layout '{layout}'",
+                job.page_source
+            )));
+        }
         let full_html = layouts::apply_layout(
-            &fm.layout,
+            layout,
             &LayoutContext {
                 title: &title,
                 site_title: &config.site.title,
@@ -2596,8 +2761,11 @@ fn render_partial(
     current_path: &str,
     pond_statuses: &Option<Vec<PondStatus>>,
     generated_at: &str,
-) -> Option<String> {
-    let path = config.partials.get(name)?;
+    page_index: &documentation::PageIndex,
+) -> Result<Option<String>, GenerateError> {
+    let Some(path) = config.partials.get(name) else {
+        return Ok(None);
+    };
     match read_pond_file(path) {
         Ok(md) => {
             // Build a shortcode context for the partial -- includes current_path
@@ -2611,7 +2779,7 @@ fn render_partial(
                 current_path: current_path.to_string(),
                 breadcrumbs: vec![],
                 base_url: config.site.base_url.clone(),
-                sidebar_sections: config.sidebar.clone(),
+                sidebar_sections: documentation::sidebar_entries(config),
                 metric_registry: config.metric_registry.clone(),
                 metric_captions: config.metric_captions.clone(),
                 pond_statuses: pond_statuses.clone(),
@@ -2622,15 +2790,50 @@ fn render_partial(
                 explore_url: None,
                 annotations: vec![],
             });
-            let preprocessed = shortcodes::preprocess_variables(&md);
-            let sc = shortcodes::register_shortcodes(sc_ctx);
-            let expanded =
-                preprocess_shortcodes(&preprocessed, &sc, Some(path)).unwrap_or(preprocessed);
-            Some(render_markdown(&expanded))
+            let mut sc = shortcodes::register_shortcodes(sc_ctx);
+            let expanded = if let Some(documentation) = &config.documentation {
+                let mut sources = BTreeMap::new();
+                for source in
+                    documentation::source_paths(&md, documentation).map_err(GenerateError)?
+                {
+                    sources.insert(
+                        source.clone(),
+                        read_pond_file(&source).map_err(GenerateError)?,
+                    );
+                }
+                documentation::register_source(&mut sc, documentation.clone(), sources);
+                documentation::preprocess(&md, &sc, path)
+            } else {
+                let preprocessed = shortcodes::preprocess_variables(&md);
+                preprocess_shortcodes(&preprocessed, &sc, Some(path))
+            };
+            match expanded {
+                Ok(expanded) if config.documentation.is_some() => {
+                    documentation::render(&expanded, path, page_index, &config.site.base_url)
+                        .map(|html| {
+                            Some(crate::markdown::rewrite_absolute_urls(
+                                &html,
+                                &config.site.base_url,
+                            ))
+                        })
+                        .map_err(GenerateError)
+                }
+                Ok(expanded) => Ok(Some(render_markdown(&expanded))),
+                Err(e) if config.strict => Err(GenerateError(format!("partial '{path}': {e}"))),
+                Err(e) => {
+                    warn!("Shortcode error in partial '{path}': {e}");
+                    Ok(Some(render_markdown(&md)))
+                }
+            }
         }
         Err(e) => {
+            if config.strict {
+                return Err(GenerateError(format!(
+                    "Cannot read partial '{name}' from '{path}': {e}"
+                )));
+            }
             warn!("Cannot read partial '{}' from '{}': {}", name, path, e);
-            None
+            Ok(None)
         }
     }
 }
@@ -2677,6 +2880,26 @@ impl std::error::Error for GenerateError {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn content_only_assets_do_not_load_visualization_dependencies() {
+        let output = tempfile::tempdir().unwrap();
+        std::fs::write(output.path().join("index.html"), "<pre>&lt;script src=\"chart.js\"&gt;</pre><script src=\"/watertown/relative-time.js\" type=\"module\"></script>").unwrap();
+        super::write_shared_assets(output.path(), true).unwrap();
+        assert!(output.path().join("style.css").is_file());
+        assert!(output.path().join("relative-time.js").is_file());
+        for unused in [
+            "chart.js",
+            "duckdb-shared.js",
+            "vega-shared.js",
+            "explore.js",
+            "overlay.js",
+            "log-viewer.js",
+            "vendor",
+        ] {
+            assert!(!output.path().join(unused).exists(), "{unused}");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -3238,6 +3461,8 @@ mod tests {
 
         let output_dir = TempDir::new().unwrap();
         let config = SiteConfig {
+            documentation: None,
+            strict: false,
             site: SiteMeta {
                 title: "Test Blog".to_string(),
                 base_url: "/".to_string(),
@@ -3368,6 +3593,8 @@ mod tests {
 
         let output_dir = TempDir::new().unwrap();
         let config = SiteConfig {
+            documentation: None,
+            strict: false,
             site: SiteMeta {
                 title: "Test".to_string(),
                 base_url: "/".to_string(),

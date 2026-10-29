@@ -21,7 +21,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct XlsOptions {
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
+pub(crate) struct XlsOptions {
     sheet: Option<String>,
     table: Option<String>,
     header: bool,

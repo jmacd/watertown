@@ -14,7 +14,7 @@ use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::prelude::SessionContext;
 use query_foundation::plans::reduce::{
     FixedWindowReduce, TimestampPartialAggregate, TimestampWindowReduce, max_timestamp_bucket,
-    reduce_fixed_windows, reduce_timestamp_windows,
+    reduce_fixed_windows, reduce_timestamp_windows, timestamp_bucket_bounds,
 };
 use query_foundation::statistics::TimeInterval;
 use query_foundation::testkit::FoundationFixture;
@@ -258,7 +258,7 @@ async fn timestamp_windows_emit_multiple_mergeable_partials() -> Result<()> {
     let bounded = bounded.collect().await?;
     assert_eq!(bounded.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
     let maximum = max_timestamp_bucket(
-        context.read_table(source)?,
+        context.read_table(source.clone())?,
         "timestamp",
         Duration::from_secs(60),
     )?
@@ -266,6 +266,21 @@ async fn timestamp_windows_emit_multiple_mergeable_partials() -> Result<()> {
     .await?;
     assert_eq!(
         datafusion::common::ScalarValue::try_from_array(maximum[0].column(0), 0)?,
+        datafusion::common::ScalarValue::TimestampNanosecond(Some(60_000_000_000), None)
+    );
+    let bounds = timestamp_bucket_bounds(
+        context.read_table(source)?,
+        "timestamp",
+        Duration::from_secs(60),
+    )?
+    .collect()
+    .await?;
+    assert_eq!(
+        datafusion::common::ScalarValue::try_from_array(bounds[0].column(0), 0)?,
+        datafusion::common::ScalarValue::TimestampNanosecond(Some(0), None)
+    );
+    assert_eq!(
+        datafusion::common::ScalarValue::try_from_array(bounds[0].column(1), 0)?,
         datafusion::common::ScalarValue::TimestampNanosecond(Some(60_000_000_000), None)
     );
     Ok(())

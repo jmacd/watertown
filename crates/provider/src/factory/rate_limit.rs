@@ -57,6 +57,7 @@ use tinyfs::ResultExt;
 /// The unit is one string; the magnitudes are numbers (Decision L4a).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct RateLimitConfig {
     /// `<scale>/<period>`, e.g. `MiB/day`, `iops/second`, `B/hour`.
     /// Carries dimension, scale, and period together.

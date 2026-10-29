@@ -33,6 +33,44 @@ and reducing timeseries.
 Watertown is useful for data collection, analysis, and monitoring in
 small industrial settings.
 
+## Start with a reproducible example
+
+The [development manual](https://jmacd.github.io/watertown/) documents the
+current interfaces and their verification limits. It is not a stable-release
+compatibility promise; original data sources should remain independently
+recoverable.
+
+Build from a checkout with the Rust toolchain, then run the complete
+[CSV example](testsuite/examples/csv-query/run.sh):
+
+```bash
+make build
+export PATH="$PWD/target/debug:$PATH"
+bash testsuite/examples/csv-query/run.sh
+```
+
+No pond, service, or credential is needed. The shared input has three rows,
+temperature total `75`, and mean humidity `45`; numbered test `057` asserts
+these results and the delimiter example. The script creates a fresh workspace
+and prints its output path; the README does not maintain a second quickstart.
+See [build/package instructions](docs/README.md#obtaining-a-compatible-binary)
+and [releases](https://github.com/jmacd/watertown/releases).
+
+## Guides and reference
+
+| Task | Tested entry point / reference |
+|---|---|
+| Create and query timeseries | [Guide](docs/manual/guides/timeseries.md) |
+| Export typed data | [Export semantics](docs/manual/reference/export.md) |
+| Build a timeseries site | [Complete package and guide](docs/manual/guides/timeseries-site.md) |
+| Publish a blog/RSS feed | [Host-mode guide](docs/manual/guides/blog.md) |
+| Back up, restore, and maintain ponds | [Operations guide](docs/manual/guides/operations.md) |
+| Find flags and configuration fields | [CLI](docs/manual/reference/cli/commands.md), [sitegen](docs/manual/reference/sitegen/configuration.md), [shared concepts](docs/manual/reference/concepts.md) |
+
+The manual is built by `pond` itself. [Authoring instructions](docs/README.md)
+explain cached-binary previews, schema-derived reference, executable fixtures,
+and production-image GitHub Pages publishing.
+
 ## Who is building Watertown?
 
 Watertown is built by the [Caspar Water System](https://casparwater.us)
@@ -55,31 +93,6 @@ Fort Bragg, CA was Watertown's first user, where Watertown gathers water
 quality data for its public portal.
 
 ![Caspar Duck Pond](./caspar_watertown.jpg)
-
-## CLI Reference
-
-See [docs/cli-reference.md](docs/cli-reference.md) for the complete
-command reference.  Common commands:
-
-```bash
-pond init                           # Create a new pond
-pond list '/**'                     # List all entries
-pond cat /path/to/file              # Read a file
-pond cat --sql "SELECT * FROM source WHERE ..." /path  # Query a table
-pond copy host:///local/file /pond/path                # Import a file
-pond copy host+series:///data.parquet /pond/series      # Import time-series
-pond mkdir /dir                     # Create a directory
-pond mknod <factory> /path --config-path config.yaml   # Install a factory
-pond run /path/to/factory <command>                     # Execute a factory
-pond log                            # Transaction history
-```
-
-**Host mode** (no pond required):
-```bash
-pond cat host+csv:///tmp/data.csv --format=table       # Query a local CSV
-pond run host+remote:///config.yaml list-ponds          # Browse S3 backups
-pond run host+sitegen:///site.yaml build ./dist         # Generate a site
-```
 
 ## Integration Tests
 

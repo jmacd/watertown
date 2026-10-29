@@ -359,6 +359,24 @@ pub fn max_timestamp_bucket(
         .aggregate(vec![], vec![max(bucket).alias("hi_bucket")])
 }
 
+/// Build a one-row aggregate containing the oldest and newest aligned buckets.
+pub fn timestamp_bucket_bounds(
+    frame: DataFrame,
+    event_time: &str,
+    width: Duration,
+) -> Result<DataFrame> {
+    let (bucket, _, _) = timestamp_bucket_expression(&frame, event_time, width)?;
+    frame
+        .filter(col(Column::from_name(event_time)).is_not_null())?
+        .aggregate(
+            vec![],
+            vec![
+                min(bucket.clone()).alias("lo_bucket"),
+                max(bucket).alias("hi_bucket"),
+            ],
+        )
+}
+
 fn timestamp_bucket_expression(
     frame: &DataFrame,
     event_time: &str,

@@ -22,7 +22,8 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EmailReportConfig {
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
+pub(crate) struct EmailReportConfig {
     sitegen: String,
     report: String,
     endpoint_env: String,

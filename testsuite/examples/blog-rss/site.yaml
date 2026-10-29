@@ -1,0 +1,21 @@
+site:
+  title: Fixture blog
+  base_url: /sample-blog/
+  site_url: https://example.invalid
+strict: true
+content:
+  - name: posts
+    pattern: /posts/*.md
+routes:
+  - name: home
+    type: static
+    slug: ""
+    page: /index.md
+    routes:
+      - name: posts
+        type: content
+        slug: ""
+        content: posts
+feed:
+  content: posts
+  section: Blog

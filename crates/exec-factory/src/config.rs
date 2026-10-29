@@ -31,6 +31,7 @@ const RESERVED_SANDBOX_TARGETS: &[&str] = &[
 /// the external program's bubblewrap sandbox.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct HostInput {
     /// Absolute path within the `pond -d` hostmount namespace.
     pub source: String,
@@ -41,6 +42,7 @@ pub struct HostInput {
 /// Configuration for one `exec` factory mount.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct ExecConfig {
     /// Absolute path to the program to execute. Never searched on `$PATH`:
     /// the config is pond-versioned, so the exact binary invoked should be
