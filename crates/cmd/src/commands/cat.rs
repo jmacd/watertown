@@ -6,21 +6,29 @@ use anyhow::Result;
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use parquet::arrow::ArrowWriter;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 use crate::common::{ShipContext, TargetContext, classify_target};
 use log::debug;
 
-/// Resolve "auto" format to "table" or "raw" based on content.
+/// Resolve "auto" format to "table" or "raw" based on context.
 ///
 /// When format is "auto":
-///   - Queryable content uses a human-readable table, including through pipes
-///   - Non-queryable content retains its raw bytes
-fn resolve_auto_format(format: &str, is_queryable: bool) -> &str {
+///   - If output is a String buffer (testing), use "raw" (parquet)
+///   - If stdout is a TTY and file is queryable, use "table"
+///   - Otherwise use "raw" (parquet bytes for piping)
+fn resolve_auto_format(format: &str, is_queryable: bool, is_testing: bool) -> &str {
     if format != "auto" {
         return format;
     }
-    if is_queryable { "table" } else { "raw" }
+    if is_testing {
+        return "raw";
+    }
+    if is_queryable && io::stdout().is_terminal() {
+        "table"
+    } else {
+        "raw"
+    }
 }
 
 /// Handle output from a DataFusion stream based on display mode
@@ -288,7 +296,7 @@ async fn cat_impl(
         let is_queryable =
             metadata.entry_type.is_table_file() || metadata.entry_type.is_series_file();
 
-        let effective_display = resolve_auto_format(display, is_queryable);
+        let effective_display = resolve_auto_format(display, is_queryable, output.is_some());
 
         if !is_queryable {
             // Non-queryable file types (file:data) - use simple streaming
@@ -343,7 +351,7 @@ async fn cat_impl(
 
     // Use consolidated output handler
     // If we reach here, content is queryable (non-queryable returned early above)
-    let effective_display = resolve_auto_format(display, true);
+    let effective_display = resolve_auto_format(display, true, output.is_some());
     handle_stream_output(stream, effective_display, sql_query, output, path).await?;
 
     Ok(())
@@ -548,12 +556,12 @@ mod tests {
     use tinyfs::arrow::ParquetExt;
 
     #[test]
-    fn auto_format_keeps_queryable_output_textual_for_pipes() {
-        assert_eq!(resolve_auto_format("auto", true), "table");
-        assert_eq!(resolve_auto_format("auto", false), "raw");
-        assert_eq!(resolve_auto_format("raw", true), "raw");
-        assert_eq!(resolve_auto_format("table", false), "table");
-        assert_eq!(resolve_auto_format("csv", true), "csv");
+    fn auto_format_preserves_raw_output_for_pipes_and_buffers() {
+        assert_eq!(resolve_auto_format("auto", true, true), "raw");
+        assert_eq!(resolve_auto_format("auto", false, false), "raw");
+        assert_eq!(resolve_auto_format("raw", true, false), "raw");
+        assert_eq!(resolve_auto_format("table", false, false), "table");
+        assert_eq!(resolve_auto_format("csv", true, false), "csv");
     }
 
     /// Test setup helper - creates pond and returns context for testing
