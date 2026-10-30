@@ -319,7 +319,7 @@ jobs:
 
   build-pages:
     name: Validate production-image manual
-    needs: [audit, check, version, build-container]
+    needs: [check, version, build-container]
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:

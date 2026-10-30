@@ -513,6 +513,9 @@ commits to a publishing branch.
   secrets.
 - Trusted `main` builds publish only after required checks pass for the same
   revision.
+- Dependency advisories remain visible in a separate audit check, not a
+  prerequisite for static documentation publication. Build/test checks and
+  exact image digest, source revision, and binary version checks remain required.
 - The deployment job receives only the necessary Pages/OIDC permissions and
   uses the `github-pages` environment.
 - Pin Actions to reviewed commit SHAs and use reproducible Rust dependencies.
