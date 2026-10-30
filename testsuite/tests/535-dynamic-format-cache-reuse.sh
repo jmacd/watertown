@@ -133,7 +133,7 @@ ref: main
 prefix: data
 EOF
 pond mknod git-ingest /sensors --config-path /tmp/git-dyncache.yaml >/dev/null
-RUST_LOG=info pond run /sensors pull >/dev/null 2>&1
+RUST_LOG=info pond run /sensors pull
 echo "git-ingest pull complete (sensors.csv is a dynamic FileDynamic node)"
 
 #############################
@@ -199,7 +199,7 @@ CSV
 git add -A
 git commit -q -m "Add hot reading (max temp 99.9)"
 cd /
-RUST_LOG=info pond run /sensors pull >/dev/null 2>&1
+RUST_LOG=info pond run /sensors pull
 echo "Re-pull complete; blob OID changed, so the node_id must change too."
 
 #############################
