@@ -82,8 +82,8 @@ treats interactive querying as a *sitegen* feature (§4.3), reusing the same cor
 Extend `--format` and add explicit stream discipline:
 
 ```
---format table            # human ASCII (default when stdout is a TTY)
---format csv              # RFC-4180, header row
+--format table            # human ASCII (default for queryable content)
+--format csv              # RFC-4180, header row (implemented)
 --format ndjson           # one JSON object per row (default when piped?)
 --format json             # single JSON array
 --format parquet          # today's `raw`; keep as alias
@@ -202,10 +202,12 @@ sitegen feature and gets its own design doc.
 
 ## 7. Open questions
 
-- Default piped format: `ndjson` vs keep `parquet`(`raw`)? (NDJSON is friendlier
-  for agents/jq; parquet is friendlier for chaining back into a pond.)
 - Do we keep growing `cat`, or introduce `pond query` as the multi-input +
   `-c`/`-f` batch verb and leave `cat` as the single-file reader?
 - Should `SHOW FUNCTIONS` also print each function's signature/arg types?
 - Sitegen interactive (§4.3): dev-only endpoint vs a published page? How is the
   warm `SessionContext` scoped/invalidated as the pond advances?
+
+Until a dedicated machine-text format is implemented, `auto` keeps queryable
+output as a text table through pipes; binary Parquet output requires explicit
+`--format=raw`.

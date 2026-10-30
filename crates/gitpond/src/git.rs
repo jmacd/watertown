@@ -277,6 +277,16 @@ fn fetch_remote(repo: &gix::Repository) -> Result<(), tinyfs::Error> {
     let remote = repo
         .find_remote("origin")
         .map_other_context("Failed to find remote 'origin'")?;
+    let remote = if remote.refspecs(gix::remote::Direction::Fetch).is_empty() {
+        remote
+            .with_refspecs(
+                ["+refs/heads/*:refs/remotes/origin/*"],
+                gix::remote::Direction::Fetch,
+            )
+            .map_other_context("Failed to configure default fetch refspec")?
+    } else {
+        remote
+    };
 
     let _outcome = remote
         .connect(gix::remote::Direction::Fetch)

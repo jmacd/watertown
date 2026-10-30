@@ -1460,7 +1460,7 @@
             "auto"
           ],
           "global": false,
-          "help": "Output format [default: auto] [possible values: auto, raw, table] auto: table for queryable types when stdout is a TTY, raw otherwise",
+          "help": "Output format [default: auto] [possible values: auto, raw, table, csv] auto: table for queryable types, raw for non-queryable files",
           "id": "format",
           "long": "format",
           "num_args": "1",
@@ -5648,6 +5648,27 @@
       "type": "object"
     },
     "factory:exec": {
+      "$defs": {
+        "HostInput": {
+          "additionalProperties": false,
+          "description": "A read-only path projected from the operator-selected hostmount root into\nthe external program's bubblewrap sandbox.",
+          "properties": {
+            "source": {
+              "description": "Absolute path within the `pond -d` hostmount namespace.",
+              "type": "string"
+            },
+            "target": {
+              "description": "Absolute path at which the source is visible inside the sandbox.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "target"
+          ],
+          "type": "object"
+        }
+      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "description": "Configuration for one `exec` factory mount.",
@@ -5667,6 +5688,14 @@
           "default": {},
           "description": "Explicit environment variables set inside the sandbox. Empty by\ndefault -- nothing is inherited from the `pond` process environment.",
           "type": "object"
+        },
+        "host_inputs": {
+          "default": [],
+          "description": "Read-only paths from the explicit `pond -d` hostmount root. The exec\nrun fails unless the operator supplied `-d`; pond-stored configuration\ncan never select an ambient host filesystem root by itself.",
+          "items": {
+            "$ref": "#/$defs/HostInput"
+          },
+          "type": "array"
         },
         "inputs": {
           "description": "Exact pond paths staged read-only into the sandbox before exec.",
@@ -8403,7 +8432,23 @@
           "default": true,
           "type": "boolean"
         },
+        "header_row": {
+          "default": null,
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "sheet": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "table": {
           "default": null,
           "type": [
             "string",
