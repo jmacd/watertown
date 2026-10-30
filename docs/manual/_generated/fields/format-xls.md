@@ -10,6 +10,8 @@ Generated from the Rust **deserialization** contract. This describes shape, not 
 |---|---|---|---|---|
 | `batch_size` | integer | no | 8192 | Constraints: format="uint"; minimum=0. |
 | `header` | boolean | no | true |  |
+| `header_row` | integer &#124; null | no | null | Constraints: format="uint"; minimum=0. |
 | `sheet` | string &#124; null | no | null |  |
+| `table` | string &#124; null | no | null |  |
 
 Unknown fields: **rejected**.

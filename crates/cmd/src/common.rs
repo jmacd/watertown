@@ -134,24 +134,33 @@ impl ShipContext {
     /// If `--hostmount` specs were provided, they are passed through to
     /// the steward for overlay processing.
     pub fn open_host(&self) -> Result<steward::Steward> {
-        let root_path = if let Some(ref dir) = self.host_root {
-            // Convert relative -d paths to absolute
-            if dir.is_absolute() {
-                dir.clone()
-            } else {
-                env::current_dir()
-                    .map_err(|e| anyhow!("Failed to get current directory: {}", e))?
-                    .join(dir)
-            }
-        } else {
-            PathBuf::from("/")
-        };
+        let root_path = self
+            .explicit_host_root()?
+            .unwrap_or_else(|| PathBuf::from("/"));
 
         debug!("Opening host steward at root: {:?}", root_path);
         Ok(steward::Steward::open_host(
             root_path,
             self.mount_specs.clone(),
         ))
+    }
+
+    /// Resolve an explicitly supplied `-d` host root without falling back to `/`.
+    ///
+    /// Exec sandbox host inputs require this explicit operator authorization;
+    /// a pond-stored factory configuration must never gain ambient host access.
+    pub fn explicit_host_root(&self) -> Result<Option<PathBuf>> {
+        let Some(dir) = &self.host_root else {
+            return Ok(None);
+        };
+        let resolved = if dir.is_absolute() {
+            dir.clone()
+        } else {
+            env::current_dir()
+                .map_err(|e| anyhow!("Failed to get current directory: {}", e))?
+                .join(dir)
+        };
+        Ok(Some(resolved))
     }
 }
 

@@ -309,10 +309,11 @@ async fn commit_series_outputs(
 pub async fn execute(
     config: Value,
     context: FactoryContext,
-    _ctx: ExecutionContext,
+    ctx: ExecutionContext,
 ) -> Result<(), tinyfs::Error> {
-    let cfg: ExecConfig =
+    let mut cfg: ExecConfig =
         serde_json::from_value(config).map_other_context("exec: invalid config")?;
+    cfg.args.extend(ctx.args().iter().cloned());
 
     let staging = tempfile::tempdir().map_other_context("exec: create staging directory")?;
     let root = context.root().await?;
@@ -325,7 +326,7 @@ pub async fn execute(
     let before = snapshot_outputs(staging.path(), &output_specs)
         .map_other_context("exec: snapshot outputs before run")?;
 
-    let status = run_sandboxed(&cfg, staging.path())
+    let status = run_sandboxed(&cfg, staging.path(), ctx.host_root())
         .await
         .map_err(|e| tinyfs::Error::Other(format!("exec: sandbox failed: {e}")))?;
     if !status.success() {
