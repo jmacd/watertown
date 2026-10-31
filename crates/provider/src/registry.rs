@@ -18,6 +18,7 @@ use linkme::distributed_slice;
 use serde_json::Value;
 use std::any::Any;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use tinyfs::Result as TinyFSResult;
@@ -43,6 +44,7 @@ pub enum ExecutionMode {
 pub struct ExecutionContext {
     mode: ExecutionMode,
     args: Vec<String>,
+    host_root: Option<PathBuf>,
 }
 
 /// Pond access required when an executable factory runs automatically after commit.
@@ -61,6 +63,7 @@ impl ExecutionContext {
         Self {
             mode: ExecutionMode::ControlReader,
             args,
+            host_root: None,
         }
     }
 
@@ -70,6 +73,7 @@ impl ExecutionContext {
         Self {
             mode: ExecutionMode::ControlWriter,
             args,
+            host_root: None,
         }
     }
 
@@ -79,6 +83,7 @@ impl ExecutionContext {
         Self {
             mode: ExecutionMode::PondReadWriter,
             args,
+            host_root: None,
         }
     }
 
@@ -88,7 +93,16 @@ impl ExecutionContext {
         Self {
             mode: ExecutionMode::TableTransform,
             args: vec![],
+            host_root: None,
         }
+    }
+
+    /// Supply the explicitly selected hostmount root for factories that
+    /// project operator-approved host files into their own sandbox.
+    #[must_use]
+    pub fn with_host_root(mut self, host_root: PathBuf) -> Self {
+        self.host_root = Some(host_root);
+        self
     }
 
     /// Get the execution mode
@@ -101,6 +115,12 @@ impl ExecutionContext {
     #[must_use]
     pub fn args(&self) -> &[String] {
         &self.args
+    }
+
+    /// Return the explicitly selected hostmount root, if the operator supplied one.
+    #[must_use]
+    pub fn host_root(&self) -> Option<&Path> {
+        self.host_root.as_deref()
     }
 }
 

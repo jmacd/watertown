@@ -12,6 +12,9 @@ use std::sync::Arc;
 
 const SINGLE: &[u8] = include_bytes!("fixtures/single.xls");
 const MULTIPLE: &[u8] = include_bytes!("fixtures/multiple.xls");
+const SINGLE_XLSX: &[u8] = include_bytes!("fixtures/single.xlsx");
+const TABLE_XLSX: &[u8] = include_bytes!("fixtures/table.xlsx");
+const REPORT_XLSX: &[u8] = include_bytes!("fixtures/report.xlsx");
 
 async fn read(
     bytes: &[u8],
@@ -41,15 +44,7 @@ async fn xls_typed_cells_nulls_mixed_columns_and_batching() -> provider::Result<
             .iter()
             .map(|f| f.name().as_str())
             .collect::<Vec<_>>(),
-        [
-            "name",
-            "value",
-            "active",
-            "when",
-            "mixed",
-            "column_6",
-            "late_mixed"
-        ]
+        ["name", "value", "active", "when", "mixed", "late_mixed"]
     );
     assert_eq!(schema.field(1).data_type(), &DataType::Float64);
     assert_eq!(schema.field(2).data_type(), &DataType::Boolean);
@@ -59,7 +54,6 @@ async fn xls_typed_cells_nulls_mixed_columns_and_batching() -> provider::Result<
     );
     assert_eq!(schema.field(4).data_type(), &DataType::Utf8);
     assert_eq!(schema.field(5).data_type(), &DataType::Utf8);
-    assert_eq!(schema.field(6).data_type(), &DataType::Utf8);
     let values = batches[0]
         .column(1)
         .as_any()
@@ -81,7 +75,6 @@ async fn xls_typed_cells_nulls_mixed_columns_and_batching() -> provider::Result<
         .expect("mixed text");
     assert_eq!(mixed.value(0), "1");
     assert_eq!(mixed.value(1), "text");
-    assert_eq!(batches[0].column(5).null_count(), 2);
     assert!(batches[1].column(2).is_null(0));
     assert!(batches[1].column(3).is_null(0));
     assert!(batches[1].column(4).is_null(0));
@@ -93,6 +86,128 @@ async fn xls_typed_cells_nulls_mixed_columns_and_batching() -> provider::Result<
         )
         .await?;
     assert_eq!(schema, inferred);
+    Ok(())
+}
+
+#[tokio::test]
+async fn xlsx_cells_are_read_by_excel_provider() -> provider::Result<()> {
+    let (schema, batches) = read(SINGLE_XLSX, "").await?;
+    assert_eq!(schema.field(0).name(), "name");
+    assert_eq!(schema.field(1).name(), "value");
+    assert_eq!(schema.field(1).data_type(), &DataType::Float64);
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 2);
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name")
+            .value(1),
+        "beta"
+    );
+    assert_eq!(
+        batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("value")
+            .value(1),
+        20.5
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn xlsx_explicit_header_row_skips_preamble() -> provider::Result<()> {
+    let (schema, batches) = read(SINGLE_XLSX, "?header_row=2").await?;
+    assert_eq!(
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        ["alpha", "10"]
+    );
+    assert_eq!(schema.field(1).data_type(), &DataType::Float64);
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 1);
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name")
+            .value(0),
+        "beta"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn xlsx_declared_table_supplies_range_and_columns() -> provider::Result<()> {
+    let (schema, batches) = read(TABLE_XLSX, "?table=Transactions").await?;
+    assert_eq!(
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        ["name", "value"]
+    );
+    assert_eq!(schema.field(1).data_type(), &DataType::Float64);
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 2);
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name")
+            .value(0),
+        "alpha"
+    );
+    assert!(
+        read(TABLE_XLSX, "?table=Missing")
+            .await
+            .expect_err("missing table")
+            .to_string()
+            .contains("available tables")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn xlsx_report_omits_empty_unnamed_columns() -> provider::Result<()> {
+    let (schema, batches) = read(REPORT_XLSX, "").await?;
+    assert_eq!(
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        ["name", "value"]
+    );
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 2);
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name")
+            .value(0),
+        "alpha"
+    );
+    assert_eq!(
+        batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("value")
+            .value(1),
+        20.5
+    );
     Ok(())
 }
 
@@ -159,16 +274,30 @@ async fn xls_empty_sheets_errors_and_invalid_options_are_explicit() -> provider:
         "?batch_size=0",
         "?batch_size=oops",
         "?header=invalid",
+        "?header_row=0",
+        "?header_row=oops",
+        "?header=false&header_row=2",
+        "?table=Transactions",
         "?unknown=true",
     ] {
         assert!(read(SINGLE, query).await.is_err(), "{query}");
     }
     assert!(
+        read(TABLE_XLSX, "?table=Transactions&header_row=1")
+            .await
+            .is_err()
+    );
+    let error = read(SINGLE, "?header_row=99")
+        .await
+        .expect_err("header row outside worksheet")
+        .to_string();
+    assert!(error.contains("outside populated rows"), "{error}");
+    assert!(
         read(b"not an Excel workbook", "")
             .await
             .expect_err("invalid workbook")
             .to_string()
-            .contains("cannot open binary Excel workbook")
+            .contains("cannot open Excel workbook")
     );
     assert!(read(&SINGLE[..100], "").await.is_err());
     Ok(())
@@ -177,7 +306,7 @@ async fn xls_empty_sheets_errors_and_invalid_options_are_explicit() -> provider:
 #[tokio::test]
 async fn xls_host_datafusion_query_without_pond() -> provider::Result<()> {
     let dir = tempfile::tempdir()?;
-    let path = dir.path().join("workbook.xls");
+    let path = dir.path().join("workbook with spaces.xls");
     std::fs::write(&path, SINGLE)?;
     let url = Url::parse(&format!("host+xls://{}?batch_size=2", path.display()))?;
     let table = provider::create_memtable_from_host_url(&url).await?;

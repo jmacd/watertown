@@ -140,8 +140,11 @@ configured). Protect the `github-pages` environment for trusted main.
 The existing Rust CI workflow builds/validates PR previews with read-only
 permissions and uploads a preview artifact; PRs do not deploy.
 
-Trusted main waits for audit/check and both production image builds. The AMD64
-matrix job uploads its own image digest/version/revision record, avoiding
+Trusted main waits for build/test checks, version computation, and both
+production image builds. Dependency advisories remain visible in a separate
+audit check, but do not gate static documentation publication or suppress
+functional failures. The AMD64 matrix job uploads its own image
+digest/version/revision record, avoiding
 matrix-output architecture ambiguity. Pages pulls that exact digest, verifies
 the OCI source revision and binary version, and runs all documentation
 examples again through `scripts/docs-publish.sh`. Sources mount read-only;

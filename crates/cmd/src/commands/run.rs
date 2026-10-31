@@ -148,11 +148,15 @@ async fn run_host_command(
         extra_args
     };
 
+    let mut execution_context = ExecutionContext::pond_readwriter(args);
+    if let Some(host_root) = ship_context.explicit_host_root()? {
+        execution_context = execution_context.with_host_root(host_root);
+    }
     FactoryRegistry::execute::<tlogfs::TLogFSError>(
         &factory_name,
         &config_bytes,
         factory_context,
-        ExecutionContext::pond_readwriter(args),
+        execution_context,
     )
     .await
     .map_err(|e| {
@@ -197,6 +201,7 @@ async fn run_pond_command(
         extra_args,
         all_factory_modes,
         pond_metadata,
+        ship_context.explicit_host_root()?,
     )
     .await
     {
@@ -217,6 +222,7 @@ async fn run_pond_command_impl(
     extra_args: Vec<String>,
     all_factory_modes: std::collections::HashMap<String, String>,
     pond_metadata: tlogfs::PondMetadata,
+    host_root: Option<std::path::PathBuf>,
 ) -> Result<()> {
     // Get filesystem root (guard derefs to FS)
     let root = tx.root().await?;
@@ -330,11 +336,15 @@ async fn run_pond_command_impl(
     }
 
     // Execute the configuration using the factory registry in write mode
+    let mut execution_context = ExecutionContext::pond_readwriter(args);
+    if let Some(host_root) = host_root {
+        execution_context = execution_context.with_host_root(host_root);
+    }
     FactoryRegistry::execute::<tlogfs::TLogFSError>(
         &factory_name,
         &config_bytes,
         factory_context,
-        ExecutionContext::pond_readwriter(args),
+        execution_context,
     )
     .await
     .map_err(|e| {

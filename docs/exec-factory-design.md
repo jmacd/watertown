@@ -130,6 +130,9 @@ spec:
                                           # otherwise an exact file path
     series_outputs:
       - /data/billing/journal.ledger     # exact path, append-only (see §5b)
+    host_inputs:
+      - source: /statements              # path inside explicit `pond -d` root
+        target: /inbox                   # read-only path inside bwrap
     env: {}                              # explicit allow-list; empty by default
     network: false                       # bwrap --unshare-net unless true
     interactive: false                   # true: keep terminal job control (§5c)
@@ -146,6 +149,15 @@ listed in `series_outputs` must *not* also appear in `outputs`: each output
 path picks exactly one commit semantics (whole-file diff vs. append-only),
 and listing it in both is rejected at `mknod` time.
 
+`host_inputs` project paths from the hostmount root selected explicitly by the
+operator with `pond -d HOST_ROOT run ...`. `source` is a clean absolute path
+inside that confined hostmount namespace; `target` is a clean absolute sandbox
+path. A run with `host_inputs` fails unless `-d` was supplied. The pond-stored
+configuration therefore cannot select `/` or another ambient host directory by
+itself. Sources are canonicalized and must remain beneath the selected root;
+targets may not overlap system paths such as `/usr`, `/etc`, `/dev`, `/proc`,
+or `/tmp`, and overlapping targets are rejected.
+
 Paths are resolved relative to `context.root()` (which, per
 `FactoryContext::root()` (`crates/tinyfs/src/context.rs:522-534`), already
 honors an `effective_root` chroot when the factory config itself lives
@@ -156,6 +168,8 @@ lookup, and `args` is always a literal `Vec<String>`, never a shell string,
 so there is no shell-injection surface. If a program genuinely needs shell
 semantics, `program: /bin/bash, args: ["-c", "..."]` is spelled out
 explicitly in the config, which is pond-versioned and auditable.
+Arguments supplied after the exec node to `pond run NODE ARGS...` are appended
+literally to configured `args`; they are never shell-interpreted.
 
 `timeout_seconds` defaults to 60s for ordinary runs and to "no timeout" for
 `interactive: true` runs (an attended session shouldn't be killed out from
@@ -224,7 +238,9 @@ bwrap \
   --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
   --ro-bind /bin /bin --ro-bind /sbin /sbin --ro-bind /etc /etc \
   --dev /dev --proc /proc \
+  --tmpfs /tmp \
   --bind <staging> <staging> \
+  --ro-bind <explicit-host-root>/statements /inbox \
   --chdir <staging> \
   --unshare-pid \
   --die-with-parent \
@@ -234,9 +250,12 @@ bwrap \
   -- /bin/cat journal.ledger
 ```
 
-- `--unshare-net` unless `config.network: true` is explicitly set (expected
-  to stay `false` for every bookkeeping use case -- these are local-file
-  tools).
+- `--unshare-net` unless `config.network: true` is explicitly set. Plaintext
+  accounting remains local-only; model-backed statement extraction is an
+  explicit exception because it contacts its configured Ollama endpoint.
+- Every `host_inputs` source is mounted with `--ro-bind`. The operator-selected
+  root is also expected to be a read-only outer container mount in deployments,
+  providing defense in depth.
 - `--unshare-pid` + `--die-with-parent` so a runaway child can't outlive
   the factory call or fork-bomb the host.
 - Read-only binds for the program binary and the minimal set of shared

@@ -329,7 +329,7 @@ Read a file from the pond
 | Argument / option | Accepted values | Required | Default | Description |
 |---|---|---|---|---|
 | --explain | flag (no value) | no | false | Show pattern resolution and schema without executing the query |
-| --format | 1 value(s) | no | auto | Output format [default: auto] [possible values: auto, raw, table] auto: table for queryable types when stdout is a TTY, raw otherwise |
+| --format | 1 value(s) | no | auto | Output format [default: auto] [possible values: auto, raw, table, csv] auto: table for queryable types, raw for non-queryable files |
 | -h, --help | flag (no value) | no | not specified | Print help |
 | PATH | 1 value(s) | yes | not specified | File path to read |
 | --sql, --query | 1 value(s) | no | not specified | SQL query to execute on the file:series data |

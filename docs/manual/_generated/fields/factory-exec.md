@@ -23,6 +23,7 @@ Configuration for one exec factory mount.
 |---|---|---|---|---|
 | `args` | array of string | no | [] | Literal argument vector passed to the program. Never shell-interpreted; if shell semantics are wanted, spell them out explicitly, e.g. program: /bin/bash, args: ["-c", "..."]. |
 | `env` | map of string | no | {} | Explicit environment variables set inside the sandbox. Empty by default -- nothing is inherited from the pond process environment. |
+| `host_inputs` | array of HostInput | no | [] | Read-only paths from the explicit pond -d hostmount root. The exec run fails unless the operator supplied -d; pond-stored configuration can never select an ambient host filesystem root by itself. |
 | `inputs` | array of string | yes | not specified | Exact pond paths staged read-only into the sandbox before exec. |
 | `interactive` | boolean | no | false | Run the program without bwrap's --new-session isolation, so a real interactive program (a REPL, hledger add, etc.) keeps normal terminal job control (Ctrl-C, Ctrl-Z) instead of losing it to a detached session. This trades away --new-session's defense against the sandboxed program injecting fake keystrokes back at the controlling terminal (TIOCSTI) -- acceptable only because running a program interactively is already an explicit, attended choice by the operator. See docs/exec-factory-design.md's interactive sessions section. |
 | `network` | boolean | no | false | Allow network access inside the sandbox. false unless a concrete use case needs it; bookkeeping tools are local-file-only. |
@@ -30,5 +31,16 @@ Configuration for one exec factory mount.
 | `program` | string | yes | not specified | Absolute path to the program to execute. Never searched on $PATH: the config is pond-versioned, so the exact binary invoked should be an explicit, auditable value. |
 | `series_outputs` | array of string | no | [] | Exact pond paths (no directory prefixes) treated as **append-only** tinyfs::EntryType::FilePhysicalSeries files: the program sees the path's full prior content staged read-write (series versions are concatenated on read), and on clean exit only the *new* suffix bytes -- not the whole file -- are committed as the series' next version. A natural fit for append-only formats like Ledger journals. If the program leaves behind anything that isn't a byte-for-byte extension of what it started with (edited, truncated, or deleted), the whole run is rejected and the pond is left unchanged, same as any other output error. |
 | `timeout_seconds` | integer &#124; null | no | null | Kill the program if it hasn't exited within this many seconds. None resolves via [ExecConfig::effective_timeout]: 60s for ordinary runs, no timeout at all for interactive: true runs. Some(0) always means "no timeout", for either kind of run. Constraints: format="uint64"; minimum=0. |
+
+Unknown fields: **rejected**.
+
+### HostInput
+
+A read-only path projected from the operator-selected hostmount root into the external program's bubblewrap sandbox.
+
+| Field | Accepted type | Required | Default | Description |
+|---|---|---|---|---|
+| `source` | string | yes | not specified | Absolute path within the pond -d hostmount namespace. |
+| `target` | string | yes | not specified | Absolute path at which the source is visible inside the sandbox. |
 
 Unknown fields: **rejected**.

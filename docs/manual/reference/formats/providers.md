@@ -59,17 +59,36 @@ general HTML-table or binary Excel parser. Output has nullable Utf8
 explicitly for downstream temporal operations. It buffers the HTML DOM and
 rows, then emits batches of 1000. Missing tables/headers and invalid input fail.
 
-## Binary Excel
+## Excel
 
-Use `xls:///readings.xls?sheet=Readings&header=true`. It reads binary `.xls`,
-not `.xlsx` and not the HTML provider above. `sheet` is mandatory when the
-workbook has zero/multiple worksheets; a missing named sheet reports available
-names. `header: false` treats the first row as data. Calamine buffers the
-workbook/range for seeking; parsing runs off the async executor and Arrow
-conversion proceeds in batches. Inference chooses compatible Boolean,
-Int64, Float64, string, or microsecond timestamp representations across cells;
-mixed/incompatible contents can become strings. No universal timestamp column
-is imposed. Unknown options, invalid workbooks, and zero batch size fail.
+Use `xls:///readings.xls?sheet=Readings&header=true`. The Calamine-backed
+provider reads `.xls` and `.xlsx` workbooks, but not Excel-compatible HTML (use
+`excelhtml` for HydroVu HTML exports). `sheet` is required when a workbook has
+zero or multiple worksheets; a missing named sheet reports available names.
+
+For `.xlsx`, a declared Excel Table supplies its exact range and column names.
+Without a declared table, header detection normally selects the first populated
+row. It also recognizes report exports consisting of one-cell title rows, a
+blank separator row, and a multi-column text header, excluding the title
+material from output and inference. Use `header_row` only to override an
+ambiguous or unusual layout. `header: false` retains every row as data and
+generates column names.
+
+Blank headers receive generated names when their columns contain data; unnamed
+columns empty in every data row are omitted as worksheet layout. Named empty
+columns remain in the schema. Duplicate names are rejected. Inference examines
+data rows after the selected header: numeric columns become `Int64` or
+`Float64`, booleans become `Boolean`, and Excel datetimes become timezone-free
+microsecond timestamps. Other mixed-type columns become text without dropping
+values. Empty cells are nulls and internal blank rows are retained.
+
+Spreadsheet error cells, invalid options, unreadable workbooks, and empty
+worksheets fail explicitly. Header-only worksheets expose their schema with
+zero data rows. Formulas use cached values; the provider does not recalculate
+them. Calamine requires seekable input, so the provider buffers the workbook
+and selected worksheet in memory. Parsing and inference run on a blocking
+worker; batching does not make workbook reads streaming, and SQL filters do not
+avoid parsing the worksheet.
 
 <!-- docs:reference format:xls -->
 ## Configuration reference
@@ -82,7 +101,9 @@ Generated from the Rust **deserialization** contract. This describes shape, not 
 |---|---|---|---|---|
 | `batch_size` | integer | no | 8192 | Constraints: format="uint"; minimum=0. |
 | `header` | boolean | no | true |  |
+| `header_row` | integer &#124; null | no | null | Constraints: format="uint"; minimum=0. |
 | `sheet` | string &#124; null | no | null |  |
+| `table` | string &#124; null | no | null |  |
 
 Unknown fields: **rejected**.
 <!-- docs:end-reference -->

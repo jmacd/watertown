@@ -34,7 +34,7 @@ SPDX-FileCopyrightText = "Caspar Water Company"
 SPDX-License-Identifier = "Apache-2.0"
 
 [[annotations]]
-path = ["crates/provider/tests/fixtures/*.xls"]
+path = ["crates/provider/tests/fixtures/*.xls", "crates/provider/tests/fixtures/*.xlsx"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Caspar Water Company"
 SPDX-License-Identifier = "Apache-2.0"

@@ -692,7 +692,7 @@ mod tests {
             let mut output = String::new();
             describe_command(&context, pattern, |s| output.push_str(s)).await?;
             assert_eq!(output.matches("Provider: xls").count(), count);
-            assert_eq!(output.matches("Schema: 7 fields").count(), count);
+            assert_eq!(output.matches("Schema: 6 fields").count(), count);
             assert!(output.contains("value: Float64"), "{output}");
             assert!(output.contains("active: Boolean"), "{output}");
         }
