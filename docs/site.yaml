@@ -110,21 +110,18 @@ sidebar:
         children:
           - label: CSV
             href: /reference/formats/csv.html
-          - label: Other formats
-            href: /reference/formats/providers.html
-            children:
-              - label: OpenTelemetry JSON
-                href: /reference/formats/providers.html#opentelemetry-json
-              - label: JSON logs
-                href: /reference/formats/providers.html#json-logs
-              - label: Web logs
-                href: /reference/formats/providers.html#web-logs
-              - label: Excel HTML
-                href: /reference/formats/providers.html#excel-html
-              - label: Excel
-                href: /reference/formats/providers.html#excel
-              - label: Hledger journal
-                href: /reference/formats/providers.html#hledger-journal
+          - label: OpenTelemetry JSON
+            href: /reference/formats/providers.html#opentelemetry-json
+          - label: JSON logs
+            href: /reference/formats/providers.html#json-logs
+          - label: Web logs
+            href: /reference/formats/providers.html#web-logs
+          - label: Excel HTML
+            href: /reference/formats/providers.html#excel-html
+          - label: Excel
+            href: /reference/formats/providers.html#excel
+          - label: Hledger journal
+            href: /reference/formats/providers.html#hledger-journal
       - label: Sitegen
         children:
           - label: Configuration
