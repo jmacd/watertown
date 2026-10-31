@@ -109,7 +109,7 @@ def reference(component, metadata):
             text.append(f"| {cell(', '.join(names))} | {cell(values)} | {'yes' if arg['required'] else 'no'} | {cell(defaults)} | {cell(description)} |")
         text.append("\nGlobal options are documented in [Global options](global-options.md).\n")
         return "\n".join(text)
-    text = ["## Configuration reference\n",
+    text = ["## Full configuration\n",
             "Generated from the Rust **deserialization** contract. This describes shape, "
             "not all semantic validation, service prerequisites, or successful execution.\n"]
     if component in metadata.get("factories", {}):

@@ -1,5 +1,5 @@
 #!/bin/bash
-# EXPERIMENT: Four-page documentation readiness gate, using cached pond only
+# EXPERIMENT: Documentation readiness gate, using cached pond only
 # EXPECTED: Canonical nested links, literal code, strict rejection, and lean offline output
 set -euo pipefail
 source check.sh
@@ -12,12 +12,17 @@ export POND_BIN="${POND_BIN:-$(command -v pond)}"
 bash "${EXAMPLES_ROOT}/documentation-pilot/run.sh"
 SITE="${EXAMPLE_OUTPUT}/site"
 FACTORY="${SITE}/reference/factories/synthetic-timeseries.html"
+GIT_FACTORY="${SITE}/reference/factories/git-ingest.html"
 CSV="${SITE}/reference/formats/csv.html"
 GUIDE="${SITE}/guides/timeseries.html"
 SHORTCODES="${SITE}/reference/sitegen/shortcodes.html"
-for page in "${SITE}/index.html" "${FACTORY}" "${CSV}" "${GUIDE}" "${SHORTCODES}"; do
+for page in "${SITE}/index.html" "${FACTORY}" "${GIT_FACTORY}" "${CSV}" "${GUIDE}" "${SHORTCODES}"; do
     check '[[ -f "${page}" ]]' "pilot page $(basename "${page}") generated"
 done
+check '[[ "$(find "${SITE}" -name "*.html" -type f | wc -l | tr -d " ")" = 42 ]]' "complete manual renders 42 pages"
+check_contains "${GIT_FACTORY}" "each public factory has an individual page" '<h1 id="git-ingestion">Git ingestion'
+check_contains "${GIT_FACTORY}" "factory page includes generated full configuration" 'id="full-configuration"'
+check_contains "${GIT_FACTORY}" "page contents nests schema heading" 'href="#full-configuration">Full configuration</a><ul>'
 check_contains "${GUIDE}" "duplicate heading gets unique ID" 'id="inspect-1"'
 check_contains "${GUIDE}" "page contents uses canonical ID" 'href="#inspect-1"'
 check_contains "${GUIDE}" "cross-page fragment uses Pages prefix" 'href="/watertown/reference/factories/synthetic-timeseries.html#inspect"'

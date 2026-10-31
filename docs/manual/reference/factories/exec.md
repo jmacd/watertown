@@ -23,7 +23,7 @@ then `pond run /etc/checksum`. Inspect inputs/committed outputs with `cat`;
 update configuration with `mknod ... --overwrite`.
 
 <!-- docs:reference factory:exec -->
-## Configuration reference
+## Full configuration
 
 Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
 

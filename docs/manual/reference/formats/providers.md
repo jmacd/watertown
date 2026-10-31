@@ -91,7 +91,7 @@ worker; batching does not make workbook reads streaming, and SQL filters do not
 avoid parsing the worksheet.
 
 <!-- docs:reference format:xls -->
-## Configuration reference
+## Full configuration
 
 Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
 
@@ -123,7 +123,7 @@ Unsupported journal features are errors, not an instruction to execute includes
 or external commands. Unknown options and zero batch size fail.
 
 <!-- docs:reference format:hledger -->
-## Configuration reference
+## Full configuration
 
 Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
 

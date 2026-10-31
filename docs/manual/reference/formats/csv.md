@@ -38,7 +38,7 @@ URL values are strings parsed by the provider. Use ASCII delimiter/quote/escape
 characters.
 
 <!-- docs:reference format:csv -->
-## Configuration reference
+## Full configuration
 
 Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
 
