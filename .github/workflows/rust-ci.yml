@@ -279,12 +279,16 @@ jobs:
       - name: Push container image
         id: push
         run: |
-          podman push "${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.version }}-${{ matrix.arch }}"
+          set -euo pipefail
+          DIGEST_FILE="$RUNNER_TEMP/pushed-${{ matrix.arch }}.digest"
+          podman push --digestfile "$DIGEST_FILE" \
+            "${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.version }}-${{ matrix.arch }}"
           podman push "${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.semver }}-${{ matrix.arch }}"
           if [ -n "${{ steps.meta.outputs.extra_tag }}" ]; then
             podman push "${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.extra_tag }}-${{ matrix.arch }}"
           fi
-          DIGEST=$(podman inspect "${{ steps.meta.outputs.image_id }}:${{ steps.meta.outputs.version }}-${{ matrix.arch }}" --format '{{.Digest}}')
+          DIGEST="$(cat "$DIGEST_FILE")"
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
 
       - name: Sign container image with Sigstore
