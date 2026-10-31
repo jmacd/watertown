@@ -10,7 +10,7 @@ by the actual sitegen deserializer. Unknown metadata (including `doc_id`) is
 tolerated, but unknown layouts fail strict builds.
 
 <!-- docs:reference sitegen:frontmatter -->
-## Configuration reference
+## Full configuration
 
 Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
 

@@ -2,6 +2,33 @@ site:
   title: Watertown development manual
   base_url: "/watertown/"
   github_url: https://github.com/jmacd/watertown
+theme:
+  page-toc-display: "none"
+  accent: "#1e3a8a"
+  accent-light: "#1d4ed8"
+  accent-wash: "#eff6ff"
+  bg: "#ffffff"
+  bg-sidebar: "#f8fafc"
+  bg-card: "#f8fafc"
+  bg-hover: "#f1f5f9"
+  bg-secondary: "#f8fafc"
+  fg: "#0f172a"
+  fg-secondary: "#475569"
+  fg-muted: "#64748b"
+  border: "#cbd5e1"
+  border-light: "#e2e8f0"
+  nav-btn: "#f1f5f9"
+  nav-btn-hover: "#e2e8f0"
+  nav-btn-active: "#1e40af"
+  nav-sub-btn: "transparent"
+  nav-sub-btn-hover: "#eff6ff"
+  nav-sub-btn-active: "#1e40af"
+  radius: "4px"
+  radius-sm: "3px"
+  shadow-sm: "none"
+  shadow-md: "none"
+  font-sans: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+  font-mono: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
 documentation:
   version: 1
   source_root: /docs/manual
@@ -52,26 +79,76 @@ sidebar:
         href: /reference/export.html
       - label: Factories
         children:
-          - label: Synthetic timeseries
-            href: /reference/factories/synthetic-timeseries.html
-          - label: SQL and transforms
-            href: /reference/factories/sql.html
-          - label: Timeseries transformations
-            href: /reference/factories/timeseries.html
           - label: Ingestion
-            href: /reference/factories/ingestion.html
-          - label: Storage and budgets
-            href: /reference/factories/storage.html
+            children:
+              - label: Git
+                href: /reference/factories/git-ingest.html
+              - label: Rotating logs
+                href: /reference/factories/logfile-ingest.html
+              - label: Systemd journal
+                href: /reference/factories/journal-ingest.html
+              - label: HydroVu
+                href: /reference/factories/hydrovu.html
+          - label: SQL and transforms
+            children:
+              - label: SQL-derived table
+                href: /reference/factories/sql-derived-table.html
+              - label: SQL-derived series
+                href: /reference/factories/sql-derived-series.html
+              - label: Column rename
+                href: /reference/factories/column-rename.html
+              - label: Dynamic directory
+                href: /reference/factories/dynamic-dir.html
+          - label: Timeseries
+            children:
+              - label: Synthetic timeseries
+                href: /reference/factories/synthetic-timeseries.html
+              - label: Join
+                href: /reference/factories/timeseries-join.html
+              - label: Pivot
+                href: /reference/factories/timeseries-pivot.html
+              - label: Temporal reduction
+                href: /reference/factories/temporal-reduce.html
+              - label: Direct temporal reduction
+                href: /reference/factories/temporal-reduce-series.html
+              - label: Pump state
+                href: /reference/factories/pump-state-series.html
+              - label: Materialization
+                href: /reference/factories/materialize-series.html
           - label: Exec
             href: /reference/factories/exec.html
-          - label: Reports
-            href: /reference/factories/reporting.html
+          - label: Publishing and reports
+            children:
+              - label: Sitegen
+                href: /reference/factories/sitegen.html
+              - label: Monitor report
+                href: /reference/factories/monitor-report.html
+              - label: Email report
+                href: /reference/factories/email-report.html
+          - label: Storage and budgets
+            children:
+              - label: MinIO
+                href: /reference/factories/storage-minio.html
+              - label: Azure
+                href: /reference/factories/storage-azure.html
+              - label: Rate limit
+                href: /reference/factories/rate-limit.html
       - label: Formats
         children:
           - label: CSV
             href: /reference/formats/csv.html
-          - label: Other providers
-            href: /reference/formats/providers.html
+          - label: OpenTelemetry JSON
+            href: /reference/formats/providers.html#opentelemetry-json
+          - label: JSON logs
+            href: /reference/formats/providers.html#json-logs
+          - label: Web logs
+            href: /reference/formats/providers.html#web-logs
+          - label: Excel HTML
+            href: /reference/formats/providers.html#excel-html
+          - label: Excel
+            href: /reference/formats/providers.html#excel
+          - label: Hledger journal
+            href: /reference/formats/providers.html#hledger-journal
       - label: Sitegen
         children:
           - label: Configuration

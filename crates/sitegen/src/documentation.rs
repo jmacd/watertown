@@ -367,6 +367,52 @@ fn heading_slug(text: &str) -> String {
     }
 }
 
+fn render_contents(contents: &[(u8, String, String)]) -> String {
+    fn render_level(
+        html: &mut String,
+        contents: &[(u8, String, String)],
+        index: &mut usize,
+        level: u8,
+    ) {
+        html.push_str("<ul>");
+        while *index < contents.len() {
+            let (entry_level, id, text) = &contents[*index];
+            if *entry_level < level {
+                break;
+            }
+            if *entry_level > level {
+                render_level(html, contents, index, *entry_level);
+                continue;
+            }
+            html.push_str(&format!("<li><a href=\"#{id}\">{}</a>", escape(text)));
+            *index += 1;
+            if *index < contents.len() && contents[*index].0 > level {
+                let child_level = contents[*index].0;
+                render_level(html, contents, index, child_level);
+            }
+            html.push_str("</li>");
+        }
+        html.push_str("</ul>");
+    }
+
+    let contents: Vec<_> = contents
+        .iter()
+        .filter(|(level, _, _)| *level >= 2)
+        .cloned()
+        .collect();
+    if contents.is_empty() {
+        return String::new();
+    }
+    let mut html =
+        "<nav class=\"page-toc\" aria-label=\"On this page\"><strong>On this page</strong>"
+            .to_string();
+    let mut index = 0;
+    let level = contents[0].0;
+    render_level(&mut html, &contents, &mut index, level);
+    html.push_str("</nav>\n");
+    html
+}
+
 pub(crate) fn render(
     content: &str,
     source: &str,
@@ -428,19 +474,7 @@ pub(crate) fn render(
             }
         }
     }
-    let mut html = String::new();
-    if contents.iter().any(|(level, _, _)| *level >= 2) {
-        html.push_str(
-            "<nav class=\"page-toc\" aria-label=\"On this page\"><strong>On this page</strong><ul>",
-        );
-        for (level, id, text) in contents.iter().filter(|(level, _, _)| *level >= 2) {
-            html.push_str(&format!(
-                "<li class=\"toc-level-{level}\"><a href=\"#{id}\">{}</a></li>",
-                escape(text)
-            ));
-        }
-        html.push_str("</ul></nav>\n");
-    }
+    let mut html = render_contents(&contents);
     push_html(&mut html, events.into_iter());
     Ok(html)
 }
@@ -821,6 +855,21 @@ mod tests {
             assert!(html.contains(&format!("id=\"{id}\"")));
             assert!(html.contains(&format!("href=\"#{id}\"")));
         }
+    }
+
+    #[test]
+    fn page_contents_preserves_heading_hierarchy() {
+        let html = render(
+            "## Factory\n### Configuration\n#### Variant\n### Evidence\n## Next\n",
+            "/manual/page.md",
+            &PageIndex::default(),
+            "/",
+        )
+        .unwrap();
+        assert!(html.contains(
+            "<ul><li><a href=\"#factory\">Factory</a><ul><li><a href=\"#configuration\">Configuration</a><ul><li><a href=\"#variant\">Variant</a></li></ul></li><li><a href=\"#evidence\">Evidence</a></li></ul></li><li><a href=\"#next\">Next</a></li></ul>"
+        ));
+        assert!(!html.contains("toc-level-"));
     }
 
     #[test]

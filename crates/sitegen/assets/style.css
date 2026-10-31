@@ -1690,8 +1690,8 @@ table.explore-grid th {
 .documentation pre code { overflow-wrap: normal; }
 .documentation table { border-collapse: collapse; display: block; overflow-x: auto; }
 .documentation th, .documentation td { padding: .5rem; border: 1px solid #8886; text-align: left; }
-.documentation .page-toc { padding: 1rem; border: 1px solid #8886; }
-.documentation .toc-level-3 { margin-left: 1rem; }
+.documentation .page-toc { display: var(--page-toc-display, block); padding: 1rem; border: 1px solid #8886; }
+.documentation .page-toc ul { margin-block: .35rem 0; padding-left: 1.5rem; }
 .documentation a:focus-visible { outline: 3px solid currentColor; outline-offset: 3px; }
 .documentation .skip-link { position: absolute; left: -10000px; }
 .documentation .skip-link:focus { left: 1rem; top: 1rem; z-index: 100; background: white; color: black; padding: 1rem; }

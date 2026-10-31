@@ -223,11 +223,11 @@ pond backup add origin s3://my-bucket \
 
 ### sql-derived-table
 
-See the [authoritative factory reference](manual/reference/factories/sql.md#sql-derived-table-and-series).
+See the [authoritative factory reference](manual/reference/factories/sql-derived-table.md).
 
 ### sql-derived-series
 
-See the [authoritative factory reference](manual/reference/factories/sql.md#sql-derived-table-and-series).
+See the [authoritative factory reference](manual/reference/factories/sql-derived-series.md).
 
 ### synthetic-timeseries
 
@@ -235,35 +235,35 @@ See the [authoritative factory reference](manual/reference/factories/synthetic-t
 
 ### dynamic-dir
 
-See the [authoritative factory reference](manual/reference/factories/sql.md#dynamic-directory).
+See the [authoritative factory reference](manual/reference/factories/dynamic-dir.md).
 
 ### timeseries-join
 
-See the [authoritative factory reference](manual/reference/factories/timeseries.md#join).
+See the [authoritative factory reference](manual/reference/factories/timeseries-join.md).
 
 ### timeseries-pivot
 
-See the [authoritative factory reference](manual/reference/factories/timeseries.md#pivot).
+See the [authoritative factory reference](manual/reference/factories/timeseries-pivot.md).
 
 ### temporal-reduce
 
-See the [authoritative factory reference](manual/reference/factories/timeseries.md#temporal-reduction).
+See the [authoritative factory reference](manual/reference/factories/temporal-reduce.md).
 
 ### temporal-reduce-series
 
-See the [authoritative factory reference](manual/reference/factories/timeseries.md#temporal-reduction).
+See the [authoritative factory reference](manual/reference/factories/temporal-reduce-series.md).
 
 ### pump-state-series
 
-See the [authoritative factory reference](manual/reference/factories/timeseries.md#pump-state).
+See the [authoritative factory reference](manual/reference/factories/pump-state-series.md).
 
 ### sitegen
 
-See the [authoritative factory reference](manual/reference/factories/../sitegen/configuration.md).
+See the [authoritative factory reference](manual/reference/factories/sitegen.md).
 
 ### column-rename
 
-See the [authoritative factory reference](manual/reference/factories/sql.md#column-rename).
+See the [authoritative factory reference](manual/reference/factories/column-rename.md).
 
 ### remote (REMOVED in D4)
 
@@ -271,15 +271,15 @@ Historical removed interface. Use current [backup/import operations](manual/guid
 
 ### hydrovu
 
-See the [authoritative factory reference](manual/reference/factories/ingestion.md#hydrovu).
+See the [authoritative factory reference](manual/reference/factories/hydrovu.md).
 
 ### logfile-ingest
 
-See the [authoritative factory reference](manual/reference/factories/ingestion.md#rotating-log-files).
+See the [authoritative factory reference](manual/reference/factories/logfile-ingest.md).
 
 ### journal-ingest
 
-See the [authoritative factory reference](manual/reference/factories/ingestion.md#systemd-journal).
+See the [authoritative factory reference](manual/reference/factories/journal-ingest.md).
 
 ## Glob Patterns
 

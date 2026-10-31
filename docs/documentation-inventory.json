@@ -269,6 +269,207 @@
     }
   ],
   "pages": {
+    "cli:global-options": {
+      "path": "docs/manual/reference/cli/global-options.md",
+      "components": [
+        "cli:global-options"
+      ],
+      "examples": [
+        "csv-query"
+      ],
+      "coverage": "validation-only"
+    },
+    "factory:column-rename": {
+      "path": "docs/manual/reference/factories/column-rename.md",
+      "components": [
+        "factory:column-rename"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "factory:dynamic-dir": {
+      "path": "docs/manual/reference/factories/dynamic-dir.md",
+      "components": [
+        "factory:dynamic-dir"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "factory:email-report": {
+      "path": "docs/manual/reference/factories/email-report.md",
+      "components": [
+        "factory:email-report"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "factory:exec": {
+      "path": "docs/manual/reference/factories/exec.md",
+      "components": [
+        "factory:exec"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "factory:git-ingest": {
+      "path": "docs/manual/reference/factories/git-ingest.md",
+      "components": [
+        "factory:git-ingest"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "factory:hydrovu": {
+      "path": "docs/manual/reference/factories/hydrovu.md",
+      "components": [
+        "factory:hydrovu"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "factory:journal-ingest": {
+      "path": "docs/manual/reference/factories/journal-ingest.md",
+      "components": [
+        "factory:journal-ingest"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "factory:logfile-ingest": {
+      "path": "docs/manual/reference/factories/logfile-ingest.md",
+      "components": [
+        "factory:logfile-ingest"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "factory:materialize-series": {
+      "path": "docs/manual/reference/factories/materialize-series.md",
+      "components": [
+        "factory:materialize-series"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "factory:monitor-report": {
+      "path": "docs/manual/reference/factories/monitor-report.md",
+      "components": [
+        "factory:monitor-report"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "factory:pump-state-series": {
+      "path": "docs/manual/reference/factories/pump-state-series.md",
+      "components": [
+        "factory:pump-state-series"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "factory:rate-limit": {
+      "path": "docs/manual/reference/factories/rate-limit.md",
+      "components": [
+        "factory:rate-limit"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "factory:sitegen": {
+      "path": "docs/manual/reference/factories/sitegen.md",
+      "components": [
+        "factory:sitegen"
+      ],
+      "examples": [
+        "timeseries-site",
+        "blog-rss"
+      ],
+      "coverage": "validation-only"
+    },
+    "factory:sql-derived-series": {
+      "path": "docs/manual/reference/factories/sql-derived-series.md",
+      "components": [
+        "factory:sql-derived-series"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "factory:sql-derived-table": {
+      "path": "docs/manual/reference/factories/sql-derived-table.md",
+      "components": [
+        "factory:sql-derived-table"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "factory:storage-azure": {
+      "path": "docs/manual/reference/factories/storage-azure.md",
+      "components": [
+        "factory:storage-azure"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "factory:storage-minio": {
+      "path": "docs/manual/reference/factories/storage-minio.md",
+      "components": [
+        "factory:storage-minio"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "factory:synthetic-timeseries": {
+      "path": "docs/manual/reference/factories/synthetic-timeseries.md",
+      "components": [
+        "factory:synthetic-timeseries"
+      ],
+      "examples": [
+        "synthetic-timeseries"
+      ],
+      "coverage": "offline-e2e"
+    },
+    "factory:temporal-reduce": {
+      "path": "docs/manual/reference/factories/temporal-reduce.md",
+      "components": [
+        "factory:temporal-reduce"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "factory:temporal-reduce-series": {
+      "path": "docs/manual/reference/factories/temporal-reduce-series.md",
+      "components": [
+        "factory:temporal-reduce-series"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "factory:timeseries-join": {
+      "path": "docs/manual/reference/factories/timeseries-join.md",
+      "components": [
+        "factory:timeseries-join"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "factory:timeseries-pivot": {
+      "path": "docs/manual/reference/factories/timeseries-pivot.md",
+      "components": [
+        "factory:timeseries-pivot"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "format:csv": {
+      "path": "docs/manual/reference/formats/csv.md",
+      "components": [
+        "format:csv"
+      ],
+      "examples": [
+        "csv-query"
+      ],
+      "coverage": "offline-e2e"
+    },
     "guide:blog": {
       "path": "docs/manual/guides/blog.md",
       "components": [],
@@ -285,20 +486,20 @@
       ],
       "coverage": "offline-e2e"
     },
-    "guide:timeseries-site": {
-      "path": "docs/manual/guides/timeseries-site.md",
-      "components": [],
-      "examples": [
-        "timeseries-site"
-      ],
-      "coverage": "offline-e2e"
-    },
     "guide:timeseries": {
       "path": "docs/manual/guides/timeseries.md",
       "components": [],
       "examples": [
         "csv-query",
         "synthetic-timeseries"
+      ],
+      "coverage": "offline-e2e"
+    },
+    "guide:timeseries-site": {
+      "path": "docs/manual/guides/timeseries-site.md",
+      "components": [],
+      "examples": [
+        "timeseries-site"
       ],
       "coverage": "offline-e2e"
     },
@@ -366,16 +567,6 @@
       ],
       "coverage": "validation-only"
     },
-    "cli:global-options": {
-      "path": "docs/manual/reference/cli/global-options.md",
-      "components": [
-        "cli:global-options"
-      ],
-      "examples": [
-        "csv-query"
-      ],
-      "coverage": "validation-only"
-    },
     "reference:concepts": {
       "path": "docs/manual/reference/concepts.md",
       "components": [
@@ -409,88 +600,6 @@
       ],
       "coverage": "offline-e2e"
     },
-    "factory:exec": {
-      "path": "docs/manual/reference/factories/exec.md",
-      "components": [
-        "factory:exec"
-      ],
-      "examples": [],
-      "coverage": "unverified"
-    },
-    "reference:ingestion": {
-      "path": "docs/manual/reference/factories/ingestion.md",
-      "components": [
-        "factory:git-ingest",
-        "factory:hydrovu",
-        "factory:journal-ingest",
-        "factory:logfile-ingest"
-      ],
-      "examples": [],
-      "coverage": "unverified"
-    },
-    "reference:reporting": {
-      "path": "docs/manual/reference/factories/reporting.md",
-      "components": [
-        "factory:email-report",
-        "factory:monitor-report"
-      ],
-      "examples": [],
-      "coverage": "unverified"
-    },
-    "reference:sql": {
-      "path": "docs/manual/reference/factories/sql.md",
-      "components": [
-        "factory:column-rename",
-        "factory:dynamic-dir",
-        "factory:sql-derived-series",
-        "factory:sql-derived-table"
-      ],
-      "examples": [],
-      "coverage": "unverified"
-    },
-    "reference:storage": {
-      "path": "docs/manual/reference/factories/storage.md",
-      "components": [
-        "factory:rate-limit",
-        "factory:storage-azure",
-        "factory:storage-minio"
-      ],
-      "examples": [],
-      "coverage": "unverified"
-    },
-    "factory:synthetic-timeseries": {
-      "path": "docs/manual/reference/factories/synthetic-timeseries.md",
-      "components": [
-        "factory:synthetic-timeseries"
-      ],
-      "examples": [
-        "synthetic-timeseries"
-      ],
-      "coverage": "offline-e2e"
-    },
-    "reference:timeseries-factories": {
-      "path": "docs/manual/reference/factories/timeseries.md",
-      "components": [
-        "factory:materialize-series",
-        "factory:pump-state-series",
-        "factory:temporal-reduce",
-        "factory:temporal-reduce-series",
-        "factory:timeseries-join",
-        "factory:timeseries-pivot"
-      ],
-      "examples": [],
-      "coverage": "unverified"
-    },
-    "format:csv": {
-      "path": "docs/manual/reference/formats/csv.md",
-      "components": [
-        "format:csv"
-      ],
-      "examples": [
-        "csv-query"
-      ],
-      "coverage": "offline-e2e"
-    },
     "reference:formats": {
       "path": "docs/manual/reference/formats/providers.md",
       "components": [
@@ -504,48 +613,17 @@
       "examples": [],
       "coverage": "unverified"
     },
-    "sitegen:browser": {
-      "path": "docs/manual/reference/sitegen/browser.md",
-      "components": [
-        "sitegen:browser"
-      ],
-      "examples": [
-        "timeseries-site"
-      ],
+    "reference:ingestion": {
+      "path": "docs/manual/reference/factories/ingestion.md",
+      "components": [],
+      "examples": [],
       "coverage": "unverified"
     },
-    "sitegen:configuration": {
-      "path": "docs/manual/reference/sitegen/configuration.md",
-      "components": [
-        "factory:sitegen",
-        "sitegen:build",
-        "sitegen:configuration",
-        "sitegen:content",
-        "sitegen:documentation",
-        "sitegen:exports",
-        "sitegen:feeds",
-        "sitegen:navigation",
-        "sitegen:report",
-        "sitegen:reports",
-        "sitegen:routes",
-        "sitegen:subsites",
-        "sitegen:themes"
-      ],
-      "examples": [
-        "timeseries-site",
-        "blog-rss"
-      ],
-      "coverage": "validation-only"
-    },
-    "sitegen:frontmatter": {
-      "path": "docs/manual/reference/sitegen/frontmatter.md",
-      "components": [
-        "sitegen:frontmatter"
-      ],
-      "examples": [
-        "blog-rss"
-      ],
-      "coverage": "offline-e2e"
+    "reference:reporting": {
+      "path": "docs/manual/reference/factories/reporting.md",
+      "components": [],
+      "examples": [],
+      "coverage": "unverified"
     },
     "reference:shortcodes": {
       "path": "docs/manual/reference/sitegen/shortcodes.md",
@@ -579,6 +657,66 @@
         "documentation-pilot"
       ],
       "coverage": "validation-only"
+    },
+    "reference:sql": {
+      "path": "docs/manual/reference/factories/sql.md",
+      "components": [],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "reference:storage": {
+      "path": "docs/manual/reference/factories/storage.md",
+      "components": [],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "reference:timeseries-factories": {
+      "path": "docs/manual/reference/factories/timeseries.md",
+      "components": [],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "sitegen:browser": {
+      "path": "docs/manual/reference/sitegen/browser.md",
+      "components": [
+        "sitegen:browser"
+      ],
+      "examples": [
+        "timeseries-site"
+      ],
+      "coverage": "unverified"
+    },
+    "sitegen:configuration": {
+      "path": "docs/manual/reference/sitegen/configuration.md",
+      "components": [
+        "sitegen:build",
+        "sitegen:configuration",
+        "sitegen:content",
+        "sitegen:documentation",
+        "sitegen:exports",
+        "sitegen:feeds",
+        "sitegen:navigation",
+        "sitegen:report",
+        "sitegen:reports",
+        "sitegen:routes",
+        "sitegen:subsites",
+        "sitegen:themes"
+      ],
+      "examples": [
+        "timeseries-site",
+        "blog-rss"
+      ],
+      "coverage": "validation-only"
+    },
+    "sitegen:frontmatter": {
+      "path": "docs/manual/reference/sitegen/frontmatter.md",
+      "components": [
+        "sitegen:frontmatter"
+      ],
+      "examples": [
+        "blog-rss"
+      ],
+      "coverage": "offline-e2e"
     }
   },
   "examples": {

@@ -29,7 +29,7 @@ inclusive boundaries `00:00:00Z` and `03:00:00Z`, and temperatures
 [download package](/downloads/synthetic-timeseries.tar).
 
 <!-- docs:reference factory:synthetic-timeseries -->
-## Configuration reference
+## Full configuration
 
 Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
 

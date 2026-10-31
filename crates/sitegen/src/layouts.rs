@@ -180,7 +180,8 @@ fn documentation_layout(ctx: &LayoutContext) -> Markup {
             body class="documentation" {
                 a class="skip-link" href="#manual-content" { "Skip to content" }
                 @if let Some(sidebar) = ctx.sidebar {
-                    nav class="sidebar" aria-label="Manual" { (PreEscaped(sidebar)) }
+                    nav class="sidebar" aria-label="Manual" data-base-url=(ctx.base_url) { (PreEscaped(sidebar)) }
+                    script { (PreEscaped(include_str!("../assets/manual-navigation.js"))) }
                 }
                 main id="manual-content" class="content-page" tabindex="-1" {
                     (top_bar(Some("Manual home"), Some(ctx.base_url), None, ctx.github_url))
