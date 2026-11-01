@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -15,6 +16,7 @@ REGION = re.compile(
     r"^<!-- docs:reference ([\w:/-]+) -->\n.*?^<!-- docs:end-reference -->",
     re.MULTILINE | re.DOTALL,
 )
+EXAMPLE_INCLUDE = '{{ source path="default.yaml" language="yaml" /}}'
 
 
 def cell(value):
@@ -23,11 +25,17 @@ def cell(value):
     ).replace("{{", "&#123;&#123;").strip()
 
 
+def display_name(name):
+    name = re.sub(r"(Config|Options)$", "", name) or "Configuration"
+    name = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", name)
+    return re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", name).replace("_", " ").replace("-", " ")
+
+
 def type_name(schema):
     if isinstance(schema, bool):
         return "any JSON value" if schema else "no accepted value"
     if "$ref" in schema:
-        return schema["$ref"].rsplit("/", 1)[-1]
+        return display_name(schema["$ref"].rsplit("/", 1)[-1])
     if "const" in schema:
         return json.dumps(schema["const"])
     if "enum" in schema:
@@ -45,12 +53,27 @@ def type_name(schema):
     return kind
 
 
-def fields(schema, title):
-    text = [f"### {title}\n"]
+def variant_title(schema):
+    if isinstance(schema, dict):
+        if schema.get("title"):
+            return display_name(schema["title"])
+        if schema.get("description"):
+            summary = schema["description"].split("\n\n", 1)[0]
+            return cell(summary.split(". ", 1)[0].split(": ", 1)[0].rstrip("."))
+        for name, value in schema.get("properties", {}).items():
+            if isinstance(value, dict) and "const" in value:
+                return f"{name}: {cell(json.dumps(value['const']))}"
+    return cell(type_name(schema))
+
+
+def fields(schema, title, level=3, describe=True):
+    text = [f"{'#' * level} {title}\n"]
     if isinstance(schema, bool):
         return text[0] + type_name(schema) + ".\n"
-    if schema.get("description"):
-        text.append(cell(schema["description"]) + "\n")
+    if describe and schema.get("description"):
+        summary = cell(schema["description"].split("\n\n", 1)[0])
+        if summary.rstrip(".") != title:
+            text.append(summary + "\n")
     if "properties" in schema:
         required = schema.get("required", [])
         text.append("| Field | Accepted type | Required | Default | Description |\n"
@@ -65,11 +88,16 @@ def fields(schema, title):
                           if key in value]
                 description += (" Constraints: " + "; ".join(limits) + ".") if limits else ""
             text.append(f"| `{name}` | {cell(type_name(value))} | {'yes' if name in required else 'no'} | {cell(default)} | {cell(description)} |")
-        text.append("\nUnknown fields: **rejected**.\n" if schema.get("additionalProperties") is False
-                    else "\nUnknown fields: not rejected by this shape; see runtime notes.\n")
+        text.append("")
     if any(key in schema for key in ("anyOf", "oneOf", "allOf")):
-        for index, variant in enumerate(schema.get("anyOf", schema.get("oneOf", schema.get("allOf", [])))):
-            text.append(fields(variant, f"{title} variant {index + 1}"))
+        kind = next(key for key in ("anyOf", "oneOf", "allOf") if key in schema)
+        text.append("Choose one of the following:\n" if kind != "allOf"
+                    else "The following requirements also apply:\n")
+        for variant in schema[kind]:
+            if isinstance(variant, dict) and "$ref" in variant:
+                text.append(f"- {cell(type_name(variant))}")
+            else:
+                text.append(fields(variant, variant_title(variant), level + 1))
     elif "properties" not in schema:
         text.append(f"Accepted value: {cell(type_name(schema))}.\n")
     return "\n".join(text)
@@ -109,27 +137,87 @@ def reference(component, metadata):
             text.append(f"| {cell(', '.join(names))} | {cell(values)} | {'yes' if arg['required'] else 'no'} | {cell(defaults)} | {cell(description)} |")
         text.append("\nGlobal options are documented in [Global options](global-options.md).\n")
         return "\n".join(text)
-    text = ["## Full configuration\n",
-            "Generated from the Rust **deserialization** contract. This describes shape, "
-            "not all semantic validation, service prerequisites, or successful execution.\n"]
-    if component in metadata.get("factories", {}):
-        factory = metadata["factories"][component]
-        text.append("| Capability | Registered |\n|---|---|")
-        for key in ["directory", "file", "initialize", "execute", "table_transform", "raw_validation"]:
-            text.append(f"| {key.replace('_', ' ')} | {'yes' if factory[key] else 'no'} |")
-        text.append(f"\nAutomatic post-commit access: `{factory['post_commit_access'] or 'not registered'}`.\n")
+    text = ["## Full configuration\n"]
     schema = metadata.get("schemas", {}).get(component)
     if schema is not None:
-        text.append(fields(schema, schema.get("title", "Configuration")))
+        text.append(fields(schema, "Settings", describe=False))
         for name, definition in sorted(schema.get("$defs", {}).items()):
-            text.append(fields(definition, name))
+            text.append(fields(definition, display_name(name)))
     return "\n".join(text)
 
 
-def outputs(metadata):
-    generated = ROOT / "docs/manual/_generated"
+def input_path(root, relative):
+    path = Path(relative)
+    if path.is_absolute() or ".." in path.parts or not path.parts:
+        raise ValueError(f"Expected an input-tree relative path: {relative}")
+    resolved = (root / path).resolve()
+    if not resolved.is_relative_to(root.resolve()):
+        raise ValueError(f"Input escapes source tree: {relative}")
+    return root / path
+
+
+def component_outputs(catalog, metadata, root=ROOT):
+    result = {}
+    for component, page in catalog["pages"].items():
+        if not component.startswith(("factory:", "format:")):
+            continue
+        kind, name = component.split(":", 1)
+        expected = f"docs/manual/reference/{'factories' if kind == 'factory' else 'formats'}/{name}.md"
+        if page.get("output") != expected:
+            raise ValueError(f"{component}: expected published path {expected}")
+        source = input_path(root, page["path"])
+        if source.name != "documentation.md" or not Path(page["path"]).is_relative_to("crates"):
+            raise ValueError(f"{component}: documentation must live with its implementation")
+        original = source.read_text()
+        markers = list(REGION.finditer(original))
+        if component in metadata["schemas"] and len(markers) != 1:
+            raise ValueError(f"{source}: expected one reference marker for {component}")
+        if kind == "factory" and component not in metadata["schemas"]:
+            raise ValueError(f"{component}: missing compiled configuration schema")
+        if kind == "factory":
+            if original.count(EXAMPLE_INCLUDE) != 1:
+                raise ValueError(f"{component}: include default.yaml exactly once")
+            example = source.with_name("default.yaml")
+            example = input_path(root, example.relative_to(root))
+            staged_example = f"docs/examples/{name}/default.yaml"
+            result[Path(staged_example)] = example.read_bytes()
+            original = original.replace(
+                EXAMPLE_INCLUDE,
+                f'{{{{ source path="/{staged_example}" language="yaml" /}}}}',
+            )
+
+        def replace(match):
+            if match[1] != component:
+                raise ValueError(f"{source}: reference must describe {component}, not {match[1]}")
+            if match[0].split("\n", 1)[1].rsplit("<!-- docs:end-reference -->", 1)[0].strip():
+                raise ValueError(f"{source}: keep only an empty reference marker")
+            return f"{match[0].splitlines()[0]}\n{reference(component, metadata).rstrip()}\n<!-- docs:end-reference -->"
+
+        rendered = REGION.sub(replace, original)
+        result[Path(expected)] = rendered.encode()
+    return result
+
+
+def stage_manual(root, destination):
+    catalog = json.loads((root / "docs/documentation-inventory.json").read_text())
+    metadata = json.loads((root / "docs/manual/_generated/inventory.json").read_text())
+    components = component_outputs(catalog, metadata, root)
+    destination.mkdir(parents=True, exist_ok=False)
+    for directory in ("docs/manual", "docs/templates", "testsuite/examples"):
+        shutil.copytree(root / directory, destination / directory)
+    shutil.copyfile(root / "docs/site.yaml", destination / "docs/site.yaml")
+    for relative, content in components.items():
+        target = destination / relative
+        if target.exists():
+            raise ValueError(f"Generated component output collides with authored input: {relative}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+
+
+def outputs(metadata, root=ROOT):
+    generated = root / "docs/manual/_generated"
     result = {generated / "inventory.json": json.dumps(metadata, indent=2, sort_keys=True, ensure_ascii=True) + "\n"}
-    for page in sorted((ROOT / "docs/manual").rglob("*.md")):
+    for page in sorted((root / "docs/manual").rglob("*.md")):
         if "_generated" in page.parts:
             continue
         original = page.read_text()
@@ -151,20 +239,36 @@ def main():
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--write", action="store_true")
     mode.add_argument("--check", action="store_true")
+    mode.add_argument("--stage", type=Path, help="Assemble a manual input tree in a new directory, using cached metadata")
+    parser.add_argument("--source-root", type=Path, default=ROOT)
     parser.add_argument("--input", type=Path, help="Precomputed exporter JSON; otherwise invoke DOCS_EXPORT")
     args = parser.parse_args()
+    root = args.source_root.resolve()
+    if args.stage:
+        stage_manual(root, args.stage)
+        print(f"Manual inputs assembled: {args.stage}")
+        return
     if args.input:
         metadata = json.loads(args.input.read_text())
     else:
         exporter = os.environ.get("DOCS_EXPORT", str(ROOT / "target/debug/docs-export"))
         metadata = json.loads(subprocess.check_output([exporter], text=True))
+    catalog = json.loads((root / "docs/documentation-inventory.json").read_text())
+    component_outputs(catalog, metadata, root)
     changed = []
-    for path, content in outputs(metadata).items():
+    for path, content in outputs(metadata, root).items():
         if not path.exists() or path.read_text() != content:
-            changed.append(str(path.relative_to(ROOT)))
+            changed.append(str(path.relative_to(root)))
             if args.write:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(content)
+    for component in catalog["pages"]:
+        if component.startswith(("factory:", "format:")):
+            path = root / "docs/manual/_generated/fields" / (component.replace(":", "-") + ".md")
+            if path.exists():
+                changed.append(str(path.relative_to(root)))
+                if args.write:
+                    path.unlink()
     if changed and args.check:
         raise SystemExit("Stale generated reference; run make docs-generate:\n" + "\n".join(changed))
     print(f"Generated reference {'updated' if args.write else 'fresh'} ({len(changed)} changed files).")

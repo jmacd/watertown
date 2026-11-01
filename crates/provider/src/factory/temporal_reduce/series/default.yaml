@@ -1,0 +1,11 @@
+in_pattern: series:///sensors/*  # Required: example source pattern.
+time_column: timestamp          # Required: source event-time column.
+resolution: 1h                  # Required: example aggregation window.
+aggregations:                   # Required: one or more aggregation operations.
+  - type: avg                   # Required: example operation.
+    columns: null               # Default: all eligible numeric columns.
+transforms: null                # Default: no input transforms.
+output_aliases: null            # Default: names such as temperature.avg.
+allowed_lateness: 1d            # Effective default: one-day hot window.
+seal_target_bytes: 1048576       # Effective default: 1 MiB before sealing.
+max_live_segments: 50           # Effective default: compaction backstop.

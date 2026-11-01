@@ -4,6 +4,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -38,6 +39,31 @@ def validate(catalog, metadata, root=ROOT, previous=None):
         require(page["coverage"] in catalog["metadata_contract"]["coverage_levels"], page_id)
         for component in page["components"]:
             require(component in public, f"{page_id}: unknown component {component}")
+            if component.startswith(("factory:", "format:")):
+                require(len(page["components"]) == 1,
+                        f"{component}: factories and formats need individual authoritative pages")
+                kind, name = component.split(":", 1)
+                output = f"docs/manual/reference/{'factories' if kind == 'factory' else 'formats'}/{name}.md"
+                require(page_id == component and page.get("output") == output,
+                        f"{component}: missing stable published output path")
+                require(path.name == "documentation.md" and page["path"].startswith("crates/")
+                        and ".." not in Path(page["path"]).parts
+                        and path.resolve().is_relative_to((root / "crates").resolve()),
+                        f"{component}: documentation must live with its implementation")
+                require((path.parent / "mod.rs").is_file() or (path.parent.parent / "mod.rs").is_file(),
+                        f"{component}: missing adjacent implementation module")
+                require(not (root / output).exists(),
+                        f"{component}: generated page must not also exist in docs/manual")
+                for reference, body in re.findall(
+                        r"<!-- docs:reference ([\w:/-]+) -->\n(.*?)<!-- docs:end-reference -->", text, re.DOTALL):
+                    require(reference == component and not body.strip(),
+                            f"{component}: keep only an empty reference marker in authored documentation")
+            if component.startswith("factory:"):
+                example = path.with_name("default.yaml")
+                require(example.is_file(),
+                        f"{component}: missing {example}")
+                require(text.count('{{ source path="default.yaml" language="yaml" /}}') == 1,
+                        f"{component}: page must include its authoritative default.yaml")
             require(component not in completed, f"{component}: duplicate authoritative mapping")
             completed.add(component)
             if component in metadata.get("schemas", {}):

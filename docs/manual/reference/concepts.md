@@ -49,6 +49,11 @@ this pattern language.
 
 ## Substitution and credentials
 
+Use the documented configuration field names: most factory configurations
+reject unrecognized fields. Sections documented as maps accept their own keys;
+page frontmatter can also carry custom metadata. Example configurations use
+illustrative paths and inputs, which you must replace for your environment.
+
 Factory configs can reference `${env:NAME}` and `${env:NAME:-default}`.
 Validation expands a copy; persisted raw config retains references, and
 materialization resolves against the current process environment. Missing

@@ -34,6 +34,7 @@ documentation:
   source_root: /docs/manual
   include_roots:
     - /testsuite/examples
+    - /docs/examples
 strict: true
 content:
   - name: reference
@@ -138,17 +139,17 @@ sidebar:
           - label: CSV
             href: /reference/formats/csv.html
           - label: OpenTelemetry JSON
-            href: /reference/formats/providers.html#opentelemetry-json
+            href: /reference/formats/oteljson.html
           - label: JSON logs
-            href: /reference/formats/providers.html#json-logs
+            href: /reference/formats/jsonlogs.html
           - label: Web logs
-            href: /reference/formats/providers.html#web-logs
+            href: /reference/formats/weblog.html
           - label: Excel HTML
-            href: /reference/formats/providers.html#excel-html
+            href: /reference/formats/excelhtml.html
           - label: Excel
-            href: /reference/formats/providers.html#excel
+            href: /reference/formats/xls.html
           - label: Hledger journal
-            href: /reference/formats/providers.html#hledger-journal
+            href: /reference/formats/hledger.html
       - label: Sitegen
         children:
           - label: Configuration

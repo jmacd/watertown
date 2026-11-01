@@ -1,0 +1,13 @@
+entries:                              # Children exposed by this directory.
+  - name: temperature                 # Appears as /demo/temperature below.
+    factory: synthetic-timeseries     # Generate readings without external data.
+    config:                           # Settings for this child.
+      start: "2024-01-01T00:00:00Z"
+      end: "2024-01-01T03:00:00Z"      # Inclusive: four hourly readings.
+      interval: 1h
+      points:
+        - name: temperature           # Output measurement column.
+          components:
+            - type: line
+              offset: 20.0            # Starting temperature.
+              slope: 0.001            # Increase per second: 3.6 per hour.

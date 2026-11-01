@@ -1,0 +1,3 @@
+url: https://github.com/jmacd/watertown.git  # Required: example Git remote.
+ref: main                                 # Required: branch, tag, or commit.
+prefix: null                              # Default: expose the whole tree.

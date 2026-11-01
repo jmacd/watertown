@@ -1,0 +1,33 @@
+site:
+  title: My site              # Required: example site title.
+  base_url: /                 # Default: serve at the domain root.
+  site_url: null              # Default: no canonical URL for RSS.
+  github_url: null            # Default: no repository link.
+  default_range: null         # Default: no configured chart range.
+routes:                      # Default: []; this example supplies a home page.
+  - name: home               # Required for this route: example name.
+    type: static             # Required: select the static-page variant.
+    slug: ""                 # Required: empty slug produces index.html.
+    page: /site/index.md      # Required for a useful static route; default null.
+    export: null             # Default: no export stage.
+    annotations: null        # Default: no secondary annotation export.
+    content: null            # Default: no content stage.
+    routes: []               # Default: no child routes.
+content: []                  # Default: no Markdown discovery stages.
+exports: []                  # Default: no dataset exports.
+partials: {}                 # Default: no shared Markdown partials.
+static: []                   # Default: no extra copied assets.
+sidebar: []                  # Default: no configured navigation entries.
+labels: {}                   # Default: no display-name overrides.
+metric_registry: {}          # Default: no metric instrument-kind overrides.
+metric_captions: {}          # Default: no chart-caption overrides.
+reports: {}                  # Default: no named reports.
+theme: {}                    # Default: built-in CSS variables.
+subsites: []                 # Default: no imported subsites.
+documentation: null         # Default: ordinary site rendering.
+strict: false                # Default: strict diagnostics not enabled.
+feed: null                   # Default: no RSS feed.
+explore: null                # Default: no browser data explorer.
+status_grid: null            # Default: no pond status grid.
+footer: null                 # Default: no custom footer text.
+header: null                 # Default: no header image.

@@ -60,11 +60,11 @@ See the [authoritative development manual](manual/reference/concepts.md#url-laye
 
 #### Hledger journal provider
 
-See the [authoritative development manual](manual/reference/formats/providers.md#hledger-journal).
+See the [Hledger component documentation](../crates/provider/src/format/hledger/documentation.md).
 
 #### Binary Excel (`xls`)
 
-See the [authoritative development manual](manual/reference/formats/providers.md#binary-excel).
+See the [Excel component documentation](../crates/provider/src/format/xls/documentation.md).
 
 #### Schema Discovery with `information_schema`
 
@@ -223,47 +223,47 @@ pond backup add origin s3://my-bucket \
 
 ### sql-derived-table
 
-See the [authoritative factory reference](manual/reference/factories/sql-derived-table.md).
+See the [authoritative factory reference](../crates/provider/src/factory/sql_derived/table/documentation.md).
 
 ### sql-derived-series
 
-See the [authoritative factory reference](manual/reference/factories/sql-derived-series.md).
+See the [authoritative factory reference](../crates/provider/src/factory/sql_derived/series/documentation.md).
 
 ### synthetic-timeseries
 
-See the [authoritative factory reference](manual/reference/factories/synthetic-timeseries.md).
+See the [authoritative factory reference](../crates/provider/src/factory/synthetic_timeseries/documentation.md).
 
 ### dynamic-dir
 
-See the [authoritative factory reference](manual/reference/factories/dynamic-dir.md).
+See the [authoritative factory reference](../crates/provider/src/factory/dynamic_dir/documentation.md).
 
 ### timeseries-join
 
-See the [authoritative factory reference](manual/reference/factories/timeseries-join.md).
+See the [authoritative factory reference](../crates/provider/src/factory/timeseries_join/documentation.md).
 
 ### timeseries-pivot
 
-See the [authoritative factory reference](manual/reference/factories/timeseries-pivot.md).
+See the [authoritative factory reference](../crates/provider/src/factory/timeseries_pivot/documentation.md).
 
 ### temporal-reduce
 
-See the [authoritative factory reference](manual/reference/factories/temporal-reduce.md).
+See the [authoritative factory reference](../crates/provider/src/factory/temporal_reduce/documentation.md).
 
 ### temporal-reduce-series
 
-See the [authoritative factory reference](manual/reference/factories/temporal-reduce-series.md).
+See the [authoritative factory reference](../crates/provider/src/factory/temporal_reduce/series/documentation.md).
 
 ### pump-state-series
 
-See the [authoritative factory reference](manual/reference/factories/pump-state-series.md).
+See the [authoritative factory reference](../crates/provider/src/factory/pump_state/documentation.md).
 
 ### sitegen
 
-See the [authoritative factory reference](manual/reference/factories/sitegen.md).
+See the [authoritative factory reference](../crates/sitegen/src/factory/documentation.md).
 
 ### column-rename
 
-See the [authoritative factory reference](manual/reference/factories/column-rename.md).
+See the [authoritative factory reference](../crates/provider/src/factory/column_rename/documentation.md).
 
 ### remote (REMOVED in D4)
 
@@ -271,15 +271,15 @@ Historical removed interface. Use current [backup/import operations](manual/guid
 
 ### hydrovu
 
-See the [authoritative factory reference](manual/reference/factories/hydrovu.md).
+See the [authoritative factory reference](../crates/hydrovu/src/factory/documentation.md).
 
 ### logfile-ingest
 
-See the [authoritative factory reference](manual/reference/factories/logfile-ingest.md).
+See the [authoritative factory reference](../crates/provider/src/factory/logfile_ingest/documentation.md).
 
 ### journal-ingest
 
-See the [authoritative factory reference](manual/reference/factories/journal-ingest.md).
+See the [authoritative factory reference](../crates/provider/src/factory/journal_ingest/documentation.md).
 
 ## Glob Patterns
 

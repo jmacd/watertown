@@ -1,0 +1,10 @@
+program: /usr/bin/sha256sum  # Required: example absolute executable path.
+inputs: [/data/input.txt]   # Required: example pond file, staged read-only.
+args: [data/input.txt]      # Example checksum argument; default is [].
+env: {}                    # Default: no extra environment variables.
+host_inputs: []            # Default: no files from the operator's -d root.
+outputs: []                # Default: no ordinary files committed back.
+series_outputs: []         # Default: no append-only output paths.
+network: false             # Default: network isolation.
+interactive: false         # Default: detached sandbox session.
+timeout_seconds: null      # Default: 60 seconds; unlimited if interactive=true.

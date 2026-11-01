@@ -1,0 +1,3 @@
+source: series:///derived/temperature  # Required: example queryable input.
+target: /stored/temperature            # Required: example physical output.
+time_column: timestamp                # Required: source event-time column.

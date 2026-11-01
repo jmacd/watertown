@@ -280,103 +280,115 @@
       "coverage": "validation-only"
     },
     "factory:column-rename": {
-      "path": "docs/manual/reference/factories/column-rename.md",
+      "path": "crates/provider/src/factory/column_rename/documentation.md",
       "components": [
         "factory:column-rename"
       ],
       "examples": [],
-      "coverage": "unverified"
+      "coverage": "unverified",
+      "output": "docs/manual/reference/factories/column-rename.md"
     },
     "factory:dynamic-dir": {
-      "path": "docs/manual/reference/factories/dynamic-dir.md",
+      "path": "crates/provider/src/factory/dynamic_dir/documentation.md",
       "components": [
         "factory:dynamic-dir"
       ],
       "examples": [],
-      "coverage": "unverified"
+      "coverage": "unverified",
+      "output": "docs/manual/reference/factories/dynamic-dir.md"
     },
     "factory:email-report": {
-      "path": "docs/manual/reference/factories/email-report.md",
+      "path": "crates/sitegen/src/email/documentation.md",
       "components": [
         "factory:email-report"
       ],
       "examples": [],
-      "coverage": "unverified"
+      "coverage": "unverified",
+      "output": "docs/manual/reference/factories/email-report.md"
     },
     "factory:exec": {
-      "path": "docs/manual/reference/factories/exec.md",
+      "path": "crates/exec-factory/src/factory/documentation.md",
       "components": [
         "factory:exec"
       ],
       "examples": [],
-      "coverage": "unverified"
+      "coverage": "unverified",
+      "output": "docs/manual/reference/factories/exec.md"
     },
     "factory:git-ingest": {
-      "path": "docs/manual/reference/factories/git-ingest.md",
+      "path": "crates/gitpond/src/factory/documentation.md",
       "components": [
         "factory:git-ingest"
       ],
       "examples": [],
-      "coverage": "unverified"
+      "coverage": "unverified",
+      "output": "docs/manual/reference/factories/git-ingest.md"
     },
     "factory:hydrovu": {
-      "path": "docs/manual/reference/factories/hydrovu.md",
+      "path": "crates/hydrovu/src/factory/documentation.md",
       "components": [
         "factory:hydrovu"
       ],
       "examples": [],
-      "coverage": "unverified"
+      "coverage": "unverified",
+      "output": "docs/manual/reference/factories/hydrovu.md"
     },
     "factory:journal-ingest": {
-      "path": "docs/manual/reference/factories/journal-ingest.md",
+      "path": "crates/provider/src/factory/journal_ingest/documentation.md",
       "components": [
         "factory:journal-ingest"
       ],
       "examples": [],
-      "coverage": "unverified"
+      "coverage": "unverified",
+      "output": "docs/manual/reference/factories/journal-ingest.md"
     },
     "factory:logfile-ingest": {
-      "path": "docs/manual/reference/factories/logfile-ingest.md",
+      "path": "crates/provider/src/factory/logfile_ingest/documentation.md",
       "components": [
         "factory:logfile-ingest"
       ],
       "examples": [],
-      "coverage": "unverified"
+      "coverage": "unverified",
+      "output": "docs/manual/reference/factories/logfile-ingest.md"
     },
     "factory:materialize-series": {
-      "path": "docs/manual/reference/factories/materialize-series.md",
+      "path": "crates/provider/src/factory/materialize_series/documentation.md",
       "components": [
         "factory:materialize-series"
       ],
       "examples": [],
-      "coverage": "unverified"
+      "coverage": "unverified",
+      "output": "docs/manual/reference/factories/materialize-series.md"
     },
     "factory:monitor-report": {
-      "path": "docs/manual/reference/factories/monitor-report.md",
+      "path": "crates/sitegen/src/monitor/documentation.md",
       "components": [
         "factory:monitor-report"
       ],
       "examples": [],
-      "coverage": "unverified"
+      "coverage": "unverified",
+      "output": "docs/manual/reference/factories/monitor-report.md"
     },
     "factory:pump-state-series": {
-      "path": "docs/manual/reference/factories/pump-state-series.md",
+      "path": "crates/provider/src/factory/pump_state/documentation.md",
       "components": [
         "factory:pump-state-series"
       ],
       "examples": [],
-      "coverage": "unverified"
+      "coverage": "unverified",
+      "output": "docs/manual/reference/factories/pump-state-series.md"
     },
     "factory:rate-limit": {
-      "path": "docs/manual/reference/factories/rate-limit.md",
+      "path": "crates/provider/src/factory/rate_limit/documentation.md",
       "components": [
         "factory:rate-limit"
       ],
       "examples": [],
-      "coverage": "unverified"
+      "coverage": "unverified",
+      "output": "docs/manual/reference/factories/rate-limit.md"
     },
     "factory:sitegen": {
-      "path": "docs/manual/reference/factories/sitegen.md",
+      "path": "crates/sitegen/src/factory/documentation.md",
       "components": [
         "factory:sitegen"
       ],
@@ -384,91 +396,156 @@
         "timeseries-site",
         "blog-rss"
       ],
-      "coverage": "validation-only"
+      "coverage": "validation-only",
+      "output": "docs/manual/reference/factories/sitegen.md"
     },
     "factory:sql-derived-series": {
-      "path": "docs/manual/reference/factories/sql-derived-series.md",
+      "path": "crates/provider/src/factory/sql_derived/series/documentation.md",
       "components": [
         "factory:sql-derived-series"
       ],
       "examples": [],
-      "coverage": "unverified"
+      "coverage": "unverified",
+      "output": "docs/manual/reference/factories/sql-derived-series.md"
     },
     "factory:sql-derived-table": {
-      "path": "docs/manual/reference/factories/sql-derived-table.md",
+      "path": "crates/provider/src/factory/sql_derived/table/documentation.md",
       "components": [
         "factory:sql-derived-table"
       ],
       "examples": [],
-      "coverage": "unverified"
+      "coverage": "unverified",
+      "output": "docs/manual/reference/factories/sql-derived-table.md"
     },
     "factory:storage-azure": {
-      "path": "docs/manual/reference/factories/storage-azure.md",
+      "path": "crates/provider/src/factory/storage_azure/documentation.md",
       "components": [
         "factory:storage-azure"
       ],
       "examples": [],
-      "coverage": "unverified"
+      "coverage": "unverified",
+      "output": "docs/manual/reference/factories/storage-azure.md"
     },
     "factory:storage-minio": {
-      "path": "docs/manual/reference/factories/storage-minio.md",
+      "path": "crates/provider/src/factory/storage_minio/documentation.md",
       "components": [
         "factory:storage-minio"
       ],
       "examples": [],
-      "coverage": "unverified"
+      "coverage": "unverified",
+      "output": "docs/manual/reference/factories/storage-minio.md"
     },
     "factory:synthetic-timeseries": {
-      "path": "docs/manual/reference/factories/synthetic-timeseries.md",
+      "path": "crates/provider/src/factory/synthetic_timeseries/documentation.md",
       "components": [
         "factory:synthetic-timeseries"
       ],
       "examples": [
         "synthetic-timeseries"
       ],
-      "coverage": "offline-e2e"
+      "coverage": "offline-e2e",
+      "output": "docs/manual/reference/factories/synthetic-timeseries.md"
     },
     "factory:temporal-reduce": {
-      "path": "docs/manual/reference/factories/temporal-reduce.md",
+      "path": "crates/provider/src/factory/temporal_reduce/documentation.md",
       "components": [
         "factory:temporal-reduce"
       ],
       "examples": [],
-      "coverage": "unverified"
+      "coverage": "unverified",
+      "output": "docs/manual/reference/factories/temporal-reduce.md"
     },
     "factory:temporal-reduce-series": {
-      "path": "docs/manual/reference/factories/temporal-reduce-series.md",
+      "path": "crates/provider/src/factory/temporal_reduce/series/documentation.md",
       "components": [
         "factory:temporal-reduce-series"
       ],
       "examples": [],
-      "coverage": "unverified"
+      "coverage": "unverified",
+      "output": "docs/manual/reference/factories/temporal-reduce-series.md"
     },
     "factory:timeseries-join": {
-      "path": "docs/manual/reference/factories/timeseries-join.md",
+      "path": "crates/provider/src/factory/timeseries_join/documentation.md",
       "components": [
         "factory:timeseries-join"
       ],
       "examples": [],
-      "coverage": "unverified"
+      "coverage": "unverified",
+      "output": "docs/manual/reference/factories/timeseries-join.md"
     },
     "factory:timeseries-pivot": {
-      "path": "docs/manual/reference/factories/timeseries-pivot.md",
+      "path": "crates/provider/src/factory/timeseries_pivot/documentation.md",
       "components": [
         "factory:timeseries-pivot"
       ],
       "examples": [],
-      "coverage": "unverified"
+      "coverage": "unverified",
+      "output": "docs/manual/reference/factories/timeseries-pivot.md"
     },
     "format:csv": {
-      "path": "docs/manual/reference/formats/csv.md",
+      "path": "crates/provider/src/format/csv/documentation.md",
       "components": [
         "format:csv"
       ],
       "examples": [
         "csv-query"
       ],
-      "coverage": "offline-e2e"
+      "coverage": "offline-e2e",
+      "output": "docs/manual/reference/formats/csv.md"
+    },
+    "format:excelhtml": {
+      "path": "crates/provider/src/format/excelhtml/documentation.md",
+      "components": [
+        "format:excelhtml"
+      ],
+      "examples": [],
+      "coverage": "unverified",
+      "output": "docs/manual/reference/formats/excelhtml.md"
+    },
+    "format:hledger": {
+      "path": "crates/provider/src/format/hledger/documentation.md",
+      "components": [
+        "format:hledger"
+      ],
+      "examples": [],
+      "coverage": "unverified",
+      "output": "docs/manual/reference/formats/hledger.md"
+    },
+    "format:jsonlogs": {
+      "path": "crates/provider/src/format/jsonlogs/documentation.md",
+      "components": [
+        "format:jsonlogs"
+      ],
+      "examples": [],
+      "coverage": "unverified",
+      "output": "docs/manual/reference/formats/jsonlogs.md"
+    },
+    "format:oteljson": {
+      "path": "crates/provider/src/format/oteljson/documentation.md",
+      "components": [
+        "format:oteljson"
+      ],
+      "examples": [],
+      "coverage": "unverified",
+      "output": "docs/manual/reference/formats/oteljson.md"
+    },
+    "format:weblog": {
+      "path": "crates/provider/src/format/weblog/documentation.md",
+      "components": [
+        "format:weblog"
+      ],
+      "examples": [],
+      "coverage": "unverified",
+      "output": "docs/manual/reference/formats/weblog.md"
+    },
+    "format:xls": {
+      "path": "crates/provider/src/format/xls/documentation.md",
+      "components": [
+        "format:xls"
+      ],
+      "examples": [],
+      "coverage": "unverified",
+      "output": "docs/manual/reference/formats/xls.md"
     },
     "guide:blog": {
       "path": "docs/manual/guides/blog.md",
@@ -602,14 +679,7 @@
     },
     "reference:formats": {
       "path": "docs/manual/reference/formats/providers.md",
-      "components": [
-        "format:excelhtml",
-        "format:hledger",
-        "format:jsonlogs",
-        "format:oteljson",
-        "format:weblog",
-        "format:xls"
-      ],
+      "components": [],
       "examples": [],
       "coverage": "unverified"
     },

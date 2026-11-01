@@ -1,0 +1,10 @@
+client_id: "${env:HYDROVU_CLIENT_ID}"          # Required: credential reference.
+client_secret: "${env:HYDROVU_CLIENT_SECRET}"  # Required: secret reference.
+max_points_per_run: 1000                     # Required: example collection limit.
+hydrovu_path: /hydrovu                       # Required: example output path.
+archive_path: null                          # Default: no read-only seed archive.
+devices:                                   # Required: devices to collect.
+  - name: example-device                    # Required: example local name.
+    id: 123                                 # Required: replace with a real device ID.
+    active: true                            # Default: collect this device.
+    comment: null                           # Default: no operator comment.

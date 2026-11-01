@@ -1,0 +1,14 @@
+pond: /path/to/pond                 # Required: example pond to inspect.
+title: Example monitor             # Required: report heading.
+output_dir: /path/to/report         # Required: example artifact destination.
+checks:                            # Required: example with one complete check.
+  - type: stale-after              # Select the staleness-check variant.
+    id: temperature-freshness      # Required: unique check identifier.
+    label: Temperature freshness   # Required: short display label.
+    description: Sensor reporting  # Required: explanation for the report.
+    href: /temperature.html        # Required: example detail-page link.
+    source: series:///sensors/temperature  # Required: example input URL.
+    value_column: temperature      # Required: source measurement column.
+    timestamp_column: timestamp    # Default: event-time column.
+    unit: ""                       # Default: no display-unit suffix.
+    window: 1h                     # Required: example freshness window.

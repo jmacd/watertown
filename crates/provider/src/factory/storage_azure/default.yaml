@@ -1,0 +1,14 @@
+account_name: exampleaccount                # Required: replace with your account.
+account_key: "${env:AZURE_STORAGE_KEY}"      # Example: select account-key auth.
+sas_token: null                             # Default: no SAS credential.
+service_principal: null                     # Default: no application credential.
+timeout: null                               # Default: object_store client timeout.
+
+# Choose exactly one credential variant.
+# For SAS auth, set account_key to null and sas_token to "${env:AZURE_STORAGE_SAS}".
+# For application auth, keep both scalar credentials null and replace
+# service_principal: null with:
+# service_principal:
+#   tenant_id: "${env:AZURE_TENANT_ID}"          # Required.
+#   client_id: "${env:AZURE_CLIENT_ID}"          # Required.
+#   client_secret: "${env:AZURE_CLIENT_SECRET}"  # Required.
