@@ -46,6 +46,33 @@ class DriftTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "removed compiled"):
             checker.validate(self.catalog, self.metadata)
 
+    def test_formats_cannot_regress_to_a_grouped_authority_page(self):
+        self.catalog["pages"]["format:csv"]["components"].append("format:hledger")
+        self.catalog["pages"]["format:hledger"]["components"] = []
+        with self.assertRaisesRegex(ValueError, "individual authoritative pages"):
+            checker.validate(self.catalog, self.metadata)
+
+    def test_factory_requires_its_yaml_file_and_source_include(self):
+        component = "factory:git-ingest"
+        page = self.catalog["pages"][component]
+        self.catalog["pages"] = {component: page}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / page["path"]
+            target.parent.mkdir(parents=True)
+            text = (ROOT / page["path"]).read_text()
+            target.write_text(text)
+            with self.assertRaisesRegex(ValueError, "missing /docs/examples/git-ingest/default.yaml"):
+                checker.validate(self.catalog, self.metadata, root=root)
+            example = root / "docs/examples/git-ingest/default.yaml"
+            example.parent.mkdir(parents=True)
+            example.write_text((ROOT / example.relative_to(root)).read_text())
+            target.write_text(text.replace(
+                '{{ source path="/docs/examples/git-ingest/default.yaml" language="yaml" /}}',
+                "```yaml\nurl: duplicated-example\n```"))
+            with self.assertRaisesRegex(ValueError, "must include its authoritative default.yaml"):
+                checker.validate(self.catalog, self.metadata, root=root)
+
     def test_mechanical_reference_tracks_flag_defaults(self):
         changed = copy.deepcopy(self.metadata)
         argument = next(arg for arg in changed["cli"]["cli:maintain"]["arguments"] if arg["long"] == "collapse-versions")
@@ -78,8 +105,27 @@ class DriftTests(unittest.TestCase):
         }, "Nested configuration")
         self.assertIn("any JSON value", rendered)
         self.assertIn("minimum=1", rendered)
-        self.assertIn("variant 1", rendered)
+        self.assertIn('#### type: "example"', rendered)
+        self.assertIn("requirements also apply", rendered)
         self.assertIn("example", rendered)
+
+    def test_configuration_reference_uses_reader_facing_names(self):
+        rendered = generator.reference("factory:column-rename", self.metadata)
+        self.assertIn("#### Direct column name mapping", rendered)
+        self.assertIn("#### Regex pattern-based renaming", rendered)
+        self.assertIn("array of Rename Rule", rendered)
+        self.assertIn('| `type` | "pattern"', rendered)
+        self.assertIn("| `replacement` |", rendered)
+        for internal in ("variant 1", "variant 2", "ColumnRenameConfig",
+                         "Unknown fields:", "Capability", "post-commit",
+                         "deserialization", "Example: yaml"):
+            self.assertNotIn(internal, rendered)
+
+    def test_reference_alternatives_do_not_duplicate_their_definitions(self):
+        rendered = generator.reference("factory:monitor-report", self.metadata)
+        self.assertIn("- Rate While Check", rendered)
+        self.assertEqual(rendered.count("### Rate While Check\n"), 1)
+        self.assertNotIn("variant ", rendered)
 
 
 if __name__ == "__main__":

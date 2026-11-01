@@ -2,20 +2,7 @@
 
 ## Full configuration
 
-Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
-
-| Capability | Registered |
-|---|---|
-| directory | no |
-| file | no |
-| initialize | yes |
-| execute | yes |
-| table transform | no |
-| raw validation | no |
-
-Automatic post-commit access: `ReadWrite`.
-
-### EmailReportConfig
+### Settings
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
@@ -28,5 +15,3 @@ Automatic post-commit access: `ReadWrite`.
 | `sitegen` | string | yes | not specified |  |
 | `subject` | string | yes | not specified |  |
 | `timeout` | string &#124; null | no | null |  |
-
-Unknown fields: **rejected**.

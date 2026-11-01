@@ -2,31 +2,14 @@
 
 ## Full configuration
 
-Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
-
-| Capability | Registered |
-|---|---|
-| directory | no |
-| file | yes |
-| initialize | no |
-| execute | no |
-| table transform | no |
-| raw validation | no |
-
-Automatic post-commit access: `not registered`.
-
-### TimeseriesJoinConfig
-
-Configuration for the timeseries-join factory
+### Settings
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
-| `inputs` | array of TimeseriesInput | yes | not specified | List of input sources with patterns and optional time ranges |
+| `inputs` | array of Timeseries Input | yes | not specified | List of input sources with patterns and optional time ranges |
 | `time_column` | string | no | "timestamp" | Name of the timestamp column (defaults to "timestamp") |
 
-Unknown fields: **rejected**.
-
-### TimeRange
+### Time Range
 
 Time range bounds for filtering
 
@@ -35,21 +18,17 @@ Time range bounds for filtering
 | `begin` | string &#124; null | no | not specified | Optional start time (ISO 8601 format) |
 | `end` | string &#124; null | no | not specified | Optional end time (ISO 8601 format) |
 
-Unknown fields: **rejected**.
-
-### TimeseriesInput
+### Timeseries Input
 
 Input source with URL pattern and optional time range
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
-| `pattern` | WatertownUrl | yes | not specified | URL pattern for matching time series files  Supported URL schemes: - series:///pattern - Builtin TinyFS FileSeries (Parquet) - series+gzip:///pattern - Compressed FileSeries - csv:///pattern - CSV files (requires format conversion) - csv+gzip:///pattern?delimiter=; - CSV with decompression and options - excelhtml:///pattern - HydroVu HTML exports  Example: series:///data/sensors/*.series |
-| `range` | TimeRange &#124; null | no | not specified | Optional time range filter for this specific input |
+| `pattern` | Watertown Url | yes | not specified | URL pattern for matching time series files  Supported URL schemes: - series:///pattern - Builtin TinyFS FileSeries (Parquet) - series+gzip:///pattern - Compressed FileSeries - csv:///pattern - CSV files (requires format conversion) - csv+gzip:///pattern?delimiter=; - CSV with decompression and options - excelhtml:///pattern - HydroVu HTML exports  Example: series:///data/sensors/*.series |
+| `range` | Time Range &#124; null | no | not specified | Optional time range filter for this specific input |
 | `scope` | string &#124; null | no | not specified | Optional scope prefix to add to all column names (e.g., "temperature" -&gt; "BDock.temperature") |
 | `transforms` | array &#124; null | no | not specified | Optional list of table transform factory paths to apply to this input's TableProvider. Transforms are applied in order before scope prefixes and SQL execution. Each transform is a path like "/etc/hydro_rename" |
 
-Unknown fields: **rejected**.
-
-### WatertownUrl
+### Watertown Url
 
 Accepted value: string.

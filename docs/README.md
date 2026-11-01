@@ -17,6 +17,28 @@ not need vendor downloads.
 
 ## Fast prose workflow
 
+Each factory has one editable page at `docs/manual/reference/factories/NAME.md`;
+each format provider has one at `docs/manual/reference/formats/NAME.md`. Start
+there to edit the component's overview, annotated example, usage, and limits.
+Factory pages show YAML; format pages show URLs, not invented YAML interfaces.
+
+Edit `docs/examples/NAME/default.yaml` for a factory's annotated configuration.
+The Markdown page includes that exact file with a `source` shortcode as an
+always-visible code block. Do not add download links, collapse the example,
+or duplicate its YAML in Markdown.
+Each file contains a complete configuration for the illustrated variant:
+all top-level fields are present, optional defaults are explicit, and example
+inputs or overrides are labeled in comments. For optional features, `null`,
+`[]`, or `{}` can be the actual default, not an unfinished placeholder.
+Explain runtime-derived defaults and mutually exclusive alternatives in the
+YAML comments. Do not replace credential references with literal secrets.
+
+Prose and these annotated YAML files are hand-authored. Regeneration changes
+only the `docs:reference` blocks below the included examples, never the prose
+or `default.yaml` files. URL-based formats keep their URL examples in Markdown.
+Runnable fixtures remain separately included from `testsuite/examples/`;
+an illustrative configuration is not a claim of live-service execution.
+
 ```bash
 make docs-build
 make docs-serve POND_BIN=/absolute/path/to/pond
@@ -72,6 +94,13 @@ semantic constraints, side effects, prerequisites, and effective runtime
 defaults still need authored explanation. The renderer never generates
 reference or executes code fences.
 
+The public reference omits registry bookkeeping and repeated schema warnings.
+Section names use readable words rather than Rust type identifiers; alternative
+configurations use their schema title or the opening sentence of their Rust
+documentation. Only the opening paragraph is used as a section summary; keep
+complete examples in `default.yaml` and longer explanations in the component
+Markdown. The exported inventory retains the complete developer metadata.
+
 `docs-check` rejects stale output, missing/removed compiled interfaces,
 invalid page/example mappings, and regression of completed reference coverage.
 `DOCS_BASE_REF` optionally checks against a Git base revision. Migration pending
@@ -84,6 +113,12 @@ Typed-contract tests:
 ```bash
 cargo test --locked -p cmd --features documentation --lib documentation::tests
 ```
+
+These also parse every factory's `default.yaml`, check it against the compiled
+schema, and ensure it includes every top-level field. Changing a factory's
+fields therefore requires updating its authored YAML file, not just
+regenerating the reference. `docs-check` requires each factory page to include
+its own YAML file.
 
 ## Executable examples
 

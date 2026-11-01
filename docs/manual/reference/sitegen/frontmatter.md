@@ -12,11 +12,7 @@ tolerated, but unknown layouts fail strict builds.
 <!-- docs:reference sitegen:frontmatter -->
 ## Full configuration
 
-Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
-
-### Frontmatter
-
-Frontmatter parsed from the top of each markdown page.
+### Settings
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
@@ -29,8 +25,6 @@ Frontmatter parsed from the top of each markdown page.
 | `summary` | string &#124; null | no | null | Short summary for blog card display. |
 | `title` | string | no | "" |  |
 | `weight` | integer | no | 100 | Sort weight for content pages (lower = higher in nav). Default: 100 Constraints: format="int32". |
-
-Unknown fields: not rejected by this shape; see runtime notes.
 <!-- docs:end-reference -->
 
 In ordinary sites the default layout is `default`; documentation mode selects

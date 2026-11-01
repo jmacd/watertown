@@ -118,6 +118,36 @@ mod tests {
     }
 
     #[test]
+    fn factory_default_yaml_files_are_complete_and_schema_valid() {
+        let metadata = inventory();
+        let catalog: Value =
+            serde_json::from_str(include_str!("../../../docs/documentation-inventory.json"))
+                .unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples");
+        for id in catalog["public"]["factory"]["ids"].as_array().unwrap() {
+            let id = id.as_str().unwrap();
+            let name = id.strip_prefix("factory:").unwrap();
+            let example = std::fs::read_to_string(root.join(name).join("default.yaml"))
+                .unwrap_or_else(|error| panic!("{id}: cannot read default.yaml: {error}"));
+            let value: Value = serde_yaml::from_str(&example)
+                .unwrap_or_else(|error| panic!("{id}: invalid example YAML: {error}"));
+            let schema = &metadata["schemas"][id];
+            let validator = jsonschema::validator_for(schema).unwrap();
+            let errors: Vec<_> = validator
+                .iter_errors(&value)
+                .map(|e| e.to_string())
+                .collect();
+            assert!(errors.is_empty(), "{id}: {errors:?}");
+            for field in schema["properties"].as_object().unwrap().keys() {
+                assert!(
+                    value.get(field).is_some(),
+                    "{id}: default.yaml omits {field}; show its default or an annotated example value"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn deserialization_schemas_preserve_tags_defaults_and_unknown_field_rules() {
         use provider::factory::synthetic_timeseries::SyntheticTimeseriesConfig;
         let value = json!({

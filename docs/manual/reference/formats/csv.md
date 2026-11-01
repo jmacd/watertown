@@ -10,7 +10,20 @@ SQL. It is a URL format provider, not a factory with a YAML configuration.
 For pond files use `csv:///path.csv`; for host files use
 `host+csv:///path.csv`, optionally rooted with `-d DIRECTORY`.
 
-## Example
+## URL example
+
+```bash
+# Replace the example host path with a CSV file.
+# All non-null defaults are explicit: comma (%2C), double quote (%22),
+# header row, 8192-row batches, and 100 records for type inference.
+# escape has no default character: omit it, rather than write escape=null.
+pond cat 'host+csv:///tmp/readings.csv?delimiter=%2C&quote=%22&has_header=true&batch_size=8192&schema_infer_max_records=100' --format=table
+```
+
+For an explicit backslash escape character, add `&escape=%5C`. That is an
+example override, not the default. For pond files, remove the `host+` layer.
+
+## Runnable example
 
 Prerequisites: Bash and `pond` on `PATH`. No pond, credentials, or service is
 required. `SOURCE_DIR` and `WORK` are initialized by the complete script below.
@@ -40,11 +53,7 @@ characters.
 <!-- docs:reference format:csv -->
 ## Full configuration
 
-Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
-
-### CsvOptions
-
-CSV format options parsed from query parameters  Based on arrow_csv::reader::Format and ReaderBuilder options. All fields have sensible defaults matching arrow_csv defaults.  # URL Examples  - csv:///data/file.csv - Default settings (comma delimiter, has header) - csv:///data/file.csv?delimiter=; - Semicolon delimiter - csv:///data/file.csv?delimiter=;&amp;has_header=false - No header row - csv:///data/file.csv?batch_size=16384 - Larger batch size
+### Settings
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
@@ -54,8 +63,6 @@ CSV format options parsed from query parameters  Based on arrow_csv::reader::For
 | `has_header` | boolean | no | true | Whether the file has a header row (default: true) |
 | `quote` | string | no | "\"" | Quote character (default: '"') Constraints: minLength=1; maxLength=1. |
 | `schema_infer_max_records` | integer | no | 100 | Number of rows to sample for schema inference (default: 100) Constraints: format="uint"; minimum=0. |
-
-Unknown fields: not rejected by this shape; see runtime notes.
 <!-- docs:end-reference -->
 
 Use positive batch/inference sizes. Unknown options are ignored. **Current

@@ -2,9 +2,7 @@
 
 ## Full configuration
 
-Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
-
-### XlsOptions
+### Settings
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
@@ -13,5 +11,3 @@ Generated from the Rust **deserialization** contract. This describes shape, not 
 | `header_row` | integer &#124; null | no | null | Constraints: format="uint"; minimum=0. |
 | `sheet` | string &#124; null | no | null |  |
 | `table` | string &#124; null | no | null |  |
-
-Unknown fields: **rejected**.

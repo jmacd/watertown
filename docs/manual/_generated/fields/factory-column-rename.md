@@ -2,36 +2,19 @@
 
 ## Full configuration
 
-Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
-
-| Capability | Registered |
-|---|---|
-| directory | no |
-| file | no |
-| initialize | no |
-| execute | no |
-| table transform | yes |
-| raw validation | no |
-
-Automatic post-commit access: `not registered`.
-
-### ColumnRenameConfig
-
-Configuration for column rename transformation
+### Settings
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
-| `rules` | array of RenameRule | yes | not specified | List of rename rules applied in order |
+| `rules` | array of Rename Rule | yes | not specified | List of rename rules applied in order |
 
-Unknown fields: **rejected**.
-
-### RenameRule
+### Rename Rule
 
 A single column rename rule
 
-### RenameRule variant 1
+Choose one of the following:
 
-Direct column name mapping  Example: yaml - type: direct   from: "DateTime"   to: "timestamp"   cast: "timestamp"
+#### Direct column name mapping
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
@@ -40,16 +23,10 @@ Direct column name mapping  Example: yaml - type: direct   from: "DateTime"   to
 | `to` | string | yes | not specified |  |
 | `type` | "direct" | yes | not specified |  |
 
-Unknown fields: **rejected**.
-
-### RenameRule variant 2
-
-Regex pattern-based renaming  Example: yaml - type: pattern   pattern: "^(.+) \\((.+)\\)$"   replacement: "$1.$2"  This transforms "Temperature (C)" -&gt; "Temperature.C"
+#### Regex pattern-based renaming
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
 | `pattern` | string | yes | not specified |  |
 | `replacement` | string | yes | not specified |  |
 | `type` | "pattern" | yes | not specified |  |
-
-Unknown fields: **rejected**.

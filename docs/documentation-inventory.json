@@ -470,6 +470,54 @@
       ],
       "coverage": "offline-e2e"
     },
+    "format:excelhtml": {
+      "path": "docs/manual/reference/formats/excelhtml.md",
+      "components": [
+        "format:excelhtml"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "format:hledger": {
+      "path": "docs/manual/reference/formats/hledger.md",
+      "components": [
+        "format:hledger"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "format:jsonlogs": {
+      "path": "docs/manual/reference/formats/jsonlogs.md",
+      "components": [
+        "format:jsonlogs"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "format:oteljson": {
+      "path": "docs/manual/reference/formats/oteljson.md",
+      "components": [
+        "format:oteljson"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "format:weblog": {
+      "path": "docs/manual/reference/formats/weblog.md",
+      "components": [
+        "format:weblog"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
+    "format:xls": {
+      "path": "docs/manual/reference/formats/xls.md",
+      "components": [
+        "format:xls"
+      ],
+      "examples": [],
+      "coverage": "unverified"
+    },
     "guide:blog": {
       "path": "docs/manual/guides/blog.md",
       "components": [],
@@ -602,14 +650,7 @@
     },
     "reference:formats": {
       "path": "docs/manual/reference/formats/providers.md",
-      "components": [
-        "format:excelhtml",
-        "format:hledger",
-        "format:jsonlogs",
-        "format:oteljson",
-        "format:weblog",
-        "format:xls"
-      ],
+      "components": [],
       "examples": [],
       "coverage": "unverified"
     },

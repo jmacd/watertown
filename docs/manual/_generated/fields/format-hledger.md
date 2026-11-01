@@ -2,12 +2,8 @@
 
 ## Full configuration
 
-Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
-
-### Options
+### Settings
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
 | `batch_size` | integer | no | 8192 | Constraints: format="uint"; minimum=0. |
-
-Unknown fields: **rejected**.

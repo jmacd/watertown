@@ -11,12 +11,7 @@ doc_id: factory:storage-minio
 
 ## Example configuration
 
-```yaml
-endpoint: http://127.0.0.1:9000
-access_key_id: "${env:MINIO_ACCESS_KEY}"
-secret_access_key: "${env:MINIO_SECRET_KEY}"
-region: us-east-1
-```
+{{ source path="/docs/examples/storage-minio/default.yaml" language="yaml" /}}
 
 ## Use and behavior
 
@@ -27,22 +22,7 @@ The CLI add command has no `--storage` flag. Raw credentials must remain `${env:
 <!-- docs:reference factory:storage-minio -->
 ## Full configuration
 
-Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
-
-| Capability | Registered |
-|---|---|
-| directory | no |
-| file | yes |
-| initialize | no |
-| execute | no |
-| table transform | no |
-| raw validation | yes |
-
-Automatic post-commit access: `not registered`.
-
-### StorageMinioConfig
-
-On-disk config for a storage-minio node.
+### Settings
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
@@ -50,10 +30,4 @@ On-disk config for a storage-minio node.
 | `endpoint` | string | yes | not specified | MinIO endpoint URL, e.g. http://watershop:9000.  Required: a MinIO without an endpoint is not a MinIO. |
 | `region` | string &#124; null | no | not specified | Region used for SigV4 signing.  Defaults to [DEFAULT_REGION], which [render] makes explicit so pond cat shows what is in effect. |
 | `secret_access_key` | string | yes | not specified | Secret access key.  Must be an ${env:...} reference (Decision A1). |
-
-Unknown fields: **rejected**.
 <!-- docs:end-reference -->
-
-## Evidence and limitations
-
-The sample is configuration guidance, not a claimed runnable documentation fixture. The generated schema is the deserialization contract; semantic validation, source data, platform support, credentials, and external side effects still apply. Keep original source data independently recoverable.

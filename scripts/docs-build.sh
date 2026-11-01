@@ -22,7 +22,7 @@ mkdir -p "$(dirname "${OUTPUT}")"
 SOURCE="$(cd "${SOURCE}" && pwd)"
 OUTPUT="$(cd "$(dirname "${OUTPUT}")" && pwd)/$(basename "${OUTPUT}")"
 case "${OUTPUT}/" in
-    "${SOURCE}/"|"${SOURCE}/docs/"|"${SOURCE}/docs/manual/"*|"${SOURCE}/docs/templates/"*|"${SOURCE}/testsuite/"*)
+    "${SOURCE}/"|"${SOURCE}/docs/"|"${SOURCE}/docs/manual/"*|"${SOURCE}/docs/templates/"*|"${SOURCE}/docs/examples/"*|"${SOURCE}/testsuite/"*)
         echo "Documentation output must not replace selected source inputs: ${OUTPUT}" >&2
         exit 1
         ;;

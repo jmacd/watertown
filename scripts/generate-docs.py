@@ -23,11 +23,17 @@ def cell(value):
     ).replace("{{", "&#123;&#123;").strip()
 
 
+def display_name(name):
+    name = re.sub(r"(Config|Options)$", "", name) or "Configuration"
+    name = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", name)
+    return re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", name).replace("_", " ").replace("-", " ")
+
+
 def type_name(schema):
     if isinstance(schema, bool):
         return "any JSON value" if schema else "no accepted value"
     if "$ref" in schema:
-        return schema["$ref"].rsplit("/", 1)[-1]
+        return display_name(schema["$ref"].rsplit("/", 1)[-1])
     if "const" in schema:
         return json.dumps(schema["const"])
     if "enum" in schema:
@@ -45,12 +51,27 @@ def type_name(schema):
     return kind
 
 
-def fields(schema, title):
-    text = [f"### {title}\n"]
+def variant_title(schema):
+    if isinstance(schema, dict):
+        if schema.get("title"):
+            return display_name(schema["title"])
+        if schema.get("description"):
+            summary = schema["description"].split("\n\n", 1)[0]
+            return cell(summary.split(". ", 1)[0].split(": ", 1)[0].rstrip("."))
+        for name, value in schema.get("properties", {}).items():
+            if isinstance(value, dict) and "const" in value:
+                return f"{name}: {cell(json.dumps(value['const']))}"
+    return cell(type_name(schema))
+
+
+def fields(schema, title, level=3, describe=True):
+    text = [f"{'#' * level} {title}\n"]
     if isinstance(schema, bool):
         return text[0] + type_name(schema) + ".\n"
-    if schema.get("description"):
-        text.append(cell(schema["description"]) + "\n")
+    if describe and schema.get("description"):
+        summary = cell(schema["description"].split("\n\n", 1)[0])
+        if summary.rstrip(".") != title:
+            text.append(summary + "\n")
     if "properties" in schema:
         required = schema.get("required", [])
         text.append("| Field | Accepted type | Required | Default | Description |\n"
@@ -65,11 +86,16 @@ def fields(schema, title):
                           if key in value]
                 description += (" Constraints: " + "; ".join(limits) + ".") if limits else ""
             text.append(f"| `{name}` | {cell(type_name(value))} | {'yes' if name in required else 'no'} | {cell(default)} | {cell(description)} |")
-        text.append("\nUnknown fields: **rejected**.\n" if schema.get("additionalProperties") is False
-                    else "\nUnknown fields: not rejected by this shape; see runtime notes.\n")
+        text.append("")
     if any(key in schema for key in ("anyOf", "oneOf", "allOf")):
-        for index, variant in enumerate(schema.get("anyOf", schema.get("oneOf", schema.get("allOf", [])))):
-            text.append(fields(variant, f"{title} variant {index + 1}"))
+        kind = next(key for key in ("anyOf", "oneOf", "allOf") if key in schema)
+        text.append("Choose one of the following:\n" if kind != "allOf"
+                    else "The following requirements also apply:\n")
+        for variant in schema[kind]:
+            if isinstance(variant, dict) and "$ref" in variant:
+                text.append(f"- {cell(type_name(variant))}")
+            else:
+                text.append(fields(variant, variant_title(variant), level + 1))
     elif "properties" not in schema:
         text.append(f"Accepted value: {cell(type_name(schema))}.\n")
     return "\n".join(text)
@@ -109,20 +135,12 @@ def reference(component, metadata):
             text.append(f"| {cell(', '.join(names))} | {cell(values)} | {'yes' if arg['required'] else 'no'} | {cell(defaults)} | {cell(description)} |")
         text.append("\nGlobal options are documented in [Global options](global-options.md).\n")
         return "\n".join(text)
-    text = ["## Full configuration\n",
-            "Generated from the Rust **deserialization** contract. This describes shape, "
-            "not all semantic validation, service prerequisites, or successful execution.\n"]
-    if component in metadata.get("factories", {}):
-        factory = metadata["factories"][component]
-        text.append("| Capability | Registered |\n|---|---|")
-        for key in ["directory", "file", "initialize", "execute", "table_transform", "raw_validation"]:
-            text.append(f"| {key.replace('_', ' ')} | {'yes' if factory[key] else 'no'} |")
-        text.append(f"\nAutomatic post-commit access: `{factory['post_commit_access'] or 'not registered'}`.\n")
+    text = ["## Full configuration\n"]
     schema = metadata.get("schemas", {}).get(component)
     if schema is not None:
-        text.append(fields(schema, schema.get("title", "Configuration")))
+        text.append(fields(schema, "Settings", describe=False))
         for name, definition in sorted(schema.get("$defs", {}).items()):
-            text.append(fields(definition, name))
+            text.append(fields(definition, display_name(name)))
     return "\n".join(text)
 
 

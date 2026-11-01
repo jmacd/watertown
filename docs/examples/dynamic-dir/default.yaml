@@ -1,0 +1,10 @@
+entries:                             # Required: child definitions.
+  - name: readings                   # Required: example child name.
+    factory: sql-derived-series      # Required: registered child factory.
+    config:                          # Required: that factory's configuration.
+      patterns:                      # Default: {}; supply an example input.
+        source: series:///sensors/*
+      query: null                    # Default: SELECT * FROM source.
+      transforms: null               # Default: no input transforms.
+      locality:
+        type: global                 # Default: conservative query locality.

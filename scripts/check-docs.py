@@ -38,6 +38,16 @@ def validate(catalog, metadata, root=ROOT, previous=None):
         require(page["coverage"] in catalog["metadata_contract"]["coverage_levels"], page_id)
         for component in page["components"]:
             require(component in public, f"{page_id}: unknown component {component}")
+            if component.startswith(("factory:", "format:")):
+                require(len(page["components"]) == 1,
+                        f"{component}: factories and formats need individual authoritative pages")
+            if component.startswith("factory:"):
+                name = component.removeprefix("factory:")
+                example = f"/docs/examples/{name}/default.yaml"
+                require((root / example.lstrip("/")).is_file(),
+                        f"{component}: missing {example}")
+                require(f'{{{{ source path="{example}" language="yaml" /}}}}' in text,
+                        f"{component}: page must include its authoritative default.yaml")
             require(component not in completed, f"{component}: duplicate authoritative mapping")
             completed.add(component)
             if component in metadata.get("schemas", {}):

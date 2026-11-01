@@ -2,30 +2,13 @@
 
 ## Full configuration
 
-Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
-
-| Capability | Registered |
-|---|---|
-| directory | yes |
-| file | no |
-| initialize | no |
-| execute | no |
-| table transform | no |
-| raw validation | no |
-
-Automatic post-commit access: `not registered`.
-
-### DynamicDirConfig
-
-Configuration for the dynamic directory
+### Settings
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
-| `entries` | array of DynamicDirEntry | yes | not specified | List of directory entries to create |
+| `entries` | array of Dynamic Dir Entry | yes | not specified | List of directory entries to create |
 
-Unknown fields: **rejected**.
-
-### DynamicDirEntry
+### Dynamic Dir Entry
 
 Configuration for a single directory entry
 
@@ -34,5 +17,3 @@ Configuration for a single directory entry
 | `config` | any JSON value | yes | not specified | Configuration for the specific factory (as raw Value for flexibility) |
 | `factory` | string | yes | not specified | Factory type to use for creating this entry |
 | `name` | string | yes | not specified | Name of the entry in the directory |
-
-Unknown fields: **rejected**.

@@ -1,0 +1,10 @@
+time_column: timestamp                       # Default: join on this column.
+inputs:                                     # Required: at least two inputs.
+  - pattern: series:///sensors/temperature    # Required: example input.
+    scope: air                              # Example column prefix; default null.
+    range: null                             # Default: no time bounds.
+    transforms: null                        # Default: no input transforms.
+  - pattern: series:///sensors/humidity       # Required: example second input.
+    scope: weather                          # Example column prefix; default null.
+    range: null                             # Default: no time bounds.
+    transforms: null                        # Default: no input transforms.

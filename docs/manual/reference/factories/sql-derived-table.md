@@ -11,13 +11,13 @@ doc_id: factory:sql-derived-table
 
 ## Example configuration
 
-```yaml
-patterns:
-  readings: table:///sensors/readings
-query: SELECT * FROM readings
-locality:
-  type: global
-```
+{{ source path="/docs/examples/sql-derived-table/default.yaml" language="yaml" /}}
+
+All fields have omission behavior, but an empty `patterns` map does not make
+the default query useful: it needs an input named `source`. Set `query` to your
+own SQL to select, filter, or calculate columns. For the restricted local
+variant, replace `locality` with `{type: timestamp-local, event_time: timestamp}`;
+the event-time field is required for that variant.
 
 ## Use and behavior
 
@@ -28,37 +28,22 @@ Table inputs reject multi-file matches. Output schema is the SQL query schema. `
 <!-- docs:reference factory:sql-derived-table -->
 ## Full configuration
 
-Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
-
-| Capability | Registered |
-|---|---|
-| directory | no |
-| file | yes |
-| initialize | no |
-| execute | no |
-| table transform | no |
-| raw validation | no |
-
-Automatic post-commit access: `not registered`.
-
-### SqlDerivedConfig
-
-Configuration for SQL-derived file generation
+### Settings
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
-| `locality` | SqlDerivedLocality | no | {"type": "global"} | Declared query locality. Defaults to conservative global execution. |
-| `patterns` | map of WatertownUrl | no | {} | Named URL patterns for matching files. Each pattern name becomes a table in the SQL query. Each pattern can match multiple files which are automatically harmonized with UNION ALL BY NAME.  **URL Format**: scheme:///path/pattern - series:///pattern - FileSeries (for sql-derived-series mode) - table:///pattern - FileTable (for sql-derived-table mode)  Example: {"vulink": "series:///data/vulink*.series", "at500": "series:///data/at500*.series"} |
+| `locality` | Sql Derived Locality | no | {"type": "global"} | Declared query locality. Defaults to conservative global execution. |
+| `patterns` | map of Watertown Url | no | {} | Named URL patterns for matching files. Each pattern name becomes a table in the SQL query. Each pattern can match multiple files which are automatically harmonized with UNION ALL BY NAME.  **URL Format**: scheme:///path/pattern - series:///pattern - FileSeries (for sql-derived-series mode) - table:///pattern - FileTable (for sql-derived-table mode)  Example: {"vulink": "series:///data/vulink*.series", "at500": "series:///data/at500*.series"} |
 | `query` | string &#124; null | no | not specified | SQL query to execute on the source data. Defaults to "SELECT * FROM source" if not specified |
 | `transforms` | array &#124; null | no | not specified | Optional list of table transform factory paths to apply to each pattern's TableProvider. Transforms are applied in order before scope prefixes and SQL execution. Each transform is a path like "/transforms/column-rename" |
 
-Unknown fields: **rejected**.
-
-### SqlDerivedLocality
+### Sql Derived Locality
 
 Explicit locality contract for user-authored SQL.
 
-### SqlDerivedLocality variant 1
+Choose one of the following:
+
+#### Unrestricted SQL
 
 Unrestricted SQL. The query is visible as global and non-incremental.
 
@@ -66,24 +51,14 @@ Unrestricted SQL. The query is visible as global and non-incremental.
 |---|---|---|---|---|
 | `type` | "global" | yes | not specified |  |
 
-Unknown fields: not rejected by this shape; see runtime notes.
-
-### SqlDerivedLocality variant 2
-
-A single-source immutable projection/filter that preserves event time.
+#### A single-source immutable projection/filter that preserves event time
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
 | `event_time` | string | yes | not specified | Event-time column retained by the output. |
 | `type` | "timestamp-local" | yes | not specified |  |
 
-Unknown fields: not rejected by this shape; see runtime notes.
-
-### WatertownUrl
+### Watertown Url
 
 Accepted value: string.
 <!-- docs:end-reference -->
-
-## Evidence and limitations
-
-The sample is configuration guidance, not a claimed runnable documentation fixture. The generated schema is the deserialization contract; semantic validation, source data, platform support, credentials, and external side effects still apply. Keep original source data independently recoverable.

@@ -19,7 +19,11 @@ SHORTCODES="${SITE}/reference/sitegen/shortcodes.html"
 for page in "${SITE}/index.html" "${FACTORY}" "${GIT_FACTORY}" "${CSV}" "${GUIDE}" "${SHORTCODES}"; do
     check '[[ -f "${page}" ]]' "pilot page $(basename "${page}") generated"
 done
-check '[[ "$(find "${SITE}" -name "*.html" -type f | wc -l | tr -d " ")" = 42 ]]' "complete manual renders 42 pages"
+check '[[ "$(find "${SITE}" -name "*.html" -type f | wc -l | tr -d " ")" = 48 ]]' "complete manual renders 48 pages"
+for format in csv excelhtml hledger jsonlogs oteljson weblog xls; do
+    check '[[ -f "${SITE}/reference/formats/${format}.html" ]]' "individual ${format} format page generated"
+    check_contains "${SITE}/index.html" "${format} has a direct sidebar link" "href=\"/watertown/reference/formats/${format}.html\""
+done
 check_contains "${GIT_FACTORY}" "each public factory has an individual page" '<h1 id="git-ingestion">Git ingestion'
 check_contains "${GIT_FACTORY}" "factory page includes generated full configuration" 'id="full-configuration"'
 check_contains "${GIT_FACTORY}" "page contents nests schema heading" 'href="#full-configuration">Full configuration</a><ul>'
@@ -40,6 +44,10 @@ check '! find "${SITE}" -name "*.js" -o -name "*.wasm" | grep -q .' "no unused J
 check '[[ ! -d "${SITE}/vendor" ]]' "no visualization vendor tree"
 check '! grep -R -E "fonts.googleapis|fonts.gstatic" "${SITE}" --include="*.html"' "no remote fonts"
 check 'cmp "${EXAMPLES_ROOT}/synthetic-timeseries/config.yaml" "${SITE}/testsuite/examples/synthetic-timeseries/config.yaml"' "downloadable raw source is identical"
+check_not_contains "${GIT_FACTORY}" "example is not collapsible" '<details'
+check_contains "${GIT_FACTORY}" "example is displayed inline" '<pre><code class="language-yaml">'
+check_not_contains "${GIT_FACTORY}" "example has no download link" 'Download default.yaml'
+check_contains "${GIT_FACTORY}" "annotated YAML comments are included verbatim" 'Required: example Git remote.'
 mkdir "${WORK}/download"
 tar -xf "${SITE}/downloads/csv-query.tar" -C "${WORK}/download"
 check 'diff -r "${EXAMPLES_ROOT}/csv-query" "${WORK}/download/csv-query"' "archive is generated from exact fixtures"
@@ -47,7 +55,7 @@ check 'diff -r "${EXAMPLES_ROOT}/csv-query" "${WORK}/download/csv-query"' "archi
 # Only the explicitly selected source tree is copied. Archives are not inputs.
 INPUT="${WORK}/input"
 mkdir -p "${INPUT}/docs" "${INPUT}/testsuite"
-cp -R "${REPO_ROOT}/docs/manual" "${REPO_ROOT}/docs/templates" "${INPUT}/docs/"
+cp -R "${REPO_ROOT}/docs/manual" "${REPO_ROOT}/docs/templates" "${REPO_ROOT}/docs/examples" "${INPUT}/docs/"
 cp "${REPO_ROOT}/docs/site.yaml" "${INPUT}/docs/site.yaml"
 cp -R "${EXAMPLES_ROOT}" "${INPUT}/testsuite/examples"
 mkdir -p "${INPUT}/docs/manual/reference/_generated"

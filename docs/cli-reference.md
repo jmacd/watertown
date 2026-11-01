@@ -60,11 +60,11 @@ See the [authoritative development manual](manual/reference/concepts.md#url-laye
 
 #### Hledger journal provider
 
-See the [authoritative development manual](manual/reference/formats/providers.md#hledger-journal).
+See the [authoritative development manual](manual/reference/formats/hledger.md).
 
 #### Binary Excel (`xls`)
 
-See the [authoritative development manual](manual/reference/formats/providers.md#binary-excel).
+See the [authoritative development manual](manual/reference/formats/xls.md).
 
 #### Schema Discovery with `information_schema`
 

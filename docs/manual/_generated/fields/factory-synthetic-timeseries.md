@@ -2,49 +2,32 @@
 
 ## Full configuration
 
-Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
-
-| Capability | Registered |
-|---|---|
-| directory | no |
-| file | yes |
-| initialize | no |
-| execute | no |
-| table transform | no |
-| raw validation | no |
-
-Automatic post-commit access: `not registered`.
-
-### SyntheticTimeseriesConfig
-
-Top-level configuration for the synthetic-timeseries factory
+### Settings
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
 | `end` | string | yes | not specified | End time (RFC 3339 / ISO 8601) |
 | `interval` | string | yes | not specified | Sampling interval as a human-readable duration (e.g., "15m", "1h", "30s") |
-| `points` | array of PointConfig | yes | not specified | Named timeseries points (each becomes a Float64 column) |
+| `points` | array of Point | yes | not specified | Named timeseries points (each becomes a Float64 column) |
 | `start` | string | yes | not specified | Start time (RFC 3339 / ISO 8601) |
 | `time_column` | string | no | "timestamp" | Name of the timestamp column (default: "timestamp") |
 
-Unknown fields: **rejected**.
-
-### PointConfig
+### Point
 
 A named timeseries point -- its value at each timestamp is the sum of its components
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
-| `components` | array of WaveformComponent | yes | not specified | Waveform components whose values are summed |
+| `components` | array of Waveform Component | yes | not specified | Waveform components whose values are summed |
 | `name` | string | yes | not specified | Column name for this point |
 
-Unknown fields: **rejected**.
-
-### WaveformComponent
+### Waveform Component
 
 Waveform component type
 
-### WaveformComponent variant 1
+Choose one of the following:
+
+#### Sine wave
 
 Sine wave: offset + amplitude * sin(2pi * t / period + phase)
 
@@ -56,9 +39,7 @@ Sine wave: offset + amplitude * sin(2pi * t / period + phase)
 | `phase` | number | no | 0.0 | Phase offset in radians Constraints: format="double". |
 | `type` | "sine" | yes | not specified |  |
 
-Unknown fields: not rejected by this shape; see runtime notes.
-
-### WaveformComponent variant 2
+#### Triangle wave
 
 Triangle wave: offset + amplitude * triangle(t / period + phase)
 
@@ -70,9 +51,7 @@ Triangle wave: offset + amplitude * triangle(t / period + phase)
 | `phase` | number | no | 0.0 | Constraints: format="double". |
 | `type` | "triangle" | yes | not specified |  |
 
-Unknown fields: not rejected by this shape; see runtime notes.
-
-### WaveformComponent variant 3
+#### Square wave
 
 Square wave: offset + amplitude * sign(sin(2pi * t / period + phase))
 
@@ -84,9 +63,7 @@ Square wave: offset + amplitude * sign(sin(2pi * t / period + phase))
 | `phase` | number | no | 0.0 | Constraints: format="double". |
 | `type` | "square" | yes | not specified |  |
 
-Unknown fields: not rejected by this shape; see runtime notes.
-
-### WaveformComponent variant 4
+#### Linear ramp
 
 Linear ramp: offset + slope * t_seconds
 
@@ -95,5 +72,3 @@ Linear ramp: offset + slope * t_seconds
 | `offset` | number | no | 0.0 | Constraints: format="double". |
 | `slope` | number | no | 0.0 | Constraints: format="double". |
 | `type` | "line" | yes | not specified |  |
-
-Unknown fields: not rejected by this shape; see runtime notes.

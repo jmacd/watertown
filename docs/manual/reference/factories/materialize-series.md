@@ -11,11 +11,9 @@ doc_id: factory:materialize-series
 
 ## Example configuration
 
-```yaml
-source: series:///derived/temperature
-target: /stored/temperature
-time_column: timestamp
-```
+{{ source path="/docs/examples/materialize-series/default.yaml" language="yaml" /}}
+
+All three fields are required; this component has no optional configuration fields.
 
 ## Use and behavior
 
@@ -26,36 +24,15 @@ Each run selects rows beyond the target event-time watermark and appends a versi
 <!-- docs:reference factory:materialize-series -->
 ## Full configuration
 
-Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
-
-| Capability | Registered |
-|---|---|
-| directory | no |
-| file | no |
-| initialize | yes |
-| execute | yes |
-| table transform | no |
-| raw validation | no |
-
-Automatic post-commit access: `ReadWrite`.
-
-### MaterializeSeriesConfig
-
-Configuration for the materialize-series factory.
+### Settings
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
-| `source` | WatertownUrl | yes | not specified | URL of the signal to materialize, e.g. series:///derived/p-water-prod.  Anything the provider can turn into a table works, so a derived node, a physical series, or a raw log read through a format scheme are all valid sources. |
+| `source` | Watertown Url | yes | not specified | URL of the signal to materialize, e.g. series:///derived/p-water-prod.  Anything the provider can turn into a table works, so a derived node, a physical series, or a raw log read through a format scheme are all valid sources. |
 | `target` | string | yes | not specified | Pond path of the TablePhysicalSeries to append to.  Created on the first run. |
 | `time_column` | string | yes | not specified | Event-time column, present in the source and used both as the watermark and as the series' temporal index. |
 
-Unknown fields: **rejected**.
-
-### WatertownUrl
+### Watertown Url
 
 Accepted value: string.
 <!-- docs:end-reference -->
-
-## Evidence and limitations
-
-The sample is configuration guidance, not a claimed runnable documentation fixture. The generated schema is the deserialization contract; semantic validation, source data, platform support, credentials, and external side effects still apply. Keep original source data independently recoverable.

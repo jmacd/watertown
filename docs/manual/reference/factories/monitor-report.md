@@ -11,78 +11,58 @@ doc_id: factory:monitor-report
 
 ## Example configuration
 
-```yaml
-pond: /path/to/pond
-title: Example monitor
-output_dir: /path/to/report
-checks: []
-```
+{{ source path="/docs/examples/monitor-report/default.yaml" language="yaml" /}}
+
+This is a full configuration for the `stale-after` check variant, not a
+collection of mutually incompatible check options. The reference below
+lists every other supported check shape and its required fields.
 
 ## Use and behavior
 
-Install with `pond mknod monitor-report /etc/monitor --config-path monitor.yaml`, then run `pond run /etc/monitor -- push`. An empty check list demonstrates the minimum shape but is not a useful monitor.
+Install with `pond mknod monitor-report /etc/monitor --config-path monitor.yaml`, then run `pond run /etc/monitor -- push`. Replace the example paths and check with sources and criteria meaningful for your pond.
 
 Nonempty checks require real sources and semantic validation. Missing or stale data follows each check's contract and must not be interpreted as a healthy zero. Rendered reports are snapshots, not proof of collector health or alert delivery.
 
 <!-- docs:reference factory:monitor-report -->
 ## Full configuration
 
-Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
-
-| Capability | Registered |
-|---|---|
-| directory | no |
-| file | no |
-| initialize | yes |
-| execute | yes |
-| table transform | no |
-| raw validation | no |
-
-Automatic post-commit access: `ReadOnly`.
-
-### MonitorConfig
+### Settings
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
-| `checks` | array of CheckConfig | yes | not specified |  |
+| `checks` | array of Check | yes | not specified |  |
 | `output_dir` | string | yes | not specified |  |
 | `pond` | string | yes | not specified |  |
 | `title` | string | yes | not specified |  |
-
-Unknown fields: **rejected**.
 
 ### Accumulation
 
 Accepted value: "positive-deltas".
 
-### AlarmConfig
+### Alarm
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
-| `operator` | AlarmOperator | yes | not specified |  |
+| `operator` | Alarm Operator | yes | not specified |  |
 | `unit` | string | no | "" |  |
 | `value` | number | yes | not specified | Constraints: format="double". |
 
-Unknown fields: **rejected**.
-
-### AlarmOperator
+### Alarm Operator
 
 Accepted value: "lt".
 
-### AlignmentConfig
+### Alignment
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
-| `method` | AlignmentMethod | yes | not specified |  |
+| `method` | Alignment Method | yes | not specified |  |
 | `tolerance` | string | yes | not specified |  |
 
-Unknown fields: **rejected**.
-
-### AlignmentMethod
+### Alignment Method
 
 Accepted value: "previous".
 
-### AnyObservedBelowCheckConfig
+### Any Observed Below Check
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
@@ -93,18 +73,16 @@ Accepted value: "previous".
 | `source` | string | yes | not specified |  |
 | `threshold` | number | yes | not specified | Constraints: format="double". |
 | `timestamp_column` | string | no | "timestamp" |  |
-| `type` | AnyObservedBelowType | yes | not specified |  |
+| `type` | Any Observed Below Type | yes | not specified |  |
 | `unit` | string | no | "" |  |
 | `value_column` | string | yes | not specified |  |
 | `window` | string | yes | not specified |  |
 
-Unknown fields: **rejected**.
-
-### AnyObservedBelowType
+### Any Observed Below Type
 
 Accepted value: "any-observed-below".
 
-### AverageRangeCheckConfig
+### Average Range Check
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
@@ -115,19 +93,17 @@ Accepted value: "any-observed-below".
 | `lower_bound` | number | yes | not specified | Constraints: format="double". |
 | `source` | string | yes | not specified |  |
 | `timestamp_column` | string | no | "timestamp" |  |
-| `type` | AverageRangeType | yes | not specified |  |
+| `type` | Average Range Type | yes | not specified |  |
 | `unit` | string | no | "" |  |
 | `upper_bound` | number | yes | not specified | Constraints: format="double". |
 | `value_column` | string | yes | not specified |  |
 | `window` | string | yes | not specified |  |
 
-Unknown fields: **rejected**.
-
-### AverageRangeType
+### Average Range Type
 
 Accepted value: "average-range".
 
-### BelowCheckConfig
+### Below Check
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
@@ -142,57 +118,28 @@ Accepted value: "average-range".
 | `value_column` | string | yes | not specified |  |
 | `window` | string | yes | not specified |  |
 
-Unknown fields: **rejected**.
+### Check
 
-### CheckConfig
+Choose one of the following:
 
-### CheckConfig variant 1
-
-Accepted value: RateWhileCheckConfig.
-
-### CheckConfig variant 2
-
-Accepted value: AnyObservedBelowCheckConfig.
-
-### CheckConfig variant 3
-
-Accepted value: AverageRangeCheckConfig.
-
-### CheckConfig variant 4
-
-Accepted value: BelowCheckConfig.
-
-### CheckConfig variant 5
-
-Accepted value: StaleAfterCheckConfig.
-
-### CheckConfig variant 6
-
-Accepted value: GradedScoreCheckConfig.
-
-### CheckConfig variant 7
-
-Accepted value: StaleOrBelowCheckConfig.
-
-### CheckConfig variant 8
-
-Accepted value: StaleOrAllBelowCheckConfig.
-
-### CheckConfig variant 9
-
-Accepted value: StaleOrBelowAnyColumnCheckConfig.
-
-### ConditionConfig
+- Rate While Check
+- Any Observed Below Check
+- Average Range Check
+- Below Check
+- Stale After Check
+- Graded Score Check
+- Stale Or Below Check
+- Stale Or All Below Check
+- Stale Or Below Any Column Check
+### Condition
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
-| `predicate` | PredicateConfig | yes | not specified |  |
+| `predicate` | Predicate | yes | not specified |  |
 | `source` | string | yes | not specified |  |
 | `timestamp` | string | no | "timestamp" |  |
 
-Unknown fields: **rejected**.
-
-### GradedScoreCheckConfig
+### Graded Score Check
 
 Classifies the latest sample of a continuous 0.0-1.0-style score into one of four quality bands (good/watch/concern/alarm) instead of a plain pass/fail threshold, for signals like the leak-probability score where a single alarm/healthy split loses the gradient the operator cares about. good_max &lt; watch_max &lt; concern_max must hold; values above concern_max, and a missing/no-data window, both land in the worst (alarm) band -- absence of a recent score is treated as the worst case, not as "unknown", so a quiet source can't hide a real leak behind a gray card.
 
@@ -206,19 +153,17 @@ Classifies the latest sample of a continuous 0.0-1.0-style score into one of fou
 | `label` | string | yes | not specified |  |
 | `source` | string | yes | not specified |  |
 | `timestamp_column` | string | no | "timestamp" |  |
-| `type` | GradedScoreType | yes | not specified |  |
+| `type` | Graded Score Type | yes | not specified |  |
 | `unit` | string | no | "" |  |
 | `value_column` | string | yes | not specified |  |
 | `watch_max` | number | yes | not specified | Constraints: format="double". |
 | `window` | string | yes | not specified |  |
 
-Unknown fields: **rejected**.
-
-### GradedScoreType
+### Graded Score Type
 
 Accepted value: "graded-score".
 
-### MeasurementConfig
+### Measurement
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
@@ -227,45 +172,39 @@ Accepted value: "graded-score".
 | `source` | string | yes | not specified |  |
 | `timestamp` | string | no | "timestamp" |  |
 
-Unknown fields: **rejected**.
-
-### PredicateConfig
+### Predicate
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
 | `column` | string | yes | not specified |  |
-| `operator` | PredicateOperator | yes | not specified |  |
+| `operator` | Predicate Operator | yes | not specified |  |
 | `value` | string | yes | not specified |  |
 
-Unknown fields: **rejected**.
-
-### PredicateOperator
+### Predicate Operator
 
 Accepted value: "eq".
 
-### RateWhileCheckConfig
+### Rate While Check
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
-| `alarm` | AlarmConfig | yes | not specified |  |
-| `alignment` | AlignmentConfig | yes | not specified |  |
-| `condition` | ConditionConfig | yes | not specified |  |
+| `alarm` | Alarm | yes | not specified |  |
+| `alignment` | Alignment | yes | not specified |  |
+| `condition` | Condition | yes | not specified |  |
 | `description` | string | yes | not specified |  |
 | `href` | string | yes | not specified |  |
 | `id` | string | yes | not specified |  |
 | `label` | string | yes | not specified |  |
-| `measurement` | MeasurementConfig | yes | not specified |  |
+| `measurement` | Measurement | yes | not specified |  |
 | `minimum_active_time` | string | yes | not specified |  |
-| `type` | RateWhileType | yes | not specified |  |
+| `type` | Rate While Type | yes | not specified |  |
 | `window` | string | yes | not specified |  |
 
-Unknown fields: **rejected**.
-
-### RateWhileType
+### Rate While Type
 
 Accepted value: "rate-while".
 
-### StaleAfterCheckConfig
+### Stale After Check
 
 Alarms when a source has produced zero non-null samples within window. Unlike the other scalar checks, an empty sample set here *is* the alarm condition rather than an unknown/indeterminate state: it means the data source has stopped producing new data.
 
@@ -277,18 +216,16 @@ Alarms when a source has produced zero non-null samples within window. Unlike th
 | `label` | string | yes | not specified |  |
 | `source` | string | yes | not specified |  |
 | `timestamp_column` | string | no | "timestamp" |  |
-| `type` | StaleAfterType | yes | not specified |  |
+| `type` | Stale After Type | yes | not specified |  |
 | `unit` | string | no | "" |  |
 | `value_column` | string | yes | not specified |  |
 | `window` | string | yes | not specified |  |
 
-Unknown fields: **rejected**.
-
-### StaleAfterType
+### Stale After Type
 
 Accepted value: "stale-after".
 
-### StaleOrAllBelowCheckConfig
+### Stale Or All Below Check
 
 Alarms if the source has produced zero samples at all in the longer stale_window (ingestion has stalled), or if every sample observed within the shorter window is below threshold -- combining the staleness and sustained-low-value failure modes of a single instrument (e.g. well depth) into one check instead of requiring two separate cards. Unlike stale-or-below, this uses "all observed" polarity: a single recent reading at or above threshold is enough to stay healthy.
 
@@ -302,18 +239,16 @@ Alarms if the source has produced zero samples at all in the longer stale_window
 | `stale_window` | string | yes | not specified |  |
 | `threshold` | number | yes | not specified | Constraints: format="double". |
 | `timestamp_column` | string | no | "timestamp" |  |
-| `type` | StaleOrAllBelowType | yes | not specified |  |
+| `type` | Stale Or All Below Type | yes | not specified |  |
 | `unit` | string | no | "" |  |
 | `value_column` | string | yes | not specified |  |
 | `window` | string | yes | not specified |  |
 
-Unknown fields: **rejected**.
-
-### StaleOrAllBelowType
+### Stale Or All Below Type
 
 Accepted value: "stale-or-all-below".
 
-### StaleOrBelowAnyColumnCheckConfig
+### Stale Or Below Any Column Check
 
 Combines a staleness check on value_column (zero samples within window means the source has stopped reporting, same polarity as stale-after) with a threshold check spread across one or more secondary threshold_columns -- alarm if ANY sample on ANY of those columns is below threshold within the same window -- into a single check/card. Useful when a device's primary signal and some auxiliary signals (e.g. two redundant radio batteries) should be reported as one pass/fail instead of three separate cards. Staleness on the primary column is checked first and takes priority: if the device has stopped reporting at all, the secondary columns (which live on the same stalled device) aren't evaluated separately.
 
@@ -327,18 +262,16 @@ Combines a staleness check on value_column (zero samples within window means the
 | `threshold` | number | yes | not specified | Constraints: format="double". |
 | `threshold_columns` | array of string | yes | not specified |  |
 | `timestamp_column` | string | no | "timestamp" |  |
-| `type` | StaleOrBelowAnyColumnType | yes | not specified |  |
+| `type` | Stale Or Below Any Column Type | yes | not specified |  |
 | `unit` | string | no | "" |  |
 | `value_column` | string | yes | not specified |  |
 | `window` | string | yes | not specified |  |
 
-Unknown fields: **rejected**.
-
-### StaleOrBelowAnyColumnType
+### Stale Or Below Any Column Type
 
 Accepted value: "stale-or-below-any-column".
 
-### StaleOrBelowCheckConfig
+### Stale Or Below Check
 
 Alarms if the source has produced zero samples in window (stale or missing), or if any observed sample is below threshold -- combining the staleness and low-value failure modes of a single instrument (e.g. a pH probe) into one check instead of requiring two separate cards.
 
@@ -351,18 +284,12 @@ Alarms if the source has produced zero samples in window (stale or missing), or 
 | `source` | string | yes | not specified |  |
 | `threshold` | number | yes | not specified | Constraints: format="double". |
 | `timestamp_column` | string | no | "timestamp" |  |
-| `type` | StaleOrBelowType | yes | not specified |  |
+| `type` | Stale Or Below Type | yes | not specified |  |
 | `unit` | string | no | "" |  |
 | `value_column` | string | yes | not specified |  |
 | `window` | string | yes | not specified |  |
 
-Unknown fields: **rejected**.
-
-### StaleOrBelowType
+### Stale Or Below Type
 
 Accepted value: "stale-or-below".
 <!-- docs:end-reference -->
-
-## Evidence and limitations
-
-The sample is configuration guidance, not a claimed runnable documentation fixture. The generated schema is the deserialization contract; semantic validation, source data, platform support, credentials, and external side effects still apply. Keep original source data independently recoverable.

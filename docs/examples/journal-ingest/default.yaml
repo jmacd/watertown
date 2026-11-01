@@ -1,0 +1,5 @@
+pond_path: logs/journal                  # Required: example pond destination.
+collect_kernel: true                    # Default: also collect kernel messages.
+journalctl_command: journalctl          # Default: command resolved on the host.
+timestamp_field: __REALTIME_TIMESTAMP   # Default: journald microsecond timestamp.
+extra_args: []                          # Default: no extra journalctl arguments.

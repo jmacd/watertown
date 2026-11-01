@@ -11,13 +11,10 @@ doc_id: factory:logfile-ingest
 
 ## Example configuration
 
-```yaml
-archived_pattern: /var/log/example-*.jsonl
-active_pattern: /var/log/example.jsonl
-pond_path: logs/example
-timestamp_field: timeUnixNano
-timestamp_unit: nanoseconds
-```
+{{ source path="/docs/examples/logfile-ingest/default.yaml" language="yaml" /}}
+
+For OTLP JSON, set `timestamp_field: timeUnixNano` and
+`timestamp_unit: nanoseconds` together. Supported units are listed below.
 
 ## Use and behavior
 
@@ -28,22 +25,7 @@ Timestamp extraction searches recursively for the configured JSON key and record
 <!-- docs:reference factory:logfile-ingest -->
 ## Full configuration
 
-Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
-
-| Capability | Registered |
-|---|---|
-| directory | no |
-| file | no |
-| initialize | yes |
-| execute | yes |
-| table transform | no |
-| raw validation | no |
-
-Automatic post-commit access: `ReadWrite`.
-
-### LogfileIngestConfig
-
-Configuration for the logfile ingestion factory
+### Settings
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
@@ -51,17 +33,11 @@ Configuration for the logfile ingestion factory
 | `archived_pattern` | string | yes | not specified | Glob pattern for archived (immutable) log files Example: "/var/log/casparwater-*.json" |
 | `pond_path` | string | yes | not specified | Destination path within the pond (relative to pond root) Example: "logs/casparwater" |
 | `timestamp_field` | string &#124; null | no | null | JSON key holding the event time of a record, looked up at any depth in each line. Example: "timeUnixNano" for OTLP metrics JSON.  Absent by default, which leaves versions without event-time bounds. That is not free: temporal-reduce reads these bounds to decide which cached segments a new source version can have touched, and a version without them is taken to span all of time (SourceRange::UNKNOWN), so every build unseals every segment and recomputes the whole history from source. Setting this is what keeps an incremental build incremental. |
-| `timestamp_unit` | TimestampUnit | no | "microseconds" | Unit of the timestamp_field values. OTLP's timeUnixNano is nanoseconds; journald's __REALTIME_TIMESTAMP is microseconds. |
+| `timestamp_unit` | Timestamp Unit | no | "microseconds" | Unit of the timestamp_field values. OTLP's timeUnixNano is nanoseconds; journald's __REALTIME_TIMESTAMP is microseconds. |
 
-Unknown fields: **rejected**.
+### Timestamp Unit
 
-### TimestampUnit
-
-Unit of the values found under timestamp_field.  tlogfs records event times in microseconds, so everything is converted to that. Microseconds is the default because it is what tlogfs itself uses.
+Unit of the values found under timestamp_field.
 
 Accepted value: "seconds" &#124; "milliseconds" &#124; "microseconds" &#124; "nanoseconds".
 <!-- docs:end-reference -->
-
-## Evidence and limitations
-
-The sample is configuration guidance, not a claimed runnable documentation fixture. The generated schema is the deserialization contract; semantic validation, source data, platform support, credentials, and external side effects still apply. Keep original source data independently recoverable.

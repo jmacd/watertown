@@ -2,22 +2,7 @@
 
 ## Full configuration
 
-Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
-
-| Capability | Registered |
-|---|---|
-| directory | no |
-| file | yes |
-| initialize | no |
-| execute | no |
-| table transform | no |
-| raw validation | yes |
-
-Automatic post-commit access: `not registered`.
-
-### StorageMinioConfig
-
-On-disk config for a storage-minio node.
+### Settings
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
@@ -25,5 +10,3 @@ On-disk config for a storage-minio node.
 | `endpoint` | string | yes | not specified | MinIO endpoint URL, e.g. http://watershop:9000.  Required: a MinIO without an endpoint is not a MinIO. |
 | `region` | string &#124; null | no | not specified | Region used for SigV4 signing.  Defaults to [DEFAULT_REGION], which [render] makes explicit so pond cat shows what is in effect. |
 | `secret_access_key` | string | yes | not specified | Secret access key.  Must be an ${env:...} reference (Decision A1). |
-
-Unknown fields: **rejected**.

@@ -11,7 +11,7 @@ Keep original sensor/source data independently recoverable.
 
 ## Query a host file
 
-Run the [complete CSV script](../reference/formats/csv.md#example). It requires
+Run the [complete CSV script](../reference/formats/csv.md#runnable-example). It requires
 no pond and selects the two readings at or above 25 degrees.
 
 {{ source path="/testsuite/examples/csv-query/run.sh" region="query" language="bash" /}}
@@ -23,7 +23,7 @@ semicolon parameter example.
 
 ## Creating a timeseries
 
-Run the complete [synthetic example](../reference/factories/synthetic-timeseries.md#example)
+Run the complete [synthetic example](../reference/factories/synthetic-timeseries.md#runnable-example)
 to initialize a new scratch pond and install its dynamic table.
 The input is fixed at four hourly samples on January 1, 2024.
 

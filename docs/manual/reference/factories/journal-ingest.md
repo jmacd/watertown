@@ -11,11 +11,10 @@ doc_id: factory:journal-ingest
 
 ## Example configuration
 
-```yaml
-pond_path: logs/journal
-collect_kernel: true
-extra_args: [--merge]
-```
+{{ source path="/docs/examples/journal-ingest/default.yaml" language="yaml" /}}
+
+For example, `extra_args: [--merge]` includes journals from other namespaces
+available to the host command.
 
 ## Use and behavior
 
@@ -26,22 +25,7 @@ The cursor is stored beneath the output path as `.journal-cursor`. Removing it c
 <!-- docs:reference factory:journal-ingest -->
 ## Full configuration
 
-Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
-
-| Capability | Registered |
-|---|---|
-| directory | no |
-| file | no |
-| initialize | yes |
-| execute | yes |
-| table transform | no |
-| raw validation | no |
-
-Automatic post-commit access: `ReadWrite`.
-
-### JournalIngestConfig
-
-Configuration for the journal ingestion factory
+### Settings
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
@@ -50,10 +34,4 @@ Configuration for the journal ingestion factory
 | `journalctl_command` | string | no | "journalctl" | Command to invoke journalctl (default: "journalctl") Can be customized for non-standard installs |
 | `pond_path` | string | yes | not specified | Destination path within the pond (relative to pond root) Example: "logs/watershop" |
 | `timestamp_field` | string | no | "__REALTIME_TIMESTAMP" | JSON field name containing the timestamp (default: "__REALTIME_TIMESTAMP") The value is interpreted as microseconds since Unix epoch. |
-
-Unknown fields: **rejected**.
 <!-- docs:end-reference -->
-
-## Evidence and limitations
-
-The sample is configuration guidance, not a claimed runnable documentation fixture. The generated schema is the deserialization contract; semantic validation, source data, platform support, credentials, and external side effects still apply. Keep original source data independently recoverable.
