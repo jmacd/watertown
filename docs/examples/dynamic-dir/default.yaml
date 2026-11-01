@@ -1,10 +1,13 @@
-entries:                             # Required: child definitions.
-  - name: readings                   # Required: example child name.
-    factory: sql-derived-series      # Required: registered child factory.
-    config:                          # Required: that factory's configuration.
-      patterns:                      # Default: {}; supply an example input.
-        source: series:///sensors/*
-      query: null                    # Default: SELECT * FROM source.
-      transforms: null               # Default: no input transforms.
-      locality:
-        type: global                 # Default: conservative query locality.
+entries:                              # Children exposed by this directory.
+  - name: temperature                 # Appears as /demo/temperature below.
+    factory: synthetic-timeseries     # Generate readings without external data.
+    config:                           # Settings for this child.
+      start: "2024-01-01T00:00:00Z"
+      end: "2024-01-01T03:00:00Z"      # Inclusive: four hourly readings.
+      interval: 1h
+      points:
+        - name: temperature           # Output measurement column.
+          components:
+            - type: line
+              offset: 20.0            # Starting temperature.
+              slope: 0.001            # Increase per second: 3.6 per hour.
