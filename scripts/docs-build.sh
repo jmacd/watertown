@@ -22,7 +22,7 @@ mkdir -p "$(dirname "${OUTPUT}")"
 SOURCE="$(cd "${SOURCE}" && pwd)"
 OUTPUT="$(cd "$(dirname "${OUTPUT}")" && pwd)/$(basename "${OUTPUT}")"
 case "${OUTPUT}/" in
-    "${SOURCE}/"|"${SOURCE}/docs/"|"${SOURCE}/docs/manual/"*|"${SOURCE}/docs/templates/"*|"${SOURCE}/docs/examples/"*|"${SOURCE}/testsuite/"*)
+    "${SOURCE}/"|"${SOURCE}/docs/"*|"${SOURCE}/crates/"*|"${SOURCE}/testsuite/"*)
         echo "Documentation output must not replace selected source inputs: ${OUTPUT}" >&2
         exit 1
         ;;
@@ -30,6 +30,7 @@ esac
 STAGE="$(mktemp -d "$(dirname "${OUTPUT}")/.docs-build.XXXXXX")"
 trap 'rm -r -- "${STAGE}"' EXIT
 mkdir -p "${STAGE}/site/downloads"
+python3 "${REPO}/scripts/generate-docs.py" --source-root "${SOURCE}" --stage "${STAGE}/input"
 for example in csv-query synthetic-timeseries timeseries-site blog-rss pond-recovery; do
     dependencies=("${example}")
     case "${example}" in
@@ -38,7 +39,7 @@ for example in csv-query synthetic-timeseries timeseries-site blog-rss pond-reco
     esac
     tar -C "${SOURCE}/testsuite/examples" -cf "${STAGE}/site/downloads/${example}.tar" "${dependencies[@]}"
 done
-if ! "${BINARY}" run -d "${SOURCE}" host+sitegen:///docs/site.yaml -- build "${STAGE}/site" --strict; then
+if ! "${BINARY}" run -d "${STAGE}/input" host+sitegen:///docs/site.yaml -- build "${STAGE}/site" --strict; then
     echo "Manual build failed. This source requires documentation renderer contract 1 and build --strict; use a binary built after D04. Original diagnostics are above." >&2
     exit 1
 fi

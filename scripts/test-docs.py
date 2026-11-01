@@ -62,16 +62,54 @@ class DriftTests(unittest.TestCase):
             target.parent.mkdir(parents=True)
             text = (ROOT / page["path"]).read_text()
             target.write_text(text)
-            with self.assertRaisesRegex(ValueError, "missing /docs/examples/git-ingest/default.yaml"):
+            target.with_name("mod.rs").write_text("")
+            with self.assertRaisesRegex(ValueError, "missing .*default.yaml"):
                 checker.validate(self.catalog, self.metadata, root=root)
-            example = root / "docs/examples/git-ingest/default.yaml"
-            example.parent.mkdir(parents=True)
+            example = target.with_name("default.yaml")
             example.write_text((ROOT / example.relative_to(root)).read_text())
             target.write_text(text.replace(
-                '{{ source path="/docs/examples/git-ingest/default.yaml" language="yaml" /}}',
+                generator.EXAMPLE_INCLUDE,
                 "```yaml\nurl: duplicated-example\n```"))
             with self.assertRaisesRegex(ValueError, "must include its authoritative default.yaml"):
                 checker.validate(self.catalog, self.metadata, root=root)
+            target.write_text(text)
+            duplicate = root / page["output"]
+            duplicate.parent.mkdir(parents=True)
+            duplicate.write_text(text)
+            with self.assertRaisesRegex(ValueError, "generated page must not also exist"):
+                checker.validate(self.catalog, self.metadata, root=root)
+
+    def test_component_pages_are_assembled_without_changing_authored_sources(self):
+        page = self.catalog["pages"]["factory:git-ingest"]
+        source = ROOT / page["path"]
+        original = source.read_bytes()
+        example = source.with_name("default.yaml").read_bytes()
+        with tempfile.TemporaryDirectory() as directory:
+            staged = Path(directory) / "input"
+            generator.stage_manual(ROOT, staged)
+            rendered = (staged / page["output"]).read_text()
+            self.assertIn("## Overview", rendered)
+            self.assertIn("## Full configuration", rendered)
+            self.assertIn("| `prefix` |", rendered)
+            self.assertIn('/docs/examples/git-ingest/default.yaml', rendered)
+            self.assertEqual((staged / "docs/examples/git-ingest/default.yaml").read_bytes(), example)
+            self.assertFalse((staged / "crates").exists())
+            for component, entry in self.catalog["pages"].items():
+                if component.startswith(("factory:", "format:")):
+                    self.assertTrue((staged / entry["output"]).is_file(), component)
+                    self.assertFalse((ROOT / entry["output"]).exists(), component)
+            self.assertEqual(source.read_bytes(), original)
+            self.assertEqual(source.with_name("default.yaml").read_bytes(), example)
+
+    def test_component_generation_rejects_unsafe_paths(self):
+        page = self.catalog["pages"]["factory:git-ingest"]
+        page["output"] = "../escaped.md"
+        with self.assertRaisesRegex(ValueError, "expected published path"):
+            generator.component_outputs(self.catalog, self.metadata)
+        page["output"] = "docs/manual/reference/factories/git-ingest.md"
+        page["path"] = "../documentation.md"
+        with self.assertRaisesRegex(ValueError, "input-tree relative path"):
+            generator.component_outputs(self.catalog, self.metadata)
 
     def test_mechanical_reference_tracks_flag_defaults(self):
         changed = copy.deepcopy(self.metadata)

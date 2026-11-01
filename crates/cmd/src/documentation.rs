@@ -123,12 +123,13 @@ mod tests {
         let catalog: Value =
             serde_json::from_str(include_str!("../../../docs/documentation-inventory.json"))
                 .unwrap();
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         for id in catalog["public"]["factory"]["ids"].as_array().unwrap() {
             let id = id.as_str().unwrap();
-            let name = id.strip_prefix("factory:").unwrap();
-            let example = std::fs::read_to_string(root.join(name).join("default.yaml"))
-                .unwrap_or_else(|error| panic!("{id}: cannot read default.yaml: {error}"));
+            let documentation = catalog["pages"][id]["path"].as_str().unwrap();
+            let example =
+                std::fs::read_to_string(root.join(documentation).with_file_name("default.yaml"))
+                    .unwrap_or_else(|error| panic!("{id}: cannot read default.yaml: {error}"));
             let value: Value = serde_yaml::from_str(&example)
                 .unwrap_or_else(|error| panic!("{id}: invalid example YAML: {error}"));
             let schema = &metadata["schemas"][id];

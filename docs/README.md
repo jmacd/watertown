@@ -1,10 +1,12 @@
 # Manual authoring
 
-`docs/manual/` is the public content boundary selected by `docs/site.yaml`.
-Design notes, this workflow, `docs/archive/`, and the reviewed migration
-inventory are not pages. `_generated` directories never become standalone
-pages. The manual is current development documentation, not a multi-version
-stable-release site. D11 retains final historical/duplicate cleanup.
+`docs/manual/` owns guides, concepts, CLI documentation, and category indexes.
+Factory and format documentation lives beside the corresponding implementation
+in `crates/`. The build assembles both into an isolated input tree selected by
+`docs/site.yaml`; component pages are not checked-in copies under `docs/manual/`.
+Design notes, this workflow, `docs/archive/`, and Rust source are not pages.
+`_generated` directories never become standalone pages. The manual is current
+development documentation, not a multi-version stable-release site.
 
 ## Obtaining a compatible binary
 
@@ -17,15 +19,30 @@ not need vendor downloads.
 
 ## Fast prose workflow
 
-Each factory has one editable page at `docs/manual/reference/factories/NAME.md`;
-each format provider has one at `docs/manual/reference/formats/NAME.md`. Start
-there to edit the component's overview, annotated example, usage, and limits.
-Factory pages show YAML; format pages show URLs, not invented YAML interfaces.
+Each component owns an editable `documentation.md` beside its implementation:
 
-Edit `docs/examples/NAME/default.yaml` for a factory's annotated configuration.
-The Markdown page includes that exact file with a `source` shortcode as an
-always-visible code block. Do not add download links, collapse the example,
-or duplicate its YAML in Markdown.
+```text
+crates/provider/src/factory/column_rename/
+  mod.rs
+  documentation.md
+  default.yaml
+crates/provider/src/format/csv/
+  mod.rs
+  documentation.md
+```
+
+Factories in separate crates keep these files there, such as
+`crates/gitpond/src/factory/`. Shared implementations retain separate component
+inputs without duplicating Rust: SQL-derived table/series use `table/` and
+`series/` under `sql_derived/`; direct temporal reduction uses
+`temporal_reduce/series/`.
+
+Edit the component's `documentation.md` for its overview, usage, and limits.
+Factory pages include the adjacent `default.yaml` using
+`{{ source path="default.yaml" language="yaml" /}}`. The build resolves this to
+an exact staged copy and displays it as an always-visible code block. Do not
+add download links, collapse the example, or duplicate its YAML in Markdown.
+Format pages keep URL examples in Markdown, not invented YAML interfaces.
 Each file contains a complete configuration for the illustrated variant:
 all top-level fields are present, optional defaults are explicit, and example
 inputs or overrides are labeled in comments. For optional features, `null`,
@@ -33,9 +50,9 @@ inputs or overrides are labeled in comments. For optional features, `null`,
 Explain runtime-derived defaults and mutually exclusive alternatives in the
 YAML comments. Do not replace credential references with literal secrets.
 
-Prose and these annotated YAML files are hand-authored. Regeneration changes
-only the `docs:reference` blocks below the included examples, never the prose
-or `default.yaml` files. URL-based formats keep their URL examples in Markdown.
+Prose and annotated YAML files are hand-authored. Component reference markers
+are empty in source; the build fills them from the cached compiled schema in
+the staging tree only. It never writes into component source files.
 Runnable fixtures remain separately included from `testsuite/examples/`;
 an illustrative configuration is not a claim of live-service execution.
 
@@ -45,8 +62,9 @@ make docs-serve POND_BIN=/absolute/path/to/pond
 ```
 
 `docs-build` invokes no Cargo, examples, services, or network downloads. Bash,
-Make, and tar are required. It packages the exact shared fixtures, stages a
-strict sitegen build, and replaces only marked documentation output after
+Make, tar, and Python 3.9+ (stdlib only) are required. It assembles component
+pages and YAML from the checkout with cached metadata, packages the exact
+shared fixtures, and replaces only marked documentation output after
 success. Failure preserves the previous preview. Default output is
 `.docs-preview/watertown/`; `DOCS_OUT` can select an absent directory or
 existing marked output, never selected source directories.
@@ -56,11 +74,9 @@ localhost, and **never opens a browser**. Visit
 `http://127.0.0.1:8000/watertown/`; change `DOCS_PORT` if needed. Stop with
 Ctrl-C. No watcher/live reload is installed.
 
-The renderer command after preparing downloads is:
-
-```bash
-pond run -d "$PWD" host+sitegen:///docs/site.yaml -- build OUTPUT --strict
-```
+The wrapper runs the renderer against the assembled input tree, not directly
+against the checkout. Stable component URLs remain
+`reference/factories/NAME.html` and `reference/formats/NAME.html`.
 
 An incompatible binary fails explicitly; no fallback renderer is selected.
 Local footer provenance says `working-tree`; CI supplies the exact source SHA.
@@ -79,17 +95,19 @@ the `documentation` Cargo feature; ordinary production builds do not ship it
 or schema dependencies. It introspects shared Clap definitions and fully linked
 registries, without creating a pond or executing factories/services.
 
-`scripts/generate-docs.py` writes deterministic metadata/fragments under
-`docs/manual/_generated/` and managed regions in ordinary authored Markdown:
+`scripts/generate-docs.py --write` updates deterministic compiled metadata under
+`docs/manual/_generated/` and managed references in non-component manual pages.
+Component Markdown contains only a placement marker:
 
 ```text
 <!-- docs:reference factory:synthetic-timeseries -->
-... generated fields ...
 <!-- docs:end-reference -->
 ```
 
-Edit field descriptions beside their Rust fields, then regenerate. Do not edit
-generated region bodies. Schema is explicitly the **deserialization** contract;
+The staging mode fills that marker with the full reference. There are no
+committed per-component generated fragments or generated pages to edit.
+Edit field descriptions beside their Rust fields, then refresh the compiled
+metadata with `make docs-generate`. Schema is the **deserialization** contract;
 semantic constraints, side effects, prerequisites, and effective runtime
 defaults still need authored explanation. The renderer never generates
 reference or executes code fences.
@@ -117,8 +135,9 @@ cargo test --locked -p cmd --features documentation --lib documentation::tests
 These also parse every factory's `default.yaml`, check it against the compiled
 schema, and ensure it includes every top-level field. Changing a factory's
 fields therefore requires updating its authored YAML file, not just
-regenerating the reference. `docs-check` requires each factory page to include
-its own YAML file.
+regenerating the reference. `docs-check` requires colocated component inputs,
+an include of the adjacent YAML, empty reference markers, and no duplicate
+component pages in `docs/manual/`.
 
 ## Executable examples
 
@@ -158,11 +177,14 @@ headless suite.
 ## Authoring and navigation
 
 Frontmatter `doc_id` is a plain scalar matching the page key in
-`documentation-inventory.json`. That catalog maps stable public IDs to one
-authoritative page and records examples, evidence levels, exclusions, and
-known correctness gaps.
+`documentation-inventory.json`. For components, `path` names the authoritative
+colocated Markdown and `output` names its generated location in the assembled
+manual. Non-component pages use `path` only. The catalog also records examples,
+evidence levels, exclusions, and known correctness gaps.
 
-Use source-relative `.md` links and actual heading fragments. Strict builds
+Use manual-relative `.md` links and actual heading fragments. In component
+Markdown, relative links use the published `output` location, not the crate
+directory. Strict builds
 validate output paths, navigation, includes/regions, links, and anchors under
 `/watertown/`. Source inclusion reads only approved `include_roots`; fences,
 inline code, and included source remain literal. Documentation uses system

@@ -55,16 +55,33 @@ check 'diff -r "${EXAMPLES_ROOT}/csv-query" "${WORK}/download/csv-query"' "archi
 # Only the explicitly selected source tree is copied. Archives are not inputs.
 INPUT="${WORK}/input"
 mkdir -p "${INPUT}/docs" "${INPUT}/testsuite"
-cp -R "${REPO_ROOT}/docs/manual" "${REPO_ROOT}/docs/templates" "${REPO_ROOT}/docs/examples" "${INPUT}/docs/"
-cp "${REPO_ROOT}/docs/site.yaml" "${INPUT}/docs/site.yaml"
+cp -R "${REPO_ROOT}/docs/manual" "${REPO_ROOT}/docs/templates" "${INPUT}/docs/"
+cp "${REPO_ROOT}/docs/site.yaml" "${REPO_ROOT}/docs/documentation-inventory.json" "${INPUT}/docs/"
 cp -R "${EXAMPLES_ROOT}" "${INPUT}/testsuite/examples"
+python3 - "${REPO_ROOT}" "${INPUT}" <<'PY'
+import json
+from pathlib import Path
+import shutil
+import sys
+root, target = map(Path, sys.argv[1:])
+catalog = json.loads((root / "docs/documentation-inventory.json").read_text())
+for page in catalog["pages"].values():
+    if "output" not in page:
+        continue
+    source = Path(page["path"])
+    destination = target / source
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(root / source, destination)
+    example = source.with_name("default.yaml")
+    if (root / example).is_file():
+        shutil.copyfile(root / example, target / example)
+PY
 mkdir -p "${INPUT}/docs/manual/reference/_generated"
 printf '{{ this_must_not_be_discovered /}}\n' > "${INPUT}/docs/manual/reference/_generated/fragment.md"
-mkdir -p "${WORK}/rebuild/downloads"
-cp "${SITE}/downloads/"*.tar "${WORK}/rebuild/downloads/"
 
 build() {
-    "${POND_BIN}" run -d "${INPUT}" host+sitegen:///docs/site.yaml -- build "${WORK}/rebuild" --strict > "${WORK}/build.log" 2>&1
+    DOCS_SOURCE_ROOT="${INPUT}" DOCS_OUT="${WORK}/rebuild" \
+        bash "${REPO_ROOT}/scripts/docs-build.sh" > "${WORK}/build.log" 2>&1
 }
 PAGE="${INPUT}/docs/manual/reference/sitegen/shortcodes.md"
 ORIGINAL="${REPO_ROOT}/docs/manual/reference/sitegen/shortcodes.md"
@@ -102,11 +119,31 @@ printf '\n{{ source path="/docs/site.yaml" /}}\n' >> "${PAGE}"
 check '! build' "include cannot read outside approved roots"
 check_contains "${WORK}/build.log" "include confinement diagnostic" 'outside documentation include_roots'
 cp "${ORIGINAL}" "${PAGE}"
+DEFAULTS="${INPUT}/crates/gitpond/src/factory/default.yaml"
+mv "${DEFAULTS}" "${WORK}/missing-default.yaml"
+check '! DOCS_SOURCE_ROOT="${INPUT}" DOCS_OUT="${SITE}" bash "${REPO_ROOT}/scripts/docs-build.sh" > "${WORK}/wrapper.log" 2>&1' "missing colocated YAML rejects assembly"
+check_contains "${WORK}/wrapper.log" "missing YAML diagnostic identifies its component" 'crates/gitpond/src/factory/default.yaml'
+check 'cmp "${SHORTCODES}" "${WORK}/previous.html"' "failed assembly preserves the previous preview"
+mv "${WORK}/missing-default.yaml" "${DEFAULTS}"
+DUPLICATE="${INPUT}/docs/manual/reference/factories/git-ingest.md"
+cp "${INPUT}/crates/gitpond/src/factory/documentation.md" "${DUPLICATE}"
+check '! build' "assembly rejects duplicate authored component pages"
+check_contains "${WORK}/build.log" "duplicate diagnostic identifies its output" 'Generated component output collides with authored input: docs/manual/reference/factories/git-ingest.md'
+rm -- "${DUPLICATE}"
 printf '\nA cached-binary prose edit.\n' >> "${PAGE}"
+COMPONENT="${INPUT}/crates/gitpond/src/factory/documentation.md"
+printf '\nA colocated component prose edit.\n' >> "${COMPONENT}"
+printf '\n# A colocated YAML edit.\n' >> "${DEFAULTS}"
+cp "${COMPONENT}" "${WORK}/authored-component.md"
+cp "${DEFAULTS}" "${WORK}/authored-default.yaml"
 mkdir "${WORK}/tools"
 printf '#!/bin/bash\necho "Unexpected Cargo invocation" >&2\nexit 99\n' > "${WORK}/tools/cargo"
 chmod +x "${WORK}/tools/cargo"
 check 'PATH="${WORK}/tools:${PATH}" DOCS_SOURCE_ROOT="${INPUT}" DOCS_OUT="${SITE}" bash "${REPO_ROOT}/scripts/docs-build.sh" > "${WORK}/wrapper.log" 2>&1' "ordinary prose edits rebuild with Cargo unavailable"
 check_contains "${SHORTCODES}" "prose edit reaches output" 'A cached-binary prose edit.'
+check_contains "${GIT_FACTORY}" "colocated component prose reaches output without Cargo" 'A colocated component prose edit.'
+check_contains "${GIT_FACTORY}" "colocated YAML reaches output without Cargo" '# A colocated YAML edit.'
+check 'cmp "${COMPONENT}" "${WORK}/authored-component.md" && cmp "${DEFAULTS}" "${WORK}/authored-default.yaml"' "build leaves colocated inputs unchanged"
+check '[[ ! -e "${INPUT}/docs/manual/reference/factories/git-ingest.md" ]]' "component pages exist only in the generated staging tree"
 check '[[ ! -e "${WORK}/input/pond" && ! -e "${WORK}/input/.pond" ]]' "manual requires no pond"
 check_finish
