@@ -5471,6 +5471,7 @@
     "format:hledger",
     "format:jsonlogs",
     "format:oteljson",
+    "format:site-analytics",
     "format:weblog",
     "format:xls"
   ],
@@ -5919,6 +5920,13 @@
         "active_pattern": {
           "description": "Glob pattern for the active (append-only) log file\nExample: \"/var/log/casparwater.json\"",
           "type": "string"
+        },
+        "analytics_site_id": {
+          "description": "Opt in to the collector inventory/rotation protocol for this site.\nRequires exact views.jsonl/views-*.jsonl paths and microsecond timestamps.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "archived_pattern": {
           "description": "Glob pattern for archived (immutable) log files\nExample: \"/var/log/casparwater-*.json\"",

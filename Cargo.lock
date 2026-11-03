@@ -5346,6 +5346,7 @@ dependencies = [
  "datafusion-common",
  "datafusion-expr",
  "env_logger",
+ "fs2",
  "futures",
  "gitpond",
  "hledger-parser",
@@ -5364,6 +5365,8 @@ dependencies = [
  "serde_json",
  "serde_qs",
  "serde_yaml",
+ "sha2 0.11.1",
+ "site-analytics-collector",
  "stacker",
  "tempfile",
  "thiserror 2.0.21",
@@ -5374,6 +5377,7 @@ dependencies = [
  "tokio-util",
  "url",
  "utilities",
+ "uuid",
  "uuid7",
 ]
 

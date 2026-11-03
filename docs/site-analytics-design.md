@@ -1,6 +1,6 @@
 # First-party site analytics: design and implementation
 
-> **Status: Sitegen instrumentation and collector core implemented; not deployed.**
+> **Status: instrumentation, collector, and strict ingestion core implemented; not deployed.**
 > Phase 1 provides independent per-site catalogs and disabled-by-default
 > first-visible instrumentation. See the
 > [Sitegen reference](../crates/sitegen/src/factory/documentation.md) for the
@@ -8,8 +8,9 @@
 > [collector](../crates/site-analytics-collector/README.md) implements bounded
 > HTTP collection and durable local logs, with an inactive outer-repository
 > service template. Host provisioning, binary promotion, and proxy privacy
-> verification remain Phase 2 deployment gates. The ingestion integration,
-> rollup factory, and public reports remain proposals. Nothing is enabled in production.
+> verification remain Phase 2 deployment gates. Opt-in inventory-aware ingestion
+> and a typed reference query are implemented; staging scheduling remains pending.
+> The rollup factory and public reports remain proposals. Nothing is enabled in production.
 > Deployment and retention choices require approval.
 
 ## 1. Purpose and recommended scope
@@ -56,8 +57,8 @@ prefixed with `../`.
 | Sitegen routes | `crates/sitegen/src/routes.rs` expands routes into `PageJob`s; `analytics.rs` derives independent per-site catalogs from all eligible jobs, including recursive subsites. | Install and retain these catalogs in the collector registry before deployment. |
 | Browser output | Sitegen optionally emits first-visible instrumentation with escaped metadata in every layout. Copied HTML must be explicitly excluded or rendered through a layout. | Production disclosure and collector deployment approval. |
 | Collection endpoint | `crates/site-analytics-collector/` provides a standalone loopback HTTP service, catalog validation, durable NDJSON/inventory, rotation/recovery, and private health. | Promote/package the binary, provision isolated host accounts, and verify sanitized Caddy behavior before enabling collection. No event-by-event pond writes. |
-| Rotating ingestion | `crates/provider/src/factory/logfile_ingest/` ingests active files and immutable rotations. Configured integer JSON timestamps provide event-time bounds and active-record alignment. | A tested collector rotation contract, permissions, retention, and recovery procedure. |
-| JSON parsing | `crates/provider/src/format/jsonlogs/` exposes top-level JSON fields as nullable strings. Nested values remain JSON text. It buffers parsed input and warns when skipping malformed records. | Explicit typing and strict accounting for collector records; measure memory and avoid accepting undetected event loss. |
+| Rotating ingestion | `logfile-ingest` supports opt-in `analytics_site_id`: locked inventory snapshots, strict completeness/checksum checks, stable segment paths, typed time bounds, and transactional raw membership. | Staging permissions, cadence, scratch-space sizing, retention, and recovery operations. |
+| JSON parsing | `site-analytics://` streams strictly validated collector records with typed UTC timestamps and sequence identity. `jsonlogs://` remains permissive for its existing users. | Integrate the typed events with replacement rollups; measure retained-history scan cost on staging. |
 | Existing web experiment | `../config/watershop-selfmon.yaml` ingests Caddy JSON and defines `watershop-pageviews`, counting requests by hour and status. | This is not a page-view classifier and is not exported by the current selfmon Sitegen configuration. Do not copy it as the finished design. |
 | Temporal reduction | `crates/provider/src/factory/temporal_reduce/` has time-bucket aggregation, source-version caches, and late-data invalidation. | Its public configuration does not supply arbitrary grouping dimensions such as `page_uri`. A long-form page table is not a YAML-only application of that factory. |
 | Append materialization | `crates/provider/src/factory/materialize_series/` selects timestamps strictly greater than the target maximum. | Unsafe for changing aggregates and for late/equal-timestamp events. Do not use this as the analytics checkpoint. |
@@ -408,19 +409,21 @@ during the supported rebuild horizon.
 Use `logfile-ingest` with explicit integer timestamps:
 
 ```yaml
-# Illustrative existing factory configuration; host paths are proposed.
-archived_pattern: /var/log/watertown-analytics/site-prod/views-*.jsonl
-active_pattern: /var/log/watertown-analytics/site-prod/views.jsonl
+# Implemented opt-in configuration; host deployment remains proposed.
+archived_pattern: /var/lib/watertown-analytics/site-prod/views-*.jsonl
+active_pattern: /var/lib/watertown-analytics/site-prod/views.jsonl
 pond_path: /analytics/raw
 timestamp_field: received_at_us
 timestamp_unit: microseconds
+analytics_site_id: caspar-water
 ```
 
-This uses the current integer timestamp extractor rather than Caddy's usual
-fractional-seconds `ts`. Configuring a timestamp field also holds an unfinished
-active record until its newline arrives. Verify rotations with the actual
-collector, including rotation while ingestion is reading and multiple rotations
-between runs.
+This opts into the collector protocol, not the ordinary permissive timestamp
+extractor. Under a shared rotation lock it snapshots the durable inventory,
+verifies all listed segments, and stages exactly the acknowledged active prefix
+in a private temporary file. Complete and partial uncheckpointed tails wait.
+The lock is released before pond writes. Source scanning and scratch space are
+linear in retained history; memory and file-descriptor use are bounded.
 
 Parsed canonical events have typed timestamp, URI, site, catalog, and record
 identity fields. A strict validation stage must reconcile records against segment
@@ -428,15 +431,19 @@ sequence information and reject invalid accepted-event data before advancing
 progress. `jsonlogs://` alone is not that contract: its warning-and-skip parser
 can produce plausible but incomplete counts.
 
-Reuse the JSON provider if strict validation can be integrated without changing
-other log users' behavior. Otherwise add a narrow strict reader for collector
-records. Do not change all permissive log parsing as an incidental analytics fix.
+The separate `site-analytics://` reader supplies the typed schema and fails on
+invalid records without changing ordinary `jsonlogs://` parsing.
 
 Ingestion idempotence is based on logical source membership and accepted record
 identity, not filenames or maximum timestamps. Renaming an active log into its
 archive name must not count its prefix again. An explicitly restored duplicate
 segment must be recognized before aggregation; conflicting content for a known
-segment/sequence is an error.
+segment/sequence is an error. The implementation uses permanent UUID filenames
+even for the active pond segment, and commits `_inventory.json` with raw
+appends. Missing listed archives, regressed inventory, changed prefixes, and
+unlisted/duplicate host JSONL files fail rather than producing partial counts.
+Restoring an original missing archive allows retry; no automatic deletion is
+implemented. An empty inventory is explicit, not inferred from a failed glob.
 
 Keep collection, ingestion, aggregation, and Sitegen on independent cadences.
 Collection is continuous. Ingestion can run more frequently than the site's
@@ -840,6 +847,13 @@ memory and queue size remain bounded under overload. Proxy and process logs are
 checked for unintended request-data retention.
 
 ### Phase 3: ingestion and a reference query
+
+**Core implemented; staging installation pending.** Opt-in strict ingestion
+and `site-analytics://` pass a real collector-journal to TLogFS/DataFusion
+reference-query test through append, rotation, restart, interrupted transaction,
+restore, and error cases. Inventory membership is atomic with raw appends.
+Host scheduling, backup verification, and outage-coverage intervals remain
+operational gates, and no production configuration is enabled.
 
 Primary code: existing `logfile-ingest`, strict collector-record validation,
 and SQL/provider integration under `crates/provider/`.

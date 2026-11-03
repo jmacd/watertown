@@ -134,6 +134,7 @@
         "format:csv",
         "format:oteljson",
         "format:jsonlogs",
+        "format:site-analytics",
         "format:weblog",
         "format:xls",
         "format:excelhtml",
@@ -519,6 +520,15 @@
       "examples": [],
       "coverage": "unverified",
       "output": "docs/manual/reference/formats/jsonlogs.md"
+    },
+    "format:site-analytics": {
+      "path": "crates/provider/src/format/site_analytics/documentation.md",
+      "components": [
+        "format:site-analytics"
+      ],
+      "examples": [],
+      "coverage": "validation-only",
+      "output": "docs/manual/reference/formats/site-analytics.md"
     },
     "format:oteljson": {
       "path": "crates/provider/src/format/oteljson/documentation.md",

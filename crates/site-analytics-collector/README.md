@@ -132,10 +132,13 @@ acknowledged data, unlisted segments, or malformed complete records fail startup
 they are never silently skipped. Startup cost is linear in retained log bytes.
 
 `.rotation.lock` is held exclusively during startup recovery and rotation. The
-future ingestion integration must take a shared lock while discovering/opening
-and reading its host snapshot, and align active reads to complete lines. The
-current `logfile-ingest` factory **does not yet participate in this protocol**;
-do not claim a production-safe integration just by matching filename patterns.
+ingester must take a shared lock while discovering/opening and reading its host
+snapshot. `logfile-ingest` participates when explicitly configured with
+`analytics_site_id` and the collector's exact filenames. It verifies the complete
+inventory and stages its durable prefixes under the shared lock, then releases
+the lock before pond writes. Query that isolated raw destination through
+`site-analytics://`. Ordinary glob matching without this opt-in is **not** the
+collector protocol.
 
 `SIGTERM`/`SIGINT` stop serving and drain queued writes before exit. Crash tests
 cover append, log synchronization, inventory publication, rename, new-inventory,

@@ -3,3 +3,4 @@ active_pattern: /var/log/example.jsonl     # Required: example active log.
 pond_path: logs/example                    # Required: example pond destination.
 timestamp_field: null                      # Default: do not extract time bounds.
 timestamp_unit: microseconds               # Default: unit when a field is selected.
+analytics_site_id: null                    # Default: ordinary logs, no collector protocol.

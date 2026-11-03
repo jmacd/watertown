@@ -25,6 +25,7 @@ mod tests {
             pond_path: "logs/test".to_string(),
             timestamp_field: None,
             timestamp_unit: Default::default(),
+            analytics_site_id: None,
         };
 
         assert!(config.validate().is_ok());
@@ -38,6 +39,7 @@ mod tests {
             pond_path: "".to_string(),
             timestamp_field: None,
             timestamp_unit: Default::default(),
+            analytics_site_id: None,
         };
 
         assert!(config.validate().is_err());
@@ -349,6 +351,7 @@ mod integration_tests {
             pond_path: "logs/test_app".to_string(),
             timestamp_field: None,
             timestamp_unit: Default::default(),
+            analytics_site_id: None,
         };
 
         // Create pond with the config (creates real config file with FileID)
@@ -488,6 +491,7 @@ mod integration_tests {
             pond_path: "logs/test_app".to_string(),
             timestamp_field: None,
             timestamp_unit: Default::default(),
+            analytics_site_id: None,
         };
 
         // Create pond with config (gets real FileID)
@@ -562,6 +566,7 @@ mod integration_tests {
             pond_path: "logs/test_app".to_string(),
             timestamp_field: None,
             timestamp_unit: Default::default(),
+            analytics_site_id: None,
         };
 
         // Create pond
@@ -911,6 +916,7 @@ mod integration_tests {
             pond_path: "logs/blake3_test".to_string(),
             timestamp_field: None,
             timestamp_unit: Default::default(),
+            analytics_site_id: None,
         };
 
         let pond = PondSimulator::new(&config).await.unwrap();
@@ -1075,6 +1081,7 @@ mod integration_tests {
             pond_path: "logs/large_test".to_string(),
             timestamp_field: None,
             timestamp_unit: Default::default(),
+            analytics_site_id: None,
         };
 
         let pond = PondSimulator::new(&config).await.unwrap();
@@ -1167,6 +1174,7 @@ mod integration_tests {
             pond_path: "logs/boundary_test".to_string(),
             timestamp_field: None,
             timestamp_unit: Default::default(),
+            analytics_site_id: None,
         };
 
         let pond = PondSimulator::new(&config).await.unwrap();
@@ -1280,6 +1288,7 @@ mod integration_tests {
                 pond_path: format!("logs/{}", test_name),
                 timestamp_field: None,
                 timestamp_unit: Default::default(),
+                analytics_site_id: None,
             };
 
             let pond = PondSimulator::new(&config).await?;

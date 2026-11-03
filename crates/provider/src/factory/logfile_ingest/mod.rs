@@ -24,6 +24,8 @@ use tinyfs::ResultExt;
 use tinyfs::{EntryType, FileID, Result as TinyFSResult};
 use utilities::bao_outboard::IncrementalHashState;
 
+mod analytics;
+
 /// Logfile ingest factory subcommands
 #[derive(Debug, Parser)]
 struct LogfileCommand {
@@ -100,6 +102,11 @@ pub struct LogfileIngestConfig {
     /// nanoseconds; journald's `__REALTIME_TIMESTAMP` is microseconds.
     #[serde(default)]
     pub timestamp_unit: TimestampUnit,
+
+    /// Opt in to the collector inventory/rotation protocol for this site.
+    /// Requires exact views.jsonl/views-*.jsonl paths and microsecond timestamps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analytics_site_id: Option<String>,
 }
 
 /// Unit of the values found under `timestamp_field`.
@@ -163,6 +170,9 @@ impl TimestampUnit {
 impl LogfileIngestConfig {
     /// Validate the configuration
     pub fn validate(&self) -> TinyFSResult<()> {
+        if self.analytics_site_id.is_some() {
+            analytics::validate_config(self)?;
+        }
         if self.archived_pattern.is_empty() {
             return Err(tinyfs::Error::Other(
                 "archived_pattern cannot be empty".to_string(),
@@ -460,6 +470,11 @@ pub async fn execute(
 
     match cmd.command {
         Some(LogfileSubcommand::B3sum) => {
+            if config.analytics_site_id.is_some() {
+                return Err(tinyfs::Error::Other(
+                    "b3sum uses host filenames and is unavailable for analytics; use inventory-validated ingestion".into(),
+                ));
+            }
             return execute_b3sum(&context, &config).await;
         }
         Some(LogfileSubcommand::Pull) => {
@@ -476,6 +491,10 @@ pub async fn execute(
         "Starting logfile ingestion for (mode: {:?})",
         ExecutionMode::PondReadWriter
     );
+
+    if config.analytics_site_id.is_some() {
+        return analytics::ingest(&context, &config).await;
+    }
 
     // Step 1: Enumerate host files
     let host_files = enumerate_host_files(&config).await?;
@@ -1263,6 +1282,7 @@ mod tests {
             pond_path: "logs/test".to_string(),
             timestamp_field: None,
             timestamp_unit: TimestampUnit::default(),
+            analytics_site_id: None,
         };
 
         assert!(config.validate().is_ok());
@@ -1276,6 +1296,7 @@ mod tests {
             pond_path: "".to_string(),
             timestamp_field: None,
             timestamp_unit: TimestampUnit::default(),
+            analytics_site_id: None,
         };
 
         assert!(config.validate().is_err());
@@ -1591,6 +1612,7 @@ mod tests {
             pond_path: "logs/test".to_string(),
             timestamp_field: Some("".to_string()),
             timestamp_unit: TimestampUnit::default(),
+            analytics_site_id: None,
         };
         assert!(config.validate().is_err());
     }
@@ -1607,6 +1629,7 @@ mod line_alignment_tests {
             pond_path: "/ingest".to_string(),
             timestamp_field: Some("timeUnixNano".to_string()),
             timestamp_unit: Default::default(),
+            analytics_site_id: None,
         }
     }
 

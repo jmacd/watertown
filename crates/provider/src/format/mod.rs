@@ -25,6 +25,7 @@ pub mod excelhtml;
 pub mod hledger;
 pub mod jsonlogs;
 pub mod oteljson;
+pub mod site_analytics;
 pub mod weblog;
 pub mod xls;
 

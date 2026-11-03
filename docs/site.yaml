@@ -142,6 +142,8 @@ sidebar:
             href: /reference/formats/oteljson.html
           - label: JSON logs
             href: /reference/formats/jsonlogs.html
+          - label: Site analytics
+            href: /reference/formats/site-analytics.html
           - label: Web logs
             href: /reference/formats/weblog.html
           - label: Excel HTML

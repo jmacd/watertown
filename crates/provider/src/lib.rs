@@ -19,6 +19,7 @@ pub mod partial_aggregate_cache;
 mod provider_api;
 pub mod query_foundation_adapter;
 pub mod series_append;
+mod site_analytics;
 pub mod size_tier;
 mod sql_transform;
 mod table_creation;
