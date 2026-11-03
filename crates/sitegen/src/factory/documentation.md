@@ -26,5 +26,60 @@ Install with `pond mknod sitegen /etc/site --config-path site.yaml`, then run `p
 
 Paths are rooted in the selected input filesystem, not the YAML file's directory. See the [configuration topics](../sitegen/configuration.md), [blog guide](../../guides/blog.md), and [timeseries-site guide](../../guides/timeseries-site.md).
 
+### Optional reported page views
+
+Instrumentation is disabled by default. To prepare an instrumented build:
+
+```yaml
+analytics:
+  enabled: true
+  site_id: caspar-water
+  endpoint: /_analytics/view
+  exclude:
+    - /status
+```
+
+The collector is not implemented yet. Do not publish an enabled build until a
+same-origin collector has installed and accepted its catalog. The script makes
+one best-effort request per top-level document, at first visibility after
+prerender activation. Tab returns and already-reported back/forward-cache
+restores do not report again; reloads create new documents. Failures warn without
+blocking the page, and there are no retries, cookies, visitor identifiers, client
+timestamps, or referrers in the request.
+
+Each enabled site emits `_analytics/catalog.json` and one shared
+`_analytics/view-<sha256>.js` asset in its own output directory. The catalog
+contains version, stable `site_id`, sorted entries (`page_uri`, title, aliases),
+and a SHA-256 identity derived from version, site identity, and entries serialized
+as compact JSON in that field order. Neither build timestamps nor exported data
+change its identity. Public catalog labels describe only eligible pages; the
+collector's installed registry and historical catalogs must remain private.
+
+Canonical paths include `site.base_url` exactly once. With the supported Caddy
+`try_files {path} {path}.html {path}/` configuration, `water.html` identifies
+`/water`, while `section/index.html` identifies `/section/`. Explicit aliases
+include those emitted paths and the directory's slashless request path.
+Ambiguous serving paths fail enabled builds rather than merging page counts.
+The `_analytics/` output namespace is reserved for generated analytics artifacts.
+
+Subsites must opt in independently and use distinct `site_id` values. Parent
+enablement is never inherited, and no subsite entries enter the parent's catalog.
+A subsite's configured `base_url` must match its actual publishing mount.
+Noyo therefore remains its own site while mounted at `/noyo-harbor/`; a later
+domain move leaves its stable site identity unchanged but changes its catalog
+paths. The endpoint is always an origin-relative path, never mount-prefixed.
+
+Use frontmatter `analytics: false` or exact canonical paths in `exclude` for
+private, diagnostic, or synthetic pages. Navigation `hidden` is unrelated.
+The site's `/analytics` dashboard (including its directory form) is excluded by
+default. Raw HTML inside Markdown is instrumented by the surrounding layout.
+Copied standalone HTML assets must be explicitly excluded or converted to
+layout-rendered pages; they are never silently counted as instrumented.
+
+Documentation configurations remain off unless explicitly enabled. `build
+--no-analytics` suppresses instrumentation for the whole tree even when sites
+opt in; `--quick` always suppresses it. Use this for previews. These controls
+do not disable unrelated chart or page scripts.
+
 <!-- docs:reference factory:sitegen -->
 <!-- docs:end-reference -->

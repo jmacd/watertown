@@ -1,10 +1,12 @@
 # First-party site analytics: design and implementation
 
-> **Status: proposal, not implemented.** This document specifies a small,
-> first-party analytics pipeline owned end-to-end by Sitegen and Watertown.
-> Proposed configuration keys, factory names, endpoint paths, and schemas below
-> are design interfaces, not currently available commands. Deployment and
-> retention choices require approval before implementation in production.
+> **Status: Sitegen instrumentation implemented; collection and storage proposed.**
+> Phase 1 provides independent per-site catalogs and disabled-by-default
+> first-visible instrumentation. See the
+> [Sitegen reference](../crates/sitegen/src/factory/documentation.md) for the
+> implemented configuration. The collector, ingestion contract, rollup factory,
+> and public reports below remain proposals. Nothing is enabled in production.
+> Deployment and retention choices require approval.
 
 ## 1. Purpose and recommended scope
 
@@ -47,8 +49,8 @@ prefixed with `../`.
 
 | Component | Existing behavior | Work required |
 |---|---|---|
-| Sitegen routes | `crates/sitegen/src/routes.rs` expands static, content, and template routes into `PageJob`s and indexes canonical content URLs. | A complete analytics catalog across all emitted page types and recursive subsites; optional instrumentation. |
-| Browser output | Sitegen controls layouts, assets, and generated HTML. | A tiny first-party script and escaped page metadata; explicit treatment of HTML passthrough and documentation layouts. |
+| Sitegen routes | `crates/sitegen/src/routes.rs` expands routes into `PageJob`s; `analytics.rs` derives independent per-site catalogs from all eligible jobs, including recursive subsites. | Install and retain these catalogs in the future collector registry. |
+| Browser output | Sitegen optionally emits first-visible instrumentation with escaped metadata in every layout. Copied HTML must be explicitly excluded or rendered through a layout. | Production disclosure and collector deployment approval. |
 | Collection endpoint | Static hosting is configured through Caddy in the outer repository. | A bounded, independently supervised HTTP collector writing local logs. No event-by-event pond writes. |
 | Rotating ingestion | `crates/provider/src/factory/logfile_ingest/` ingests active files and immutable rotations. Configured integer JSON timestamps provide event-time bounds and active-record alignment. | A tested collector rotation contract, permissions, retention, and recovery procedure. |
 | JSON parsing | `crates/provider/src/format/jsonlogs/` exposes top-level JSON fields as nullable strings. Nested values remain JSON text. It buffers parsed input and warns when skipping malformed records. | Explicit typing and strict accounting for collector records; measure memory and avoid accepting undetected event loss. |
@@ -171,10 +173,18 @@ integer index and not an auto-incremented page number. A genuine URL rename
 creates a new identity unless an explicit reporting alias later joins them.
 Titles can change without changing identity.
 
-Keep environment separation in the collector and pond configuration. A server
-configured for staging must never accept a browser field that routes events into
-production. If datasets are combined later, use a server-assigned `site_id` and
-environment dimension.
+Keep site and environment separation in the collector and pond configuration.
+Noyo is an independent site temporarily mounted at `/noyo-harbor/`, not a section
+of Caspar Water. Give each site a stable `site_id`, separate catalogs, datasets,
+coverage, and reports. Moving Noyo to an independent origin such as
+`noyocenter.org` changes its mounted page paths and catalog, not its site identity
+or Caspar Water's analytics. Historical path aliases for that move require an
+explicit reporting migration.
+
+A server configured for staging must never accept a browser field that routes
+events into production. Resolve `site_id` from the installed catalog and trusted
+collector configuration, not a browser-supplied routing field. Shared collector
+infrastructure may serve separate sites but must preserve their boundaries.
 
 ### 5.2 Catalog generation
 
@@ -195,10 +205,13 @@ Construct aliases from actual emitted paths and the configured serving rules.
 Do not universally strip `.html`, lowercase paths, decode reserved separators,
 or remove trailing slashes. These operations can merge distinct URLs.
 
-Combine recursive subsite catalogs at the outer publishing root after applying
-each mount prefix exactly once. Fail the build on conflicting canonical URIs or
-aliases. The configured origin-wide collector endpoint must not accidentally
-become `/noyo-harbor/_analytics/...` when rendering a subsite.
+Generate a separate catalog for each independently configured site, including
+recursive subsites, after applying each mount prefix exactly once. Never merge
+Noyo's entries into Caspar Water's catalog or inherit analytics enablement from
+the parent. Validate serving-path collisions across the combined output without
+combining analytics ownership. The configured origin-relative collector endpoint
+must not accidentally become `/noyo-harbor/_analytics/...` when rendering a
+subsite. A collector shared by both sites resolves their catalogs separately.
 
 Explicit opt-out controls are needed for private/internal pages, diagnostic
 pages, and previews. Do not equate "hidden from navigation" with "do not count."
@@ -424,7 +437,7 @@ The primary hourly table is long-form:
 | `page_uri` | UTF-8 string | Canonical page identity, including mount prefix. |
 | `page_views` | UInt64 | Accepted reported views assigned to this bucket. |
 
-The logical key is `(timestamp, page_uri)` within one site/environment and metric
+The logical key is `(timestamp, page_uri)` within one separate site/environment and metric
 definition. Exactly one current row may exist for each key. Keep source snapshot,
 recipe version, catalog registry identity, and coverage in publication metadata
 rather than repeating them in every count row.
@@ -435,7 +448,7 @@ Example:
 timestamp             page_uri          page_views
 2026-11-01T10:00:00Z   /                 12
 2026-11-01T10:00:00Z   /water             7
-2026-11-01T10:00:00Z   /noyo-harbor/      4
+2026-11-01T10:00:00Z   /blog/example     4
 2026-11-01T11:00:00Z   /water             9
 ```
 
@@ -673,9 +686,14 @@ setting, not a runtime special case hidden in the SQL.
 
 ### 12.1 Initial topology
 
-Recommend one local collector per serving environment. Initially use the site's
-existing pond for raw ingestion and private aggregate materialization, but run
-collector and ingestion jobs independently of site rendering.
+Recommend one local collector per serving environment, with separate trusted
+catalog registries and streams for each site if the process is shared. Initially
+use the site's existing pond for raw ingestion and private aggregate
+materialization, but run collector and ingestion jobs independently of site
+rendering. Noyo's data and reports remain independent of the Caspar Water site
+pond even while both are published by the same outer build. Its current imported
+read-only mount is not a write destination; provisioning must provide an
+explicitly writable, site-owned ingestion destination.
 
 This avoids a new pond replication lifecycle. A separate analytics pond can
 follow if privacy permissions, workload, or retention require it. Ensure existing
@@ -721,13 +739,14 @@ Public presentation can be disabled independently of collection.
 
 ## 13. Proposed configuration surface
 
-These examples illustrate interfaces to implement; they are not valid current
-Sitegen or rollup configuration.
+The Sitegen interface below is implemented but disabled by default. The rollup
+example remains a proposed interface, not an available factory.
 
 ```yaml
-# Proposed Sitegen opt-in.
+# Implemented Sitegen opt-in; collector deployment is still required.
 analytics:
   enabled: true
+  site_id: caspar-water
   endpoint: /_analytics/view
   exclude:
     - /analytics
@@ -757,12 +776,13 @@ Each phase should be independently reviewable. Documentation and tests must
 distinguish implemented behavior from future configuration. Work stays in the
 checked-out repository pair; branch creation and PR merging remain human-owned.
 
-### Phase 1: page identity and disabled-by-default instrumentation
+### Phase 1: page identity and disabled-by-default instrumentation (implemented)
 
 Primary code: `crates/sitegen/src/routes.rs`, `config.rs`, `layouts.rs`,
 `factory/mod.rs`, and the existing asset pipeline.
 
-- Define a complete route catalog and deterministic identity.
+- Define complete per-site route catalogs and deterministic identities; do not
+  merge Noyo into Caspar Water or inherit parent analytics settings.
 - Cover static, template, content, recursive subsite, and passthrough pages.
 - Add the opt-in browser script and fixed first-visible semantics.
 - Keep endpoints origin-relative and safely escape embedded metadata.
@@ -922,8 +942,9 @@ operational choices remain explicit approval points:
 
 1. Confirm first-visible-document semantics, including not counting an already
    reported back/forward-cache restoration.
-2. Confirm that canonical mounted path is the requested base-URI dimension;
-   add a site dimension only if combining origins/environments.
+2. Canonical mounted paths are scoped to stable, independent site identities.
+   Noyo and Caspar Water remain separate even on one origin; any future URL move
+   needs an explicit historical reporting alias policy.
 3. Choose public granularity: hourly per-page counts or daily-only publication.
 4. Approve raw-event/backup retention, repair horizon, and disclosure/consent
    treatment.

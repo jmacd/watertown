@@ -24,6 +24,7 @@ metric_captions: {}          # Default: no chart-caption overrides.
 reports: {}                  # Default: no named reports.
 theme: {}                    # Default: built-in CSS variables.
 subsites: []                 # Default: no imported subsites.
+analytics: null              # Default: no reported page-view instrumentation.
 documentation: null         # Default: ordinary site rendering.
 strict: false                # Default: strict diagnostics not enabled.
 feed: null                   # Default: no RSS feed.

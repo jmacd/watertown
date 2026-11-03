@@ -36,6 +36,9 @@ use std::collections::BTreeMap;
 #[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub struct SiteConfig {
     pub site: SiteMeta,
+    /// Independent, opt-in reported page views. Never inherited by subsites.
+    #[serde(default)]
+    pub analytics: Option<AnalyticsConfig>,
     /// Opt in to source-relative manual paths, literal code, and lean assets.
     #[serde(default)]
     pub documentation: Option<DocumentationConfig>,
@@ -138,6 +141,28 @@ pub struct SiteConfig {
     /// See `StatusGridConfig` for fields.
     #[serde(default)]
     pub status_grid: Option<StatusGridConfig>,
+}
+
+/// First-visible-document analytics, disabled unless explicitly enabled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
+pub struct AnalyticsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Stable publisher-owned site identity, independent of host and mount path.
+    pub site_id: String,
+    /// Same-origin absolute path. Shared endpoints must resolve sites by catalog.
+    #[serde(default = "default_analytics_endpoint")]
+    pub endpoint: String,
+    /// Exact canonical mounted paths to exclude, in addition to /analytics.
+    /// Frontmatter analytics: false also excludes a page; hidden does not.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+fn default_analytics_endpoint() -> String {
+    "/_analytics/view".into()
 }
 
 /// Bounded documentation capabilities; paths are relative to the input root.

@@ -111,6 +111,7 @@ fn top_bar(
 
 /// Context passed to layout functions.
 pub struct LayoutContext<'a> {
+    pub analytics: Option<&'a crate::analytics::PageAnalytics>,
     /// Page title (from frontmatter)
     pub title: &'a str,
     /// Site title (from site.yaml)
@@ -176,6 +177,9 @@ fn documentation_layout(ctx: &LayoutContext) -> Markup {
                 title { (ctx.title) " -- " (ctx.site_title) }
                 link rel="stylesheet" href=(format!("{}style.css", ctx.root_base_url));
                 link rel="stylesheet" href=(format!("{}theme.css", ctx.base_url));
+                @if let Some(analytics) = ctx.analytics {
+                    (analytics.markup())
+                }
             }
             body class="documentation" {
                 a class="skip-link" href="#manual-content" { "Skip to content" }
@@ -209,6 +213,9 @@ fn documentation_layout(ctx: &LayoutContext) -> Markup {
 /// Common `<head>` elements shared by all layouts.
 fn common_head(ctx: &LayoutContext) -> Markup {
     html! {
+        @if let Some(analytics) = ctx.analytics {
+            (analytics.markup())
+        }
         meta charset="utf-8";
         meta name="viewport" content="width=device-width, initial-scale=1";
         meta name="generator" content=(format!("Watertown v{}", VERSION));
@@ -463,6 +470,7 @@ mod tests {
     #[test]
     fn documentation_assets_follow_active_shortcodes_only() {
         let mut ctx = LayoutContext {
+            analytics: None,
             title: "Manual",
             site_title: "Test",
             base_url: "/watertown/",
@@ -489,6 +497,7 @@ mod tests {
     #[test]
     fn test_default_layout() {
         let ctx = LayoutContext {
+            analytics: None,
             title: "Home",
             site_title: "Test Site",
             base_url: "/",
@@ -530,6 +539,7 @@ mod tests {
     #[test]
     fn test_data_layout_with_sidebar() {
         let ctx = LayoutContext {
+            analytics: None,
             title: "Temperature",
             site_title: "Noyo Harbor",
             base_url: "/noyo-harbor/",
@@ -563,6 +573,7 @@ mod tests {
     #[test]
     fn test_unknown_layout_falls_back_to_default() {
         let ctx = LayoutContext {
+            analytics: None,
             title: "Page",
             site_title: "Site",
             base_url: "/",
@@ -582,6 +593,7 @@ mod tests {
     #[test]
     fn test_page_layout() {
         let ctx = LayoutContext {
+            analytics: None,
             title: "Water System",
             site_title: "Caspar Water",
             base_url: "/",
@@ -610,6 +622,7 @@ mod tests {
     #[test]
     fn test_blog_layout() {
         let ctx = LayoutContext {
+            analytics: None,
             title: "My Blog Post",
             site_title: "Test Blog",
             base_url: "/",
@@ -668,6 +681,7 @@ mod tests {
     #[test]
     fn test_blog_layout_no_date() {
         let ctx = LayoutContext {
+            analytics: None,
             title: "Undated Post",
             site_title: "Blog",
             base_url: "/",
@@ -692,6 +706,7 @@ mod tests {
     #[test]
     fn test_logs_layout_uses_root_base_url() {
         let ctx = LayoutContext {
+            analytics: None,
             title: "System Logs",
             site_title: "Noyo Harbor",
             base_url: "/noyo-harbor/",
@@ -723,6 +738,7 @@ mod tests {
     #[test]
     fn test_explore_layout_loads_explore_js() {
         let ctx = LayoutContext {
+            analytics: None,
             title: "Data Explorer",
             site_title: "Noyo Harbor",
             base_url: "/noyo-harbor/",

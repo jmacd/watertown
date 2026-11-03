@@ -15,6 +15,7 @@
 //! 4. Renders each page: markdown -> shortcodes -> HTML -> layout
 //! 5. Writes the complete site to the output directory
 
+use crate::analytics::{self, BuildRegistry, Catalog, CatalogEntry};
 use crate::config::SiteConfig;
 use crate::documentation;
 use crate::layouts::{self, LayoutContext};
@@ -56,6 +57,9 @@ enum SitegenSubcommand {
         /// Fail on incomplete routes, navigation, includes, and local links
         #[arg(long)]
         strict: bool,
+        /// Disable analytics for the entire build, including independent subsites
+        #[arg(long)]
+        no_analytics: bool,
     },
     /// Render a named report without sending it
     Report {
@@ -73,6 +77,7 @@ enum SitegenSubcommand {
 fn validate_config(config: &[u8]) -> tinyfs::Result<Value> {
     // Try parsing as standalone SiteConfig first
     if let Ok(config) = serde_yaml::from_slice::<SiteConfig>(config) {
+        analytics::validate(&config).map_err(tinyfs::Error::Other)?;
         if let Some(documentation) = &config.documentation {
             documentation::validate_config(documentation).map_err(tinyfs::Error::Other)?;
         }
@@ -119,6 +124,7 @@ fn extract_sitegen_from_pond_config(config: &[u8]) -> tinyfs::Result<Value> {
                     tinyfs::Error::Other(format!("Invalid sitegen config in pond YAML: {}", e))
                 })?;
             crate::report::validate_reports(&site_config).map_err(tinyfs::Error::Other)?;
+            analytics::validate(&site_config).map_err(tinyfs::Error::Other)?;
 
             return serde_json::to_value(&site_config)
                 .map_other_context("Config serialization error");
@@ -156,6 +162,7 @@ async fn execute(
             output_dir,
             quick,
             strict,
+            no_analytics,
         } => {
             config.strict |= strict;
             let output_path = std::path::PathBuf::from(&output_dir);
@@ -169,6 +176,7 @@ async fn execute(
             })?;
             let root = context.root().await?;
             let provider_ctx = &context.context;
+            let mut registry = BuildRegistry::default();
 
             if quick {
                 info!("Quick mode: skipping exports and subsites");
@@ -176,6 +184,7 @@ async fn execute(
                 let mut quick_config = config.clone();
                 quick_config.exports.clear();
                 quick_config.subsites.clear();
+                quick_config.analytics = None;
 
                 build_site_from_root(
                     &quick_config,
@@ -183,104 +192,27 @@ async fn execute(
                     provider_ctx,
                     &output_path,
                     &quick_config.site.base_url,
+                    &mut registry,
                 )
                 .await?;
 
                 write_shared_assets(&output_path, quick_config.documentation.is_some())?;
                 write_theme_css(&output_path, &quick_config.theme)?;
             } else {
-                // Build the main site
-                build_site_from_root(
+                build_site_tree(
                     &config,
                     &root,
                     provider_ctx,
                     &output_path,
                     &config.site.base_url,
+                    no_analytics,
+                    &mut registry,
                 )
                 .await?;
-
-                // Write shared build assets (base CSS, JS, vendor) once
-                // Write per-site theme overrides
-                write_theme_css(&output_path, &config.theme)?;
-
-                // Build subsites from imported ponds
-                for subsite in &config.subsites {
-                    info!("Building subsite '{}'...", subsite.name);
-
-                    // Read sub-site config from the imported pond
-                    let config_full_path = format!("{}{}", subsite.path, subsite.config);
-                    let config_bytes = root
-                        .read_file_path_to_vec(&config_full_path)
-                        .await
-                        .map_err(|e| {
-                            tinyfs::Error::Other(format!(
-                                "Cannot read subsite config '{}': {}",
-                                config_full_path, e
-                            ))
-                        })?;
-                    let mut sub_config: SiteConfig = serde_yaml::from_slice(&config_bytes)
-                        .map_err(|e| {
-                            tinyfs::Error::Other(format!(
-                                "Invalid subsite config '{}': {}",
-                                config_full_path, e
-                            ))
-                        })?;
-                    sub_config.strict |= config.strict;
-
-                    // Override base_url if specified, rewriting sidebar links
-                    // to match the new mount point.
-                    if let Some(ref base_url) = subsite.base_url {
-                        let old_base = sub_config.site.base_url.clone();
-                        sub_config.site.base_url = base_url.clone();
-                        if old_base != *base_url {
-                            sub_config.rewrite_sidebar_urls(&old_base, base_url);
-                        }
-                    }
-
-                    // Derive output subdirectory from base_url relative to parent.
-                    // e.g. parent base="/staging/", subsite base="/staging/noyo-harbor/"
-                    // → subdir = "noyo-harbor"
-                    let parent_base = config.site.base_url.trim_matches('/');
-                    let sub_base = subsite
-                        .base_url
-                        .as_deref()
-                        .unwrap_or(&subsite.name)
-                        .trim_matches('/');
-                    let subdir = sub_base
-                        .strip_prefix(parent_base)
-                        .unwrap_or(sub_base)
-                        .trim_start_matches('/');
-                    let subsite_output = output_path.join(subdir);
-                    std::fs::create_dir_all(&subsite_output).map_err(|e| {
-                        tinyfs::Error::Other(format!("mkdir {:?}: {}", subsite_output, e))
-                    })?;
-
-                    // Create WD scoped to the mount point
-                    let subsite_wd = root.open_dir_path(&subsite.path).await.map_err(|e| {
-                        tinyfs::Error::Other(format!(
-                            "Cannot open subsite path '{}': {}",
-                            subsite.path, e
-                        ))
-                    })?;
-                    let subsite_root = subsite_wd.as_root();
-
-                    build_site_from_root(
-                        &sub_config,
-                        &subsite_root,
-                        provider_ctx,
-                        &subsite_output,
-                        &config.site.base_url,
-                    )
-                    .await?;
-
-                    // Write per-subsite theme overrides
-                    write_theme_css(&subsite_output, &sub_config.theme)?;
-
-                    info!("Subsite '{}' built at {:?}", subsite.name, subsite_output);
-                }
                 write_shared_assets(&output_path, config.documentation.is_some())?;
             }
 
+            registry.finish().map_err(tinyfs::Error::Other)?;
             validate_local_image_references(&output_path, &root_base_url)?;
             if config.strict {
                 documentation::validate_output(&output_path, &root_base_url)
@@ -305,6 +237,79 @@ async fn execute(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn build_site_tree(
+    config: &SiteConfig,
+    root: &tinyfs::WD,
+    provider_ctx: &tinyfs::ProviderContext,
+    output: &Path,
+    root_base_url: &str,
+    no_analytics: bool,
+    registry: &mut BuildRegistry,
+) -> Result<(), tinyfs::Error> {
+    let mut config = config.clone();
+    if no_analytics {
+        config.analytics = None;
+    }
+    build_site_from_root(&config, root, provider_ctx, output, root_base_url, registry).await?;
+    write_theme_css(output, &config.theme)?;
+
+    for subsite in &config.subsites {
+        let config_path = format!("{}{}", subsite.path, subsite.config);
+        let bytes = root.read_file_path_to_vec(&config_path).await?;
+        let mut child: SiteConfig = serde_yaml::from_slice(&bytes)
+            .map_other_context(format!("Invalid subsite config '{config_path}'"))?;
+        child.strict |= config.strict;
+        let old_base = child.site.base_url.clone();
+        // The mount is a publishing concern; analytics settings stay site-owned.
+        if let Some(base) = &subsite.base_url {
+            child.site.base_url = base.clone();
+            child.rewrite_sidebar_urls(&old_base, base);
+        }
+        let parent_base = config.site.base_url.trim_matches('/');
+        let sub_base = subsite
+            .base_url
+            .as_deref()
+            .unwrap_or(&subsite.name)
+            .trim_matches('/');
+        let subdir = sub_base
+            .strip_prefix(parent_base)
+            .unwrap_or(sub_base)
+            .trim_start_matches('/');
+        if !no_analytics
+            && analytics::enabled(&child).is_some()
+            && child.site.base_url != format!("{}{subdir}/", config.site.base_url)
+        {
+            return Err(tinyfs::Error::Other(format!(
+                "analytics subsite '{}' base_url must match its emitted mount",
+                subsite.name
+            )));
+        }
+        if Path::new(subdir)
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_)))
+        {
+            return Err(tinyfs::Error::Other(format!(
+                "invalid subsite mount '{subdir}'"
+            )));
+        }
+        let child_output = output.join(subdir);
+        std::fs::create_dir_all(&child_output).map_other()?;
+        let child_root = root.open_dir_path(&subsite.path).await?.as_root();
+        Box::pin(build_site_tree(
+            &child,
+            &child_root,
+            provider_ctx,
+            &child_output,
+            root_base_url,
+            no_analytics,
+            registry,
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
 /// Build a single site from a WD root.
 ///
 /// Runs the full sitegen pipeline: export stages, content stages, route
@@ -321,7 +326,9 @@ async fn build_site_from_root(
     provider_ctx: &tinyfs::ProviderContext,
     output_dir: &std::path::Path,
     root_base_url: &str,
+    registry: &mut BuildRegistry,
 ) -> Result<(), tinyfs::Error> {
+    analytics::validate(config).map_err(tinyfs::Error::Other)?;
     let build_started = Instant::now();
 
     // Run export stages
@@ -450,6 +457,10 @@ async fn build_site_from_root(
             }
         }
     }
+
+    registry
+        .record(config, &jobs, static_assets.keys())
+        .map_err(tinyfs::Error::Other)?;
 
     // Simple lookup closure
     let read_pond_file = |path: &str| -> Result<String, String> {
@@ -1851,6 +1862,7 @@ async fn run_content_stages(
             let (fm_yaml, _body) = split_frontmatter(&text);
             let fm: Frontmatter = if fm_yaml.is_empty() {
                 Frontmatter {
+                    analytics: None,
                     title: slug_from_path(&path_str),
                     layout: default_layout(),
                     weight: default_weight(),
@@ -2341,6 +2353,10 @@ register_executable_factory!(
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "documentation", derive(schemars::JsonSchema))]
 pub(crate) struct Frontmatter {
+    /// Set false to exclude this page from analytics, independently of navigation.
+    /// True never enables analytics when the site or build has disabled it.
+    #[serde(default)]
+    analytics: Option<bool>,
     #[serde(default)]
     title: String,
     #[serde(default = "default_layout")]
@@ -2376,6 +2392,20 @@ fn default_weight() -> i32 {
     100
 }
 
+fn read_page(
+    source: &str,
+    read: &dyn Fn(&str) -> Result<String, String>,
+) -> Result<(Frontmatter, String), GenerateError> {
+    let raw = read(source).map_err(|e| GenerateError(format!("Cannot read '{source}': {e}")))?;
+    let (yaml, body) = split_frontmatter(&raw);
+    let mut fm: Frontmatter = serde_yaml::from_str(if yaml.is_empty() { "{}" } else { &yaml })
+        .map_err(|e| GenerateError(format!("Bad frontmatter in '{source}': {e}")))?;
+    if yaml.is_empty() {
+        fm.title = source.into();
+    }
+    Ok((fm, body))
+}
+
 /// Generate the complete static site.
 #[allow(clippy::too_many_arguments)]
 fn generate_site(
@@ -2400,6 +2430,24 @@ fn generate_site(
     let expansion = routes::expand_routes(config, exports, content);
     let jobs = expansion.jobs;
     let content_urls = expansion.content_urls;
+    let catalog = if analytics::enabled(config).is_some() {
+        let mut entries = Vec::new();
+        for job in &jobs {
+            let (fm, _) = read_page(&job.page_source, read_pond_file)?;
+            let (page_uri, aliases) = analytics::identity(&config.site.base_url, &job.output_path)
+                .map_err(GenerateError)?;
+            if fm.analytics != Some(false) && !analytics::excluded(config, &page_uri) {
+                entries.push(CatalogEntry {
+                    page_uri,
+                    title: interpolate_captures(&fm.title, &job.captures, &config.labels),
+                    aliases,
+                });
+            }
+        }
+        Some(Catalog::new(config, entries).map_err(GenerateError)?)
+    } else {
+        None
+    };
     let page_index = if config.documentation.is_some() || config.strict {
         documentation::PageIndex::new(&jobs).map_err(GenerateError)?
     } else {
@@ -2486,26 +2534,13 @@ fn generate_site(
             generated_at,
             &page_index,
         )?;
-        let raw_md = read_pond_file(&job.page_source)
-            .map_err(|e| GenerateError(format!("Cannot read '{}': {}", job.page_source, e)))?;
-
-        let (fm_yaml, body) = split_frontmatter(&raw_md);
-        let fm: Frontmatter = if fm_yaml.is_empty() {
-            Frontmatter {
-                title: job.page_source.clone(),
-                layout: default_layout(),
-                weight: default_weight(),
-                slug: None,
-                hidden: false,
-                section: None,
-                date: None,
-                summary: None,
-                image: None,
-            }
+        let (fm, body) = read_page(&job.page_source, read_pond_file)?;
+        let page_analytics = if let Some(catalog) = &catalog {
+            let (uri, _) = analytics::identity(&config.site.base_url, &job.output_path)
+                .map_err(GenerateError)?;
+            catalog.page(config, &uri)
         } else {
-            serde_yaml::from_str(&fm_yaml).map_err(|e| {
-                GenerateError(format!("Bad frontmatter in '{}': {}", job.page_source, e))
-            })?
+            None
         };
 
         // Interpolate capture groups into the title
@@ -2583,6 +2618,7 @@ fn generate_site(
         let full_html = layouts::apply_layout(
             layout,
             &LayoutContext {
+                analytics: page_analytics.as_ref(),
                 title: &title,
                 site_title: &config.site.title,
                 base_url: &config.site.base_url,
@@ -2607,6 +2643,10 @@ fn generate_site(
             .map_err(|e| GenerateError(format!("write {:?}: {}", out_path, e)))?;
 
         debug!("wrote {}", job.output_path);
+    }
+
+    if let Some(catalog) = catalog {
+        catalog.write(output_dir).map_err(GenerateError)?;
     }
 
     // Generate RSS feed if site_url is configured
@@ -3438,6 +3478,315 @@ mod tests {
     }
 
     #[test]
+    fn analytics_build_covers_routes_layouts_opt_out_and_stable_catalogs() {
+        let mut config: SiteConfig = serde_yaml::from_str(
+            r#"
+site:
+  title: Test
+  base_url: /noyo-harbor/
+analytics:
+  enabled: true
+  site_id: noyo
+  exclude: [/noyo-harbor/private/]
+routes:
+  - {name: home, type: static, slug: "", page: /home.md}
+  - {name: analytics, type: static, slug: analytics, page: /home.md}
+  - {name: private, type: static, slug: private, page: /home.md}
+  - {name: opted-out, type: static, slug: opted-out, page: /opt-out.md}
+  - {name: docs, type: content, slug: "", content: docs}
+  - {name: data, type: template, slug: "sites/$0", page: /data.md, export: data}
+labels:
+  BDock: 'Dock <"&>'
+"#,
+        )
+        .unwrap();
+        let pages = BTreeMap::from([
+            (
+                "/home.md",
+                "---\ntitle: Home\nhidden: true\n---\n<div id=\"passthrough\">Raw HTML</div>",
+            ),
+            (
+                "/opt-out.md",
+                "---\ntitle: Private\nanalytics: false\n---\nNo views",
+            ),
+            ("/water.md", "---\ntitle: Water\nlayout: page\n---\nContent"),
+            (
+                "/data.md",
+                "---\ntitle: '{{ $0 }}'\nlayout: data\n---\nTemplate",
+            ),
+        ]);
+        let read = |path: &str| {
+            pages
+                .get(path)
+                .map(|v| v.to_string())
+                .ok_or_else(|| path.into())
+        };
+        let exports = BTreeMap::from([(
+            "data".into(),
+            ExportContext {
+                by_key: BTreeMap::from([("BDock".into(), vec![])]),
+                columns: vec![],
+            },
+        )]);
+        let content = BTreeMap::from([(
+            "docs".into(),
+            ContentContext {
+                pages: vec![ContentPage {
+                    title: "Water".into(),
+                    slug: "water".into(),
+                    weight: 100,
+                    hidden: false,
+                    section: None,
+                    source_path: "/water.md".into(),
+                    date: None,
+                    summary: None,
+                    image: None,
+                    url_path: String::new(),
+                }],
+            },
+        )]);
+        let output = tempfile::tempdir().unwrap();
+        generate_site(
+            &config,
+            &exports,
+            &content,
+            &read,
+            output.path(),
+            "/",
+            None,
+            "first",
+        )
+        .unwrap();
+        let catalog_path = output.path().join(analytics::CATALOG_PATH);
+        let before = std::fs::read(&catalog_path).unwrap();
+        let catalog: Value = serde_json::from_slice(&before).unwrap();
+        let uris: Vec<_> = catalog["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["page_uri"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            uris,
+            [
+                "/noyo-harbor/",
+                "/noyo-harbor/sites/BDock",
+                "/noyo-harbor/water"
+            ]
+        );
+        assert_eq!(catalog["entries"][1]["title"], "Dock <\"&>");
+        for path in ["index.html", "water.html", "sites/BDock.html"] {
+            let html = std::fs::read_to_string(output.path().join(path)).unwrap();
+            assert_eq!(html.matches("data-watertown-analytics=").count(), 1);
+            assert!(html.contains("data-endpoint=\"/_analytics/view\""));
+            assert!(html.contains("src=\"/noyo-harbor/_analytics/view-"));
+        }
+        let home = std::fs::read_to_string(output.path().join("index.html")).unwrap();
+        assert!(home.contains("<div id=\"passthrough\">Raw HTML</div>"));
+        for path in [
+            "analytics/index.html",
+            "private/index.html",
+            "opted-out/index.html",
+        ] {
+            assert!(
+                !std::fs::read_to_string(output.path().join(path))
+                    .unwrap()
+                    .contains("data-watertown-analytics=")
+            );
+        }
+        generate_site(
+            &config,
+            &exports,
+            &content,
+            &read,
+            output.path(),
+            "/",
+            None,
+            "later",
+        )
+        .unwrap();
+        assert_eq!(before, std::fs::read(&catalog_path).unwrap());
+
+        // Disabled configuration must not change even the generated HTML bytes.
+        config.analytics.as_mut().unwrap().enabled = false;
+        let disabled = tempfile::tempdir().unwrap();
+        generate_site(
+            &config,
+            &exports,
+            &content,
+            &read,
+            disabled.path(),
+            "/",
+            None,
+            "",
+        )
+        .unwrap();
+        config.analytics = None;
+        let baseline = tempfile::tempdir().unwrap();
+        generate_site(
+            &config,
+            &exports,
+            &content,
+            &read,
+            baseline.path(),
+            "/",
+            None,
+            "",
+        )
+        .unwrap();
+        for path in ["index.html", "water.html", "sites/BDock.html"] {
+            assert_eq!(
+                std::fs::read(disabled.path().join(path)).unwrap(),
+                std::fs::read(baseline.path().join(path)).unwrap()
+            );
+        }
+        assert!(!disabled.path().join("_analytics").exists());
+    }
+
+    #[test]
+    fn analytics_metadata_is_escaped_in_every_layout() {
+        for layout in [
+            "default",
+            "page",
+            "blog",
+            "data",
+            "logs",
+            "explore",
+            "documentation",
+        ] {
+            let mut config: SiteConfig = serde_yaml::from_str(
+                r#"
+site: {title: Test}
+analytics: {enabled: true, site_id: test}
+routes:
+  - {name: home, type: static, slug: 'a"&<', page: /page.md}
+"#,
+            )
+            .unwrap();
+            if layout == "documentation" {
+                config.documentation = Some(crate::config::DocumentationConfig {
+                    version: 1,
+                    source_root: "/".into(),
+                    include_roots: vec![],
+                });
+            }
+            let read = |_: &str| Ok(format!("---\ntitle: Test\nlayout: {layout}\n---\nPage"));
+            let output = tempfile::tempdir().unwrap();
+            generate_site(
+                &config,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &read,
+                output.path(),
+                "/",
+                None,
+                "",
+            )
+            .unwrap();
+            let html = std::fs::read_to_string(output.path().join("a\"&</index.html")).unwrap();
+            assert_eq!(
+                html.matches("data-watertown-analytics=").count(),
+                1,
+                "{layout}"
+            );
+            assert!(
+                html.contains("data-page-uri=\"/a&quot;&amp;&lt;/\""),
+                "{html}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recursive_analytics_catalogs_remain_independent_and_preview_disables_all() {
+        let persistence: Arc<dyn tinyfs::PersistenceLayer> =
+            Arc::new(tinyfs::MemoryPersistence::default());
+        let fs = tinyfs::FS::from_arc(persistence.clone());
+        let root = fs.root().await.unwrap();
+        let _ = root.create_dir_all("/noyo/child").await.unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let ctx = tinyfs::ProviderContext::new(
+            Arc::new(datafusion::prelude::SessionContext::new()),
+            persistence,
+        )
+        .with_cache_dir(cache.path().into());
+        let base_config = |id: &str| -> SiteConfig {
+            serde_yaml::from_str(&format!(
+                "site: {{title: Test}}\nanalytics: {{enabled: true, site_id: {id}}}\nroutes:\n  - {{name: home, type: static, slug: '', page: /index.md}}\n"
+            )).unwrap()
+        };
+        let mut parent = base_config("caspar-water");
+        parent.subsites.push(crate::config::SubsiteConfig {
+            name: "noyo".into(),
+            path: "/noyo".into(),
+            config: "/config.yaml".into(),
+            base_url: Some("/noyo-harbor/".into()),
+        });
+        let mut noyo = base_config("noyo");
+        noyo.subsites.push(crate::config::SubsiteConfig {
+            name: "child".into(),
+            path: "/child".into(),
+            config: "/config.yaml".into(),
+            base_url: Some("/noyo-harbor/child/".into()),
+        });
+        let mut child = base_config("child");
+        child.analytics = None;
+        for (path, config) in [
+            ("/noyo/config.yaml", &noyo),
+            ("/noyo/child/config.yaml", &child),
+        ] {
+            root.write_file_path_from_slice(
+                path,
+                serde_yaml::to_string(config).unwrap().as_bytes(),
+            )
+            .await
+            .unwrap();
+        }
+        for path in ["/index.md", "/noyo/index.md", "/noyo/child/index.md"] {
+            root.write_file_path_from_slice(path, b"---\ntitle: Home\n---\nPage")
+                .await
+                .unwrap();
+        }
+        for preview in [false, true] {
+            let output = tempfile::tempdir().unwrap();
+            let mut registry = BuildRegistry::default();
+            build_site_tree(
+                &parent,
+                &root,
+                &ctx,
+                output.path(),
+                "/",
+                preview,
+                &mut registry,
+            )
+            .await
+            .unwrap();
+            registry.finish().unwrap();
+            for (mount, id, uri) in [
+                ("", "caspar-water", "/"),
+                ("noyo-harbor/", "noyo", "/noyo-harbor/"),
+            ] {
+                let catalog_path = output.path().join(mount).join(analytics::CATALOG_PATH);
+                if preview {
+                    assert!(!catalog_path.exists());
+                    assert!(
+                        !std::fs::read_to_string(output.path().join(mount).join("index.html"))
+                            .unwrap()
+                            .contains("data-watertown-analytics")
+                    );
+                } else {
+                    let catalog: Value =
+                        serde_json::from_slice(&std::fs::read(catalog_path).unwrap()).unwrap();
+                    assert_eq!(catalog["site_id"], id);
+                    assert_eq!(catalog["entries"].as_array().unwrap().len(), 1);
+                    assert_eq!(catalog["entries"][0]["page_uri"], uri);
+                }
+            }
+            assert!(output.path().join("noyo-harbor/child/index.html").exists());
+            assert!(!output.path().join("noyo-harbor/child/_analytics").exists());
+        }
+    }
+
+    #[test]
     fn test_iso_date_to_rfc2822() {
         let result = iso_date_to_rfc2822("2025-03-10").unwrap();
         assert!(
@@ -3461,6 +3810,7 @@ mod tests {
 
         let output_dir = TempDir::new().unwrap();
         let config = SiteConfig {
+            analytics: None,
             documentation: None,
             strict: false,
             site: SiteMeta {
@@ -3593,6 +3943,7 @@ mod tests {
 
         let output_dir = TempDir::new().unwrap();
         let config = SiteConfig {
+            analytics: None,
             documentation: None,
             strict: false,
             site: SiteMeta {
