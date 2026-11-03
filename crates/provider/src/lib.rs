@@ -153,6 +153,14 @@ pub fn documentation_schemas() -> std::collections::BTreeMap<&'static str, schem
             schema::<materialize_series::MaterializeSeriesConfig>(),
         ),
         (
+            "factory:analytics-rollup",
+            schema::<analytics_rollup::AnalyticsRollupConfig>(),
+        ),
+        (
+            "factory:analytics-table",
+            schema::<analytics_rollup::AnalyticsTableConfig>(),
+        ),
+        (
             "factory:column-rename",
             schema::<column_rename::ColumnRenameConfig>(),
         ),

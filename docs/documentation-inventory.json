@@ -97,6 +97,8 @@
         "factory:temporal-reduce",
         "factory:temporal-reduce-series",
         "factory:materialize-series",
+        "factory:analytics-rollup",
+        "factory:analytics-table",
         "factory:pump-state-series",
         "factory:dynamic-dir",
         "factory:column-rename",
@@ -360,6 +362,24 @@
       "examples": [],
       "coverage": "unverified",
       "output": "docs/manual/reference/factories/materialize-series.md"
+    },
+    "factory:analytics-rollup": {
+      "path": "crates/provider/src/factory/analytics_rollup/documentation.md",
+      "components": [
+        "factory:analytics-rollup"
+      ],
+      "examples": [],
+      "coverage": "validation-only",
+      "output": "docs/manual/reference/factories/analytics-rollup.md"
+    },
+    "factory:analytics-table": {
+      "path": "crates/provider/src/factory/analytics_rollup/table/documentation.md",
+      "components": [
+        "factory:analytics-table"
+      ],
+      "examples": [],
+      "coverage": "validation-only",
+      "output": "docs/manual/reference/factories/analytics-table.md"
     },
     "factory:monitor-report": {
       "path": "crates/sitegen/src/monitor/documentation.md",

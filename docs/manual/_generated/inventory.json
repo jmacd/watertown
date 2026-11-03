@@ -5204,6 +5204,26 @@
   },
   "contract": 1,
   "factories": {
+    "factory:analytics-rollup": {
+      "description": "Transactionally replace daily snapshots of hourly reported page views",
+      "directory": false,
+      "execute": true,
+      "file": false,
+      "initialize": true,
+      "post_commit_access": "ReadWrite",
+      "raw_validation": false,
+      "table_transform": false
+    },
+    "factory:analytics-table": {
+      "description": "Query the currently selected hourly analytics partitions as one table",
+      "directory": false,
+      "execute": false,
+      "file": true,
+      "initialize": false,
+      "post_commit_access": null,
+      "raw_validation": false,
+      "table_transform": false
+    },
     "factory:column-rename": {
       "description": "Column rename transformation for table providers",
       "directory": false,
@@ -5476,6 +5496,62 @@
     "format:xls"
   ],
   "schemas": {
+    "factory:analytics-rollup": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "exclude": {
+          "default": [],
+          "description": "Exact canonical URIs excluded from counts; changing this requires rebuild.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "repair_days": {
+          "description": "Explicit ordinary repair horizon in UTC days, including today.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "site_id": {
+          "description": "Stable independent site identity.",
+          "type": "string"
+        },
+        "source": {
+          "description": "Dedicated inventory-aware logfile-ingest destination.",
+          "type": "string"
+        },
+        "target": {
+          "description": "Dedicated directory for immutable objects and the selection manifest.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "target",
+        "site_id",
+        "repair_days"
+      ],
+      "title": "AnalyticsRollupConfig",
+      "type": "object"
+    },
+    "factory:analytics-table": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "description": "Directory containing the committed rollup selection manifest.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "title": "AnalyticsTableConfig",
+      "type": "object"
+    },
     "factory:column-rename": {
       "$defs": {
         "RenameRule": {

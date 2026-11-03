@@ -1,6 +1,6 @@
 # First-party site analytics: design and implementation
 
-> **Status: instrumentation, collector, and strict ingestion core implemented; not deployed.**
+> **Status: instrumentation, collector, strict ingestion, and rollup core implemented; not deployed.**
 > Phase 1 provides independent per-site catalogs and disabled-by-default
 > first-visible instrumentation. See the
 > [Sitegen reference](../crates/sitegen/src/factory/documentation.md) for the
@@ -10,7 +10,9 @@
 > service template. Host provisioning, binary promotion, and proxy privacy
 > verification remain Phase 2 deployment gates. Opt-in inventory-aware ingestion
 > and a typed reference query are implemented; staging scheduling remains pending.
-> The rollup factory and public reports remain proposals. Nothing is enabled in production.
+> Transactional daily rollups and their selected-partition table are implemented.
+> Dictionary lifecycle verification and public reports remain pending.
+> Nothing is enabled in production.
 > Deployment and retention choices require approval.
 
 ## 1. Purpose and recommended scope
@@ -62,7 +64,7 @@ prefixed with `../`.
 | Existing web experiment | `../config/watershop-selfmon.yaml` ingests Caddy JSON and defines `watershop-pageviews`, counting requests by hour and status. | This is not a page-view classifier and is not exported by the current selfmon Sitegen configuration. Do not copy it as the finished design. |
 | Temporal reduction | `crates/provider/src/factory/temporal_reduce/` has time-bucket aggregation, source-version caches, and late-data invalidation. | Its public configuration does not supply arbitrary grouping dimensions such as `page_uri`. A long-form page table is not a YAML-only application of that factory. |
 | Append materialization | `crates/provider/src/factory/materialize_series/` selects timestamps strictly greater than the target maximum. | Unsafe for changing aggregates and for late/equal-timestamp events. Do not use this as the analytics checkpoint. |
-| Replacement foundation | `crates/query-foundation/src/materialize.rs` models `Replace` publication and atomic output/progress. `frontier.rs` classifies late changes and repair policies. | `TinyFsMaterializationSink` in `crates/provider/src/query_foundation_adapter.rs` explicitly rejects replacement ranges. A production replacement sink still needs implementation. |
+| Replacement foundation | `analytics-rollup` uses a separate partition snapshot sink: immutable daily objects plus transactional selection/progress. `analytics-table` exposes a coherent query-foundation snapshot. The append-only `TinyFsMaterializationSink` remains unchanged. | Staging performance and operations; dictionary/maintenance/restore lifecycle verification. |
 | Physical encoding | The deterministic table pack writer in `crates/sync-store/src/content/series_pack_builder.rs` explicitly disables dictionary encoding and compression. | An explicit, compatible dictionary policy and proof that maintenance/import preserve the requirement. |
 | Publication | `../config/scripts/run.sh` builds and publishes the site using versioned build directories and a `current` symlink. | Feed it a successful aggregate snapshot without making analytics failure block core site content. |
 
@@ -562,7 +564,7 @@ discarding late records, or waiting a fixed hour and declaring it complete.
 Use **replaceable daily partitions of hourly counts**. The logical table remains
 one table; partitioning is an implementation detail.
 
-A narrowly scoped, proposed `analytics-rollup` executable factory owns:
+The `analytics-rollup` executable factory owns:
 
 1. Validation/typing of new logical event chunks.
 2. Identification of affected UTC days from conservative source bounds.
@@ -580,9 +582,12 @@ authority, not in an untracked host cache. Publish the new manifest and source
 progress in the same pond commit. Expose selected partitions through a provider
 as one typed table for queries and Sitegen.
 
-The sink is new work. Before coding the factory, demonstrate the smallest real
-TLogFS transaction that makes partition membership and progress visible together,
-including restart. Foundation test doubles alone are insufficient.
+The sink lives in `crates/provider/src/factory/analytics_rollup/partitions.rs`.
+A real TLogFS test demonstrated atomic partition membership and progress before
+factory implementation, including reopen, abort before/after manifest publication,
+and empty replacement. Readers use query-foundation's `DatasetSnapshot` and the
+existing stale/closed-context contract. Foundation test doubles alone are
+insufficient.
 
 Daily partitions bound repair without requiring native row-level updates. At
 larger volume, cached per-logical-chunk partial counts can reduce reparsing.
@@ -617,6 +622,15 @@ Do not scan every historical manifest entry or log body merely to discover an
 unchanged tail without measuring that cost. Reuse logical chunk identity,
 persisted bounds, and incremental source membership mechanisms.
 
+The implementation compares complete inventory identities first. Changed runs
+inspect raw membership metadata and seek only new suffixes for dirty-day
+discovery. Reports expose inventory bytes, prior partition count, source segments
+inspected, discovery records and replaced UTC dates. Manifest parsing remains
+linear in retained membership. Aggregate reads use typed-format caching and
+lower-bound version pruning, with exact day predicates; cold cache warming can
+include later versions because the existing provider has no upper-bound warming
+filter. Do not equate discovery counters with total query I/O.
+
 ### 9.4 Repair policy and retention
 
 Maintain a bounded ordinary repair horizon chosen from actual ingestion lag and
@@ -631,6 +645,13 @@ Do not relabel unrecomputed history as if a new classification rule had applied.
 A repair can remove counts as well as add them. Changes to exclusions, duplicate
 handling, and erroneous catalog mappings therefore require replacement semantics.
 Plan and display the rebuild range before an operator authorizes it.
+
+`repair_days` is a required configuration value, counting UTC calendar days
+including today, with no production default selected. `plan` displays a full
+historical rebuild's dates and approval token without writing. `rebuild --plan
+TOKEN` applies only that exact source/recipe/prior-publication plan. New ingestion
+or publication invalidates the token. Recipe changes require this full rebuild;
+the first version does not support partial historical recipe migrations.
 
 ## 10. Coverage, zeros, and operational health
 
@@ -869,6 +890,16 @@ exactly the expected accepted-event set. Duplicate/conflicting segments are
 handled explicitly. A missing archive is a coverage error, not zero views.
 
 ### Phase 4: transactional grouped materialization
+
+**Core implemented; deployment remains disabled.** `analytics-rollup` publishes
+immutable daily objects and exact source/recipe progress in one TLogFS
+transaction; `analytics-table` reads only selected objects as one typed table.
+Integration tests compare incremental counts with full-history SQL through
+equal/late timestamps, multiple rotations, abort/retry, out-of-horizon data,
+stale rebuild approvals, and exclusions removing entire partitions. Empty
+publication and no-change runs are explicit. Source membership identity is
+independent of physical packing; actual pack/restore lifecycle validation remains
+part of Phase 5, not a claim established by these tests.
 
 Primary code: `crates/query-foundation/`, a new provider-side partition sink and
 analytics factory, and actual TLogFS integration tests.
