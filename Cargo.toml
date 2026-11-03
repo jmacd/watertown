@@ -10,6 +10,7 @@ members = [
 "crates/utilities",
 "crates/provider",
 "crates/sitegen",
+"crates/site-analytics-collector",
 "crates/gitpond",
 "crates/sync-store",
 "crates/exec-factory",
@@ -78,6 +79,9 @@ hex = "0.4.3"
 hledger-parser = "=1.0.0-beta.2"
 hmac = "0.13"
 httpdate = "1.0"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 humantime = "2.1"
 linkme = "0.3"
 log = "0.4.17"

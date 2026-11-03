@@ -1,11 +1,15 @@
 # First-party site analytics: design and implementation
 
-> **Status: Sitegen instrumentation implemented; collection and storage proposed.**
+> **Status: Sitegen instrumentation and collector core implemented; not deployed.**
 > Phase 1 provides independent per-site catalogs and disabled-by-default
 > first-visible instrumentation. See the
 > [Sitegen reference](../crates/sitegen/src/factory/documentation.md) for the
-> implemented configuration. The collector, ingestion contract, rollup factory,
-> and public reports below remain proposals. Nothing is enabled in production.
+> implemented configuration. The standalone
+> [collector](../crates/site-analytics-collector/README.md) implements bounded
+> HTTP collection and durable local logs, with an inactive outer-repository
+> service template. Host provisioning, binary promotion, and proxy privacy
+> verification remain Phase 2 deployment gates. The ingestion integration,
+> rollup factory, and public reports remain proposals. Nothing is enabled in production.
 > Deployment and retention choices require approval.
 
 ## 1. Purpose and recommended scope
@@ -49,9 +53,9 @@ prefixed with `../`.
 
 | Component | Existing behavior | Work required |
 |---|---|---|
-| Sitegen routes | `crates/sitegen/src/routes.rs` expands routes into `PageJob`s; `analytics.rs` derives independent per-site catalogs from all eligible jobs, including recursive subsites. | Install and retain these catalogs in the future collector registry. |
+| Sitegen routes | `crates/sitegen/src/routes.rs` expands routes into `PageJob`s; `analytics.rs` derives independent per-site catalogs from all eligible jobs, including recursive subsites. | Install and retain these catalogs in the collector registry before deployment. |
 | Browser output | Sitegen optionally emits first-visible instrumentation with escaped metadata in every layout. Copied HTML must be explicitly excluded or rendered through a layout. | Production disclosure and collector deployment approval. |
-| Collection endpoint | Static hosting is configured through Caddy in the outer repository. | A bounded, independently supervised HTTP collector writing local logs. No event-by-event pond writes. |
+| Collection endpoint | `crates/site-analytics-collector/` provides a standalone loopback HTTP service, catalog validation, durable NDJSON/inventory, rotation/recovery, and private health. | Promote/package the binary, provision isolated host accounts, and verify sanitized Caddy behavior before enabling collection. No event-by-event pond writes. |
 | Rotating ingestion | `crates/provider/src/factory/logfile_ingest/` ingests active files and immutable rotations. Configured integer JSON timestamps provide event-time bounds and active-record alignment. | A tested collector rotation contract, permissions, retention, and recovery procedure. |
 | JSON parsing | `crates/provider/src/format/jsonlogs/` exposes top-level JSON fields as nullable strings. Nested values remain JSON text. It buffers parsed input and warns when skipping malformed records. | Explicit typing and strict accounting for collector records; measure memory and avoid accepting undetected event loss. |
 | Existing web experiment | `../config/watershop-selfmon.yaml` ingests Caddy JSON and defines `watershop-pageviews`, counting requests by hour and status. | This is not a page-view classifier and is not exported by the current selfmon Sitegen configuration. Do not copy it as the finished design. |
@@ -253,9 +257,10 @@ observable. Allowlisting bounds cardinality; it is not authentication of views.
 
 ### 6.1 Request contract
 
-Proposed endpoint: `POST /_analytics/view`, same origin as the generated page.
+Implemented example endpoint: `POST /_analytics/view`, same origin as the
+generated page. The collector's configured endpoint must match Sitegen.
 
-Proposed request:
+Implemented request:
 
 ```json
 {
@@ -272,8 +277,8 @@ No full URL, referrer, user agent, IP address, screen dimensions, language list,
 or browser identifier belongs in the payload.
 
 The collector validates method, media type, body size, schema, catalog membership,
-and URI limits before accepting a record. Proposed starting limits are a 2 KiB
-body and a 1 KiB page URI, subject to catalog validation before deployment.
+and URI limits before accepting a record. Current limits are a 2 KiB body and a
+1 KiB page URI, subject to catalog validation before deployment.
 Do not permit arbitrary strings to create pages or output paths.
 
 Successful response: `204 No Content` with `Cache-Control: no-store`, after the
@@ -285,7 +290,7 @@ Unknown and rejected requests contribute to health counters, not raw-body logs.
 
 ### 6.2 Hosting and isolation
 
-Run a small dedicated process under its own service account, listening on a
+Run one dedicated process per site/environment under its own service account, listening on a
 loopback address or Unix socket behind Caddy. Keep it independent of Sitegen and
 pond transactions. A site build, maintenance operation, or pond write lock must
 not stop the collector.
@@ -294,6 +299,12 @@ The collector needs no DataFusion session, cloud credentials, or browser-visible
 secret. Do not make an HTTP request launch `pond`. Reuse workspace infrastructure
 where appropriate, but keep the HTTP service's runtime and dependency footprint
 small.
+
+The implementation is the standalone `site-analytics-collector` Rust binary.
+It deliberately supports one site/environment per process rather than combining
+site streams. Its normal dependency graph contains no pond, Arrow, DataFusion,
+or TLS stack. The outer service template is inactive; host provisioning and
+release packaging are not yet wired into Terraform or the existing pond package.
 
 Caddy must route the endpoint before static `try_files` rewriting and file
 serving. Only the configured production host reaches the production collector;
@@ -327,6 +338,13 @@ successful only after the containing batch has been flushed and synchronized
 according to the documented local-disk durability policy. A full queue applies
 backpressure or returns failure instead of consuming unbounded memory. Local
 durability is not protection from disk or host loss.
+
+The current implementation uses a 256-event queue and groups at most 128 events
+or 10 ms of arrivals. It synchronizes the active log, atomically replaces a
+synchronized `inventory.json` checkpoint, and synchronizes the containing
+directory before success. Its configured file-byte cap includes inventories and
+recovery evidence but is not a filesystem quota; disk provisioning must also
+budget allocation/metadata overhead.
 
 At the site's expected scale, a per-batch synchronization interval can be small;
 measure latency and I/O before choosing it. Test crash recovery at every boundary.
@@ -686,8 +704,8 @@ setting, not a runtime special case hidden in the SQL.
 
 ### 12.1 Initial topology
 
-Recommend one local collector per serving environment, with separate trusted
-catalog registries and streams for each site if the process is shared. Initially
+Use one local collector per site/environment, with separate trusted catalog
+registries and streams. Shared-process hosting is not implemented. Initially
 use the site's existing pond for raw ingestion and private aggregate
 materialization, but run collector and ingestion jobs independently of site
 rendering. Noyo's data and reports remain independent of the Caspar Water site
@@ -796,6 +814,15 @@ first visibility, and no second event for tab returns or counted bfcache restore
 No browser GUI is opened by tooling.
 
 ### Phase 2: collector and source-log contract
+
+**Core implemented; deployment gates remain.** The standalone collector covers
+strict HTTP/catalog validation, bounded queues/connections, durable group
+acknowledgement, segment inventory, rotation/recovery, and private health.
+Unit and process tests cover storage failures, partial tails, missing segments,
+real kill/restart, and request-data minimization. The inactive outer service
+template is ready for host integration. Terraform provisioning, binary promotion,
+and staging proxy/error-log verification must complete before this phase's
+operational exit criteria are met.
 
 Add the smallest dedicated collector binary/service justified by existing
 workspace dependencies. Avoid embedding DataFusion or pond mutation in it.

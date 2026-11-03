@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: 2026 Caspar Water Company
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "site-analytics-collector"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+categories.workspace = true
+keywords.workspace = true
+description = "Bounded first-party page-view collector with durable local logs"
+
+[dependencies]
+chrono.workspace = true
+clap.workspace = true
+fs2.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "sync"] }
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

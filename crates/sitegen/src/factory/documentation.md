@@ -39,8 +39,10 @@ analytics:
     - /status
 ```
 
-The collector is not implemented yet. Do not publish an enabled build until a
-same-origin collector has installed and accepted its catalog. The script makes
+The standalone collector is available but not deployed; see
+`crates/site-analytics-collector/README.md` in the source tree. Do not publish an
+enabled build until a same-origin collector has installed and accepted its
+catalog and passed the deployment privacy checks. The script makes
 one best-effort request per top-level document, at first visibility after
 prerender activation. Tab returns and already-reported back/forward-cache
 restores do not report again; reloads create new documents. Failures warn without
