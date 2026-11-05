@@ -47,6 +47,8 @@ struct SitegenCommand {
 
 #[derive(Debug, Subcommand)]
 enum SitegenSubcommand {
+    /// Refresh the daily-only public analytics bundle; fails independently of builds
+    AnalyticsReport,
     /// Build the complete static site
     Build {
         /// Output directory for generated files
@@ -158,6 +160,14 @@ async fn execute(
     let cmd = SitegenCommand::try_parse_from(args).map_other()?;
 
     match cmd.command {
+        SitegenSubcommand::AnalyticsReport => {
+            crate::analytics_report::refresh(
+                &config,
+                &context.context,
+                chrono::Utc::now().timestamp_micros(),
+            )
+            .await
+        }
         SitegenSubcommand::Build {
             output_dir,
             quick,
@@ -185,6 +195,7 @@ async fn execute(
                 quick_config.exports.clear();
                 quick_config.subsites.clear();
                 quick_config.analytics = None;
+                quick_config.analytics_report = None;
 
                 build_site_from_root(
                     &quick_config,
@@ -250,6 +261,7 @@ async fn build_site_tree(
     let mut config = config.clone();
     if no_analytics {
         config.analytics = None;
+        config.analytics_report = None;
     }
     build_site_from_root(&config, root, provider_ctx, output, root_base_url, registry).await?;
     write_theme_css(output, &config.theme)?;
@@ -277,7 +289,7 @@ async fn build_site_tree(
             .unwrap_or(sub_base)
             .trim_start_matches('/');
         if !no_analytics
-            && analytics::enabled(&child).is_some()
+            && (analytics::enabled(&child).is_some() || child.analytics_report.is_some())
             && child.site.base_url != format!("{}{subdir}/", config.site.base_url)
         {
             return Err(tinyfs::Error::Other(format!(
@@ -484,6 +496,13 @@ async fn build_site_from_root(
 
     // Copy static assets to output, preserving directory structure
     copy_static_assets(&static_assets, output_dir)?;
+    crate::analytics_report::render(
+        config,
+        &jobs,
+        output_dir,
+        root_base_url,
+        chrono::Utc::now().timestamp_micros(),
+    )?;
 
     log_sitegen_phase(config, output_dir, "render", phase_started);
     info!(
@@ -3710,9 +3729,21 @@ routes:
         )
         .with_cache_dir(cache.path().into());
         let base_config = |id: &str| -> SiteConfig {
-            serde_yaml::from_str(&format!(
+            let mut config: SiteConfig = serde_yaml::from_str(&format!(
                 "site: {{title: Test}}\nanalytics: {{enabled: true, site_id: {id}}}\nroutes:\n  - {{name: home, type: static, slug: '', page: /index.md}}\n"
-            )).unwrap()
+            )).unwrap();
+            config.analytics_report = Some(crate::analytics_report::AnalyticsReportConfig {
+                site_id: id.into(),
+                target: "/analytics/hourly".into(),
+                catalog_dir: "/private/catalogs".into(),
+                current_catalog: "/private/current.json".into(),
+                state_path: cache
+                    .path()
+                    .join(format!("{id}.json"))
+                    .to_string_lossy()
+                    .into(),
+            });
+            config
         };
         let mut parent = base_config("caspar-water");
         parent.subsites.push(crate::config::SubsiteConfig {
@@ -3730,6 +3761,7 @@ routes:
         });
         let mut child = base_config("child");
         child.analytics = None;
+        child.analytics_report = None;
         for (path, config) in [
             ("/noyo/config.yaml", &noyo),
             ("/noyo/child/config.yaml", &child),
@@ -3768,12 +3800,17 @@ routes:
                 let catalog_path = output.path().join(mount).join(analytics::CATALOG_PATH);
                 if preview {
                     assert!(!catalog_path.exists());
+                    assert!(!output.path().join(mount).join("analytics.html").exists());
                     assert!(
                         !std::fs::read_to_string(output.path().join(mount).join("index.html"))
                             .unwrap()
                             .contains("data-watertown-analytics")
                     );
                 } else {
+                    let report =
+                        std::fs::read_to_string(output.path().join(mount).join("analytics.html"))
+                            .unwrap();
+                    assert!(report.contains("Analytics unavailable."));
                     let catalog: Value =
                         serde_json::from_slice(&std::fs::read(catalog_path).unwrap()).unwrap();
                     assert_eq!(catalog["site_id"], id);
@@ -3783,6 +3820,12 @@ routes:
             }
             assert!(output.path().join("noyo-harbor/child/index.html").exists());
             assert!(!output.path().join("noyo-harbor/child/_analytics").exists());
+            assert!(
+                !output
+                    .path()
+                    .join("noyo-harbor/child/analytics.html")
+                    .exists()
+            );
         }
     }
 
@@ -3811,6 +3854,7 @@ routes:
         let output_dir = TempDir::new().unwrap();
         let config = SiteConfig {
             analytics: None,
+            analytics_report: None,
             documentation: None,
             strict: false,
             site: SiteMeta {
@@ -3944,6 +3988,7 @@ routes:
         let output_dir = TempDir::new().unwrap();
         let config = SiteConfig {
             analytics: None,
+            analytics_report: None,
             documentation: None,
             strict: false,
             site: SiteMeta {

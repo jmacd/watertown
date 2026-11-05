@@ -12,7 +12,8 @@
 > and a typed reference query are implemented; staging scheduling remains pending.
 > Transactional daily rollups and their selected-partition table are implemented.
 > Dictionary preservation is verified through maintenance, native restore,
-> capsule import and export. Public reports and staged operational exercises remain pending.
+> capsule import and export. Daily-only public reports and explicit last-good
+> rendering are implemented, disabled by default. Staged operational exercises remain pending.
 > Nothing is enabled in production.
 > Deployment and retention choices require approval.
 
@@ -710,10 +711,10 @@ must be identified as partial, not compared unqualified with full days.
 Sitegen consumes a committed aggregate snapshot, never opens the raw collector
 directory, and never performs collection as part of rendering.
 
-Initial presentation:
+Approved public presentation:
 
-- Site-wide hourly/daily reported-view chart.
-- Top pages over a fixed trailing window, with canonical links and titles.
+- Site-wide daily reported-view chart; hourly detail stays private.
+- Top pages over 30 UTC calendar days including today, with canonical links and titles.
 - Optional per-page history selected from the same long-form table.
 - Metric definition, UTC convention, source coverage, and "updated through."
 
@@ -730,9 +731,9 @@ Export only approved aggregate columns and public catalog labels. Raw logs,
 per-event rows, collector record identities, health internals, and source
 credentials must never enter public Parquet manifests or the SQL explorer.
 Publishing aggregate data means visitors can download it, not just see the chart.
-Decide whether hourly per-page counts are suitable for public release on this
-small site; daily-only public output is an alternative without changing internal
-storage.
+The approved disclosure is daily per-page counts and daily site totals over a
+30-day trailing window. Internal hourly storage is unchanged and must not be
+added to ordinary public exports or the SQL explorer.
 
 If analytics fails, keep the last successful analytics bundle and report its
 staleness while allowing core site content to publish. This must be an explicit
@@ -742,6 +743,23 @@ errors. If no successful bundle exists, render "analytics unavailable."
 Preserve the bundle's data and its original freshness metadata together. A new
 site build must not make old analytics look newly collected. The analytics job
 still reports failure to monitoring even when the content build succeeds.
+
+The implementation is Sitegen's opt-in `analytics_report` configuration and
+separate `analytics-report` refresh command. Refresh saves one private, atomic
+state file; rendering reads it without querying the analytics source.
+`analytics.html` and `_analytics/report.json` expose only the approved daily
+projection. Refresh errors retain valid last-good data but return failure;
+missing/corrupt state renders unavailable and logs an error. Original snapshot
+freshness and partial-day flags survive fallback. The renderer additionally
+clips old saved rows to the current 30-day window.
+
+Site identities, retained-catalog hashes and current-build links are checked.
+Retired pages retain labels/history without blind links. No report settings or
+data are inherited by recursively generated subsites, and quick/no-analytics
+builds suppress both reporting and instrumentation. The current outer site
+configuration, runner, service schedules and container mounts are unchanged:
+private state sharing and independent monitored refresh jobs remain explicit
+staging work. Do not claim pipeline uptime from the still-unknown coverage field.
 
 Exclude the analytics dashboard and synthetic validation routes by default to
 avoid counting operational inspection as audience activity. This is a catalog
@@ -804,8 +822,8 @@ Public presentation can be disabled independently of collection.
 
 ## 13. Proposed configuration surface
 
-The Sitegen interface below is implemented but disabled by default. The rollup
-example remains a proposed interface, not an available factory.
+The Sitegen and rollup interfaces below are implemented; neither is enabled in
+production. The Sitegen reference also documents the independent daily report.
 
 ```yaml
 # Implemented Sitegen opt-in; collector deployment is still required.
@@ -980,6 +998,14 @@ rows/hashes are unchanged by equivalent repacking. The requirement is not met by
 an initial-file-only check.
 
 ### Phase 6: presentation and staged operations
+
+**Presentation/fallback core implemented; staged operations pending.** Local
+tests publish a real committed aggregate snapshot, verify daily-only disclosure
+and UTC boundaries, inject catalog failures and corrupt report state, preserve
+last-good freshness/partial-day flags, reject cross-site bundles, and confirm
+recursive site builds still produce core pages when analytics is unavailable.
+The private report refresh continues to fail independently of successful
+rendering. No production config, timer, service or public navigation is enabled.
 
 Primary code: Sitegen grouping/presentation and outer-repository site templates,
 `config/site.yaml`, scripts, and deployment configuration.

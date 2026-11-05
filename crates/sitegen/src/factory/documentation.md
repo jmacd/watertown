@@ -80,8 +80,80 @@ layout-rendered pages; they are never silently counted as instrumented.
 
 Documentation configurations remain off unless explicitly enabled. `build
 --no-analytics` suppresses instrumentation for the whole tree even when sites
-opt in; `--quick` always suppresses it. Use this for previews. These controls
+opt in; `--quick` always suppresses it. Both also suppress analytics reports.
+Use this for previews. These controls
 do not disable unrelated chart or page scripts.
+
+### Optional daily analytics report
+
+The approved public contract is **daily per-page counts and daily site totals
+over 30 UTC calendar days, including today**. Hourly detail remains private.
+Reporting is disabled when `analytics_report` is absent and can be configured
+independently of instrumentation:
+
+```yaml
+analytics_report:
+  site_id: noyo
+  target: /analytics/hourly
+  catalog_dir: /private/noyo/catalogs
+  current_catalog: /private/noyo/current-catalog.json
+  state_path: /private/noyo/report-state.json
+```
+
+`target` is a committed `analytics-rollup` directory. Run refresh in the
+**owning site's pond**, not through another pond's imported mount:
+
+```sh
+pond run /etc/site -- analytics-report
+```
+
+Schedule this as a separate monitored job, after ingestion/rollup. It queries
+only selected aggregate objects, never collector logs. Catalogs must be trusted
+publisher catalogs for that site; hashes and identities are checked. Current
+titles take precedence; ambiguous historical titles fall back to the URI.
+Keep the state file and retained catalogs private, outside every web root.
+
+The refresh command atomically saves data and original aggregate-publication
+time together. On query/catalog failure it records failure, preserves any valid
+last-good bundle, and **still returns an error**. Never mask this exit status
+with `|| true`, or make the core site build depend on refresh success.
+If failure-state storage itself is unavailable, the job still fails and any
+older saved bundle retains its original timestamp.
+
+An ordinary site build only reads this saved file. It generates `analytics.html`
+and `_analytics/report.json`, without querying the pond's analytics tables.
+Missing or corrupt state logs an error and renders **analytics unavailable**;
+failed refreshes show last-good data with an explicit failure notice.
+Successful core publication does not mean the separate analytics job succeeded.
+Filesystem write failures and unsafe report configuration still fail the build.
+
+The dashboard includes daily totals with a static bar chart, ranked pages,
+expandable daily histories, UTC/metric definitions, unknown coverage, and the
+original aggregate timestamp. Missing counts are never zero-filled. Partial
+snapshot days remain marked partial even when served later. Historical pages
+not in the current catalog or current build remain visible without live links.
+Titles are escaped. Add an explicit sidebar link to `/analytics` (or its mounted
+equivalent) when enabling the feature; do not create a competing route.
+
+The public JSON contains only daily counts, public URI/title labels, partial-day
+flags, site identity, the original window and original publication timestamp,
+and unknown coverage. Even fallback rendering removes rows older than the
+current 30-day window without refreshing their publication timestamp. No raw
+events, hourly rows, catalog/segment IDs, source inventories, private paths or
+error details are exported. Do not separately expose the private hourly table
+through ordinary `exports` or the SQL explorer.
+
+Each site/environment needs its own state file and job. Subsites never inherit
+this setting. Mount the same private state into the report job and renderer,
+read-only for the renderer, with explicit service ownership/read permissions.
+Only the report job needs access to private catalogs. The outer site's current
+`run.sh` and container mounts do not provision or schedule this feature yet.
+
+Limits fail visibly rather than truncating counts: 100,000 daily URI/day rows,
+8 MiB projected JSON, 1,024-byte titles, and at most 4,096 catalog-directory
+entries with 2 MiB per catalog and 64 MiB retained catalog bytes.
+Coverage intervals, live monitoring integration and staging failure exercises
+remain deployment gates; this configuration does not enable them automatically.
 
 <!-- docs:reference factory:sitegen -->
 <!-- docs:end-reference -->

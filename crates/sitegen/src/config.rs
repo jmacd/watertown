@@ -39,6 +39,9 @@ pub struct SiteConfig {
     /// Independent, opt-in reported page views. Never inherited by subsites.
     #[serde(default)]
     pub analytics: Option<AnalyticsConfig>,
+    /// Independent daily-only, 30-day public report. Absent means disabled.
+    #[serde(default)]
+    pub analytics_report: Option<crate::analytics_report::AnalyticsReportConfig>,
     /// Opt in to source-relative manual paths, literal code, and lean assets.
     #[serde(default)]
     pub documentation: Option<DocumentationConfig>,

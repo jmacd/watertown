@@ -7,7 +7,7 @@
 use crate::config::{AnalyticsConfig, SiteConfig};
 use crate::routes::PageJob;
 use maud::{Markup, html};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -15,14 +15,16 @@ use std::path::Path;
 pub(crate) const SCRIPT: &str = include_str!("../assets/analytics.js");
 pub(crate) const CATALOG_PATH: &str = "_analytics/catalog.json";
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CatalogEntry {
     pub page_uri: String,
     pub title: String,
     pub aliases: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Catalog {
     pub schema_version: u32,
     pub site_id: String,
@@ -54,18 +56,11 @@ pub(crate) fn enabled(config: &SiteConfig) -> Option<&AnalyticsConfig> {
 }
 
 pub(crate) fn validate(config: &SiteConfig) -> Result<(), String> {
+    crate::analytics_report::validate(config)?;
     let Some(analytics) = enabled(config) else {
         return Ok(());
     };
-    if analytics.site_id.is_empty()
-        || analytics.site_id.len() > 128
-        || !analytics
-            .site_id
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
-    {
-        return Err("analytics.site_id must be 1-128 ASCII letters, digits, '-' or '_'".into());
-    }
+    validate_site(&analytics.site_id)?;
     validate_path(&analytics.endpoint)?;
     validate_path(&config.site.base_url)?;
     if !config.site.base_url.ends_with('/') {
@@ -77,7 +72,19 @@ pub(crate) fn validate(config: &SiteConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_path(path: &str) -> Result<(), String> {
+pub(crate) fn validate_site(site_id: &str) -> Result<(), String> {
+    if site_id.is_empty()
+        || site_id.len() > 128
+        || !site_id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+    {
+        return Err("analytics.site_id must be 1-128 ASCII letters, digits, '-' or '_'".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_path(path: &str) -> Result<(), String> {
     if !path.starts_with('/')
         || path.contains("//")
         || path.contains(['\\', '?', '#', '%'])
@@ -119,6 +126,32 @@ pub(crate) fn excluded(config: &SiteConfig, uri: &str) -> bool {
 }
 
 impl Catalog {
+    pub fn verify(&self, site: &str) -> Result<(), String> {
+        #[derive(Serialize)]
+        struct Identity<'a> {
+            schema_version: u32,
+            site_id: &'a str,
+            entries: &'a [CatalogEntry],
+        }
+        let bytes = serde_json::to_vec(&Identity {
+            schema_version: self.schema_version,
+            site_id: &self.site_id,
+            entries: &self.entries,
+        })
+        .map_err(|error| error.to_string())?;
+        if self.schema_version != 1 || self.site_id != site || digest(&bytes) != self.catalog_id {
+            return Err("analytics catalog identity mismatch".into());
+        }
+        let mut paths = BTreeSet::new();
+        for entry in &self.entries {
+            validate_path(&entry.page_uri)?;
+            if !paths.insert(&entry.page_uri) || entry.title.len() > 1024 {
+                return Err("duplicate catalog URI or oversized title".into());
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(config: &SiteConfig, mut entries: Vec<CatalogEntry>) -> Result<Self, String> {
         validate(config)?;
         let analytics = enabled(config).ok_or("analytics is disabled")?;
@@ -209,6 +242,15 @@ impl BuildRegistry {
         jobs: &[PageJob],
         assets: impl Iterator<Item = impl AsRef<str>>,
     ) -> Result<(), String> {
+        if let Some(report) = &config.analytics_report {
+            self.active = true;
+            if enabled(config).is_none() && !self.sites.insert(report.site_id.clone()) {
+                return Err(format!("duplicate analytics site_id: {}", report.site_id));
+            }
+            self.reserved
+                .insert(format!("{}_analytics/", config.site.base_url));
+            self.record_output(config, "analytics.html");
+        }
         if let Some(analytics) = enabled(config) {
             self.active = true;
             validate(config)?;

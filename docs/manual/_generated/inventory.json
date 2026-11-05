@@ -6915,6 +6915,39 @@
           ],
           "type": "object"
         },
+        "AnalyticsReportConfig": {
+          "additionalProperties": false,
+          "properties": {
+            "catalog_dir": {
+              "description": "Private host directory of retained publisher catalogs, never raw logs.",
+              "type": "string"
+            },
+            "current_catalog": {
+              "description": "Current publisher catalog; retired pages are never linked blindly.",
+              "type": "string"
+            },
+            "site_id": {
+              "description": "Independent site/environment identity, matching the rollup and catalogs.",
+              "type": "string"
+            },
+            "state_path": {
+              "description": "Private host file shared by refresh and rendering; outside the web root.",
+              "type": "string"
+            },
+            "target": {
+              "description": "Committed analytics-rollup target in this site's own pond.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "site_id",
+            "target",
+            "catalog_dir",
+            "current_catalog",
+            "state_path"
+          ],
+          "type": "object"
+        },
         "ContentStage": {
           "additionalProperties": false,
           "description": "A content stage: globs markdown data files in the pond and reads\ntheir frontmatter for metadata (title, weight, slug).\n\nContent stages are resolved before route expansion. A `content` route\nreferences a stage by name, producing one page per matched file.",
@@ -7475,6 +7508,18 @@
           ],
           "default": null,
           "description": "Independent, opt-in reported page views. Never inherited by subsites."
+        },
+        "analytics_report": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AnalyticsReportConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Independent daily-only, 30-day public report. Absent means disabled."
         },
         "content": {
           "default": [],
