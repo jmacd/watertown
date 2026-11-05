@@ -33,7 +33,12 @@ pub fn schema() -> SchemaRef {
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             false,
         ),
-        Field::new("page_uri", DataType::Utf8, false),
+        Field::new("page_uri", DataType::Utf8, false).with_metadata(
+            std::collections::HashMap::from([(
+                utilities::parquet_policy::POLICY_KEY.into(),
+                utilities::parquet_policy::DICTIONARY_V1.into(),
+            )]),
+        ),
         Field::new("page_views", DataType::UInt64, false),
     ]))
 }
@@ -245,6 +250,11 @@ impl PartitionSink {
                 ));
             }
             for chunk in snapshot.snapshot().chunks() {
+                if chunk.schema() != &schema() {
+                    return Err(tinyfs::Error::Other(
+                        "analytics partition schema changed; plan and rebuild the rollup".into(),
+                    ));
+                }
                 if chunk.event_time_bounds().is_none_or(|bounds| {
                     bounds.min().div_euclid(DAY_US) != day.div_euclid(DAY_US)
                         || bounds.max().div_euclid(DAY_US) != day.div_euclid(DAY_US)

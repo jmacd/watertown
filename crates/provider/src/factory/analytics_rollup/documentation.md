@@ -75,6 +75,31 @@ An empty published manifest is a typed empty table; an absent manifest is an
 error. The node is read-only and supports typed queries/exports, not raw byte
 reads. Providers obey the pond's stale/closed transaction checks.
 
+## Encoding and compatibility
+
+`page_uri` remains an Arrow UTF-8 string. Its field metadata declares
+`watertown.parquet.encoding: bounded-utf8-dictionary.1`. The shared writer policy
+enables its Parquet dictionary, limits row groups to 8,192 rows and values to
+1,024 UTF-8 bytes, and allows a 16 MiB dictionary. Even distinct maximum-size
+values fit below that threshold. Writers reject oversized values or unknown
+policies and check actual data-page encoding evidence before reporting success.
+
+The policy applies to initial partitions, native pack maintenance, native
+reconstruction, capsule import, and Parquet export. Unmarked tables retain their
+existing encoding settings. Empty selections contain no physical objects.
+
+Field metadata is part of logical schema identity. This is a one-time analytics
+schema change, not a pond/capsule wire-format migration or a cache-only refresh.
+Recipe version 2 requires `plan` and `rebuild --plan TOKEN` for rollups created
+before the policy; raw events are unchanged. Repacking or restoring an opted-in
+table preserves its logical schema and leaf hashes.
+
+Standard Parquet readers remain compatible. Older Watertown writers may ignore
+the declaration: upgrade every writer/maintenance/import process before enabling
+this schema, and do not roll those processes back while writing these tables.
+New snapshot readers reject marked objects with missing dictionary evidence or
+plain data-page fallback.
+
 ## Work bounds and remaining gates
 
 Output records are streamed in timestamp/URI order, one partition at a time.
@@ -90,10 +115,9 @@ the current provider does not have an upper-bound cache-warming filter.
 Measure retained-history metadata and cache costs on staging before claiming
 constant-time tail discovery or a strict day-only I/O bound.
 
-The existing append-only materialization sink is unchanged. This publication
-path does not yet satisfy the separate dictionary-encoding lifecycle requirement:
-maintenance/import encoding, backup/rebuild operations, outage intervals,
-presentation and production enablement remain subsequent work.
+The existing append-only materialization sink is unchanged. Staging backup/rebuild
+exercises, outage intervals, presentation and production enablement remain
+subsequent work.
 
 <!-- docs:reference factory:analytics-rollup -->
 <!-- docs:end-reference -->

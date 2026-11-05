@@ -30,5 +30,9 @@ Use typed queries or exports, not raw byte reads.
 Each site/environment needs a separate rollup target. This factory neither
 collects events nor establishes collector uptime.
 
+The URI field carries the [rollup's encoding policy](analytics-rollup.md).
+Older rollup snapshots must be rebuilt before use with the new schema; deleting
+a query cache is not a migration.
+
 <!-- docs:reference factory:analytics-table -->
 <!-- docs:end-reference -->

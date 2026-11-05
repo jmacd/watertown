@@ -6550,6 +6550,7 @@ dependencies = [
  "serde_arrow",
  "serde_json",
  "serde_yaml",
+ "site-analytics-collector",
  "sync-store",
  "tempfile",
  "thiserror 2.0.21",
@@ -6669,6 +6670,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "url",
+ "utilities",
  "uuid",
 ]
 

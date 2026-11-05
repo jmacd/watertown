@@ -37,6 +37,7 @@ tokio.workspace = true
 tokio-util.workspace = true
 url.workspace = true
 uuid.workspace = true
+utilities.workspace = true
 
 [dev-dependencies]
 env_logger.workspace = true

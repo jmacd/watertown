@@ -549,4 +549,36 @@ async fn partition_selection_and_progress_commit_or_rollback_together() {
         .await
         .unwrap();
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+
+    use futures::StreamExt;
+    use tinyfs::arrow::ParquetExt;
+    let batch = stream(1).next().await.unwrap().unwrap();
+    let legacy_schema = Arc::new(arrow::datatypes::Schema::new(
+        schema()
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone().with_metadata(Default::default()))
+            .collect::<Vec<_>>(),
+    ));
+    let legacy = RecordBatch::try_new(legacy_schema, batch.columns().to_vec()).unwrap();
+    let object = uuid::Uuid::new_v4();
+    let root = context.filesystem().root().await.unwrap();
+    let _ = root
+        .write_series_from_batch(
+            format!("/analytics/hourly/_objects/{object}.series"),
+            &legacy,
+            Some("timestamp"),
+        )
+        .await
+        .unwrap();
+    let _ = manifest.days.insert(
+        0,
+        provider::factory::analytics_rollup::partitions::Partition { object, rows: 1 },
+    );
+    sink.publish(&manifest).await.unwrap();
+    let error = sink
+        .table(&manifest)
+        .await
+        .expect_err("legacy schema requires rebuild");
+    assert!(error.to_string().contains("plan and rebuild"));
 }

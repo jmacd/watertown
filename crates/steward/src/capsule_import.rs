@@ -2603,6 +2603,8 @@ async fn write_table_leaf_from_capsule(
                 StewardError::Content(format!("read Parquet rows for {path:?}: {error}"))
             })?;
             let batch = canonicalize_table_batch(batch, &object.schema, path)?;
+            utilities::parquet_policy::validate_batch(&batch)
+                .map_err(|error| StewardError::Content(error.to_string()))?;
             if pending.is_none() {
                 let file = tempfile::NamedTempFile::new_in(staging).map_err(|error| {
                     StewardError::Content(format!(
@@ -2613,7 +2615,13 @@ async fn write_table_leaf_from_capsule(
                     ArrowWriter::try_new(
                         file,
                         object.schema.clone(),
-                        Some(WriterProperties::builder().build()),
+                        Some(
+                            utilities::parquet_policy::writer_properties(
+                                &object.schema,
+                                WriterProperties::builder(),
+                            )
+                            .map_err(|error| StewardError::Content(error.to_string()))?,
+                        ),
                     )
                     .map_err(|error| {
                         StewardError::Content(format!(
@@ -2704,6 +2712,14 @@ async fn write_table_leaf(
     let mut scratch = arrow_writer.into_inner().map_err(|error| {
         StewardError::Content(format!("finish Parquet encoder for {name:?} leaf: {error}"))
     })?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(scratch.reopen().map_err(|error| {
+        StewardError::Content(format!(
+            "reopen encoded leaf for policy validation: {error}"
+        ))
+    })?)
+    .map_err(|error| StewardError::Content(error.to_string()))?;
+    utilities::parquet_policy::validate_metadata(reader.schema(), reader.metadata())
+        .map_err(|error| StewardError::Content(error.to_string()))?;
     let _ = scratch.seek(SeekFrom::Start(0)).map_err(|error| {
         StewardError::Content(format!(
             "rewind temporary Parquet leaf for {name:?}: {error}"

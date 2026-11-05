@@ -99,7 +99,7 @@ impl AnalyticsRollupConfig {
 
     fn recipe(&self) -> TinyResult<String> {
         let bytes =
-            serde_json::to_vec(&(1, &self.source, &self.site_id, &self.exclude)).map_other()?;
+            serde_json::to_vec(&(2, &self.source, &self.site_id, &self.exclude)).map_other()?;
         Ok(blake3::hash(&bytes).to_hex().to_string())
     }
 }

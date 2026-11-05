@@ -1,6 +1,6 @@
 # First-party site analytics: design and implementation
 
-> **Status: instrumentation, collector, strict ingestion, and rollup core implemented; not deployed.**
+> **Status: instrumentation, collector, strict ingestion, rollups, and dictionary lifecycle implemented; not deployed.**
 > Phase 1 provides independent per-site catalogs and disabled-by-default
 > first-visible instrumentation. See the
 > [Sitegen reference](../crates/sitegen/src/factory/documentation.md) for the
@@ -11,7 +11,8 @@
 > verification remain Phase 2 deployment gates. Opt-in inventory-aware ingestion
 > and a typed reference query are implemented; staging scheduling remains pending.
 > Transactional daily rollups and their selected-partition table are implemented.
-> Dictionary lifecycle verification and public reports remain pending.
+> Dictionary preservation is verified through maintenance, native restore,
+> capsule import and export. Public reports and staged operational exercises remain pending.
 > Nothing is enabled in production.
 > Deployment and retention choices require approval.
 
@@ -65,7 +66,7 @@ prefixed with `../`.
 | Temporal reduction | `crates/provider/src/factory/temporal_reduce/` has time-bucket aggregation, source-version caches, and late-data invalidation. | Its public configuration does not supply arbitrary grouping dimensions such as `page_uri`. A long-form page table is not a YAML-only application of that factory. |
 | Append materialization | `crates/provider/src/factory/materialize_series/` selects timestamps strictly greater than the target maximum. | Unsafe for changing aggregates and for late/equal-timestamp events. Do not use this as the analytics checkpoint. |
 | Replacement foundation | `analytics-rollup` uses a separate partition snapshot sink: immutable daily objects plus transactional selection/progress. `analytics-table` exposes a coherent query-foundation snapshot. The append-only `TinyFsMaterializationSink` remains unchanged. | Staging performance and operations; dictionary/maintenance/restore lifecycle verification. |
-| Physical encoding | The deterministic table pack writer in `crates/sync-store/src/content/series_pack_builder.rs` explicitly disables dictionary encoding and compression. | An explicit, compatible dictionary policy and proof that maintenance/import preserve the requirement. |
+| Physical encoding | The shared bounded UTF-8 dictionary policy opts analytics into dictionary encoding across materialization, packs, native reconstruction, capsule import and exports. Unmarked tables keep their prior settings. | Upgrade all writers before enabling the new analytics schema; rebuild older derived rollups. Staging lifecycle exercises remain required. |
 | Publication | `../config/scripts/run.sh` builds and publishes the site using versioned build directories and a `current` symlink. | Feed it a successful aggregate snapshot without making analytics failure block core site content. |
 
 The cloud Caddy configuration currently has no access-log directive. The
@@ -502,13 +503,31 @@ Implementation must audit all relevant writers:
 - Native import/reconstruction.
 - Public aggregate export, if it rewrites rather than copies the data.
 
-The current deterministic pack policy explicitly disables dictionaries. Merely
-relying on a Parquet default in the first writer does not satisfy the requirement.
-Choose an explicit bounded dictionary policy shared by these paths, preserving
-determinism for identical ordered input within a build. Prefer enabling supported
-string dictionaries through an existing physical-policy mechanism if available;
-otherwise introduce the smallest versioned policy needed. Do not silently alter
-unrelated table encoding or wire formats.
+The deterministic pack policy disables dictionaries for unmarked schemas.
+Analytics explicitly opts `page_uri` into the shared
+`watertown.parquet.encoding: bounded-utf8-dictionary.1` field contract.
+`crates/utilities/src/parquet_policy.rs` caps row groups at 8,192 rows, UTF-8 values
+at 1,024 bytes (matching accepted page URIs), and dictionary pages at 16 MiB.
+This bounds even an all-distinct row group below the dictionary threshold,
+independently of catalog turnover. Writer completion and snapshot reads check
+data-page encoding statistics, including the reader's compact encoding mask;
+PLAIN dictionary pages are not mistaken for plain data-page fallback.
+
+The policy is shared by TinyFS batch/stream writers, deterministic pack/native
+reconstruction encoding, capsule leaf reconstruction, Sitegen/CLI partitioned
+export, `cp` Parquet export, and `cat` Parquet output. Large-file storage's outer
+byte-chunk wrapper is not a rewrite of the inner analytics Parquet and is
+unchanged. Private transform/format caches are not the authoritative rollup
+partition publication path. No unmarked table or pond/capsule wire format changes.
+
+The field declaration participates in logical schema identity. Recipe version 2
+therefore requires an explicitly approved full rebuild of older derived rollups,
+not merely cache invalidation; raw event streams are unchanged. Thereafter
+packing and restore preserve the opted-in schema and leaf identities. Standard
+Parquet readers can read these files, but all Watertown writers must be upgraded
+before enabling the policy: older writers can ignore it. Maintenance's layout
+marker advances to version 2 so old layout markers are not treated as proof of
+the new policy.
 
 Respect [logical series identity](logical-series-identity-design.md): physical
 encoding and pack boundaries must not change logical row or series identity.
@@ -915,6 +934,37 @@ failures before/after publication never expose mixed data/progress. Retry does
 not double count. Repacking source files does not dirty unchanged logical data.
 
 ### Phase 5: dictionary encoding and physical lifecycle
+
+**Implemented locally; not deployed.** The opt-in policy and analytics recipe
+version 2 are wired through the physical write/rewrite chain. The real lifecycle
+test uses collector events, strict ingestion, a selected rollup partition, and a
+four-leaf table of the same schema to force table maintenance (ordinary immutable
+rollup objects have only one leaf). It inspects actual maintained pack objects,
+not only retained original files, verifies native pack proofs through fetch and
+reconstruction, imports a recovery capsule, checks public Parquet exports, and
+rebuilds counts from restored raw events. Ordered rows, logical hashes, schema,
+and rollup progress survive; maintenance does not dirty unchanged source data.
+
+The policy test also covers maximum-length all-distinct URIs crossing row groups,
+deterministic bytes, rejected fallback/unknown policies, and unchanged unmarked
+writer settings. For a synthetic 24-hour, three-column rollup with 50-byte URIs,
+uncompressed Parquet measurements are:
+
+| Pages | Plain URI bytes | Dictionary URI bytes | Plain file bytes | Policy file bytes |
+|---|---:|---:|---:|---:|
+| 10 | 12,982 | 698 | 18,155 | 5,869 |
+| 100 | 129,622 | 7,543 | 169,367 | 47,297 |
+| 1,000 | 1,296,047 | 192,178 | 1,681,645 | 578,892 |
+
+These compare the same ordered rows and metadata, not production traffic.
+Other columns remain plain in this comparison. The four-leaf lifecycle fixture
+shrinks from 6,192 bytes to a 2,972-byte maintained object while preserving URI
+dictionaries. Native reconstruction uses the deterministic pack encoder, so its
+individual files can be larger than the initial writer's files (a 96-row rollup
+is 1,637 bytes initially and 2,972 after native reconstruction); dictionary
+preservation is not a promise of byte-identical physical layout or minimum size.
+Capsule import preserves source mtimes; native pack reconstruction guarantees
+logical identities/event-time bounds, not historical per-leaf write mtimes.
 
 Primary code: materialization writers, `crates/sync-store/src/content/`,
 `crates/tinyfs/src/arrow/parquet.rs`, and native import/export paths as required.
