@@ -146,8 +146,11 @@ through ordinary `exports` or the SQL explorer.
 Each site/environment needs its own state file and job. Subsites never inherit
 this setting. Mount the same private state into the report job and renderer,
 read-only for the renderer, with explicit service ownership/read permissions.
-Only the report job needs access to private catalogs. The outer site's current
-`run.sh` and container mounts do not provision or schedule this feature yet.
+Only the report job needs access to private catalogs. The outer repository
+provides an opt-in staging runner, narrow report mounts, and inactive
+`pond-analytics-report@` user-unit templates; see its operations guide.
+Provisioning, timer installation and alerting remain explicit deployment work.
+The core `run.sh` does not invoke report refresh.
 
 Limits fail visibly rather than truncating counts: 100,000 daily URI/day rows,
 8 MiB projected JSON, 1,024-byte titles, and at most 4,096 catalog-directory

@@ -756,10 +756,12 @@ clips old saved rows to the current 30-day window.
 Site identities, retained-catalog hashes and current-build links are checked.
 Retired pages retain labels/history without blind links. No report settings or
 data are inherited by recursively generated subsites, and quick/no-analytics
-builds suppress both reporting and instrumentation. The current outer site
-configuration, runner, service schedules and container mounts are unchanged:
-private state sharing and independent monitored refresh jobs remain explicit
-staging work. Do not claim pipeline uptime from the still-unknown coverage field.
+builds suppress both reporting and instrumentation. The outer repository now
+provides staging-only opt-in report mounts, a separately failing refresh runner,
+and inactive user-service/timer templates. Existing unconfigured commands and
+core site publication remain unchanged. Host provisioning, unit installation,
+alerting and live failure exercises remain explicit staging work. Do not claim
+pipeline uptime from the still-unknown coverage field.
 
 Exclude the analytics dashboard and synthetic validation routes by default to
 avoid counting operational inspection as audience activity. This is a catalog
