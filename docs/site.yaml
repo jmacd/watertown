@@ -94,10 +94,6 @@ sidebar:
                 href: /reference/factories/hydrovu.html
           - label: SQL and transforms
             children:
-              - label: Analytics rollups
-                href: /reference/factories/analytics-rollup.html
-              - label: Analytics table
-                href: /reference/factories/analytics-table.html
               - label: SQL-derived table
                 href: /reference/factories/sql-derived-table.html
               - label: SQL-derived series
@@ -148,8 +144,6 @@ sidebar:
             href: /reference/formats/oteljson.html
           - label: JSON logs
             href: /reference/formats/jsonlogs.html
-          - label: Site analytics
-            href: /reference/formats/site-analytics.html
           - label: Web logs
             href: /reference/formats/weblog.html
           - label: Excel HTML

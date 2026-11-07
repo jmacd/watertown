@@ -14,7 +14,6 @@
 //! ```
 
 mod analytics;
-mod analytics_report;
 mod config;
 mod documentation;
 mod email;

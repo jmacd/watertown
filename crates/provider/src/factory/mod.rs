@@ -2,7 +2,6 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-pub mod analytics_rollup;
 pub mod column_rename;
 mod config_util;
 pub mod dynamic_dir;

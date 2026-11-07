@@ -19,7 +19,6 @@ pub mod partial_aggregate_cache;
 mod provider_api;
 pub mod query_foundation_adapter;
 pub mod series_append;
-mod site_analytics;
 pub mod size_tier;
 mod sql_transform;
 mod table_creation;
@@ -151,14 +150,6 @@ pub fn documentation_schemas() -> std::collections::BTreeMap<&'static str, schem
         (
             "factory:materialize-series",
             schema::<materialize_series::MaterializeSeriesConfig>(),
-        ),
-        (
-            "factory:analytics-rollup",
-            schema::<analytics_rollup::AnalyticsRollupConfig>(),
-        ),
-        (
-            "factory:analytics-table",
-            schema::<analytics_rollup::AnalyticsTableConfig>(),
         ),
         (
             "factory:column-rename",

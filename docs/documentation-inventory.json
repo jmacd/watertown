@@ -97,8 +97,6 @@
         "factory:temporal-reduce",
         "factory:temporal-reduce-series",
         "factory:materialize-series",
-        "factory:analytics-rollup",
-        "factory:analytics-table",
         "factory:pump-state-series",
         "factory:dynamic-dir",
         "factory:column-rename",
@@ -136,7 +134,6 @@
         "format:csv",
         "format:oteljson",
         "format:jsonlogs",
-        "format:site-analytics",
         "format:weblog",
         "format:xls",
         "format:excelhtml",
@@ -363,24 +360,6 @@
       "coverage": "unverified",
       "output": "docs/manual/reference/factories/materialize-series.md"
     },
-    "factory:analytics-rollup": {
-      "path": "crates/provider/src/factory/analytics_rollup/documentation.md",
-      "components": [
-        "factory:analytics-rollup"
-      ],
-      "examples": [],
-      "coverage": "validation-only",
-      "output": "docs/manual/reference/factories/analytics-rollup.md"
-    },
-    "factory:analytics-table": {
-      "path": "crates/provider/src/factory/analytics_rollup/table/documentation.md",
-      "components": [
-        "factory:analytics-table"
-      ],
-      "examples": [],
-      "coverage": "validation-only",
-      "output": "docs/manual/reference/factories/analytics-table.md"
-    },
     "factory:monitor-report": {
       "path": "crates/sitegen/src/monitor/documentation.md",
       "components": [
@@ -540,15 +519,6 @@
       "examples": [],
       "coverage": "unverified",
       "output": "docs/manual/reference/formats/jsonlogs.md"
-    },
-    "format:site-analytics": {
-      "path": "crates/provider/src/format/site_analytics/documentation.md",
-      "components": [
-        "format:site-analytics"
-      ],
-      "examples": [],
-      "coverage": "validation-only",
-      "output": "docs/manual/reference/formats/site-analytics.md"
     },
     "format:oteljson": {
       "path": "crates/provider/src/format/oteljson/documentation.md",

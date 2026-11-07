@@ -461,7 +461,6 @@ mod tests {
     fn test_config() -> SiteConfig {
         SiteConfig {
             analytics: None,
-            analytics_report: None,
             documentation: None,
             strict: false,
             site: SiteMeta {
@@ -656,7 +655,6 @@ mod tests {
 
         let config = SiteConfig {
             analytics: None,
-            analytics_report: None,
             documentation: None,
             strict: false,
             site: SiteMeta {

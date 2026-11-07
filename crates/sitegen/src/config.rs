@@ -39,9 +39,6 @@ pub struct SiteConfig {
     /// Independent, opt-in reported page views. Never inherited by subsites.
     #[serde(default)]
     pub analytics: Option<AnalyticsConfig>,
-    /// Independent daily-only, 30-day public report. Absent means disabled.
-    #[serde(default)]
-    pub analytics_report: Option<crate::analytics_report::AnalyticsReportConfig>,
     /// Opt in to source-relative manual paths, literal code, and lean assets.
     #[serde(default)]
     pub documentation: Option<DocumentationConfig>,
@@ -155,7 +152,7 @@ pub struct AnalyticsConfig {
     pub enabled: bool,
     /// Stable publisher-owned site identity, independent of host and mount path.
     pub site_id: String,
-    /// Same-origin absolute path. Shared endpoints must resolve sites by catalog.
+    /// Same-origin absolute path, routed to this site's dedicated beacon log.
     #[serde(default = "default_analytics_endpoint")]
     pub endpoint: String,
     /// Exact canonical mounted paths to exclude, in addition to /analytics.

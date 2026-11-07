@@ -23,7 +23,12 @@ before(async () => {
     } else if (url.pathname === "/_analytics/view") {
       let body = "";
       for await (const chunk of req) body += chunk;
-      records.push({ payload: JSON.parse(body), headers: req.headers });
+      records.push({
+        payload: Object.fromEntries(url.searchParams),
+        method: req.method,
+        body,
+        headers: req.headers,
+      });
       res.writeHead(status).end();
     } else {
       const state = url.searchParams.get("state") || "visible";
@@ -91,11 +96,11 @@ test("first visible view omits credentials, referrer, URL state and identifiers"
     await signal(page, "visible");
     assert.equal(records.length, 1);
     assert.deepEqual(records[0].payload, {
-      schema_version: 1,
-      event: "pageview",
       catalog_id: "fixture-catalog",
       page_uri: "/noyo-harbor/sites/BDock",
     });
+    assert.equal(records[0].method, "POST");
+    assert.equal(records[0].body, "");
     assert.equal(records[0].headers.cookie, undefined);
     assert.equal(records[0].headers.referer, undefined);
     await signal(page, "hidden");
@@ -163,7 +168,7 @@ test("rejections and network failures warn once, do not retry or affect content"
       if (networkFailure) {
         await page.setRequestInterception(true);
         page.on("request", request => {
-          if (request.url().endsWith("/_analytics/view")) void request.abort();
+          if (new URL(request.url()).pathname === "/_analytics/view") void request.abort();
           else void request.continue();
         });
       }

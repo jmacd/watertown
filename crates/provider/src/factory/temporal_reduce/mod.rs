@@ -129,6 +129,9 @@ pub struct AggregationConfig {
 pub struct TemporalReduceSeriesConfig {
     pub in_pattern: crate::Url,
     pub time_column: String,
+    /// Exact source columns retained as grouping keys alongside the time bucket.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_by: Vec<String>,
     pub resolution: String,
     pub aggregations: Vec<AggregationConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -149,6 +152,7 @@ impl TemporalReduceSeriesConfig {
             in_pattern: self.in_pattern,
             out_pattern: String::new(),
             time_column: self.time_column,
+            group_by: self.group_by,
             resolutions: vec![self.resolution],
             aggregations: self.aggregations,
             output_aliases: self.output_aliases,
@@ -173,6 +177,10 @@ pub struct TemporalReduceConfig {
 
     /// Name of the timestamp column
     pub time_column: String,
+
+    /// Exact source columns retained as grouping keys alongside the time bucket.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_by: Vec<String>,
 
     /// List of temporal resolutions (e.g., "1h", "6h", "1d")
     /// Parsed using humantime::parse_duration
@@ -245,6 +253,36 @@ pub(crate) struct SealPolicy {
 const DEFAULT_ALLOWED_LATENESS: Duration = Duration::from_secs(24 * 60 * 60);
 
 impl TemporalReduceConfig {
+    fn validate_group_by(&self) -> TinyFSResult<()> {
+        let mut unique = std::collections::HashSet::new();
+        for group in &self.group_by {
+            if group.is_empty()
+                || group == &self.time_column
+                || group == "time_bucket"
+                || group.starts_with("__p_")
+            {
+                return Err(tinyfs::Error::Other(format!(
+                    "invalid or reserved temporal-reduce group column '{group}'"
+                )));
+            }
+            if !unique.insert(group) {
+                return Err(tinyfs::Error::Other(format!(
+                    "duplicate temporal-reduce group column '{group}'"
+                )));
+            }
+            if self
+                .output_aliases
+                .as_ref()
+                .is_some_and(|aliases| aliases.values().any(|output| output == group))
+            {
+                return Err(tinyfs::Error::Other(format!(
+                    "temporal-reduce group column '{group}' conflicts with an output alias"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Resolve the configured maximum allowed lateness as whole seconds,
     /// defaulting to [`DEFAULT_ALLOWED_LATENESS`]. Parsing failures are a hard
     /// error so a malformed duration surfaces instead of silently defaulting.
@@ -907,7 +945,13 @@ impl TemporalReduceSqlFile {
             match agg.columns.take() {
                 None => {
                     // Use all discovered columns for this aggregation
-                    agg.columns = Some(discovered_columns.clone());
+                    agg.columns = Some(
+                        discovered_columns
+                            .iter()
+                            .filter(|name| !self.config.group_by.contains(name))
+                            .cloned()
+                            .collect(),
+                    );
                     log::debug!(
                         "TemporalReduceFile: filled {} aggregation with {} columns",
                         agg.agg_type.to_sql(),
@@ -954,6 +998,12 @@ impl TemporalReduceSqlFile {
     }
 
     fn configured_empty_source_columns(&self) -> TinyFSResult<Vec<String>> {
+        if !self.config.group_by.is_empty() {
+            return Err(tinyfs::Error::Other(format!(
+                "temporal-reduce source '{}' matched no files; group column types cannot be inferred",
+                self.pattern_url
+            )));
+        }
         let mut columns = std::collections::BTreeSet::new();
         for aggregation in &self.config.aggregations {
             let configured = aggregation.columns.as_ref().ok_or_else(|| {
@@ -2635,6 +2685,9 @@ fn partial_aggregate_cfg_canonical(
             let _ = write!(s, "alias={source}:{output};");
         }
     }
+    if !filled.group_by.is_empty() {
+        let _ = write!(s, "groups={:?};", filled.group_by);
+    }
     s
 }
 
@@ -2855,6 +2908,7 @@ struct PartialDef {
 /// - the cross-version merge query ([`AggSqlPieces::merge_sql`]) that combines
 ///   cached partials back into the final output.
 struct AggSqlPieces {
+    group_by: Vec<String>,
     partials: Vec<PartialDef>,
     reconstructions: Vec<Reconstruction>,
 }
@@ -2886,11 +2940,13 @@ impl Reconstruction {
 impl AggSqlPieces {
     /// Build the decomposed pieces from the (schema-filled) config.
     fn build(config: &TemporalReduceConfig) -> TinyFSResult<Self> {
+        config.validate_group_by()?;
         let mut aliases: HashMap<(PartialKind, String), String> = HashMap::new();
         let mut partials: Vec<PartialDef> = Vec::new();
         let mut reconstructions = Vec::new();
         let mut used_aliases = std::collections::HashSet::new();
         let mut output_names = std::collections::HashSet::from([config.time_column.clone()]);
+        output_names.extend(config.group_by.iter().cloned());
 
         // Register a partial for (kind, column), deduplicating so e.g. Avg and
         // Sum on the same column share a single SUM partial. Returns its alias.
@@ -3027,6 +3083,7 @@ impl AggSqlPieces {
         }
 
         Ok(Self {
+            group_by: config.group_by.clone(),
             partials,
             reconstructions,
         })
@@ -3127,6 +3184,7 @@ impl AggSqlPieces {
             })
             .collect();
         query_foundation::plans::reduce::TimestampWindowReduce::try_new(ts, interval, aggregates)
+            .and_then(|recipe| recipe.with_groups(self.group_by.clone()))
     }
 
     fn merge_partials_frame(
@@ -3165,6 +3223,7 @@ impl AggSqlPieces {
             output_interval,
             aggregates,
         )?
+        .with_groups(self.group_by.clone())?
         .with_epoch_second_bounds(lower_bound, upper_bound);
         let merged = query_foundation::plans::reduce::reduce_timestamp_windows(frame, &recipe)?;
         let output_timestamp =
@@ -3182,6 +3241,7 @@ impl AggSqlPieces {
             ])
             .alias(ts),
         ];
+        projection.extend(self.group_expressions());
         projection.extend(self.partials.iter().map(|partial| {
             let value = col(Column::from_name(&partial.alias));
             match partial.kind {
@@ -3191,9 +3251,11 @@ impl AggSqlPieces {
                 _ => value,
             }
         }));
-        merged
-            .select(projection)?
-            .sort(vec![col(Column::from_name(ts)).sort(true, true)])
+        let order = std::iter::once(ts)
+            .chain(self.group_by.iter().map(String::as_str))
+            .map(|name| col(Column::from_name(name)).sort(true, true))
+            .collect();
+        merged.select(projection)?.sort(order)
     }
 
     /// Single-pass query: group raw rows into buckets, compute partials, and
@@ -3208,18 +3270,19 @@ impl AggSqlPieces {
             r#"
         WITH time_buckets AS (
           SELECT 
-            {bin} AS time_bucket,
+            {bin} AS time_bucket{groups},
             {partial_exprs}
           FROM {table}
           WHERE {ts} IS NOT NULL
-          GROUP BY {bin}
+          GROUP BY {bin}{groups}
         )
         SELECT 
           COALESCE(CAST(time_bucket AS TIMESTAMP), CAST(0 AS TIMESTAMP)) AS {ts},
           {select_exprs}
         FROM time_buckets
-        ORDER BY time_bucket
+        ORDER BY time_bucket{groups}
         "#,
+            groups = self.group_sql_suffix(),
             partial_exprs = self.raw_partial_exprs().join(",\n            "),
             select_exprs = self.reconstruction_sql_exprs().join(",\n          "),
         )
@@ -3242,12 +3305,13 @@ impl AggSqlPieces {
         format!(
             r#"
         SELECT 
-          {bin} AS time_bucket,
+          {bin} AS time_bucket{groups},
           {partial_exprs}
         FROM {version_table}
         WHERE {ts} IS NOT NULL
-        GROUP BY {bin}
+        GROUP BY {bin}{groups}
         "#,
+            groups = self.group_sql_suffix(),
             partial_exprs = self.raw_partial_exprs_for(available).join(",\n          "),
         )
     }
@@ -3310,28 +3374,38 @@ impl AggSqlPieces {
             r#"
         WITH merged AS (
           SELECT 
-            {bin} AS time_bucket,
+            {bin} AS time_bucket{groups},
             {merge_exprs}
           FROM {partials_table}
           {where_clause}
-          GROUP BY {bin}
+          GROUP BY {bin}{groups}
         )
         SELECT 
           COALESCE(CAST(time_bucket AS TIMESTAMP), CAST(0 AS TIMESTAMP)) AS {ts},
           {select_exprs}
         FROM merged
-        ORDER BY time_bucket
+        ORDER BY time_bucket{groups}
         "#,
+            groups = self.group_sql_suffix(),
             merge_exprs = self.merge_partial_exprs().join(",\n            "),
             select_exprs = self.reconstruction_sql_exprs().join(",\n          "),
         )
     }
 
     #[cfg(test)]
-    fn reconstruction_sql_exprs(&self) -> Vec<String> {
-        self.reconstructions
+    fn group_sql_suffix(&self) -> String {
+        self.group_by
             .iter()
-            .map(Reconstruction::sql_expr)
+            .map(|name| format!(", \"{}\"", name.replace('"', "\"\"")))
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn reconstruction_sql_exprs(&self) -> Vec<String> {
+        self.group_by
+            .iter()
+            .map(|name| format!("\"{}\"", name.replace('"', "\"\"")))
+            .chain(self.reconstructions.iter().map(Reconstruction::sql_expr))
             .collect()
     }
 
@@ -3342,6 +3416,7 @@ impl AggSqlPieces {
         ts: &str,
     ) -> datafusion::error::Result<datafusion::dataframe::DataFrame> {
         let mut projection = vec![col(Column::from_name(ts))];
+        projection.extend(self.group_expressions());
         projection.extend(self.reconstruction_expressions());
         frame.select(projection)
     }
@@ -3367,10 +3442,20 @@ impl AggSqlPieces {
             ])
             .alias(ts),
         ];
+        projection.extend(self.group_expressions());
         projection.extend(self.reconstruction_expressions());
-        frame
-            .select(projection)?
-            .sort(vec![col(Column::from_name(ts)).sort(true, true)])
+        let order = std::iter::once(ts)
+            .chain(self.group_by.iter().map(String::as_str))
+            .map(|name| col(Column::from_name(name)).sort(true, true))
+            .collect();
+        frame.select(projection)?.sort(order)
+    }
+
+    fn group_expressions(&self) -> Vec<datafusion::logical_expr::Expr> {
+        self.group_by
+            .iter()
+            .map(|name| col(Column::from_name(name)))
+            .collect()
     }
 
     fn reconstruction_expressions(&self) -> Vec<datafusion::logical_expr::Expr> {
@@ -3915,6 +4000,7 @@ fn validate_temporal_reduce_config(config: &[u8]) -> TinyFSResult<Value> {
 
     // Surface a malformed allowed_lateness at config time, not mid-build.
     _ = temporal_config.allowed_lateness_secs()?;
+    temporal_config.validate_group_by()?;
 
     Ok(config_value)
 }
@@ -3936,6 +4022,7 @@ fn validate_temporal_reduce_series_config(config: &[u8]) -> TinyFSResult<Value> 
     _ = parse_nesting_resolutions(std::slice::from_ref(&series_config.resolution))?;
     let temporal_config = series_config.into_temporal_config();
     _ = temporal_config.allowed_lateness_secs()?;
+    temporal_config.validate_group_by()?;
     if let Some(aliases) = &temporal_config.output_aliases {
         let mut outputs = std::collections::HashSet::new();
         for (source, output) in aliases {
@@ -4288,6 +4375,7 @@ mod tests {
             in_pattern: crate::Url::parse("series:///sources/*").unwrap(),
             out_pattern: "$0".to_string(),
             time_column: "timestamp".to_string(),
+            group_by: Vec::new(),
             resolutions: vec!["1d".to_string()],
             aggregations,
             output_aliases: None,
@@ -4327,6 +4415,34 @@ mod tests {
             "src=series:///sources/*;finest=3600s;ts=timestamp;\
              agg=SUM:depth,temp,;agg=COUNT:depth,;"
         );
+    }
+
+    #[test]
+    fn grouping_columns_are_validated_and_separate_cache_identity() {
+        let mut config = cfg_with_aggs(vec![agg(AggregationType::Count, &["*"])]);
+        let canonical = |config: &TemporalReduceConfig| {
+            partial_aggregate_cfg_canonical(config, Duration::from_secs(86400), "series:///source")
+        };
+        let ungrouped = canonical(&config);
+        config.group_by = vec!["site".into(), "page.uri".into()];
+        assert_ne!(canonical(&config), ungrouped);
+        let grouped = canonical(&config);
+        config.group_by = vec!["site, page.uri".into()];
+        assert_ne!(canonical(&config), grouped);
+        for groups in [
+            vec![""],
+            vec!["site", "site"],
+            vec!["timestamp"],
+            vec!["time_bucket"],
+            vec!["__p_count_0"],
+            vec!["timestamp.count"],
+        ] {
+            config.group_by = groups.into_iter().map(str::to_owned).collect();
+            assert!(AggSqlPieces::build(&config).is_err());
+        }
+        config.group_by = vec!["site".into()];
+        config.output_aliases = Some(HashMap::from([("timestamp.count".into(), "site".into())]));
+        assert!(AggSqlPieces::build(&config).is_err());
     }
 
     #[test]
@@ -4478,6 +4594,7 @@ mod tests {
             in_pattern: crate::Url::parse("series:///missing/*.series").unwrap(),
             out_pattern: "data".to_owned(),
             time_column: "timestamp".to_owned(),
+            group_by: Vec::new(),
             resolutions: vec!["1h".to_owned()],
             aggregations: vec![
                 agg(AggregationType::Avg, &["temperature"]),
@@ -4903,6 +5020,7 @@ mod tests {
                 in_pattern: crate::Url::parse("series:///sources/*.series").unwrap(),
                 out_pattern: "$0".to_string(), // Preserve filename as site directory name
                 time_column: "timestamp".to_string(),
+                group_by: Vec::new(),
                 resolutions: vec!["1d".to_string()], // Daily aggregation
                 aggregations: vec![
                     AggregationConfig {
@@ -5254,6 +5372,7 @@ output_aliases:
                 in_pattern,
                 out_pattern: "out".to_string(),
                 time_column: "timestamp".to_string(),
+                group_by: Vec::new(),
                 resolutions: vec!["1h".to_string()],
                 aggregations: vec![],
                 output_aliases: None,
@@ -5376,6 +5495,7 @@ output_aliases:
                 in_pattern: crate::Url::parse("csv:///ingest/weather.csv").unwrap(),
                 out_pattern: "weather".to_string(),
                 time_column: "timestamp".to_string(),
+                group_by: Vec::new(),
                 resolutions: vec!["1d".to_string()],
                 aggregations: vec![
                     AggregationConfig {
@@ -5514,6 +5634,7 @@ output_aliases:
             in_pattern: crate::Url::parse("csv:///ingest/weather-*.csv").unwrap(),
             out_pattern: "weather".to_owned(),
             time_column: "timestamp".to_owned(),
+            group_by: Vec::new(),
             resolutions: vec!["1d".to_owned()],
             aggregations: vec![agg(AggregationType::Max, &["temperature"])],
             output_aliases: None,
@@ -5565,6 +5686,7 @@ output_aliases:
             in_pattern: crate::Url::parse("csv:///ingest/weather.csv").unwrap(),
             out_pattern: "weather".to_owned(),
             time_column: "timestamp".to_owned(),
+            group_by: Vec::new(),
             resolutions: vec!["1d".to_owned()],
             aggregations: vec![agg(AggregationType::Max, &["temperature"])],
             output_aliases: None,
@@ -5646,6 +5768,251 @@ output_aliases:
     /// values as the single-pass delegate, and a second read over an unchanged
     /// source must reuse the cached partials without recomputing any.
     #[tokio::test]
+    async fn grouped_rollup_preserves_dimensions_through_cascade_reuse_and_backfill() {
+        use arrow::array::{Array, Int64Array, StringArray, TimestampMicrosecondArray};
+        use tinyfs::arrow::ParquetExt;
+
+        type Row = (i64, Option<String>, String, i64, f64);
+        const DAY: i64 = 86_400_000_000;
+        let persistence = tinyfs::MemoryPersistence::default();
+        let fs = tinyfs::FS::new(persistence.clone()).await.unwrap();
+        let root = fs.root().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+
+        async fn append(root: &tinyfs::WD, rows: &[(i64, Option<&str>, &str, f64)]) {
+            let batch = RecordBatch::try_from_iter(vec![
+                (
+                    "timestamp",
+                    Arc::new(TimestampMicrosecondArray::from(
+                        rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                    )) as arrow::array::ArrayRef,
+                ),
+                (
+                    "site",
+                    Arc::new(StringArray::from(
+                        rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                    )),
+                ),
+                (
+                    "page.uri",
+                    Arc::new(StringArray::from(
+                        rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                    )),
+                ),
+                (
+                    "value",
+                    Arc::new(Float64Array::from(
+                        rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+                    )),
+                ),
+            ])
+            .unwrap();
+            _ = root
+                .write_series_from_batch("/events", &batch, Some("timestamp"))
+                .await
+                .unwrap();
+        }
+
+        let make_context = |cached: bool| {
+            let session = Arc::new(datafusion::prelude::SessionContext::new());
+            _ = crate::register_tinyfs_object_store(&session, persistence.clone()).unwrap();
+            let context = crate::ProviderContext::new(session, Arc::new(persistence.clone()));
+            if cached {
+                context.with_cache_dir(tmp.path().to_path_buf())
+            } else {
+                context
+            }
+        };
+        let mut config = cfg_with_aggs(vec![
+            agg(AggregationType::Count, &["*"]),
+            AggregationConfig {
+                agg_type: AggregationType::Avg,
+                columns: None,
+            },
+        ]);
+        config.in_pattern = crate::Url::parse("series:///events").unwrap();
+        config.out_pattern = "events".into();
+        config.group_by = vec!["site".into(), "page.uri".into()];
+        config.resolutions = vec!["1h".into(), "1d".into()];
+        config.output_aliases = Some(HashMap::from([("timestamp.count".into(), "views".into())]));
+        config.allowed_lateness = Some("0s".into());
+        config.max_live_segments = Some(1);
+
+        async fn collect(
+            context: &crate::ProviderContext,
+            config: TemporalReduceConfig,
+            resolution: &str,
+        ) -> Vec<Row> {
+            let dir = TemporalReduceDirectory::new(config, test_context(context, FileID::root()))
+                .unwrap()
+                .create_handle();
+            let node = dir.get("events").await.unwrap().unwrap();
+            let NodeType::Directory(dir) = node.node_type else {
+                panic!("directory");
+            };
+            let node = dir
+                .get(&format!("res={resolution}.series"))
+                .await
+                .unwrap()
+                .unwrap();
+            let NodeType::File(file) = node.node_type else {
+                panic!("file");
+            };
+            let file = file.get_file().await;
+            let file = file.lock().await;
+            let provider = file
+                .as_queryable()
+                .unwrap()
+                .as_table_provider(node.id, context)
+                .await
+                .unwrap();
+            _ = context
+                .datafusion_session
+                .register_table("reduced", provider)
+                .unwrap();
+            let batches = context
+                .datafusion_session
+                .sql(
+                    r#"SELECT CAST(timestamp AS BIGINT) AS t, arrow_cast(site, 'Utf8') AS site_key,
+                          arrow_cast("page.uri", 'Utf8') AS page_key, views, "value.avg"
+                   FROM reduced ORDER BY t, site_key NULLS FIRST, page_key"#,
+                )
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let mut rows = Vec::new();
+            for batch in batches {
+                let timestamps = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let sites = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let pages = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let counts = batch
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let averages = batch
+                    .column(4)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap();
+                for i in 0..batch.num_rows() {
+                    rows.push((
+                        timestamps.value(i),
+                        (!sites.is_null(i)).then(|| sites.value(i).to_owned()),
+                        pages.value(i).to_owned(),
+                        counts.value(i),
+                        averages.value(i),
+                    ));
+                }
+            }
+            rows
+        }
+
+        append(
+            &root,
+            &[
+                (0, Some("a"), "x", 2.0),
+                (1, Some("a"), "x", 4.0),
+                (3_600_000_000, Some("a"), "x", 6.0),
+                (0, Some("a"), "y", 8.0),
+                (0, Some("b"), "x", 10.0),
+                (0, None, "x", 12.0),
+                (3 * DAY, Some("a"), "x", 20.0),
+            ],
+        )
+        .await;
+        let cached = make_context(true);
+        let initial = collect(&cached, config.clone(), "1d").await;
+        assert_eq!(cached.plan_visibility_metrics().non_incremental_plans, 0);
+        assert_eq!(
+            initial,
+            vec![
+                (0, None, "x".into(), 1, 12.0),
+                (0, Some("a".into()), "x".into(), 3, 4.0),
+                (0, Some("a".into()), "y".into(), 1, 8.0),
+                (0, Some("b".into()), "x".into(), 1, 10.0),
+                (3 * DAY, Some("a".into()), "x".into(), 1, 20.0),
+            ]
+        );
+        for resolution in ["1h", "1d"] {
+            assert_eq!(
+                collect(&make_context(true), config.clone(), resolution).await,
+                collect(&make_context(false), config.clone(), resolution).await,
+            );
+        }
+        let manifests = walk_find(tmp.path(), &|name| name == "manifest.json");
+        assert_eq!(manifests.len(), 2);
+        for path in &manifests {
+            let manifest =
+                crate::partial_aggregate_cache::read_segment_manifest(path.parent().unwrap())
+                    .unwrap()
+                    .unwrap();
+            assert!(!manifest.segments.is_empty(), "old buckets must be sealed");
+        }
+        let fingerprint = || {
+            let mut paths = walk_find(tmp.path(), &|name| {
+                name.ends_with(".parquet") || name == "manifest.json"
+            });
+            paths.sort();
+            paths
+                .into_iter()
+                .map(|path| {
+                    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                    let bytes = std::fs::read(&path).unwrap();
+                    (path, modified, bytes)
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = fingerprint();
+        assert_eq!(
+            collect(&make_context(true), config.clone(), "1d").await,
+            initial
+        );
+        assert_eq!(fingerprint(), before, "warm read must reuse cache files");
+
+        append(&root, &[(6 * DAY, Some("a"), "x", 40.0)]).await;
+        _ = collect(&make_context(true), config.clone(), "1d").await;
+        append(
+            &root,
+            &[(0, Some("a"), "x", 14.0), (0, Some("b"), "y", 30.0)],
+        )
+        .await;
+        let backfilled = collect(&make_context(true), config.clone(), "1d").await;
+        assert_eq!(
+            backfilled,
+            vec![
+                (0, None, "x".into(), 1, 12.0),
+                (0, Some("a".into()), "x".into(), 4, 6.5),
+                (0, Some("a".into()), "y".into(), 1, 8.0),
+                (0, Some("b".into()), "x".into(), 1, 10.0),
+                (0, Some("b".into()), "y".into(), 1, 30.0),
+                (3 * DAY, Some("a".into()), "x".into(), 1, 20.0),
+                (6 * DAY, Some("a".into()), "x".into(), 1, 40.0),
+            ]
+        );
+        for resolution in ["1h", "1d"] {
+            assert_eq!(
+                collect(&make_context(true), config.clone(), resolution).await,
+                collect(&make_context(false), config.clone(), resolution).await,
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_rollup_cache_matches_single_pass_and_is_incremental() {
         let _ = env_logger::try_init();
 
@@ -5685,6 +6052,7 @@ output_aliases:
             in_pattern: crate::Url::parse("csv:///ingest/weather-*.csv").unwrap(),
             out_pattern: "weather".to_string(),
             time_column: "timestamp".to_string(),
+            group_by: Vec::new(),
             resolutions: vec!["1d".to_string()],
             aggregations: vec![
                 agg(AggregationType::Avg, &["temperature", "humidity"]),
@@ -5922,6 +6290,7 @@ output_aliases:
             in_pattern: crate::Url::parse("csv:///ingest/weather-*.csv").unwrap(),
             out_pattern: "weather".to_string(),
             time_column: "timestamp".to_string(),
+            group_by: Vec::new(),
             resolutions: vec!["1h".to_string(), "6h".to_string(), "1d".to_string()],
             aggregations: vec![
                 agg(AggregationType::Avg, &["temperature"]),
@@ -6110,6 +6479,7 @@ output_aliases:
             in_pattern: crate::Url::parse("csv:///ingest/weather.csv").unwrap(),
             out_pattern: "weather".to_string(),
             time_column: "timestamp".to_string(),
+            group_by: Vec::new(),
             resolutions: vec!["1h".to_string(), "6h".to_string(), "1d".to_string()],
             aggregations: vec![agg(AggregationType::Max, &["temperature"])],
             output_aliases: None,
@@ -6403,6 +6773,7 @@ output_aliases:
             in_pattern: crate::Url::parse("csv:///ingest/weather.csv").unwrap(),
             out_pattern: "weather".to_string(),
             time_column: "timestamp".to_string(),
+            group_by: Vec::new(),
             resolutions: vec!["1d".to_string()],
             aggregations: vec![agg(AggregationType::Avg, &["temperature"])],
             output_aliases: None,
@@ -6502,6 +6873,7 @@ output_aliases:
             in_pattern: crate::Url::parse("csv:///ingest/weather.csv").unwrap(),
             out_pattern: "weather".to_string(),
             time_column: "timestamp".to_string(),
+            group_by: Vec::new(),
             resolutions: vec!["1d".to_string()],
             aggregations: vec![
                 agg(AggregationType::Avg, &["temperature"]),
@@ -6639,6 +7011,7 @@ output_aliases:
             in_pattern: crate::Url::parse("csv:///ingest/weather.csv").unwrap(),
             out_pattern: "weather".to_string(),
             time_column: "timestamp".to_string(),
+            group_by: Vec::new(),
             resolutions: vec!["1d".to_string()],
             aggregations: vec![
                 agg(AggregationType::Avg, &["temperature"]),
@@ -6837,6 +7210,7 @@ output_aliases:
             in_pattern: crate::Url::parse("csv:///ingest/weather.csv").unwrap(),
             out_pattern: "weather".to_string(),
             time_column: "timestamp".to_string(),
+            group_by: Vec::new(),
             resolutions: vec!["1h".to_string(), "1d".to_string()],
             aggregations: vec![agg(AggregationType::Max, &["temperature"])],
             output_aliases: None,
@@ -7001,6 +7375,7 @@ output_aliases:
             in_pattern: crate::Url::parse("csv:///ingest/weather.csv").unwrap(),
             out_pattern: "weather".to_string(),
             time_column: "timestamp".to_string(),
+            group_by: Vec::new(),
             resolutions: vec!["1d".to_string()],
             // Max ALONE is invariant under both double-counting and dropping a
             // duplicate: max(x, x) == x. It cannot distinguish "every row was
@@ -7329,6 +7704,7 @@ output_aliases:
             in_pattern: crate::Url::parse("csv:///ingest/weather.csv").unwrap(),
             out_pattern: "weather".to_string(),
             time_column: "timestamp".to_string(),
+            group_by: Vec::new(),
             resolutions: vec!["1d".to_string()],
             aggregations: vec![agg(AggregationType::Avg, &["temperature"])],
             output_aliases: None,

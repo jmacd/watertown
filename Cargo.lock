@@ -3951,7 +3951,6 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
- "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",
@@ -5346,7 +5345,6 @@ dependencies = [
  "datafusion-common",
  "datafusion-expr",
  "env_logger",
- "fs2",
  "futures",
  "gitpond",
  "hledger-parser",
@@ -5365,8 +5363,6 @@ dependencies = [
  "serde_json",
  "serde_qs",
  "serde_yaml",
- "sha2 0.11.1",
- "site-analytics-collector",
  "stacker",
  "tempfile",
  "thiserror 2.0.21",
@@ -5377,7 +5373,6 @@ dependencies = [
  "tokio-util",
  "url",
  "utilities",
- "uuid",
  "uuid7",
 ]
 
@@ -6395,25 +6390,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 
 [[package]]
-name = "site-analytics-collector"
-version = "0.52.0"
-dependencies = [
- "chrono",
- "clap",
- "fs2",
- "http-body-util",
- "hyper",
- "hyper-util",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "tempfile",
- "tokio",
- "url",
- "uuid",
-]
-
-[[package]]
 name = "sitegen"
 version = "0.52.0"
 dependencies = [
@@ -6422,7 +6398,6 @@ dependencies = [
  "chrono",
  "clap",
  "datafusion",
- "futures",
  "hmac",
  "httpdate",
  "humantime",
@@ -6446,7 +6421,6 @@ dependencies = [
  "thiserror 2.0.21",
  "tinyfs",
  "tl",
- "tlogfs",
  "tokio",
  "url",
  "uuid",
@@ -6552,7 +6526,6 @@ dependencies = [
  "serde_arrow",
  "serde_json",
  "serde_yaml",
- "site-analytics-collector",
  "sync-store",
  "tempfile",
  "thiserror 2.0.21",

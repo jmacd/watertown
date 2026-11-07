@@ -212,6 +212,11 @@ provide concrete examples without duplicating their configurations here.
 
 ## Before extending the platform
 
+Keep Watertown small. Compose existing infrastructure before adding a service:
+for example, an existing web server can record beacon requests for periodic
+log ingestion without a dedicated analytics server. A new component needs a
+demonstrated responsibility that existing services cannot reasonably provide.
+
 For each new responsibility, identify the existing service and its limits
 first. State which facts are authoritative, their owning pond, the transaction
 boundary, the exact source identity, and the behavior under late data or

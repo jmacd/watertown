@@ -18,19 +18,17 @@
     document.removeEventListener("prerenderingchange", report);
     window.removeEventListener("pageshow", report);
     try {
-      const response = await fetch(metadata.endpoint, {
+      const endpoint = new URL(metadata.endpoint, window.location.origin);
+      endpoint.search = new URLSearchParams({
+        page_uri: metadata.pageUri,
+        catalog_id: metadata.catalogId,
+      }).toString();
+      const response = await fetch(endpoint, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         credentials: "omit",
         referrerPolicy: "no-referrer",
         keepalive: true,
         cache: "no-store",
-        body: JSON.stringify({
-          schema_version: 1,
-          event: "pageview",
-          catalog_id: metadata.catalogId,
-          page_uri: metadata.pageUri,
-        }),
       });
       if (!response.ok) console.warn("Site analytics: view was not accepted");
     } catch {

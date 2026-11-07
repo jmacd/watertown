@@ -47,10 +47,8 @@ rss.workspace = true
 regex.workspace = true
 uuid.workspace = true
 tl.workspace = true
-futures.workspace = true
-tempfile.workspace = true
 percent-encoding.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
-tlogfs.workspace = true
+tempfile.workspace = true

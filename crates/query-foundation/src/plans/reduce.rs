@@ -67,6 +67,7 @@ impl TimestampPartialAggregate {
 pub struct TimestampWindowReduce {
     event_time: String,
     width: Duration,
+    groups: Vec<String>,
     aggregates: Vec<TimestampPartialAggregate>,
     lower_bound_secs: Option<i64>,
     upper_bound_secs: Option<i64>,
@@ -116,10 +117,34 @@ impl TimestampWindowReduce {
         Ok(Self {
             event_time,
             width,
+            groups: Vec::new(),
             aggregates,
             lower_bound_secs: None,
             upper_bound_secs: None,
         })
+    }
+
+    /// Retain these columns as grouping keys alongside the timestamp bucket.
+    pub fn with_groups(mut self, groups: Vec<String>) -> Result<Self> {
+        let mut unique = BTreeSet::new();
+        for group in &groups {
+            if group.is_empty()
+                || group == &self.event_time
+                || group == "time_bucket"
+                || self.aggregates.iter().any(|agg| agg.output() == group)
+            {
+                return Err(DataFusionError::Plan(format!(
+                    "invalid or conflicting reduce group column '{group}'"
+                )));
+            }
+            if !unique.insert(group) {
+                return Err(DataFusionError::Plan(format!(
+                    "duplicate reduce group column '{group}'"
+                )));
+            }
+        }
+        self.groups = groups;
+        Ok(self)
     }
 
     /// Restrict input to buckets in the half-open epoch-second range `[lo, hi)`.
@@ -294,6 +319,14 @@ pub fn reduce_timestamp_windows(
 ) -> Result<DataFrame> {
     let (bucket, unit, timezone) =
         timestamp_bucket_expression(&frame, &recipe.event_time, recipe.width)?;
+    for group in &recipe.groups {
+        _ = frame
+            .schema()
+            .field_with_unqualified_name(group)
+            .map_err(|_| {
+                DataFusionError::Plan(format!("reduce input is missing group column '{group}'"))
+            })?;
+    }
     for aggregate in &recipe.aggregates {
         if let Some(value) = aggregate.value() {
             _ = frame
@@ -342,9 +375,14 @@ pub fn reduce_timestamp_windows(
                 .lt(lit(timestamp_from_epoch_seconds(&unit, &timezone, upper)?)),
         );
     }
-    frame
-        .filter(predicate)?
-        .aggregate(vec![bucket.alias("time_bucket")], aggregates)
+    let mut groups = vec![bucket.alias("time_bucket")];
+    groups.extend(
+        recipe
+            .groups
+            .iter()
+            .map(|name| col(Column::from_name(name))),
+    );
+    frame.filter(predicate)?.aggregate(groups, aggregates)
 }
 
 /// Build a one-row aggregate containing the newest aligned timestamp bucket.

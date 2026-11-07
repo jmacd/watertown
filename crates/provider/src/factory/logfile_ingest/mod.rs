@@ -24,8 +24,6 @@ use tinyfs::ResultExt;
 use tinyfs::{EntryType, FileID, Result as TinyFSResult};
 use utilities::bao_outboard::IncrementalHashState;
 
-mod analytics;
-
 /// Logfile ingest factory subcommands
 #[derive(Debug, Parser)]
 struct LogfileCommand {
@@ -102,11 +100,6 @@ pub struct LogfileIngestConfig {
     /// nanoseconds; journald's `__REALTIME_TIMESTAMP` is microseconds.
     #[serde(default)]
     pub timestamp_unit: TimestampUnit,
-
-    /// Opt in to the collector inventory/rotation protocol for this site.
-    /// Requires exact views.jsonl/views-*.jsonl paths and microsecond timestamps.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub analytics_site_id: Option<String>,
 }
 
 /// Unit of the values found under `timestamp_field`.
@@ -170,9 +163,6 @@ impl TimestampUnit {
 impl LogfileIngestConfig {
     /// Validate the configuration
     pub fn validate(&self) -> TinyFSResult<()> {
-        if self.analytics_site_id.is_some() {
-            analytics::validate_config(self)?;
-        }
         if self.archived_pattern.is_empty() {
             return Err(tinyfs::Error::Other(
                 "archived_pattern cannot be empty".to_string(),
@@ -274,7 +264,7 @@ fn scan_temporal_bounds(content: &[u8], field: &str, unit: TimestampUnit) -> Opt
 /// Fold every value stored under `field`, at any depth of `value`, into `acc`
 /// as a running (min, max).
 ///
-/// Returns false if a value under that key is not an integer, which drops the
+/// Returns false if a value under that key is not a usable number, which drops the
 /// line from the scan -- see `scan_temporal_bounds` for why that is preferred
 /// to guessing.
 fn fold_timestamps(value: &Value, field: &str, acc: &mut Option<(i64, i64)>) -> bool {
@@ -284,16 +274,12 @@ fn fold_timestamps(value: &Value, field: &str, acc: &mut Option<(i64, i64)>) -> 
                 if key == field {
                     // OTLP writes 64-bit times as JSON strings; journald and
                     // plain numeric logs write them as numbers.
-                    let Some(ts) = (match child {
-                        Value::String(s) => s.parse::<i64>().ok(),
-                        Value::Number(n) => n.as_i64(),
-                        _ => None,
-                    }) else {
+                    let Some((lower, upper)) = timestamp_bounds(child) else {
                         return false;
                     };
                     *acc = Some(match *acc {
-                        Some((lo, hi)) => (lo.min(ts), hi.max(ts)),
-                        None => (ts, ts),
+                        Some((lo, hi)) => (lo.min(lower), hi.max(upper)),
+                        None => (lower, upper),
                     });
                 } else if !fold_timestamps(child, field, acc) {
                     return false;
@@ -304,6 +290,32 @@ fn fold_timestamps(value: &Value, field: &str, acc: &mut Option<(i64, i64)>) -> 
         Value::Array(items) => items.iter().all(|v| fold_timestamps(v, field, acc)),
         _ => true,
     }
+}
+
+fn timestamp_bounds(value: &Value) -> Option<(i64, i64)> {
+    let integer = match value {
+        Value::String(s) => s.parse::<i64>().ok(),
+        Value::Number(n) => n.as_i64(),
+        _ => None,
+    };
+    if let Some(integer) = integer {
+        return Some((integer, integer));
+    }
+
+    let fractional = match value {
+        Value::String(s) => s.parse::<f64>().ok()?,
+        Value::Number(n) => n.as_f64()?,
+        _ => return None,
+    };
+    // Allow for floating-point rounding before bounding in whole input units.
+    // Integer timestamps above bypass floating point entirely.
+    let lower = fractional.next_down().floor();
+    let upper = fractional.next_up().ceil();
+    // i64::MAX rounds to 2^63 as f64, so that endpoint must be excluded.
+    if !fractional.is_finite() || lower < i64::MIN as f64 || upper >= i64::MAX as f64 {
+        return None;
+    }
+    Some((lower as i64, upper as i64))
 }
 
 /// The portion of `slice` that should be stored now.
@@ -470,11 +482,6 @@ pub async fn execute(
 
     match cmd.command {
         Some(LogfileSubcommand::B3sum) => {
-            if config.analytics_site_id.is_some() {
-                return Err(tinyfs::Error::Other(
-                    "b3sum uses host filenames and is unavailable for analytics; use inventory-validated ingestion".into(),
-                ));
-            }
             return execute_b3sum(&context, &config).await;
         }
         Some(LogfileSubcommand::Pull) => {
@@ -491,10 +498,6 @@ pub async fn execute(
         "Starting logfile ingestion for (mode: {:?})",
         ExecutionMode::PondReadWriter
     );
-
-    if config.analytics_site_id.is_some() {
-        return analytics::ingest(&context, &config).await;
-    }
 
     // Step 1: Enumerate host files
     let host_files = enumerate_host_files(&config).await?;
@@ -1282,7 +1285,6 @@ mod tests {
             pond_path: "logs/test".to_string(),
             timestamp_field: None,
             timestamp_unit: TimestampUnit::default(),
-            analytics_site_id: None,
         };
 
         assert!(config.validate().is_ok());
@@ -1296,7 +1298,6 @@ mod tests {
             pond_path: "".to_string(),
             timestamp_field: None,
             timestamp_unit: TimestampUnit::default(),
-            analytics_site_id: None,
         };
 
         assert!(config.validate().is_err());
@@ -1432,6 +1433,76 @@ mod tests {
     }
 
     #[test]
+    fn fractional_timestamps_bound_whole_input_units() {
+        for value in ["1700000000.789", "\"1700000000.789\"", "1.700000000789e9"] {
+            let content = format!(r#"{{"ts":{value}}}"#);
+            assert_eq!(
+                scan_temporal_bounds(content.as_bytes(), "ts", TimestampUnit::Seconds),
+                Some((1_700_000_000_000_000, 1_700_000_001_000_000))
+            );
+        }
+        for (unit, expected) in [
+            (TimestampUnit::Seconds, (-1_000_000, 0)),
+            (TimestampUnit::Milliseconds, (-1_000, 0)),
+            (TimestampUnit::Microseconds, (-1, 0)),
+            (TimestampUnit::Nanoseconds, (-1, 0)),
+        ] {
+            assert_eq!(
+                scan_temporal_bounds(br#"{"ts":-0.25}"#, "ts", unit),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_integer_and_fractional_timestamps_span_day_boundary() {
+        let content = b"{\"ts\":86399.75}\n{\"ts\":86400}\n{\"ts\":\"86400.25\"}\n";
+        assert_eq!(
+            scan_temporal_bounds(content, "ts", TimestampUnit::Seconds),
+            Some((86_399_000_000, 86_401_000_000))
+        );
+        assert_eq!(
+            scan_temporal_bounds(
+                br#"{"ts":"86399.999999999999"}"#,
+                "ts",
+                TimestampUnit::Seconds
+            ),
+            Some((86_399_000_000, 86_401_000_000))
+        );
+    }
+
+    #[test]
+    fn fractional_timestamp_bounds_reject_nonfinite_and_overflow() {
+        for value in [
+            "\"NaN\"",
+            "\"inf\"",
+            "\"-inf\"",
+            "\"1e400\"",
+            "9.223372036854776e18",
+            "-9.223372036854778e18",
+        ] {
+            let content = format!(r#"{{"ts":{value}}}"#);
+            assert_eq!(
+                scan_temporal_bounds(content.as_bytes(), "ts", TimestampUnit::Microseconds),
+                None
+            );
+        }
+        assert_eq!(
+            scan_temporal_bounds(br#"{"ts":1e13}"#, "ts", TimestampUnit::Seconds),
+            None
+        );
+        for integer in [i64::MIN, i64::MAX] {
+            for value in [integer.to_string(), format!("\"{integer}\"")] {
+                let content = format!(r#"{{"ts":{value}}}"#);
+                assert_eq!(
+                    scan_temporal_bounds(content.as_bytes(), "ts", TimestampUnit::Microseconds),
+                    Some((integer, integer))
+                );
+            }
+        }
+    }
+
+    #[test]
     fn bounds_span_every_line_and_every_point() {
         let content = format!(
             "{}\n{}\n",
@@ -1501,7 +1572,7 @@ mod tests {
     }
 
     #[test]
-    fn a_non_integer_timestamp_drops_the_line() {
+    fn a_nonnumeric_timestamp_drops_the_line() {
         let content =
             r#"{"resourceMetrics":[{"gauge":{"dataPoints":[{"timeUnixNano":"not-a-number"}]}}]}"#;
         assert_eq!(
@@ -1612,7 +1683,6 @@ mod tests {
             pond_path: "logs/test".to_string(),
             timestamp_field: Some("".to_string()),
             timestamp_unit: TimestampUnit::default(),
-            analytics_site_id: None,
         };
         assert!(config.validate().is_err());
     }
@@ -1629,7 +1699,6 @@ mod line_alignment_tests {
             pond_path: "/ingest".to_string(),
             timestamp_field: Some("timeUnixNano".to_string()),
             timestamp_unit: Default::default(),
-            analytics_site_id: None,
         }
     }
 

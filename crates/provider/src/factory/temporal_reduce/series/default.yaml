@@ -1,5 +1,6 @@
 in_pattern: series:///sensors/*  # Required: example source pattern.
 time_column: timestamp          # Required: source event-time column.
+group_by: []                    # Default: no additional grouping columns.
 resolution: 1h                  # Required: example aggregation window.
 aggregations:                   # Required: one or more aggregation operations.
   - type: avg                   # Required: example operation.

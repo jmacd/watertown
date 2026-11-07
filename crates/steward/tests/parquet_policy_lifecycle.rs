@@ -1,19 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use arrow_array::{RecordBatch, StringArray, TimestampMicrosecondArray, UInt64Array};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use provider::{
-    ExecutionContext, FactoryContext,
-    factory::analytics_rollup::{
-        AnalyticsRollupConfig,
-        partitions::{HOUR_US, Manifest, PartitionSink, schema},
-        run,
-    },
-};
-use site_analytics_collector::{
-    config::Config,
-    journal::{Event, Journal},
-};
+use provider::query_foundation_adapter::capture_tinyfs_snapshot;
+use query_foundation::{overlap::OverlapPolicy, snapshot::EventTimeContract};
 use std::{path::Path, sync::Arc};
 use steward::{
     ContentSource, LocalPondSource, Ship, build_recovery_capsule, compute_content_tree,
@@ -24,19 +15,27 @@ use tinyfs::arrow::ParquetExt;
 use tlogfs::PondUserMetadata;
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
+const HOUR_US: i64 = 3_600_000_000;
 
 fn meta() -> PondUserMetadata {
-    PondUserMetadata::new(vec!["analytics-lifecycle".into()])
+    PondUserMetadata::new(vec!["parquet-policy-lifecycle".into()])
 }
 
-fn config() -> AnalyticsRollupConfig {
-    AnalyticsRollupConfig {
-        source: "/analytics/raw".into(),
-        target: "/analytics/hourly".into(),
-        site_id: "noyo".into(),
-        repair_days: 1,
-        exclude: Default::default(),
-    }
+fn schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+        Field::new("category", DataType::Utf8, false).with_metadata(
+            std::collections::HashMap::from([(
+                utilities::parquet_policy::POLICY_KEY.into(),
+                utilities::parquet_policy::DICTIONARY_V1.into(),
+            )]),
+        ),
+        Field::new("count", DataType::UInt64, false),
+    ]))
 }
 
 fn batch(hour: i64) -> RecordBatch {
@@ -55,26 +54,27 @@ fn batch(hour: i64) -> RecordBatch {
     .expect("counts batch")
 }
 
-async fn inspect(ship: &mut Ship, export: &Path) -> TestResult<Manifest> {
+async fn inspect(ship: &mut Ship, export: &Path) -> TestResult<()> {
     let tx = ship.begin_write(&meta()).await?;
     let context = tx.provider_context()?.with_cache_dir(export.join("cache"));
     let root = tx.root().await?;
-    let factory = FactoryContext::new(context.clone(), root.node_path().id());
-    let report = run(&config(), &factory, false, None, 4 * HOUR_US).await?;
-    assert!(
-        !report.published,
-        "physical changes must not dirty rollup progress"
-    );
-    assert_eq!(report.records_examined_for_changes, 0);
-    let sink = PartitionSink::new(context.clone(), config().target);
-    let manifest = sink.load().await?.expect("snapshot");
-    let table = sink.table(&manifest).await?;
+    let id = root.get_node_path("/dictionary-fixture").await?.id();
+    let snapshot = capture_tinyfs_snapshot(
+        &context,
+        id,
+        "dictionary-fixture",
+        schema(),
+        Some(EventTimeContract::new("timestamp")),
+        OverlapPolicy::PreserveAll,
+    )
+    .await?;
+    let table = snapshot.table_provider()?;
     let _ = context
         .datafusion_session
         .register_table("counts", table.clone())?;
     let rows = context
         .datafusion_session
-        .sql("SELECT * FROM counts ORDER BY timestamp, page_uri")
+        .sql("SELECT * FROM counts ORDER BY timestamp, category")
         .await?
         .collect()
         .await?;
@@ -86,7 +86,7 @@ async fn inspect(ship: &mut Ship, export: &Path) -> TestResult<Manifest> {
     let output = export.join("public");
     let (outputs, _) = provider::export::export_table_provider_to_parquet(
         table,
-        "analytics",
+        "dictionary-fixture",
         &output,
         &[],
         &[],
@@ -105,7 +105,7 @@ async fn inspect(ship: &mut Ship, export: &Path) -> TestResult<Manifest> {
     let exported = reader.build()?.collect::<Result<Vec<_>, _>>()?;
     assert_eq!(arrow::compute::concat_batches(&schema(), &exported)?, rows);
     let _ = tx.commit().await?;
-    Ok(manifest)
+    Ok(())
 }
 
 #[allow(clippy::print_stderr)]
@@ -134,10 +134,7 @@ fn inspect_capsule(capsule: &steward::CapsuleBuild) -> TestResult<()> {
             }
         }
     }
-    assert_eq!(
-        tables, 2,
-        "selected partition and multi-leaf encoding fixture"
-    );
+    assert_eq!(tables, 1, "multi-leaf encoding fixture");
     Ok(())
 }
 
@@ -244,89 +241,30 @@ async fn inspect_maintained_objects(ship: &Ship, source: &LocalPondSource) -> Te
 }
 
 #[tokio::test]
-async fn analytics_encoding_and_identity_survive_maintenance_native_restore_and_capsule_import()
+async fn dictionary_encoding_and_identity_survive_maintenance_native_restore_and_capsule_import()
 -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let source_path = temp.path().join("source");
-    let mut ship = Ship::create_pond(&source_path, "analytics").await?;
-    let collector = Config {
-        site_id: "noyo".into(),
-        origin: "https://noyocenter.org".into(),
-        listen: "127.0.0.1:0".parse()?,
-        catalog_dir: temp.path().join("catalogs"),
-        log_dir: temp.path().join("logs"),
-        endpoint: "/_analytics/view".into(),
-        max_log_bytes: 1048576,
-        segment_bytes: 524288,
-    };
-    let mut journal = Journal::open(&collector)?;
+    let mut ship = Ship::create_pond(&source_path, "dictionary").await?;
     for hour in 0..4 {
-        let events = (0..24)
-            .flat_map(|page| {
-                vec![
-                    Event {
-                        received_at_us: hour * HOUR_US,
-                        page_uri: format!("/page/{page:02}"),
-                        catalog_id: "a".repeat(64),
-                    };
-                    2
-                ]
-            })
-            .collect::<Vec<_>>();
-        let _ = journal.append(&events)?;
         let tx = ship.begin_write(&meta()).await?;
         let root = tx.root().await?;
-        let context = tx.provider_context()?;
-        provider::factory::logfile_ingest::execute(
-            serde_json::json!({
-                "active_pattern": collector.log_dir.join("views.jsonl"),
-                "archived_pattern": collector.log_dir.join("views-*.jsonl"),
-                "pond_path": config().source, "timestamp_field": "received_at_us",
-                "timestamp_unit": "microseconds", "analytics_site_id": "noyo",
-            }),
-            FactoryContext::new(context, root.node_path().id()),
-            ExecutionContext::pond_readwriter(vec![]),
-        )
-        .await?;
-        // Rollup objects have one immutable leaf; this companion series exercises
-        // the same schema through actual multi-leaf table maintenance.
         let _ = root
             .write_series_from_batch("/dictionary-fixture", &batch(hour), Some("timestamp"))
             .await?;
         let _ = tx.commit().await?;
     }
-    let tx = ship.begin_write(&meta()).await?;
-    let context = tx
-        .provider_context()?
-        .with_cache_dir(temp.path().join("initial-cache"));
-    let root = tx.root().await?;
-    let report = run(
-        &config(),
-        &FactoryContext::new(context, root.node_path().id()),
-        false,
-        None,
-        4 * HOUR_US,
-    )
-    .await?;
-    assert!(report.published);
-    let _ = tx.commit().await?;
-    let original = inspect(&mut ship, &temp.path().join("initial")).await?;
+    inspect(&mut ship, &temp.path().join("initial")).await?;
     let before = build_recovery_capsule(&ship).await?;
     inspect_capsule(&before)?;
     let root_before = compute_content_tree(&ship).await?.root_tree_hash;
     let maintenance = ship.collapse_versions(1).await?;
-    assert_eq!(
-        maintenance.series_repacked, 2,
-        "raw events and dictionary fixture"
-    );
+    assert_eq!(maintenance.series_repacked, 1, "dictionary fixture");
     assert_eq!(
         compute_content_tree(&ship).await?.root_tree_hash,
         root_before
     );
-    assert_eq!(
-        inspect(&mut ship, &temp.path().join("maintained")).await?,
-        original
-    );
+    inspect(&mut ship, &temp.path().join("maintained")).await?;
     let maintained = build_recovery_capsule(&ship).await?;
     inspect_capsule(&maintained)?;
     assert_logical_snapshot(&before, &maintained, true);
@@ -338,10 +276,7 @@ async fn analytics_encoding_and_identity_survive_maintenance_native_restore_and_
     let graph = fetch_object_graph(&source, "").await?;
     let mut rebuilt = Ship::create_pond(temp.path().join("rebuilt"), "rebuild").await?;
     let _ = rebuild_pond(&mut rebuilt, &source, &graph).await?;
-    assert_eq!(
-        inspect(&mut rebuilt, &temp.path().join("rebuilt-export")).await?,
-        original
-    );
+    inspect(&mut rebuilt, &temp.path().join("rebuilt-export")).await?;
     let rebuilt_capsule = build_recovery_capsule(&rebuilt).await?;
     inspect_capsule(&rebuilt_capsule)?;
     assert_logical_snapshot(&before, &rebuilt_capsule, false);
@@ -359,45 +294,10 @@ async fn analytics_encoding_and_identity_survive_maintenance_native_restore_and_
     let imported_path = temp.path().join("imported");
     let _ = import_capsule(&remote_path, &imported_path, "import").await?;
     let mut imported = Ship::open_pond(&imported_path).await?;
-    assert_eq!(
-        inspect(&mut imported, &temp.path().join("imported-export")).await?,
-        original
-    );
+    inspect(&mut imported, &temp.path().join("imported-export")).await?;
     let imported_capsule = build_recovery_capsule(&imported).await?;
     inspect_capsule(&imported_capsule)?;
     assert_logical_snapshot(&before, &imported_capsule, true);
 
-    let tx = imported.begin_write(&meta()).await?;
-    let context = tx
-        .provider_context()?
-        .with_cache_dir(temp.path().join("restore-rebuild-cache"));
-    let root = tx.root().await?;
-    let factory = FactoryContext::new(context.clone(), root.node_path().id());
-    let plan = run(&config(), &factory, true, None, 4 * HOUR_US).await?;
-    let rebuilt = run(
-        &config(),
-        &factory,
-        true,
-        plan.rebuild_token.as_deref(),
-        4 * HOUR_US,
-    )
-    .await?;
-    assert!(rebuilt.published);
-    let sink = PartitionSink::new(context.clone(), config().target);
-    let manifest = sink.load().await?.expect("rebuilt snapshot");
-    let _ = context
-        .datafusion_session
-        .register_table("counts", sink.table(&manifest).await?)?;
-    let rows = context
-        .datafusion_session
-        .sql("SELECT * FROM counts ORDER BY timestamp, page_uri")
-        .await?
-        .collect()
-        .await?;
-    assert_eq!(
-        arrow::compute::concat_batches(&schema(), &rows)?,
-        arrow::compute::concat_batches(&schema(), &(0..4).map(batch).collect::<Vec<_>>())?
-    );
-    let _ = tx.commit().await?;
     Ok(())
 }

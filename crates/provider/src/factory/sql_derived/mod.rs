@@ -3334,6 +3334,7 @@ query: ""
                 in_pattern: crate::Url::parse("series:///sensors/stations/*").unwrap(), // Use pattern to match parquet data
                 out_pattern: "$0".to_string(), // Keep original filename as output
                 time_column: "timestamp".to_string(),
+                group_by: Vec::new(),
                 resolutions: vec!["1d".to_string()],
                 aggregations: vec![AggregationConfig {
                     agg_type: AggregationType::Avg,
@@ -3638,6 +3639,7 @@ query: ""
                 in_pattern: crate::Url::parse("series:///sensors/wildcard_test/*").unwrap(), // Use pattern to match base_data.series
                 out_pattern: "$0".to_string(), // Keep original filename as output
                 time_column: "timestamp".to_string(),
+                group_by: Vec::new(),
                 resolutions: vec!["1d".to_string()],
                 aggregations: vec![AggregationConfig {
                     agg_type: AggregationType::Avg,

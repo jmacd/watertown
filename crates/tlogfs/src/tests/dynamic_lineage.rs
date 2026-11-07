@@ -300,6 +300,7 @@ async fn sparse_dynamic_reduction_seals_by_active_span_and_bounds_the_next_appen
             in_pattern: provider::Url::parse("file+series:///singled/*").unwrap(),
             out_pattern: "$0".to_owned(),
             time_column: "timestamp".to_owned(),
+            group_by: Vec::new(),
             resolutions: vec!["1h".to_owned()],
             aggregations: vec![AggregationConfig {
                 agg_type: AggregationType::Avg,
@@ -453,6 +454,7 @@ async fn pump_state_manifest_bounds_incremental_daily_usage() {
         let daily = TemporalReduceSeriesConfig {
             in_pattern: provider::Url::parse("series:///usage/rate").unwrap(),
             time_column: "timestamp".to_owned(),
+            group_by: Vec::new(),
             resolution: "1d".to_owned(),
             aggregations: vec![AggregationConfig {
                 agg_type: AggregationType::Sum,
@@ -574,6 +576,7 @@ async fn direct_reduction_reuses_and_repairs_timestamp_local_dynamic_source() {
         let daily = TemporalReduceSeriesConfig {
             in_pattern: provider::Url::parse("series:///usage/rate").unwrap(),
             time_column: "timestamp".to_owned(),
+            group_by: Vec::new(),
             resolution: "1d".to_owned(),
             aggregations: vec![AggregationConfig {
                 agg_type: AggregationType::Sum,
@@ -756,6 +759,7 @@ async fn dynamic_join_pivot_reuses_persistent_reduction_lineage() {
             in_pattern: provider::Url::parse("file+series:///singled/*").unwrap(),
             out_pattern: "$0".to_owned(),
             time_column: "timestamp".to_owned(),
+            group_by: Vec::new(),
             resolutions: vec!["1h".to_owned()],
             aggregations: vec![AggregationConfig {
                 agg_type: AggregationType::Avg,

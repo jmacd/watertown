@@ -61,7 +61,6 @@ arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 env_logger = { workspace = true }
 query-foundation = { workspace = true }
-site-analytics-collector = { path = "../site-analytics-collector" }
 
 [lints]
 workspace = true

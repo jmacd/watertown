@@ -22,5 +22,10 @@ Install with `pond mknod temporal-reduce-series /derived/hourly --config-path re
 
 `resolution` must be a positive duration. The same cache, lateness, sealing, schema, and backfill semantics as [temporal reduction](temporal-reduce.md) apply.
 
+`group_by` also works here. For example, `group_by: [site_id, page_uri]`,
+`resolution: 1d`, `aggregations: [{type: count, columns: ["*"]}]`, and
+`output_aliases: {timestamp.count: views}` expose daily per-site/page counts
+through the same shared reduction cache.
+
 <!-- docs:reference factory:temporal-reduce-series -->
 <!-- docs:end-reference -->

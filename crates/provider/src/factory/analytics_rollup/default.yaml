@@ -1,6 +1,0 @@
-# Illustrative repair horizon; approve a policy before deployment.
-source: /analytics/raw
-target: /analytics/hourly
-site_id: noyo
-repair_days: 2
-exclude: []

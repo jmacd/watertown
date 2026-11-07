@@ -56,7 +56,6 @@ pub(crate) fn enabled(config: &SiteConfig) -> Option<&AnalyticsConfig> {
 }
 
 pub(crate) fn validate(config: &SiteConfig) -> Result<(), String> {
-    crate::analytics_report::validate(config)?;
     let Some(analytics) = enabled(config) else {
         return Ok(());
     };
@@ -126,32 +125,6 @@ pub(crate) fn excluded(config: &SiteConfig, uri: &str) -> bool {
 }
 
 impl Catalog {
-    pub fn verify(&self, site: &str) -> Result<(), String> {
-        #[derive(Serialize)]
-        struct Identity<'a> {
-            schema_version: u32,
-            site_id: &'a str,
-            entries: &'a [CatalogEntry],
-        }
-        let bytes = serde_json::to_vec(&Identity {
-            schema_version: self.schema_version,
-            site_id: &self.site_id,
-            entries: &self.entries,
-        })
-        .map_err(|error| error.to_string())?;
-        if self.schema_version != 1 || self.site_id != site || digest(&bytes) != self.catalog_id {
-            return Err("analytics catalog identity mismatch".into());
-        }
-        let mut paths = BTreeSet::new();
-        for entry in &self.entries {
-            validate_path(&entry.page_uri)?;
-            if !paths.insert(&entry.page_uri) || entry.title.len() > 1024 {
-                return Err("duplicate catalog URI or oversized title".into());
-            }
-        }
-        Ok(())
-    }
-
     pub fn new(config: &SiteConfig, mut entries: Vec<CatalogEntry>) -> Result<Self, String> {
         validate(config)?;
         let analytics = enabled(config).ok_or("analytics is disabled")?;
@@ -242,15 +215,6 @@ impl BuildRegistry {
         jobs: &[PageJob],
         assets: impl Iterator<Item = impl AsRef<str>>,
     ) -> Result<(), String> {
-        if let Some(report) = &config.analytics_report {
-            self.active = true;
-            if enabled(config).is_none() && !self.sites.insert(report.site_id.clone()) {
-                return Err(format!("duplicate analytics site_id: {}", report.site_id));
-            }
-            self.reserved
-                .insert(format!("{}_analytics/", config.site.base_url));
-            self.record_output(config, "analytics.html");
-        }
         if let Some(analytics) = enabled(config) {
             self.active = true;
             validate(config)?;
@@ -260,7 +224,12 @@ impl BuildRegistry {
                     analytics.site_id
                 ));
             }
-            self.endpoints.insert(analytics.endpoint.clone());
+            if !self.endpoints.insert(analytics.endpoint.clone()) {
+                return Err(format!(
+                    "analytics sites must use distinct beacon endpoints: {}",
+                    analytics.endpoint
+                ));
+            }
             self.reserved
                 .insert(format!("{}_analytics/", config.site.base_url));
         }
@@ -457,8 +426,25 @@ mod tests {
         registry.record(&config, &[], ["/raw.html"].iter()).unwrap();
         registry.finish().unwrap();
         config.analytics.as_mut().unwrap().site_id = "other".into();
+        config.analytics.as_mut().unwrap().endpoint = "/_analytics/other/view".into();
         registry.record(&config, &[], ["/raw.html"].iter()).unwrap();
         assert!(registry.finish().unwrap_err().contains("collision"));
+    }
+
+    #[test]
+    fn independent_sites_cannot_share_a_beacon_endpoint() {
+        let mut registry = BuildRegistry::default();
+        registry
+            .record(&config("parent", "/"), &[], std::iter::empty::<&str>())
+            .unwrap();
+        let error = registry
+            .record(
+                &config("noyo", "/noyo-harbor/"),
+                &[],
+                std::iter::empty::<&str>(),
+            )
+            .unwrap_err();
+        assert!(error.contains("distinct beacon endpoints"), "{error}");
     }
 
     #[test]

@@ -5204,26 +5204,6 @@
   },
   "contract": 1,
   "factories": {
-    "factory:analytics-rollup": {
-      "description": "Transactionally replace daily snapshots of hourly reported page views",
-      "directory": false,
-      "execute": true,
-      "file": false,
-      "initialize": true,
-      "post_commit_access": "ReadWrite",
-      "raw_validation": false,
-      "table_transform": false
-    },
-    "factory:analytics-table": {
-      "description": "Query the currently selected hourly analytics partitions as one table",
-      "directory": false,
-      "execute": false,
-      "file": true,
-      "initialize": false,
-      "post_commit_access": null,
-      "raw_validation": false,
-      "table_transform": false
-    },
     "factory:column-rename": {
       "description": "Column rename transformation for table providers",
       "directory": false,
@@ -5491,67 +5471,10 @@
     "format:hledger",
     "format:jsonlogs",
     "format:oteljson",
-    "format:site-analytics",
     "format:weblog",
     "format:xls"
   ],
   "schemas": {
-    "factory:analytics-rollup": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "additionalProperties": false,
-      "properties": {
-        "exclude": {
-          "default": [],
-          "description": "Exact canonical URIs excluded from counts; changing this requires rebuild.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array",
-          "uniqueItems": true
-        },
-        "repair_days": {
-          "description": "Explicit ordinary repair horizon in UTC days, including today.",
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "site_id": {
-          "description": "Stable independent site identity.",
-          "type": "string"
-        },
-        "source": {
-          "description": "Dedicated inventory-aware logfile-ingest destination.",
-          "type": "string"
-        },
-        "target": {
-          "description": "Dedicated directory for immutable objects and the selection manifest.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "source",
-        "target",
-        "site_id",
-        "repair_days"
-      ],
-      "title": "AnalyticsRollupConfig",
-      "type": "object"
-    },
-    "factory:analytics-table": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "additionalProperties": false,
-      "properties": {
-        "target": {
-          "description": "Directory containing the committed rollup selection manifest.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "target"
-      ],
-      "title": "AnalyticsTableConfig",
-      "type": "object"
-    },
     "factory:column-rename": {
       "$defs": {
         "RenameRule": {
@@ -5996,13 +5919,6 @@
         "active_pattern": {
           "description": "Glob pattern for the active (append-only) log file\nExample: \"/var/log/casparwater.json\"",
           "type": "string"
-        },
-        "analytics_site_id": {
-          "description": "Opt in to the collector inventory/rotation protocol for this site.\nRequires exact views.jsonl/views-*.jsonl paths and microsecond timestamps.",
-          "type": [
-            "string",
-            "null"
-          ]
         },
         "archived_pattern": {
           "description": "Glob pattern for archived (immutable) log files\nExample: \"/var/log/casparwater-*.json\"",
@@ -6894,7 +6810,7 @@
             },
             "endpoint": {
               "default": "/_analytics/view",
-              "description": "Same-origin absolute path. Shared endpoints must resolve sites by catalog.",
+              "description": "Same-origin absolute path, routed to this site's dedicated beacon log.",
               "type": "string"
             },
             "exclude": {
@@ -6912,39 +6828,6 @@
           },
           "required": [
             "site_id"
-          ],
-          "type": "object"
-        },
-        "AnalyticsReportConfig": {
-          "additionalProperties": false,
-          "properties": {
-            "catalog_dir": {
-              "description": "Private host directory of retained publisher catalogs, never raw logs.",
-              "type": "string"
-            },
-            "current_catalog": {
-              "description": "Current publisher catalog; retired pages are never linked blindly.",
-              "type": "string"
-            },
-            "site_id": {
-              "description": "Independent site/environment identity, matching the rollup and catalogs.",
-              "type": "string"
-            },
-            "state_path": {
-              "description": "Private host file shared by refresh and rendering; outside the web root.",
-              "type": "string"
-            },
-            "target": {
-              "description": "Committed analytics-rollup target in this site's own pond.",
-              "type": "string"
-            }
-          },
-          "required": [
-            "site_id",
-            "target",
-            "catalog_dir",
-            "current_catalog",
-            "state_path"
           ],
           "type": "object"
         },
@@ -7508,18 +7391,6 @@
           ],
           "default": null,
           "description": "Independent, opt-in reported page views. Never inherited by subsites."
-        },
-        "analytics_report": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/AnalyticsReportConfig"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "description": "Independent daily-only, 30-day public report. Absent means disabled."
         },
         "content": {
           "default": [],
@@ -8211,6 +8082,13 @@
             "null"
           ]
         },
+        "group_by": {
+          "description": "Exact source columns retained as grouping keys alongside the time bucket.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "in_pattern": {
           "$ref": "#/$defs/WatertownUrl",
           "description": "Input URL pattern to match source files (supports glob patterns)"
@@ -8336,6 +8214,13 @@
             "string",
             "null"
           ]
+        },
+        "group_by": {
+          "description": "Exact source columns retained as grouping keys alongside the time bucket.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "in_pattern": {
           "$ref": "#/$defs/WatertownUrl"
