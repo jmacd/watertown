@@ -5,6 +5,10 @@ doc_id: reference:concepts
 
 # Shared concepts
 
+For implementation responsibilities and service boundaries, read
+[architecture for developers](../guides/architecture.md). This reference
+defines the shared vocabulary used by individual component pages.
+
 ## Pond and host roots
 
 `POND` or global `--pond` selects the local transactional storage directory,
