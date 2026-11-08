@@ -142,8 +142,12 @@ not evidence that every page is unknown.
 
 Show the last 30 UTC calendar days and mark today as partial. Do not silently
 fill collection gaps with zero. The public projection limits dates but does not
-invent missing daily rows or establish collection coverage. Chart rendering,
-coverage presentation, and automated inventory transfer remain pending.
+invent missing daily rows or establish collection coverage. The Sitegen
+`viz renderer="stacked-area"` shortcode renders this shape using the existing
+Parquet/DuckDB/Vega-Lite path. The opt-in template at
+`config/analytics/site/overview.md` in the enclosing repository supplies the
+section order and reporting explanation. Publication/import wiring, collection
+coverage facts, and automated inventory transfer remain pending.
 
 Missing observations are not zero, and maximum observed event time is not
 proof of collection uptime. Coverage remains unknown unless independently

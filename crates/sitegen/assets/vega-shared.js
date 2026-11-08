@@ -203,6 +203,109 @@ export function buildMetricChartSpec(opts) {
   };
 }
 
+// Daily totals are step areas, not interpolated estimates. Separate contiguous
+// runs prevent Vega from drawing across missing days; endpoint copies give even
+// an isolated observed day its full UTC-day width.
+export function buildDailyStackedAreaSpec(rows, opts = {}) {
+  const { days = 30, now = Date.now(), order = [], yTitle = "Count", theme } = opts;
+  const dayMs = 86400000;
+  if (!Number.isSafeInteger(days) || days < 1 || !Number.isFinite(now)) {
+    throw new Error("A daily stacked area needs a positive integer day window.");
+  }
+  const today = Math.floor(now / dayMs) * dayMs;
+  const start = today - (days - 1) * dayMs;
+  const end = today + dayMs;
+  if (!Number.isFinite(new Date(start).getTime())) throw new Error("Invalid day window.");
+  const byDay = new Map();
+  const categories = new Set(order);
+  for (const row of rows) {
+    const { timestamp, series, value } = row;
+    if (!Number.isSafeInteger(timestamp) || timestamp % dayMs !== 0 ||
+        typeof series !== "string" || !series.trim() ||
+        !Number.isSafeInteger(value) || value < 0) {
+      throw new Error("Expected UTC-midnight timestamps, named series, and nonnegative integer counts.");
+    }
+    if (timestamp < start || timestamp >= end) continue;
+    categories.add(series);
+    if (!byDay.has(timestamp)) byDay.set(timestamp, new Map());
+    const counts = byDay.get(timestamp);
+    const sum = (counts.get(series) || 0) + value;
+    if (!Number.isSafeInteger(sum)) throw new Error("Count exceeds exact browser numeric precision.");
+    counts.set(series, sum);
+  }
+  if (!byDay.size) return { error: "No reported data in this UTC window." };
+  const domain = [...new Set(order), ...[...categories].filter((s) => !order.includes(s)).sort()];
+  const dates = [...byDay.keys()].sort((a, b) => a - b);
+  const values = [];
+  let segment = 0;
+  for (let i = 0; i < dates.length; i++) {
+    const timestamp = dates[i];
+    if (i && timestamp !== dates[i - 1] + dayMs) segment++;
+    const counts = byDay.get(timestamp);
+    const total = [...counts.values()].reduce((a, b) => a + b, 0);
+    if (!Number.isSafeInteger(total)) throw new Error("Daily total exceeds exact browser numeric precision.");
+    const daily = domain.map((series, rank) => ({
+      timestamp, series, rank, segment, total,
+      day: new Date(timestamp).toISOString().slice(0, 10),
+      period: timestamp === today ? "Partial day" : "Past UTC day",
+      // Only a day with reported rows establishes absent categories as zero.
+      value: counts.get(series) || 0,
+    }));
+    values.push(...daily);
+    if (dates[i + 1] !== timestamp + dayMs) {
+      values.push(...daily.map((row) => ({ ...row, timestamp: timestamp + dayMs })));
+    }
+  }
+  return {
+    spec: {
+      $schema: "https://vega.github.io/schema/vega-lite/v5.json",
+      width: "container",
+      height: 340,
+      config: themeConfig(theme),
+      layer: [
+        {
+          data: { values: [{ start: today, end, label: "Today (UTC): partial day" }] },
+          mark: { type: "rect", color: "#888888", opacity: 0.1 },
+          encoding: {
+            x: { field: "start", type: "temporal", scale: { type: "utc", domain: [start, end], nice: false }, axis: { title: "UTC day", format: "%b %d" } },
+            x2: { field: "end" },
+            tooltip: [{ field: "label", title: "Period" }],
+          },
+        },
+        {
+          data: { values },
+          transform: [{
+            stack: "value",
+            groupby: ["timestamp", "segment"],
+            sort: [{ field: "rank", order: "ascending" }],
+            as: ["lower", "upper"],
+          }],
+          mark: { type: "area", interpolate: "step-after", clip: true },
+          encoding: {
+            x: {
+              field: "timestamp", type: "temporal",
+              scale: { type: "utc", domain: [start, end], nice: false },
+              axis: { title: "UTC day", format: "%b %d" },
+            },
+            y: { field: "upper", type: "quantitative", scale: { zero: true }, title: yTitle },
+            y2: { field: "lower" },
+            color: { field: "series", type: "nominal", scale: { domain, scheme: "tableau10" }, title: null },
+            detail: { field: "segment", type: "nominal" },
+            order: { field: "timestamp", type: "temporal" },
+            tooltip: [
+              { field: "day", type: "nominal", title: "UTC day" },
+              { field: "series", type: "nominal", title: "Series" },
+              { field: "value", type: "quantitative", title: yTitle, format: ",.0f" },
+              { field: "total", type: "quantitative", title: "Daily total", format: ",.0f" },
+              { field: "period", type: "nominal", title: "Period" },
+            ],
+          },
+        },
+      ],
+    },
+  };
+}
+
 // Build a data-less overview-timeline spec carrying an `interval` selection on
 // the x (time) axis, used by the overlay analysis page to pick a date range.
 // Each row draws a vertical stem (`yTopField` -> `yField`, identity color) plus

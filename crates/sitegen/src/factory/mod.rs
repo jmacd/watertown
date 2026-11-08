@@ -2087,6 +2087,7 @@ fn has_uri_scheme(value: &str) -> bool {
 fn write_shared_assets(output_dir: &Path, lean: bool) -> Result<(), tinyfs::Error> {
     static STYLE_CSS: &str = include_str!("../../assets/style.css");
     static CHART_JS: &str = include_str!("../../assets/chart.js");
+    static STACKED_AREA_JS: &str = include_str!("../../assets/stacked-area.js");
     static DUCKDB_SHARED_JS: &str = include_str!("../../assets/duckdb-shared.js");
     static EXPLORE_JS: &str = include_str!("../../assets/explore.js");
     static VEGA_SHARED_JS: &str = include_str!("../../assets/vega-shared.js");
@@ -2117,20 +2118,27 @@ fn write_shared_assets(output_dir: &Path, lean: bool) -> Result<(), tinyfs::Erro
         }
     }
     let vega = !lean
-        || ["chart.js", "overlay.js", "explore.js"]
+        || ["chart.js", "overlay.js", "explore.js", "stacked-area.js"]
             .iter()
             .any(|name| required.contains(*name));
     let duckdb_shared = !lean
-        || ["chart.js", "explore.js"]
+        || ["chart.js", "explore.js", "stacked-area.js"]
             .iter()
             .any(|name| required.contains(*name));
     let visualization = !lean
-        || ["chart.js", "overlay.js", "log-viewer.js", "explore.js"]
-            .iter()
-            .any(|name| required.contains(*name));
+        || [
+            "chart.js",
+            "overlay.js",
+            "log-viewer.js",
+            "explore.js",
+            "stacked-area.js",
+        ]
+        .iter()
+        .any(|name| required.contains(*name));
     for (name, content) in [
         ("style.css", STYLE_CSS),
         ("chart.js", CHART_JS),
+        ("stacked-area.js", STACKED_AREA_JS),
         ("duckdb-shared.js", DUCKDB_SHARED_JS),
         ("explore.js", EXPLORE_JS),
         ("vega-shared.js", VEGA_SHARED_JS),
@@ -2930,6 +2938,7 @@ mod tests {
         assert!(output.path().join("relative-time.js").is_file());
         for unused in [
             "chart.js",
+            "stacked-area.js",
             "duckdb-shared.js",
             "vega-shared.js",
             "explore.js",

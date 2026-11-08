@@ -197,6 +197,7 @@ fn documentation_layout(ctx: &LayoutContext) -> Markup {
                 (build_footer(ctx.footer))
                 @for (marker, script) in [
                     ("chart-data", "chart.js"),
+                    ("stacked-area-data", "stacked-area.js"),
                     ("overlay-data", "overlay.js"),
                     ("log-data", "log-viewer.js"),
                     ("datasets", "explore.js"),
@@ -260,6 +261,9 @@ fn data_layout(ctx: &LayoutContext) -> Markup {
                 (build_footer(ctx.footer))
                 script src=(format!("{}chart.js", ctx.root_base_url)) type="module" {}
                 script src=(format!("{}overlay.js", ctx.root_base_url)) type="module" {}
+                @if ctx.content.contains("class=\"stacked-area-data\"") {
+                    script src=(format!("{}stacked-area.js", ctx.root_base_url)) type="module" {}
+                }
                 script src=(format!("{}relative-time.js", ctx.root_base_url)) type="module" {}
             }
         }
@@ -492,6 +496,11 @@ mod tests {
         assert!(active.contains("src=\"/watertown/chart.js\""));
         assert!(!active.contains("overlay.js"));
         assert!(!active.contains("explore.js"));
+        ctx.content = "<div id=\"stacked-area\"><script class=\"stacked-area-data\" type=\"application/json\">[]</script></div>";
+        for layout in ["documentation", "data"] {
+            let active = apply_layout(layout, &ctx);
+            assert!(active.contains("src=\"/watertown/stacked-area.js\""));
+        }
     }
 
     #[test]
