@@ -14,6 +14,7 @@ use std::path::Path;
 
 pub(crate) const SCRIPT: &str = include_str!("../assets/analytics.js");
 pub(crate) const CATALOG_PATH: &str = "_analytics/catalog.json";
+pub(crate) const PAGES_PATH: &str = "_analytics/pages.jsonl";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,6 +22,7 @@ pub(crate) struct CatalogEntry {
     pub page_uri: String,
     pub title: String,
     pub aliases: Vec<String>,
+    pub section: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -67,6 +69,20 @@ pub(crate) fn validate(config: &SiteConfig) -> Result<(), String> {
     }
     for path in &analytics.exclude {
         validate_path(path)?;
+    }
+    for label in std::iter::once(&analytics.default_section).chain(analytics.sections.values()) {
+        if label.trim().is_empty() || label.chars().any(char::is_control) {
+            return Err(
+                "analytics section labels must be nonempty and contain no control characters"
+                    .into(),
+            );
+        }
+    }
+    for prefix in analytics.sections.keys() {
+        validate_path(prefix)?;
+        if prefix != "/" && prefix.ends_with('/') {
+            return Err("analytics section prefixes must not end with '/'".into());
+        }
     }
     Ok(())
 }
@@ -130,7 +146,27 @@ impl Catalog {
         let analytics = enabled(config).ok_or("analytics is disabled")?;
         entries.sort_by(|a, b| a.page_uri.cmp(&b.page_uri));
         let mut aliases = BTreeSet::new();
-        for entry in &entries {
+        for entry in &mut entries {
+            let relative = entry
+                .page_uri
+                .strip_prefix(&config.site.base_url)
+                .ok_or("analytics page is outside its site's publishing mount")?;
+            let relative = format!("/{relative}");
+            entry.section = analytics
+                .sections
+                .iter()
+                .filter(|(prefix, _)| {
+                    prefix.as_str() == "/"
+                        || relative == **prefix
+                        || relative
+                            .strip_prefix(prefix.as_str())
+                            .is_some_and(|tail| tail.starts_with('/'))
+                })
+                .max_by_key(|(prefix, _)| prefix.len())
+                .map_or_else(
+                    || analytics.default_section.clone(),
+                    |(_, label)| label.clone(),
+                );
             for alias in &entry.aliases {
                 if !aliases.insert(alias) {
                     return Err(format!("analytics page or alias collision: {alias}"));
@@ -145,13 +181,13 @@ impl Catalog {
             entries: &'a [CatalogEntry],
         }
         let bytes = serde_json::to_vec(&Identity {
-            schema_version: 1,
+            schema_version: 2,
             site_id: &analytics.site_id,
             entries: &entries,
         })
         .map_err(|e| e.to_string())?;
         Ok(Self {
-            schema_version: 1,
+            schema_version: 2,
             site_id: analytics.site_id.clone(),
             entries,
             catalog_id: digest(&bytes),
@@ -182,6 +218,26 @@ impl Catalog {
             serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
+        #[derive(Serialize)]
+        struct PageRow<'a> {
+            site_id: &'a str,
+            page_uri: &'a str,
+            section: &'a str,
+        }
+        let mut rows = Vec::new();
+        for entry in &self.entries {
+            serde_json::to_writer(
+                &mut rows,
+                &PageRow {
+                    site_id: &self.site_id,
+                    page_uri: &entry.page_uri,
+                    section: &entry.section,
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            rows.push(b'\n');
+        }
+        std::fs::write(output.join(PAGES_PATH), rows).map_err(|e| e.to_string())?;
         std::fs::write(output.join(script_path()), SCRIPT).map_err(|e| e.to_string())
     }
 }
@@ -318,6 +374,7 @@ mod tests {
             page_uri,
             aliases,
             title: output.into(),
+            section: String::new(),
         }
     }
 
@@ -364,6 +421,79 @@ mod tests {
                 .endpoint,
             "/_analytics/view"
         );
+    }
+
+    #[test]
+    fn publisher_sections_match_segments_and_remain_site_owned() {
+        let mut parent = config("parent", "/");
+        let analytics = parent.analytics.as_mut().unwrap();
+        analytics.default_section = "Static content".into();
+        analytics.sections = BTreeMap::from([
+            ("/blog".into(), "Blog".into()),
+            ("/blog/special".into(), "Special".into()),
+            ("/data".into(), "Monitoring".into()),
+        ]);
+        let entries = vec![
+            entry("/", "index.html"),
+            entry("/", "blog/post.html"),
+            entry("/", "blog/special/post.html"),
+            entry("/", "blogger.html"),
+            entry("/", "data/well.html"),
+        ];
+        let catalog = Catalog::new(&parent, entries.clone()).unwrap();
+        let section = |uri: &str| {
+            &catalog
+                .entries
+                .iter()
+                .find(|e| e.page_uri == uri)
+                .unwrap()
+                .section
+        };
+        assert_eq!(section("/"), "Static content");
+        assert_eq!(section("/blog/post"), "Blog");
+        assert_eq!(section("/blog/special/post"), "Special");
+        assert_eq!(section("/blogger"), "Static content");
+        assert_eq!(section("/data/well"), "Monitoring");
+        parent
+            .analytics
+            .as_mut()
+            .unwrap()
+            .sections
+            .insert("/blog".into(), "News".into());
+        assert_ne!(
+            catalog.catalog_id,
+            Catalog::new(&parent, entries).unwrap().catalog_id
+        );
+
+        let mut child = config("noyo", "/noyo-harbor/");
+        child.analytics.as_mut().unwrap().default_section = "Noyo".into();
+        let child_catalog = Catalog::new(
+            &child,
+            vec![
+                entry("/noyo-harbor/", "blog/post.html"),
+                entry("/noyo-harbor/", "data/well.html"),
+            ],
+        )
+        .unwrap();
+        assert!(child_catalog.entries.iter().all(|e| e.section == "Noyo"));
+        child
+            .analytics
+            .as_mut()
+            .unwrap()
+            .sections
+            .insert("/blog".into(), "Child blog".into());
+        assert_eq!(
+            Catalog::new(&child, vec![entry("/noyo-harbor/", "blog/post.html")])
+                .unwrap()
+                .entries[0]
+                .section,
+            "Child blog"
+        );
+        for prefix in ["blog", "/blog/", "/../blog"] {
+            child.analytics.as_mut().unwrap().sections =
+                BTreeMap::from([(prefix.into(), "Blog".into())]);
+            assert!(validate(&child).is_err());
+        }
     }
 
     #[test]

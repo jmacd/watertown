@@ -159,6 +159,17 @@ pub struct AnalyticsConfig {
     /// Frontmatter analytics: false also excludes a page; hidden does not.
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Section assigned to eligible pages without a matching section prefix.
+    #[serde(default = "default_analytics_section")]
+    pub default_section: String,
+    /// Site-relative path prefixes mapped to section labels; longest match wins.
+    /// Prefixes match complete path segments, independently of the publishing mount.
+    #[serde(default)]
+    pub sections: std::collections::BTreeMap<String, String>,
+}
+
+fn default_analytics_section() -> String {
+    "Other / unclassified".into()
 }
 
 fn default_analytics_endpoint() -> String {

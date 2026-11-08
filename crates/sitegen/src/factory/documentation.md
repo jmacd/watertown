@@ -35,6 +35,13 @@ analytics:
   enabled: true
   site_id: caspar-water
   endpoint: /_analytics/view
+  default_section: Static content
+  sections:
+    /blog: Blog
+    /data: Monitoring
+    /analysis: Monitoring
+    /septic: Monitoring
+    /explore: Monitoring
   exclude:
     - /status
 ```
@@ -53,14 +60,30 @@ restores do not report again; reloads create new documents. Failures warn withou
 blocking the page, and there are no retries, cookies, visitor identifiers, client
 timestamps, or referrers in the request.
 
-Each enabled site emits `_analytics/catalog.json` and one shared
+Each enabled site emits `_analytics/catalog.json`, `_analytics/pages.jsonl`, and one shared
 `_analytics/view-<sha256>.js` asset in its own output directory. The catalog
-contains version, stable `site_id`, sorted entries (`page_uri`, title, aliases),
+contains version 2, stable `site_id`, sorted entries (`page_uri`, title, aliases, section),
 and a SHA-256 identity derived from version, site identity, and entries serialized
 as compact JSON in that field order. Neither build timestamps nor exported data
 change its identity. Public catalog labels describe only eligible pages.
 The web server does not need an installed catalog registry. Beacon page and
 catalog identities remain untrusted claims, not server-validated membership.
+
+Sections are publisher-owned labels. `sections` maps site-relative path prefixes
+to labels, matching whole path segments; the longest matching prefix wins.
+Prefixes start with `/` and, except for `/`, have no trailing slash.
+`default_section` applies to eligible pages without a match and defaults to
+`Other / unclassified`. A prefix `/blog` matches `/blog/entry`, not `/blogger`.
+Mount prefixes are stripped before matching. Subsites do not inherit the parent's
+section rules; Noyo can use `default_section: Noyo` and an empty `sections` map.
+Changing an emitted section changes the catalog identity.
+
+The JSON Lines inventory contains one row per eligible canonical page, with only
+`site_id`, `page_uri`, and `section`. After publishing, copy it into the owning
+analytics pond with ordinary `pond copy`, as a current versioned data file.
+It is a publisher inventory, not observations or a host-only report database.
+Unknown paths can then be grouped as `Other / unclassified` without exposing
+their names. An empty inventory has no rows and does not provide a query schema.
 
 Canonical paths include `site.base_url` exactly once. With the supported Caddy
 `try_files {path} {path}.html {path}/` configuration, `water.html` identifies

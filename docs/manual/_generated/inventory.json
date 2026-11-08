@@ -6804,6 +6804,11 @@
           "additionalProperties": false,
           "description": "First-visible-document analytics, disabled unless explicitly enabled.",
           "properties": {
+            "default_section": {
+              "default": "Other / unclassified",
+              "description": "Section assigned to eligible pages without a matching section prefix.",
+              "type": "string"
+            },
             "enabled": {
               "default": false,
               "type": "boolean"
@@ -6820,6 +6825,14 @@
                 "type": "string"
               },
               "type": "array"
+            },
+            "sections": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "description": "Site-relative path prefixes mapped to section labels; longest match wins.\nPrefixes match complete path segments, independently of the publishing mount.",
+              "type": "object"
             },
             "site_id": {
               "description": "Stable publisher-owned site identity, independent of host and mount path.",

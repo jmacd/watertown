@@ -2441,6 +2441,7 @@ fn generate_site(
                     page_uri,
                     title: interpolate_captures(&fm.title, &job.captures, &config.labels),
                     aliases,
+                    section: String::new(),
                 });
             }
         }
@@ -3487,6 +3488,7 @@ site:
 analytics:
   enabled: true
   site_id: noyo
+  default_section: Noyo
   exclude: [/noyo-harbor/private/]
 routes:
   - {name: home, type: static, slug: "", page: /home.md}
@@ -3575,6 +3577,19 @@ labels:
             ]
         );
         assert_eq!(catalog["entries"][1]["title"], "Dock <\"&>");
+        let inventory: Vec<Value> =
+            std::fs::read_to_string(output.path().join(analytics::PAGES_PATH))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert_eq!(inventory.len(), uris.len());
+        for (row, uri) in inventory.iter().zip(&uris) {
+            assert_eq!(row["site_id"], "noyo");
+            assert_eq!(row["section"], "Noyo");
+            assert_eq!(row["page_uri"], *uri);
+            assert_eq!(row.as_object().unwrap().len(), 3);
+        }
         for path in ["index.html", "water.html", "sites/BDock.html"] {
             let html = std::fs::read_to_string(output.path().join(path)).unwrap();
             assert_eq!(html.matches("data-watertown-analytics=").count(), 1);

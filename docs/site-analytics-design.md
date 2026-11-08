@@ -118,10 +118,32 @@ to exactly one section, so the stack adds up without double-counting. Noyo may
 appear as a section in the enclosing site's overview while retaining its
 independent source identity and dataset.
 
+The agreed sections are:
+
+- Noyo: all recognized Noyo pages, including its blog and monitoring pages.
+- Blog: recognized main-site `/blog` pages.
+- Monitoring: recognized main-site `/data`, `/analysis`, `/septic`, and `/explore` pages.
+- Static content: the remaining recognized main-site pages.
+- Other / unclassified: unrecognized paths, counted without publishing their names.
+
+Sitegen emits publisher-controlled sections in its page catalog and a flat
+`_analytics/pages.jsonl` inventory. Copy the inventory into the analytics pond
+using ordinary `pond copy`; queries read the replicated pond copy, not a host
+registry. The optional `config/analytics-public.yaml` joins current inventory
+to daily counts by site identity and canonical path and exposes only
+`timestamp`, `section`, and `views`. It deduplicates inventory keys so duplicate
+rows cannot inflate counts; conflicting section labels fall into Other.
+
+Classification uses the current inventory: changed assignments reclassify the
+displayed history, and retired or otherwise unrecognized paths move to Other.
+It does not use a client-supplied section or assume that a claimed catalog ID
+proves membership. A missing or unreadable inventory is an unavailable report,
+not evidence that every page is unknown.
+
 Show the last 30 UTC calendar days and mark today as partial. Do not silently
-fill collection gaps with zero. Section membership, treatment of unrecognized
-or retired pages, and the representation of collection coverage must be settled
-before enabling the report. Section labels are not trusted beacon parameters.
+fill collection gaps with zero. The public projection limits dates but does not
+invent missing daily rows or establish collection coverage. Chart rendering,
+coverage presentation, and automated inventory transfer remain pending.
 
 Missing observations are not zero, and maximum observed event time is not
 proof of collection uptime. Coverage remains unknown unless independently
