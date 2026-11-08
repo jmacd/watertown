@@ -475,7 +475,7 @@ impl Provider {
 
     /// Create a cached table from a format URL.
     ///
-    /// For each version of the source file, checks if a cached Parquet file
+    /// For each query-selected version, checks if a cached Parquet file
     /// exists.  Uncached versions are parsed via the format provider and
     /// streamed to cache Parquet files.  Returns a `ListingTable` over the
     /// cache directory, pruned to the versions retained by `bounds` (so a
@@ -490,22 +490,16 @@ impl Provider {
     ) -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
         let scheme = url.scheme();
         let (node_id, versions) = self
-            .ensure_url_cached(url, format_provider, cache_dir)
+            .ensure_url_query_cached(url, format_provider, cache_dir)
             .await?;
 
-        // Return ListingTable over the cached version Parquet files retained by
-        // the bounds (all versions when bounds are NONE).
+        // Bounds prune the query's selected versions, not the file's history.
         crate::format_cache::listing_table_from_cache_bounded(
             cache_dir, scheme, &node_id, &versions, &bounds, ctx,
         )
         .await
     }
 
-    /// Populate the per-node cache for a URL, returning the `NodeID` and its
-    /// version list so callers can build glob symlinks or listing tables.
-    ///
-    /// Resolves the URL to a `FileID`, lists all versions, and caches any
-    /// uncached versions by streaming them through the format provider.
     /// Resolve a URL's path to the node it names.
     async fn resolve_url_node(&self, url: &Url) -> Result<tinyfs::NodePath> {
         use tinyfs::Lookup;
@@ -584,11 +578,36 @@ impl Provider {
         Ok((node_id, versions))
     }
 
+    /// Cache all live versions for callers explicitly inspecting version history.
     pub(crate) async fn ensure_url_cached(
         &self,
         url: &Url,
         format_provider: &dyn FormatProvider,
         cache_dir: &std::path::Path,
+    ) -> Result<(tinyfs::NodeID, Vec<tinyfs::FileVersionInfo>)> {
+        self.cache_url_versions(url, format_provider, cache_dir, false)
+            .await
+    }
+
+    /// Cache and return the versions exposed by an ordinary format query.
+    /// FilePhysicalVersion contributes only its current content; series
+    /// contribute all live chunks. Historical cache entries remain available.
+    pub(crate) async fn ensure_url_query_cached(
+        &self,
+        url: &Url,
+        format_provider: &dyn FormatProvider,
+        cache_dir: &std::path::Path,
+    ) -> Result<(tinyfs::NodeID, Vec<tinyfs::FileVersionInfo>)> {
+        self.cache_url_versions(url, format_provider, cache_dir, true)
+            .await
+    }
+
+    async fn cache_url_versions(
+        &self,
+        url: &Url,
+        format_provider: &dyn FormatProvider,
+        cache_dir: &std::path::Path,
+        for_query: bool,
     ) -> Result<(tinyfs::NodeID, Vec<tinyfs::FileVersionInfo>)> {
         let scheme = url.scheme();
         let path = url.path();
@@ -670,7 +689,7 @@ impl Provider {
             .expect("cache path requires ProviderContext");
 
         // List all versions
-        let versions = persistence
+        let mut versions = persistence
             .persistence
             .list_file_versions(file_id)
             .await
@@ -686,8 +705,13 @@ impl Provider {
         // Reconcile, not merely check: `versions` is this node's complete live
         // set, so this is the one place that can also retire the sidecars of
         // versions a collapse superseded. Without it the cache only ever grew.
-        let uncached =
+        let mut uncached =
             crate::format_cache::reconcile_cached_versions(cache_dir, scheme, &node_id, &versions)?;
+
+        if for_query && file_id.entry_type() == tinyfs::EntryType::FilePhysicalVersion {
+            retain_file_query_versions(file_id, &mut versions);
+            uncached.retain(|version| versions.iter().any(|v| v.version == version.version));
+        }
 
         if uncached.is_empty() {
             log::debug!(
@@ -808,13 +832,13 @@ impl Provider {
                     .await;
             }
 
-            // Multi-file: cache each, then scan every live version explicitly.
+            // Multi-file: cache and scan each file's query-selected versions.
             let mut nodes = Vec::with_capacity(matches.len());
             for (node_path, _) in &matches {
                 let file_url = url.with_path(&node_path.path().to_string_lossy());
 
                 nodes.push(
-                    self.ensure_url_cached(&file_url, format_provider.as_ref(), cache_dir)
+                    self.ensure_url_query_cached(&file_url, format_provider.as_ref(), cache_dir)
                         .await?,
                 );
             }
@@ -953,7 +977,7 @@ impl Provider {
             }
 
             let matched_url = url.with_path(&node_path.path().to_string_lossy());
-            let (node_id, versions) =
+            let (node_id, mut versions) =
                 if let Some(format_provider) = FormatRegistry::get_provider(url.scheme()) {
                     let Some(cache_dir) = self
                         .provider_context
@@ -962,11 +986,12 @@ impl Provider {
                     else {
                         return Ok(None);
                     };
-                    self.ensure_url_cached(&matched_url, format_provider.as_ref(), cache_dir)
+                    self.ensure_url_query_cached(&matched_url, format_provider.as_ref(), cache_dir)
                         .await?
                 } else {
                     self.list_url_versions(&matched_url).await?
                 };
+            retain_file_query_versions(file_id, &mut versions);
             for version in versions {
                 let metadata = version.extended_metadata.as_ref();
                 let parse = |name: &str| {
@@ -985,6 +1010,21 @@ impl Provider {
             }
         }
         Ok(Some(lineage))
+    }
+}
+
+fn retain_file_query_versions(
+    file_id: tinyfs::FileID,
+    versions: &mut Vec<tinyfs::FileVersionInfo>,
+) {
+    if file_id.entry_type() == tinyfs::EntryType::FilePhysicalVersion {
+        // Match the byte reader: zero-byte temporal override records are not content.
+        let current = versions
+            .iter()
+            .filter(|version| version.size > 0)
+            .map(|version| version.version)
+            .max();
+        versions.retain(|version| Some(version.version) == current);
     }
 }
 
@@ -1054,7 +1094,200 @@ pub(crate) async fn read_pond_node_as_parquet(
 mod tests {
     use super::*;
     use crate::factory::test_factory::{InfiniteCsvConfig, InfiniteCsvFile};
+    use crate::factory::test_support::{create_file_with_type, create_test_environment};
     use tinyfs::{File, MemoryPersistence};
+
+    async fn format_query_values(provider: &Provider, url: &str) -> Vec<String> {
+        let ctx = SessionContext::new();
+        let table = provider.create_provider_for_url(url, &ctx).await.unwrap();
+        let batches = ctx.read_table(table).unwrap().collect().await.unwrap();
+        let mut values = Vec::new();
+        for batch in batches {
+            let column = batch.column_by_name("value").unwrap();
+            for row in 0..batch.num_rows() {
+                values.push(
+                    arrow::util::display::array_value_to_string(column.as_ref(), row).unwrap(),
+                );
+            }
+        }
+        values.sort();
+        values
+    }
+
+    #[tokio::test]
+    async fn format_queries_distinguish_replacement_files_from_series() {
+        for entry_type in [
+            tinyfs::EntryType::FilePhysicalVersion,
+            tinyfs::EntryType::FilePhysicalSeries,
+        ] {
+            let (fs, context) = create_test_environment().await;
+            let fs = Arc::new(fs);
+            let cache = tempfile::tempdir().unwrap();
+            let context = Arc::new(context.with_cache_dir(cache.path().to_path_buf()));
+            let cached = Provider::with_context(fs.clone(), context.clone());
+            let uncached = Provider::new(fs.clone());
+            let path = "/data.jsonl";
+            let url = "jsonlogs:///data.jsonl";
+            let old = b"{\"value\":\"old\"}\n{\"value\":\"retired\"}\n".to_vec();
+            let id = create_file_with_type(&fs, path, old.clone(), entry_type)
+                .await
+                .unwrap();
+            assert_eq!(format_query_values(&cached, url).await, ["old", "retired"]);
+            let old_lineage = cached.query_lineage_for_url(url).await.unwrap().unwrap();
+            let old_version = context
+                .persistence
+                .list_file_versions(id)
+                .await
+                .unwrap()
+                .remove(0);
+            let old_cache = crate::format_cache::cache_version_path(
+                cache.path(),
+                "jsonlogs",
+                &id.node_id(),
+                &old_version,
+            );
+            assert!(old_cache.exists());
+
+            _ = create_file_with_type(&fs, path, b"{\"value\":\"current\"}\n".to_vec(), entry_type)
+                .await
+                .unwrap();
+            let expected = if entry_type == tinyfs::EntryType::FilePhysicalVersion {
+                vec!["current"]
+            } else {
+                vec!["current", "old", "retired"]
+            };
+            assert_eq!(format_query_values(&uncached, url).await, expected);
+            for _ in 0..2 {
+                assert_eq!(format_query_values(&cached, url).await, expected);
+            }
+            let lineage = cached.query_lineage_for_url(url).await.unwrap().unwrap();
+            assert_ne!(lineage, old_lineage);
+            assert_eq!(
+                lineage.leaves.len(),
+                if entry_type == tinyfs::EntryType::FilePhysicalSeries {
+                    2
+                } else {
+                    1
+                }
+            );
+            if entry_type == tinyfs::EntryType::FilePhysicalVersion {
+                assert!(
+                    !lineage
+                        .leaves
+                        .iter()
+                        .any(|leaf| leaf.identity == old_lineage.leaves[0].identity)
+                );
+            }
+
+            assert_eq!(
+                context
+                    .persistence
+                    .list_file_versions(id)
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_eq!(
+                context
+                    .persistence
+                    .read_file_version(id, old_version.version)
+                    .await
+                    .unwrap(),
+                old
+            );
+            assert!(
+                old_cache.exists(),
+                "selecting current content must not delete cached history"
+            );
+            let (_, history) = cached
+                .ensure_url_cached(
+                    &Url::parse(url).unwrap(),
+                    FormatRegistry::get_provider("jsonlogs").unwrap().as_ref(),
+                    cache.path(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                history.len(),
+                2,
+                "explicit history consumers still receive all live versions"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn format_glob_queries_select_each_files_versions() {
+        let (fs, context) = create_test_environment().await;
+        let fs = Arc::new(fs);
+        for (path, entry_type) in [
+            ("/snapshot.jsonl", tinyfs::EntryType::FilePhysicalVersion),
+            ("/series.jsonl", tinyfs::EntryType::FilePhysicalSeries),
+        ] {
+            for value in ["old", "current"] {
+                _ = create_file_with_type(
+                    &fs,
+                    path,
+                    format!("{{\"value\":\"{path}:{value}\"}}\n").into_bytes(),
+                    entry_type,
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let cache = tempfile::tempdir().unwrap();
+        let cached = Provider::with_context(
+            fs.clone(),
+            Arc::new(context.with_cache_dir(cache.path().to_path_buf())),
+        );
+        let expected = [
+            "/series.jsonl:current",
+            "/series.jsonl:old",
+            "/snapshot.jsonl:current",
+        ];
+        assert_eq!(
+            format_query_values(&Provider::new(fs), "jsonlogs:///*.jsonl").await,
+            expected
+        );
+        assert_eq!(
+            format_query_values(&cached, "jsonlogs:///*.jsonl").await,
+            expected
+        );
+        assert_eq!(
+            cached
+                .query_lineage_for_url("jsonlogs:///*.jsonl")
+                .await
+                .unwrap()
+                .unwrap()
+                .leaves
+                .len(),
+            3,
+        );
+    }
+
+    #[tokio::test]
+    async fn format_snapshot_query_does_not_parse_historical_content() {
+        let (fs, context) = create_test_environment().await;
+        for content in [b"not JSON\n".as_slice(), b"{\"value\":\"current\"}\n"] {
+            _ = create_file_with_type(
+                &fs,
+                "/snapshot.jsonl",
+                content.to_vec(),
+                tinyfs::EntryType::FilePhysicalVersion,
+            )
+            .await
+            .unwrap();
+        }
+        let cache = tempfile::tempdir().unwrap();
+        let provider = Provider::with_context(
+            Arc::new(fs),
+            Arc::new(context.with_cache_dir(cache.path().to_path_buf())),
+        );
+        assert_eq!(
+            format_query_values(&provider, "jsonlogs:///snapshot.jsonl").await,
+            ["current"],
+        );
+    }
 
     async fn create_test_fs() -> Arc<tinyfs::FS> {
         let persistence = MemoryPersistence::default();

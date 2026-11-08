@@ -1014,7 +1014,7 @@ impl SqlDerivedFile {
 
                     nodes.push(
                         provider_api
-                            .ensure_url_cached(&file_url, format_provider.as_ref(), cache_dir)
+                            .ensure_url_query_cached(&file_url, format_provider.as_ref(), cache_dir)
                             .await
                             .map_other()?,
                     );
@@ -1866,6 +1866,68 @@ mod tests {
     use crate::factory::test_support::{
         create_parquet_file, create_parquet_from_batch, create_test_environment, test_context,
     };
+
+    #[tokio::test]
+    async fn format_sources_select_current_snapshots_and_all_series_chunks() {
+        use crate::factory::test_support::create_file_with_type;
+
+        let (fs, context) = create_test_environment().await;
+        for (path, entry_type) in [
+            ("/snapshot.jsonl", EntryType::FilePhysicalVersion),
+            ("/series.jsonl", EntryType::FilePhysicalSeries),
+        ] {
+            for value in ["old", "current"] {
+                _ = create_file_with_type(
+                    &fs,
+                    path,
+                    format!("{{\"value\":\"{value}\"}}\n").into_bytes(),
+                    entry_type,
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let cache = tempfile::tempdir().unwrap();
+        for use_cache in [false, true] {
+            let context = ProviderContext::new_for_testing(context.persistence.clone());
+            let context = if use_cache {
+                context.with_cache_dir(cache.path().to_path_buf())
+            } else {
+                context
+            };
+            for (pattern, expected) in [
+                ("jsonlogs:///snapshot.jsonl", vec!["current"]),
+                ("jsonlogs:///*.jsonl", vec!["current", "current", "old"]),
+            ] {
+                let file = SqlDerivedFile::new(
+                    SqlDerivedConfig::new(
+                        test_patterns(&[("input", pattern)]),
+                        Some("SELECT value FROM input ORDER BY value".to_owned()),
+                    ),
+                    test_context(
+                        &context,
+                        FileID::from_content(
+                            PartID::root(),
+                            EntryType::TableDynamic,
+                            pattern.as_bytes(),
+                            context.persistence.pond_uuid(),
+                        ),
+                    ),
+                    SqlDerivedMode::Series,
+                )
+                .unwrap();
+                let batches = execute_sql_derived_direct(&file, &context).await.unwrap();
+                let values: Vec<String> = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        let values = get_string_array(batch, 0);
+                        (0..values.len()).map(move |row| values.value(row).to_owned())
+                    })
+                    .collect();
+                assert_eq!(values, expected, "cache={use_cache}, pattern={pattern}");
+            }
+        }
+    }
 
     /// Helper function to get a string array from any column, handling different Arrow string types
     fn get_string_array(batch: &RecordBatch, column_index: usize) -> Arc<StringArray> {
