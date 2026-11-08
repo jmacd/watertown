@@ -104,6 +104,25 @@ be exported through the report or an unrestricted public query interface.
 Public report data must not include source paths, internal errors, or catalog
 identifiers. The public publisher catalog is separate from report output.
 
+### At-a-glance overview
+
+The primary presentation is a stacked area chart of **daily reported page
+views**, not a running cumulative total. The horizontal axis is the UTC day;
+the total height is that day's count, and colored bands show the contributions
+from sections such as blog, static content, monitoring, and Noyo. Individual
+page detail is secondary.
+
+The overview derives `(UTC day, section, reported views)` from daily per-page
+counts and publisher-controlled section assignments. Each included view belongs
+to exactly one section, so the stack adds up without double-counting. Noyo may
+appear as a section in the enclosing site's overview while retaining its
+independent source identity and dataset.
+
+Show the last 30 UTC calendar days and mark today as partial. Do not silently
+fill collection gaps with zero. Section membership, treatment of unrecognized
+or retired pages, and the representation of collection coverage must be settled
+before enabling the report. Section labels are not trusted beacon parameters.
+
 Missing observations are not zero, and maximum observed event time is not
 proof of collection uptime. Coverage remains unknown unless independently
 established. Failed refreshes must not fabricate freshness or prevent core
