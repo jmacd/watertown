@@ -6,15 +6,21 @@
 
 use crate::config::{AnalyticsConfig, SiteConfig};
 use crate::routes::PageJob;
+use datafusion::arrow::{
+    array::{RecordBatch, StringArray},
+    datatypes::{DataType, Field, Schema},
+};
+use datafusion::parquet::arrow::ArrowWriter;
 use maud::{Markup, html};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Arc;
 
 pub(crate) const SCRIPT: &str = include_str!("../assets/analytics.js");
 pub(crate) const CATALOG_PATH: &str = "_analytics/catalog.json";
-pub(crate) const PAGES_PATH: &str = "_analytics/pages.jsonl";
+pub(crate) const PAGES_PATH: &str = "_analytics/pages.parquet";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -218,26 +224,31 @@ impl Catalog {
             serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
-        #[derive(Serialize)]
-        struct PageRow<'a> {
-            site_id: &'a str,
-            page_uri: &'a str,
-            section: &'a str,
-        }
-        let mut rows = Vec::new();
-        for entry in &self.entries {
-            serde_json::to_writer(
-                &mut rows,
-                &PageRow {
-                    site_id: &self.site_id,
-                    page_uri: &entry.page_uri,
-                    section: &entry.section,
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            rows.push(b'\n');
-        }
-        std::fs::write(output.join(PAGES_PATH), rows).map_err(|e| e.to_string())?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("site_id", DataType::Utf8, false),
+            Field::new("page_uri", DataType::Utf8, false),
+            Field::new("section", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(std::iter::repeat_n(
+                    self.site_id.as_str(),
+                    self.entries.len(),
+                ))),
+                Arc::new(StringArray::from_iter_values(
+                    self.entries.iter().map(|entry| entry.page_uri.as_str()),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    self.entries.iter().map(|entry| entry.section.as_str()),
+                )),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        let file = std::fs::File::create(output.join(PAGES_PATH)).map_err(|e| e.to_string())?;
+        let mut writer = ArrowWriter::try_new(file, schema, None).map_err(|e| e.to_string())?;
+        writer.write(&batch).map_err(|e| e.to_string())?;
+        _ = writer.close().map_err(|e| e.to_string())?;
         std::fs::write(output.join(script_path()), SCRIPT).map_err(|e| e.to_string())
     }
 }
@@ -376,6 +387,91 @@ mod tests {
             title: output.into(),
             section: String::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn inventory_snapshots_preserve_schema_and_replace_with_empty_content() {
+        let config = config("001", "/");
+        let output = tempfile::tempdir().unwrap();
+        let fs = Arc::new(
+            tinyfs::FS::new(tinyfs::MemoryPersistence::default())
+                .await
+                .unwrap(),
+        );
+        let root = fs.root().await.unwrap();
+        let provider = provider::Provider::new(fs);
+        let session = datafusion::prelude::SessionContext::new();
+        let url = "file+table:///pages.parquet";
+        assert!(
+            provider
+                .create_provider_for_url(url, &session)
+                .await
+                .is_err()
+        );
+
+        for pages in [
+            vec![],
+            vec!["first.html", "second.html"],
+            vec![],
+            vec!["replacement.html"],
+        ] {
+            let catalog =
+                Catalog::new(&config, pages.iter().map(|page| entry("/", page)).collect()).unwrap();
+            catalog.write(output.path()).unwrap();
+            let bytes = std::fs::read(output.path().join(PAGES_PATH)).unwrap();
+            root.write_file_path_from_slice("/pages.parquet", &bytes)
+                .await
+                .unwrap();
+            let node = root.get_node_path("/pages.parquet").await.unwrap();
+            assert_eq!(
+                node.id().entry_type(),
+                tinyfs::EntryType::FilePhysicalVersion
+            );
+            let table = provider
+                .create_provider_for_url(url, &session)
+                .await
+                .unwrap();
+            let expected_schema = Schema::new(vec![
+                Field::new("site_id", DataType::Utf8, false),
+                Field::new("page_uri", DataType::Utf8, false),
+                Field::new("section", DataType::Utf8, false),
+            ]);
+            assert_eq!(table.schema().as_ref(), &expected_schema);
+            let batches = session.read_table(table).unwrap().collect().await.unwrap();
+            let mut actual = Vec::new();
+            for batch in batches {
+                let column = |index| {
+                    batch
+                        .column(index)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                };
+                for row in 0..batch.num_rows() {
+                    assert_eq!(column(0).value(row), "001");
+                    actual.push(column(1).value(row).to_owned());
+                    assert_eq!(column(2).value(row), "Other / unclassified");
+                }
+            }
+            assert_eq!(
+                actual,
+                catalog
+                    .entries
+                    .iter()
+                    .map(|entry| entry.page_uri.clone())
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        root.write_file_path_from_slice("/pages.parquet", b"not Parquet")
+            .await
+            .unwrap();
+        assert!(
+            provider
+                .create_provider_for_url(url, &session)
+                .await
+                .is_err()
+        );
     }
 
     #[test]

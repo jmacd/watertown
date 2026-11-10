@@ -307,11 +307,8 @@ impl Provider {
             }
         };
 
-        // Capability-based gate: cast only nodes that cannot serve themselves
-        // as a TableProvider (data archetype).  Natively queryable
-        // series/table nodes are returned as `Ok(None)` so the caller falls
-        // through to the standard `as_queryable()` path -- this is the
-        // *only* legitimate fallthrough.
+        // Physical snapshot handles also expose QueryableFile, but its version
+        // listing is not snapshot replacement. Explicit casts read current bytes.
         let is_queryable = {
             let file_handle = node_path
                 .as_file()
@@ -321,7 +318,7 @@ impl Provider {
             let file_guard = file_arc.lock().await;
             file_guard.as_queryable().is_some()
         };
-        if is_queryable {
+        if is_queryable && node_path.id().entry_type() != tinyfs::EntryType::FilePhysicalVersion {
             return Ok(None);
         }
 

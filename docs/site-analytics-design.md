@@ -127,9 +127,12 @@ The agreed sections are:
 - Other / unclassified: unrecognized paths, counted without publishing their names.
 
 Sitegen emits publisher-controlled sections in its page catalog and a flat
-`_analytics/pages.jsonl` inventory. Copy the inventory into the analytics pond
-using ordinary `pond copy`; queries read the replicated pond copy, not a host
-registry. The optional `config/analytics-public.yaml` joins current inventory
+`_analytics/pages.parquet` inventory with non-null UTF-8 `site_id`, `page_uri`,
+and `section` columns, including when there are zero rows. Copy the inventory
+into the analytics pond using ordinary `pond copy host:///...`, not a table or
+series copy; `file+table:///analytics/pages.parquet` reads the current version
+of the replicated file, not a host registry or historical replacements.
+The optional `config/analytics-public.yaml` joins current inventory
 to daily counts by site identity and canonical path and exposes only
 `timestamp`, `section`, and `views`. It deduplicates inventory keys so duplicate
 rows cannot inflate counts; conflicting section labels fall into Other.
@@ -137,8 +140,9 @@ rows cannot inflate counts; conflicting section labels fall into Other.
 Classification uses the current inventory: changed assignments reclassify the
 displayed history, and retired or otherwise unrecognized paths move to Other.
 It does not use a client-supplied section or assume that a claimed catalog ID
-proves membership. A missing or unreadable inventory is an unavailable report,
-not evidence that every page is unknown.
+proves membership. A valid zero-row inventory explicitly removes all recognized
+pages, putting retained views into Other. A missing or unreadable inventory is
+an unavailable report, not evidence that every page is unknown.
 
 Show the last 30 UTC calendar days and mark today as partial. Do not silently
 fill collection gaps with zero. The public projection limits dates but does not

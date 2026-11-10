@@ -60,7 +60,7 @@ restores do not report again; reloads create new documents. Failures warn withou
 blocking the page, and there are no retries, cookies, visitor identifiers, client
 timestamps, or referrers in the request.
 
-Each enabled site emits `_analytics/catalog.json`, `_analytics/pages.jsonl`, and one shared
+Each enabled site emits `_analytics/catalog.json`, `_analytics/pages.parquet`, and one shared
 `_analytics/view-<sha256>.js` asset in its own output directory. The catalog
 contains version 2, stable `site_id`, sorted entries (`page_uri`, title, aliases, section),
 and a SHA-256 identity derived from version, site identity, and entries serialized
@@ -78,12 +78,16 @@ Mount prefixes are stripped before matching. Subsites do not inherit the parent'
 section rules; Noyo can use `default_section: Noyo` and an empty `sections` map.
 Changing an emitted section changes the catalog identity.
 
-The JSON Lines inventory contains one row per eligible canonical page, with only
-`site_id`, `page_uri`, and `section`. After publishing, copy it into the owning
-analytics pond with ordinary `pond copy`, as a current versioned data file.
+The Parquet inventory contains one row per eligible canonical page, with only
+`site_id`, `page_uri`, and `section`, all non-null UTF-8 strings. After publishing,
+copy it into the owning analytics pond with ordinary `pond copy host:///...`,
+as a current versioned data file, not `host+table` or `host+series`. Query it
+through `file+table:///analytics/pages.parquet` to read only the current file.
 It is a publisher inventory, not observations or a host-only report database.
 Unknown paths can then be grouped as `Other / unclassified` without exposing
-their names. An empty inventory has no rows and does not provide a query schema.
+their names. An empty inventory is a valid zero-row Parquet file with the same
+schema: it replaces previous classifications, so all retained views become
+Other. Missing or unreadable inventory is an error, not a known-empty inventory.
 
 Canonical paths include `site.base_url` exactly once. With the supported Caddy
 `try_files {path} {path}.html {path}/` configuration, `water.html` identifies

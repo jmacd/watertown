@@ -3489,6 +3489,9 @@ mod tests {
 
     #[test]
     fn analytics_build_covers_routes_layouts_opt_out_and_stable_catalogs() {
+        use datafusion::arrow::{array::StringArray, compute::concat_batches};
+        use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
         let mut config: SiteConfig = serde_yaml::from_str(
             r#"
 site:
@@ -3586,18 +3589,30 @@ labels:
             ]
         );
         assert_eq!(catalog["entries"][1]["title"], "Dock <\"&>");
-        let inventory: Vec<Value> =
-            std::fs::read_to_string(output.path().join(analytics::PAGES_PATH))
+        let reader = ParquetRecordBatchReaderBuilder::try_new(
+            std::fs::File::open(output.path().join(analytics::PAGES_PATH)).unwrap(),
+        )
+        .unwrap();
+        let schema = reader.schema().clone();
+        let batches = reader
+            .build()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let inventory = concat_batches(&schema, &batches).unwrap();
+        assert_eq!(inventory.num_rows(), uris.len());
+        assert_eq!(inventory.num_columns(), 3);
+        let column = |index| {
+            inventory
+                .column(index)
+                .as_any()
+                .downcast_ref::<StringArray>()
                 .unwrap()
-                .lines()
-                .map(|line| serde_json::from_str(line).unwrap())
-                .collect();
-        assert_eq!(inventory.len(), uris.len());
-        for (row, uri) in inventory.iter().zip(&uris) {
-            assert_eq!(row["site_id"], "noyo");
-            assert_eq!(row["section"], "Noyo");
-            assert_eq!(row["page_uri"], *uri);
-            assert_eq!(row.as_object().unwrap().len(), 3);
+        };
+        for (row, uri) in uris.iter().enumerate() {
+            assert_eq!(column(0).value(row), "noyo");
+            assert_eq!(column(1).value(row), *uri);
+            assert_eq!(column(2).value(row), "Noyo");
         }
         for path in ["index.html", "water.html", "sites/BDock.html"] {
             let html = std::fs::read_to_string(output.path().join(path)).unwrap();

@@ -934,11 +934,8 @@ impl SqlDerivedFile {
             .collect::<Vec<_>>()
             .join(" UNION ALL BY NAME ");
         let df = temp_ctx.sql(&union_sql).await.map_other()?;
+        let schema = Arc::new(df.schema().as_arrow().clone());
         let batches = df.collect().await.map_other()?;
-        let schema = batches
-            .first()
-            .map(|b| b.schema())
-            .ok_or_else(|| tinyfs::Error::Other("No batches in union".to_string()))?;
         let mem_table =
             datafusion::datasource::MemTable::try_new(schema, vec![batches]).map_other()?;
         Ok(Arc::new(mem_table))
@@ -1085,7 +1082,10 @@ impl SqlDerivedFile {
             .map_other_context("Failed to get file handle")?;
         let file_arc = file_handle.handle.get_file().await;
         let file_guard = file_arc.lock().await;
-        if let Some(queryable_file) = file_guard.as_queryable() {
+        if let Some(queryable_file) = file_guard
+            .as_queryable()
+            .filter(|_| file_id.entry_type() != EntryType::FilePhysicalVersion)
+        {
             debug!(
                 "[SEARCH] SQL-DERIVED: File implements QueryableFile trait, calling as_table_provider..."
             );
@@ -1136,10 +1136,8 @@ impl SqlDerivedFile {
     ) -> TinyFSResult<Arc<dyn TableProvider>> {
         let mut urls = Vec::new();
         let mut file_ids = Vec::new();
-        // Data-archetype nodes matched under a +series/+table URL cast (e.g.
-        // git-ingested FileDynamic Parquet archives) are not natively queryable
-        // and cannot be enumerated through the tinyfs:/// version ListingTable;
-        // they are read directly as Parquet (see docs/url-entry-type-casting.md).
+        // Data casts, including physical snapshots, read current bytes rather
+        // than enumerating every historical version through a ListingTable.
         let mut data_cast_files: Vec<tinyfs::NodePath> = Vec::new();
         for node_path in queryable_files {
             let file_id = node_path.id();
@@ -1152,7 +1150,7 @@ impl SqlDerivedFile {
                 let file_guard = file_arc.lock().await;
                 file_guard.as_queryable().is_some()
             };
-            if is_queryable {
+            if is_queryable && file_id.entry_type() != EntryType::FilePhysicalVersion {
                 // tinyfs:///pond/{pond_id}/part/{part_id}/node/{node_id}/version/
                 let url_pattern = format!(
                     "tinyfs:///pond/{}/part/{}/node/{}/version/",
@@ -1866,6 +1864,84 @@ mod tests {
     use crate::factory::test_support::{
         create_parquet_file, create_parquet_from_batch, create_test_environment, test_context,
     };
+
+    #[tokio::test]
+    async fn parquet_cast_sources_select_current_snapshots_including_empty() {
+        use arrow::array::Int64Array;
+
+        let (fs, context) = create_test_environment().await;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        for (path, values) in [
+            ("/a.parquet", vec![1]),
+            ("/b.parquet", vec![2]),
+            ("/a.parquet", vec![]),
+        ] {
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(values))])
+                    .unwrap();
+            _ = create_parquet_from_batch(&fs, path, &batch, EntryType::FilePhysicalVersion)
+                .await
+                .unwrap();
+        }
+        for values in [vec![], vec![3]] {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(values.clone()))],
+            )
+            .unwrap();
+            _ = create_parquet_from_batch(
+                &fs,
+                "/b.parquet",
+                &batch,
+                EntryType::FilePhysicalVersion,
+            )
+            .await
+            .unwrap();
+            // Each publication is queried in a fresh transaction context.
+            let context = ProviderContext::new_for_testing(context.persistence.clone());
+            for (pattern, expected) in [
+                ("file+table:///a.parquet", vec![]),
+                ("file+table:///*.parquet", values.clone()),
+            ] {
+                let file = SqlDerivedFile::new(
+                    SqlDerivedConfig::new(
+                        test_patterns(&[("input", pattern)]),
+                        Some("SELECT value FROM input ORDER BY value".to_owned()),
+                    ),
+                    test_context(
+                        &context,
+                        FileID::from_content(
+                            PartID::root(),
+                            EntryType::TableDynamic,
+                            pattern.as_bytes(),
+                            context.persistence.pond_uuid(),
+                        ),
+                    ),
+                    SqlDerivedMode::Series,
+                )
+                .unwrap();
+                let batches = execute_sql_derived_direct(&file, &context).await.unwrap();
+                let actual = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap()
+                            .values()
+                            .iter()
+                            .copied()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected, "{pattern}");
+            }
+        }
+    }
 
     #[tokio::test]
     async fn format_sources_select_current_snapshots_and_all_series_chunks() {
