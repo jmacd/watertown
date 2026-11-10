@@ -16,10 +16,10 @@ GIT_FACTORY="${SITE}/reference/factories/git-ingest.html"
 CSV="${SITE}/reference/formats/csv.html"
 GUIDE="${SITE}/guides/timeseries.html"
 SHORTCODES="${SITE}/reference/sitegen/shortcodes.html"
-for page in "${SITE}/index.html" "${FACTORY}" "${GIT_FACTORY}" "${CSV}" "${GUIDE}" "${SHORTCODES}"; do
+for page in "${SITE}/index.html" "${FACTORY}" "${GIT_FACTORY}" "${CSV}" "${GUIDE}" "${SHORTCODES}" "${SITE}/guides/architecture.html"; do
     check '[[ -f "${page}" ]]' "pilot page $(basename "${page}") generated"
 done
-check '[[ "$(find "${SITE}" -name "*.html" -type f | wc -l | tr -d " ")" = 48 ]]' "complete manual renders 48 pages"
+check '[[ "$(find "${SITE}" -name "*.html" -type f | wc -l | tr -d " ")" = 49 ]]' "complete manual renders 49 pages"
 for format in csv excelhtml hledger jsonlogs oteljson weblog xls; do
     check '[[ -f "${SITE}/reference/formats/${format}.html" ]]' "individual ${format} format page generated"
     check_contains "${SITE}/index.html" "${format} has a direct sidebar link" "href=\"/watertown/reference/formats/${format}.html\""
