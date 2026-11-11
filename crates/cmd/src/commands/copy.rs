@@ -756,10 +756,15 @@ async fn export_queryable_file_as_parquet(
         .await
         .map_err(|e| anyhow!("Failed to create output file '{}': {}", host_output_path, e))?;
 
-    let mut writer = AsyncArrowWriter::try_new(host_writer, schema, None)
+    let props = utilities::parquet_policy::writer_properties(
+        &schema,
+        parquet::file::properties::WriterProperties::builder(),
+    )?;
+    let mut writer = AsyncArrowWriter::try_new(host_writer, schema.clone(), Some(props))
         .map_err(|e| anyhow!("Failed to create parquet writer: {}", e))?;
 
     // Write first batch
+    utilities::parquet_policy::validate_batch(&first_batch)?;
     writer
         .write(&first_batch)
         .await
@@ -768,16 +773,18 @@ async fn export_queryable_file_as_parquet(
     // Stream remaining batches
     while let Some(batch_result) = stream.next().await {
         let batch = batch_result.map_err(|e| anyhow!("Failed to read batch from stream: {}", e))?;
+        utilities::parquet_policy::validate_batch(&batch)?;
         writer
             .write(&batch)
             .await
             .map_err(|e| anyhow!("Failed to write batch to parquet: {}", e))?;
     }
 
-    _ = writer
+    let metadata = writer
         .close()
         .await
         .map_err(|e| anyhow!("Failed to close parquet writer: {}", e))?;
+    utilities::parquet_policy::validate_metadata(&schema, &metadata)?;
 
     log::debug!("Exported parquet file to {}", host_output_path);
     Ok(())

@@ -16,10 +16,10 @@ GIT_FACTORY="${SITE}/reference/factories/git-ingest.html"
 CSV="${SITE}/reference/formats/csv.html"
 GUIDE="${SITE}/guides/timeseries.html"
 SHORTCODES="${SITE}/reference/sitegen/shortcodes.html"
-for page in "${SITE}/index.html" "${FACTORY}" "${GIT_FACTORY}" "${CSV}" "${GUIDE}" "${SHORTCODES}"; do
+for page in "${SITE}/index.html" "${FACTORY}" "${GIT_FACTORY}" "${CSV}" "${GUIDE}" "${SHORTCODES}" "${SITE}/guides/architecture.html"; do
     check '[[ -f "${page}" ]]' "pilot page $(basename "${page}") generated"
 done
-check '[[ "$(find "${SITE}" -name "*.html" -type f | wc -l | tr -d " ")" = 48 ]]' "complete manual renders 48 pages"
+check '[[ "$(find "${SITE}" -name "*.html" -type f | wc -l | tr -d " ")" = 49 ]]' "complete manual renders 49 pages"
 for format in csv excelhtml hledger jsonlogs oteljson weblog xls; do
     check '[[ -f "${SITE}/reference/formats/${format}.html" ]]' "individual ${format} format page generated"
     check_contains "${SITE}/index.html" "${format} has a direct sidebar link" "href=\"/watertown/reference/formats/${format}.html\""
@@ -146,4 +146,28 @@ check_contains "${GIT_FACTORY}" "colocated YAML reaches output without Cargo" '#
 check 'cmp "${COMPONENT}" "${WORK}/authored-component.md" && cmp "${DEFAULTS}" "${WORK}/authored-default.yaml"' "build leaves colocated inputs unchanged"
 check '[[ ! -e "${INPUT}/docs/manual/reference/factories/git-ingest.md" ]]' "component pages exist only in the generated staging tree"
 check '[[ ! -e "${WORK}/input/pond" && ! -e "${WORK}/input/.pond" ]]' "manual requires no pond"
+
+QUICK_INPUT="${WORK}/quick-input"
+QUICK_OUTPUT="${WORK}/quick-output"
+mkdir -p "${QUICK_INPUT}" "${QUICK_OUTPUT}/noyo"
+cat > "${QUICK_INPUT}/site.yaml" <<'YAML'
+site: {title: Quick preview}
+documentation: {version: 1, source_root: /}
+routes:
+  - {name: home, type: static, slug: "", page: /index.md}
+YAML
+printf '%s\n' '---' 'title: Fresh page' '---' 'Preview content.' > "${QUICK_INPUT}/index.md"
+RETAINED="${QUICK_OUTPUT}/noyo/old.html"
+printf '%s\n' '<script defer src="/_analytics/old.js" data-watertown-analytics="1"></script>' > "${RETAINED}"
+cp "${RETAINED}" "${QUICK_OUTPUT}/index.html"
+cp "${RETAINED}" "${WORK}/retained-before.html"
+check '"${POND_BIN}" run -d "${QUICK_INPUT}" host+sitegen:///site.yaml -- build "${QUICK_OUTPUT}" --quick > "${WORK}/quick.log" 2>&1' "quick preview succeeds with retained analytics"
+check_contains "${WORK}/quick.log" "quick preview warns about retained subsite HTML" "Quick build retained analytics instrumentation in ${RETAINED}"
+check_not_contains "${WORK}/quick.log" "regenerated pages do not produce stale analytics warnings" "Quick build retained analytics instrumentation in ${QUICK_OUTPUT}/index.html"
+check 'cmp "${RETAINED}" "${WORK}/retained-before.html"' "quick warning leaves retained HTML untouched"
+check_not_contains "${QUICK_OUTPUT}/index.html" "quick preview regenerates the main page without analytics" 'data-watertown-analytics="1"'
+check '"${POND_BIN}" run -d "${QUICK_INPUT}" host+sitegen:///site.yaml -- build "${QUICK_OUTPUT}" > "${WORK}/full.log" 2>&1' "full build succeeds with retained HTML"
+check_not_contains "${WORK}/full.log" "full builds do not emit the development warning" "Quick build retained analytics"
+check '"${POND_BIN}" run -d "${QUICK_INPUT}" host+sitegen:///site.yaml -- build "${WORK}/fresh-quick" --quick > "${WORK}/fresh-quick.log" 2>&1' "fresh quick preview succeeds"
+check_not_contains "${WORK}/fresh-quick.log" "fresh quick previews do not warn" "Quick build retained analytics"
 check_finish

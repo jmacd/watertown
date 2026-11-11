@@ -62,6 +62,8 @@ sidebar:
     href: /index.html
   - label: Guides
     children:
+      - label: Architecture for developers
+        href: /guides/architecture.html
       - label: Timeseries
         href: /guides/timeseries.html
       - label: Timeseries site

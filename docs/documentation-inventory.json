@@ -547,6 +547,12 @@
       "coverage": "unverified",
       "output": "docs/manual/reference/formats/xls.md"
     },
+    "guide:architecture": {
+      "path": "docs/manual/guides/architecture.md",
+      "components": [],
+      "examples": [],
+      "coverage": "unverified"
+    },
     "guide:blog": {
       "path": "docs/manual/guides/blog.md",
       "components": [],

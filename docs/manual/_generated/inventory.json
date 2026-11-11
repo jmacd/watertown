@@ -6800,6 +6800,50 @@
     },
     "factory:sitegen": {
       "$defs": {
+        "AnalyticsConfig": {
+          "additionalProperties": false,
+          "description": "First-visible-document analytics, disabled unless explicitly enabled.",
+          "properties": {
+            "default_section": {
+              "default": "Other / unclassified",
+              "description": "Section assigned to eligible pages without a matching section prefix.",
+              "type": "string"
+            },
+            "enabled": {
+              "default": false,
+              "type": "boolean"
+            },
+            "endpoint": {
+              "default": "/_analytics/view",
+              "description": "Same-origin absolute path, routed to this site's dedicated beacon log.",
+              "type": "string"
+            },
+            "exclude": {
+              "default": [],
+              "description": "Exact canonical mounted paths to exclude, in addition to /analytics.\nFrontmatter analytics: false also excludes a page; hidden does not.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "sections": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "description": "Site-relative path prefixes mapped to section labels; longest match wins.\nPrefixes match complete path segments, independently of the publishing mount.",
+              "type": "object"
+            },
+            "site_id": {
+              "description": "Stable publisher-owned site identity, independent of host and mount path.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "site_id"
+          ],
+          "type": "object"
+        },
         "ContentStage": {
           "additionalProperties": false,
           "description": "A content stage: globs markdown data files in the pond and reads\ntheir frontmatter for metadata (title, weight, slug).\n\nContent stages are resolved before route expansion. A `content` route\nreferences a stage by name, producing one page per matched file.",
@@ -7349,6 +7393,18 @@
       "additionalProperties": false,
       "description": "Top-level site configuration.\n\n```yaml\nsite:\n  title: \"Noyo Harbor Blue Economy\"\n  base_url: \"/\"\n\nexports:\n  - name: \"params\"\n    pattern: \"/reduced/single_param/*/*.series\"\n\nroutes:\n  - name: \"home\"\n    type: static\n    slug: \"\"\n    page: \"/site/index.md\"\n    routes: [...]\n\npartials:\n  sidebar: \"/site/sidebar.md\"\n\nstatic:\n  - pattern: \"/static/*\"\n```",
       "properties": {
+        "analytics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AnalyticsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Independent, opt-in reported page views. Never inherited by subsites."
+        },
         "content": {
           "default": [],
           "items": {
@@ -8039,6 +8095,13 @@
             "null"
           ]
         },
+        "group_by": {
+          "description": "Exact source columns retained as grouping keys alongside the time bucket.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "in_pattern": {
           "$ref": "#/$defs/WatertownUrl",
           "description": "Input URL pattern to match source files (supports glob patterns)"
@@ -8164,6 +8227,13 @@
             "string",
             "null"
           ]
+        },
+        "group_by": {
+          "description": "Exact source columns retained as grouping keys alongside the time bucket.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "in_pattern": {
           "$ref": "#/$defs/WatertownUrl"
@@ -8463,6 +8533,14 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "description": "Frontmatter parsed from the top of each markdown page.",
       "properties": {
+        "analytics": {
+          "default": null,
+          "description": "Set false to exclude this page from analytics, independently of navigation.\nTrue never enables analytics when the site or build has disabled it.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "date": {
           "default": null,
           "description": "Publication date (ISO 8601, e.g. \"2024-06-15\").",

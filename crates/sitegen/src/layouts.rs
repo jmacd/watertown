@@ -111,6 +111,7 @@ fn top_bar(
 
 /// Context passed to layout functions.
 pub struct LayoutContext<'a> {
+    pub analytics: Option<&'a crate::analytics::PageAnalytics>,
     /// Page title (from frontmatter)
     pub title: &'a str,
     /// Site title (from site.yaml)
@@ -176,6 +177,9 @@ fn documentation_layout(ctx: &LayoutContext) -> Markup {
                 title { (ctx.title) " -- " (ctx.site_title) }
                 link rel="stylesheet" href=(format!("{}style.css", ctx.root_base_url));
                 link rel="stylesheet" href=(format!("{}theme.css", ctx.base_url));
+                @if let Some(analytics) = ctx.analytics {
+                    (analytics.markup())
+                }
             }
             body class="documentation" {
                 a class="skip-link" href="#manual-content" { "Skip to content" }
@@ -193,6 +197,7 @@ fn documentation_layout(ctx: &LayoutContext) -> Markup {
                 (build_footer(ctx.footer))
                 @for (marker, script) in [
                     ("chart-data", "chart.js"),
+                    ("stacked-area-data", "stacked-area.js"),
                     ("overlay-data", "overlay.js"),
                     ("log-data", "log-viewer.js"),
                     ("datasets", "explore.js"),
@@ -209,6 +214,9 @@ fn documentation_layout(ctx: &LayoutContext) -> Markup {
 /// Common `<head>` elements shared by all layouts.
 fn common_head(ctx: &LayoutContext) -> Markup {
     html! {
+        @if let Some(analytics) = ctx.analytics {
+            (analytics.markup())
+        }
         meta charset="utf-8";
         meta name="viewport" content="width=device-width, initial-scale=1";
         meta name="generator" content=(format!("Watertown v{}", VERSION));
@@ -253,6 +261,9 @@ fn data_layout(ctx: &LayoutContext) -> Markup {
                 (build_footer(ctx.footer))
                 script src=(format!("{}chart.js", ctx.root_base_url)) type="module" {}
                 script src=(format!("{}overlay.js", ctx.root_base_url)) type="module" {}
+                @if ctx.content.contains("class=\"stacked-area-data\"") {
+                    script src=(format!("{}stacked-area.js", ctx.root_base_url)) type="module" {}
+                }
                 script src=(format!("{}relative-time.js", ctx.root_base_url)) type="module" {}
             }
         }
@@ -463,6 +474,7 @@ mod tests {
     #[test]
     fn documentation_assets_follow_active_shortcodes_only() {
         let mut ctx = LayoutContext {
+            analytics: None,
             title: "Manual",
             site_title: "Test",
             base_url: "/watertown/",
@@ -484,11 +496,17 @@ mod tests {
         assert!(active.contains("src=\"/watertown/chart.js\""));
         assert!(!active.contains("overlay.js"));
         assert!(!active.contains("explore.js"));
+        ctx.content = "<div id=\"stacked-area\"><script class=\"stacked-area-data\" type=\"application/json\">[]</script></div>";
+        for layout in ["documentation", "data"] {
+            let active = apply_layout(layout, &ctx);
+            assert!(active.contains("src=\"/watertown/stacked-area.js\""));
+        }
     }
 
     #[test]
     fn test_default_layout() {
         let ctx = LayoutContext {
+            analytics: None,
             title: "Home",
             site_title: "Test Site",
             base_url: "/",
@@ -530,6 +548,7 @@ mod tests {
     #[test]
     fn test_data_layout_with_sidebar() {
         let ctx = LayoutContext {
+            analytics: None,
             title: "Temperature",
             site_title: "Noyo Harbor",
             base_url: "/noyo-harbor/",
@@ -563,6 +582,7 @@ mod tests {
     #[test]
     fn test_unknown_layout_falls_back_to_default() {
         let ctx = LayoutContext {
+            analytics: None,
             title: "Page",
             site_title: "Site",
             base_url: "/",
@@ -582,6 +602,7 @@ mod tests {
     #[test]
     fn test_page_layout() {
         let ctx = LayoutContext {
+            analytics: None,
             title: "Water System",
             site_title: "Caspar Water",
             base_url: "/",
@@ -610,6 +631,7 @@ mod tests {
     #[test]
     fn test_blog_layout() {
         let ctx = LayoutContext {
+            analytics: None,
             title: "My Blog Post",
             site_title: "Test Blog",
             base_url: "/",
@@ -668,6 +690,7 @@ mod tests {
     #[test]
     fn test_blog_layout_no_date() {
         let ctx = LayoutContext {
+            analytics: None,
             title: "Undated Post",
             site_title: "Blog",
             base_url: "/",
@@ -692,6 +715,7 @@ mod tests {
     #[test]
     fn test_logs_layout_uses_root_base_url() {
         let ctx = LayoutContext {
+            analytics: None,
             title: "System Logs",
             site_title: "Noyo Harbor",
             base_url: "/noyo-harbor/",
@@ -723,6 +747,7 @@ mod tests {
     #[test]
     fn test_explore_layout_loads_explore_js() {
         let ctx = LayoutContext {
+            analytics: None,
             title: "Data Explorer",
             site_title: "Noyo Harbor",
             base_url: "/noyo-harbor/",

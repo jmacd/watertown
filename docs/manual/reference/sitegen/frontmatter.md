@@ -16,6 +16,7 @@ tolerated, but unknown layouts fail strict builds.
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
+| `analytics` | boolean &#124; null | no | null | Set false to exclude this page from analytics, independently of navigation. True never enables analytics when the site or build has disabled it. |
 | `date` | string &#124; null | no | null | Publication date (ISO 8601, e.g. "2024-06-15"). |
 | `hidden` | boolean | no | false | If true, page renders but does not appear in navigation. |
 | `image` | string &#124; null | no | null | Image URL for blog card hero image. |

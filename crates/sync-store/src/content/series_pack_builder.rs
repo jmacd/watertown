@@ -890,17 +890,21 @@ fn build_table_physical_objects(
 /// with: pinned explicitly (rather than left at the `parquet` crate's own
 /// defaults) so that repacking identical input under an identical layout
 /// always reproduces bit-identical physical object bytes within one build.
-/// Compression is disabled, dictionary encoding is disabled, and the writer
-/// version and statistics level are fixed, removing every degree of
+/// Compression is disabled; dictionaries are disabled unless the schema opts
+/// into the versioned bounded UTF-8 policy. Writer version and statistics are fixed,
+/// removing every degree of
 /// freedom that could otherwise vary output bytes for identical logical
 /// content without changing the properties themselves.
-fn deterministic_writer_properties() -> WriterProperties {
-    WriterProperties::builder()
-        .set_writer_version(WriterVersion::PARQUET_1_0)
-        .set_compression(Compression::UNCOMPRESSED)
-        .set_dictionary_enabled(false)
-        .set_statistics_enabled(EnabledStatistics::Chunk)
-        .build()
+fn deterministic_writer_properties(schema: &Schema) -> Result<WriterProperties, String> {
+    utilities::parquet_policy::writer_properties(
+        schema,
+        WriterProperties::builder()
+            .set_writer_version(WriterVersion::PARQUET_1_0)
+            .set_compression(Compression::UNCOMPRESSED)
+            .set_dictionary_enabled(false)
+            .set_statistics_enabled(EnabledStatistics::Chunk),
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Encode `batches` (already the exact rows of one logical unit -- a table
@@ -925,18 +929,21 @@ pub fn encode_table_leaf_parquet(
     schema: &Arc<Schema>,
     batches: &[RecordBatch],
 ) -> Result<Vec<u8>, String> {
-    let props = deterministic_writer_properties();
+    let props = deterministic_writer_properties(schema)?;
     let mut bytes = Vec::new();
     let mut writer = ArrowWriter::try_new(&mut bytes, Arc::clone(schema), Some(props))
         .map_err(|e| format!("create parquet writer: {e}"))?;
     for batch in batches {
+        utilities::parquet_policy::validate_batch(batch).map_err(|error| error.to_string())?;
         writer
             .write(batch)
             .map_err(|e| format!("write parquet batch: {e}"))?;
     }
-    writer
+    let metadata = writer
         .close()
         .map_err(|e| format!("close parquet writer: {e}"))?;
+    utilities::parquet_policy::validate_metadata(schema, &metadata)
+        .map_err(|error| error.to_string())?;
     Ok(bytes)
 }
 

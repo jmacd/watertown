@@ -5,7 +5,7 @@
 //! Test that dynamic files (FileDynamic) served by dynamic directories
 //! can be read through external format providers (e.g., csv://).
 //!
-//! This exercises the fix in ensure_url_cached() that detects dynamic files
+//! This exercises the fix in cache_url_contents() that detects dynamic files
 //! and reads them via async_reader() instead of querying the persistence
 //! layer for version records (which don't exist for ephemeral nodes).
 

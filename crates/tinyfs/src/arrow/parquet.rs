@@ -216,13 +216,20 @@ fn serialize_batch_to_parquet(batch: &RecordBatch) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
     {
         let cursor = Cursor::new(&mut buffer);
-        let props = WriterProperties::builder().build();
+        let props = utilities::parquet_policy::writer_properties(
+            batch.schema().as_ref(),
+            WriterProperties::builder(),
+        )
+        .map_other()?;
         let mut writer = ArrowWriter::try_new(cursor, batch.schema(), Some(props))
             .map_other_context("Arrow writer error")?;
 
+        utilities::parquet_policy::validate_batch(batch).map_other()?;
         writer.write(batch).map_other_context("Write batch error")?;
 
-        let _ = writer.close().map_other_context("Close writer error")?;
+        let metadata = writer.close().map_other_context("Close writer error")?;
+        utilities::parquet_policy::validate_metadata(batch.schema().as_ref(), &metadata)
+            .map_other()?;
     }
     Ok(buffer)
 }
@@ -344,6 +351,7 @@ pub struct StreamingSeriesWriter {
     metadata: Arc<Mutex<WriterMetadata>>,
     timestamp_column: String,
     rows: u64,
+    schema: arrow_schema::SchemaRef,
 }
 
 impl StreamingSeriesWriter {
@@ -393,21 +401,25 @@ impl StreamingSeriesWriter {
         tinyfs_writer.require_temporal_metadata(timestamp_column.clone());
         let metadata = Arc::new(Mutex::new(WriterMetadata::default()));
         let proxy = MetadataWriterProxy::new(tinyfs_writer, Arc::clone(&metadata));
-        let props = WriterProperties::builder()
-            .set_max_row_group_row_count(Some(max_row_group_rows))
-            .build();
-        let writer = parquet::arrow::AsyncArrowWriter::try_new(proxy, schema, Some(props))
+        let props = utilities::parquet_policy::writer_properties(
+            &schema,
+            WriterProperties::builder().set_max_row_group_row_count(Some(max_row_group_rows)),
+        )
+        .map_other()?;
+        let writer = parquet::arrow::AsyncArrowWriter::try_new(proxy, schema.clone(), Some(props))
             .map_other_context("Arrow writer error")?;
         Ok(Self {
             writer,
             metadata,
             timestamp_column,
             rows: 0,
+            schema,
         })
     }
 
     /// Write one batch and update exact temporal metadata.
     pub async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        utilities::parquet_policy::validate_batch(batch).map_other()?;
         if batch.num_rows() == 0 {
             return Ok(());
         }
@@ -492,11 +504,13 @@ impl StreamingSeriesWriter {
             ));
         }
         let rows = self.rows;
-        _ = self
+        let parquet_metadata = self
             .writer
             .close()
             .await
             .map_other_context("Close Arrow writer error")?;
+        utilities::parquet_policy::validate_metadata(&self.schema, &parquet_metadata)
+            .map_other()?;
         let (minimum, maximum, _) = self
             .metadata
             .lock()

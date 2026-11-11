@@ -45,8 +45,9 @@ const FIXTURE_HTML = `<!DOCTYPE html>
   <div id="single" style="width:600px"></div>
   <div id="multi" style="width:600px"></div>
   <div id="dotted" style="width:600px"></div>
+  <div id="daily" style="width:600px"></div>
   <script type="module">
-    import { loadVega, buildLineSpec, sanitizeRows } from "${BASE_PATH}vega-shared.js";
+    import { loadVega, buildLineSpec, sanitizeRows, buildDailyStackedAreaSpec } from "${BASE_PATH}vega-shared.js";
 
     async function render(targetId, fields, rows) {
       const built = buildLineSpec(fields, rows, { height: 240 });
@@ -95,6 +96,18 @@ const FIXTURE_HTML = `<!DOCTYPE html>
       }));
       await render("dotted", dottedFields, dottedRows);
 
+      const day = 86400000;
+      const daily = buildDailyStackedAreaSpec([
+        { timestamp: t0, series: "Blog", value: 2 },
+        { timestamp: t0, series: "Monitoring", value: 3 },
+        { timestamp: t0 + day, series: "Blog", value: 4 },
+        { timestamp: t0 + 3 * day, series: "Monitoring", value: 7 },
+      ], { days: 4, now: t0 + 3 * day + hour, order: ["Blog", "Monitoring"] });
+      const embed = await loadVega();
+      const { view } = await embed(document.getElementById("daily"), daily.spec, {
+        actions: false, renderer: "svg",
+      });
+      window.__dailyView = view;
       window.__vegaReady = true;
     })().catch((e) => {
       window.__vegaError = String((e && e.message) || e);
@@ -180,6 +193,32 @@ try {
     return withGeometry;
   });
   check(dottedPaths > 0, `dotted-column spec drew line geometry (${dottedPaths})`);
+
+  const daily = await tab.evaluate(() => {
+    const paths = [...document.querySelectorAll("#daily svg g.mark-area path")];
+    const width = window.__dailyView.width();
+    const boxes = paths.map((path) => {
+      const box = path.getBBox();
+      return { x: box.x, end: box.x + box.width, height: box.height };
+    });
+    const stacked = [];
+    function visit(item) {
+      if (item.datum?.series && Number.isFinite(item.datum.upper)) stacked.push(item.datum);
+      for (const child of item.items || []) visit(child);
+    }
+    visit(window.__dailyView.scenegraph().root);
+    return {
+      boxes, width,
+      axis: document.querySelector("#daily svg").textContent.includes("UTC day"),
+      totals: ["2026-01-01", "2026-01-02", "2026-01-04"].map((day) =>
+        Math.max(...stacked.filter((row) => row.day === day).map((row) => row.upper))),
+    };
+  });
+  check(daily.axis, "stacked area labels the UTC axis");
+  check(JSON.stringify(daily.totals) === "[5,4,7]", `Vega stacks actual daily totals (${daily.totals})`);
+  check(daily.boxes.filter((box) => box.height > 0).length >= 3, "stacked area draws both runs, including an isolated day");
+  check(daily.boxes.every((box) => box.end <= daily.width / 2 + 0.1 || box.x >= daily.width * 3 / 4 - 0.1),
+    "no area polygon bridges the missing UTC day");
 
   await tab.close();
 } finally {

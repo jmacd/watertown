@@ -264,7 +264,7 @@ fn scan_temporal_bounds(content: &[u8], field: &str, unit: TimestampUnit) -> Opt
 /// Fold every value stored under `field`, at any depth of `value`, into `acc`
 /// as a running (min, max).
 ///
-/// Returns false if a value under that key is not an integer, which drops the
+/// Returns false if a value under that key is not a usable number, which drops the
 /// line from the scan -- see `scan_temporal_bounds` for why that is preferred
 /// to guessing.
 fn fold_timestamps(value: &Value, field: &str, acc: &mut Option<(i64, i64)>) -> bool {
@@ -274,16 +274,12 @@ fn fold_timestamps(value: &Value, field: &str, acc: &mut Option<(i64, i64)>) -> 
                 if key == field {
                     // OTLP writes 64-bit times as JSON strings; journald and
                     // plain numeric logs write them as numbers.
-                    let Some(ts) = (match child {
-                        Value::String(s) => s.parse::<i64>().ok(),
-                        Value::Number(n) => n.as_i64(),
-                        _ => None,
-                    }) else {
+                    let Some((lower, upper)) = timestamp_bounds(child) else {
                         return false;
                     };
                     *acc = Some(match *acc {
-                        Some((lo, hi)) => (lo.min(ts), hi.max(ts)),
-                        None => (ts, ts),
+                        Some((lo, hi)) => (lo.min(lower), hi.max(upper)),
+                        None => (lower, upper),
                     });
                 } else if !fold_timestamps(child, field, acc) {
                     return false;
@@ -294,6 +290,32 @@ fn fold_timestamps(value: &Value, field: &str, acc: &mut Option<(i64, i64)>) -> 
         Value::Array(items) => items.iter().all(|v| fold_timestamps(v, field, acc)),
         _ => true,
     }
+}
+
+fn timestamp_bounds(value: &Value) -> Option<(i64, i64)> {
+    let integer = match value {
+        Value::String(s) => s.parse::<i64>().ok(),
+        Value::Number(n) => n.as_i64(),
+        _ => None,
+    };
+    if let Some(integer) = integer {
+        return Some((integer, integer));
+    }
+
+    let fractional = match value {
+        Value::String(s) => s.parse::<f64>().ok()?,
+        Value::Number(n) => n.as_f64()?,
+        _ => return None,
+    };
+    // Allow for floating-point rounding before bounding in whole input units.
+    // Integer timestamps above bypass floating point entirely.
+    let lower = fractional.next_down().floor();
+    let upper = fractional.next_up().ceil();
+    // i64::MAX rounds to 2^63 as f64, so that endpoint must be excluded.
+    if !fractional.is_finite() || lower < i64::MIN as f64 || upper >= i64::MAX as f64 {
+        return None;
+    }
+    Some((lower as i64, upper as i64))
 }
 
 /// The portion of `slice` that should be stored now.
@@ -1411,6 +1433,76 @@ mod tests {
     }
 
     #[test]
+    fn fractional_timestamps_bound_whole_input_units() {
+        for value in ["1700000000.789", "\"1700000000.789\"", "1.700000000789e9"] {
+            let content = format!(r#"{{"ts":{value}}}"#);
+            assert_eq!(
+                scan_temporal_bounds(content.as_bytes(), "ts", TimestampUnit::Seconds),
+                Some((1_700_000_000_000_000, 1_700_000_001_000_000))
+            );
+        }
+        for (unit, expected) in [
+            (TimestampUnit::Seconds, (-1_000_000, 0)),
+            (TimestampUnit::Milliseconds, (-1_000, 0)),
+            (TimestampUnit::Microseconds, (-1, 0)),
+            (TimestampUnit::Nanoseconds, (-1, 0)),
+        ] {
+            assert_eq!(
+                scan_temporal_bounds(br#"{"ts":-0.25}"#, "ts", unit),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_integer_and_fractional_timestamps_span_day_boundary() {
+        let content = b"{\"ts\":86399.75}\n{\"ts\":86400}\n{\"ts\":\"86400.25\"}\n";
+        assert_eq!(
+            scan_temporal_bounds(content, "ts", TimestampUnit::Seconds),
+            Some((86_399_000_000, 86_401_000_000))
+        );
+        assert_eq!(
+            scan_temporal_bounds(
+                br#"{"ts":"86399.999999999999"}"#,
+                "ts",
+                TimestampUnit::Seconds
+            ),
+            Some((86_399_000_000, 86_401_000_000))
+        );
+    }
+
+    #[test]
+    fn fractional_timestamp_bounds_reject_nonfinite_and_overflow() {
+        for value in [
+            "\"NaN\"",
+            "\"inf\"",
+            "\"-inf\"",
+            "\"1e400\"",
+            "9.223372036854776e18",
+            "-9.223372036854778e18",
+        ] {
+            let content = format!(r#"{{"ts":{value}}}"#);
+            assert_eq!(
+                scan_temporal_bounds(content.as_bytes(), "ts", TimestampUnit::Microseconds),
+                None
+            );
+        }
+        assert_eq!(
+            scan_temporal_bounds(br#"{"ts":1e13}"#, "ts", TimestampUnit::Seconds),
+            None
+        );
+        for integer in [i64::MIN, i64::MAX] {
+            for value in [integer.to_string(), format!("\"{integer}\"")] {
+                let content = format!(r#"{{"ts":{value}}}"#);
+                assert_eq!(
+                    scan_temporal_bounds(content.as_bytes(), "ts", TimestampUnit::Microseconds),
+                    Some((integer, integer))
+                );
+            }
+        }
+    }
+
+    #[test]
     fn bounds_span_every_line_and_every_point() {
         let content = format!(
             "{}\n{}\n",
@@ -1480,7 +1572,7 @@ mod tests {
     }
 
     #[test]
-    fn a_non_integer_timestamp_drops_the_line() {
+    fn a_nonnumeric_timestamp_drops_the_line() {
         let content =
             r#"{"resourceMetrics":[{"gauge":{"dataPoints":[{"timeUnixNano":"not-a-number"}]}}]}"#;
         assert_eq!(

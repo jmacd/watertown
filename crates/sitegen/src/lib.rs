@@ -13,6 +13,7 @@
 //! pond run /etc/site.yaml build ./dist
 //! ```
 
+mod analytics;
 mod config;
 mod documentation;
 mod email;
