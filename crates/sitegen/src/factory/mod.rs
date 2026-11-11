@@ -213,7 +213,7 @@ async fn execute(
             }
 
             registry.finish().map_err(tinyfs::Error::Other)?;
-            validate_local_image_references(&output_path, &root_base_url)?;
+            check_generated_html(&output_path, &root_base_url, quick)?;
             if config.strict {
                 documentation::validate_output(&output_path, &root_base_url)
                     .map_err(tinyfs::Error::Other)?;
@@ -1950,12 +1950,12 @@ fn copy_static_assets(
     Ok(())
 }
 
-/// Fail the build when generated HTML references a local image that was not
-/// emitted. Validation runs after all sites and assets are written so it covers
-/// shortcodes, Markdown images, raw HTML, frontmatter hero images, and subsites.
-fn validate_local_image_references(
+/// Check output HTML after all sites and assets are written. Missing local
+/// images fail the build; retained analytics only warn in quick mode.
+fn check_generated_html(
     output_root: &Path,
     base_url: &str,
+    quick: bool,
 ) -> Result<(), tinyfs::Error> {
     let image_src = regex::Regex::new(r#"(?is)<img\b[^>]*?\s+src\s*=\s*["']([^"']+)["']"#).unwrap();
     let mut html_files = Vec::new();
@@ -1966,6 +1966,12 @@ fn validate_local_image_references(
     for html_path in html_files {
         let html = std::fs::read_to_string(&html_path)
             .map_other_context(format!("read generated HTML {:?}", html_path))?;
+        if quick && html.contains(r#"data-watertown-analytics="1""#) {
+            warn!(
+                "Quick build retained analytics instrumentation in {}. Use a fresh output directory for an analytics-free preview.",
+                html_path.display()
+            );
+        }
         for captures in image_src.captures_iter(&html) {
             let src = captures.get(1).unwrap().as_str();
             if is_nonlocal_image_source(src) {
@@ -3006,7 +3012,7 @@ mod tests {
         )
         .unwrap();
 
-        validate_local_image_references(output.path(), "/staging/").unwrap();
+        check_generated_html(output.path(), "/staging/", false).unwrap();
     }
 
     #[test]
@@ -3018,7 +3024,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = validate_local_image_references(output.path(), "/")
+        let error = check_generated_html(output.path(), "/", false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("Generated site contains missing local images"));
@@ -3035,7 +3041,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = validate_local_image_references(output.path(), "/")
+        let error = check_generated_html(output.path(), "/", false)
             .unwrap_err()
             .to_string();
         assert!(error.contains(r#"blog/index.html: img src="../../outside.png""#));

@@ -112,10 +112,11 @@ Copied standalone HTML assets must be explicitly excluded or converted to
 layout-rendered pages; they are never silently counted as instrumented.
 
 Documentation configurations remain off unless explicitly enabled. `build
---no-analytics` suppresses instrumentation for the whole tree even when sites
-opt in; `--quick` always suppresses it.
-Use this for previews. These controls
-do not disable unrelated chart or page scripts.
+--no-analytics` suppresses instrumentation on rendered pages, including independent
+subsites; `--quick` also suppresses it on pages it renders. Quick builds leave
+skipped pages untouched in reused output directories and warn if output HTML
+still contains Sitegen's analytics tag. Use a fresh output directory for an
+analytics-free preview. These controls do not disable unrelated chart or page scripts.
 
 ### Analytics publication boundary
 
