@@ -23,6 +23,11 @@ Install with `pond mknod temporal-reduce /derived/reduced --config-path reduce.y
 
 Incremental caches use source versions and event-time metadata. Missing bounds can force full-history invalidation. Late backfill unseals and recomputes affected segments rather than silently dropping data.
 
+For format-backed inputs such as `csv://` and `jsonlogs://`, replacement files
+(`FilePhysicalVersion`) contribute only their current content. Replacing a file
+invalidates its previous aggregates; stored revisions are not extra observations.
+Append-only file series continue to contribute all live chunks.
+
 ### Grouping dimensions
 
 Set `group_by: [site_id, page_uri]` to produce one row per time bucket and

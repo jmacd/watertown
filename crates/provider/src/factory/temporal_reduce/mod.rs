@@ -1178,7 +1178,7 @@ impl TemporalReduceSqlFile {
         let merged_dir =
             crate::partial_aggregate_cache::merged_dir(&cache_dir, &cfg_hash, &site_node_id);
 
-        // Collect every source node's LIVE versions, plus the content identity
+        // Collect every source node's query-selected live versions, plus the content identity
         // of the set: blake3 -> event-time range. That map is the freshness key
         // (design §5.3); nothing here is keyed by a version number or filename.
         let mut source_nodes: Vec<(tinyfs::NodeID, Vec<tinyfs::FileVersionInfo>)> =
@@ -1278,7 +1278,7 @@ impl TemporalReduceSqlFile {
 
                 let (source_node_id, versions) = match format_provider.as_ref() {
                     Some(fp) => provider_api
-                        .ensure_url_cached(&file_url, fp.as_ref(), &cache_dir)
+                        .cache_url_contents(&file_url, fp.as_ref(), &cache_dir)
                         .await
                         .map_other()?,
                     // Pond-native Parquet: the node's own version files are already
@@ -1289,21 +1289,10 @@ impl TemporalReduceSqlFile {
                         .map_other()?,
                 };
 
-                // The rollup sums every live version of a source. Series entry types
-                // (FilePhysicalSeries, TablePhysicalSeries) store append-only deltas
-                // that are concatenated on read, so their versions are disjoint and
-                // summing them is exactly a single-pass GROUP BY over the whole
-                // series. A non-series file stores a full RE-SNAPSHOT per version,
-                // so two live versions share rows and summing them double-counts.
-                //
-                // This used to be defended by a per-source "sequentiality frontier":
-                // scan each new version's bucket span, persist the high-water mark,
-                // and fail if a later version reached below it. That is a
-                // data-dependent test for a condition fixed by the entry type -- and
-                // for a re-snapshot it fires on the second version regardless, since
-                // every snapshot re-covers all of history. Testing the structure
-                // says the same thing without the scan, the sidecar file, or the
-                // chance of a stale frontier disagreeing with the data.
+                // Series versions are disjoint chunks. Non-series sources must
+                // select one revision, not merge replacement history. Format-backed
+                // files were narrowed to current contents above; keep the guard
+                // for other sources still exposing multiple non-series versions.
                 let is_series = matches!(
                     node_path.id().entry_type(),
                     EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries
@@ -1311,7 +1300,7 @@ impl TemporalReduceSqlFile {
                 if !is_series && versions.len() > 1 {
                     return Err(tinyfs::Error::Other(format!(
                         "temporal-reduce rollup: source '{}' is a non-series file with \
-                     {} live versions. Each version is a full re-snapshot, so they \
+                     {} selected versions. Each version is a full re-snapshot, so they \
                      overlap and cannot be aggregated together without \
                      double-counting. Use a series entry type for incrementally \
                      appended data, or reduce a single-version source.",
@@ -4288,16 +4277,16 @@ fn bounded_source_set(
 
 /// Reject a source set that does not cover every live version it will claim.
 ///
-/// The build that follows records `now` -- the digest of every LIVE source
-/// version -- as the coverage of what it wrote. A live version whose sidecar
+/// The build that follows records `now` -- the digest of every selected source
+/// version -- as the coverage of what it wrote. A selected version whose sidecar
 /// vanished contributes no rows, so the manifest would assert coverage the
 /// cache does not have. That undercount then agrees with itself forever: the
 /// next build compares `sources == now`, finds them equal, reuses, and never
 /// recomputes. Failing here is what keeps a lost race from becoming permanent
 /// wrong output; the retry re-caches the version and succeeds.
 ///
-/// It is a race, not a data error. `ensure_url_cached` writes a sidecar for
-/// every live version before this point, so a single build cannot reach this by
+/// It is a race, not a data error. `cache_url_contents` writes a sidecar for
+/// every selected version before this point, so a single build cannot reach this by
 /// itself -- only a concurrent reconciler deleting a sidecar this reader still
 /// considers live can, and neither side takes a lock.
 ///
@@ -6721,107 +6710,113 @@ output_aliases:
         assert_eq!(ok.first().copied(), Some(Duration::from_secs(3600)));
     }
 
-    /// A non-series source with more than one live version is a hard error
-    /// rather than a silent double-count: each version is a full re-snapshot, so
-    /// summing them counts the overlapping rows twice. A single CSV is written
-    /// twice; the second version is a full rewrite that also prepends a day.
-    ///
-    /// This used to be phrased as a *sequentiality* check -- scan each version's
-    /// bucket span and fail if it reached below a persisted frontier -- which
-    /// tested the data for a property fixed by the entry type, and needed a
-    /// sidecar file to remember. The structural test reports the same case, and
-    /// reports it before reading a single row.
     #[tokio::test]
-    async fn test_rollup_rejects_multi_version_non_series_source() {
-        let _ = env_logger::try_init();
+    async fn test_rollup_replacement_invalidates_cached_aggregates() {
+        use crate::factory::test_support::create_file_with_type;
+        use arrow::array::Int64Array;
+        use tinyfs::QueryableFile;
 
         let persistence = tinyfs::MemoryPersistence::default();
-        let fs = tinyfs::FS::new(persistence.clone())
-            .await
-            .expect("create FS");
+        let fs = tinyfs::FS::new(persistence.clone()).await.unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut config = cfg_with_aggs(vec![
+            agg(AggregationType::Count, &["*"]),
+            agg(AggregationType::Sum, &["temperature"]),
+        ]);
+        config.in_pattern = crate::Url::parse("csv:///readings.csv").unwrap();
+        config.allowed_lateness = Some("0s".into());
+        config.output_aliases = Some(HashMap::from([
+            ("timestamp.count".into(), "views".into()),
+            ("temperature.sum".into(), "total".into()),
+        ]));
 
-        async fn write_csv(root: &tinyfs::WD, path: &str, days: std::ops::Range<u32>) {
-            use tokio::io::AsyncWriteExt;
-            let mut csv_data = String::from("timestamp,temperature\n");
-            for day in days {
-                for hour in 0..24u32 {
-                    let ts = format!("1970-01-{:02}T{:02}:00:00", day, hour);
-                    let temp = 20.5 + hour as f64;
-                    csv_data.push_str(&format!("{},{}\n", ts, temp));
-                }
+        async fn reduce(
+            persistence: tinyfs::MemoryPersistence,
+            config: &TemporalReduceConfig,
+            cache_dir: Option<&std::path::Path>,
+        ) -> Vec<(i64, i64, f64)> {
+            let session = Arc::new(datafusion::prelude::SessionContext::new());
+            _ = crate::register_tinyfs_object_store(&session, persistence.clone()).unwrap();
+            let mut context = crate::ProviderContext::new(session.clone(), Arc::new(persistence));
+            if let Some(cache_dir) = cache_dir {
+                context = context.with_cache_dir(cache_dir.to_path_buf());
             }
-            let mut w = root
-                .async_writer_path_with_type(path, EntryType::FilePhysicalVersion)
+            let file = TemporalReduceSqlFile::new_direct(
+                config.clone(),
+                Duration::from_secs(86400),
+                config.in_pattern.path().to_owned(),
+                config.in_pattern.to_string(),
+                test_context(&context, FileID::root()),
+            );
+            let table = file
+                .as_table_provider(FileID::root(), &context)
                 .await
                 .unwrap();
-            w.write_all(csv_data.as_bytes()).await.unwrap();
-            w.flush().await.unwrap();
-            w.shutdown().await.unwrap();
+            _ = session.register_table("reduced", table).unwrap();
+            let batches = session
+                .sql(
+                    "SELECT CAST(date_part('epoch', timestamp) AS BIGINT) AS t, views, total \
+                     FROM reduced ORDER BY t",
+                )
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let mut rows = Vec::new();
+            for batch in batches {
+                let timestamps = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let counts = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let sums = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap();
+                for row in 0..batch.num_rows() {
+                    rows.push((timestamps.value(row), counts.value(row), sums.value(row)));
+                }
+            }
+            rows
         }
 
-        {
-            let root = fs.root().await.unwrap();
-            _ = root.create_dir_path("/ingest").await.unwrap();
-            // Version 1: day 2 only.
-            write_csv(&root, "/ingest/weather.csv", 2..3).await;
-            // Version 2: full rewrite that prepends day 1, backfilling a sealed
-            // bucket below the version-1 frontier.
-            write_csv(&root, "/ingest/weather.csv", 1..3).await;
+        for (contents, expected) in [
+            (
+                "1970-01-02T00:00:00,10.0\n1970-01-02T01:00:00,20.0\n1970-01-05T00:00:00,50.0\n",
+                vec![(86400, 2, 30.0), (345600, 1, 50.0)],
+            ),
+            (
+                "1970-01-01T00:00:00,7.0\n1970-01-02T00:00:00,11.0\n1970-01-07T00:00:00,70.0\n",
+                vec![(0, 1, 7.0), (86400, 1, 11.0), (518400, 1, 70.0)],
+            ),
+            ("1970-01-02T00:00:00,3.0\n", vec![(86400, 1, 3.0)]),
+        ] {
+            _ = create_file_with_type(
+                &fs,
+                "/readings.csv",
+                format!("timestamp,temperature\n{contents}").into_bytes(),
+                EntryType::FilePhysicalVersion,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                reduce(persistence.clone(), &config, Some(cache.path())).await,
+                expected,
+                "replacement must invalidate corrected, removed, and backfilled buckets"
+            );
+            assert_eq!(
+                reduce(persistence.clone(), &config, None).await,
+                expected,
+                "cache availability must not change query membership"
+            );
         }
-
-        let config = TemporalReduceConfig {
-            in_pattern: crate::Url::parse("csv:///ingest/weather.csv").unwrap(),
-            out_pattern: "weather".to_string(),
-            time_column: "timestamp".to_string(),
-            group_by: Vec::new(),
-            resolutions: vec!["1d".to_string()],
-            aggregations: vec![agg(AggregationType::Avg, &["temperature"])],
-            output_aliases: None,
-            transforms: None,
-            allowed_lateness: None,
-            // Seal on every advance, as before the size gate existed: these
-            // tests assert seal MECHANICS on datasets far under any real target.
-            seal_target_bytes: Some(0),
-            max_live_segments: None,
-        };
-
-        let tmp = tempfile::tempdir().unwrap();
-        let cache_dir = tmp.path().to_path_buf();
-
-        let session = Arc::new(datafusion::prelude::SessionContext::new());
-        let _ = crate::register_tinyfs_object_store(&session, persistence.clone())
-            .expect("register object store");
-        let provider_context = crate::ProviderContext::new(session, Arc::new(persistence.clone()))
-            .with_cache_dir(cache_dir.clone());
-
-        let context = test_context(&provider_context, FileID::root());
-        let temporal_dir = TemporalReduceDirectory::new(config, context).unwrap();
-        let temporal_handle = temporal_dir.create_handle();
-
-        let weather_node = temporal_handle.get("weather").await.unwrap().unwrap();
-        let NodeType::Directory(weather_dir) = &weather_node.node_type else {
-            panic!("expected directory");
-        };
-        let daily_node = weather_dir.get("res=1d.series").await.unwrap().unwrap();
-        let file_id = daily_node.id;
-        let NodeType::File(file_handle) = &daily_node.node_type else {
-            panic!("expected file node");
-        };
-        let file_arc = file_handle.get_file().await;
-        let file_guard = file_arc.lock().await;
-        let queryable = file_guard.as_queryable().expect("queryable");
-
-        let result = queryable
-            .as_table_provider(file_id, &provider_context)
-            .await;
-
-        let err = result.expect_err("overlapping re-snapshots must be a hard error");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("non-series") && msg.contains("double-counting"),
-            "error must name the overlap and why it is refused, got: {}",
-            msg
-        );
     }
 
     /// A FilePhysicalSeries source appends disjoint deltas, so a later version
@@ -7596,7 +7591,7 @@ output_aliases:
     /// live version's sidecar.
     ///
     /// The condition is a lost race with cache reconciliation, so a single build
-    /// cannot produce it: `ensure_url_cached` writes a sidecar for every live
+    /// cannot produce it: `cache_url_contents` writes a sidecar for every selected
     /// version before the read. That unreachability is why this is tested at the
     /// check rather than through a build -- the alternative is no coverage at
     /// all for a guard whose whole value is preventing a permanent undercount.

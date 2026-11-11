@@ -487,7 +487,7 @@ impl Provider {
     ) -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
         let scheme = url.scheme();
         let (node_id, versions) = self
-            .ensure_url_query_cached(url, format_provider, cache_dir)
+            .cache_url_contents(url, format_provider, cache_dir)
             .await?;
 
         // Bounds prune the query's selected versions, not the file's history.
@@ -517,11 +517,9 @@ impl Provider {
     /// The live versions of the node a URL names, WITHOUT touching the format
     /// cache.
     ///
-    /// This is the builtin-scheme counterpart of [`Self::ensure_url_cached`].
     /// A pond-native Parquet node (`series:///`, `table:///`) is already
     /// columnar, so there is no parse to memoize -- the format cache would only
-    /// re-encode the same rows. What a caller actually needs from
-    /// `ensure_url_cached` is the version list, which this returns directly.
+    /// re-encode the same rows. These callers only need the version list.
     pub(crate) async fn list_url_versions(
         &self,
         url: &Url,
@@ -576,7 +574,8 @@ impl Provider {
     }
 
     /// Cache all live versions for callers explicitly inspecting version history.
-    pub(crate) async fn ensure_url_cached(
+    #[cfg(test)]
+    pub(crate) async fn cache_url_all_live_versions(
         &self,
         url: &Url,
         format_provider: &dyn FormatProvider,
@@ -586,10 +585,10 @@ impl Provider {
             .await
     }
 
-    /// Cache and return the versions exposed by an ordinary format query.
+    /// Cache and return the versions comprising the node's logical current contents.
     /// FilePhysicalVersion contributes only its current content; series
     /// contribute all live chunks. Historical cache entries remain available.
-    pub(crate) async fn ensure_url_query_cached(
+    pub(crate) async fn cache_url_contents(
         &self,
         url: &Url,
         format_provider: &dyn FormatProvider,
@@ -604,7 +603,7 @@ impl Provider {
         url: &Url,
         format_provider: &dyn FormatProvider,
         cache_dir: &std::path::Path,
-        for_query: bool,
+        current_contents_only: bool,
     ) -> Result<(tinyfs::NodeID, Vec<tinyfs::FileVersionInfo>)> {
         let scheme = url.scheme();
         let path = url.path();
@@ -705,7 +704,7 @@ impl Provider {
         let mut uncached =
             crate::format_cache::reconcile_cached_versions(cache_dir, scheme, &node_id, &versions)?;
 
-        if for_query && file_id.entry_type() == tinyfs::EntryType::FilePhysicalVersion {
+        if current_contents_only && file_id.entry_type() == tinyfs::EntryType::FilePhysicalVersion {
             retain_file_query_versions(file_id, &mut versions);
             uncached.retain(|version| versions.iter().any(|v| v.version == version.version));
         }
@@ -835,7 +834,7 @@ impl Provider {
                 let file_url = url.with_path(&node_path.path().to_string_lossy());
 
                 nodes.push(
-                    self.ensure_url_query_cached(&file_url, format_provider.as_ref(), cache_dir)
+                    self.cache_url_contents(&file_url, format_provider.as_ref(), cache_dir)
                         .await?,
                 );
             }
@@ -983,7 +982,7 @@ impl Provider {
                     else {
                         return Ok(None);
                     };
-                    self.ensure_url_query_cached(&matched_url, format_provider.as_ref(), cache_dir)
+                    self.cache_url_contents(&matched_url, format_provider.as_ref(), cache_dir)
                         .await?
                 } else {
                     self.list_url_versions(&matched_url).await?
@@ -1198,7 +1197,7 @@ mod tests {
                 "selecting current content must not delete cached history"
             );
             let (_, history) = cached
-                .ensure_url_cached(
+                .cache_url_all_live_versions(
                     &Url::parse(url).unwrap(),
                     FormatRegistry::get_provider("jsonlogs").unwrap().as_ref(),
                     cache.path(),

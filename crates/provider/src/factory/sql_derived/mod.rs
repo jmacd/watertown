@@ -1011,7 +1011,7 @@ impl SqlDerivedFile {
 
                     nodes.push(
                         provider_api
-                            .ensure_url_query_cached(&file_url, format_provider.as_ref(), cache_dir)
+                            .cache_url_contents(&file_url, format_provider.as_ref(), cache_dir)
                             .await
                             .map_other()?,
                     );
