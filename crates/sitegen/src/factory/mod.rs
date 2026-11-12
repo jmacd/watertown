@@ -2637,6 +2637,7 @@ fn generate_site(
                 title: &title,
                 site_title: &config.site.title,
                 base_url: &config.site.base_url,
+                home_url: config.site.home_url.as_deref(),
                 root_base_url,
                 content: &content_html,
                 sidebar: sidebar_html.as_deref(),
@@ -3503,6 +3504,7 @@ mod tests {
 site:
   title: Test
   base_url: /noyo-harbor/
+  home_url: /
 analytics:
   enabled: true
   site_id: noyo
@@ -3625,6 +3627,11 @@ labels:
             assert_eq!(html.matches("data-watertown-analytics=").count(), 1);
             assert!(html.contains("data-endpoint=\"/_analytics/view\""));
             assert!(html.contains("src=\"/noyo-harbor/_analytics/view-"));
+        }
+        for path in ["water.html", "sites/BDock.html"] {
+            let html = std::fs::read_to_string(output.path().join(path)).unwrap();
+            assert!(html.contains(r#"class="top-bar-back" href="/""#));
+            assert!(html.contains(r#"href="/noyo-harbor/theme.css""#));
         }
         let home = std::fs::read_to_string(output.path().join("index.html")).unwrap();
         assert!(home.contains("<div id=\"passthrough\">Raw HTML</div>"));
@@ -3861,6 +3868,7 @@ routes:
             site: SiteMeta {
                 title: "Test Blog".to_string(),
                 base_url: "/".to_string(),
+                home_url: None,
                 site_url: Some("https://example.com".to_string()),
                 github_url: None,
                 default_range: None,
@@ -3994,6 +4002,7 @@ routes:
             site: SiteMeta {
                 title: "Test".to_string(),
                 base_url: "/".to_string(),
+                home_url: None,
                 site_url: None,
                 github_url: None,
                 default_range: None,

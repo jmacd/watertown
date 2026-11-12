@@ -118,6 +118,8 @@ pub struct LayoutContext<'a> {
     pub site_title: &'a str,
     /// Base URL path prefix (from site.yaml, e.g. "/" or "/noyo-harbor/")
     pub base_url: &'a str,
+    /// Optional Home destination, independent of the publishing mount.
+    pub home_url: Option<&'a str>,
     /// Root base URL for shared assets (style.css, chart.js, vendor/).
     /// For standalone sites this equals base_url. For subsites this is
     /// the top-level site's base_url.
@@ -188,7 +190,7 @@ fn documentation_layout(ctx: &LayoutContext) -> Markup {
                     script { (PreEscaped(include_str!("../assets/manual-navigation.js"))) }
                 }
                 main id="manual-content" class="content-page" tabindex="-1" {
-                    (top_bar(Some("Manual home"), Some(ctx.base_url), None, ctx.github_url))
+                    (top_bar(Some("Manual home"), Some(ctx.home_url.unwrap_or(ctx.base_url)), None, ctx.github_url))
                     article class="manual-article" { (PreEscaped(ctx.content)) }
                     footer {
                         small { "Development manual | Watertown v" (VERSION) " | renderer build " (GIT_SHA) }
@@ -251,7 +253,7 @@ fn data_layout(ctx: &LayoutContext) -> Markup {
                     }
                 }
                 main class="content-page" {
-                    (top_bar(Some("Home"), Some(ctx.base_url), ctx.feed_url, ctx.github_url))
+                    (top_bar(Some("Home"), Some(ctx.home_url.unwrap_or(ctx.base_url)), ctx.feed_url, ctx.github_url))
                     article class="blog-post" {
                         div class="blog-post-content" {
                             (PreEscaped(ctx.content))
@@ -289,7 +291,7 @@ fn logs_layout(ctx: &LayoutContext) -> Markup {
                     }
                 }
                 main class="content-page" {
-                    (top_bar(Some("Home"), Some(ctx.base_url), ctx.feed_url, ctx.github_url))
+                    (top_bar(Some("Home"), Some(ctx.home_url.unwrap_or(ctx.base_url)), ctx.feed_url, ctx.github_url))
                     article class="blog-post" {
                         div class="blog-post-content" {
                             (PreEscaped(ctx.content))
@@ -323,7 +325,7 @@ fn explore_layout(ctx: &LayoutContext) -> Markup {
                     }
                 }
                 main class="content-page" {
-                    (top_bar(Some("Home"), Some(ctx.base_url), ctx.feed_url, ctx.github_url))
+                    (top_bar(Some("Home"), Some(ctx.home_url.unwrap_or(ctx.base_url)), ctx.feed_url, ctx.github_url))
                     article class="blog-post" {
                         div class="blog-post-content" {
                             (PreEscaped(ctx.content))
@@ -356,7 +358,7 @@ fn page_layout(ctx: &LayoutContext) -> Markup {
                     }
                 }
                 main class="content-page" {
-                    (top_bar(Some("Home"), Some(ctx.base_url), ctx.feed_url, ctx.github_url))
+                    (top_bar(Some("Home"), Some(ctx.home_url.unwrap_or(ctx.base_url)), ctx.feed_url, ctx.github_url))
                     article class="blog-post" {
                         div class="blog-post-content" {
                             (PreEscaped(ctx.content))
@@ -478,6 +480,7 @@ mod tests {
             title: "Manual",
             site_title: "Test",
             base_url: "/watertown/",
+            home_url: None,
             root_base_url: "/watertown/",
             content: "<pre>&lt;script class=&quot;chart-data&quot;&gt;</pre>",
             sidebar: Some("<a href=\"/watertown/index.html\">Home</a>"),
@@ -510,6 +513,7 @@ mod tests {
             title: "Home",
             site_title: "Test Site",
             base_url: "/",
+            home_url: None,
             root_base_url: "/",
             content: "<h1>Hello</h1>",
             sidebar: None,
@@ -547,11 +551,12 @@ mod tests {
 
     #[test]
     fn test_data_layout_with_sidebar() {
-        let ctx = LayoutContext {
+        let mut ctx = LayoutContext {
             analytics: None,
             title: "Temperature",
             site_title: "Noyo Harbor",
             base_url: "/noyo-harbor/",
+            home_url: None,
             root_base_url: "/",
             content: "<p>Chart here</p>",
             sidebar: Some("<ul><li>Nav</li></ul>"),
@@ -577,6 +582,19 @@ mod tests {
             !html.contains("github.com"),
             "No GitHub link when url is None"
         );
+        assert!(html.contains(r#"class="top-bar-back" href="/noyo-harbor/""#));
+        ctx.home_url = Some("/");
+        for layout in ["data", "page", "logs", "explore", "documentation"] {
+            let html = apply_layout(layout, &ctx);
+            assert!(
+                html.contains(r#"class="top-bar-back" href="/""#),
+                "{layout}"
+            );
+            assert!(
+                html.contains(r#"href="/noyo-harbor/theme.css""#),
+                "{layout}"
+            );
+        }
     }
 
     #[test]
@@ -586,6 +604,7 @@ mod tests {
             title: "Page",
             site_title: "Site",
             base_url: "/",
+            home_url: None,
             root_base_url: "/",
             content: "<p>Content</p>",
             sidebar: None,
@@ -606,6 +625,7 @@ mod tests {
             title: "Water System",
             site_title: "Caspar Water",
             base_url: "/",
+            home_url: None,
             root_base_url: "/",
             content: "<h1>Water</h1><p>Info</p>",
             sidebar: Some("<ul><li>Nav</li></ul>"),
@@ -635,6 +655,7 @@ mod tests {
             title: "My Blog Post",
             site_title: "Test Blog",
             base_url: "/",
+            home_url: None,
             root_base_url: "/",
             content: "<p>Post content here</p>",
             sidebar: Some("<ul><li>Nav</li></ul>"),
@@ -694,6 +715,7 @@ mod tests {
             title: "Undated Post",
             site_title: "Blog",
             base_url: "/",
+            home_url: None,
             root_base_url: "/",
             content: "<p>No date</p>",
             sidebar: None,
@@ -719,6 +741,7 @@ mod tests {
             title: "System Logs",
             site_title: "Noyo Harbor",
             base_url: "/noyo-harbor/",
+            home_url: None,
             root_base_url: "/",
             content: "<div id=\"log-viewer\"></div>",
             sidebar: Some("<ul><li>Nav</li></ul>"),
@@ -751,6 +774,7 @@ mod tests {
             title: "Data Explorer",
             site_title: "Noyo Harbor",
             base_url: "/noyo-harbor/",
+            home_url: None,
             root_base_url: "/",
             content: "<div id=\"explore\"></div>",
             sidebar: Some("<ul><li>Nav</li></ul>"),

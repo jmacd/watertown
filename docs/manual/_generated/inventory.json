@@ -7281,6 +7281,14 @@
                 "null"
               ]
             },
+            "home_url": {
+              "default": null,
+              "description": "Destination of Home navigation links; defaults to base_url.\nDoes not change page or asset paths.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "site_url": {
               "default": null,
               "description": "Canonical site URL for RSS feed links (e.g., \"https://casparwater.org\").\nRequired for RSS feed generation; if absent, feed is skipped.",
