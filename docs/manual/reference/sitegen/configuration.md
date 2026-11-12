@@ -30,6 +30,9 @@ validation. See [export](../export.md) for boundaries and file layout.
 used by content navigation. Strings match page titles; explicit `label` /
 `href` entries and `children` support nesting. Documentation strict mode
 checks targets, and all internal output URLs include `site.base_url`.
+Set `site.home_url: /` when Home navigation should return to the enclosing
+website instead of the site's publishing mount. It defaults to `site.base_url`
+and does not change page, theme, or visualization asset paths.
 Theme keys override CSS custom properties, not arbitrary template code.
 `header` is a banner asset. `footer` accompanies the binary build identifier.
 
