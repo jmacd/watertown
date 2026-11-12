@@ -325,6 +325,10 @@ pub struct SiteMeta {
     pub title: String,
     #[serde(default = "default_base_url")]
     pub base_url: String,
+    /// Destination of Home navigation links; defaults to base_url.
+    /// Does not change page or asset paths.
+    #[serde(default)]
+    pub home_url: Option<String>,
     /// Canonical site URL for RSS feed links (e.g., "https://casparwater.org").
     /// Required for RSS feed generation; if absent, feed is skipped.
     #[serde(default)]

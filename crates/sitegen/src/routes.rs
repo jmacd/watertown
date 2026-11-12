@@ -93,11 +93,13 @@ pub fn expand_routes(
     let mut jobs = Vec::new();
     let mut content_urls: ContentUrlIndex = BTreeMap::new();
     let base = config.site.base_url.trim_end_matches('/').to_string();
-    let home_url = if base.is_empty() || base == "/" {
-        "/".to_string()
-    } else {
-        format!("{}/", base)
-    };
+    let home_url = config.site.home_url.clone().unwrap_or_else(|| {
+        if base.is_empty() || base == "/" {
+            "/".to_string()
+        } else {
+            format!("{}/", base)
+        }
+    });
     let breadcrumbs = vec![("Home".to_string(), home_url)];
 
     for route in &config.routes {
@@ -466,6 +468,7 @@ mod tests {
             site: SiteMeta {
                 title: "Test".to_string(),
                 base_url: "/test/".to_string(),
+                home_url: None,
                 site_url: None,
                 github_url: None,
                 default_range: None,
@@ -591,7 +594,7 @@ mod tests {
 
     #[test]
     fn test_breadcrumbs() {
-        let config = test_config();
+        let mut config = test_config();
         let exports = test_exports();
         let content = BTreeMap::new();
         let jobs = expand_routes(&config, &exports, &content).jobs;
@@ -605,6 +608,16 @@ mod tests {
         assert_eq!(temp_job.breadcrumbs[0].0, "Home");
         assert_eq!(temp_job.breadcrumbs[1].0, "params");
         assert_eq!(temp_job.breadcrumbs[2].0, "Temperature");
+        assert_eq!(temp_job.breadcrumbs[0].1, "/test/");
+
+        config.site.home_url = Some("/".into());
+        let jobs = expand_routes(&config, &exports, &content).jobs;
+        let overridden = jobs
+            .iter()
+            .find(|job| job.output_path == temp_job.output_path)
+            .unwrap();
+        assert_eq!(overridden.breadcrumbs[0].1, "/");
+        assert_eq!(overridden.breadcrumbs[1..], temp_job.breadcrumbs[1..]);
     }
 
     #[test]
@@ -660,6 +673,7 @@ mod tests {
             site: SiteMeta {
                 title: "Test".to_string(),
                 base_url: "/".to_string(),
+                home_url: None,
                 site_url: None,
                 github_url: None,
                 default_range: None,

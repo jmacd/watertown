@@ -1,6 +1,7 @@
 site:
   title: My site              # Required: example site title.
   base_url: /                 # Default: serve at the domain root.
+  home_url: null              # Default: Home links use base_url.
   site_url: null              # Default: no canonical URL for RSS.
   github_url: null            # Default: no repository link.
   default_range: null         # Default: no configured chart range.
