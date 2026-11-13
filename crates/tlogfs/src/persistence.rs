@@ -165,12 +165,58 @@ pub struct State {
     pond_id: String,
 }
 
-fn file_version_info_from_record(record: OplogEntry) -> FileVersionInfo {
-    let size = if record.is_large_file() {
-        record.size.unwrap_or(0)
-    } else {
-        record.content.as_ref().map(|c| c.len() as i64).unwrap_or(0)
-    };
+#[derive(Deserialize)]
+struct VersionMetadata {
+    file_type: EntryType,
+    timestamp: i64,
+    version: i64,
+    blake3: Option<String>,
+    size: Option<i64>,
+    min_event_time: Option<i64>,
+    max_event_time: Option<i64>,
+    extended_attributes: Option<String>,
+    collapsed_from: Option<i64>,
+    collapsed_through: Option<i64>,
+    logical_leaf_hash: Option<String>,
+    logical_count: Option<i64>,
+    series_schema_fingerprint: Option<String>,
+}
+
+impl From<&OplogEntry> for VersionMetadata {
+    fn from(record: &OplogEntry) -> Self {
+        Self {
+            file_type: record.file_type,
+            timestamp: record.timestamp,
+            version: record.version,
+            blake3: record.blake3.clone(),
+            size: record
+                .size
+                .or_else(|| record.content.as_ref().map(|content| content.len() as i64)),
+            min_event_time: record.min_event_time,
+            max_event_time: record.max_event_time,
+            extended_attributes: record.extended_attributes.clone(),
+            collapsed_from: record.collapsed_from,
+            collapsed_through: record.collapsed_through,
+            logical_leaf_hash: record.logical_leaf_hash.clone(),
+            logical_count: record.logical_count,
+            series_schema_fingerprint: record.series_schema_fingerprint.clone(),
+        }
+    }
+}
+
+fn file_version_info_from_metadata(
+    id: FileID,
+    record: VersionMetadata,
+) -> TinyFSResult<FileVersionInfo> {
+    let size = record
+        .size
+        .and_then(|size| u64::try_from(size).ok())
+        .ok_or_else(|| {
+            tinyfs::Error::Other(format!(
+                "Missing or invalid logical size {:?} for version {} of file {id}",
+                record.size, record.version
+            ))
+        })?;
     let extended_metadata =
         if record.file_type.is_series_file() || record.file_type == EntryType::FilePhysicalSeries {
             let mut metadata = HashMap::new();
@@ -194,14 +240,14 @@ fn file_version_info_from_record(record: OplogEntry) -> FileVersionInfo {
         } else {
             None
         };
-    FileVersionInfo {
+    Ok(FileVersionInfo {
         version: record.version as u64,
         timestamp: record.timestamp,
-        size: size as u64,
+        size,
         blake3: record.blake3,
         entry_type: record.file_type,
         extended_metadata,
-    }
+    })
 }
 
 // Re-export TableProviderKey from provider for backward compatibility
@@ -4145,7 +4191,7 @@ impl InnerState {
         Ok(())
     }
 
-    /// Query for ONLY the latest record for any node type (O(1) performance)
+    /// Query the latest logical version, with pending writes taking precedence.
     async fn query_latest_record(&mut self, id: FileID) -> Result<OplogEntry, TLogFSError> {
         let pond_id_str = id.pond_id().to_string();
 
@@ -4168,10 +4214,8 @@ impl InnerState {
             return Ok(pending);
         }
 
-        self.query_committed_node_records(id)
+        self.query_latest_committed_record(id, false)
             .await?
-            .into_iter()
-            .next()
             .ok_or_else(|| TLogFSError::PartitionNotFound {
                 part_id: id.part_id().to_string(),
                 node_id: id.node_id().to_string(),
@@ -4179,10 +4223,7 @@ impl InnerState {
             })
     }
 
-    /// Query for ONLY the latest directory record (O(1) performance)
-    ///
-    /// This function uses SQL LIMIT 1 to fetch only the most recent directory version,
-    /// avoiding the O(N) cost of reading all historical versions.
+    /// Query the latest directory record without loading historical contents.
     ///
     /// IMPORTANT: This function checks BOTH committed (Delta Lake) and pending (self.records) state.
     /// During a transaction, pending directory records in self.records take precedence over committed ones.
@@ -4203,11 +4244,7 @@ impl InnerState {
             .max_by_key(|r| r.version)
             .cloned();
 
-        let committed_record = self
-            .query_committed_node_records(id)
-            .await?
-            .into_iter()
-            .find(|record| record.file_type.is_directory());
+        let committed_record = self.query_latest_committed_record(id, true).await?;
 
         // Step 3: Return the latest between committed and pending (pending wins if both exist)
         match (committed_record, pending_record) {
@@ -4216,6 +4253,51 @@ impl InnerState {
             (None, Some(p)) => Ok(Some(p)),
             (None, None) => Ok(None),
         }
+    }
+
+    async fn query_latest_committed_record(
+        &self,
+        id: FileID,
+        directory_only: bool,
+    ) -> Result<Option<OplogEntry>, TLogFSError> {
+        #[derive(Deserialize)]
+        struct Revision {
+            version: i64,
+            timestamp: i64,
+        }
+
+        let mut predicate = format!(
+            "pond_id = '{}' AND part_id = '{}' AND node_id = '{}'",
+            id.pond_id(),
+            id.part_id(),
+            id.node_id()
+        );
+        if directory_only {
+            predicate.push_str(&format!(
+                " AND file_type IN ('{}', '{}')",
+                EntryType::DirectoryPhysical,
+                EntryType::DirectoryDynamic
+            ));
+        }
+        // A LIMIT on SELECT * can still scan payload columns while finding
+        // the winning row. Resolve its identity first within this snapshot.
+        let revisions: Vec<Revision> = self
+            .query_oplog_rows(&format!(
+                "SELECT version, timestamp FROM delta_table WHERE {predicate} \
+                 ORDER BY version DESC, timestamp DESC LIMIT 1"
+            ))
+            .await?;
+        let Some(revision) = revisions.into_iter().next() else {
+            return Ok(None);
+        };
+        let records = self
+            .query_oplog_rows(&format!(
+                "SELECT * FROM delta_table WHERE {predicate} AND version = {} \
+                 AND timestamp = to_timestamp_micros({}) LIMIT 1",
+                revision.version, revision.timestamp
+            ))
+            .await?;
+        Ok(records.into_iter().next())
     }
 
     /// Query committed records for one exact node using Delta predicates.
@@ -4230,17 +4312,24 @@ impl InnerState {
             id.part_id(),
             id.node_id()
         );
+        self.query_oplog_rows(&sql).await
+    }
+
+    async fn query_oplog_rows<T: serde::de::DeserializeOwned>(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<T>, TLogFSError> {
         let batches = self
             .session_context
-            .sql(&sql)
+            .sql(sql)
             .await
             .map_err(TLogFSError::DataFusion)?
             .collect()
             .await
             .map_err(TLogFSError::DataFusion)?;
-        let mut records: Vec<OplogEntry> = Vec::new();
+        let mut records = Vec::new();
         for batch in batches {
-            let batch_records: Vec<OplogEntry> = serde_arrow::from_record_batch(&batch)?;
+            let batch_records: Vec<T> = serde_arrow::from_record_batch(&batch)?;
             records.extend(batch_records);
         }
         Ok(records)
@@ -4585,33 +4674,53 @@ impl InnerState {
             id.entry_type()
         );
 
-        let mut records = self
-            .query_records(id)
-            .await
-            .map_err(error_utils::to_tinyfs_error)?;
+        let mut records = self.query_committed_version_metadata(id, None).await?;
+        let pond_id = id.pond_id().to_string();
+        records.extend(
+            self.records
+                .iter()
+                .filter(|record| {
+                    record.part_id == id.part_id()
+                        && record.node_id == id.node_id()
+                        && record.pond_id == pond_id
+                })
+                .map(VersionMetadata::from),
+        );
 
         let record_count = records.len();
         debug!("list_file_versions found {record_count} records for node {id}");
 
-        // Sort records by version number (which should match timestamp order anyway)
-        records.sort_by_key(|record| record.version);
+        records.sort_by_key(|record| (record.version, std::cmp::Reverse(record.timestamp)));
 
         // Hide versions superseded by a collapse merge row: a merged
         // FilePhysicalSeries row covers the closed version range
         // [collapsed_from, collapsed_through], so rows inside that range are no
         // longer independently readable. Rows of other entry types carry no
         // range and are left unchanged.
-        let live: HashSet<i64> = crate::schema::live_series_entries(&records)
+        let ranges: Vec<_> = records
+            .iter()
+            .map(|record| {
+                (
+                    record.version,
+                    crate::schema::CollapseRange::new(
+                        record.version,
+                        record.collapsed_from,
+                        record.collapsed_through,
+                    ),
+                )
+            })
+            .collect();
+        let live: HashSet<i64> = crate::schema::live_series_versions(&ranges)
             .into_iter()
-            .map(|r| r.version)
             .collect();
 
-        let version_infos = records
+        let mut version_infos = Vec::new();
+        for record in records
             .into_iter()
             .filter(|record| live.contains(&record.version))
-            .map(file_version_info_from_record)
-            .collect();
-
+        {
+            version_infos.push(self.resolve_version_info(id, record).await?);
+        }
         Ok(version_infos)
     }
 
@@ -4620,11 +4729,64 @@ impl InnerState {
         id: FileID,
         version: u64,
     ) -> TinyFSResult<Option<FileVersionInfo>> {
-        match self.load_file_version_record(id, version).await {
-            Ok(record) => Ok(Some(file_version_info_from_record(record))),
-            Err(tinyfs::Error::NotFound(_)) => Ok(None),
-            Err(error) => Err(error),
+        let pond_id = id.pond_id().to_string();
+        let pending = self.records.iter().find(|record| {
+            record.part_id == id.part_id()
+                && record.node_id == id.node_id()
+                && record.pond_id == pond_id
+                && record.version == version as i64
+        });
+        let record = match pending {
+            Some(record) => Some(VersionMetadata::from(record)),
+            None => self
+                .query_committed_version_metadata(id, Some(version))
+                .await?
+                .into_iter()
+                .next(),
+        };
+        match record {
+            Some(record) => self.resolve_version_info(id, record).await.map(Some),
+            None => Ok(None),
         }
+    }
+
+    async fn query_committed_version_metadata(
+        &self,
+        id: FileID,
+        version: Option<u64>,
+    ) -> TinyFSResult<Vec<VersionMetadata>> {
+        let selection = version.map_or_else(String::new, |version| {
+            format!(" AND version = {version} LIMIT 1")
+        });
+        self.query_oplog_rows(&format!(
+            "SELECT file_type, timestamp, version, blake3, size, min_event_time, \
+             max_event_time, extended_attributes, collapsed_from, collapsed_through, \
+             logical_leaf_hash, logical_count, series_schema_fingerprint \
+             FROM delta_table WHERE pond_id = '{}' AND part_id = '{}' AND node_id = '{}'{selection}",
+            id.pond_id(), id.part_id(), id.node_id()
+        ))
+        .await
+        .map_err(error_utils::to_tinyfs_error)
+    }
+
+    async fn resolve_version_info(
+        &self,
+        id: FileID,
+        mut record: VersionMetadata,
+    ) -> TinyFSResult<FileVersionInfo> {
+        if record.size.is_none() {
+            if record.file_type.is_file() {
+                warn!(
+                    "Version {} of file {id} has no stored size; reading its record to recover inline size",
+                    record.version
+                );
+            }
+            let full = self
+                .load_file_version_record(id, record.version as u64)
+                .await?;
+            record.size = full.content.as_ref().map(|content| content.len() as i64);
+        }
+        file_version_info_from_metadata(id, record)
     }
 
     async fn load_file_version_record(&self, id: FileID, version: u64) -> TinyFSResult<OplogEntry> {
@@ -5247,6 +5409,371 @@ mod node_factory {
         // The node will be automatically cached when returned
 
         Ok(node)
+    }
+}
+
+#[cfg(test)]
+mod metadata_query_tests {
+    use super::*;
+    use datafusion::catalog::Session;
+    use datafusion::datasource::{TableProvider, TableType};
+    use datafusion::error::Result as DataFusionResult;
+    use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+    use datafusion::physical_plan::ExecutionPlan;
+
+    #[derive(Debug)]
+    struct Scan {
+        columns: Vec<String>,
+        filters: String,
+    }
+
+    #[derive(Debug)]
+    struct RecordingTable {
+        inner: Arc<dyn TableProvider>,
+        scans: Arc<std::sync::Mutex<Vec<Scan>>>,
+    }
+
+    #[async_trait]
+    impl TableProvider for RecordingTable {
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            self.inner.schema()
+        }
+
+        fn table_type(&self) -> TableType {
+            self.inner.table_type()
+        }
+
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&Expr],
+        ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+            self.inner.supports_filters_pushdown(filters)
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            let schema = self.schema();
+            let columns = projection.map_or_else(
+                || schema.fields().iter().map(|f| f.name().clone()).collect(),
+                |indices| {
+                    indices
+                        .iter()
+                        .map(|i| schema.field(*i).name().clone())
+                        .collect()
+                },
+            );
+            self.scans.lock().expect("scans").push(Scan {
+                columns,
+                filters: filters
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" AND "),
+            });
+            self.inner.scan(state, projection, filters, limit).await
+        }
+    }
+
+    async fn record_scans(state: &State) -> Arc<std::sync::Mutex<Vec<Scan>>> {
+        let session = &state.session_context;
+        let inner = session
+            .table_provider("delta_table")
+            .await
+            .expect("Delta provider");
+        let scans = Arc::new(std::sync::Mutex::new(Vec::new()));
+        _ = session
+            .deregister_table("delta_table")
+            .expect("replace Delta provider");
+        _ = session
+            .register_table(
+                "delta_table",
+                Arc::new(RecordingTable {
+                    inner,
+                    scans: scans.clone(),
+                }),
+            )
+            .expect("record Delta scans");
+        scans
+    }
+
+    async fn fixture() -> (tempfile::TempDir, OpLogPersistence, FileID) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persistence = OpLogPersistence::create_test(dir.path().join("pond").to_str().unwrap())
+            .await
+            .expect("create");
+        let pond = persistence.pond_id().parse().expect("pond UUID");
+        let id = FileID::new_in_partition(
+            FileID::root_for(pond).part_id(),
+            EntryType::FilePhysicalVersion,
+            pond,
+        );
+        (dir, persistence, id)
+    }
+
+    async fn commit_rows(persistence: &mut OpLogPersistence, rows: Vec<OplogEntry>) {
+        let tx = persistence.begin_test().await.expect("begin fixture");
+        tx.state()
+            .expect("state")
+            .inner
+            .lock()
+            .await
+            .records
+            .extend(rows);
+        tx.commit_test().await.expect("commit fixture");
+    }
+
+    fn row(id: FileID, version: i64) -> OplogEntry {
+        // Decreasing mtimes must not override logical version ordering.
+        OplogEntry::new_small_file(id, 1000 - version, version, vec![version as u8; 4096], 2)
+    }
+
+    #[tokio::test]
+    async fn latest_reads_only_selected_payload_and_preserves_identity() {
+        let (_dir, mut persistence, id) = fixture().await;
+        let directory =
+            FileID::new_in_partition(id.part_id(), EntryType::DirectoryPhysical, id.pond_id());
+        let mut rows: Vec<_> = (1..=16).map(|version| row(id, version)).collect();
+        let mut tied = row(id, 16);
+        tied.timestamp += 1;
+        tied.content = Some(b"newer timestamp".to_vec());
+        tied.size = Some(15);
+        rows.push(tied);
+        let mut foreign = row(id, 100);
+        foreign.pond_id = uuid7::uuid7().to_string();
+        rows.push(foreign.clone());
+        rows.extend(
+            (1..=8).map(|v| OplogEntry::new_inline(directory, 1000 - v, v, vec![v as u8; 4096], 2)),
+        );
+        let mut not_directory = row(directory, 50);
+        not_directory.file_type = EntryType::FilePhysicalVersion;
+        rows.push(not_directory);
+        commit_rows(&mut persistence, rows).await;
+
+        let tx = persistence.begin_test().await.expect("begin read");
+        let state = tx.state().expect("state");
+        let scans = record_scans(&state).await;
+        let mut inner = state.inner.lock().await;
+        inner.records.push(foreign);
+        let latest = inner.query_latest_record(id).await.expect("latest");
+        assert_eq!(latest.version, 16);
+        assert_eq!(
+            latest.content.as_deref(),
+            Some(b"newer timestamp".as_slice())
+        );
+        let latest_dir = inner
+            .query_latest_directory_record(directory)
+            .await
+            .expect("directory")
+            .expect("directory exists");
+        assert_eq!(latest_dir.version, 8);
+        {
+            let scans = scans.lock().expect("scans");
+            let payloads: Vec<_> = scans
+                .iter()
+                .filter(|s| s.columns.iter().any(|c| c == "content"))
+                .collect();
+            assert_eq!(payloads.len(), 2, "{scans:?}");
+            for scan in payloads {
+                assert!(
+                    scan.filters.contains("version = Int64(16)")
+                        || scan.filters.contains("version = Int64(8)"),
+                    "payload scans must select an exact version, not sort all historical content: {scan:?}"
+                );
+            }
+        }
+        inner.records.push(row(id, 17));
+        assert_eq!(
+            inner
+                .query_latest_record(id)
+                .await
+                .expect("pending latest")
+                .version,
+            17
+        );
+        inner.records.push(OplogEntry::new_inline(
+            directory,
+            1,
+            9,
+            b"pending".to_vec(),
+            3,
+        ));
+        assert_eq!(
+            inner
+                .query_latest_directory_record(directory)
+                .await
+                .expect("pending dir")
+                .unwrap()
+                .version,
+            9
+        );
+    }
+
+    #[tokio::test]
+    async fn version_metadata_excludes_payload_and_preserves_live_membership() {
+        let (_dir, mut persistence, file) = fixture().await;
+        let id = FileID::new_in_partition(
+            file.part_id(),
+            EntryType::FilePhysicalSeries,
+            file.pond_id(),
+        );
+        let mut rows: Vec<_> = (1..=16)
+            .map(|v| {
+                let mut r = row(id, v);
+                r.min_event_time = Some(v * 10);
+                r.max_event_time = Some(v * 10 + 1);
+                r.extended_attributes = Some(r#"{"timestamp_column":"ts"}"#.to_string());
+                r.logical_leaf_hash = Some(format!("leaf-{v}"));
+                r.logical_count = Some(4096);
+                r.series_schema_fingerprint = Some("schema".to_string());
+                r
+            })
+            .collect();
+        rows[15].collapsed_from = Some(4);
+        rows[15].collapsed_through = Some(12);
+        let mut foreign = rows[0].clone();
+        foreign.pond_id = uuid7::uuid7().to_string();
+        foreign.version = 100;
+        rows.push(foreign.clone());
+        commit_rows(&mut persistence, rows).await;
+
+        let tx = persistence.begin_test().await.expect("begin metadata");
+        let state = tx.state().expect("state");
+        let scans = record_scans(&state).await;
+        state
+            .inner
+            .lock()
+            .await
+            .records
+            .extend([row(id, 17), foreign]);
+        let versions = state.list_file_versions(id).await.expect("versions");
+        assert_eq!(
+            versions.iter().map(|v| v.version).collect::<Vec<_>>(),
+            vec![1, 2, 3, 13, 14, 15, 16, 17]
+        );
+        for info in &versions {
+            assert_eq!(info.size, 4096);
+            assert_eq!(
+                info.blake3.as_deref(),
+                Some(
+                    blake3::hash(&vec![info.version as u8; 4096])
+                        .to_hex()
+                        .as_str()
+                )
+            );
+        }
+        let exact = state
+            .file_version_info(id, 4)
+            .await
+            .expect("superseded exact version")
+            .unwrap();
+        let metadata = exact.extended_metadata.expect("extended metadata");
+        assert_eq!(metadata["min_event_time"], "40");
+        assert_eq!(metadata["max_event_time"], "41");
+        assert_eq!(metadata["logical_leaf_hash"], "leaf-4");
+        assert_eq!(metadata["logical_count"], "4096");
+        assert_eq!(metadata["series_schema_fingerprint"], "schema");
+        assert_eq!(
+            metadata["extended_attributes"],
+            r#"{"timestamp_column":"ts"}"#
+        );
+        assert!(
+            state
+                .file_version_info(id, 999)
+                .await
+                .expect("missing version")
+                .is_none()
+        );
+        {
+            let scans = scans.lock().expect("scans");
+            assert!(!scans.is_empty());
+            for scan in scans.iter() {
+                assert!(
+                    !scan
+                        .columns
+                        .iter()
+                        .any(|c| c == "content" || c == "bao_outboard"),
+                    "metadata query must not load payload columns: {scan:?}"
+                );
+            }
+        }
+        scans.lock().expect("scans").clear();
+        assert_eq!(
+            state
+                .file_version_info(id, 17)
+                .await
+                .expect("pending version")
+                .unwrap()
+                .size,
+            4096
+        );
+        assert!(
+            scans.lock().expect("scans").is_empty(),
+            "pending exact version needs no committed query"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_metadata_handles_legacy_sizes_and_rejects_invalid_sizes() {
+        let (_dir, mut persistence, id) = fixture().await;
+        let mut legacy = row(id, 1);
+        legacy.size = None;
+        let large = OplogEntry::new_large_file(id, 2, 2, "large".to_string(), 131072, 2);
+        let mut invalid = row(id, 3);
+        invalid.size = Some(-1);
+        let mut missing = row(id, 4);
+        missing.size = None;
+        missing.content = None;
+        commit_rows(&mut persistence, vec![legacy, large, invalid, missing]).await;
+        let tx = persistence.begin_test().await.expect("begin sizes");
+        let state = tx.state().expect("state");
+        let scans = record_scans(&state).await;
+        assert_eq!(
+            state
+                .file_version_info(id, 1)
+                .await
+                .expect("legacy")
+                .unwrap()
+                .size,
+            4096
+        );
+        scans.lock().expect("scans").clear();
+        assert_eq!(
+            state
+                .file_version_info(id, 2)
+                .await
+                .expect("large")
+                .unwrap()
+                .size,
+            131072
+        );
+        assert!(
+            scans
+                .lock()
+                .expect("scans")
+                .iter()
+                .all(|s| !s.columns.iter().any(|c| c == "content"))
+        );
+        assert!(
+            state
+                .file_version_info(id, 3)
+                .await
+                .expect_err("negative size")
+                .to_string()
+                .contains("size")
+        );
+        assert!(
+            state
+                .file_version_info(id, 4)
+                .await
+                .expect_err("missing size and content")
+                .to_string()
+                .contains("size")
+        );
     }
 }
 
