@@ -265,6 +265,14 @@ impl<P: PersistenceLayer + Send + Sync + 'static> PersistenceLayer for CachingPe
         self.inner.snapshot_identity().await
     }
 
+    async fn resolve_file_version(
+        &self,
+        id: FileID,
+        version: u64,
+    ) -> Result<Option<Box<dyn crate::ResolvedFileVersion + '_>>> {
+        self.inner.resolve_file_version(id, version).await
+    }
+
     /// Read file version - pass through
     async fn read_file_version(&self, id: FileID, version: u64) -> Result<Vec<u8>> {
         self.inner.read_file_version(id, version).await

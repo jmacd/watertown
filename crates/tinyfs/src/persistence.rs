@@ -31,6 +31,52 @@ pub struct FileVersionInfo {
     pub extended_metadata: Option<HashMap<String, String>>,
 }
 
+/// One request's resolved immutable file version.
+///
+/// Resolution may load inline bytes, but external content remains unopened
+/// until a consuming body operation. Callers should keep the handle
+/// request-scoped. Transactional backends must reject new open/range operations
+/// after their transaction closes.
+#[async_trait]
+pub trait ResolvedFileVersion: Send + Sync {
+    fn info(&self) -> &FileVersionInfo;
+
+    async fn open(self: Box<Self>) -> Result<Pin<Box<dyn crate::AsyncReadSeek>>>;
+
+    async fn read_range(self: Box<Self>, range: Range<u64>) -> Result<Bytes>;
+}
+
+struct DeferredFileVersion<'a, P: PersistenceLayer + ?Sized> {
+    persistence: &'a P,
+    id: FileID,
+    info: FileVersionInfo,
+}
+
+#[async_trait]
+impl<P: PersistenceLayer + ?Sized> ResolvedFileVersion for DeferredFileVersion<'_, P> {
+    fn info(&self) -> &FileVersionInfo {
+        &self.info
+    }
+
+    async fn open(self: Box<Self>) -> Result<Pin<Box<dyn crate::AsyncReadSeek>>> {
+        if let Some(coherence) = self.persistence.coherence_state() {
+            coherence.ensure_open()?;
+        }
+        self.persistence
+            .open_file_version(self.id, self.info.version)
+            .await
+    }
+
+    async fn read_range(self: Box<Self>, range: Range<u64>) -> Result<Bytes> {
+        if let Some(coherence) = self.persistence.coherence_state() {
+            coherence.ensure_open()?;
+        }
+        self.persistence
+            .read_file_version_range(self.id, self.info.version, range)
+            .await
+    }
+}
+
 /// Validate and clamp a logical file-version range.
 ///
 /// The end offset is clamped to the content size. An empty range is accepted
@@ -159,6 +205,30 @@ pub trait PersistenceLayer: Send + Sync {
             .find(|info| info.version == version))
     }
 
+    /// Resolve metadata and body access for one exact version.
+    ///
+    /// The default defers body access to the existing read methods. Backends
+    /// may retain a resolved record for this request to avoid looking it up
+    /// again. Resolution may read inline content; metadata-only callers should
+    /// use [`Self::file_version_info`] instead.
+    async fn resolve_file_version(
+        &self,
+        id: FileID,
+        version: u64,
+    ) -> Result<Option<Box<dyn ResolvedFileVersion + '_>>> {
+        if let Some(coherence) = self.coherence_state() {
+            coherence.ensure_open()?;
+        }
+        let Some(info) = self.file_version_info(id, version).await? else {
+            return Ok(None);
+        };
+        Ok(Some(Box::new(DeferredFileVersion {
+            persistence: self,
+            id,
+            info,
+        })))
+    }
+
     /// Read content of a specific version of a file
     /// If version is None, reads the latest version
     async fn read_file_version(&self, id: FileID, version: u64) -> Result<Vec<u8>>;
@@ -192,7 +262,7 @@ pub trait PersistenceLayer: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_file_version_range;
+    use super::{PersistenceLayer, validate_file_version_range};
     use crate::Error;
 
     #[test]
@@ -207,6 +277,81 @@ mod tests {
         assert_eq!(
             validate_file_version_range(std::ops::Range { start: 8, end: 7 }, 10,),
             Err(Error::invalid_range(8, 7, 10))
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_versions_defer_body_and_reject_closed_context() {
+        let persistence = crate::MemoryPersistence::default();
+        let id = crate::FileID::new_in_partition(
+            crate::FileID::root().part_id(),
+            crate::EntryType::FilePhysicalVersion,
+            crate::local_pond_uuid(),
+        );
+        persistence
+            .store_file_version(id, 1, b"0123456789".to_vec())
+            .await
+            .expect("store");
+        persistence.reset_metrics();
+        let resolved = persistence
+            .resolve_file_version(id, 1)
+            .await
+            .expect("resolve")
+            .unwrap();
+        assert_eq!(resolved.info().size, 10);
+        assert_eq!(
+            persistence.metrics().bytes_read,
+            0,
+            "default resolution must defer content"
+        );
+        assert_eq!(
+            resolved.read_range(2..5).await.expect("range").as_ref(),
+            b"234"
+        );
+        assert_eq!(persistence.metrics().range_reads, 1);
+        assert_eq!(persistence.metrics().bytes_read, 3);
+
+        let ranged = persistence
+            .resolve_file_version(id, 1)
+            .await
+            .expect("range handle")
+            .unwrap();
+        let streamed = persistence
+            .resolve_file_version(id, 1)
+            .await
+            .expect("stream handle")
+            .unwrap();
+        persistence.coherence_state().expect("coherence").close();
+        assert!(
+            ranged
+                .read_range(0..1)
+                .await
+                .expect_err("closed range")
+                .to_string()
+                .contains("closed")
+        );
+        assert!(
+            streamed
+                .open()
+                .await
+                .err()
+                .expect("closed stream")
+                .to_string()
+                .contains("closed")
+        );
+        assert!(
+            persistence
+                .resolve_file_version(id, 1)
+                .await
+                .err()
+                .expect("closed resolution")
+                .to_string()
+                .contains("closed")
+        );
+        assert_eq!(
+            persistence.metrics().bytes_read,
+            3,
+            "closed handles must not read content"
         );
     }
 }

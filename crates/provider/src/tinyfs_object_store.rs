@@ -200,25 +200,55 @@ impl<P: PersistenceLayer + Clone + 'static> ObjectStore for TinyFsObjectStore<P>
                 source: err.into(),
             })?;
 
-        let versions = match version_num {
-            Some(version) => self
-                .persistence
-                .file_version_info(parsed_path.file_id, version)
-                .await
-                .map_err(|e| object_store::Error::Generic {
-                    store: "TinyFS",
-                    source: format!("Failed to read file version {version} metadata: {e}").into(),
-                })?
-                .into_iter()
-                .collect(),
-            None => self
-                .persistence
-                .list_file_versions(parsed_path.file_id)
-                .await
-                .map_err(|e| object_store::Error::Generic {
-                    store: "TinyFS",
-                    source: format!("Failed to list file versions: {e}").into(),
-                })?,
+        // HEAD and conditional requests must check metadata before reading even
+        // inline content. Ordinary exact-version reads can reuse one resolution.
+        let resolved = if let Some(version) = version_num
+            && !options.head
+            && options.if_match.is_none()
+            && options.if_none_match.is_none()
+            && options.if_modified_since.is_none()
+            && options.if_unmodified_since.is_none()
+        {
+            Some(
+                self.persistence
+                    .resolve_file_version(parsed_path.file_id, version)
+                    .await
+                    .map_err(|error| object_store::Error::Generic {
+                        store: "TinyFS",
+                        source: format!("Failed to resolve file version {version}: {error}").into(),
+                    })?
+                    .ok_or_else(|| object_store::Error::NotFound {
+                        path: location.to_string(),
+                        source: "No file versions found".into(),
+                    })?,
+            )
+        } else {
+            None
+        };
+        let versions = if let Some(version) = &resolved {
+            vec![version.info().clone()]
+        } else {
+            match version_num {
+                Some(version) => self
+                    .persistence
+                    .file_version_info(parsed_path.file_id, version)
+                    .await
+                    .map_err(|e| object_store::Error::Generic {
+                        store: "TinyFS",
+                        source: format!("Failed to read file version {version} metadata: {e}")
+                            .into(),
+                    })?
+                    .into_iter()
+                    .collect(),
+                None => self
+                    .persistence
+                    .list_file_versions(parsed_path.file_id)
+                    .await
+                    .map_err(|e| object_store::Error::Generic {
+                        store: "TinyFS",
+                        source: format!("Failed to list file versions: {e}").into(),
+                    })?,
+            }
         };
 
         if versions.is_empty() {
@@ -284,21 +314,25 @@ impl<P: PersistenceLayer + Clone + 'static> ObjectStore for TinyFsObjectStore<P>
                 "ObjectStore reading version {version_to_read} range {response_range:?} from {}",
                 series_info.file_id
             );
-            let bytes = self
-                .persistence
-                .read_file_version_range(
-                    series_info.file_id,
-                    version_to_read,
-                    response_range.clone(),
+            let bytes = match resolved {
+                Some(version) => version.read_range(response_range.clone()).await,
+                None => {
+                    self.persistence
+                        .read_file_version_range(
+                            series_info.file_id,
+                            version_to_read,
+                            response_range.clone(),
+                        )
+                        .await
+                }
+            }
+            .map_err(|e| object_store::Error::Generic {
+                store: "TinyFS",
+                source: format!(
+                    "Failed to read version {version_to_read} range {response_range:?}: {e}"
                 )
-                .await
-                .map_err(|e| object_store::Error::Generic {
-                    store: "TinyFS",
-                    source: format!(
-                        "Failed to read version {version_to_read} range {response_range:?}: {e}"
-                    )
-                    .into(),
-                })?;
+                .into(),
+            })?;
             return Ok(GetResult {
                 meta: object_meta,
                 payload: object_store::GetResultPayload::Stream(
@@ -309,14 +343,18 @@ impl<P: PersistenceLayer + Clone + 'static> ObjectStore for TinyFsObjectStore<P>
             });
         }
 
-        let mut reader = self
-            .persistence
-            .open_file_version(series_info.file_id, version_to_read)
-            .await
-            .map_err(|e| object_store::Error::Generic {
-                store: "TinyFS",
-                source: format!("Failed to open version {}: {}", version_to_read, e).into(),
-            })?;
+        let mut reader = match resolved {
+            Some(version) => version.open().await,
+            None => {
+                self.persistence
+                    .open_file_version(series_info.file_id, version_to_read)
+                    .await
+            }
+        }
+        .map_err(|e| object_store::Error::Generic {
+            store: "TinyFS",
+            source: format!("Failed to open version {}: {}", version_to_read, e).into(),
+        })?;
 
         _ = reader
             .seek(std::io::SeekFrom::Start(response_range.start))

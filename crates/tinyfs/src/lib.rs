@@ -55,7 +55,7 @@ pub use error::{Error, Result, ResultExt};
 pub use hostmount::HostmountPersistence;
 pub use memory::persistence::MemoryPersistence;
 pub use metadata::{Metadata, NodeMetadata};
-pub use persistence::{FileVersionInfo, PersistenceLayer};
+pub use persistence::{FileVersionInfo, PersistenceLayer, ResolvedFileVersion};
 pub use symlink::{Handle as SymlinkHandle, Symlink};
 pub use transaction_guard::TransactionGuard;
 

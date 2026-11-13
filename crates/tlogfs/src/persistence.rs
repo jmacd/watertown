@@ -204,6 +204,33 @@ impl From<&OplogEntry> for VersionMetadata {
     }
 }
 
+struct ResolvedVersion {
+    state: State,
+    record: OplogEntry,
+    info: FileVersionInfo,
+}
+
+#[async_trait]
+impl tinyfs::ResolvedFileVersion for ResolvedVersion {
+    fn info(&self) -> &FileVersionInfo {
+        &self.info
+    }
+
+    async fn open(self: Box<Self>) -> TinyFSResult<Pin<Box<dyn tinyfs::AsyncReadSeek>>> {
+        let Self { state, record, .. } = *self;
+        state.coherence.ensure_open()?;
+        let inner = state.inner.lock().await;
+        inner.open_file_record(record).await
+    }
+
+    async fn read_range(self: Box<Self>, range: Range<u64>) -> TinyFSResult<Bytes> {
+        let Self { state, record, .. } = *self;
+        state.coherence.ensure_open()?;
+        let inner = state.inner.lock().await;
+        inner.read_file_record_range(record, range).await
+    }
+}
+
 fn file_version_info_from_metadata(
     id: FileID,
     record: VersionMetadata,
@@ -2187,6 +2214,31 @@ impl PersistenceLayer for State {
     async fn read_file_version(&self, id: FileID, version: u64) -> TinyFSResult<Vec<u8>> {
         self.coherence.ensure_open()?;
         self.inner.lock().await.read_file_version(id, version).await
+    }
+
+    async fn resolve_file_version(
+        &self,
+        id: FileID,
+        version: u64,
+    ) -> TinyFSResult<Option<Box<dyn tinyfs::ResolvedFileVersion + '_>>> {
+        self.coherence.ensure_open()?;
+        let record = match self
+            .inner
+            .lock()
+            .await
+            .load_file_version_record(id, version)
+            .await
+        {
+            Ok(record) => record,
+            Err(tinyfs::Error::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let info = file_version_info_from_metadata(id, VersionMetadata::from(&record))?;
+        Ok(Some(Box::new(ResolvedVersion {
+            state: self.clone(),
+            record,
+            info,
+        })))
     }
 
     async fn open_file_version(
@@ -4844,6 +4896,16 @@ impl InnerState {
     }
 
     async fn load_file_version_record(&self, id: FileID, version: u64) -> TinyFSResult<OplogEntry> {
+        let pond_id = id.pond_id().to_string();
+        if let Some(record) = self.records.iter().find(|record| {
+            record.part_id == id.part_id()
+                && record.node_id == id.node_id()
+                && record.pond_id == pond_id
+                && record.version == version as i64
+        }) {
+            return Ok(record.clone());
+        }
+
         // OPTIMIZATION: Query for specific version instead of fetching all versions
         // Query for specific version only
         let sql = format!(
@@ -4877,25 +4939,11 @@ impl InnerState {
             }
         };
 
-        // Check pending records too (for uncommitted writes)
-        let pending_record = self
-            .records
-            .iter()
-            .find(|r| {
-                r.part_id == id.part_id()
-                    && r.node_id == id.node_id()
-                    && r.pond_id == id.pond_id().to_string()
-                    && r.version == version as i64
-            })
-            .cloned();
-
-        pending_record
-            .or_else(|| records.into_iter().next())
-            .ok_or_else(|| {
-                tinyfs::Error::NotFound(PathBuf::from(format!(
-                    "Version {version} of file {id} not found",
-                )))
-            })
+        records.into_iter().next().ok_or_else(|| {
+            tinyfs::Error::NotFound(PathBuf::from(format!(
+                "Version {version} of file {id} not found",
+            )))
+        })
     }
 
     async fn large_file_reader(
@@ -4938,7 +4986,13 @@ impl InnerState {
         version: u64,
     ) -> TinyFSResult<Pin<Box<dyn tinyfs::AsyncReadSeek>>> {
         let target_record = self.load_file_version_record(id, version).await?;
+        self.open_file_record(target_record).await
+    }
 
+    async fn open_file_record(
+        &self,
+        target_record: OplogEntry,
+    ) -> TinyFSResult<Pin<Box<dyn tinyfs::AsyncReadSeek>>> {
         // Load content based on file type
         if target_record.is_large_file() {
             Ok(Box::pin(self.large_file_reader(&target_record).await?))
@@ -4968,9 +5022,17 @@ impl InnerState {
         version: u64,
         range: Range<u64>,
     ) -> TinyFSResult<Bytes> {
+        let target_record = self.load_file_version_record(id, version).await?;
+        self.read_file_record_range(target_record, range).await
+    }
+
+    async fn read_file_record_range(
+        &self,
+        target_record: OplogEntry,
+        range: Range<u64>,
+    ) -> TinyFSResult<Bytes> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-        let target_record = self.load_file_version_record(id, version).await?;
         if target_record.is_large_file() {
             let mut reader = self.large_file_reader(&target_record).await?;
             let range =
@@ -5827,6 +5889,329 @@ mod metadata_query_tests {
                 .expect_err("missing size and content")
                 .to_string()
                 .contains("size")
+        );
+    }
+
+    #[tokio::test]
+    async fn object_store_version_reads_resolve_record_once() {
+        use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt, path::Path};
+
+        let (_dir, mut persistence, id) = fixture().await;
+        let content: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let mut rows: Vec<_> = (1..=16).map(|version| row(id, version)).collect();
+        rows[15].content = Some(content.clone());
+        rows[15].blake3 = Some(blake3::hash(&content).to_hex().to_string());
+        let mut foreign = row(id, 16);
+        foreign.pond_id = uuid7::uuid7().to_string();
+        rows.push(foreign.clone());
+        commit_rows(&mut persistence, rows).await;
+
+        let tx = persistence.begin_test().await.expect("begin object reads");
+        let state = tx.state().expect("state");
+        let scans = record_scans(&state).await;
+        let store = provider::TinyFsObjectStore::new(state.clone());
+        let path = Path::from(provider::TinyFsPathBuilder::specific_version(&id, 16));
+        for (range, expected) in [
+            (GetRange::Bounded(10..27), 10..27),
+            (GetRange::Offset(4080), 4080..4096),
+            (GetRange::Suffix(9), 4087..4096),
+            (GetRange::Bounded(4090..5000), 4090..4096),
+        ] {
+            scans.lock().expect("scans").clear();
+            let result = store
+                .get_opts(
+                    &path,
+                    GetOptions {
+                        range: Some(range),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("range");
+            assert_eq!(result.range, expected);
+            assert_eq!(result.meta.size, content.len() as u64);
+            assert_eq!(
+                result.bytes().await.expect("range bytes").as_ref(),
+                &content[expected.start as usize..expected.end as usize]
+            );
+            assert_eq!(
+                scans.lock().expect("scans").len(),
+                1,
+                "version metadata and content must share one lookup"
+            );
+        }
+        scans.lock().expect("scans").clear();
+        assert_eq!(
+            store
+                .get(&path)
+                .await
+                .expect("full get")
+                .bytes()
+                .await
+                .expect("full bytes")
+                .as_ref(),
+            content
+        );
+        assert_eq!(scans.lock().expect("scans").len(), 1);
+
+        scans.lock().expect("scans").clear();
+        let conditional = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    if_match: Some("*".to_string()),
+                    range: Some(GetRange::Bounded(10..27)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("satisfied precondition");
+        assert_eq!(
+            conditional
+                .bytes()
+                .await
+                .expect("conditional body")
+                .as_ref(),
+            &content[10..27]
+        );
+        assert!(
+            !scans.lock().expect("scans")[0]
+                .columns
+                .iter()
+                .any(|column| column == "content")
+        );
+        let latest = Path::from(provider::TinyFsPathBuilder::all_versions(&id));
+        assert_eq!(
+            store
+                .get(&latest)
+                .await
+                .expect("latest get")
+                .bytes()
+                .await
+                .expect("latest bytes")
+                .as_ref(),
+            content
+        );
+
+        let pending_content = b"pending version contents";
+        let pending = OplogEntry::new_small_file(id, 1, 17, pending_content.to_vec(), 3);
+        state.inner.lock().await.records.extend([pending, foreign]);
+        scans.lock().expect("scans").clear();
+        let pending_path = Path::from(provider::TinyFsPathBuilder::specific_version(&id, 17));
+        assert_eq!(
+            store
+                .get_range(&pending_path, 3..10)
+                .await
+                .expect("pending range")
+                .as_ref(),
+            &pending_content[3..10]
+        );
+        assert!(
+            scans.lock().expect("scans").is_empty(),
+            "pending content must not query committed rows"
+        );
+
+        let missing = Path::from(provider::TinyFsPathBuilder::specific_version(&id, 999));
+        assert!(matches!(
+            store.get_range(&missing, 0..1).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn object_store_metadata_checks_precede_content_access() {
+        use object_store::{GetOptions, GetRange, ObjectStore, path::Path};
+
+        let (_dir, mut persistence, id) = fixture().await;
+        // The metadata exists, but the external content deliberately does not.
+        commit_rows(
+            &mut persistence,
+            vec![OplogEntry::new_large_file(
+                id,
+                1,
+                1,
+                "missing-content".to_string(),
+                100,
+                2,
+            )],
+        )
+        .await;
+        let tx = persistence
+            .begin_test()
+            .await
+            .expect("begin conditional reads");
+        let state = tx.state().expect("state");
+        let scans = record_scans(&state).await;
+        let store = provider::TinyFsObjectStore::new(state);
+        let path = Path::from(provider::TinyFsPathBuilder::specific_version(&id, 1));
+        let head = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    head: true,
+                    range: Some(GetRange::Offset(1000)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("HEAD must not open content or validate a body range");
+        assert_eq!(head.range, 0..100);
+        assert!(head.bytes().await.expect("HEAD bytes").is_empty());
+
+        for options in [
+            GetOptions {
+                if_none_match: Some("*".to_string()),
+                ..Default::default()
+            },
+            GetOptions {
+                if_match: Some("absent".to_string()),
+                ..Default::default()
+            },
+            GetOptions {
+                if_modified_since: Some(chrono::DateTime::<Utc>::MAX_UTC),
+                ..Default::default()
+            },
+            GetOptions {
+                if_unmodified_since: Some(chrono::DateTime::<Utc>::MIN_UTC),
+                ..Default::default()
+            },
+        ] {
+            let error = store
+                .get_opts(&path, options)
+                .await
+                .expect_err("precondition");
+            assert!(
+                matches!(
+                    error,
+                    object_store::Error::NotModified { .. }
+                        | object_store::Error::Precondition { .. }
+                ),
+                "{error}"
+            );
+        }
+        assert!(
+            scans.lock().expect("scans").iter().all(|scan| !scan
+                .columns
+                .iter()
+                .any(|column| column == "content" || column == "bao_outboard")),
+            "HEAD and rejected conditions must remain metadata-only"
+        );
+
+        let error = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Offset(101)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("invalid range");
+        assert!(error.to_string().contains("Invalid range"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn object_store_large_ranges_reuse_resolved_record() {
+        use object_store::{ObjectStoreExt, path::Path};
+
+        let (_dir, mut persistence, _) = fixture().await;
+        let content: Vec<u8> = (0..crate::large_files::LARGE_FILE_THRESHOLD + 50000)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let tx = persistence.begin_test().await.expect("begin large write");
+        let root = tx.root().await.expect("root");
+        root.write_file_path_from_slice("/large.dat", &content)
+            .await
+            .expect("write large");
+        let id = root
+            .get_node_path("/large.dat")
+            .await
+            .expect("large node")
+            .id();
+        tx.commit_test().await.expect("commit large");
+
+        let tx = persistence.begin_test().await.expect("begin large read");
+        let state = tx.state().expect("state");
+        let version = state.list_file_versions(id).await.expect("versions")[0].version;
+        let scans = record_scans(&state).await;
+        let store = provider::TinyFsObjectStore::new(state);
+        let path = Path::from(provider::TinyFsPathBuilder::specific_version(&id, version));
+        let middle = (content.len() / 2) as u64;
+        assert_eq!(
+            store
+                .get_range(&path, middle..middle + 257)
+                .await
+                .expect("large range")
+                .as_ref(),
+            &content[middle as usize..middle as usize + 257]
+        );
+        assert_eq!(
+            scans.lock().expect("scans").len(),
+            1,
+            "large range must use one record lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_versions_preserve_wrapper_and_transaction_contracts() {
+        let (_dir, mut persistence, id) = fixture().await;
+        commit_rows(&mut persistence, vec![row(id, 1)]).await;
+        let tx = persistence.begin_test().await.expect("begin resolved read");
+        let state = tx.state().expect("state");
+        let scans = record_scans(&state).await;
+        let cached = tinyfs::CachingPersistence::new(state.clone());
+        let resolved = cached
+            .resolve_file_version(id, 1)
+            .await
+            .expect("resolve through wrapper")
+            .unwrap();
+        assert_eq!(resolved.info().size, 4096);
+        assert_eq!(
+            resolved
+                .read_range(3..10)
+                .await
+                .expect("resolved range")
+                .as_ref(),
+            &[1; 7]
+        );
+        assert_eq!(
+            scans.lock().expect("scans").len(),
+            1,
+            "wrapper must preserve backend resolution"
+        );
+
+        let ranged = state
+            .resolve_file_version(id, 1)
+            .await
+            .expect("resolve range")
+            .unwrap();
+        let streamed = cached
+            .resolve_file_version(id, 1)
+            .await
+            .expect("resolve stream")
+            .unwrap();
+        tx.commit_test().await.expect("close transaction");
+        scans.lock().expect("scans").clear();
+        assert!(
+            ranged
+                .read_range(0..1)
+                .await
+                .expect_err("closed range")
+                .to_string()
+                .contains("closed")
+        );
+        assert!(
+            streamed
+                .open()
+                .await
+                .err()
+                .expect("closed stream")
+                .to_string()
+                .contains("closed")
+        );
+        assert!(
+            scans.lock().expect("scans").is_empty(),
+            "closed handles must not query storage"
         );
     }
 
