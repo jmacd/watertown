@@ -325,6 +325,59 @@ pub struct OplogEntry {
     pub series_schema_fingerprint: Option<String>,
 }
 
+/// Metadata projection for one selected row, excluding file contents.
+#[derive(Deserialize)]
+pub(crate) struct NodeMetadataRecord {
+    file_type: EntryType,
+    timestamp: i64,
+    version: i64,
+    blake3: Option<String>,
+    size: Option<i64>,
+    bao_outboard: Option<Vec<u8>>,
+}
+
+impl From<&OplogEntry> for NodeMetadataRecord {
+    fn from(record: &OplogEntry) -> Self {
+        Self {
+            file_type: record.file_type,
+            timestamp: record.timestamp,
+            version: record.version,
+            blake3: record.blake3.clone(),
+            size: record.size,
+            bao_outboard: record.bao_outboard.clone(),
+        }
+    }
+}
+
+impl NodeMetadataRecord {
+    pub(crate) fn into_metadata(self) -> tinyfs::NodeMetadata {
+        // Byte-series identity is cumulative, not the per-version content hash.
+        let blake3 = if self.file_type == EntryType::FilePhysicalSeries {
+            if let Some(bao) = &self.bao_outboard {
+                let so = utilities::bao_outboard::SeriesOutboard::from_bytes(bao)
+                    .expect("FilePhysicalSeries bao_outboard must be valid SeriesOutboard");
+                Some(
+                    blake3::Hash::from_bytes(so.cumulative_blake3)
+                        .to_hex()
+                        .to_string(),
+                )
+            } else {
+                self.blake3
+            }
+        } else {
+            self.blake3
+        };
+        tinyfs::NodeMetadata {
+            version: self.version as u64,
+            size: self.size.map(|size| size as u64),
+            blake3,
+            bao_outboard: self.bao_outboard,
+            entry_type: self.file_type,
+            timestamp: self.timestamp,
+        }
+    }
+}
+
 /// The closed range of series versions a row occupies (loose row) or supersedes
 /// (merged collapse row).
 ///
@@ -417,12 +470,20 @@ fn is_superseded(i: usize, rows: &[(i64, CollapseRange)]) -> bool {
 /// the stream.
 #[must_use]
 pub fn live_series_versions(rows: &[(i64, CollapseRange)]) -> Vec<i64> {
-    let mut live: Vec<(i64, CollapseRange)> = (0..rows.len())
+    live_series_indices(rows)
+        .into_iter()
+        .map(|i| rows[i].0)
+        .collect()
+}
+
+/// Live row positions in content order, preserving each row's identity even
+/// when multiple historical records carry the same version number.
+pub(crate) fn live_series_indices(rows: &[(i64, CollapseRange)]) -> Vec<usize> {
+    let mut live: Vec<usize> = (0..rows.len())
         .filter(|i| !is_superseded(*i, rows))
-        .map(|i| rows[i])
         .collect();
-    live.sort_by_key(|(_, range)| range.sort_key());
-    live.into_iter().map(|(version, _)| version).collect()
+    live.sort_by_key(|i| rows[*i].1.sort_key());
+    live
 }
 
 /// Select the live rows of a series — those not superseded by any merged
@@ -442,15 +503,10 @@ pub fn live_series_entries(records: &[OplogEntry]) -> Vec<&OplogEntry> {
         .map(|e| (e.version, CollapseRange::of(e)))
         .collect();
 
-    let mut live: Vec<&OplogEntry> = records
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !is_superseded(*i, &rows))
-        .map(|(_, entry)| entry)
-        .collect();
-
-    live.sort_by_key(|e| CollapseRange::of(e).sort_key());
-    live
+    live_series_indices(&rows)
+        .into_iter()
+        .map(|i| &records[i])
+        .collect()
 }
 
 impl ForArrow for OplogEntry {
@@ -764,34 +820,7 @@ impl OplogEntry {
     /// Extract consolidated metadata
     #[must_use]
     pub fn metadata(&self) -> tinyfs::NodeMetadata {
-        // For FilePhysicalSeries, the canonical blake3 is the cumulative hash
-        // stored in SeriesOutboard, not the per-version hash in self.blake3.
-        // Every written version has a SeriesOutboard computed in poll_shutdown.
-        let blake3 = if self.file_type == EntryType::FilePhysicalSeries {
-            if let Some(bao) = &self.bao_outboard {
-                let so = utilities::bao_outboard::SeriesOutboard::from_bytes(bao)
-                    .expect("FilePhysicalSeries bao_outboard must be valid SeriesOutboard");
-                Some(
-                    blake3::Hash::from_bytes(so.cumulative_blake3)
-                        .to_hex()
-                        .to_string(),
-                )
-            } else {
-                // No bao_outboard yet — this is a pending/unwritten file.
-                self.blake3.clone()
-            }
-        } else {
-            self.blake3.clone()
-        };
-
-        tinyfs::NodeMetadata {
-            version: self.version as u64,
-            size: self.size.map(|s| s as u64),
-            blake3,
-            bao_outboard: self.bao_outboard.clone(),
-            entry_type: self.file_type,
-            timestamp: self.timestamp,
-        }
+        NodeMetadataRecord::from(self).into_metadata()
     }
 
     /// Create entry for dynamic node with factory type and configuration

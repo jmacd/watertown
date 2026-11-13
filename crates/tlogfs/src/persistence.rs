@@ -4613,52 +4613,106 @@ impl InnerState {
             });
         }
 
-        // Query Delta Lake for the most recent record for this node using the correct partition
-        let records = self
-            .query_records(id)
+        #[derive(Deserialize)]
+        struct Candidate {
+            version: i64,
+            timestamp: i64,
+            size: Option<i64>,
+            collapsed_from: Option<i64>,
+            collapsed_through: Option<i64>,
+            #[serde(skip)]
+            pending_index: Option<usize>,
+        }
+
+        let pond_id = id.pond_id().to_string();
+        let predicate = format!(
+            "pond_id = '{pond_id}' AND part_id = '{}' AND node_id = '{}'",
+            id.part_id(),
+            id.node_id()
+        );
+        let byte_series = id.entry_type() == EntryType::FilePhysicalSeries;
+        let limit = if byte_series { "" } else { " LIMIT 1" };
+        let mut candidates: Vec<Candidate> = self
+            .query_oplog_rows(&format!(
+                "SELECT version, timestamp, size, collapsed_from, collapsed_through \
+                 FROM delta_table WHERE {predicate} ORDER BY version DESC, timestamp DESC{limit}"
+            ))
             .await
             .map_err(error_utils::to_tinyfs_error)?;
-
-        let record_count = records.len();
-        debug!("metadata: found {record_count} records");
-
-        // Debug: log all records to understand the issue
-        for (i, record) in records.iter().enumerate() {
-            let file_type_str = format!("{:?}", record.file_type);
-            let version = record.version;
-            let timestamp = record.timestamp;
-            debug!(
-                "metadata: record[{i}] - file_type={file_type_str}, version={version}, timestamp={timestamp}"
-            );
-        }
+        candidates.extend(
+            self.records
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| {
+                    record.part_id == id.part_id()
+                        && record.node_id == id.node_id()
+                        && record.pond_id == pond_id
+                })
+                .map(|(index, record)| Candidate {
+                    version: record.version,
+                    timestamp: record.timestamp,
+                    size: record.size,
+                    collapsed_from: record.collapsed_from,
+                    collapsed_through: record.collapsed_through,
+                    pending_index: Some(index),
+                }),
+        );
+        candidates.sort_by_key(|row| std::cmp::Reverse((row.version, row.timestamp)));
 
         // For a FilePhysicalSeries the newest *content* is not necessarily the
         // highest *version*: size-tiered collapse appends a merged run with a
         // fresh (highest) version number while that run stands for versions in
         // the middle of the byte stream. The append path resumes its cumulative
         // bao state from this record, so it must be the row covering the end of
-        // the stream -- the last live row in range order -- not `records.first()`.
-        let newest = if id.entry_type() == EntryType::FilePhysicalSeries {
-            crate::schema::live_series_entries(&records)
+        // the stream -- the last live row in range order -- not the highest version.
+        let selected = if byte_series {
+            let ranges: Vec<_> = candidates
+                .iter()
+                .map(|row| {
+                    (
+                        row.version,
+                        crate::schema::CollapseRange::new(
+                            row.version,
+                            row.collapsed_from,
+                            row.collapsed_through,
+                        ),
+                    )
+                })
+                .collect();
+            crate::schema::live_series_indices(&ranges)
                 .into_iter()
-                .rfind(|r| r.size.unwrap_or(0) > 0)
-                .or_else(|| records.first())
+                .rfind(|index| candidates[*index].size.unwrap_or(0) > 0)
+                .unwrap_or(0)
         } else {
-            records.first()
+            0
         };
-
-        if let Some(record) = newest {
-            // Use the record directly - it's already an OplogEntry with metadata() method
-            let file_type_str = format!("{:?}", record.file_type);
-            debug!(
-                "metadata: returning consolidated metadata from OplogEntry - using file_type={file_type_str}"
-            );
-            Ok(record.metadata())
-        } else {
-            debug!("metadata: no records found");
-            // Node doesn't exist
-            Err(tinyfs::Error::not_found(format!("Node {id}")))
+        let Some(selected) = candidates.get(selected) else {
+            return Err(tinyfs::Error::not_found(format!("Node {id}")));
+        };
+        if let Some(index) = selected.pending_index {
+            return Ok(self.records[index].metadata());
         }
+
+        // Fetch the selected outboard, never the history's contents/outboards.
+        let records: Vec<crate::schema::NodeMetadataRecord> = self
+            .query_oplog_rows(&format!(
+                "SELECT file_type, timestamp, version, blake3, size, bao_outboard \
+                 FROM delta_table WHERE {predicate} AND version = {} \
+                 AND timestamp = to_timestamp_micros({}) LIMIT 1",
+                selected.version, selected.timestamp
+            ))
+            .await
+            .map_err(error_utils::to_tinyfs_error)?;
+        records
+            .into_iter()
+            .next()
+            .map(crate::schema::NodeMetadataRecord::into_metadata)
+            .ok_or_else(|| {
+                tinyfs::Error::Other(format!(
+                    "Selected metadata revision ({}, {}) for node {id} disappeared from the snapshot",
+                    selected.version, selected.timestamp
+                ))
+            })
     }
 
     // Versioning operations implementation
@@ -5774,6 +5828,260 @@ mod metadata_query_tests {
                 .to_string()
                 .contains("size")
         );
+    }
+
+    fn assert_node_metadata_projection(
+        scans: &Arc<std::sync::Mutex<Vec<Scan>>>,
+        committed_version: Option<i64>,
+    ) {
+        let scans = scans.lock().expect("scans");
+        assert!(
+            scans
+                .iter()
+                .all(|scan| !scan.columns.iter().any(|column| column == "content")),
+            "node metadata must not read content: {scans:?}"
+        );
+        let outboards: Vec<_> = scans
+            .iter()
+            .filter(|scan| scan.columns.iter().any(|column| column == "bao_outboard"))
+            .collect();
+        if let Some(version) = committed_version {
+            assert_eq!(outboards.len(), 1, "{scans:?}");
+            assert!(
+                outboards[0]
+                    .filters
+                    .contains(&format!("version = Int64({version})")),
+                "only the selected revision's outboard may be read: {scans:?}"
+            );
+        } else {
+            assert!(
+                outboards.is_empty(),
+                "pending metadata needs no committed outboard: {scans:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn node_metadata_projects_only_selected_revision_and_merges_pending() {
+        let (_dir, mut persistence, id) = fixture().await;
+        let mut rows: Vec<_> = (1..=16)
+            .map(|version| {
+                let mut record = row(id, version);
+                record.bao_outboard = Some(vec![version as u8; 1024]);
+                record
+            })
+            .collect();
+        let mut foreign = row(id, 100);
+        foreign.pond_id = uuid7::uuid7().to_string();
+        rows.push(foreign.clone());
+        let directory =
+            FileID::new_in_partition(id.part_id(), EntryType::DirectoryPhysical, id.pond_id());
+        let symlink = FileID::new_in_partition(id.part_id(), EntryType::Symlink, id.pond_id());
+        rows.push(OplogEntry::new_inline(
+            directory,
+            10,
+            1,
+            b"directory content".to_vec(),
+            2,
+        ));
+        rows.push(OplogEntry::new_inline(
+            symlink,
+            20,
+            1,
+            b"/target".to_vec(),
+            2,
+        ));
+        commit_rows(&mut persistence, rows).await;
+
+        let tx = persistence.begin_test().await.expect("begin node metadata");
+        let state = tx.state().expect("state");
+        let scans = record_scans(&state).await;
+        let mut older_pending = row(id, 15);
+        older_pending.timestamp = 2000;
+        state
+            .inner
+            .lock()
+            .await
+            .records
+            .extend([older_pending, foreign]);
+        let metadata = state.metadata(id).await.expect("committed metadata");
+        assert_eq!(metadata.version, 16);
+        assert_eq!(metadata.timestamp, 984);
+        assert_eq!(metadata.size, Some(4096));
+        assert_eq!(metadata.bao_outboard, Some(vec![16; 1024]));
+        assert_node_metadata_projection(&scans, Some(16));
+
+        for (node, timestamp) in [(directory, 10), (symlink, 20)] {
+            scans.lock().expect("scans").clear();
+            let metadata = state.metadata(node).await.expect("non-file metadata");
+            assert_eq!(metadata.entry_type, node.entry_type());
+            assert_eq!(metadata.size, None);
+            assert_eq!(metadata.timestamp, timestamp);
+            assert_node_metadata_projection(&scans, Some(1));
+        }
+
+        // A newer timestamp at the same logical version must win, but an
+        // equal timestamp must retain the committed row's precedence.
+        let mut pending = row(id, 16);
+        pending.blake3 = Some("pending".to_string());
+        state.inner.lock().await.records.push(pending.clone());
+        assert_ne!(
+            state
+                .metadata(id)
+                .await
+                .expect("equal revision")
+                .blake3
+                .as_deref(),
+            Some("pending")
+        );
+        pending.timestamp += 1;
+        state.inner.lock().await.records.push(pending);
+        scans.lock().expect("scans").clear();
+        let metadata = state.metadata(id).await.expect("newer pending revision");
+        assert_eq!(metadata.blake3.as_deref(), Some("pending"));
+        assert_eq!(metadata.timestamp, 985);
+        assert_node_metadata_projection(&scans, None);
+    }
+
+    #[tokio::test]
+    async fn node_metadata_preserves_series_tail_and_reads_only_its_outboard() {
+        use utilities::bao_outboard::SeriesOutboard;
+
+        let (_dir, mut persistence, file) = fixture().await;
+        let id = FileID::new_in_partition(
+            file.part_id(),
+            EntryType::FilePhysicalSeries,
+            file.pond_id(),
+        );
+        let mut stream = Vec::new();
+        let mut rows = Vec::new();
+        for version in 1..=25 {
+            let mut record = row(id, version);
+            stream.extend_from_slice(record.content.as_ref().unwrap());
+            let mut outboard = SeriesOutboard::first_version(&stream);
+            outboard.version_size = 4096;
+            record.bao_outboard = Some(outboard.to_bytes());
+            rows.push(record);
+        }
+        let tail = rows[24].metadata();
+        for (version, lo, hi) in [(26, 1, 10), (27, 11, 20)] {
+            let mut merged = rows[hi as usize - 1].clone();
+            merged.version = version;
+            merged.collapsed_from = Some(lo);
+            merged.collapsed_through = Some(hi);
+            merged.content = Some(stream[(lo as usize - 1) * 4096..hi as usize * 4096].to_vec());
+            merged.size = Some((hi - lo + 1) * 4096);
+            rows.push(merged);
+        }
+        let empty = OplogEntry::new_small_file(id, 0, 28, Vec::new(), 2);
+        rows.push(empty.clone());
+        commit_rows(&mut persistence, rows).await;
+
+        let tx = persistence.begin_test().await.expect("begin tail metadata");
+        let state = tx.state().expect("state");
+        let scans = record_scans(&state).await;
+        let metadata = state.metadata(id).await.expect("stream tail");
+        assert_eq!(metadata, tail);
+        assert_eq!(metadata.version, 25);
+        assert_eq!(
+            SeriesOutboard::from_bytes(metadata.bao_outboard.as_ref().unwrap())
+                .unwrap()
+                .cumulative_size,
+            stream.len() as u64
+        );
+        assert_node_metadata_projection(&scans, Some(25));
+
+        let mut pending_run = row(id, 29);
+        pending_run.collapsed_from = Some(1);
+        pending_run.collapsed_through = Some(20);
+        let mut pending_empty = empty;
+        pending_empty.version = 30;
+        state
+            .inner
+            .lock()
+            .await
+            .records
+            .extend([pending_run, pending_empty]);
+        scans.lock().expect("scans").clear();
+        assert_eq!(
+            state
+                .metadata(id)
+                .await
+                .expect("tail with pending mid-stream merge"),
+            tail
+        );
+        assert_node_metadata_projection(&scans, Some(25));
+
+        let mut appended = row(id, 31);
+        stream.extend_from_slice(appended.content.as_ref().unwrap());
+        let mut outboard = SeriesOutboard::first_version(&stream);
+        outboard.version_size = 4096;
+        let expected_hash = blake3::Hash::from_bytes(outboard.cumulative_blake3)
+            .to_hex()
+            .to_string();
+        appended.bao_outboard = Some(outboard.to_bytes());
+        state.inner.lock().await.records.push(appended);
+        scans.lock().expect("scans").clear();
+        let metadata = state.metadata(id).await.expect("pending tail");
+        assert_eq!(metadata.version, 31);
+        assert_eq!(metadata.blake3.as_deref(), Some(expected_hash.as_str()));
+        assert_node_metadata_projection(&scans, None);
+    }
+
+    #[tokio::test]
+    async fn node_metadata_preserves_empty_missing_and_unwritten_states() {
+        let (_dir, mut persistence, file) = fixture().await;
+        let id = FileID::new_in_partition(
+            file.part_id(),
+            EntryType::FilePhysicalSeries,
+            file.pond_id(),
+        );
+        let empty = OplogEntry::new_small_file(id, 10, 1, Vec::new(), 2);
+        let mut unknown_size = row(id, 2);
+        unknown_size.size = None;
+        commit_rows(&mut persistence, vec![empty, unknown_size]).await;
+
+        let tx = persistence
+            .begin_test()
+            .await
+            .expect("begin empty metadata");
+        let state = tx.state().expect("state");
+        let scans = record_scans(&state).await;
+        let metadata = state.metadata(id).await.expect("fallback to latest row");
+        assert_eq!(metadata.version, 2);
+        assert_eq!(metadata.size, None);
+        assert_node_metadata_projection(&scans, Some(2));
+
+        state
+            .inner
+            .lock()
+            .await
+            .records
+            .push(OplogEntry::new_small_file(id, 1, 3, Vec::new(), 3));
+        let metadata = state.metadata(id).await.expect("pending empty fallback");
+        assert_eq!(metadata.version, 3);
+        assert_eq!(metadata.size, Some(0));
+        scans.lock().expect("scans").clear();
+        _ = state
+            .inner
+            .lock()
+            .await
+            .pending_files
+            .insert(file, EntryType::FilePhysicalVersion);
+        let metadata = state.metadata(file).await.expect("unwritten node");
+        assert_eq!(metadata.version, 0);
+        assert_eq!(metadata.size, Some(0));
+        assert!(scans.lock().expect("scans").is_empty());
+
+        let missing = FileID::new_in_partition(
+            file.part_id(),
+            EntryType::FilePhysicalVersion,
+            file.pond_id(),
+        );
+        assert!(matches!(
+            state.metadata(missing).await,
+            Err(tinyfs::Error::NotFound(_))
+        ));
     }
 }
 
