@@ -61,6 +61,98 @@ mod integration_tests {
     use tinyfs::persistence::PersistenceLayer;
     use tokio::fs;
 
+    #[tokio::test]
+    async fn rfc3339_appends_preserve_legacy_versions_and_line_boundaries() {
+        async fn inspect(pond: &PondSimulator) -> (Vec<tinyfs::FileVersionInfo>, Vec<u8>) {
+            let mut persistence = crate::persistence::OpLogPersistence::open(
+                pond.store_path(),
+                pond.pond_id().to_string(),
+            )
+            .await
+            .unwrap();
+            let tx = persistence.begin_test().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let versions = root.list_file_versions("/logs/perf/app.log").await.unwrap();
+            let content = root
+                .read_file_path_to_vec("/logs/perf/app.log")
+                .await
+                .unwrap();
+            (versions, content)
+        }
+
+        let host = TempDir::new().unwrap();
+        let active = host.path().join("app.log");
+        let legacy = b"{\"ts\":\"1970-01-01T00:00:01Z\",\"read.seconds\":1}\n";
+        fs::write(&active, legacy).await.unwrap();
+        let mut config = LogfileIngestConfig {
+            active_pattern: active.to_str().unwrap().to_owned(),
+            archived_pattern: host.path().join("app-*.log").to_str().unwrap().to_owned(),
+            pond_path: "/logs/perf".to_owned(),
+            timestamp_field: None,
+            timestamp_unit: Default::default(),
+        };
+        let pond = PondSimulator::new(&config).await.unwrap();
+        pond.execute_factory(&config).await.unwrap();
+        let (before, _) = inspect(&pond).await;
+        assert_eq!(before.len(), 1);
+        assert!(
+            before[0]
+                .extended_metadata
+                .as_ref()
+                .is_none_or(|m| !m.contains_key("max_event_time"))
+        );
+
+        config.timestamp_field = Some("ts".to_owned());
+        config.timestamp_unit = serde_json::from_str("\"rfc3339\"").unwrap();
+        let second = b"{\"ts\":\"1970-01-01T00:00:02.0000005+00:00\",\"read.seconds\":2}\n";
+        let third = b"{\"ts\":\"1970-01-01T00:00:03.0000005Z\",\"read.seconds\":3}\n";
+        let split = third.len() - 3;
+        let mut content = [legacy.as_slice(), second.as_slice(), &third[..split]].concat();
+        fs::write(&active, &content).await.unwrap();
+        pond.execute_factory(&config).await.unwrap();
+        let (versions, stored) = inspect(&pond).await;
+        assert_eq!(versions.len(), 2);
+        assert_eq!(stored, [legacy.as_slice(), second.as_slice()].concat());
+        assert_eq!(versions[0].extended_metadata, before[0].extended_metadata);
+        assert_eq!(versions[0].blake3, before[0].blake3);
+        let metadata = versions[1].extended_metadata.as_ref().unwrap();
+        assert_eq!(metadata["min_event_time"], "2000000");
+        assert_eq!(metadata["max_event_time"], "2000001");
+        let attributes: serde_json::Value =
+            serde_json::from_str(&metadata["extended_attributes"]).unwrap();
+        assert_eq!(attributes["watertown.timestamp_column"], "ts");
+
+        pond.execute_factory(&config).await.unwrap();
+        assert_eq!(
+            inspect(&pond).await.0.len(),
+            2,
+            "a partial line must not create a version"
+        );
+        content.extend_from_slice(&third[split..]);
+        fs::write(&active, &content).await.unwrap();
+        pond.execute_factory(&config).await.unwrap();
+        let (versions, stored) = inspect(&pond).await;
+        assert_eq!(stored, content);
+        assert_eq!(versions.len(), 3);
+        let metadata = versions[2].extended_metadata.as_ref().unwrap();
+        assert_eq!(metadata["min_event_time"], "3000000");
+        assert_eq!(metadata["max_event_time"], "3000001");
+
+        content.extend_from_slice(b"{\"ts\":\"not a date\"}\n");
+        fs::write(&active, &content).await.unwrap();
+        let error = pond
+            .execute_factory(&config)
+            .await
+            .expect_err("invalid timestamp must fail");
+        assert!(error.to_string().contains("without bounds"), "{error}");
+        let (versions, after_failure) = inspect(&pond).await;
+        assert_eq!(versions.len(), 3);
+        assert_eq!(
+            after_failure, stored,
+            "a failed append must not alter committed content"
+        );
+    }
+
     /// Test fixture for simulating a growing logfile
     struct LogfileSimulator {
         _temp_dir: TempDir,

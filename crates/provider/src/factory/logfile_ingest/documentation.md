@@ -31,5 +31,28 @@ alter the source records. Non-finite and out-of-range values are rejected.
 For default Caddy JSON logs, use `timestamp_field: ts` and
 `timestamp_unit: seconds`; no Caddy timestamp-format override is needed.
 
+For RFC3339 strings such as `"2026-11-13T03:00:00Z"` or
+`"2026-11-13T03:00:00.123456789+00:00"`, explicitly select:
+
+```yaml
+timestamp_field: ts
+timestamp_unit: rfc3339
+```
+
+The strings must include a complete date and time with `Z` or a numeric UTC
+offset. Bounds are normalized to UTC microseconds and rounded outward, including
+for sub-microsecond and pre-epoch values. Numeric epochs are not accepted in
+this mode, and numeric modes do not automatically interpret date strings.
+
+Active input is ingested only through its last complete newline-delimited
+record; an incomplete tail waits for a later append. Existing corrupt-line
+warnings still apply, and a temporal append with no usable timestamp fails
+rather than publishing an unbounded version.
+
+Deploy a binary supporting this mode before enabling it in configuration.
+Enabling timestamp extraction affects new versions only: existing unbounded
+versions are not rewritten and must still be retained conservatively by bounded
+readers. Retrofitting their metadata is a separate operation.
+
 <!-- docs:reference factory:logfile-ingest -->
 <!-- docs:end-reference -->

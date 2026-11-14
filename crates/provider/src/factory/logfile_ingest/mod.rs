@@ -96,13 +96,14 @@ pub struct LogfileIngestConfig {
     #[serde(default)]
     pub timestamp_field: Option<String>,
 
-    /// Unit of the `timestamp_field` values. OTLP's `timeUnixNano` is
-    /// nanoseconds; journald's `__REALTIME_TIMESTAMP` is microseconds.
+    /// Numeric unit or explicit string format for `timestamp_field`.
+    /// OTLP's `timeUnixNano` is nanoseconds; journald uses microseconds.
+    /// Use `rfc3339` for complete date-time strings with a UTC offset.
     #[serde(default)]
     pub timestamp_unit: TimestampUnit,
 }
 
-/// Unit of the values found under `timestamp_field`.
+/// Interpretation of the values found under `timestamp_field`.
 ///
 /// tlogfs records event times in microseconds, so everything is converted to
 /// that. Microseconds is the default because it is what tlogfs itself uses.
@@ -115,6 +116,8 @@ pub enum TimestampUnit {
     #[default]
     Microseconds,
     Nanoseconds,
+    /// RFC3339 date-time strings, including an explicit UTC offset.
+    Rfc3339,
 }
 
 impl TimestampUnit {
@@ -126,6 +129,8 @@ impl TimestampUnit {
             TimestampUnit::Milliseconds => (1_000, false),
             TimestampUnit::Microseconds => (1, false),
             TimestampUnit::Nanoseconds => (1_000, true),
+            // RFC3339 values are parsed directly into microsecond bounds.
+            TimestampUnit::Rfc3339 => (1, false),
         }
     }
 
@@ -235,7 +240,7 @@ fn scan_temporal_bounds(content: &[u8], field: &str, unit: TimestampUnit) -> Opt
         let mut line_acc: Option<(i64, i64)> = None;
         let parsed = serde_json::from_str::<Value>(trimmed)
             .ok()
-            .filter(|value| fold_timestamps(value, field, &mut line_acc));
+            .filter(|value| fold_timestamps(value, field, unit, &mut line_acc));
 
         match parsed.and(line_acc) {
             Some((lo, hi)) => {
@@ -264,35 +269,48 @@ fn scan_temporal_bounds(content: &[u8], field: &str, unit: TimestampUnit) -> Opt
 /// Fold every value stored under `field`, at any depth of `value`, into `acc`
 /// as a running (min, max).
 ///
-/// Returns false if a value under that key is not a usable number, which drops the
-/// line from the scan -- see `scan_temporal_bounds` for why that is preferred
-/// to guessing.
-fn fold_timestamps(value: &Value, field: &str, acc: &mut Option<(i64, i64)>) -> bool {
+/// Returns false if a value under that key is not usable in the configured
+/// representation, dropping the line rather than guessing its timestamp.
+fn fold_timestamps(
+    value: &Value,
+    field: &str,
+    unit: TimestampUnit,
+    acc: &mut Option<(i64, i64)>,
+) -> bool {
     match value {
         Value::Object(map) => {
             for (key, child) in map {
                 if key == field {
-                    // OTLP writes 64-bit times as JSON strings; journald and
-                    // plain numeric logs write them as numbers.
-                    let Some((lower, upper)) = timestamp_bounds(child) else {
+                    let Some((lower, upper)) = timestamp_bounds(child, unit) else {
                         return false;
                     };
                     *acc = Some(match *acc {
                         Some((lo, hi)) => (lo.min(lower), hi.max(upper)),
                         None => (lower, upper),
                     });
-                } else if !fold_timestamps(child, field, acc) {
+                } else if !fold_timestamps(child, field, unit, acc) {
                     return false;
                 }
             }
             true
         }
-        Value::Array(items) => items.iter().all(|v| fold_timestamps(v, field, acc)),
+        Value::Array(items) => items.iter().all(|v| fold_timestamps(v, field, unit, acc)),
         _ => true,
     }
 }
 
-fn timestamp_bounds(value: &Value) -> Option<(i64, i64)> {
+fn timestamp_bounds(value: &Value, unit: TimestampUnit) -> Option<(i64, i64)> {
+    if unit == TimestampUnit::Rfc3339 {
+        let timestamp = chrono::DateTime::parse_from_rfc3339(value.as_str()?).ok()?;
+        let lower = timestamp.timestamp_micros();
+        let upper = if timestamp.timestamp_subsec_nanos().is_multiple_of(1_000) {
+            lower
+        } else {
+            lower.checked_add(1)?
+        };
+        return Some((lower, upper));
+    }
+
     let integer = match value {
         Value::String(s) => s.parse::<i64>().ok(),
         Value::Number(n) => n.as_i64(),
@@ -1430,6 +1448,59 @@ mod tests {
                 .expect("bounds");
         assert_eq!(min_us, 1779907425563251);
         assert_eq!(max_us, 1779907425563252);
+    }
+
+    #[test]
+    fn rfc3339_bounds_normalize_offsets_and_round_outward() {
+        let unit: TimestampUnit = serde_json::from_str("\"rfc3339\"").unwrap();
+        for (timestamp, expected) in [
+            ("1970-01-01T00:00:01Z", (1_000_000, 1_000_000)),
+            ("1970-01-01T01:00:00.0000005+01:00", (0, 1)),
+            ("1969-12-31T23:59:59.9999995Z", (-1, 0)),
+            ("1969-12-31T19:00:00-05:00", (0, 0)),
+        ] {
+            let content = format!(r#"{{"ts":"{timestamp}","committed.txn_ids":7}}"#);
+            assert_eq!(
+                scan_temporal_bounds(content.as_bytes(), "ts", unit),
+                Some(expected)
+            );
+        }
+        let nested = b"{\"samples\":[{\"timestamp\":\"1970-01-01T00:00:02.123456789Z\"}]}\n\
+                       {\"timestamp\":\"1970-01-01T01:00:00+01:00\",\"charged\":42}\n";
+        assert_eq!(
+            scan_temporal_bounds(nested, "timestamp", unit),
+            Some((0, 2_123_457))
+        );
+    }
+
+    #[test]
+    fn rfc3339_mode_is_explicit_and_requires_a_complete_zoned_timestamp() {
+        let unit: TimestampUnit = serde_json::from_str("\"rfc3339\"").unwrap();
+        for value in [
+            r#""1970-01-01""#,
+            r#""1970-01-01T00:00:00""#,
+            r#""2026-02-30T00:00:00Z""#,
+            r#""not a date""#,
+            r#""1000000""#,
+            "1000000",
+            "null",
+        ] {
+            let content = format!(r#"{{"ts":{value}}}"#);
+            assert_eq!(
+                scan_temporal_bounds(content.as_bytes(), "ts", unit),
+                None,
+                "{value}"
+            );
+        }
+        assert_eq!(
+            scan_temporal_bounds(
+                br#"{"ts":"1970-01-01T00:00:01Z"}"#,
+                "ts",
+                TimestampUnit::Seconds
+            ),
+            None,
+            "numeric modes must not silently reinterpret date strings"
+        );
     }
 
     #[test]

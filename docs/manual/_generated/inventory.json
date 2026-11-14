@@ -5902,14 +5902,23 @@
     "factory:logfile-ingest": {
       "$defs": {
         "TimestampUnit": {
-          "description": "Unit of the values found under `timestamp_field`.\n\ntlogfs records event times in microseconds, so everything is converted to\nthat. Microseconds is the default because it is what tlogfs itself uses.",
-          "enum": [
-            "seconds",
-            "milliseconds",
-            "microseconds",
-            "nanoseconds"
-          ],
-          "type": "string"
+          "description": "Interpretation of the values found under `timestamp_field`.\n\ntlogfs records event times in microseconds, so everything is converted to\nthat. Microseconds is the default because it is what tlogfs itself uses.",
+          "oneOf": [
+            {
+              "enum": [
+                "seconds",
+                "milliseconds",
+                "microseconds",
+                "nanoseconds"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "rfc3339",
+              "description": "RFC3339 date-time strings, including an explicit UTC offset.",
+              "type": "string"
+            }
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -5939,7 +5948,7 @@
         "timestamp_unit": {
           "$ref": "#/$defs/TimestampUnit",
           "default": "microseconds",
-          "description": "Unit of the `timestamp_field` values. OTLP's `timeUnixNano` is\nnanoseconds; journald's `__REALTIME_TIMESTAMP` is microseconds."
+          "description": "Numeric unit or explicit string format for `timestamp_field`.\nOTLP's `timeUnixNano` is nanoseconds; journald uses microseconds.\nUse `rfc3339` for complete date-time strings with a UTC offset."
         }
       },
       "required": [
