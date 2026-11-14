@@ -902,6 +902,97 @@ impl Provider {
         )))
     }
 
+    /// Resolve a shared event-time axis without constructing source providers.
+    ///
+    /// Native table-series metadata and explicit dynamic query contracts are
+    /// authoritative. Host files and external format transformations remain
+    /// unknown because they may change column names or time representations.
+    pub(crate) async fn event_time_column_for_url(&self, url_str: &str) -> Result<Option<String>> {
+        let url = Url::parse(url_str)?;
+        if url.is_host() || !matches!(url.scheme(), "file" | "series" | "table" | "data") {
+            return Ok(None);
+        }
+        let Some(context) = self.provider_context.as_ref() else {
+            return Ok(None);
+        };
+        let root = self.root().await?;
+        let nodes = if url.path().contains('*') || url.path().contains('?') {
+            root.collect_matches(url.path()).await.map_err(|error| {
+                Error::InvalidUrl(format!("Event-time pattern '{}': {error}", url.path()))
+            })?
+        } else {
+            vec![(self.resolve_url_node(&url).await?, Vec::new())]
+        };
+        let mut common = None;
+        for (node, _) in nodes {
+            let id = node.id();
+            let column = if id.entry_type().is_dynamic() {
+                let file = node.as_file().await.map_err(|error| {
+                    Error::InvalidUrl(format!(
+                        "Event-time source '{}': {error}",
+                        node.path().display()
+                    ))
+                })?;
+                let handle = file.handle.get_file().await;
+                let guard = handle.lock().await;
+                guard
+                    .as_queryable()
+                    .and_then(|queryable| queryable.event_time_column())
+                    .map(str::to_owned)
+            } else if id.entry_type() == tinyfs::EntryType::TablePhysicalSeries {
+                let versions =
+                    context
+                        .persistence
+                        .list_file_versions(id)
+                        .await
+                        .map_err(|error| {
+                            Error::InvalidUrl(format!("Event-time metadata for {id}: {error}"))
+                        })?;
+                let mut column = None;
+                for version in versions.iter().filter(|version| version.size > 0) {
+                    let Some(attributes) = version
+                        .extended_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("extended_attributes"))
+                    else {
+                        return Ok(None);
+                    };
+                    let attributes: serde_json::Value =
+                        serde_json::from_str(attributes).map_err(|error| {
+                            Error::InvalidUrl(format!(
+                                "Invalid event-time attributes for {id} version {}: {error}",
+                                version.version
+                            ))
+                        })?;
+                    let Some(recorded) = attributes
+                        .get("watertown.timestamp_column")
+                        .and_then(serde_json::Value::as_str)
+                    else {
+                        return Ok(None);
+                    };
+                    if column
+                        .as_deref()
+                        .is_some_and(|previous| previous != recorded)
+                    {
+                        return Ok(None);
+                    }
+                    column = Some(recorded.to_owned());
+                }
+                column
+            } else {
+                None
+            };
+            let Some(column) = column else {
+                return Ok(None);
+            };
+            if common.as_ref().is_some_and(|previous| previous != &column) {
+                return Ok(None);
+            }
+            common = Some(column);
+        }
+        Ok(common)
+    }
+
     /// Resolve the immutable physical lineage of a URL pattern.
     ///
     /// Dynamic query nodes must explicitly expose recursive lineage and bounded

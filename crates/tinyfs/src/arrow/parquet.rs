@@ -111,8 +111,8 @@ pub fn extract_temporal_bounds_from_batch(
             .ok_or_else(|| crate::Error::Other("No min value in timestamp column".into()))?;
         let max = arrow::compute::max::<TimestampNanosecondType>(ts_array)
             .ok_or_else(|| crate::Error::Other("No max value in timestamp column".into()))?;
-        // Convert nanoseconds -> microseconds
-        return Ok((min / 1_000, max / 1_000));
+        // Match query execution's microsecond bins for pre-epoch timestamps.
+        return Ok((min.div_euclid(1_000), max.div_euclid(1_000)));
     }
 
     Err(crate::Error::Other(format!(
@@ -182,8 +182,10 @@ pub fn extract_temporal_bounds_from_parquet_metadata(
         (Some(min), Some(max)) => {
             // Normalize to microseconds
             let (min_micros, max_micros) = if to_micros_multiplier < 0 {
-                // Nanoseconds: divide
-                (min / (-to_micros_multiplier), max / (-to_micros_multiplier))
+                (
+                    min.div_euclid(-to_micros_multiplier),
+                    max.div_euclid(-to_micros_multiplier),
+                )
             } else {
                 (min * to_micros_multiplier, max * to_micros_multiplier)
             };
@@ -959,6 +961,29 @@ mod tests {
         let (min, max) = extract_temporal_bounds_from_batch(&batch, "timestamp")?;
         assert_eq!(min, 100);
         assert_eq!(max, 500);
+
+        let nanoseconds = RecordBatch::try_from_iter([(
+            "timestamp",
+            Arc::new(arrow_array::TimestampNanosecondArray::from(vec![-1500, -1]))
+                as arrow_array::ArrayRef,
+        )])?;
+        assert_eq!(
+            extract_temporal_bounds_from_batch(&nanoseconds, "timestamp")?,
+            (-2, -1)
+        );
+        let bytes = super::serialize_batch_to_parquet(&nanoseconds)?;
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            bytes::Bytes::from(bytes),
+        )?;
+        assert_eq!(
+            super::extract_temporal_bounds_from_parquet_metadata(
+                reader.metadata(),
+                reader.schema(),
+                "timestamp",
+            )?,
+            (-2, -1),
+            "batch and footer bounds must use the same pre-epoch bins"
+        );
 
         debug!("[OK] Temporal bounds extraction using Arrow kernels works!");
         Ok(())

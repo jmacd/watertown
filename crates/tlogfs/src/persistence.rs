@@ -6215,6 +6215,315 @@ mod metadata_query_tests {
         );
     }
 
+    async fn materialize(
+        root_id: FileID,
+        context: &tinyfs::ProviderContext,
+        source: &str,
+        target: &str,
+    ) {
+        provider::factory::materialize_series::execute(
+            serde_json::json!({"source": source, "target": target, "time_column": "timestamp"}),
+            FactoryContext::new(context.clone(), root_id),
+            provider::ExecutionContext::pond_readwriter(Vec::new()),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("materialize {source} -> {target}: {error}"));
+    }
+
+    #[tokio::test]
+    async fn materialization_bounds_native_and_declared_derived_sources_before_construction() {
+        use tinyfs::arrow::ParquetExt;
+
+        let (_dir, mut persistence, _) = fixture().await;
+        let batch = |timestamp| {
+            arrow::record_batch::RecordBatch::try_from_iter([
+                (
+                    "timestamp",
+                    Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                        timestamp,
+                    ])) as arrow::array::ArrayRef,
+                ),
+                (
+                    "value",
+                    Arc::new(Int64Array::from(vec![timestamp])) as arrow::array::ArrayRef,
+                ),
+            ])
+            .unwrap()
+        };
+        let sources = [
+            ("series:///source.series", "/native.series"),
+            ("series:///local", "/local.series"),
+            ("series:///joined", "/joined.series"),
+            ("series:///global", "/global.series"),
+        ];
+        let tx = persistence.begin_test().await.expect("begin fixture");
+        let root = tx.root().await.expect("root");
+        for timestamp in 1..=16 {
+            _ = root
+                .write_series_from_batch("/source.series", &batch(timestamp), Some("timestamp"))
+                .await
+                .unwrap();
+            _ = root
+                .write_series_from_batch("/other.series", &batch(timestamp), Some("timestamp"))
+                .await
+                .unwrap();
+        }
+        let source_id = root.get_node_path("/source.series").await.unwrap().id();
+        for (path, locality, query) in [
+            (
+                "/local",
+                serde_json::json!({"type": "timestamp-local", "event_time": "timestamp"}),
+                "SELECT timestamp, value FROM source",
+            ),
+            (
+                "/global",
+                serde_json::json!({"type": "global"}),
+                "SELECT timestamp, COUNT(*) OVER () AS total FROM source",
+            ),
+        ] {
+            _ = root
+                .create_dynamic_path(
+                    path,
+                    EntryType::TableDynamic,
+                    "sql-derived-series",
+                    serde_yaml::to_string(&serde_json::json!({
+                        "patterns": {"source": "series:///source.series"},
+                        "locality": locality, "query": query,
+                    }))
+                    .unwrap()
+                    .into_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        _ = root
+            .create_dynamic_path(
+                "/joined",
+                EntryType::TableDynamic,
+                "timeseries-join",
+                serde_yaml::to_string(&serde_json::json!({
+                    "time_column": "timestamp",
+                    "inputs": [
+                        {"pattern": "series:///local", "scope": "metrics"},
+                        {"pattern": "series:///other.series", "scope": "copy"}
+                    ],
+                }))
+                .unwrap()
+                .into_bytes(),
+            )
+            .await
+            .unwrap();
+        let root_id = root.node_path().id();
+        tx.commit_test().await.unwrap();
+        for (source, target) in sources {
+            let tx = persistence.begin_test().await.unwrap();
+            let context = tx.state().unwrap().as_provider_context();
+            materialize(root_id, &context, source, target).await;
+            tx.commit_test().await.unwrap();
+        }
+
+        let tx = persistence.begin_test().await.unwrap();
+        _ = tx
+            .root()
+            .await
+            .unwrap()
+            .write_series_from_batch("/source.series", &batch(17), Some("timestamp"))
+            .await
+            .unwrap();
+        _ = tx
+            .root()
+            .await
+            .unwrap()
+            .write_series_from_batch("/other.series", &batch(17), Some("timestamp"))
+            .await
+            .unwrap();
+        tx.commit_test().await.unwrap();
+
+        for (source, target) in sources {
+            let tx = persistence.begin_test().await.unwrap();
+            let state = tx.state().unwrap();
+            let scans = record_scans(&state).await;
+            let context = state.as_provider_context();
+            materialize(root_id, &context, source, target).await;
+            if target != "/global.series" {
+                let scans = scans.lock().expect("scans");
+                for scan in scans.iter().filter(|scan| {
+                    scan.columns.iter().any(|column| column == "content")
+                        && scan.filters.contains(&source_id.node_id().to_string())
+                }) {
+                    assert!(
+                        scan.filters.contains("version = Int64(16)")
+                            || scan.filters.contains("version = Int64(17)"),
+                        "{source} constructed or read historical source payload before its watermark: {scan:?}"
+                    );
+                }
+            }
+            let root = tx.root().await.unwrap();
+            let query = provider::Provider::with_context(
+                Arc::new(context.filesystem()),
+                Arc::new(context.clone()),
+            )
+            .with_root(root.clone());
+            let table = query
+                .create_provider_for_url(&format!("series://{target}"), &context.datafusion_session)
+                .await
+                .unwrap();
+            let output = context
+                .datafusion_session
+                .read_table(table)
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                output.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                17,
+                "{source}"
+            );
+            if target == "/global.series" {
+                let new_totals = output
+                    .iter()
+                    .map(|batch| {
+                        batch
+                            .column_by_name("total")
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap()
+                            .values()
+                            .iter()
+                            .filter(|value| **value == 17)
+                            .count()
+                    })
+                    .sum::<usize>();
+                assert_eq!(new_totals, 1);
+                assert!(context.plan_visibility_metrics().global_plans > 0);
+            }
+            tx.commit_test().await.unwrap();
+            let tx = persistence.begin_test().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let context = tx.state().unwrap().as_provider_context();
+            materialize(root_id, &context, source, target).await;
+            assert_eq!(
+                root.list_file_versions(target).await.unwrap().len(),
+                2,
+                "idle pass must not append"
+            );
+            tx.commit_test().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn materialization_preserves_negative_nanoseconds_with_mixed_legacy_bounds() {
+        use tinyfs::arrow::ParquetExt;
+
+        let (_dir, mut persistence, _) = fixture().await;
+        let batch = |timestamp| {
+            arrow::record_batch::RecordBatch::try_from_iter([(
+                "timestamp",
+                Arc::new(arrow::array::TimestampNanosecondArray::from(vec![
+                    timestamp,
+                ])) as arrow::array::ArrayRef,
+            )])
+            .unwrap()
+        };
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        let root_id = root.node_path().id();
+        _ = root
+            .write_series_from_batch("/source.series", &batch(-900), Some("timestamp"))
+            .await
+            .unwrap();
+        let source_id = root.get_node_path("/source.series").await.unwrap().id();
+        let state = tx.state().unwrap();
+        materialize(
+            root_id,
+            &state.as_provider_context(),
+            "series:///source.series",
+            "/target.series",
+        )
+        .await;
+        let target_id = root.get_node_path("/target.series").await.unwrap().id();
+        // The old timestamp extractor truncated negative nanoseconds toward zero.
+        for record in &mut state.inner.lock().await.records {
+            if record.node_id == target_id.node_id() {
+                record.max_event_time = Some(0);
+            }
+        }
+        tx.commit_test().await.unwrap();
+
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        for timestamp in [-800, -100] {
+            _ = root
+                .write_series_from_batch("/source.series", &batch(timestamp), Some("timestamp"))
+                .await
+                .unwrap();
+        }
+        // New chunks may instead carry correctly floored microsecond bounds.
+        for record in &mut tx.state().unwrap().inner.lock().await.records {
+            if record.node_id == source_id.node_id() {
+                record.min_event_time = Some(-1);
+                record.max_event_time = Some(-1);
+            }
+        }
+        tx.commit_test().await.unwrap();
+
+        for _ in 0..2 {
+            let tx = persistence.begin_test().await.unwrap();
+            let context = tx.state().unwrap().as_provider_context();
+            materialize(
+                root_id,
+                &context,
+                "series:///source.series",
+                "/target.series",
+            )
+            .await;
+            let query = provider::Provider::with_context(
+                Arc::new(context.filesystem()),
+                Arc::new(context.clone()),
+            );
+            let table = query
+                .create_provider_for_url("series:///target.series", &context.datafusion_session)
+                .await
+                .unwrap();
+            let batches = context
+                .datafusion_session
+                .read_table(table)
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let mut values: Vec<_> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column_by_name("timestamp")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            values.sort_unstable();
+            assert_eq!(values, [-900, -800, -100]);
+            assert_eq!(
+                tx.root()
+                    .await
+                    .unwrap()
+                    .list_file_versions("/target.series")
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+            tx.commit_test().await.unwrap();
+        }
+    }
+
     fn assert_node_metadata_projection(
         scans: &Arc<std::sync::Mutex<Vec<Scan>>>,
         committed_version: Option<i64>,

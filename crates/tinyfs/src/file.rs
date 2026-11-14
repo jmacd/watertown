@@ -276,6 +276,13 @@ pub trait File: Metadata + Send + Sync {
 #[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait QueryableFile: File {
+    /// Output column whose epoch-microsecond range is accepted by
+    /// [`Self::as_table_provider_bounded`]. Unknown or global queries return
+    /// `None`; callers must not infer the axis from a column name or schema.
+    fn event_time_column(&self) -> Option<&str> {
+        None
+    }
+
     /// Convert this file into a DataFusion TableProvider for SQL queries
     ///
     /// The id parameter identifies the file, and context provides access to

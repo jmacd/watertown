@@ -1687,6 +1687,13 @@ impl SqlDerivedFile {
 // QueryableFile trait implementation - follows anti-duplication principles
 #[async_trait]
 impl tinyfs::QueryableFile for SqlDerivedFile {
+    fn event_time_column(&self) -> Option<&str> {
+        match &self.config.locality {
+            SqlDerivedLocality::TimestampLocal { event_time } => Some(event_time),
+            SqlDerivedLocality::Global => None,
+        }
+    }
+
     /// Create TableProvider for SqlDerivedFile using DataFusion's ViewTable
     ///
     /// This approach creates a ViewTable that wraps the SqlDerivedFile's SQL query,

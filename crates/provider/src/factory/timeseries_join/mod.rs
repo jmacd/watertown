@@ -324,6 +324,10 @@ crate::factory::lazy_sql_file::impl_lazy_sql_derived_file_metadata!(TimeseriesJo
 
 #[async_trait::async_trait]
 impl tinyfs::QueryableFile for TimeseriesJoinFile {
+    fn event_time_column(&self) -> Option<&str> {
+        Some(&self.config.time_column)
+    }
+
     async fn as_table_provider(
         &self,
         id: FileID,

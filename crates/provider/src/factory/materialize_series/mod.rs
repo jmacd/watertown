@@ -295,7 +295,7 @@ fn target_watermark_from_metadata(
             };
             TargetWatermark::BoundedNanosecond {
                 lower: ScalarValue::TimestampNanosecond(Some(lower_ns), timezone.clone()),
-                lower_us: max_us,
+                lower_us: lower_ns.div_euclid(1_000),
             }
         }
         other => {
@@ -307,24 +307,13 @@ fn target_watermark_from_metadata(
     Ok(scalar)
 }
 
-/// The largest event time already materialized into `target`, or `None` when
-/// the target does not exist yet.
-///
-/// Every live physical-series version records its event-time maximum in epoch
-/// microseconds. Taking the maximum across all live versions remains correct
-/// after size-tiered collapse, unlike inspecting only the numerically newest
-/// version. Microsecond and coarser target types use that value directly.
-/// Nanosecond targets perform an exact `MAX` only over the metadata-selected
-/// tail because sub-microsecond precision is not present in the version bound.
-/// A legacy target with missing bounds falls back visibly to the full scan.
-async fn read_watermark(
+async fn target_versions(
     context: &FactoryContext,
     config: &MaterializeSeriesConfig,
-    source_time_type: &DataType,
-) -> Result<Option<ScalarValue>, tinyfs::Error> {
+) -> TinyFSResult<Vec<tinyfs::FileVersionInfo>> {
     let root = context.root().await?;
     if !root.exists(&config.target).await {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let metadata = root.metadata_for_path(&config.target).await?;
     if metadata.entry_type != tinyfs::EntryType::TablePhysicalSeries {
@@ -334,8 +323,68 @@ async fn read_watermark(
         )));
     }
 
-    let versions = root.list_file_versions(&config.target).await?;
-    let plan = target_watermark_from_metadata(&versions, &config.time_column, source_time_type)?;
+    root.list_file_versions(&config.target).await
+}
+
+async fn source_read_bounds(
+    context: &FactoryContext,
+    config: &MaterializeSeriesConfig,
+    versions: &[tinyfs::FileVersionInfo],
+) -> TinyFSResult<tinyfs::SeriesReadBounds> {
+    // The target's microsecond metadata is a conservative hint even before
+    // the source's timestamp type is known. The exact filter is applied later.
+    let hint = match target_watermark_from_metadata(
+        versions,
+        &config.time_column,
+        &DataType::Int64,
+    )? {
+        TargetWatermark::Empty => return Ok(tinyfs::SeriesReadBounds::NONE),
+        TargetWatermark::FullScan { reason } => {
+            warn!(
+                "materialize-series: source {} is unbounded because target metadata is incomplete: {reason}",
+                config.source
+            );
+            return Ok(tinyfs::SeriesReadBounds::NONE);
+        }
+        TargetWatermark::Exact(ScalarValue::Int64(Some(max_us))) => max_us,
+        _ => unreachable!("microsecond metadata hint is exact, empty or unavailable"),
+    };
+    let provider = crate::Provider::with_context(
+        Arc::new(context.context.filesystem()),
+        Arc::new(context.context.clone()),
+    )
+    .with_root(context.root().await?);
+    let column = provider
+        .event_time_column_for_url(&config.source.to_string())
+        .await
+        .map_other_context("materialize-series: source event-time contract")?;
+    if column.as_deref() != Some(config.time_column.as_str()) {
+        warn!(
+            "materialize-series: source {} is unbounded: declared event-time column {:?} does not establish requested column {:?}",
+            config.source, column, config.time_column
+        );
+        return Ok(tinyfs::SeriesReadBounds::NONE);
+    }
+    // Legacy nanosecond metadata truncated toward zero. Retain the preceding
+    // microsecond bin until the source type and exact target maximum are known.
+    let lower = if hint <= 0 {
+        hint.saturating_sub(1)
+    } else {
+        hint
+    };
+    Ok(tinyfs::SeriesReadBounds::from_event_time_lo(lower))
+}
+
+/// Resolve the exact target watermark from already-read version metadata.
+/// Nanosecond targets need a bounded tail scan; legacy metadata needs a visible
+/// full scan. Microsecond and coarser types normally require no target payload.
+async fn read_watermark(
+    context: &FactoryContext,
+    config: &MaterializeSeriesConfig,
+    versions: &[tinyfs::FileVersionInfo],
+    source_time_type: &DataType,
+) -> Result<Option<ScalarValue>, tinyfs::Error> {
+    let plan = target_watermark_from_metadata(versions, &config.time_column, source_time_type)?;
     match plan {
         TargetWatermark::Empty => return Ok(None),
         TargetWatermark::Exact(watermark) => {
@@ -417,7 +466,9 @@ pub async fn execute(
     }
 
     let session = &context.context.datafusion_session;
-    let source = table_for(&context, &config.source.to_string(), session).await?;
+    let versions = target_versions(&context, &config).await?;
+    let bounds = source_read_bounds(&context, &config, &versions).await?;
+    let source = table_for_bounded(&context, &config.source.to_string(), session, bounds).await?;
     let mut frame = session
         .read_table(source)
         .map_err(|e| tinyfs::Error::Other(format!("materialize-series: read source: {e}")))?;
@@ -432,7 +483,7 @@ pub async fn execute(
         })?
         .data_type()
         .clone();
-    let watermark = read_watermark(&context, &config, &source_time_type).await?;
+    let watermark = read_watermark(&context, &config, &versions, &source_time_type).await?;
     if watermark.is_none() {
         context.context.record_non_incremental_plan();
         info!(
@@ -457,6 +508,16 @@ pub async fn execute(
         .map_other_context("materialize-series: serialize recipe identity")?;
     let recipe_id = blake3::hash(&recipe_bytes).to_hex().to_string();
     let after = watermark.as_ref().map(scalar_event_time_us).transpose()?;
+    // The frame already enforces the exact predicate. A second microsecond-only
+    // publication boundary would reject valid nanosecond rows in the same bin.
+    let publication_after = if matches!(
+        source_time_type,
+        DataType::Timestamp(TimeUnit::Nanosecond, _)
+    ) {
+        None
+    } else {
+        after
+    };
     let source_generation = context
         .context
         .persistence
@@ -489,7 +550,9 @@ pub async fn execute(
                 SettledState::try_new(source_max_us, source_max_us, RepairPolicy::reject())?,
             )
         },
-        MaterializationPublication::Append { after },
+        MaterializationPublication::Append {
+            after: publication_after,
+        },
         stream,
     )
     .await
@@ -624,7 +687,7 @@ mod tests {
             watermark,
             TargetWatermark::BoundedNanosecond {
                 lower: ScalarValue::TimestampNanosecond(Some(-1_999), None),
-                lower_us: -1,
+                lower_us: -2,
             }
         ));
     }
@@ -787,7 +850,7 @@ mod tests {
         let first = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
-                Arc::new(TimestampNanosecondArray::from(vec![1_001, 1_999])),
+                Arc::new(TimestampNanosecondArray::from(vec![1_001, 1_500])),
                 Arc::new(Float64Array::from(vec![10.0, 20.0])),
             ],
         )
@@ -827,8 +890,8 @@ mod tests {
         let second = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(TimestampNanosecondArray::from(vec![2_001])),
-                Arc::new(Float64Array::from(vec![30.0])),
+                Arc::new(TimestampNanosecondArray::from(vec![1_500, 1_999, 2_001])),
+                Arc::new(Float64Array::from(vec![20.0, 30.0, 40.0])),
             ],
         )
         .unwrap();
@@ -865,13 +928,91 @@ mod tests {
                     .copied()
             })
             .collect::<Vec<_>>();
-        assert_eq!(timestamps, vec![1_001, 1_999, 2_001]);
+        assert_eq!(timestamps, vec![1_001, 1_500, 1_999, 2_001]);
         assert_eq!(
             root.list_file_versions("/target-ns.series")
                 .await
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_does_not_prune_using_a_different_source_time_column() {
+        let (fs, provider_context) = crate::factory::test_support::create_test_environment().await;
+        let root = fs.root().await.unwrap();
+        let batch = |value| {
+            RecordBatch::try_from_iter([
+                (
+                    "timestamp",
+                    Arc::new(TimestampMicrosecondArray::from(vec![value]))
+                        as arrow::array::ArrayRef,
+                ),
+                (
+                    "other_time",
+                    Arc::new(TimestampMicrosecondArray::from(vec![value * 100]))
+                        as arrow::array::ArrayRef,
+                ),
+            ])
+            .unwrap()
+        };
+        let config = serde_json::json!({
+            "source": "series:///source.series",
+            "target": "/target.series",
+            "time_column": "other_time",
+        });
+        let context = crate::factory::test_support::test_context(&provider_context, FileID::root());
+        for values in [1..=2, 3..=4] {
+            for value in values {
+                _ = root
+                    .write_series_from_batch("/source.series", &batch(value), Some("timestamp"))
+                    .await
+                    .unwrap();
+                let id = root.get_node_path("/source.series").await.unwrap().id();
+                provider_context
+                    .persistence
+                    .set_extended_attributes(
+                        id,
+                        HashMap::from([
+                            ("min_event_time".to_owned(), value.to_string()),
+                            ("max_event_time".to_owned(), value.to_string()),
+                            (
+                                "extended_attributes".to_owned(),
+                                r#"{"watertown.timestamp_column":"timestamp"}"#.to_owned(),
+                            ),
+                        ]),
+                    )
+                    .await
+                    .unwrap();
+            }
+            execute(
+                config.clone(),
+                context.clone(),
+                ExecutionContext::pond_readwriter(Vec::new()),
+            )
+            .await
+            .unwrap();
+        }
+        let context = crate::factory::test_support::test_context(&provider_context, FileID::root());
+        let table = table_for(
+            &context,
+            "series:///target.series",
+            &provider_context.datafusion_session,
+        )
+        .await
+        .unwrap();
+        let output = provider_context
+            .datafusion_session
+            .read_table(table)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            output.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            4,
+            "a different temporal index must not hide valid rows"
         );
     }
 }
