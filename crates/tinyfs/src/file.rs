@@ -279,6 +279,8 @@ pub trait QueryableFile: File {
     /// Output column whose epoch-microsecond range is accepted by
     /// [`Self::as_table_provider_bounded`]. Unknown or global queries return
     /// `None`; callers must not infer the axis from a column name or schema.
+    /// Derived implementations must verify each input's axis before forwarding
+    /// event-time bounds, ignoring them for unknown or mismatched inputs.
     fn event_time_column(&self) -> Option<&str> {
         None
     }

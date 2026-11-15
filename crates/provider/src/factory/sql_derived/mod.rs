@@ -1231,12 +1231,11 @@ impl SqlDerivedFile {
 
     /// Resolve a single pattern to its source files, build a source
     /// TableProvider, apply transforms and scope prefixes, and register it in
-    /// the DataFusion session under a deterministic table name.  Records the
-    /// pattern -> table-name mapping in `table_mappings`.  Tables already
+    /// the DataFusion session under a deterministic table name. Tables already
     /// registered (shared source files) are not rebuilt.
     ///
-    /// Returns `true` when a real source table was registered (and mapped), or
-    /// `false` when the pattern matched no files.  A zero-match pattern is NOT
+    /// Returns the registered table name, or `None` when the pattern matched
+    /// no files. A zero-match pattern is NOT
     /// an error: a glob is a set and an empty set is valid.  The caller is
     /// responsible for registering an empty placeholder for the unmatched
     /// pattern (see `register_empty_pattern_table`), because the generated SQL
@@ -1248,9 +1247,9 @@ impl SqlDerivedFile {
         context: &tinyfs::ProviderContext,
         pattern_name: &str,
         pattern: &crate::Url,
-        table_mappings: &mut HashMap<String, String>,
         bounds: tinyfs::SeriesReadBounds,
-    ) -> TinyFSResult<bool> {
+        event_time: Option<&str>,
+    ) -> TinyFSResult<Option<String>> {
         let ctx = &context.datafusion_session;
 
         // Source files can be created by factories (Dynamic) or direct uploads
@@ -1307,7 +1306,37 @@ impl SqlDerivedFile {
         }
 
         if queryable_files.is_empty() {
-            return Ok(false);
+            return Ok(None);
+        }
+
+        let mut bounds = bounds;
+        if bounds.event_time_lo.is_some() {
+            let transforms = match &self.config.pattern_transforms {
+                Some(pattern_transforms) => pattern_transforms.get(pattern_name),
+                None => self.config.transforms.as_ref(),
+            };
+            let source_time = if transforms.is_some_and(|paths| !paths.is_empty())
+                || self.config.provider_wrapper.is_some()
+            {
+                None
+            } else {
+                crate::Provider::with_context(
+                    Arc::new(context.filesystem()),
+                    Arc::new(context.clone()),
+                )
+                .with_root(self.context.root().await?)
+                .event_time_column_for_url(&pattern.to_string())
+                .await
+                .map_other_context("SQL-derived source event-time contract")?
+            };
+            if event_time.is_none() || source_time.as_deref() != event_time {
+                log::warn!(
+                    "SQL-derived source {pattern} is unbounded in event time: \
+                     requested axis {event_time:?}, proven input axis {source_time:?}; \
+                     unknown axes and unproven transforms cannot prune source versions"
+                );
+                bounds.event_time_lo = None;
+            }
         }
 
         // Data-only table name: depends ONLY on the pattern URL and resolved
@@ -1335,8 +1364,6 @@ impl SqlDerivedFile {
             unique_table_name, pattern, has_per_consumer_wrapping
         );
 
-        _ = table_mappings.insert(pattern_name.to_string(), unique_table_name.clone());
-
         // Only the first instance sharing this data table name does the
         // expensive construction.  With per-consumer wrapping the name includes
         // the node_id so the check always misses and each consumer builds its own.
@@ -1355,7 +1382,7 @@ impl SqlDerivedFile {
                 "[GO] SQL-DERIVED: Data table '{}' already registered, skipping construction",
                 unique_table_name
             );
-            return Ok(true);
+            return Ok(Some(unique_table_name));
         }
 
         let scheme = pattern.scheme();
@@ -1446,7 +1473,7 @@ impl SqlDerivedFile {
             unique_table_name, pattern_name
         );
 
-        Ok(true)
+        Ok(Some(unique_table_name))
     }
 
     /// Register an empty placeholder table for a pattern that matched no files.
@@ -1587,7 +1614,12 @@ impl SqlDerivedFile {
         debug!("[SAVE] CACHE MISS: Creating new ViewTable for node_id: {id}");
         let ctx = &context.datafusion_session;
         let (table_mappings, _) = self
-            .register_source_tables_bounded(id, context, bounds)
+            .register_source_tables_bounded(
+                id,
+                context,
+                bounds,
+                tinyfs::QueryableFile::event_time_column(self),
+            )
             .await?;
         let effective_sql = self.get_effective_sql(&SqlTransformOptions {
             table_mappings: Some(table_mappings.clone()),
@@ -1677,30 +1709,29 @@ impl SqlDerivedFile {
         id: FileID,
         context: &tinyfs::ProviderContext,
     ) -> TinyFSResult<(HashMap<String, String>, std::collections::HashSet<String>)> {
-        self.register_source_tables_bounded(id, context, tinyfs::SeriesReadBounds::NONE)
+        self.register_source_tables_bounded(id, context, tinyfs::SeriesReadBounds::NONE, None)
             .await
     }
 
+    /// Qualify event-time bounds against each input before constructing it.
+    /// Output names alone do not prove an input index or transform uses the
+    /// same axis; unproven inputs retain their full event-time history.
     pub(crate) async fn register_source_tables_bounded(
         &self,
         id: FileID,
         context: &tinyfs::ProviderContext,
         bounds: tinyfs::SeriesReadBounds,
+        event_time: Option<&str>,
     ) -> TinyFSResult<(HashMap<String, String>, std::collections::HashSet<String>)> {
         let mut table_mappings = HashMap::new();
         let mut empty_patterns = Vec::new();
         for (pattern_name, pattern) in &self.get_config().patterns {
             let registered = self
-                .register_pattern_source(
-                    id,
-                    context,
-                    pattern_name,
-                    pattern,
-                    &mut table_mappings,
-                    bounds,
-                )
+                .register_pattern_source(id, context, pattern_name, pattern, bounds, event_time)
                 .await?;
-            if !registered {
+            if let Some(table_name) = registered {
+                _ = table_mappings.insert(pattern_name.clone(), table_name);
+            } else {
                 empty_patterns.push(pattern_name.clone());
             }
         }

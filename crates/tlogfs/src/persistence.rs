@@ -6414,6 +6414,207 @@ mod metadata_query_tests {
     }
 
     #[tokio::test]
+    async fn materialization_preserves_rows_through_mismatched_and_unknown_input_axes() {
+        use tinyfs::arrow::ParquetExt;
+
+        let (_dir, mut persistence, _) = fixture().await;
+        let batch = |time| {
+            arrow::record_batch::RecordBatch::try_from_iter([
+                (
+                    "timestamp",
+                    Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                        time * 100,
+                    ])) as arrow::array::ArrayRef,
+                ),
+                (
+                    "ingest_time",
+                    Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![time]))
+                        as arrow::array::ArrayRef,
+                ),
+                (
+                    "value",
+                    Arc::new(Int64Array::from(vec![time])) as arrow::array::ArrayRef,
+                ),
+            ])
+            .unwrap()
+        };
+        let sources = [
+            ("series:///local", "/local-target.series"),
+            ("series:///grouped", "/grouped-target.series"),
+            ("series:///joined", "/joined-target.series"),
+            ("series:///nested", "/nested-target.series"),
+            ("series:///unknown", "/unknown-target.series"),
+        ];
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        for time in 1..=2 {
+            for (path, column) in [
+                ("/indexed.series", "ingest_time"),
+                ("/unknown.series", "ingest_time"),
+                ("/matched.series", "timestamp"),
+            ] {
+                _ = root
+                    .write_series_from_batch(path, &batch(time), Some(column))
+                    .await
+                    .unwrap();
+            }
+        }
+        let unknown_id = root.get_node_path("/unknown.series").await.unwrap().id();
+        for record in &mut tx.state().unwrap().inner.lock().await.records {
+            if record.node_id == unknown_id.node_id() {
+                record.extended_attributes = None;
+            }
+        }
+        for (path, source, locality, query) in [
+            (
+                "/local",
+                "series:///indexed.series",
+                "timestamp-local",
+                "SELECT timestamp, value FROM source",
+            ),
+            (
+                "/grouped",
+                "series:///indexed.series",
+                "timestamp-grouped",
+                "SELECT timestamp, SUM(value) AS value FROM source GROUP BY timestamp",
+            ),
+            (
+                "/unknown",
+                "series:///unknown.series",
+                "timestamp-local",
+                "SELECT timestamp, value FROM source",
+            ),
+        ] {
+            _ = root
+                .create_dynamic_path(
+                    path,
+                    EntryType::TableDynamic,
+                    "sql-derived-series",
+                    serde_yaml::to_string(&serde_json::json!({
+                        "patterns": {"source": source},
+                        "locality": {"type": locality, "event_time": "timestamp"},
+                        "query": query,
+                    }))
+                    .unwrap()
+                    .into_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        for (path, source) in [
+            ("/joined", "series:///indexed.series"),
+            ("/nested", "series:///local"),
+        ] {
+            _ = root
+                .create_dynamic_path(
+                    path,
+                    EntryType::TableDynamic,
+                    "timeseries-join",
+                    serde_yaml::to_string(&serde_json::json!({
+                        "time_column": "timestamp",
+                        "inputs": [
+                            {"pattern": source, "scope": "metrics"},
+                            {"pattern": "series:///matched.series", "scope": "copy"}
+                        ],
+                    }))
+                    .unwrap()
+                    .into_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        let root_id = root.node_path().id();
+        tx.commit_test().await.unwrap();
+        for (source, target) in sources {
+            let tx = persistence.begin_test().await.unwrap();
+            materialize(
+                root_id,
+                &tx.state().unwrap().as_provider_context(),
+                source,
+                target,
+            )
+            .await;
+            tx.commit_test().await.unwrap();
+        }
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        // Two separate chunks ensure keeping only the newest schema fallback
+        // cannot conceal an incorrectly pruned input.
+        for time in 3..=4 {
+            for (path, column) in [
+                ("/indexed.series", "ingest_time"),
+                ("/unknown.series", "ingest_time"),
+                ("/matched.series", "timestamp"),
+            ] {
+                _ = root
+                    .write_series_from_batch(path, &batch(time), Some(column))
+                    .await
+                    .unwrap();
+            }
+        }
+        for record in &mut tx.state().unwrap().inner.lock().await.records {
+            if record.node_id == unknown_id.node_id() {
+                record.extended_attributes = None;
+            }
+        }
+        tx.commit_test().await.unwrap();
+
+        for _ in 0..2 {
+            for (source, target) in sources {
+                let tx = persistence.begin_test().await.unwrap();
+                let context = tx.state().unwrap().as_provider_context();
+                materialize(root_id, &context, source, target).await;
+                let query = provider::Provider::with_context(
+                    Arc::new(context.filesystem()),
+                    Arc::new(context.clone()),
+                );
+                let table = query
+                    .create_provider_for_url(
+                        &format!("series://{target}"),
+                        &context.datafusion_session,
+                    )
+                    .await
+                    .unwrap();
+                let batches = context
+                    .datafusion_session
+                    .read_table(table)
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                let mut times: Vec<_> = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        batch
+                            .column_by_name("timestamp")
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+                            .unwrap()
+                            .values()
+                            .iter()
+                            .copied()
+                    })
+                    .collect();
+                times.sort_unstable();
+                assert_eq!(times, [100, 200, 300, 400], "{source}");
+                assert_eq!(
+                    tx.root()
+                        .await
+                        .unwrap()
+                        .list_file_versions(target)
+                        .await
+                        .unwrap()
+                        .len(),
+                    2,
+                    "idle materialization must not append for {source}"
+                );
+                tx.commit_test().await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn materialization_preserves_negative_nanoseconds_with_mixed_legacy_bounds() {
         use tinyfs::arrow::ParquetExt;
 
