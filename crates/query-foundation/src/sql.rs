@@ -9,12 +9,11 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, TimeUnit};
-use datafusion::common::DFSchema;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::dataframe::DataFrame;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::{SQLOptions, SessionContext};
-use datafusion::logical_expr::{Expr, LogicalPlan, Volatility};
+use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, Volatility};
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{Ident, ObjectName, ObjectNamePart, Query, Visit, Visitor};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
@@ -27,6 +26,7 @@ pub struct UserSqlDeclaration {
     locality: LocalityContract,
     sources: BTreeSet<Arc<str>>,
     event_time: Option<Arc<str>>,
+    input_event_time: Option<Arc<str>>,
     timestamp_grouped: bool,
 }
 
@@ -63,6 +63,19 @@ impl UserSqlDeclaration {
         Ok(declaration)
     }
 
+    /// Declare the source event-time column when SQL renames it. Int64 time is
+    /// epoch microseconds; text may be parsed as RFC3339 or integer microseconds.
+    pub fn with_input_event_time(mut self, input_event_time: impl Into<Arc<str>>) -> Result<Self> {
+        let input_event_time = input_event_time.into();
+        if self.event_time.is_none() || input_event_time.is_empty() {
+            return Err(DataFusionError::Plan(
+                "input event time requires a local declaration and a nonempty column".to_owned(),
+            ));
+        }
+        self.input_event_time = Some(input_event_time);
+        Ok(self)
+    }
+
     fn try_new<I, S>(class: LocalityClass, sources: I, event_time: Option<Arc<str>>) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
@@ -78,6 +91,7 @@ impl UserSqlDeclaration {
         Ok(Self {
             locality,
             sources: sources.into_iter().collect(),
+            input_event_time: event_time.clone(),
             event_time,
             timestamp_grouped: false,
         })
@@ -127,28 +141,14 @@ pub async fn plan_user_sql(
             context,
             sql,
             &declaration.sources,
-            declaration.timestamp_grouped.then_some(
-                declaration
-                    .event_time
-                    .as_deref()
-                    .expect("local declaration has event time"),
-            ),
+            declaration.event_time.as_deref().expect("local event time"),
+            declaration
+                .input_event_time
+                .as_deref()
+                .expect("local input event time"),
+            declaration.timestamp_grouped,
         )
         .await?;
-    }
-    if declaration.locality.class() == LocalityClass::TimestampLocal {
-        let event_time = declaration
-            .event_time
-            .as_deref()
-            .expect("timestamp-local declaration has event time");
-        _ = frame
-            .schema()
-            .field_with_unqualified_name(event_time)
-            .map_err(|_| {
-                DataFusionError::Plan(format!(
-                    "timestamp-local SQL output must retain event-time column '{event_time}'"
-                ))
-            })?;
     }
     Ok(PlannedUserSql {
         frame,
@@ -255,7 +255,9 @@ async fn validate_timestamp_local_sql(
     context: &SessionContext,
     sql: &str,
     sources: &BTreeSet<Arc<str>>,
-    grouped_time: Option<&str>,
+    event_time: &str,
+    input_event_time: &str,
+    grouped: bool,
 ) -> Result<()> {
     let validation = SessionContext::new();
     for source in sources {
@@ -277,30 +279,32 @@ async fn validate_timestamp_local_sql(
         .with_allow_dml(false)
         .with_allow_statements(false);
     let frame = validation.sql_with_options(sql, options).await?;
-    validate_local_plan(frame.logical_plan(), grouped_time)
+    validate_local_plan(frame.logical_plan(), event_time, input_event_time, grouped)
 }
 
-#[cfg(test)]
-fn validate_timestamp_local_plan(plan: &LogicalPlan) -> Result<()> {
-    validate_local_plan(plan, None)
-}
-
-fn validate_local_plan(plan: &LogicalPlan, grouped_time: Option<&str>) -> Result<()> {
-    let mode = if grouped_time.is_some() {
+fn validate_local_plan(
+    plan: &LogicalPlan,
+    event_time: &str,
+    input_event_time: &str,
+    grouped: bool,
+) -> Result<()> {
+    let mode = if grouped {
         "timestamp-grouped"
     } else {
         "timestamp-local"
     };
     let mut saw_aggregate = false;
     _ = plan.apply(|node| {
-        let grouped_aggregate = if let (Some(event_time), LogicalPlan::Aggregate(aggregate)) = (grouped_time, node) {
-            if !matches!(aggregate.group_expr.as_slice(), [Expr::Column(column)] if column.name == event_time) {
+        let grouped_aggregate = if let (true, LogicalPlan::Aggregate(aggregate)) = (grouped, node) {
+            if !matches!(aggregate.group_expr.as_slice(), [Expr::Column(_)])
+                || !preserves_time_expression(&aggregate.group_expr[0], &aggregate.input, input_event_time)?
+            {
                 return Err(DataFusionError::Plan(format!(
                     "timestamp-grouped SQL must GROUP BY only the exact event-time column '{event_time}'"
                 )));
             }
-            let field = aggregate.input.schema().field_with_unqualified_name(event_time)?;
-            if !matches!(field.data_type(), DataType::Int64 | DataType::Timestamp(_, _)) {
+            let data_type = aggregate.group_expr[0].get_type(aggregate.input.schema())?;
+            if !matches!(data_type, DataType::Int64 | DataType::Timestamp(_, _)) {
                 return Err(DataFusionError::Plan(
                     "timestamp-grouped SQL must parse event time before grouping".to_owned(),
                 ));
@@ -324,29 +328,25 @@ fn validate_local_plan(plan: &LogicalPlan, grouped_time: Option<&str>) -> Result
                 logical_operator_name(node)
             )));
         }
-        if let Some(event_time) = grouped_time {
-            _ = node.schema().field_with_unqualified_name(event_time).map_err(|_| {
-                DataFusionError::Plan(format!("timestamp-grouped SQL must retain '{event_time}' at every stage"))
-            })?;
-            if let LogicalPlan::Projection(projection) = node {
-                let mut positions = projection.schema.fields().iter().enumerate()
-                    .filter(|(_, field)| field.name() == event_time);
-                let (index, _) = positions.next().expect("event-time field checked above");
-                if positions.next().is_some() || !preserves_group_time(
-                    &projection.expr[index], projection.input.schema(), event_time,
-                )? {
-                    return Err(DataFusionError::Plan(format!(
-                        "timestamp-grouped SQL must preserve the value and name of '{event_time}'"
-                    )));
-                }
-            }
-        }
         for expression in node.expressions() {
             validate_local_expression(&expression, grouped_aggregate)?;
         }
         Ok(TreeNodeRecursion::Continue)
     })?;
-    if let Some(event_time) = grouped_time {
+    let index = plan
+        .schema()
+        .index_of_column(&datafusion::common::Column::from_name(event_time))
+        .map_err(|_| {
+            DataFusionError::Plan(format!(
+                "{mode} SQL output must retain event-time column '{event_time}'"
+            ))
+        })?;
+    if !preserves_time_column(plan, index, input_event_time)? {
+        return Err(DataFusionError::Plan(format!(
+            "{mode} SQL must preserve input event-time column '{input_event_time}' as '{event_time}'"
+        )));
+    }
+    if grouped {
         if !saw_aggregate {
             return Err(DataFusionError::Plan(
                 "timestamp-grouped SQL requires an exact-time aggregation".to_owned(),
@@ -365,23 +365,68 @@ fn validate_local_plan(plan: &LogicalPlan, grouped_time: Option<&str>) -> Result
     Ok(())
 }
 
-fn preserves_group_time(expression: &Expr, input: &DFSchema, event_time: &str) -> Result<bool> {
+// Trace through user projections/CTEs, stopping at the schema-only declared
+// source. Checking only the last projection would allow hidden time changes.
+fn preserves_time_column(plan: &LogicalPlan, index: usize, event_time: &str) -> Result<bool> {
+    match plan {
+        LogicalPlan::TableScan(_) => Ok(plan.schema().field(index).name() == event_time),
+        LogicalPlan::Projection(projection) => {
+            preserves_time_expression(&projection.expr[index], &projection.input, event_time)
+        }
+        LogicalPlan::Aggregate(aggregate) => match aggregate.group_expr.get(index) {
+            Some(expression) => preserves_time_expression(expression, &aggregate.input, event_time),
+            None => Ok(false),
+        },
+        LogicalPlan::Filter(filter) => preserves_time_column(&filter.input, index, event_time),
+        LogicalPlan::Sort(sort) => preserves_time_column(&sort.input, index, event_time),
+        LogicalPlan::SubqueryAlias(alias) => preserves_time_column(&alias.input, index, event_time),
+        _ => Ok(false),
+    }
+}
+
+fn preserves_time_expression(
+    expression: &Expr,
+    input: &LogicalPlan,
+    event_time: &str,
+) -> Result<bool> {
     match expression {
-        Expr::Alias(alias) => preserves_group_time(&alias.expr, input, event_time),
-        Expr::Column(column) => Ok(column.name == event_time),
-        Expr::Cast(cast) if matches!(cast.expr.as_ref(), Expr::Column(column) if column.name == event_time) =>
-        {
-            let input_type = input.field_with_unqualified_name(event_time)?.data_type();
-            // Parse the existing RFC3339 source representation without reducing
-            // timestamp precision. Other conversions require their own proof.
-            Ok(input_type == cast.field.data_type()
+        Expr::Alias(alias) => preserves_time_expression(&alias.expr, input, event_time),
+        Expr::Column(column) => {
+            preserves_time_column(input, input.schema().index_of_column(column)?, event_time)
+        }
+        Expr::Cast(cast) => {
+            let input_type = cast.expr.get_type(input.schema())?;
+            let preserving_cast = &input_type == cast.field.data_type()
                 || (matches!(
                     input_type,
                     DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
                 ) && matches!(
                     cast.field.data_type(),
                     DataType::Timestamp(TimeUnit::Nanosecond, _)
-                )))
+                ));
+            Ok(preserving_cast && preserves_time_expression(&cast.expr, input, event_time)?)
+        }
+        Expr::ScalarFunction(function)
+            if function.func.name() == "to_timestamp_micros" && function.args.len() == 1 =>
+        {
+            let argument = &function.args[0];
+            if argument.get_type(input.schema())? != DataType::Int64 {
+                return Ok(false);
+            }
+            // Journal timestamps are strings containing integer microseconds.
+            // Do not admit float casts, arithmetic, or timestamp downcasts.
+            let argument = match argument {
+                Expr::Cast(cast)
+                    if matches!(
+                        cast.expr.get_type(input.schema())?,
+                        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                    ) =>
+                {
+                    &cast.expr
+                }
+                _ => argument,
+            };
+            preserves_time_expression(argument, input, event_time)
         }
         _ => Ok(false),
     }
@@ -587,7 +632,7 @@ mod tests {
             panic!("expected a sort plan");
         };
         sort.fetch = Some(1);
-        let error = validate_timestamp_local_plan(&LogicalPlan::Sort(sort))
+        let error = validate_local_plan(&LogicalPlan::Sort(sort), "value", "value", false)
             .expect_err("a top-k sort must not be timestamp-local");
         assert!(error.to_string().contains("Sort"), "{error}");
     }

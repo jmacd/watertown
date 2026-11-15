@@ -154,6 +154,27 @@ impl PumpStateFile {
             Some(path) => read_manifest(path, &recipe_identity).await?,
             None => None,
         };
+        let mut bounds = bounds;
+        if bounds.event_time_lo.is_some() && prior.is_some() {
+            let provider = crate::Provider::with_context(
+                Arc::new(context.filesystem()),
+                Arc::new(context.clone()),
+            )
+            .with_root(self.context.root().await?);
+            let source_time = provider
+                .event_time_column_for_url(&self.config.source.to_string())
+                .await
+                .map_other_context("pump-state source event-time axis")?;
+            if source_time.as_deref() != Some(self.config.time_column.as_str()) {
+                log::warn!(
+                    "pump-state source {} has unproven event-time axis {:?}, expected '{}'; rebuilding from full history",
+                    self.config.source,
+                    source_time,
+                    self.config.time_column,
+                );
+                bounds = tinyfs::SeriesReadBounds::NONE;
+            }
+        }
         let mut source_bounds = tinyfs::SeriesReadBounds::NONE;
         let mut replace_from = None;
 
@@ -403,6 +424,10 @@ impl tinyfs::Metadata for PumpStateFile {
 
 #[async_trait]
 impl tinyfs::QueryableFile for PumpStateFile {
+    fn event_time_column(&self) -> Option<&str> {
+        Some("timestamp")
+    }
+
     async fn as_table_provider(
         &self,
         id: FileID,
@@ -916,6 +941,94 @@ mod tests {
         let batch = rows_to_batch(&rows, Some(&[]), Arc::new(Schema::empty())).unwrap();
         assert_eq!(batch.num_columns(), 0);
         assert_eq!(batch.num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_repair_rebuilds_when_source_time_axis_is_unproven() {
+        use tinyfs::QueryableFile;
+
+        for index in [None, Some("ingest_time")] {
+            let (fs, context) = crate::factory::test_support::create_test_environment().await;
+            let cache = tempfile::tempdir().unwrap();
+            let context = context.with_cache_dir(cache.path().to_path_buf());
+            let root = fs.root().await.unwrap();
+            let batch = source_batch();
+            let batch = RecordBatch::try_from_iter([
+                (
+                    "timestamp",
+                    Arc::clone(batch.column_by_name("timestamp").unwrap()),
+                ),
+                (
+                    "well_depth_value.avg",
+                    Arc::clone(batch.column_by_name("well_depth_value.avg").unwrap()),
+                ),
+                (
+                    "ingest_time",
+                    Arc::new(TimestampMicrosecondArray::from(vec![0; batch.num_rows()]))
+                        as ArrayRef,
+                ),
+            ])
+            .unwrap();
+            _ = root
+                .write_series_from_batch("/depth.series", &batch, index)
+                .await
+                .unwrap();
+            let file = PumpStateFile {
+                config: PumpStateConfig {
+                    source: crate::Url::parse("series:///depth.series").unwrap(),
+                    time_column: "timestamp".to_owned(),
+                    depth_column: "well_depth_value.avg".to_owned(),
+                    lookback: "60m".to_owned(),
+                    disturbance_drop: 0.3,
+                    valid_depth_min: 10.0,
+                    valid_depth_max: 60.0,
+                },
+                context: crate::factory::test_support::test_context(&context, FileID::root()),
+            };
+            let cold = file
+                .as_table_provider(FileID::root(), &context)
+                .await
+                .unwrap();
+            let expected = context
+                .datafusion_session
+                .read_table(cold)
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let identity = file.config.recipe_identity().unwrap();
+            assert!(
+                read_manifest(
+                    &manifest_path(&context, FileID::root(), &identity).unwrap(),
+                    &identity
+                )
+                .await
+                .unwrap()
+                .is_some()
+            );
+            let before = context.plan_visibility_metrics().global_plans;
+            let bounded = file
+                .as_table_provider_bounded(
+                    FileID::root(),
+                    &context,
+                    tinyfs::SeriesReadBounds::from_event_time_lo(66 * 60_000_000),
+                )
+                .await
+                .unwrap();
+            let actual = context
+                .datafusion_session
+                .read_table(bounded)
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(rows(&actual), rows(&expected), "{index:?}");
+            assert_eq!(
+                context.plan_visibility_metrics().global_plans,
+                before + 1,
+                "{index:?}"
+            );
+        }
     }
 
     #[tokio::test]

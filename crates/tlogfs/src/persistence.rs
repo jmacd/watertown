@@ -6235,10 +6235,10 @@ mod metadata_query_tests {
         use tinyfs::arrow::ParquetExt;
 
         let (_dir, mut persistence, _) = fixture().await;
-        let batch = |timestamp| {
+        let batch = |time_column, timestamp| {
             arrow::record_batch::RecordBatch::try_from_iter([
                 (
-                    "timestamp",
+                    time_column,
                     Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
                         timestamp,
                     ])) as arrow::array::ArrayRef,
@@ -6255,30 +6255,63 @@ mod metadata_query_tests {
             ("series:///local", "/local.series"),
             ("series:///joined", "/joined.series"),
             ("series:///global", "/global.series"),
+            ("series:///renamed", "/renamed.series"),
         ];
         let tx = persistence.begin_test().await.expect("begin fixture");
         let root = tx.root().await.expect("root");
         for timestamp in 1..=16 {
             _ = root
-                .write_series_from_batch("/source.series", &batch(timestamp), Some("timestamp"))
+                .write_series_from_batch(
+                    "/source.series",
+                    &batch("timestamp", timestamp),
+                    Some("timestamp"),
+                )
                 .await
                 .unwrap();
             _ = root
-                .write_series_from_batch("/other.series", &batch(timestamp), Some("timestamp"))
+                .write_series_from_batch(
+                    "/other.series",
+                    &batch("timestamp", timestamp),
+                    Some("timestamp"),
+                )
+                .await
+                .unwrap();
+            _ = root
+                .write_series_from_batch(
+                    "/renamed-source.series",
+                    &batch("ts", timestamp),
+                    Some("ts"),
+                )
                 .await
                 .unwrap();
         }
         let source_id = root.get_node_path("/source.series").await.unwrap().id();
-        for (path, locality, query) in [
+        let renamed_source_id = root
+            .get_node_path("/renamed-source.series")
+            .await
+            .unwrap()
+            .id();
+        for (path, pattern, locality, query) in [
             (
                 "/local",
+                "series:///source.series",
                 serde_json::json!({"type": "timestamp-local", "event_time": "timestamp"}),
                 "SELECT timestamp, value FROM source ORDER BY timestamp",
             ),
             (
                 "/global",
+                "series:///source.series",
                 serde_json::json!({"type": "global"}),
                 "SELECT timestamp, COUNT(*) OVER () AS total FROM source",
+            ),
+            (
+                "/renamed",
+                "series:///renamed-source.series",
+                serde_json::json!({
+                    "type": "timestamp-local", "event_time": "timestamp", "input_event_time": "ts"
+                }),
+                "WITH renamed AS (SELECT ts AS raw_time, value FROM source)
+                 SELECT raw_time AS timestamp, value FROM renamed ORDER BY timestamp",
             ),
         ] {
             _ = root
@@ -6287,7 +6320,7 @@ mod metadata_query_tests {
                     EntryType::TableDynamic,
                     "sql-derived-series",
                     serde_yaml::to_string(&serde_json::json!({
-                        "patterns": {"source": "series:///source.series"},
+                        "patterns": {"source": pattern},
                         "locality": locality, "query": query,
                     }))
                     .unwrap()
@@ -6327,14 +6360,21 @@ mod metadata_query_tests {
             .root()
             .await
             .unwrap()
-            .write_series_from_batch("/source.series", &batch(17), Some("timestamp"))
+            .write_series_from_batch("/source.series", &batch("timestamp", 17), Some("timestamp"))
             .await
             .unwrap();
         _ = tx
             .root()
             .await
             .unwrap()
-            .write_series_from_batch("/other.series", &batch(17), Some("timestamp"))
+            .write_series_from_batch("/other.series", &batch("timestamp", 17), Some("timestamp"))
+            .await
+            .unwrap();
+        _ = tx
+            .root()
+            .await
+            .unwrap()
+            .write_series_from_batch("/renamed-source.series", &batch("ts", 17), Some("ts"))
             .await
             .unwrap();
         tx.commit_test().await.unwrap();
@@ -6346,6 +6386,11 @@ mod metadata_query_tests {
             let context = state.as_provider_context();
             materialize(root_id, &context, source, target).await;
             if target != "/global.series" {
+                let source_id = if target == "/renamed.series" {
+                    renamed_source_id
+                } else {
+                    source_id
+                };
                 let scans = scans.lock().expect("scans");
                 for scan in scans.iter().filter(|scan| {
                     scan.columns.iter().any(|column| column == "content")

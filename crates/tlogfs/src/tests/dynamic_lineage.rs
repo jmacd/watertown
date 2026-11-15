@@ -503,6 +503,7 @@ async fn pump_state_manifest_bounds_incremental_daily_usage() {
             ),
             locality: SqlDerivedLocality::TimestampLocal {
                 event_time: "timestamp".to_owned(),
+                input_event_time: None,
             },
             transforms: None,
             pattern_transforms: None,
@@ -625,6 +626,7 @@ async fn direct_reduction_reuses_and_repairs_timestamp_local_dynamic_source() {
             ),
             locality: SqlDerivedLocality::TimestampLocal {
                 event_time: "timestamp".to_owned(),
+                input_event_time: None,
             },
             transforms: None,
             pattern_transforms: None,

@@ -183,6 +183,178 @@ async fn declared_timestamp_local_sql_proves_operator_and_range_contracts() -> R
 }
 
 #[tokio::test]
+async fn timestamp_local_rejects_time_changes_including_hidden_projections() -> Result<()> {
+    let (_fixture, context) = fixture().await?;
+    for sql in [
+        "SELECT ts + 1000 AS ts, value FROM source",
+        "SELECT CAST(value AS BIGINT) AS ts FROM source",
+        "SELECT 1000 AS ts FROM source",
+        "WITH changed AS (SELECT ts + 1000 AS ts, value FROM source)
+         SELECT ts, value FROM changed",
+        "WITH swapped AS (SELECT ts AS original, CAST(value AS BIGINT) AS ts FROM source)
+         SELECT ts FROM swapped",
+        "SELECT CAST(ts AS TIMESTAMP) AS ts FROM source",
+        "SELECT to_timestamp_seconds(ts) AS ts FROM source",
+        "SELECT to_timestamp_micros(ts + 1000) AS ts FROM source",
+        "SELECT to_timestamp_micros(CAST(value AS BIGINT)) AS ts FROM source",
+    ] {
+        let error = plan_user_sql(
+            &context,
+            sql,
+            UserSqlDeclaration::timestamp_local("source", "ts")?,
+        )
+        .await
+        .err()
+        .expect("time-changing local SQL must fail");
+        assert!(
+            error.to_string().contains("must preserve"),
+            "{sql}: {error}"
+        );
+        _ = plan_user_sql(&context, sql, UserSqlDeclaration::global(["source"])?).await?;
+    }
+    let sql = "WITH renamed AS (SELECT ts AS original, value AS ts FROM source)
+               SELECT original AS timestamp, ts AS value FROM renamed";
+    assert!(
+        plan_user_sql(
+            &context,
+            sql,
+            UserSqlDeclaration::timestamp_local("source", "timestamp")?
+        )
+        .await
+        .is_err(),
+        "a renamed input requires an explicit mapping"
+    );
+    let batches = plan_user_sql(
+        &context,
+        sql,
+        UserSqlDeclaration::timestamp_local("source", "timestamp")?.with_input_event_time("ts")?,
+    )
+    .await?
+    .into_frame()
+    .collect()
+    .await?;
+    let times = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("timestamp")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(times, [0, 10, 19]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn timestamp_local_parses_and_renames_without_losing_precision() -> Result<()> {
+    use arrow::array::{
+        ArrayRef, StringArray, TimestampMicrosecondArray, TimestampNanosecondArray,
+    };
+    use arrow::compute::concat_batches;
+    use datafusion::datasource::MemTable;
+
+    let batch = RecordBatch::try_from_iter([
+        (
+            "ts",
+            Arc::new(StringArray::from(vec![
+                "1969-12-31T23:59:59.999999999Z",
+                "1970-01-01T01:00:00.000000100+01:00",
+                "1970-01-01T00:00:00.000000200Z",
+            ])) as ArrayRef,
+        ),
+        (
+            "__REALTIME_TIMESTAMP",
+            Arc::new(StringArray::from(vec!["-1", "1100", "1200"])) as ArrayRef,
+        ),
+    ])?;
+    let context = SessionContext::new();
+    _ = context.register_table(
+        "source",
+        Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]])?),
+    )?;
+    for sql in [
+        "SELECT CAST(ts AS TIMESTAMP) AS timestamp FROM source ORDER BY timestamp",
+        "WITH renamed(raw_time) AS (SELECT ts FROM source),
+         typed AS (SELECT CAST(raw_time AS TIMESTAMP) AS parsed FROM renamed)
+         SELECT parsed AS timestamp FROM typed ORDER BY timestamp",
+    ] {
+        let batches = plan_user_sql(
+            &context,
+            sql,
+            UserSqlDeclaration::timestamp_local("source", "timestamp")?
+                .with_input_event_time("ts")?,
+        )
+        .await?
+        .into_frame()
+        .collect()
+        .await?;
+        let batch = concat_batches(&batches[0].schema(), &batches)?;
+        assert_eq!(
+            batch
+                .column_by_name("timestamp")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap()
+                .values()
+                .as_ref(),
+            &[-1, 100, 200]
+        );
+    }
+    let batches = plan_user_sql(
+        &context,
+        "SELECT to_timestamp_micros(CAST(\"__REALTIME_TIMESTAMP\" AS BIGINT)) AS timestamp
+         FROM source ORDER BY timestamp",
+        UserSqlDeclaration::timestamp_local("source", "timestamp")?
+            .with_input_event_time("__REALTIME_TIMESTAMP")?,
+    )
+    .await?
+    .into_frame()
+    .collect()
+    .await?;
+    let batch = concat_batches(&batches[0].schema(), &batches)?;
+    assert_eq!(
+        batch
+            .column_by_name("timestamp")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap()
+            .values()
+            .as_ref(),
+        &[-1, 1100, 1200]
+    );
+    for sql in [
+        "SELECT CAST(ts AS TIMESTAMP(3)) AS timestamp FROM source",
+        "WITH typed AS (SELECT CAST(ts AS TIMESTAMP) AS ts FROM source)
+         SELECT CAST(ts AS TIMESTAMP(6)) AS timestamp FROM typed",
+        "WITH typed AS (SELECT CAST(ts AS TIMESTAMP) AS ts FROM source)
+         SELECT to_timestamp_micros(ts) AS timestamp FROM typed",
+        "SELECT CAST(substr(ts, 1, 19) AS TIMESTAMP) AS timestamp FROM source",
+        "SELECT to_timestamp_micros(CAST(CAST(ts AS DOUBLE) AS BIGINT)) AS timestamp FROM source",
+    ] {
+        assert!(
+            plan_user_sql(
+                &context,
+                sql,
+                UserSqlDeclaration::timestamp_local("source", "timestamp")?
+                    .with_input_event_time("ts")?,
+            )
+            .await
+            .is_err(),
+            "lossy conversion accepted: {sql}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn global_sql_preserves_empty_and_fully_pruned_execution() -> Result<()> {
     let (fixture, context) = fixture().await?;
     fixture.metrics().reset();
@@ -362,40 +534,46 @@ async fn timestamp_grouped_parses_text_without_bucketing_instants() -> Result<()
         "source",
         Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]])?),
     )?;
-    let query = "WITH typed AS (SELECT CAST(ts AS TIMESTAMP) AS ts, value FROM source)
-        SELECT ts, SUM(value) AS total FROM typed GROUP BY ts ORDER BY ts";
-    let batches = plan_user_sql(
-        &context,
-        query,
-        UserSqlDeclaration::timestamp_grouped("source", "ts")?,
-    )
-    .await?
-    .into_frame()
-    .collect()
-    .await?;
-    let batch = concat_batches(&batches[0].schema(), &batches)?;
-    assert_eq!(
-        batch
-            .column_by_name("ts")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<TimestampNanosecondArray>()
-            .unwrap()
-            .values()
-            .as_ref(),
-        &[100, 200]
-    );
-    assert_eq!(
-        batch
-            .column_by_name("total")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .values()
-            .as_ref(),
-        &[3.0, 4.0]
-    );
+    for event_time in ["ts", "timestamp"] {
+        let query = format!(
+            "WITH typed AS (SELECT CAST(ts AS TIMESTAMP) AS parsed, value FROM source)
+             SELECT parsed AS {event_time}, SUM(value) AS total
+             FROM typed GROUP BY parsed ORDER BY {event_time}"
+        );
+        let batches = plan_user_sql(
+            &context,
+            &query,
+            UserSqlDeclaration::timestamp_grouped("source", event_time)?
+                .with_input_event_time("ts")?,
+        )
+        .await?
+        .into_frame()
+        .collect()
+        .await?;
+        let batch = concat_batches(&batches[0].schema(), &batches)?;
+        assert_eq!(
+            batch
+                .column_by_name(event_time)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap()
+                .values()
+                .as_ref(),
+            &[100, 200]
+        );
+        assert_eq!(
+            batch
+                .column_by_name("total")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .values()
+                .as_ref(),
+            &[3.0, 4.0]
+        );
+    }
     for sql in [
         "SELECT CAST(ts AS TIMESTAMP) AS ts, SUM(value) FROM source GROUP BY ts",
         "WITH typed AS (SELECT CAST(ts AS TIMESTAMP(3)) AS ts, value FROM source)
