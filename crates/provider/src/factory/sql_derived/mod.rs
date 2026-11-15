@@ -77,6 +77,13 @@ pub enum SqlDerivedLocality {
         /// Event-time column retained by the output.
         event_time: String,
     },
+    /// Single-source aggregation grouped only by the exact retained event time.
+    /// The event-time value/name must be preserved; text may be parsed into a
+    /// nanosecond timestamp. Nonlocal operators and time bucketing are rejected.
+    TimestampGrouped {
+        /// Event-time column retained throughout the query.
+        event_time: String,
+    },
 }
 
 /// Options for SQL transformation and table name replacement
@@ -239,7 +246,9 @@ impl SqlDerivedConfig {
                 "At least one pattern must be specified".to_string(),
             ));
         }
-        if let SqlDerivedLocality::TimestampLocal { event_time } = &self.locality {
+        if let SqlDerivedLocality::TimestampLocal { event_time }
+        | SqlDerivedLocality::TimestampGrouped { event_time } = &self.locality
+        {
             if self.patterns.len() != 1 {
                 return Err(tinyfs::Error::Other(
                     "timestamp-local SQL requires exactly one source pattern".to_owned(),
@@ -1561,7 +1570,8 @@ impl SqlDerivedFile {
     ) -> TinyFSResult<Arc<dyn TableProvider>> {
         let bounds = match self.config.locality {
             SqlDerivedLocality::Global => tinyfs::SeriesReadBounds::NONE,
-            SqlDerivedLocality::TimestampLocal { .. } => requested_bounds,
+            SqlDerivedLocality::TimestampLocal { .. }
+            | SqlDerivedLocality::TimestampGrouped { .. } => requested_bounds,
         };
         let cache_key = crate::TableProviderKey::with_bounds(
             id,
@@ -1594,17 +1604,28 @@ impl SqlDerivedFile {
                 query_foundation::sql::UserSqlDeclaration::global(table_mappings.values().cloned())
                     .map_other_context("SQL-derived global locality declaration failed")?
             }
-            SqlDerivedLocality::TimestampLocal { event_time } => {
+            SqlDerivedLocality::TimestampLocal { event_time }
+            | SqlDerivedLocality::TimestampGrouped { event_time } => {
                 let source = table_mappings.values().next().ok_or_else(|| {
                     tinyfs::Error::Other(
                         "timestamp-local SQL source registration returned no table".to_owned(),
                     )
                 })?;
-                query_foundation::sql::UserSqlDeclaration::timestamp_local(
-                    source.clone(),
-                    event_time.clone(),
-                )
-                .map_other_context("SQL-derived timestamp-local declaration failed")?
+                let declaration = if matches!(
+                    self.config.locality,
+                    SqlDerivedLocality::TimestampGrouped { .. }
+                ) {
+                    query_foundation::sql::UserSqlDeclaration::timestamp_grouped(
+                        source.clone(),
+                        event_time.clone(),
+                    )
+                } else {
+                    query_foundation::sql::UserSqlDeclaration::timestamp_local(
+                        source.clone(),
+                        event_time.clone(),
+                    )
+                };
+                declaration.map_other_context("SQL-derived timestamp-local declaration failed")?
             }
         };
         let planned = query_foundation::sql::plan_user_sql(ctx, &effective_sql, declaration)
@@ -1629,6 +1650,11 @@ impl SqlDerivedFile {
             SqlDerivedLocality::TimestampLocal { .. } => {
                 info!(
                     "query-plan visibility: node={id} locality=timestamp-local incremental=true reason=declared-user-sql"
+                );
+            }
+            SqlDerivedLocality::TimestampGrouped { .. } => {
+                info!(
+                    "query-plan visibility: node={id} locality=timestamp-grouped incremental=true reason=declared-exact-time-aggregation"
                 );
             }
         }
@@ -1691,7 +1717,8 @@ impl SqlDerivedFile {
 impl tinyfs::QueryableFile for SqlDerivedFile {
     fn event_time_column(&self) -> Option<&str> {
         match &self.config.locality {
-            SqlDerivedLocality::TimestampLocal { event_time } => Some(event_time),
+            SqlDerivedLocality::TimestampLocal { event_time }
+            | SqlDerivedLocality::TimestampGrouped { event_time } => Some(event_time),
             SqlDerivedLocality::Global => None,
         }
     }

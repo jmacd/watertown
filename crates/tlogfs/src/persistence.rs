@@ -6524,6 +6524,133 @@ mod metadata_query_tests {
         }
     }
 
+    #[tokio::test]
+    async fn timestamp_grouped_materialization_keeps_complete_groups_and_bounds_reads() {
+        use tinyfs::arrow::ParquetExt;
+
+        let (_dir, mut persistence, _) = fixture().await;
+        let batch = |timestamp, value| {
+            arrow::record_batch::RecordBatch::try_from_iter([
+                (
+                    "timestamp",
+                    Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                        timestamp,
+                    ])) as arrow::array::ArrayRef,
+                ),
+                (
+                    "value",
+                    Arc::new(Int64Array::from(vec![value])) as arrow::array::ArrayRef,
+                ),
+            ])
+            .unwrap()
+        };
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        for time in 1..=8 {
+            _ = root
+                .write_series_from_batch("/source.series", &batch(time, time), Some("timestamp"))
+                .await
+                .unwrap();
+        }
+        let source_id = root.get_node_path("/source.series").await.unwrap().id();
+        _ = root.create_dynamic_path("/grouped", EntryType::TableDynamic, "sql-derived-series",
+            serde_yaml::to_string(&serde_json::json!({
+                "patterns": {"source": "series:///source.series"},
+                "locality": {"type": "timestamp-grouped", "event_time": "timestamp"},
+                "query": "SELECT timestamp, MAX(value) AS value, COUNT(*) AS samples FROM source GROUP BY timestamp ORDER BY timestamp",
+            })).unwrap().into_bytes()
+        ).await.unwrap();
+        let root_id = root.node_path().id();
+        tx.commit_test().await.unwrap();
+        let tx = persistence.begin_test().await.unwrap();
+        materialize(
+            root_id,
+            &tx.state().unwrap().as_provider_context(),
+            "series:///grouped",
+            "/target.series",
+        )
+        .await;
+        tx.commit_test().await.unwrap();
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        for (time, value) in [(9, 10), (9, 90), (10, 110)] {
+            _ = root
+                .write_series_from_batch("/source.series", &batch(time, value), Some("timestamp"))
+                .await
+                .unwrap();
+        }
+        tx.commit_test().await.unwrap();
+
+        for _ in 0..2 {
+            let tx = persistence.begin_test().await.unwrap();
+            let state = tx.state().unwrap();
+            let context = state.as_provider_context();
+            let scans = record_scans(&state).await;
+            materialize(root_id, &context, "series:///grouped", "/target.series").await;
+            {
+                let scans = scans.lock().unwrap();
+                for scan in scans.iter().filter(|scan| {
+                    scan.columns.iter().any(|c| c == "content")
+                        && scan.filters.contains(&source_id.node_id().to_string())
+                }) {
+                    assert!(
+                        (8..=11).any(|version| scan
+                            .filters
+                            .contains(&format!("version = Int64({version})"))),
+                        "grouped materialization read old source payload: {scan:?}"
+                    );
+                }
+            }
+            let query = provider::Provider::with_context(
+                Arc::new(context.filesystem()),
+                Arc::new(context.clone()),
+            );
+            let table = query
+                .create_provider_for_url("series:///target.series", &context.datafusion_session)
+                .await
+                .unwrap();
+            let batches = context
+                .datafusion_session
+                .read_table(table)
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let output = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+            assert_eq!(output.num_rows(), 10);
+            let values = output
+                .column_by_name("value")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let counts = output
+                .column_by_name("samples")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let group = values
+                .values()
+                .iter()
+                .position(|value| *value == 90)
+                .expect("both time-9 chunks must contribute");
+            assert_eq!(counts.value(group), 2);
+            assert_eq!(context.plan_visibility_metrics().global_plans, 0);
+            assert_eq!(
+                tx.root()
+                    .await
+                    .unwrap()
+                    .list_file_versions("/target.series")
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+            tx.commit_test().await.unwrap();
+        }
+    }
+
     fn assert_node_metadata_projection(
         scans: &Arc<std::sync::Mutex<Vec<Scan>>>,
         committed_version: Option<i64>,

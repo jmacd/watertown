@@ -7627,6 +7627,24 @@
                 "event_time"
               ],
               "type": "object"
+            },
+            {
+              "description": "Single-source aggregation grouped only by the exact retained event time.\nThe event-time value/name must be preserved; text may be parsed into a\nnanosecond timestamp. Nonlocal operators and time bucketing are rejected.",
+              "properties": {
+                "event_time": {
+                  "description": "Event-time column retained throughout the query.",
+                  "type": "string"
+                },
+                "type": {
+                  "const": "timestamp-grouped",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "event_time"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -7701,6 +7719,24 @@
                 },
                 "type": {
                   "const": "timestamp-local",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "event_time"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Single-source aggregation grouped only by the exact retained event time.\nThe event-time value/name must be preserved; text may be parsed into a\nnanosecond timestamp. Nonlocal operators and time bucketing are rejected.",
+              "properties": {
+                "event_time": {
+                  "description": "Event-time column retained throughout the query.",
+                  "type": "string"
+                },
+                "type": {
+                  "const": "timestamp-grouped",
                   "type": "string"
                 }
               },

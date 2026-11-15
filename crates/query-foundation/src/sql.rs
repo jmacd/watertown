@@ -8,6 +8,8 @@ use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
+use arrow::datatypes::{DataType, TimeUnit};
+use datafusion::common::DFSchema;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::dataframe::DataFrame;
 use datafusion::error::{DataFusionError, Result};
@@ -25,6 +27,7 @@ pub struct UserSqlDeclaration {
     locality: LocalityContract,
     sources: BTreeSet<Arc<str>>,
     event_time: Option<Arc<str>>,
+    timestamp_grouped: bool,
 }
 
 impl UserSqlDeclaration {
@@ -50,6 +53,16 @@ impl UserSqlDeclaration {
         )
     }
 
+    /// Declare aggregation within complete groups of one exact timestamp.
+    pub fn timestamp_grouped(
+        source: impl Into<Arc<str>>,
+        event_time: impl Into<Arc<str>>,
+    ) -> Result<Self> {
+        let mut declaration = Self::timestamp_local(source, event_time)?;
+        declaration.timestamp_grouped = true;
+        Ok(declaration)
+    }
+
     fn try_new<I, S>(class: LocalityClass, sources: I, event_time: Option<Arc<str>>) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
@@ -66,6 +79,7 @@ impl UserSqlDeclaration {
             locality,
             sources: sources.into_iter().collect(),
             event_time,
+            timestamp_grouped: false,
         })
     }
 }
@@ -109,7 +123,18 @@ pub async fn plan_user_sql(
     let parsed = parse_user_query(sql)?;
     validate_sources(&parsed, &declaration.sources)?;
     if declaration.locality.class() == LocalityClass::TimestampLocal {
-        validate_timestamp_local_sql(context, sql, &declaration.sources).await?;
+        validate_timestamp_local_sql(
+            context,
+            sql,
+            &declaration.sources,
+            declaration.timestamp_grouped.then_some(
+                declaration
+                    .event_time
+                    .as_deref()
+                    .expect("local declaration has event time"),
+            ),
+        )
+        .await?;
     }
     if declaration.locality.class() == LocalityClass::TimestampLocal {
         let event_time = declaration
@@ -230,6 +255,7 @@ async fn validate_timestamp_local_sql(
     context: &SessionContext,
     sql: &str,
     sources: &BTreeSet<Arc<str>>,
+    grouped_time: Option<&str>,
 ) -> Result<()> {
     let validation = SessionContext::new();
     for source in sources {
@@ -251,11 +277,39 @@ async fn validate_timestamp_local_sql(
         .with_allow_dml(false)
         .with_allow_statements(false);
     let frame = validation.sql_with_options(sql, options).await?;
-    validate_timestamp_local_plan(frame.logical_plan())
+    validate_local_plan(frame.logical_plan(), grouped_time)
 }
 
+#[cfg(test)]
 fn validate_timestamp_local_plan(plan: &LogicalPlan) -> Result<()> {
+    validate_local_plan(plan, None)
+}
+
+fn validate_local_plan(plan: &LogicalPlan, grouped_time: Option<&str>) -> Result<()> {
+    let mode = if grouped_time.is_some() {
+        "timestamp-grouped"
+    } else {
+        "timestamp-local"
+    };
+    let mut saw_aggregate = false;
     _ = plan.apply(|node| {
+        let grouped_aggregate = if let (Some(event_time), LogicalPlan::Aggregate(aggregate)) = (grouped_time, node) {
+            if !matches!(aggregate.group_expr.as_slice(), [Expr::Column(column)] if column.name == event_time) {
+                return Err(DataFusionError::Plan(format!(
+                    "timestamp-grouped SQL must GROUP BY only the exact event-time column '{event_time}'"
+                )));
+            }
+            let field = aggregate.input.schema().field_with_unqualified_name(event_time)?;
+            if !matches!(field.data_type(), DataType::Int64 | DataType::Timestamp(_, _)) {
+                return Err(DataFusionError::Plan(
+                    "timestamp-grouped SQL must parse event time before grouping".to_owned(),
+                ));
+            }
+            saw_aggregate = true;
+            true
+        } else {
+            false
+        };
         // A full sort commutes with time restriction; a top-k sort does not.
         if !matches!(
             node,
@@ -263,26 +317,93 @@ fn validate_timestamp_local_plan(plan: &LogicalPlan) -> Result<()> {
                 | LogicalPlan::Filter(_)
                 | LogicalPlan::SubqueryAlias(_)
                 | LogicalPlan::TableScan(_)
-        ) && !matches!(node, LogicalPlan::Sort(sort) if sort.fetch.is_none())
+        ) && !matches!(node, LogicalPlan::Sort(sort) if sort.fetch.is_none()) && !grouped_aggregate
         {
             return Err(DataFusionError::Plan(format!(
-                "timestamp-local SQL does not support logical operator {}",
+                "{mode} SQL does not support logical operator {}",
                 logical_operator_name(node)
             )));
         }
+        if let Some(event_time) = grouped_time {
+            _ = node.schema().field_with_unqualified_name(event_time).map_err(|_| {
+                DataFusionError::Plan(format!("timestamp-grouped SQL must retain '{event_time}' at every stage"))
+            })?;
+            if let LogicalPlan::Projection(projection) = node {
+                let mut positions = projection.schema.fields().iter().enumerate()
+                    .filter(|(_, field)| field.name() == event_time);
+                let (index, _) = positions.next().expect("event-time field checked above");
+                if positions.next().is_some() || !preserves_group_time(
+                    &projection.expr[index], projection.input.schema(), event_time,
+                )? {
+                    return Err(DataFusionError::Plan(format!(
+                        "timestamp-grouped SQL must preserve the value and name of '{event_time}'"
+                    )));
+                }
+            }
+        }
         for expression in node.expressions() {
-            validate_local_expression(&expression)?;
+            validate_local_expression(&expression, grouped_aggregate)?;
         }
         Ok(TreeNodeRecursion::Continue)
     })?;
+    if let Some(event_time) = grouped_time {
+        if !saw_aggregate {
+            return Err(DataFusionError::Plan(
+                "timestamp-grouped SQL requires an exact-time aggregation".to_owned(),
+            ));
+        }
+        let field = plan.schema().field_with_unqualified_name(event_time)?;
+        if !matches!(
+            field.data_type(),
+            DataType::Int64 | DataType::Timestamp(_, _)
+        ) {
+            return Err(DataFusionError::Plan(
+                "timestamp-grouped SQL requires typed event-time output".to_owned(),
+            ));
+        }
+    }
     Ok(())
 }
 
-fn validate_local_expression(expression: &Expr) -> Result<()> {
+fn preserves_group_time(expression: &Expr, input: &DFSchema, event_time: &str) -> Result<bool> {
+    match expression {
+        Expr::Alias(alias) => preserves_group_time(&alias.expr, input, event_time),
+        Expr::Column(column) => Ok(column.name == event_time),
+        Expr::Cast(cast) if matches!(cast.expr.as_ref(), Expr::Column(column) if column.name == event_time) =>
+        {
+            let input_type = input.field_with_unqualified_name(event_time)?.data_type();
+            // Parse the existing RFC3339 source representation without reducing
+            // timestamp precision. Other conversions require their own proof.
+            Ok(input_type == cast.field.data_type()
+                || (matches!(
+                    input_type,
+                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                ) && matches!(
+                    cast.field.data_type(),
+                    DataType::Timestamp(TimeUnit::Nanosecond, _)
+                )))
+        }
+        _ => Ok(false),
+    }
+}
+
+fn validate_local_expression(expression: &Expr, allow_aggregate: bool) -> Result<()> {
     _ = expression.apply(|nested| {
         match nested {
-            Expr::AggregateFunction(_)
-            | Expr::WindowFunction(_)
+            Expr::AggregateFunction(_) if !allow_aggregate => {
+                return Err(DataFusionError::Plan(format!(
+                    "timestamp-local SQL contains unsupported expression {nested}"
+                )));
+            }
+            Expr::AggregateFunction(function)
+                if function.func.signature().volatility != Volatility::Immutable =>
+            {
+                return Err(DataFusionError::Plan(format!(
+                    "timestamp-grouped SQL aggregate '{}' is not immutable",
+                    function.func.name()
+                )));
+            }
+            Expr::WindowFunction(_)
             | Expr::Exists(_)
             | Expr::InSubquery(_)
             | Expr::ScalarSubquery(_)

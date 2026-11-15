@@ -203,6 +203,222 @@ async fn global_sql_preserves_empty_and_fully_pruned_execution() -> Result<()> {
 }
 
 #[tokio::test]
+async fn exact_timestamp_groups_match_full_results_under_time_restriction() -> Result<()> {
+    use arrow::array::{BooleanArray, StringArray};
+    use arrow::compute::{concat_batches, filter_record_batch};
+    use datafusion::catalog::view::ViewTable;
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::{col, lit};
+
+    let grouped_schema = Arc::new(Schema::new(vec![
+        Field::new("ts", DataType::Int64, false),
+        Field::new("value", DataType::Float64, true),
+        Field::new("unused", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        grouped_schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![0, 10, 10, 19, 19])),
+            Arc::new(Float64Array::from(vec![
+                Some(1.0),
+                Some(2.0),
+                Some(5.0),
+                None,
+                Some(6.0),
+            ])),
+            Arc::new(StringArray::from(vec!["ops", "ops", "ops", "ops", "bytes"])),
+        ],
+    )?;
+    let context = SessionContext::new();
+    _ = context.register_table(
+        "source",
+        Arc::new(MemTable::try_new(grouped_schema, vec![vec![batch]])?),
+    )?;
+    let query = "WITH selected AS (SELECT ts, value, unused FROM source)
+        SELECT ts, MAX(CASE WHEN unused = 'ops' THEN value END) AS ops,
+               SUM(value) AS total, COUNT(*) AS samples
+        FROM selected GROUP BY ts ORDER BY ts";
+    let full = plan_user_sql(&context, query, UserSqlDeclaration::global(["source"])?)
+        .await?
+        .into_frame()
+        .collect()
+        .await?;
+    let full = concat_batches(&full[0].schema(), &full)?;
+    let times = full
+        .column_by_name("ts")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let expected = filter_record_batch(
+        &full,
+        &BooleanArray::from(
+            times
+                .values()
+                .iter()
+                .map(|time| *time >= 10)
+                .collect::<Vec<_>>(),
+        ),
+    )?;
+    let bounded = context
+        .table("source")
+        .await?
+        .filter(col("ts").gt_eq(lit(10_i64)))?;
+    _ = context.register_table(
+        "bounded",
+        Arc::new(ViewTable::new(bounded.logical_plan().clone(), None)),
+    )?;
+    let planned = plan_user_sql(
+        &context,
+        &query.replace("FROM source", "FROM bounded"),
+        UserSqlDeclaration::timestamp_grouped("bounded", "ts")?,
+    )
+    .await?;
+    assert_eq!(planned.locality().class(), LocalityClass::TimestampLocal);
+    assert_eq!(
+        planned
+            .locality()
+            .required_input_ranges(TimeInterval::try_new(10, 19)?)?
+            .get("bounded"),
+        Some(&RangeRequirement::Bounded(vec![TimeInterval::try_new(
+            10, 19
+        )?]))
+    );
+    let actual = planned.into_frame().collect().await?;
+    let actual = concat_batches(&actual[0].schema(), &actual)?;
+    assert_eq!(
+        actual, expected,
+        "all members of each retained timestamp group must contribute"
+    );
+    let counts = actual
+        .column_by_name("samples")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(counts.values().as_ref(), &[2, 2]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn timestamp_grouped_rejects_nonlocal_and_time_changing_plans() -> Result<()> {
+    let (_fixture, context) = fixture().await?;
+    for sql in [
+        "SELECT MAX(ts) AS ts, SUM(value) FROM source",
+        "SELECT unused, MAX(ts) AS ts, SUM(value) FROM source GROUP BY unused",
+        "SELECT ts / 10 AS ts, SUM(value) FROM source GROUP BY ts / 10",
+        "WITH bucketed AS (SELECT ts / 10 AS ts, value FROM source)
+         SELECT ts, SUM(value) FROM bucketed GROUP BY ts",
+        "SELECT SUM(value) AS ts FROM source GROUP BY ts",
+        "SELECT ts + 1 AS ts, SUM(value) FROM source GROUP BY ts",
+        "SELECT ts, SUM(value) FROM source GROUP BY ts, unused",
+        "SELECT ts, SUM(value) FROM source GROUP BY ROLLUP(ts)",
+        "SELECT ts, SUM(value) FROM source GROUP BY ts ORDER BY ts LIMIT 1",
+        "SELECT ts, SUM(value) FROM source GROUP BY ts ORDER BY ts OFFSET 1",
+        "SELECT ts, SUM(random()) FROM source GROUP BY ts",
+        "SELECT ts, MAX(value) FILTER (WHERE random() > 0.5) FROM source GROUP BY ts",
+        "SELECT ts, ARRAY_AGG(value ORDER BY random()) FROM source GROUP BY ts",
+        "SELECT ts, SUM((SELECT MAX(value) FROM source)) FROM source GROUP BY ts",
+        "SELECT ts, SUM(value) FROM source GROUP BY ts ORDER BY random()",
+        "SELECT ts, SUM(value) OVER () FROM source",
+        "SELECT ts, value FROM source",
+    ] {
+        assert!(
+            plan_user_sql(
+                &context,
+                sql,
+                UserSqlDeclaration::timestamp_grouped("source", "ts")?
+            )
+            .await
+            .is_err(),
+            "unsafe or ungrouped declaration was accepted: {sql}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn timestamp_grouped_parses_text_without_bucketing_instants() -> Result<()> {
+    use arrow::array::{ArrayRef, StringArray, TimestampNanosecondArray};
+    use arrow::compute::concat_batches;
+    use datafusion::datasource::MemTable;
+
+    let batch = RecordBatch::try_from_iter([
+        (
+            "ts",
+            Arc::new(StringArray::from(vec![
+                "1970-01-01T00:00:00.000000100Z",
+                "1970-01-01T01:00:00.000000100+01:00",
+                "1970-01-01T00:00:00.000000200Z",
+            ])) as ArrayRef,
+        ),
+        (
+            "value",
+            Arc::new(Float64Array::from(vec![1.0, 2.0, 4.0])) as ArrayRef,
+        ),
+    ])?;
+    let context = SessionContext::new();
+    _ = context.register_table(
+        "source",
+        Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]])?),
+    )?;
+    let query = "WITH typed AS (SELECT CAST(ts AS TIMESTAMP) AS ts, value FROM source)
+        SELECT ts, SUM(value) AS total FROM typed GROUP BY ts ORDER BY ts";
+    let batches = plan_user_sql(
+        &context,
+        query,
+        UserSqlDeclaration::timestamp_grouped("source", "ts")?,
+    )
+    .await?
+    .into_frame()
+    .collect()
+    .await?;
+    let batch = concat_batches(&batches[0].schema(), &batches)?;
+    assert_eq!(
+        batch
+            .column_by_name("ts")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap()
+            .values()
+            .as_ref(),
+        &[100, 200]
+    );
+    assert_eq!(
+        batch
+            .column_by_name("total")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .values()
+            .as_ref(),
+        &[3.0, 4.0]
+    );
+    for sql in [
+        "SELECT CAST(ts AS TIMESTAMP) AS ts, SUM(value) FROM source GROUP BY ts",
+        "WITH typed AS (SELECT CAST(ts AS TIMESTAMP(3)) AS ts, value FROM source)
+         SELECT ts, SUM(value) FROM typed GROUP BY ts",
+        "WITH typed AS (SELECT CAST(ts AS TIMESTAMP) AS ts, value FROM source),
+         bucketed AS (SELECT CAST(ts AS TIMESTAMP(3)) AS ts, value FROM typed)
+         SELECT ts, SUM(value) FROM bucketed GROUP BY ts",
+    ] {
+        assert!(
+            plan_user_sql(
+                &context,
+                sql,
+                UserSqlDeclaration::timestamp_grouped("source", "ts")?
+            )
+            .await
+            .is_err(),
+            "precision-reducing time conversion was accepted: {sql}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn local_declarations_reject_unproven_or_incomplete_plans() -> Result<()> {
     let (_fixture, context) = fixture().await?;
     for (sql, expected) in [
