@@ -37,7 +37,8 @@ impl UserSqlDeclaration {
         Self::try_new(LocalityClass::Global, sources, None)
     }
 
-    /// Declare a single-source SQL projection/filter as timestamp-local.
+    /// Declare a single-source projection/filter, optionally sorted without
+    /// limiting rows, as timestamp-local.
     pub fn timestamp_local(
         source: impl Into<Arc<str>>,
         event_time: impl Into<Arc<str>>,
@@ -255,13 +256,15 @@ async fn validate_timestamp_local_sql(
 
 fn validate_timestamp_local_plan(plan: &LogicalPlan) -> Result<()> {
     _ = plan.apply(|node| {
+        // A full sort commutes with time restriction; a top-k sort does not.
         if !matches!(
             node,
             LogicalPlan::Projection(_)
                 | LogicalPlan::Filter(_)
                 | LogicalPlan::SubqueryAlias(_)
                 | LogicalPlan::TableScan(_)
-        ) {
+        ) && !matches!(node, LogicalPlan::Sort(sort) if sort.fetch.is_none())
+        {
             return Err(DataFusionError::Plan(format!(
                 "timestamp-local SQL does not support logical operator {}",
                 logical_operator_name(node)
@@ -449,5 +452,22 @@ mod tests {
         };
 
         assert!(error.to_string().contains("Aggregate"));
+    }
+
+    #[tokio::test]
+    async fn timestamp_local_validation_rejects_a_sort_with_fetch() {
+        let context = SessionContext::new();
+        _ = context.register_table("declared", empty_table()).unwrap();
+        let frame = context
+            .sql("SELECT value FROM declared ORDER BY value")
+            .await
+            .unwrap();
+        let LogicalPlan::Sort(mut sort) = frame.logical_plan().clone() else {
+            panic!("expected a sort plan");
+        };
+        sort.fetch = Some(1);
+        let error = validate_timestamp_local_plan(&LogicalPlan::Sort(sort))
+            .expect_err("a top-k sort must not be timestamp-local");
+        assert!(error.to_string().contains("Sort"), "{error}");
     }
 }

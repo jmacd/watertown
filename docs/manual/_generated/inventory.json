@@ -7611,7 +7611,7 @@
               "type": "object"
             },
             {
-              "description": "A single-source immutable projection/filter that preserves event time.",
+              "description": "A single-source immutable projection/filter that preserves event time,\noptionally sorted without limiting rows.",
               "properties": {
                 "event_time": {
                   "description": "Event-time column retained by the output.",
@@ -7693,7 +7693,7 @@
               "type": "object"
             },
             {
-              "description": "A single-source immutable projection/filter that preserves event time.",
+              "description": "A single-source immutable projection/filter that preserves event time,\noptionally sorted without limiting rows.",
               "properties": {
                 "event_time": {
                   "description": "Event-time column retained by the output.",

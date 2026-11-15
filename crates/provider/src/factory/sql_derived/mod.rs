@@ -71,7 +71,8 @@ pub enum SqlDerivedLocality {
     /// Unrestricted SQL. The query is visible as global and non-incremental.
     #[default]
     Global,
-    /// A single-source immutable projection/filter that preserves event time.
+    /// A single-source immutable projection/filter that preserves event time,
+    /// optionally sorted without limiting rows.
     TimestampLocal {
         /// Event-time column retained by the output.
         event_time: String,
@@ -221,7 +222,8 @@ impl SqlDerivedConfig {
         self
     }
 
-    /// Declare this SQL as a single-source timestamp-local projection/filter.
+    /// Declare this SQL as a timestamp-local projection/filter, optionally
+    /// sorted without limiting rows.
     #[must_use]
     pub fn with_timestamp_local(mut self, event_time: impl Into<String>) -> Self {
         self.locality = SqlDerivedLocality::TimestampLocal {

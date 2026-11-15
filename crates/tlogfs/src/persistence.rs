@@ -6273,7 +6273,7 @@ mod metadata_query_tests {
             (
                 "/local",
                 serde_json::json!({"type": "timestamp-local", "event_time": "timestamp"}),
-                "SELECT timestamp, value FROM source",
+                "SELECT timestamp, value FROM source ORDER BY timestamp",
             ),
             (
                 "/global",

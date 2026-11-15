@@ -106,11 +106,36 @@ async fn unrestricted_window_and_cumulative_sql_remain_explicitly_global() -> Re
 #[tokio::test]
 async fn declared_timestamp_local_sql_proves_operator_and_range_contracts() -> Result<()> {
     let (_fixture, context) = fixture().await?;
+    let full = plan_user_sql(
+        &context,
+        "SELECT ts, value * 2.0 AS doubled FROM source ORDER BY doubled DESC, ts",
+        UserSqlDeclaration::global(["source"])?,
+    )
+    .await?
+    .into_frame()
+    .collect()
+    .await?;
+    let expected = full
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("ts")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+        })
+        .filter(|time| (10..=19).contains(time))
+        .collect::<Vec<_>>();
     let planned = plan_user_sql(
         &context,
         "SELECT ts, value * 2.0 AS doubled
          FROM source
-         WHERE ts >= 10 AND ts <= 19",
+         WHERE ts >= 10 AND ts <= 19
+         ORDER BY doubled DESC, ts",
         UserSqlDeclaration::timestamp_local("source", "ts")?,
     )
     .await?;
@@ -126,21 +151,32 @@ async fn declared_timestamp_local_sql_proves_operator_and_range_contracts() -> R
     );
 
     let frame = planned.into_frame();
+    let bounded = frame.clone().collect().await?;
+    let actual = bounded
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("ts")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        frame
-            .clone()
-            .collect()
-            .await?
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum::<usize>(),
-        2
+        actual, expected,
+        "time selection must preserve the full query's ordering"
     );
+    assert_eq!(actual, [19, 10]);
     let display = physical_plan(frame).await?;
     assert_eq!(display.matches("DataSourceExec").count(), 1, "{display}");
     assert!(display.contains("projection=[ts, value]"), "{display}");
     assert!(display.contains("ts@0 >= 10"), "{display}");
     assert!(display.contains("ts@0 <= 19"), "{display}");
+    assert!(display.contains("SortExec"), "{display}");
     assert!(!display.contains("unused"), "{display}");
 
     Ok(())
@@ -175,8 +211,13 @@ async fn local_declarations_reject_unproven_or_incomplete_plans() -> Result<()> 
             "SELECT ts, LAG(value) OVER (ORDER BY ts) FROM source",
             "Window",
         ),
-        ("SELECT ts, value FROM source ORDER BY ts", "Sort"),
+        ("SELECT ts, value FROM source ORDER BY ts LIMIT 1", "Limit"),
+        ("SELECT ts, value FROM source ORDER BY ts OFFSET 1", "Limit"),
         ("SELECT ts, value FROM source LIMIT 1", "Limit"),
+        (
+            "SELECT ts, value FROM source ORDER BY random()",
+            "not immutable",
+        ),
         (
             "SELECT left_source.ts
              FROM source left_source

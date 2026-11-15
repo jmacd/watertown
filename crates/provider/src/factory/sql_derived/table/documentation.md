@@ -23,7 +23,13 @@ the event-time field is required for that variant.
 
 Install with `pond mknod sql-derived-table /derived/readings --config-path view.yaml`. Inspect it with `pond describe /derived/readings` and query it with `pond cat /derived/readings --format=table --sql 'SELECT * FROM source'`.
 
-Table inputs reject multi-file matches. Output schema is the SQL query schema. `global` is the conservative locality default; `timestamp-local` is limited to a single-source immutable projection/filter that preserves its configured event-time column.
+Table inputs reject multi-file matches. Output schema is the SQL query schema.
+`global` is the conservative locality default; `timestamp-local` supports a
+single-source immutable projection/filter that preserves its configured
+event-time column, optionally with `ORDER BY` without a row limit.
+
+`LIMIT`, `OFFSET`, top-k sorts, aggregates, windows, subquery expressions, and non-immutable
+expressions remain unsupported in timestamp-local mode.
 
 <!-- docs:reference factory:sql-derived-table -->
 <!-- docs:end-reference -->

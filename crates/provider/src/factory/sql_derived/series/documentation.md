@@ -25,5 +25,11 @@ Install with `pond mknod sql-derived-series /derived/readings --config-path view
 
 Missing columns become null where schemas can be harmonized; incompatible types can fail planning. Transforms run before SQL. `timestamp-local` is an explicit restricted locality contract, not an optimization hint for arbitrary joins or aggregates.
 
+Timestamp-local queries may use immutable projections, filters, and `ORDER BY`
+without a row limit. Sorting preserves the selected rows and their values;
+`LIMIT`, `OFFSET`, and top-k sorts can change which rows belong to the result and
+remain unsupported. Aggregates, windows, subquery expressions, and non-immutable
+expressions also remain unsupported in this mode.
+
 <!-- docs:reference factory:sql-derived-series -->
 <!-- docs:end-reference -->
