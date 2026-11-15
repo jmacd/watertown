@@ -43,6 +43,22 @@ jobs:
         working-directory: testsuite
         run: ./run-all.sh --no-rebuild --skip-browser
 
+      - name: Export tested images
+        run: |
+          set -euo pipefail
+          docker save watertown-test:latest watertown-minio-test:latest \
+            | gzip -1 > "$RUNNER_TEMP/integration-images.tar.gz"
+
+      - name: Upload tested images
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: integration-images-${{ github.sha }}
+          path: ${{ runner.temp }}/integration-images.tar.gz
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+          overwrite: true
+
   compose-tests:
     name: Compose Tests (S3/MinIO)
     runs-on: ubuntu-latest
@@ -55,17 +71,18 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
           df -h
 
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - name: Download tested images
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: integration-images-${{ github.sha }}
+          path: ${{ runner.temp }}/integration-images
 
-      - name: Install cargo-zigbuild
+      - name: Load tested images
         run: |
-          pip3 install ziglang
-          cargo install cargo-zigbuild
-
-      - name: Build test image
-        working-directory: testsuite
-        run: ./build-image.sh --quiet
+          set -euo pipefail
+          docker load --input "$RUNNER_TEMP/integration-images/integration-images.tar.gz"
+          docker image inspect watertown-test:latest watertown-minio-test:latest > /dev/null
+          rm "$RUNNER_TEMP/integration-images/integration-images.tar.gz"
 
       - name: Run compose tests
         working-directory: testsuite
@@ -106,20 +123,21 @@ jobs:
         working-directory: testsuite/browser
         run: npx puppeteer browsers install chrome
 
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-
-      - name: Install cargo-zigbuild
-        run: |
-          pip3 install ziglang
-          cargo install cargo-zigbuild
-
       - name: Download vendor dependencies
         run: make vendor
 
-      - name: Build test image
-        working-directory: testsuite
-        run: ./build-image.sh --quiet
+      - name: Download tested images
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: integration-images-${{ github.sha }}
+          path: ${{ runner.temp }}/integration-images
+
+      - name: Load tested images
+        run: |
+          set -euo pipefail
+          docker load --input "$RUNNER_TEMP/integration-images/integration-images.tar.gz"
+          docker image inspect watertown-test:latest watertown-minio-test:latest > /dev/null
+          rm "$RUNNER_TEMP/integration-images/integration-images.tar.gz"
 
       - name: Run browser tests
         working-directory: testsuite

@@ -243,7 +243,11 @@ if [[ -n "${SCRIPT_FILE}" ]]; then
         export EXAMPLES_ROOT="${SCRIPT_DIR}/examples"
         export REPO_ROOT="${SCRIPT_DIR}/.."
         echo "=== Running Test: ${SCRIPT_NAME} (host, timeout: ${TIMEOUT}s) ==="
-        exec timeout "${TIMEOUT}" bash "${SCRIPT_FILE}" "$@"
+        HOST_ARGS=()
+        if [[ "${NO_REBUILD}" == "true" ]]; then
+            HOST_ARGS+=("--no-rebuild")
+        fi
+        exec timeout "${TIMEOUT}" bash "${SCRIPT_FILE}" "${HOST_ARGS[@]}" "$@"
     fi
 
     # Tests marked '# REQUIRES: privileged' need user namespaces (e.g. the

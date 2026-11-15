@@ -1,0 +1,4 @@
+endpoint: http://127.0.0.1:9000              # Required: example MinIO endpoint.
+access_key_id: "${env:MINIO_ACCESS_KEY}"     # Required: credential reference.
+secret_access_key: "${env:MINIO_SECRET_KEY}" # Required: secret reference.
+region: us-east-1                           # Effective default when omitted/null.

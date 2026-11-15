@@ -151,11 +151,12 @@ pub fn version_max_event_time(v: &FileVersionInfo) -> Option<i64> {
 /// `bounds` (per-version event-time / watermark prune), so a bounded reader
 /// scans only the hot files instead of all cached history.
 ///
-/// When `bounds` is [`tinyfs::SeriesReadBounds::NONE`] this covers every live
+/// When `bounds` is [`tinyfs::SeriesReadBounds::NONE`] this covers every supplied
 /// version. When the bounds retain no version, an empty table over the merged
 /// cache schema is returned (0 rows), never a silent full scan.
 ///
-/// `versions` must be the node's LIVE versions. The scan names their files
+/// `versions` must contain live versions selected by the caller (current
+/// content, series chunks, or explicit history). The scan names their files
 /// explicitly rather than listing the cache directory, which accumulates a
 /// Parquet per version ever written: version collapse replaces a run of
 /// versions with one merged version carrying the same content, so a listing
@@ -196,8 +197,8 @@ pub async fn listing_table_from_cache_bounded(
 /// members is present and NULL-filled elsewhere (the UNION-ALL-BY-NAME property
 /// the glob directory existed to provide).
 ///
-/// Each `versions` slice must be that node's LIVE versions, as returned by
-/// `list_file_versions`, which already hides collapse-superseded ones.
+/// Each `versions` slice must contain that node's query-selected live versions,
+/// excluding collapse-superseded chunks.
 #[must_use]
 pub fn glob_cached_set(
     cache_dir: &Path,

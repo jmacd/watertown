@@ -387,7 +387,7 @@ pub fn register_shortcodes(ctx: Arc<ShortcodeContext>) -> Shortcodes {
         });
     }
 
-    // {{ viz renderer="chart|overlay|logs" /}} -- unified visualization
+    // {{ viz renderer="chart|overlay|logs|stacked-area" /}} -- unified visualization
     // container. Emits the container div + inline parquet manifest that the
     // named client-side module binds to. This is the general, extensible seam
     // for telemetry visualizations; the {{ chart }}, {{ overlay_chart }} and
@@ -397,15 +397,31 @@ pub fn register_shortcodes(ctx: Arc<ShortcodeContext>) -> Shortcodes {
         shortcodes.register("viz", move |args: &ShortcodeArgs| {
             let name = args.get_str("renderer").unwrap_or("chart");
             match viz_renderer(name) {
-                Some(r) => render_viz(
-                    r,
-                    &c.datafiles,
-                    &c.metric_registry,
-                    &c.metric_captions,
-                    args.get_str("range").or(c.default_range.as_deref()),
-                    c.explore_url.as_deref(),
-                    &c.annotations,
-                ),
+                Some(r) => {
+                    let mut html = render_viz(
+                        r,
+                        &c.datafiles,
+                        &c.metric_registry,
+                        &c.metric_captions,
+                        args.get_str("range").or(c.default_range.as_deref()),
+                        c.explore_url.as_deref(),
+                        &c.annotations,
+                    );
+                    if r.id == "stacked-area" && !c.datafiles.is_empty() {
+                        let options: BTreeMap<_, _> =
+                            ["x", "y", "color", "days", "order", "y_title"]
+                                .into_iter()
+                                .filter_map(|key| args.get_str(key).map(|value| (key, value)))
+                                .collect();
+                        let json = serde_json::to_string(&options)
+                            .expect("string options serialize")
+                            .replace('<', "\\u003c");
+                        html.push_str(&format!(
+                            "<script type=\"application/json\" class=\"stacked-area-options\">{json}</script>"
+                        ));
+                    }
+                    html
+                }
                 None => format!(
                     "<div class=\"chart-container\"><p>Unknown viz renderer: {}</p></div>",
                     html_escape(name)
@@ -665,6 +681,17 @@ const VIZ_LOGS: VizRenderer = VizRenderer {
     empty_msg: "No log files available.",
 };
 
+const VIZ_STACKED_AREA: VizRenderer = VizRenderer {
+    id: "stacked-area",
+    container_class: "chart-container",
+    data_class: "stacked-area-data",
+    include_registry: false,
+    include_default_range: false,
+    include_explore: false,
+    include_annotations: false,
+    empty_msg: "No reported data available.",
+};
+
 /// Resolve a `renderer=` name (from the `{{ viz }}` shortcode) to its
 /// descriptor. Unknown names yield `None` so the shortcode can surface an error.
 fn viz_renderer(name: &str) -> Option<&'static VizRenderer> {
@@ -672,6 +699,7 @@ fn viz_renderer(name: &str) -> Option<&'static VizRenderer> {
         "chart" => Some(&VIZ_CHART),
         "overlay" => Some(&VIZ_OVERLAY),
         "logs" | "log" | "log-viewer" => Some(&VIZ_LOGS),
+        "stacked-area" => Some(&VIZ_STACKED_AREA),
         _ => None,
     }
 }
@@ -1928,6 +1956,45 @@ mod tests {
         assert!(!logs.contains("chart-registry"));
         assert!(!logs.contains("data-default-range"));
         assert!(!logs.contains("data-explore-url"));
+    }
+
+    #[test]
+    fn stacked_area_shortcode_maps_columns_and_keeps_options_literal() {
+        let ctx = ShortcodeContext {
+            datafiles: vec![ExportedFile {
+                path: "/analytics/public/daily-sections".into(),
+                file: "data/daily.parquet".into(),
+                captures: vec![],
+                temporal: BTreeMap::new(),
+                start_time: 0,
+                end_time: 0,
+            }],
+            ..Default::default()
+        };
+        let shortcodes = register_shortcodes(Arc::new(ctx));
+        let html = crate::markdown::preprocess_shortcodes(
+            r#"{{ viz renderer="stacked-area" x="timestamp" y="views" color="section" days="30" y_title="Views </script><script>bad</script>" /}}"#,
+            &shortcodes,
+            None,
+        ).unwrap();
+        assert!(html.contains("id=\"stacked-area\""));
+        assert!(html.contains("class=\"stacked-area-data\""));
+        assert!(html.contains("data/daily.parquet"));
+        assert!(html.contains(r#""y":"views""#));
+        assert!(html.contains(r#""color":"section""#));
+        assert!(html.contains(r#"\u003c/script>"#));
+        assert!(!html.contains("<script>bad"));
+        assert!(!html.contains("chart-registry"));
+
+        let empty = register_shortcodes(Arc::new(ShortcodeContext::default()));
+        let html = crate::markdown::preprocess_shortcodes(
+            r#"{{ viz renderer="stacked-area" /}}"#,
+            &empty,
+            None,
+        )
+        .unwrap();
+        assert!(html.contains("No reported data available."));
+        assert!(!html.contains("stacked-area-data"));
     }
 
     #[test]

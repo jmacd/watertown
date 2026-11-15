@@ -350,6 +350,8 @@ async fn version_chunk(
         )
         .map_err(external_error)?,
     );
+    utilities::parquet_policy::validate_metadata(&arrow_schema, &metadata)
+        .map_err(external_error)?;
     let logical_count = u64::try_from(file_metadata.num_rows()).map_err(|_| {
         DataFusionError::Plan(format!(
             "TinyFS Parquet version {} for {file_id} has a negative row count",

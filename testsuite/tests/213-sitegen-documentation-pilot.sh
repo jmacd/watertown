@@ -1,5 +1,5 @@
 #!/bin/bash
-# EXPERIMENT: Four-page documentation readiness gate, using cached pond only
+# EXPERIMENT: Documentation readiness gate, using cached pond only
 # EXPECTED: Canonical nested links, literal code, strict rejection, and lean offline output
 set -euo pipefail
 source check.sh
@@ -12,12 +12,21 @@ export POND_BIN="${POND_BIN:-$(command -v pond)}"
 bash "${EXAMPLES_ROOT}/documentation-pilot/run.sh"
 SITE="${EXAMPLE_OUTPUT}/site"
 FACTORY="${SITE}/reference/factories/synthetic-timeseries.html"
+GIT_FACTORY="${SITE}/reference/factories/git-ingest.html"
 CSV="${SITE}/reference/formats/csv.html"
 GUIDE="${SITE}/guides/timeseries.html"
 SHORTCODES="${SITE}/reference/sitegen/shortcodes.html"
-for page in "${SITE}/index.html" "${FACTORY}" "${CSV}" "${GUIDE}" "${SHORTCODES}"; do
+for page in "${SITE}/index.html" "${FACTORY}" "${GIT_FACTORY}" "${CSV}" "${GUIDE}" "${SHORTCODES}" "${SITE}/guides/architecture.html"; do
     check '[[ -f "${page}" ]]' "pilot page $(basename "${page}") generated"
 done
+check '[[ "$(find "${SITE}" -name "*.html" -type f | wc -l | tr -d " ")" = 49 ]]' "complete manual renders 49 pages"
+for format in csv excelhtml hledger jsonlogs oteljson weblog xls; do
+    check '[[ -f "${SITE}/reference/formats/${format}.html" ]]' "individual ${format} format page generated"
+    check_contains "${SITE}/index.html" "${format} has a direct sidebar link" "href=\"/watertown/reference/formats/${format}.html\""
+done
+check_contains "${GIT_FACTORY}" "each public factory has an individual page" '<h1 id="git-ingestion">Git ingestion'
+check_contains "${GIT_FACTORY}" "factory page includes generated full configuration" 'id="full-configuration"'
+check_contains "${GIT_FACTORY}" "page contents nests schema heading" 'href="#full-configuration">Full configuration</a><ul>'
 check_contains "${GUIDE}" "duplicate heading gets unique ID" 'id="inspect-1"'
 check_contains "${GUIDE}" "page contents uses canonical ID" 'href="#inspect-1"'
 check_contains "${GUIDE}" "cross-page fragment uses Pages prefix" 'href="/watertown/reference/factories/synthetic-timeseries.html#inspect"'
@@ -35,6 +44,10 @@ check '! find "${SITE}" -name "*.js" -o -name "*.wasm" | grep -q .' "no unused J
 check '[[ ! -d "${SITE}/vendor" ]]' "no visualization vendor tree"
 check '! grep -R -E "fonts.googleapis|fonts.gstatic" "${SITE}" --include="*.html"' "no remote fonts"
 check 'cmp "${EXAMPLES_ROOT}/synthetic-timeseries/config.yaml" "${SITE}/testsuite/examples/synthetic-timeseries/config.yaml"' "downloadable raw source is identical"
+check_not_contains "${GIT_FACTORY}" "example is not collapsible" '<details'
+check_contains "${GIT_FACTORY}" "example is displayed inline" '<pre><code class="language-yaml">'
+check_not_contains "${GIT_FACTORY}" "example has no download link" 'Download default.yaml'
+check_contains "${GIT_FACTORY}" "annotated YAML comments are included verbatim" 'Required: example Git remote.'
 mkdir "${WORK}/download"
 tar -xf "${SITE}/downloads/csv-query.tar" -C "${WORK}/download"
 check 'diff -r "${EXAMPLES_ROOT}/csv-query" "${WORK}/download/csv-query"' "archive is generated from exact fixtures"
@@ -43,15 +56,32 @@ check 'diff -r "${EXAMPLES_ROOT}/csv-query" "${WORK}/download/csv-query"' "archi
 INPUT="${WORK}/input"
 mkdir -p "${INPUT}/docs" "${INPUT}/testsuite"
 cp -R "${REPO_ROOT}/docs/manual" "${REPO_ROOT}/docs/templates" "${INPUT}/docs/"
-cp "${REPO_ROOT}/docs/site.yaml" "${INPUT}/docs/site.yaml"
+cp "${REPO_ROOT}/docs/site.yaml" "${REPO_ROOT}/docs/documentation-inventory.json" "${INPUT}/docs/"
 cp -R "${EXAMPLES_ROOT}" "${INPUT}/testsuite/examples"
+python3 - "${REPO_ROOT}" "${INPUT}" <<'PY'
+import json
+from pathlib import Path
+import shutil
+import sys
+root, target = map(Path, sys.argv[1:])
+catalog = json.loads((root / "docs/documentation-inventory.json").read_text())
+for page in catalog["pages"].values():
+    if "output" not in page:
+        continue
+    source = Path(page["path"])
+    destination = target / source
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(root / source, destination)
+    example = source.with_name("default.yaml")
+    if (root / example).is_file():
+        shutil.copyfile(root / example, target / example)
+PY
 mkdir -p "${INPUT}/docs/manual/reference/_generated"
 printf '{{ this_must_not_be_discovered /}}\n' > "${INPUT}/docs/manual/reference/_generated/fragment.md"
-mkdir -p "${WORK}/rebuild/downloads"
-cp "${SITE}/downloads/"*.tar "${WORK}/rebuild/downloads/"
 
 build() {
-    "${POND_BIN}" run -d "${INPUT}" host+sitegen:///docs/site.yaml -- build "${WORK}/rebuild" --strict > "${WORK}/build.log" 2>&1
+    DOCS_SOURCE_ROOT="${INPUT}" DOCS_OUT="${WORK}/rebuild" \
+        bash "${REPO_ROOT}/scripts/docs-build.sh" > "${WORK}/build.log" 2>&1
 }
 PAGE="${INPUT}/docs/manual/reference/sitegen/shortcodes.md"
 ORIGINAL="${REPO_ROOT}/docs/manual/reference/sitegen/shortcodes.md"
@@ -89,11 +119,55 @@ printf '\n{{ source path="/docs/site.yaml" /}}\n' >> "${PAGE}"
 check '! build' "include cannot read outside approved roots"
 check_contains "${WORK}/build.log" "include confinement diagnostic" 'outside documentation include_roots'
 cp "${ORIGINAL}" "${PAGE}"
+DEFAULTS="${INPUT}/crates/gitpond/src/factory/default.yaml"
+mv "${DEFAULTS}" "${WORK}/missing-default.yaml"
+check '! DOCS_SOURCE_ROOT="${INPUT}" DOCS_OUT="${SITE}" bash "${REPO_ROOT}/scripts/docs-build.sh" > "${WORK}/wrapper.log" 2>&1' "missing colocated YAML rejects assembly"
+check_contains "${WORK}/wrapper.log" "missing YAML diagnostic identifies its component" 'crates/gitpond/src/factory/default.yaml'
+check 'cmp "${SHORTCODES}" "${WORK}/previous.html"' "failed assembly preserves the previous preview"
+mv "${WORK}/missing-default.yaml" "${DEFAULTS}"
+DUPLICATE="${INPUT}/docs/manual/reference/factories/git-ingest.md"
+cp "${INPUT}/crates/gitpond/src/factory/documentation.md" "${DUPLICATE}"
+check '! build' "assembly rejects duplicate authored component pages"
+check_contains "${WORK}/build.log" "duplicate diagnostic identifies its output" 'Generated component output collides with authored input: docs/manual/reference/factories/git-ingest.md'
+rm -- "${DUPLICATE}"
 printf '\nA cached-binary prose edit.\n' >> "${PAGE}"
+COMPONENT="${INPUT}/crates/gitpond/src/factory/documentation.md"
+printf '\nA colocated component prose edit.\n' >> "${COMPONENT}"
+printf '\n# A colocated YAML edit.\n' >> "${DEFAULTS}"
+cp "${COMPONENT}" "${WORK}/authored-component.md"
+cp "${DEFAULTS}" "${WORK}/authored-default.yaml"
 mkdir "${WORK}/tools"
 printf '#!/bin/bash\necho "Unexpected Cargo invocation" >&2\nexit 99\n' > "${WORK}/tools/cargo"
 chmod +x "${WORK}/tools/cargo"
 check 'PATH="${WORK}/tools:${PATH}" DOCS_SOURCE_ROOT="${INPUT}" DOCS_OUT="${SITE}" bash "${REPO_ROOT}/scripts/docs-build.sh" > "${WORK}/wrapper.log" 2>&1' "ordinary prose edits rebuild with Cargo unavailable"
 check_contains "${SHORTCODES}" "prose edit reaches output" 'A cached-binary prose edit.'
+check_contains "${GIT_FACTORY}" "colocated component prose reaches output without Cargo" 'A colocated component prose edit.'
+check_contains "${GIT_FACTORY}" "colocated YAML reaches output without Cargo" '# A colocated YAML edit.'
+check 'cmp "${COMPONENT}" "${WORK}/authored-component.md" && cmp "${DEFAULTS}" "${WORK}/authored-default.yaml"' "build leaves colocated inputs unchanged"
+check '[[ ! -e "${INPUT}/docs/manual/reference/factories/git-ingest.md" ]]' "component pages exist only in the generated staging tree"
 check '[[ ! -e "${WORK}/input/pond" && ! -e "${WORK}/input/.pond" ]]' "manual requires no pond"
+
+QUICK_INPUT="${WORK}/quick-input"
+QUICK_OUTPUT="${WORK}/quick-output"
+mkdir -p "${QUICK_INPUT}" "${QUICK_OUTPUT}/noyo"
+cat > "${QUICK_INPUT}/site.yaml" <<'YAML'
+site: {title: Quick preview}
+documentation: {version: 1, source_root: /}
+routes:
+  - {name: home, type: static, slug: "", page: /index.md}
+YAML
+printf '%s\n' '---' 'title: Fresh page' '---' 'Preview content.' > "${QUICK_INPUT}/index.md"
+RETAINED="${QUICK_OUTPUT}/noyo/old.html"
+printf '%s\n' '<script defer src="/_analytics/old.js" data-watertown-analytics="1"></script>' > "${RETAINED}"
+cp "${RETAINED}" "${QUICK_OUTPUT}/index.html"
+cp "${RETAINED}" "${WORK}/retained-before.html"
+check '"${POND_BIN}" run -d "${QUICK_INPUT}" host+sitegen:///site.yaml -- build "${QUICK_OUTPUT}" --quick > "${WORK}/quick.log" 2>&1' "quick preview succeeds with retained analytics"
+check_contains "${WORK}/quick.log" "quick preview warns about retained subsite HTML" "Quick build retained analytics instrumentation in ${RETAINED}"
+check_not_contains "${WORK}/quick.log" "regenerated pages do not produce stale analytics warnings" "Quick build retained analytics instrumentation in ${QUICK_OUTPUT}/index.html"
+check 'cmp "${RETAINED}" "${WORK}/retained-before.html"' "quick warning leaves retained HTML untouched"
+check_not_contains "${QUICK_OUTPUT}/index.html" "quick preview regenerates the main page without analytics" 'data-watertown-analytics="1"'
+check '"${POND_BIN}" run -d "${QUICK_INPUT}" host+sitegen:///site.yaml -- build "${QUICK_OUTPUT}" > "${WORK}/full.log" 2>&1' "full build succeeds with retained HTML"
+check_not_contains "${WORK}/full.log" "full builds do not emit the development warning" "Quick build retained analytics"
+check '"${POND_BIN}" run -d "${QUICK_INPUT}" host+sitegen:///site.yaml -- build "${WORK}/fresh-quick" --quick > "${WORK}/fresh-quick.log" 2>&1' "fresh quick preview succeeds"
+check_not_contains "${WORK}/fresh-quick.log" "fresh quick previews do not warn" "Quick build retained analytics"
 check_finish

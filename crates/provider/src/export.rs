@@ -738,6 +738,7 @@ async fn stream_partitioned_export(
             source_schema.clone(),
             batch.columns()[..source_columns].to_vec(),
         )?;
+        utilities::parquet_policy::validate_batch(&source_batch)?;
 
         let mut start = 0;
         while start < batch.num_rows() {
@@ -807,6 +808,7 @@ struct ActivePartitionWriter {
     final_path: PathBuf,
     temp_path: PathBuf,
     writer: parquet::arrow::ArrowWriter<std::fs::File>,
+    schema: arrow::datatypes::SchemaRef,
 }
 
 impl ActivePartitionWriter {
@@ -832,20 +834,26 @@ impl ActivePartitionWriter {
         }
         let temp_path = final_path.with_extension(format!("parquet.tmp-{}", std::process::id()));
         let file = std::fs::File::create(&temp_path)?;
-        let writer = parquet::arrow::ArrowWriter::try_new(file, schema, None)?;
+        let props = utilities::parquet_policy::writer_properties(
+            &schema,
+            parquet::file::properties::WriterProperties::builder(),
+        )?;
+        let writer = parquet::arrow::ArrowWriter::try_new(file, schema.clone(), Some(props))?;
         Ok(Self {
             part,
             final_path,
             temp_path,
             writer,
+            schema,
         })
     }
 
     fn finish(self, source_label: &str) -> Result<()> {
-        _ = self
+        let metadata = self
             .writer
             .close()
             .map_err(|e| anyhow::anyhow!("Parquet close failed for '{}': {}", source_label, e))?;
+        utilities::parquet_policy::validate_metadata(&self.schema, &metadata)?;
         std::fs::rename(&self.temp_path, &self.final_path).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to publish partition '{}' for '{}': {}",

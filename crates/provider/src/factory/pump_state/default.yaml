@@ -1,0 +1,7 @@
+source: series:///sensors/well  # Required: example exact source URL.
+time_column: timestamp         # Required: source event-time column.
+depth_column: depth            # Required: source depth column.
+lookback: 60m                  # Required: example trailing ceiling window.
+disturbance_drop: 1.0           # Required: example drop in source depth units.
+valid_depth_min: 0.0           # Required: example inclusive lower depth bound.
+valid_depth_max: 100.0          # Required: example inclusive upper depth bound.

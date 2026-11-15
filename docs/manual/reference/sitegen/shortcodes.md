@@ -17,7 +17,7 @@ captures, content lists, exports, and configured metadata.
 | `chart` | Optional `range`; time/value chart with page export manifest, metric registry/captions, optional explorer link and annotations. |
 | `overlay_chart` | Pump-cycle overlay using the page's files and optional explorer link; no shortcode arguments. |
 | `log_viewer` | Log viewer for the page's files; no shortcode arguments. |
-| `viz` | `renderer` defaults to `chart`, also `overlay` or `logs`; optional `range`. Unknown renderers produce an explicit error container. |
+| `viz` | `renderer` defaults to `chart`, also `overlay`, `logs`, or `stacked-area`; optional `range` for `chart`. Unknown renderers produce an explicit error container. |
 | `explore` | `table` defaults to `data`; `label` defaults to that table. Configured multi-dataset exports supersede the fallback page dataset. |
 | `nav_list` | `collection`; `base` (alias `path`) supplies the link prefix. Legacy spelling `nav-list` is normalized outside code. |
 | `breadcrumb` | Current route breadcrumbs; no arguments. |
@@ -32,6 +32,35 @@ captures, content lists, exports, and configured metadata.
 [Browser behavior](browser.md) explains data assets and coverage boundaries;
 [configuration](configuration.md) supplies stages/routes and
 [frontmatter](frontmatter.md) supplies page metadata.
+
+## Daily stacked areas
+
+A data-layout template can render an exported daily dataset directly:
+
+```text
+{{ viz renderer="stacked-area" x="timestamp" y="views" color="section" days="30" y_title="Reported page views" order="Blog,Static content,Monitoring,Noyo,Other / unclassified" /}}
+```
+
+`x`, `y`, and `color` name the timestamp, count, and category columns; defaults
+are `timestamp`, `value`, and `series`. Input timestamps must be UTC midnight,
+counts nonnegative integers within JavaScript's exact integer range, and
+categories nonempty strings. Files must be disjoint parts of one daily dataset,
+not overlapping resolution tiers. Repeated day/category rows are summed.
+
+`days` defaults to 30 UTC calendar days including today. `y_title` labels the
+count axis. Optional comma-separated `order` fixes category order and color
+assignments even when a named category is absent; additional categories follow
+alphabetically. As with other visualization renderers, use one instance per page.
+
+The chart uses Vega-Lite stacking and step areas spanning each observed day.
+An absent category on a day with reported rows contributes zero; an entirely
+missing day remains a gap. Today is shaded and labeled partial. No collection
+coverage or freshness is inferred from the counts. Missing files fail the whole
+chart rather than display an incomplete total.
+
+The page's route supplies its exported Parquet files. The template does not
+ingest observations or query a live pond, and browser date filtering is not a
+privacy boundary: export only the permitted public dataset.
 
 ## Literal examples
 

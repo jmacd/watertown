@@ -1,0 +1,9 @@
+sitegen: /etc/site.yaml               # Required: example sitegen config path.
+report: daily                        # Required: name in its reports map.
+endpoint_env: ACS_EMAIL_ENDPOINT      # Required: name of the endpoint variable.
+access_key_env: ACS_EMAIL_ACCESS_KEY  # Required: name of the secret variable.
+recipient_env: REPORT_RECIPIENT       # Required: name of the recipient variable.
+sender: reports@example.invalid      # Required: replace with an authorized sender.
+subject: Daily report                # Required: example subject.
+reply_to: null                       # Default: no Reply-To override.
+timeout: 300s                        # Effective default when omitted or null.

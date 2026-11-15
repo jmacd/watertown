@@ -179,6 +179,69 @@ async fn fixed_windows_handle_boundaries_negative_time_groups_and_nulls() -> Res
 }
 
 #[tokio::test]
+async fn timestamp_windows_preserve_nullable_and_quoted_group_keys() -> Result<()> {
+    let context = SessionContext::new();
+    let frame = context.sql(
+        r#"SELECT arrow_cast(ts, 'Timestamp(Millisecond, None)') AS ts, site, page AS "page.""key"
+           FROM (VALUES
+             (0, 'a', 'x'), (1, 'a', 'x'), (2, 'b', 'x'),
+             (3, 'a', 'y'), (4, NULL, 'x'), (5, NULL, 'x'),
+             (60000, 'a', 'x')
+           ) AS events(ts, site, page)"#,
+    ).await?;
+    let recipe = TimestampWindowReduce::try_new(
+        "ts",
+        Duration::from_secs(60),
+        vec![TimestampPartialAggregate::CountStar {
+            output: "views".into(),
+        }],
+    )?;
+    let grouped = recipe
+        .clone()
+        .with_groups(vec!["site".into(), "page.\"key".into()])?;
+    let actual = reduce_timestamp_windows(frame.clone(), &grouped)?;
+    let actual = actual
+        .aggregate(
+            vec![],
+            vec![
+                datafusion::functions_aggregate::expr_fn::count(datafusion::logical_expr::lit(1))
+                    .alias("groups"),
+                datafusion::functions_aggregate::expr_fn::sum(datafusion::logical_expr::col(
+                    "views",
+                ))
+                .alias("events"),
+            ],
+        )?
+        .collect()
+        .await?;
+    assert_eq!(
+        datafusion::common::ScalarValue::try_from_array(actual[0].column(0), 0)?,
+        datafusion::common::ScalarValue::Int64(Some(5))
+    );
+    assert_eq!(
+        datafusion::common::ScalarValue::try_from_array(actual[0].column(1), 0)?,
+        datafusion::common::ScalarValue::Int64(Some(7))
+    );
+    for groups in [
+        vec![""],
+        vec!["site", "site"],
+        vec!["ts"],
+        vec!["time_bucket"],
+        vec!["views"],
+    ] {
+        assert!(
+            recipe
+                .clone()
+                .with_groups(groups.into_iter().map(str::to_owned).collect())
+                .is_err()
+        );
+    }
+    let missing = recipe.with_groups(vec!["absent".into()])?;
+    assert!(reduce_timestamp_windows(frame, &missing).is_err());
+    Ok(())
+}
+
+#[tokio::test]
 async fn timestamp_windows_emit_multiple_mergeable_partials() -> Result<()> {
     let schema = Arc::new(Schema::new(vec![
         Field::new(

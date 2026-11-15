@@ -42,6 +42,10 @@ visualization downloads are needed.
 
 ## Contributing
 
+Begin with [architecture for developers](guides/architecture.md): storage
+authority, directory locality, query/cache services, transaction boundaries,
+and how to extend the platform without duplicating its infrastructure.
+
 See the [authoring workflow](https://github.com/jmacd/watertown/blob/main/docs/README.md)
 and [migration inventory](https://github.com/jmacd/watertown/blob/main/docs/documentation-inventory.json).
 Only `docs/manual/` is selected as page content; archives and design notes are

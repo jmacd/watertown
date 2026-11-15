@@ -413,6 +413,7 @@ impl CachedSet {
 
 /// Stream `stream` into a Parquet file at `path` atomically (tmp + rename), and
 /// return the blake3 digest of the bytes written.
+/// Schema-declared encoding policies are enforced before publication.
 ///
 /// The single Parquet writer for every on-disk cache in this crate: the
 /// per-version sidecars, and the partial-aggregate cache's sealed runs and its
@@ -431,23 +432,30 @@ pub async fn write_parquet_atomic(
     // Deliberately NOT `{stem}.parquet.tmp`: a partial write must not end in
     // `.parquet`, or a `ListingTable` filtering on that extension would scan it.
     let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
+    let props = utilities::parquet_policy::writer_properties(
+        &schema,
+        WriterProperties::builder()
+            .set_compression(Compression::ZSTD(parquet::basic::ZstdLevel::default())),
+    )
+    .map_err(|e| crate::error::Error::Arrow(e.to_string()))?;
     let file = tokio::fs::File::create(&tmp_path).await?;
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(parquet::basic::ZstdLevel::default()))
-        .build();
-    let mut writer = AsyncArrowWriter::try_new(file, schema, Some(props))
+    let mut writer = AsyncArrowWriter::try_new(file, schema.clone(), Some(props))
         .map_err(|e| crate::error::Error::Arrow(e.to_string()))?;
 
     while let Some(batch) = stream.next().await {
         let batch = batch?;
+        utilities::parquet_policy::validate_batch(&batch)
+            .map_err(|e| crate::error::Error::Arrow(e.to_string()))?;
         writer
             .write(&batch)
             .await
             .map_err(|e| crate::error::Error::Arrow(e.to_string()))?;
     }
-    let _metadata = writer
+    let metadata = writer
         .close()
         .await
+        .map_err(|e| crate::error::Error::Arrow(e.to_string()))?;
+    utilities::parquet_policy::validate_metadata(&schema, &metadata)
         .map_err(|e| crate::error::Error::Arrow(e.to_string()))?;
 
     // Digest the temp file, before the rename publishes it.
@@ -538,7 +546,104 @@ async fn read_parquet_schema(path: &Path) -> Result<Schema> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::StringArray;
+    use arrow::datatypes::{DataType, Field};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use tinyfs::EntryType;
+    use utilities::parquet_policy::{
+        self, DICTIONARY_V1, MAX_ROW_GROUP_ROWS, MAX_VALUE_BYTES, POLICY_KEY,
+    };
+
+    fn dictionary_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("page_uri", DataType::Utf8, false).with_metadata(
+                std::collections::HashMap::from([(POLICY_KEY.into(), DICTIONARY_V1.into())]),
+            ),
+        ]))
+    }
+
+    #[tokio::test]
+    async fn atomic_cache_write_preserves_dictionary_policy_and_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("counts.parquet");
+        let schema = dictionary_schema();
+        let values = (0..=MAX_ROW_GROUP_ROWS)
+            .map(|index| format!("/{index:08}{}", "x".repeat(MAX_VALUE_BYTES - 9)))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(values))])
+            .unwrap();
+        _ = write_parquet_atomic(
+            &path,
+            schema.clone(),
+            Box::pin(futures::stream::iter([Ok(batch.clone())])),
+        )
+        .await
+        .unwrap();
+
+        let reader =
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(reader.schema(), &schema);
+        assert_eq!(reader.metadata().num_row_groups(), 2);
+        parquet_policy::validate_metadata(&schema, reader.metadata()).unwrap();
+        let batches = reader
+            .build()
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            arrow::compute::concat_batches(&schema, &batches).unwrap(),
+            batch
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_cache_write_rejects_policy_violation_without_replacing_published_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("counts.parquet");
+        let schema = dictionary_schema();
+        let valid = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["/existing"]))],
+        )
+        .unwrap();
+        _ = write_parquet_atomic(
+            &path,
+            schema.clone(),
+            Box::pin(futures::stream::iter([Ok(valid.clone())])),
+        )
+        .await
+        .unwrap();
+        let previous = std::fs::read(&path).unwrap();
+        let oversized = Arc::new(StringArray::from(vec!["x".repeat(MAX_VALUE_BYTES + 1)]));
+        let invalid = RecordBatch::try_new(schema.clone(), vec![oversized.clone()]).unwrap();
+        let error = write_parquet_atomic(
+            &path,
+            schema,
+            Box::pin(futures::stream::iter([Ok(valid), Ok(invalid)])),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("exceeds {MAX_VALUE_BYTES} UTF-8 bytes"))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), previous);
+
+        let unmarked_schema = Arc::new(Schema::new(vec![Field::new(
+            "page_uri",
+            DataType::Utf8,
+            false,
+        )]));
+        let unmarked = RecordBatch::try_new(unmarked_schema.clone(), vec![oversized]).unwrap();
+        _ = write_parquet_atomic(
+            &tmp.path().join("unmarked.parquet"),
+            unmarked_schema,
+            Box::pin(futures::stream::iter([Ok(unmarked)])),
+        )
+        .await
+        .unwrap();
+    }
 
     fn node(n: u64) -> tinyfs::NodeID {
         tinyfs::NodeID::new(format!("00000000-0000-7000-8000-{n:012x}"))

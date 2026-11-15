@@ -1,0 +1,10 @@
+start: "2024-01-01T00:00:00Z"  # Required: example inclusive start time.
+end: "2024-01-01T03:00:00Z"    # Required: example inclusive end time.
+interval: 1h                   # Required: example sample spacing.
+time_column: timestamp         # Default: event-time column name.
+points:                        # Required: output measurement definitions.
+  - name: temperature          # Required: example measurement name.
+    components:                # Required: components are summed.
+      - type: line             # Required: select the linear component.
+        slope: 0.001           # Example units/second; default is 0.0.
+        offset: 20.0           # Example starting value; default is 0.0.

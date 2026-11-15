@@ -1,0 +1,3 @@
+unit: MiB/day  # Required: example scale and replenishment period.
+limit: 10      # Required: example amount per period, not a default.
+burst: null    # Default: same numeric capacity as limit (10 MiB here).

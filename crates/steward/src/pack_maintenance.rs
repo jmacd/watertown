@@ -118,7 +118,7 @@ const TABLE_PACK_MAX_BYTES_PER_OBJECT: u64 = 8 * 1024 * 1024;
 /// safeguard can make inaccurate (see [`discover_candidates`]). Bump this
 /// whenever the row cap, byte safeguard, or packing algorithm changes, so a
 /// stale marker is never mistaken for a match against new constants.
-const TABLE_PACK_LAYOUT_VERSION: u32 = 1;
+const TABLE_PACK_LAYOUT_VERSION: u32 = 2;
 
 /// One physical read/write chunk size for streaming an externalized file
 /// leaf's bytes -- bounded, arbitrary, and unrelated to any pack layout

@@ -1,0 +1,8 @@
+rules:                         # Required: ordered rules; first match wins.
+  - type: direct               # Select the direct-name variant.
+    from: temperature          # Required: example source column.
+    to: temperature_c          # Required: example output column.
+    cast: null                 # Default: preserve the source type.
+  - type: pattern              # Alternative rule variant; no cast option.
+    pattern: "^sensor_(.*)$"   # Required: example regular expression.
+    replacement: "$1"          # Required: captured name becomes the output name.

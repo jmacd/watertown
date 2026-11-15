@@ -100,6 +100,7 @@ start_vite "${ROOT_OUTPUT}" "/"
 run_test "${TESTS_DIR}/210-browser-page-validation.mjs" "http://localhost:${PORT}" "/" "${ROOT_OUTPUT}"
 run_test "${TESTS_DIR}/211-browser-parquet-loading.mjs"  "http://localhost:${PORT}" "/" "${ROOT_OUTPUT}"
 run_test "${TESTS_DIR}/213-browser-vega-render.mjs"      "http://localhost:${PORT}" "/" "${ROOT_OUTPUT}"
+run_test "${TESTS_DIR}/214-browser-stacked-area.mjs"     "http://localhost:${PORT}" "/" "${ROOT_OUTPUT}"
 stop_vite
 
 # ── Subdir site: generate, serve, run 210 ────────────────────

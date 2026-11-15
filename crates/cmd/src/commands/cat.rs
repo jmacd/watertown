@@ -145,12 +145,17 @@ async fn write_stream_to_stdout(
 
     let schema = first_batch.schema();
     let stdout = io::stdout();
-    let mut writer = ArrowWriter::try_new(stdout, schema, None)
+    let props = utilities::parquet_policy::writer_properties(
+        &schema,
+        parquet::file::properties::WriterProperties::builder(),
+    )?;
+    let mut writer = ArrowWriter::try_new(stdout, schema.clone(), Some(props))
         .map_err(|e| anyhow::anyhow!("Failed to create parquet writer: {}", e))?;
 
     let mut total_rows = first_batch.num_rows();
     let mut batch_count = 1;
 
+    utilities::parquet_policy::validate_batch(&first_batch)?;
     writer
         .write(&first_batch)
         .map_err(|e| anyhow::anyhow!("Failed to write batch to parquet: {}", e))?;
@@ -159,6 +164,7 @@ async fn write_stream_to_stdout(
     while let Some(batch_result) = stream.next().await {
         let batch =
             batch_result.map_err(|e| anyhow::anyhow!("Failed to read batch from stream: {}", e))?;
+        utilities::parquet_policy::validate_batch(&batch)?;
         total_rows += batch.num_rows();
         batch_count += 1;
         writer
@@ -166,9 +172,10 @@ async fn write_stream_to_stdout(
             .map_err(|e| anyhow::anyhow!("Failed to write batch to parquet: {}", e))?;
     }
 
-    let _metadata = writer
+    let metadata = writer
         .close()
         .map_err(|e| anyhow::anyhow!("Failed to close parquet writer: {}", e))?;
+    utilities::parquet_policy::validate_metadata(&schema, &metadata)?;
 
     debug!(
         "Streamed parquet data to stdout ({} rows in {} batches)",
@@ -185,20 +192,26 @@ fn write_batches_to_buffer(batches: &[RecordBatch], output: &mut String) -> Resu
 
     let mut buffer = Vec::new();
     let schema = batches[0].schema();
-    let mut writer = ArrowWriter::try_new(&mut buffer, schema, None)
+    let props = utilities::parquet_policy::writer_properties(
+        &schema,
+        parquet::file::properties::WriterProperties::builder(),
+    )?;
+    let mut writer = ArrowWriter::try_new(&mut buffer, schema.clone(), Some(props))
         .map_err(|e| anyhow::anyhow!("Failed to create parquet writer: {}", e))?;
 
     let mut total_rows = 0;
     for batch in batches {
+        utilities::parquet_policy::validate_batch(batch)?;
         total_rows += batch.num_rows();
         writer
             .write(batch)
             .map_err(|e| anyhow::anyhow!("Failed to write batch to parquet: {}", e))?;
     }
 
-    let _metadata = writer
+    let metadata = writer
         .close()
         .map_err(|e| anyhow::anyhow!("Failed to close parquet writer: {}", e))?;
+    utilities::parquet_policy::validate_metadata(&schema, &metadata)?;
 
     output.push_str(&String::from_utf8_lossy(&buffer));
     debug!(

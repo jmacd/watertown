@@ -1,0 +1,6 @@
+patterns:                           # Default: {}; supply an example input.
+  source: series:///sensors/*        # This name becomes the SQL table name.
+query: null                         # Default: SELECT * FROM source.
+transforms: null                    # Default: no input transforms.
+locality:
+  type: global                      # Default: conservative query locality.

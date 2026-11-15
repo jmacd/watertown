@@ -26,6 +26,9 @@ column selection, and chart captions depend on the actual exported schema.
 `overlay_chart` supplies pump-cycle drawdown/recovery/Horner views.
 `log_viewer` provides a queryable log presentation.
 `viz renderer="chart|overlay|logs"` selects the same renderer families.
+`viz renderer="stacked-area"` draws daily category counts from long-form data,
+with a UTC day axis, a zero-based stack, explicit gaps, and a partial-today
+indicator. Its field/window options are documented under [shortcodes](shortcodes.md).
 
 `explore` offers SQL over selected exports. `explore.datasets` defines the
 multi-dataset picker; otherwise shortcode `table` / `label` name the page

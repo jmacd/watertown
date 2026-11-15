@@ -10,16 +10,13 @@ by the actual sitegen deserializer. Unknown metadata (including `doc_id`) is
 tolerated, but unknown layouts fail strict builds.
 
 <!-- docs:reference sitegen:frontmatter -->
-## Configuration reference
+## Full configuration
 
-Generated from the Rust **deserialization** contract. This describes shape, not all semantic validation, service prerequisites, or successful execution.
-
-### Frontmatter
-
-Frontmatter parsed from the top of each markdown page.
+### Settings
 
 | Field | Accepted type | Required | Default | Description |
 |---|---|---|---|---|
+| `analytics` | boolean &#124; null | no | null | Set false to exclude this page from analytics, independently of navigation. True never enables analytics when the site or build has disabled it. |
 | `date` | string &#124; null | no | null | Publication date (ISO 8601, e.g. "2024-06-15"). |
 | `hidden` | boolean | no | false | If true, page renders but does not appear in navigation. |
 | `image` | string &#124; null | no | null | Image URL for blog card hero image. |
@@ -29,8 +26,6 @@ Frontmatter parsed from the top of each markdown page.
 | `summary` | string &#124; null | no | null | Short summary for blog card display. |
 | `title` | string | no | "" |  |
 | `weight` | integer | no | 100 | Sort weight for content pages (lower = higher in nav). Default: 100 Constraints: format="int32". |
-
-Unknown fields: not rejected by this shape; see runtime notes.
 <!-- docs:end-reference -->
 
 In ordinary sites the default layout is `default`; documentation mode selects

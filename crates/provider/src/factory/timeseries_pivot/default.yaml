@@ -1,0 +1,4 @@
+pattern: series:///sensors/*  # Required: example source pattern.
+columns: [temperature]       # Required: example measurement columns to pivot.
+time_column: timestamp       # Default: source event-time column.
+transforms: null             # Default: no input transforms.

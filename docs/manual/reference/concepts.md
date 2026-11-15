@@ -5,6 +5,10 @@ doc_id: reference:concepts
 
 # Shared concepts
 
+For implementation responsibilities and service boundaries, read
+[architecture for developers](../guides/architecture.md). This reference
+defines the shared vocabulary used by individual component pages.
+
 ## Pond and host roots
 
 `POND` or global `--pond` selects the local transactional storage directory,
@@ -48,6 +52,11 @@ Exec inputs/outputs use exact paths or declared directory prefixes, **not**
 this pattern language.
 
 ## Substitution and credentials
+
+Use the documented configuration field names: most factory configurations
+reject unrecognized fields. Sections documented as maps accept their own keys;
+page frontmatter can also carry custom metadata. Example configurations use
+illustrative paths and inputs, which you must replace for your environment.
 
 Factory configs can reference `${env:NAME}` and `${env:NAME:-default}`.
 Validation expands a copy; persisted raw config retains references, and
