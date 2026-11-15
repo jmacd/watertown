@@ -220,7 +220,8 @@ pub struct TemporalReduceConfig {
     /// a segment already sealed is correct at any target, so the new value simply
     /// governs the next seal. Exposed mainly so the tradeoff can be measured
     /// against real data -- larger means fewer files but a heavier hot-window
-    /// recompute each build.
+    /// recompute each build. The fixed sealable-backlog span backstop still
+    /// applies when output remains below this byte target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seal_target_bytes: Option<u64>,
 
@@ -232,9 +233,8 @@ pub struct TemporalReduceConfig {
     pub max_live_segments: Option<usize>,
 }
 
-/// The two knobs governing how the sealed layout advances, carried together so
-/// they stay in step: `lateness_secs` decides WHICH buckets may freeze, and
-/// `target_bytes` decides WHEN enough have frozen to be worth a file.
+/// Layout policy: lateness decides which buckets may freeze, the byte target
+/// and fixed span backstop decide when to seal, and compaction bounds fan-out.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SealPolicy {
     /// Maximum allowed lateness in seconds; recorded in the manifest because a
@@ -1566,22 +1566,23 @@ impl TemporalReduceSqlFile {
         // `hot_bytes` from the previous build is an upper bound on the seal's
         // size. Sparse derived output can remain below that target while its
         // upstream graph grows expensive to recreate, so event-time span is a
-        // second trigger. The active lower bound is the prior watermark after a
-        // seal, or the oldest bucket before the first seal.
-        let active_lo_secs = match (m.sealed_hi_secs, data_bounds) {
+        // second trigger. Only the sealable backlog counts toward this limit;
+        // the allowed-lateness tail remains in hot independently.
+        let unsealed_lo_secs = match (m.sealed_hi_secs, data_bounds) {
             (Some(sealed_hi), _) => Some(sealed_hi),
             (None, Some((data_lo, _))) => Some(data_lo),
             (None, None) => None,
         };
-        let active_span_large = match (active_lo_secs, watermark) {
-            (Some(active_lo), Some(wm)) => {
-                wm.saturating_sub(active_lo) >= crate::partial_aggregate_cache::MAX_ACTIVE_SPAN_SECS
+        let sealable_backlog_large = match (unsealed_lo_secs, watermark) {
+            (Some(unsealed_lo), Some(wm)) => {
+                wm.saturating_sub(unsealed_lo)
+                    >= crate::partial_aggregate_cache::MAX_ACTIVE_SPAN_SECS
             }
             _ => false,
         };
         if let Some(wm) = watermark
             && m.sealed_hi_secs.is_none_or(|sh| wm > sh)
-            && (m.hot_bytes >= policy.target_bytes || active_span_large)
+            && (m.hot_bytes >= policy.target_bytes || sealable_backlog_large)
         {
             let seal = pieces
                 .merge_partials_frame(
@@ -1615,8 +1616,8 @@ impl TemporalReduceSqlFile {
         }
 
         // Recompute the open hot window [sealed_hi, inf) from the current input --
-        // where new appends and within-window late data land. Bounded to
-        // ~allowed_lateness worth of buckets.
+        // where new appends and within-window late data land. It includes the
+        // allowed-lateness tail plus any backlog remaining below the seal gates.
         let hot = pieces
             .merge_partials_frame(
                 ctx.table(input_table).await.map_other()?,
@@ -2057,9 +2058,9 @@ impl TemporalReduceSqlFile {
     ///  - finer appended (not rebuilt) → advance this level (bounded seal + hot);
     ///  - finer rebuilt, or no compatible manifest → rebuild this level.
     ///
-    /// No beyond-window hard-fail is needed here: this level's watermark aligns
-    /// down at least as far as the finer level's (coarser interval, same
-    /// lateness), so `coarse_sealed_hi ≤ finer_sealed_hi`.
+    /// This level's eligible watermark aligns no later than the finer level's,
+    /// but seal gates can advance their actual frontiers on different builds.
+    /// Dirty-range propagation below keeps earlier coarse segments correct.
     ///
     /// `finer_changed` is what the finer level changed. Late data is NOT a
     /// rebuild -- it takes the finer level's incremental path -- so
@@ -8068,19 +8069,10 @@ output_aliases:
         assert_eq!(on_disk.len(), live, "disk and manifest must agree");
     }
 
-    /// Four days of a handful of rows stay below both default seal triggers:
-    /// the byte target and the maximum active event-time span. No segment file
-    /// is written, yet the query still returns every day correctly from hot.
-    ///
-    /// This is the point of delaying small seals until the active span grows
-    /// large. Sealing used to fire whenever the watermark moved, so a pond
-    /// rebuilt on a timer grew one small file per build regardless of how little
-    /// data had arrived. The companion test
-    /// `test_sealed_runs_advance_as_history_grows` pins the mechanics with the
-    /// gate disabled; this one pins the policy, and together they show that
-    /// whether a bucket is sealed or hot is invisible to the answer.
+    /// Sparse output must seal after one day of eligible backlog, without
+    /// changing results or making older buckets immune to late correction.
     #[tokio::test]
-    async fn small_data_seals_nothing_yet_still_reads_correctly() {
+    async fn sparse_data_seals_daily_and_preserves_late_correction() {
         let _ = env_logger::try_init();
         let persistence = tinyfs::MemoryPersistence::default();
         let fs = tinyfs::FS::new(persistence.clone()).await.unwrap();
@@ -8101,30 +8093,46 @@ output_aliases:
 
         for day in 1..=4u32 {
             append_day_series(&fs, "/ingest/weather.csv", day).await;
+            set_day_bounds(&fs, "/ingest/weather.csv", day).await;
             let rows = daily_max(&reduce_ctx(&persistence, &cache_dir), default_target())
                 .await
                 .expect("append within lateness window must succeed");
             assert_eq!(rows.len(), day as usize, "day {day}: one bucket per day");
+            let manifests = walk_find(&cache_dir, &|n| n == "manifest.json");
+            assert_eq!(manifests.len(), 1);
+            let manifest: crate::partial_aggregate_cache::SegmentManifest =
+                serde_json::from_slice(&std::fs::read(&manifests[0]).unwrap()).unwrap();
+            if day < 3 {
+                assert!(
+                    manifest.segments.is_empty(),
+                    "no day of sealable backlog yet"
+                );
+            } else {
+                assert_eq!(
+                    manifest.sealed_hi_secs,
+                    Some(i64::from(day - 2) * 86_400),
+                    "sparse history must not wait weeks to seal"
+                );
+            }
         }
 
         let segs = walk_find(&cache_dir, &|n| {
             n.starts_with("seg-") && n.ends_with(".parquet")
         });
         assert!(
-            segs.is_empty(),
-            "a few rows per day is far under {} bytes, so nothing should have \
-             been sealed; found {:?}",
-            crate::partial_aggregate_cache::SEAL_TARGET_BYTES,
-            segs
+            !segs.is_empty(),
+            "the age trigger must seal below the byte target"
         );
 
-        // Unsealed does not mean unavailable: every day is still answered, from
-        // the hot window alone.
         let rows = daily_max(&reduce_ctx(&persistence, &cache_dir), default_target())
             .await
             .unwrap();
         let approx = |a: f64, b: f64| (a - b).abs() < 1e-9;
-        assert_eq!(rows.len(), 4, "all four days still present without any run");
+        assert_eq!(
+            rows.len(),
+            4,
+            "sealed and hot results must retain all four days"
+        );
         for (i, day) in (1..=4u32).enumerate() {
             assert!(
                 approx(rows[i], 43.5 + day as f64 * 100.0),
@@ -8132,15 +8140,24 @@ output_aliases:
             );
         }
 
-        // The buckets remain active, waiting to be written as one larger run
-        // rather than four tiny ones.
+        let sums = daily_max_col(
+            &reduce_ctx(&persistence, &cache_dir),
+            default_target(),
+            "temperature.sum",
+        )
+        .await
+        .unwrap();
+        for (i, day) in (1..=4u32).enumerate() {
+            assert!(
+                approx(sums[i], 768.0 + day as f64 * 2400.0),
+                "day {day} was lost or counted twice: {sums:?}"
+            );
+        }
+
         let manifests = walk_find(&cache_dir, &|n| n == "manifest.json");
         assert_eq!(manifests.len(), 1, "one manifest for the single resolution");
         let m: Value = serde_json::from_slice(&std::fs::read(&manifests[0]).unwrap()).unwrap();
-        assert!(
-            m["segments"].as_array().is_some_and(Vec::is_empty),
-            "manifest must record no segments: {m}"
-        );
+        assert!(!m["segments"].as_array().unwrap().is_empty());
 
         // The gate's INPUT must be the real size of hot, not a placeholder.
         // Everything above here is equally satisfied by hot_bytes == 0, which is
@@ -8150,10 +8167,7 @@ output_aliases:
         let hots = walk_find(&cache_dir, &|n| n == "hot.parquet");
         assert_eq!(hots.len(), 1, "one hot file for the single resolution");
         let on_disk = std::fs::metadata(&hots[0]).unwrap().len();
-        assert!(
-            on_disk > 0,
-            "hot.parquet is never empty; it holds four days"
-        );
+        assert!(on_disk > 0, "hot.parquet must retain the recent window");
         assert_eq!(
             m["hot_bytes"].as_u64(),
             Some(on_disk),
@@ -8163,6 +8177,46 @@ output_aliases:
             on_disk < crate::partial_aggregate_cache::SEAL_TARGET_BYTES,
             "the premise of this test is that hot is under the seal target"
         );
+
+        {
+            use tokio::io::AsyncWriteExt;
+            let root = fs.root().await.unwrap();
+            let mut writer = root
+                .async_writer_path_with_type("/ingest/weather.csv", EntryType::FilePhysicalSeries)
+                .await
+                .unwrap();
+            writer
+                .write_all(b"timestamp,temperature\n1970-01-01T12:30:00,999.0\n")
+                .await
+                .unwrap();
+            writer.shutdown().await.unwrap();
+            root.set_extended_attributes(
+                "/ingest/weather.csv",
+                HashMap::from([
+                    ("min_event_time".to_owned(), "45000000000".to_owned()),
+                    ("max_event_time".to_owned(), "45000000000".to_owned()),
+                ]),
+            )
+            .await
+            .unwrap();
+        }
+        let corrected = daily_max(&reduce_ctx(&persistence, &cache_dir), default_target())
+            .await
+            .unwrap();
+        assert_eq!(corrected.len(), 4);
+        assert!(
+            approx(corrected[0], 999.0),
+            "sealed day was not repaired: {corrected:?}"
+        );
+        let corrected_sums = daily_max_col(
+            &reduce_ctx(&persistence, &cache_dir),
+            default_target(),
+            "temperature.sum",
+        )
+        .await
+        .unwrap();
+        assert!(approx(corrected_sums[0], sums[0] + 999.0));
+        assert_eq!(&corrected_sums[1..], &sums[1..]);
     }
 
     /// A backfill that lands INSIDE the allowed_lateness window (nothing older

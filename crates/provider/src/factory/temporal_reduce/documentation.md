@@ -23,6 +23,23 @@ Install with `pond mknod temporal-reduce /derived/reduced --config-path reduce.y
 
 Incremental caches use source versions and event-time metadata. Missing bounds can force full-history invalidation. Late backfill unseals and recomputes affected segments rather than silently dropping data.
 
+### Sealing policy
+
+Older eligible buckets move from the recomputed hot file into reusable segment
+files when the byte target is reached or one day of sealable backlog has
+accumulated. The byte target defaults to 1 MiB. The backlog is measured up to
+the lateness-adjusted watermark, so it is additional to the recent
+`allowed_lateness` window, not a replacement for it.
+
+With the default one-day lateness, regularly updated sparse series generally
+keep roughly one to two days hot, subject to bucket granularity and build
+cadence. This limits excess event-time duration, not absolute input work.
+Segment compaction still controls file count.
+
+Changing this policy does not invalidate existing caches. A changed build may
+need to process an older oversized hot window once before advancing its sealed
+frontier. No source history is deleted, and late corrections remain supported.
+
 For format-backed inputs such as `csv://` and `jsonlogs://`, replacement files
 (`FilePhysicalVersion`) contribute only their current content. Replacing a file
 invalidates its previous aggregates; stored revisions are not extra observations.

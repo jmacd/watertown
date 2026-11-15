@@ -8190,7 +8190,7 @@
           "type": "array"
         },
         "seal_target_bytes": {
-          "description": "Minimum accumulated size before frozen buckets are sealed into an\nimmutable segment file. Accepts a byte count; defaults to\n[`crate::partial_aggregate_cache::SEAL_TARGET_BYTES`].\n\nUnlike `allowed_lateness`, changing this does NOT invalidate the cache:\na segment already sealed is correct at any target, so the new value simply\ngoverns the next seal. Exposed mainly so the tradeoff can be measured\nagainst real data -- larger means fewer files but a heavier hot-window\nrecompute each build.",
+          "description": "Minimum accumulated size before frozen buckets are sealed into an\nimmutable segment file. Accepts a byte count; defaults to\n[`crate::partial_aggregate_cache::SEAL_TARGET_BYTES`].\n\nUnlike `allowed_lateness`, changing this does NOT invalidate the cache:\na segment already sealed is correct at any target, so the new value simply\ngoverns the next seal. Exposed mainly so the tradeoff can be measured\nagainst real data -- larger means fewer files but a heavier hot-window\nrecompute each build. The fixed sealable-backlog span backstop still\napplies when output remains below this byte target.",
           "format": "uint64",
           "minimum": 0,
           "type": [
