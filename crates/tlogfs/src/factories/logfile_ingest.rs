@@ -138,18 +138,51 @@ mod integration_tests {
         assert_eq!(metadata["min_event_time"], "3000000");
         assert_eq!(metadata["max_event_time"], "3000001");
 
-        content.extend_from_slice(b"{\"ts\":\"not a date\"}\n");
+        let good_tail = b"{\"ts\":\"1970-01-01T00:00:04Z\",\"read.seconds\":4}\n";
+        for suspect in [
+            "{\"ts\":\"not a date\"}\n",
+            "{\"ts\":null}\n",
+            "{\"read.seconds\":5}\n",
+            "{\"ts\":\"1970-01-01T00:00:10Z\",\"nested\":{\"ts\":\"unrelated text\"}}\n",
+        ] {
+            let content = [stored.as_slice(), good_tail.as_slice(), suspect.as_bytes()].concat();
+            fs::write(&active, &content).await.unwrap();
+            let error = pond
+                .execute_factory(&config)
+                .await
+                .expect_err("mixed-validity timestamps must fail");
+            assert!(error.to_string().contains("without bounds"), "{error}");
+            let (after, after_failure) = inspect(&pond).await;
+            assert_eq!(after.len(), versions.len());
+            for (after, before) in after.iter().zip(&versions) {
+                assert_eq!(after.version, before.version);
+                assert_eq!(after.blake3, before.blake3);
+                assert_eq!(after.extended_metadata, before.extended_metadata);
+            }
+            assert_eq!(
+                after_failure, stored,
+                "a failed append must not alter committed content"
+            );
+        }
+
+        let repaired = b"{\"ts\":\"1970-01-01T00:00:10Z\",\"read.seconds\":5}\n";
+        let content = [stored.as_slice(), good_tail.as_slice(), repaired.as_slice()].concat();
         fs::write(&active, &content).await.unwrap();
-        let error = pond
-            .execute_factory(&config)
-            .await
-            .expect_err("invalid timestamp must fail");
-        assert!(error.to_string().contains("without bounds"), "{error}");
-        let (versions, after_failure) = inspect(&pond).await;
-        assert_eq!(versions.len(), 3);
+        pond.execute_factory(&config).await.unwrap();
+        let (versions, after_retry) = inspect(&pond).await;
         assert_eq!(
-            after_failure, stored,
-            "a failed append must not alter committed content"
+            after_retry, content,
+            "retry must not skip any rejected bytes"
+        );
+        assert_eq!(versions.len(), 4);
+        let metadata = versions[3].extended_metadata.as_ref().unwrap();
+        assert_eq!(metadata["min_event_time"], "4000000");
+        assert_eq!(metadata["max_event_time"], "10000000");
+        pond.execute_factory(&config).await.unwrap();
+        assert_eq!(
+            inspect(&pond).await.0.len(),
+            4,
+            "idle retry must not append"
         );
     }
 

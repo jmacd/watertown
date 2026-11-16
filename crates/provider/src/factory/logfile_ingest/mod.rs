@@ -86,6 +86,8 @@ pub struct LogfileIngestConfig {
 
     /// JSON key holding the event time of a record, looked up at any depth in
     /// each line. Example: "timeUnixNano" for OTLP metrics JSON.
+    /// When configured, every parsed JSON record must contain usable values
+    /// for this key; missing or malformed timestamps reject the write.
     ///
     /// Absent by default, which leaves versions without event-time bounds.
     /// That is not free: `temporal-reduce` reads these bounds to decide which
@@ -199,24 +201,19 @@ impl LogfileIngestConfig {
 /// Event-time bounds of one version's content, in microseconds, `max`
 /// inclusive -- the shape `set_temporal_metadata` wants.
 ///
-/// Returns `None` only when *no* line yielded a usable timestamp, and the
-/// caller then writes the version without them (or fails, if the node declared
-/// itself temporal).
+/// Returns `None` when no timestamp is found or any parsed JSON record cannot
+/// be fully bounded. A configured temporal writer then rejects the version.
 ///
 /// The correctness condition is that the bounds cover every record the reader
 /// will actually produce from this content -- not every byte. Bounds that are
 /// too narrow would let the rollup skip buckets this content belongs to and
-/// silently keep stale aggregates, so this scan must not be *looser* than the
-/// reader. But it must not be *stricter* either: a line the reader discards
-/// contributes to no bucket, so excluding its unknown timestamp cannot narrow
-/// the bounds below the data that exists.
+/// silently keep stale aggregates. In particular, jsonlogs retains valid JSON
+/// objects even if their timestamp is missing or malformed; those records must
+/// invalidate the entire range, not just disappear from the accumulator.
 ///
-/// So this mirrors `format::batch::read_clean_lines` exactly -- same NUL
-/// stripping, same trim, same per-line skip -- and a corrupt line is dropped
-/// from the scan rather than abandoning it. That matters on real data: a
-/// single torn record in a 100 MB rotation (NUL padding from a crashed write,
-/// which the reader strips and recovers) would otherwise discard the event
-/// times of every other record in the file.
+/// Line cleanup matches `format::batch::read_clean_lines`: strip NULs, trim,
+/// and ignore blanks. Syntactically corrupt JSON that readers discard is still
+/// skipped, so a torn record does not invalidate the other records' bounds.
 ///
 /// Cost is proportional to the bytes being written, not to the file: the
 /// append path passes only the new tail.
@@ -227,7 +224,7 @@ fn scan_temporal_bounds(content: &[u8], field: &str, unit: TimestampUnit) -> Opt
     let mut acc: Option<(i64, i64)> = None;
     let mut skipped: u64 = 0;
 
-    for line in text.lines() {
+    for (line_number, line) in text.lines().enumerate() {
         // Strip NUL bytes (flash-storage corruption), as the reader does.
         let cleaned: String = line.chars().filter(|c| *c != '\0').collect();
         let trimmed = cleaned.trim();
@@ -235,27 +232,32 @@ fn scan_temporal_bounds(content: &[u8], field: &str, unit: TimestampUnit) -> Opt
             continue;
         }
 
-        // Fold into a per-line accumulator so a line carrying a malformed
-        // timestamp contributes nothing rather than a partial range.
-        let mut line_acc: Option<(i64, i64)> = None;
-        let parsed = serde_json::from_str::<Value>(trimmed)
-            .ok()
-            .filter(|value| fold_timestamps(value, field, unit, &mut line_acc));
-
-        match parsed.and(line_acc) {
-            Some((lo, hi)) => {
-                acc = Some(match acc {
-                    Some((alo, ahi)) => (alo.min(lo), ahi.max(hi)),
-                    None => (lo, hi),
-                });
+        let value = match serde_json::from_str::<Value>(trimmed) {
+            Ok(value) => value,
+            Err(_) => {
+                skipped += 1;
+                continue;
             }
-            None => skipped += 1,
-        }
+        };
+        let mut line_acc: Option<(i64, i64)> = None;
+        let complete = fold_timestamps(&value, field, unit, &mut line_acc);
+        let Some((lo, hi)) = line_acc.filter(|_| complete) else {
+            log::warn!(
+                "logfile-ingest: JSON record on line {} has missing or unusable '{}' timestamps; refusing partial event-time bounds",
+                line_number + 1,
+                field
+            );
+            return None;
+        };
+        acc = Some(match acc {
+            Some((alo, ahi)) => (alo.min(lo), ahi.max(hi)),
+            None => (lo, hi),
+        });
     }
 
     if skipped > 0 {
         log::warn!(
-            "logfile-ingest: skipped {skipped} corrupt or timestamp-less line(s) while scanning event-time bounds for '{field}'"
+            "logfile-ingest: skipped {skipped} unparseable JSON line(s) while scanning event-time bounds for '{field}'"
         );
     }
 
@@ -270,7 +272,7 @@ fn scan_temporal_bounds(content: &[u8], field: &str, unit: TimestampUnit) -> Opt
 /// as a running (min, max).
 ///
 /// Returns false if a value under that key is not usable in the configured
-/// representation, dropping the line rather than guessing its timestamp.
+/// representation, invalidating the version's bounds rather than guessing.
 fn fold_timestamps(
     value: &Value,
     field: &str,
@@ -1503,6 +1505,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn retained_json_records_must_not_be_excluded_from_bounds() {
+        use crate::format::{FormatProvider, jsonlogs::JsonLogsProvider};
+        use futures::StreamExt;
+        use std::io::Cursor;
+
+        for (unit, early, late) in [
+            (
+                TimestampUnit::Rfc3339,
+                "1970-01-01T00:00:01Z",
+                "1970-01-01T00:00:10Z",
+            ),
+            (TimestampUnit::Microseconds, "1000000", "10000000"),
+        ] {
+            let good = serde_json::json!({"ts": early});
+            for suspect in [
+                serde_json::json!({"ts": "not a timestamp"}),
+                serde_json::json!({"ts": null}),
+                serde_json::json!({"value": 7}),
+                serde_json::json!({"ts": late, "nested": {"ts": "not a timestamp"}}),
+                serde_json::json!({"ts": late, "nested": [{"ts": early}, {"ts": null}]}),
+            ] {
+                for records in [[&good, &suspect], [&suspect, &good]] {
+                    let content = format!("{}\n{}\n", records[0], records[1]);
+                    let (_, mut stream) = JsonLogsProvider::new()
+                        .open_stream(
+                            Box::pin(Cursor::new(content.as_bytes().to_vec())),
+                            &crate::Url::parse("jsonlogs:///mixed.jsonl").unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    let batch = stream.next().await.unwrap().unwrap();
+                    assert_eq!(batch.num_rows(), 2, "the reader retains both records");
+                    assert_eq!(
+                        scan_temporal_bounds(content.as_bytes(), "ts", unit),
+                        None,
+                        "partial bounds would omit a retained record: {content}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn fractional_timestamps_bound_whole_input_units() {
         for value in ["1700000000.789", "\"1700000000.789\"", "1.700000000789e9"] {
@@ -1643,7 +1688,7 @@ mod tests {
     }
 
     #[test]
-    fn a_nonnumeric_timestamp_drops_the_line() {
+    fn a_nonnumeric_timestamp_invalidates_bounds() {
         let content =
             r#"{"resourceMetrics":[{"gauge":{"dataPoints":[{"timeUnixNano":"not-a-number"}]}}]}"#;
         assert_eq!(
