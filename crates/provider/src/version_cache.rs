@@ -292,7 +292,11 @@ impl SidecarDir {
         CachedSet {
             files,
             missing,
-            fallback_dirs: vec![self.dir.clone()],
+            schema_files: live
+                .as_slice()
+                .iter()
+                .map(|v| self.sidecar_path(live.node_id(), v))
+                .collect(),
         }
     }
 
@@ -329,8 +333,9 @@ pub struct CachedSet {
     /// sidecar is not on disk. Silently reading fewer rows is never correct, so
     /// this is reported rather than dropped; see [`CachedSet::missing`].
     missing: Vec<PathBuf>,
-    /// Used only to recover a schema when bounds retain no live sidecar.
-    fallback_dirs: Vec<PathBuf>,
+    /// Every query-selected live sidecar, before row pruning. Explicit paths
+    /// exclude superseded versions and other nodes even for an empty scan.
+    schema_files: Vec<PathBuf>,
 }
 
 impl CachedSet {
@@ -367,33 +372,32 @@ impl CachedSet {
     pub fn extend(&mut self, other: CachedSet) {
         self.files.extend(other.files);
         self.missing.extend(other.missing);
-        self.fallback_dirs.extend(other.fallback_dirs);
+        self.schema_files.extend(other.schema_files);
     }
 
-    /// An empty set with no schema-recovery directories yet.
+    /// An empty set with no schema members yet.
     #[must_use]
     pub fn empty() -> Self {
         Self {
             files: Vec::new(),
             missing: Vec::new(),
-            fallback_dirs: Vec::new(),
+            schema_files: Vec::new(),
         }
     }
 
     /// Build a `ListingTable` over exactly these files.
     ///
-    /// Schemas are merged across them (UNION-ALL-BY-NAME), so a column that
-    /// appears only in newer versions is present and back-filled with NULLs for
-    /// older ones. The merge is scoped to the retained files for the same
-    /// reason the scan is: a superseded version's schema must not shape the read.
+    /// Schemas are merged across all query-selected live versions, independent
+    /// of row bounds, so columns remain available and NULL-filled when their
+    /// only occurrences are in pruned versions. Superseded and unselected
+    /// versions contribute neither rows nor schemas.
     pub async fn table_provider(&self) -> Result<Arc<dyn TableProvider>> {
         let merged_schema =
-            merge_parquet_schemas_with_fallback_dirs(&self.files, &self.fallback_dirs).await?;
+            merge_parquet_schemas_with_fallback_dirs(&self.schema_files, &[]).await?;
 
         if self.files.is_empty() {
-            // Everything pruned, or nothing cached yet: an empty table over the
-            // cache schema, so the query yields 0 rows rather than erroring or
-            // falling back to scanning a directory.
+            // Everything pruned: retain the full live schema without scanning
+            // rows or admitting stale files from the cache directory.
             let table = datafusion::datasource::MemTable::try_new(merged_schema, vec![vec![]])?;
             return Ok(Arc::new(table));
         }

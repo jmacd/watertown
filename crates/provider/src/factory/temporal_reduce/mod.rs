@@ -4226,10 +4226,8 @@ async fn builtin_source_provider(
         tinyfs::SeriesReadBounds::from_event_time_lo,
     );
 
-    // One source is the common case and takes the direct path, which also
-    // applies that node's per-file temporal bounds (data-quality filtering).
-    // The multi-URL path cannot carry per-file bounds, exactly as the
-    // format-cache route cannot.
+    // Keep per-node schema discovery ahead of row pruning, including for
+    // globs. A list of only the retained version URLs loses historical columns.
     if let [only] = source_ids {
         return crate::create_table_provider(
             *only,
@@ -4243,25 +4241,41 @@ async fn builtin_source_provider(
         .map_other();
     }
 
-    let mut urls = Vec::new();
+    let mut frames = Vec::with_capacity(source_ids.len());
+    let mut schemas = Vec::with_capacity(source_ids.len());
     for id in source_ids {
-        if let Some(u) = crate::pruned_version_urls(*id, context, bounds)
-            .await
-            .map_other()?
-        {
-            urls.extend(u);
-        }
+        let provider = crate::create_table_provider(
+            *id,
+            context,
+            crate::TableProviderOptions {
+                bounds,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_other()?;
+        schemas.push(provider.schema().as_ref().clone());
+        frames.push(
+            context
+                .datafusion_session
+                .read_table(provider)
+                .map_other()?,
+        );
     }
-    crate::create_table_provider(
-        source_ids[0],
-        context,
-        crate::TableProviderOptions {
-            additional_urls: urls,
-            ..Default::default()
-        },
-    )
-    .await
-    .map_other()
+    // Preserve the ListingTable's rejection of incompatible field types,
+    // rather than letting UNION coerce them.
+    _ = arrow::datatypes::Schema::try_merge(schemas).map_other()?;
+    let mut frames = frames.into_iter();
+    let mut combined = frames.next().ok_or_else(|| {
+        tinyfs::Error::Other("temporal-reduce has no native source files".to_owned())
+    })?;
+    for frame in frames {
+        combined = combined.union_by_name(frame).map_other()?;
+    }
+    Ok(Arc::new(datafusion::catalog::view::ViewTable::new(
+        combined.logical_plan().clone(),
+        None,
+    )))
 }
 
 fn bounded_source_set(
@@ -7515,6 +7529,73 @@ output_aliases:
         }
         _ = ctx.deregister_table("reduced").unwrap();
         Ok(rows)
+    }
+
+    #[tokio::test]
+    async fn bounded_builtin_glob_preserves_columns_from_pruned_versions() {
+        use arrow::array::{ArrayRef, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use tinyfs::arrow::ParquetExt;
+
+        let (fs, context) = create_test_environment().await;
+        let root = fs.root().await.unwrap();
+        let old = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("timestamp", DataType::Int64, false),
+                Field::new("retired", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![42])),
+            ],
+        )
+        .unwrap();
+        _ = root
+            .write_series_from_batch("/a.series", &old, Some("timestamp"))
+            .await
+            .unwrap();
+        for (path, timestamp) in [("/a.series", 2), ("/b.series", 3)] {
+            let batch = RecordBatch::try_from_iter([(
+                "timestamp",
+                Arc::new(Int64Array::from(vec![timestamp])) as ArrayRef,
+            )])
+            .unwrap();
+            _ = root
+                .write_series_from_batch(path, &batch, Some("timestamp"))
+                .await
+                .unwrap();
+        }
+        let ids = [
+            root.get_node_path("/a.series").await.unwrap().id(),
+            root.get_node_path("/b.series").await.unwrap().id(),
+        ];
+        let provider = builtin_source_provider(&context, &ids, Some(2))
+            .await
+            .unwrap();
+        let batches = context
+            .datafusion_session
+            .read_table(provider)
+            .unwrap()
+            .select_columns(&["timestamp", "retired"])
+            .unwrap()
+            .sort(vec![col("timestamp").sort(true, true)])
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let batch = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .as_ref(),
+            &[2, 3]
+        );
+        assert_eq!(batch.column(1).null_count(), 2);
     }
 
     /// Guards the invariant the freshness key rests on: a set of content

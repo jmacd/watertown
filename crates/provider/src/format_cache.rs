@@ -193,9 +193,9 @@ pub async fn listing_table_from_cache_bounded(
 /// Naming the files makes the guarantee structural instead of ritual, and it is
 /// the same mechanism the rollup uses to accumulate several source nodes into
 /// one scan. Schema evolution is preserved: [`CachedSet::table_provider`] merges
-/// schemas across exactly these files, so a column that appears only in some
-/// members is present and NULL-filled elsewhere (the UNION-ALL-BY-NAME property
-/// the glob directory existed to provide).
+/// schemas across all query-selected live files before row pruning, so a column
+/// that appears only in some members is present and NULL-filled elsewhere (the
+/// UNION-ALL-BY-NAME property the glob directory existed to provide).
 ///
 /// Each `versions` slice must contain that node's query-selected live versions,
 /// excluding collapse-superseded chunks.
@@ -589,6 +589,159 @@ mod tests {
         assert_eq!(count_rows(empty).await, 0);
     }
 
+    #[tokio::test]
+    async fn bounded_cache_preserves_live_schema_without_scanning_pruned_rows() {
+        use arrow::array::Array;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let node = test_node_id();
+        let versions = vec![
+            test_series_version(1, "old", 100),
+            test_series_version(2, "new", 200),
+        ];
+        let old = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("timestamp", DataType::Int64, false),
+                Field::new("retired", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(vec!["old"])),
+            ],
+        )
+        .unwrap();
+        let new = RecordBatch::try_from_iter([(
+            "timestamp",
+            Arc::new(Int64Array::from(vec![200])) as arrow::array::ArrayRef,
+        )])
+        .unwrap();
+        for (version, batch) in versions.iter().zip([old, new]) {
+            _ = cache_write_version(
+                tmp.path(),
+                "jsonlogs",
+                &node,
+                version,
+                batch.schema(),
+                Box::pin(futures::stream::iter([Ok(batch)])),
+            )
+            .await
+            .unwrap();
+        }
+        // A superseded or unselected sidecar must not contribute even its schema.
+        let orphan = RecordBatch::try_from_iter([(
+            "orphan",
+            Arc::new(Int64Array::from(vec![999])) as arrow::array::ArrayRef,
+        )])
+        .unwrap();
+        _ = cache_write_version(
+            tmp.path(),
+            "jsonlogs",
+            &node,
+            &test_series_version(3, "orphan", 999),
+            orphan.schema(),
+            Box::pin(futures::stream::iter([Ok(orphan)])),
+        )
+        .await
+        .unwrap();
+
+        let mut expected_schema = None;
+        for (bounds, expected_times) in [
+            (tinyfs::SeriesReadBounds::NONE, vec![100, 200]),
+            (tinyfs::SeriesReadBounds::from_event_time_lo(150), vec![200]),
+            (
+                tinyfs::SeriesReadBounds {
+                    event_time_lo: None,
+                    version_gt: Some(1),
+                },
+                vec![200],
+            ),
+            (tinyfs::SeriesReadBounds::from_event_time_lo(300), vec![]),
+        ] {
+            for glob in [false, true] {
+                let ctx = SessionContext::new();
+                let table = if glob {
+                    glob_cached_set_bounded(
+                        tmp.path(),
+                        "jsonlogs",
+                        &[(node, versions.clone())],
+                        &bounds,
+                    )
+                    .table_provider()
+                    .await
+                    .unwrap()
+                } else {
+                    listing_table_from_cache_bounded(
+                        tmp.path(),
+                        "jsonlogs",
+                        &node,
+                        &versions,
+                        &bounds,
+                        &ctx,
+                    )
+                    .await
+                    .unwrap()
+                };
+                let schema = table.schema();
+                assert!(schema.field_with_name("orphan").is_err());
+                if let Some(expected) = &expected_schema {
+                    assert_eq!(
+                        &schema, expected,
+                        "bounds must not change the logical schema"
+                    );
+                } else {
+                    expected_schema = Some(schema);
+                }
+                _ = ctx.register_table("source", table).unwrap();
+                let batches = ctx
+                    .sql("SELECT timestamp, retired FROM source ORDER BY timestamp")
+                    .await
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                let mut times = Vec::new();
+                for batch in batches {
+                    let timestamps = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap();
+                    let retired = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    for index in 0..batch.num_rows() {
+                        let time = timestamps.value(index);
+                        times.push(time);
+                        assert_eq!(retired.is_null(index), time == 200);
+                    }
+                }
+                assert_eq!(times, expected_times);
+            }
+        }
+        std::fs::remove_file(cache_version_path(
+            tmp.path(),
+            "jsonlogs",
+            &node,
+            &versions[0],
+        ))
+        .unwrap();
+        assert!(
+            listing_table_from_cache_bounded(
+                tmp.path(),
+                "jsonlogs",
+                &node,
+                &versions,
+                &tinyfs::SeriesReadBounds::from_event_time_lo(150),
+                &SessionContext::new(),
+            )
+            .await
+            .is_err(),
+            "a missing schema member must not silently narrow the schema"
+        );
+    }
+
     /// A version without a recorded `max_event_time` is always retained by an
     /// event-time bound -- a missing bound must never silently drop data.
     #[tokio::test]
@@ -820,8 +973,8 @@ mod tests {
         assert!(sb_col.is_null(0), "sensor_b should be NULL for file 1");
         assert_eq!(sb_col.value(1), "b2");
 
-        // If bounds prune every member, schema recovery must inspect each
-        // node-specific cache directory and return an empty merged table.
+        // Even when every member is pruned, its schema remains available
+        // through explicit live paths, never through a directory listing.
         let empty = glob_cached_set_bounded(
             cache_dir,
             "csv",

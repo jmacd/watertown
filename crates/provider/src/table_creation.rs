@@ -14,7 +14,7 @@ use datafusion::datasource::listing::{
 };
 use datafusion::error::DataFusionError;
 use log::debug;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tinyfs::{FileID, ProviderContext};
 
@@ -90,6 +90,7 @@ pub async fn pruned_version_urls(
 struct SelectedVersion {
     url: String,
     schema_fingerprint: Option<String>,
+    retained: bool,
 }
 
 async fn selected_versions(
@@ -112,25 +113,12 @@ async fn selected_versions(
             selected.retain(|version| version.version == *target);
         }
     }
-    let schema_fallback = selected
+    let fallback = selected
         .iter()
-        .max_by_key(|version| version.version)
-        .copied();
-    if bounds != tinyfs::SeriesReadBounds::NONE {
-        selected.retain(|version| {
-            bounds.retains(
-                crate::format_cache::version_max_event_time(version),
-                version.version as i64,
-            )
-        });
-        if selected.is_empty()
-            && let Some(fallback) = schema_fallback
-        {
-            selected.push(fallback);
-        }
-    }
-
-    Ok(selected
+        .enumerate()
+        .max_by_key(|(_, version)| version.version)
+        .map(|(index, _)| index);
+    let mut selected: Vec<_> = selected
         .into_iter()
         .map(|version| SelectedVersion {
             url: crate::TinyFsPathBuilder::url_specific_version(&file_id, version.version),
@@ -139,24 +127,30 @@ async fn selected_versions(
                 .as_ref()
                 .and_then(|metadata| metadata.get("series_schema_fingerprint"))
                 .cloned(),
+            retained: bounds.retains(
+                crate::format_cache::version_max_event_time(version),
+                version.version as i64,
+            ),
         })
-        .collect())
+        .collect();
+    // Keep the existing conservative row fallback, but never let pruning
+    // remove a live version from the logical schema.
+    if !selected.iter().any(|version| version.retained)
+        && let Some(index) = fallback
+    {
+        selected[index].retained = true;
+    }
+    Ok(selected)
 }
 
 async fn listing_config_with_merged_schema(
     context: &ProviderContext,
     table_urls: Vec<ListingTableUrl>,
-    schema_fingerprints: &[Option<String>],
+    schema_urls: &[ListingTableUrl],
 ) -> Result<ListingTableConfig> {
     let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()));
-    let mut schemas = Vec::with_capacity(table_urls.len());
-    let mut seen_fingerprints = HashSet::new();
-    for (table_url, fingerprint) in table_urls.iter().zip(schema_fingerprints) {
-        if let Some(fingerprint) = fingerprint
-            && !seen_fingerprints.insert(fingerprint)
-        {
-            continue;
-        }
+    let mut schemas = Vec::with_capacity(schema_urls.len());
+    for table_url in schema_urls {
         let inferred = ListingTableConfig::new(table_url.clone())
             .with_listing_options(listing_options.clone())
             .infer_schema(&context.datafusion_session.state())
@@ -221,24 +215,46 @@ pub async fn create_table_provider(
 
     // Use explicit version URLs so DataFusion's list-files cache cannot hide a
     // version completed after an earlier provider was built.
-    let (table_urls, schema_fingerprints, debug_info) = if let Some(versions) = &selected_versions {
+    let (table_urls, schema_sources, debug_info) = if let Some(versions) = &selected_versions {
         if versions.is_empty() {
             return Err(crate::Error::TinyFs(tinyfs::Error::not_found(format!(
                 "No readable versions found for {file_id}"
             ))));
         }
-        let mut table_urls = Vec::with_capacity(versions.len());
-        let mut schema_fingerprints = Vec::with_capacity(versions.len());
+        // Prefer a retained representative of each schema, avoiding historical
+        // footer reads when the hot versions already describe it.
+        let retained_schemas: HashMap<_, _> = versions
+            .iter()
+            .filter(|version| version.retained)
+            .filter_map(|version| {
+                version
+                    .schema_fingerprint
+                    .as_ref()
+                    .map(|fingerprint| (fingerprint, &version.url))
+            })
+            .collect();
+        let mut table_urls = Vec::new();
+        let mut schema_sources = Vec::new();
+        let mut seen_schemas = HashSet::new();
         for version in versions {
-            table_urls.push(ListingTableUrl::parse(&version.url)?);
-            schema_fingerprints.push(version.schema_fingerprint.clone());
+            if version.retained {
+                table_urls.push(ListingTableUrl::parse(&version.url)?);
+            }
+            if let Some(fingerprint) = &version.schema_fingerprint
+                && !seen_schemas.insert(fingerprint)
+            {
+                continue;
+            }
+            let schema_url = version
+                .schema_fingerprint
+                .as_ref()
+                .and_then(|fingerprint| retained_schemas.get(fingerprint).copied())
+                .unwrap_or(&version.url);
+            schema_sources.push(ListingTableUrl::parse(schema_url)?);
         }
 
-        (
-            table_urls,
-            schema_fingerprints,
-            format!("{} explicit version URL(s)", versions.len()),
-        )
+        let debug_info = format!("{} explicit version URL(s)", table_urls.len());
+        (table_urls, schema_sources, debug_info)
     } else {
         // Multiple URLs provided via options - use only the provided URLs, not the default pattern
         let mut table_urls = Vec::new();
@@ -249,23 +265,20 @@ pub async fn create_table_provider(
         }
 
         let urls_str: Vec<String> = table_urls.iter().map(|u| u.to_string()).collect();
-        let schema_fingerprints = vec![None; table_urls.len()];
+        let schema_sources = table_urls.clone();
         (
             table_urls,
-            schema_fingerprints,
+            schema_sources,
             format!("multiple URLs: [{}]", urls_str.join(", ")),
         )
     };
 
     debug!("Creating table provider with {debug_info}");
 
-    // Use DataFusion's schema inference - this will automatically:
-    // 1. Iterate through all versions of the file
-    // 2. Skip 0-byte files (temporal override metadata-only versions)
-    // 3. Merge schemas from all valid Parquet versions
-    // 4. Provide the unified schema
+    // Merge the logical schema before restricting the data files. Bounds
+    // select rows, not columns; explicit version selection still scopes both.
     let config_with_schema =
-        listing_config_with_merged_schema(context, table_urls, &schema_fingerprints).await?;
+        listing_config_with_merged_schema(context, table_urls, &schema_sources).await?;
     if let (Some(coherence), Some(generation)) = (&coherence, provider_generation) {
         coherence.ensure_generation(generation)?;
     }

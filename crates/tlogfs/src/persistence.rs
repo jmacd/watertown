@@ -6231,6 +6231,139 @@ mod metadata_query_tests {
     }
 
     #[tokio::test]
+    async fn materialization_preserves_columns_from_pruned_native_versions() {
+        use arrow::array::{ArrayRef, TimestampMicrosecondArray};
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use arrow::record_batch::RecordBatch;
+        use tinyfs::arrow::ParquetExt;
+
+        let (_dir, mut persistence, _) = fixture().await;
+        let batch = |timestamp| {
+            let mut fields = vec![Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            )];
+            let mut columns =
+                vec![Arc::new(TimestampMicrosecondArray::from(vec![timestamp])) as ArrayRef];
+            if timestamp == 1 {
+                fields.push(Field::new("retired", DataType::Int64, true));
+                columns.push(Arc::new(Int64Array::from(vec![Some(42)])));
+            }
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+        };
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        for timestamp in [1, 2] {
+            _ = root
+                .write_series_from_batch("/source.series", &batch(timestamp), Some("timestamp"))
+                .await
+                .unwrap();
+        }
+        _ = root
+            .create_dynamic_path(
+                "/local",
+                EntryType::TableDynamic,
+                "sql-derived-series",
+                serde_yaml::to_string(&serde_json::json!({
+                    "patterns": {"source": "series:///source.series"},
+                    "locality": {"type": "timestamp-local", "event_time": "timestamp"},
+                    "query": "SELECT timestamp, retired FROM source",
+                }))
+                .unwrap()
+                .into_bytes(),
+            )
+            .await
+            .unwrap();
+        let root_id = root.node_path().id();
+        let source_id = root.get_node_path("/source.series").await.unwrap().id();
+        tx.commit_test().await.unwrap();
+
+        let sources = [
+            ("series:///source.series", "/native.series"),
+            ("series:///local", "/derived.series"),
+        ];
+        for (source, target) in sources {
+            let tx = persistence.begin_test().await.unwrap();
+            let context = tx.state().unwrap().as_provider_context();
+            materialize(root_id, &context, source, target).await;
+            tx.commit_test().await.unwrap();
+        }
+        let tx = persistence.begin_test().await.unwrap();
+        _ = tx
+            .root()
+            .await
+            .unwrap()
+            .write_series_from_batch("/source.series", &batch(3), Some("timestamp"))
+            .await
+            .unwrap();
+        tx.commit_test().await.unwrap();
+
+        for (source, target) in sources {
+            for _ in 0..2 {
+                let tx = persistence.begin_test().await.unwrap();
+                let context = tx.state().unwrap().as_provider_context();
+                materialize(root_id, &context, source, target).await;
+                let root = tx.root().await.unwrap();
+                assert_eq!(root.list_file_versions(target).await.unwrap().len(), 2);
+                let provider = provider::Provider::with_context(
+                    Arc::new(context.filesystem()),
+                    Arc::new(context.clone()),
+                )
+                .with_root(root);
+                let table = provider
+                    .create_provider_for_url(
+                        &format!("series://{target}"),
+                        &context.datafusion_session,
+                    )
+                    .await
+                    .unwrap();
+                let output = context
+                    .datafusion_session
+                    .read_table(table)
+                    .unwrap()
+                    .sort(vec![datafusion::prelude::col("timestamp").sort(true, true)])
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                let output = arrow::compute::concat_batches(&output[0].schema(), &output).unwrap();
+                assert_eq!(output.num_rows(), 3);
+                let retired = output
+                    .column_by_name("retired")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                assert_eq!(retired.iter().collect::<Vec<_>>(), [Some(42), None, None]);
+                tx.commit_test().await.unwrap();
+            }
+        }
+
+        let tx = persistence.begin_test().await.unwrap();
+        let context = tx.state().unwrap().as_provider_context();
+        for selection in [
+            provider::VersionSelection::LatestVersion,
+            provider::VersionSelection::SpecificVersion(2),
+        ] {
+            let table = provider::create_table_provider(
+                source_id,
+                &context,
+                provider::TableProviderOptions {
+                    version_selection: selection,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                table.schema().field_with_name("retired").is_err(),
+                "explicit version selection must not inherit unrelated historical columns"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn materialization_bounds_native_and_declared_derived_sources_before_construction() {
         use tinyfs::arrow::ParquetExt;
 
