@@ -123,6 +123,16 @@ pub enum TimestampUnit {
 }
 
 impl TimestampUnit {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Seconds => "seconds",
+            Self::Milliseconds => "milliseconds",
+            Self::Microseconds => "microseconds",
+            Self::Nanoseconds => "nanoseconds",
+            Self::Rfc3339 => "rfc3339",
+        }
+    }
+
     /// Microseconds per unit.
     fn per_micro(self) -> (i64, bool) {
         // (factor, divide) -- divide when the unit is finer than a microsecond.
@@ -417,6 +427,10 @@ fn attach_temporal_bounds(
             pond_dest, min_us, max_us, field
         );
         writer.set_temporal_metadata(min_us, max_us, field.to_string());
+        writer.set_exact_logical_attributes(crate::format::temporal_log_attributes(
+            field,
+            config.timestamp_unit.as_str(),
+        ));
     }
 }
 

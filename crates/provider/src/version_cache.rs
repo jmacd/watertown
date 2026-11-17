@@ -55,6 +55,8 @@ use futures::{Stream, StreamExt};
 use parquet::arrow::AsyncArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -392,8 +394,7 @@ impl CachedSet {
     /// only occurrences are in pruned versions. Superseded and unselected
     /// versions contribute neither rows nor schemas.
     pub async fn table_provider(&self) -> Result<Arc<dyn TableProvider>> {
-        let merged_schema =
-            merge_parquet_schemas_with_fallback_dirs(&self.schema_files, &[]).await?;
+        let merged_schema = cached_parquet_schema(&self.schema_files).await?;
 
         if self.files.is_empty() {
             // Everything pruned: retain the full live schema without scanning
@@ -413,6 +414,143 @@ impl CachedSet {
             .with_schema(merged_schema);
         Ok(Arc::new(ListingTable::try_new(config)?))
     }
+}
+
+#[derive(Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SchemaIndex {
+    files: BTreeMap<String, String>,
+    schemas: BTreeMap<String, Vec<u8>>,
+}
+
+/// Schema metadata is disposable, but membership always comes from the caller.
+/// An absent index is reconstructed; a present but invalid index is an error.
+async fn cached_parquet_schema(files: &[PathBuf]) -> Result<SchemaRef> {
+    let mut directories = BTreeMap::<PathBuf, Vec<&Path>>::new();
+    for file in files {
+        directories
+            .entry(file.parent().expect("sidecar has parent").to_path_buf())
+            .or_default()
+            .push(file);
+    }
+    let mut schemas = BTreeMap::<String, Schema>::new();
+    let mut schema_order = Vec::new();
+    for (directory, files) in directories {
+        let index_path = directory.join("schemas-0001.json");
+        let mut index: SchemaIndex = match tokio::fs::read(&index_path).await {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
+                crate::error::Error::Arrow(format!(
+                    "Invalid schema index '{}': {error}",
+                    index_path.display()
+                ))
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => SchemaIndex::default(),
+            Err(error) => return Err(error.into()),
+        };
+        let previous_count = index.files.len();
+        index.files.retain(|name, _| directory.join(name).exists());
+        let mut changed = index.files.len() != previous_count;
+        for path in files {
+            // A schema hit must not hide a missing live sidecar, even when its
+            // rows were pruned or another member has the same schema.
+            _ = tokio::fs::metadata(path).await?;
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    crate::error::Error::Arrow(format!(
+                        "Invalid schema member path '{}'",
+                        path.display()
+                    ))
+                })?;
+            let fingerprint = if let Some(fingerprint) = index.files.get(name) {
+                fingerprint.clone()
+            } else {
+                let schema = read_parquet_schema(path).await?;
+                let mut writer = arrow::ipc::writer::StreamWriter::try_new(Vec::new(), &schema)
+                    .map_err(|error| crate::error::Error::Arrow(error.to_string()))?;
+                writer
+                    .finish()
+                    .map_err(|error| crate::error::Error::Arrow(error.to_string()))?;
+                let bytes = writer
+                    .into_inner()
+                    .map_err(|error| crate::error::Error::Arrow(error.to_string()))?;
+                let fingerprint = blake3::hash(&bytes).to_hex().to_string();
+                _ = index.schemas.insert(fingerprint.clone(), bytes);
+                _ = index.files.insert(name.to_owned(), fingerprint.clone());
+                changed = true;
+                fingerprint
+            };
+            if let std::collections::btree_map::Entry::Vacant(entry) = schemas.entry(fingerprint) {
+                let fingerprint = entry.key();
+                let bytes = index.schemas.get(fingerprint).ok_or_else(|| {
+                    crate::error::Error::Arrow(format!(
+                        "Schema index '{}' is missing schema {fingerprint}",
+                        index_path.display()
+                    ))
+                })?;
+                if blake3::hash(bytes).to_hex().as_str() != fingerprint.as_str() {
+                    return Err(crate::error::Error::Arrow(format!(
+                        "Schema index '{}' has invalid schema digest {fingerprint}",
+                        index_path.display()
+                    )));
+                }
+                let reader =
+                    arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
+                        .map_err(|error| crate::error::Error::Arrow(error.to_string()))?;
+                schema_order.push(fingerprint.clone());
+                _ = entry.insert(reader.schema().as_ref().clone());
+            }
+        }
+        if changed {
+            let live: BTreeSet<_> = index.files.values().collect();
+            index
+                .schemas
+                .retain(|fingerprint, _| live.contains(fingerprint));
+            write_cache_json(&index_path, &index).await?;
+        }
+    }
+    if schemas.is_empty() {
+        return Err(crate::error::Error::Arrow(
+            "No live cached Parquet schema members".to_owned(),
+        ));
+    }
+    Ok(Arc::new(
+        Schema::try_merge(
+            schema_order
+                .into_iter()
+                .map(|fingerprint| schemas.remove(&fingerprint).expect("recorded schema")),
+        )
+        .map_err(|error| crate::error::Error::Arrow(error.to_string()))?,
+    ))
+}
+
+/// Publish shared derived-cache metadata without exposing a partial document.
+pub(crate) async fn write_cache_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    let bytes = serde_json::to_vec(value).map_err(|error| {
+        crate::error::Error::Arrow(format!("Serialize cache '{}': {error}", path.display()))
+    })?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let temporary = path.with_extension(format!("tmp-{}", uuid7::uuid7()));
+    let result = async {
+        tokio::fs::write(&temporary, bytes).await?;
+        tokio::fs::rename(&temporary, path).await
+    }
+    .await;
+    if let Err(error) = result {
+        match tokio::fs::remove_file(&temporary).await {
+            Ok(()) => {}
+            Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => {}
+            Err(cleanup) => log::error!(
+                "Failed to clean cache temporary '{}': {cleanup}",
+                temporary.display()
+            ),
+        }
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 /// Stream `stream` into a Parquet file at `path` atomically (tmp + rename), and
@@ -535,6 +673,8 @@ async fn read_parquet_schemas_in_dir(dir: &Path) -> Result<Vec<Schema>> {
 }
 
 async fn read_parquet_schema(path: &Path) -> Result<Schema> {
+    #[cfg(test)]
+    let _ = SCHEMA_FOOTER_READS.try_with(|reads| reads.set(reads.get() + 1));
     let file = tokio::fs::File::open(path).await?;
     let reader = parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(file)
         .await
@@ -545,6 +685,11 @@ async fn read_parquet_schema(path: &Path) -> Result<Schema> {
             ))
         })?;
     Ok(reader.schema().as_ref().clone())
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static SCHEMA_FOOTER_READS: std::cell::Cell<usize>;
 }
 
 #[cfg(test)]
@@ -564,6 +709,103 @@ mod tests {
                 std::collections::HashMap::from([(POLICY_KEY.into(), DICTIONARY_V1.into())]),
             ),
         ]))
+    }
+
+    #[tokio::test]
+    async fn bounded_schema_discovery_reuses_metadata_across_fresh_contexts() {
+        SCHEMA_FOOTER_READS
+            .scope(std::cell::Cell::new(0), async {
+                let tmp = tempfile::tempdir().unwrap();
+                let dir = SidecarDir::new(tmp.path().to_path_buf(), SidecarNaming::NodeOwned);
+                let schema = dictionary_schema();
+                let mut versions = Vec::new();
+                for count in [1, 16, 128] {
+                    let added = count - versions.len();
+                    while versions.len() < count {
+                        let number = versions.len() as u64 + 1;
+                        let version = version(number, Some(&format!("content-{number}")));
+                        let batch = RecordBatch::try_new(
+                            schema.clone(),
+                            vec![Arc::new(StringArray::from(vec!["/page"]))],
+                        )
+                        .unwrap();
+                        _ = dir
+                            .write_sidecar(
+                                &node(1),
+                                &version,
+                                schema.clone(),
+                                Box::pin(futures::stream::iter([Ok(batch)])),
+                            )
+                            .await
+                            .unwrap();
+                        versions.push(version);
+                    }
+                    let live = LiveVersions::from_persistence(node(1), versions.clone());
+                    SCHEMA_FOOTER_READS.with(|reads| reads.set(0));
+                    let table = dir
+                        .cached_set(&live, |_| false)
+                        .table_provider()
+                        .await
+                        .unwrap();
+                    assert_eq!(table.schema(), schema);
+                    assert_eq!(
+                        SCHEMA_FOOTER_READS.with(std::cell::Cell::get),
+                        added,
+                        "only newly encountered schemas require footer discovery"
+                    );
+                    SCHEMA_FOOTER_READS.with(|reads| reads.set(0));
+                    for _ in 0..2 {
+                        let reopened =
+                            SidecarDir::new(tmp.path().to_path_buf(), SidecarNaming::NodeOwned);
+                        let table = reopened
+                            .cached_set(&live, |_| false)
+                            .table_provider()
+                            .await
+                            .unwrap();
+                        let session = datafusion::prelude::SessionContext::new();
+                        assert!(
+                            session
+                                .read_table(table)
+                                .unwrap()
+                                .collect()
+                                .await
+                                .unwrap()
+                                .is_empty()
+                        );
+                    }
+                    assert_eq!(SCHEMA_FOOTER_READS.with(std::cell::Cell::get), 0);
+                }
+
+                std::fs::remove_file(tmp.path().join("schemas-0001.json")).unwrap();
+                SCHEMA_FOOTER_READS.with(|reads| reads.set(0));
+                let live = LiveVersions::from_persistence(node(1), versions.clone());
+                _ = dir
+                    .cached_set(&live, |_| false)
+                    .table_provider()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    SCHEMA_FOOTER_READS.with(std::cell::Cell::get),
+                    versions.len(),
+                    "a discarded index is reconstructible from exact live sidecars"
+                );
+                std::fs::remove_file(dir.sidecar_path(&node(1), &versions[0])).unwrap();
+                assert!(
+                    dir.cached_set(&live, |_| false)
+                        .table_provider()
+                        .await
+                        .is_err(),
+                    "a warm index must not hide a missing schema member"
+                );
+                std::fs::write(tmp.path().join("schemas-0001.json"), b"broken").unwrap();
+                assert!(
+                    dir.cached_set(&live, |_| false)
+                        .table_provider()
+                        .await
+                        .is_err()
+                );
+            })
+            .await;
     }
 
     #[tokio::test]

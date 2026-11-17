@@ -4535,6 +4535,7 @@ mod tests {
         let cache_dir = tempfile::tempdir().unwrap();
         let lineage = tinyfs::QueryLineage {
             recipe_identity: "pivot-recipe".to_owned(),
+            timestamp_local: false,
             leaves: vec![tinyfs::QuerySourceLeaf {
                 identity: "source:content-a".to_owned(),
                 min_event_time: Some(10),
@@ -4567,6 +4568,7 @@ mod tests {
 
         let changed = tinyfs::QueryLineage {
             recipe_identity: lineage.recipe_identity.clone(),
+            timestamp_local: false,
             leaves: vec![tinyfs::QuerySourceLeaf {
                 identity: "source:content-b".to_owned(),
                 min_event_time: Some(21),

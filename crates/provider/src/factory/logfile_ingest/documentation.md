@@ -54,5 +54,12 @@ Enabling timestamp extraction affects new versions only: existing unbounded
 versions are not rewritten and must still be retained conservatively by bounded
 readers. Retrofitting their metadata is a separate operation.
 
+New temporal versions record both `watertown.timestamp_column` and
+`watertown.timestamp_unit` in their logical attributes. The `jsonlogs` reader
+uses explicit RFC3339 or microsecond metadata to prove safe event-time mapping
+through timestamp-local SQL. Other encodings and indexed legacy versions
+without unit proof remain conservative; matching a column name alone does not
+authorize pruning. Committed historical metadata is not modified.
+
 <!-- docs:reference factory:logfile-ingest -->
 <!-- docs:end-reference -->

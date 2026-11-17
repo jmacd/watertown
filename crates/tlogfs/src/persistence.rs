@@ -6231,6 +6231,333 @@ mod metadata_query_tests {
     }
 
     #[tokio::test]
+    async fn materialization_selfmon_format_axes_prune_before_execution() {
+        use datafusion::physical_plan::display::DisplayableExecutionPlan;
+        use datafusion::prelude::{col, lit};
+        use datafusion::scalar::ScalarValue;
+        use tokio::io::AsyncWriteExt;
+
+        for (field, unit, grouped, joined) in [
+            ("ts", "rfc3339", false, true),
+            ("timestamp", "rfc3339", true, false),
+            ("__REALTIME_TIMESTAMP", "microseconds", false, false),
+        ] {
+            let (_dir, mut persistence, _) = fixture().await;
+            let tx = persistence.begin_test().await.unwrap();
+            let root = tx.root().await.unwrap();
+            for second in 1..=3 {
+                let timestamp = if unit == "rfc3339" {
+                    format!("1970-01-01T00:00:0{second}Z")
+                } else {
+                    (second * 1_000_000).to_string()
+                };
+                let bytes = format!("{{\"{field}\":\"{timestamp}\",\"value\":1}}\n");
+                let mut writer = root
+                    .async_writer_path_with_type("/events.jsonl", EntryType::FilePhysicalSeries)
+                    .await
+                    .unwrap();
+                writer.write_all(bytes.as_bytes()).await.unwrap();
+                // Unknown-bound legacy versions must survive pruning.
+                if second != 1 {
+                    writer.set_temporal_metadata(
+                        second * 1_000_000,
+                        second * 1_000_000,
+                        field.to_owned(),
+                    );
+                    writer.set_exact_logical_attributes(
+                        serde_json::to_vec(&serde_json::json!({
+                            "watertown.timestamp_column": field,
+                            "watertown.timestamp_unit": unit,
+                        }))
+                        .unwrap(),
+                    );
+                }
+                writer.shutdown().await.unwrap();
+            }
+            let expression = if unit == "rfc3339" {
+                format!("CAST(\"{field}\" AS TIMESTAMP)")
+            } else {
+                format!("to_timestamp_micros(CAST(\"{field}\" AS BIGINT))")
+            };
+            let query = if grouped {
+                format!(
+                    "WITH typed AS (SELECT {expression} AS timestamp FROM source) \
+                    SELECT timestamp, COUNT(*) AS count FROM typed GROUP BY timestamp ORDER BY timestamp"
+                )
+            } else {
+                format!(
+                    "SELECT {expression} AS timestamp, CAST(value AS BIGINT) AS value FROM source ORDER BY timestamp"
+                )
+            };
+            let paths: &[&str] = if joined {
+                &["/typed", "/typed-other"]
+            } else {
+                &["/typed"]
+            };
+            for path in paths {
+                _ = root
+                    .create_dynamic_path(
+                        path,
+                        EntryType::TableDynamic,
+                        "sql-derived-series",
+                        serde_json::to_vec(&serde_json::json!({
+                            "patterns": {"source": "jsonlogs:///events.jsonl"},
+                            "locality": {
+                                "type": if grouped { "timestamp-grouped" } else { "timestamp-local" },
+                                "event_time": "timestamp", "input_event_time": field,
+                            },
+                            "query": query,
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            if joined {
+                _ = root
+                    .create_dynamic_path(
+                        "/joined",
+                        EntryType::TableDynamic,
+                        "timeseries-join",
+                        serde_json::to_vec(&serde_json::json!({
+                            "time_column": "timestamp",
+                            "inputs": [
+                                {"pattern": "series:///typed", "scope": "left"},
+                                {"pattern": "series:///typed-other", "scope": "right"},
+                            ],
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            tx.commit_test().await.unwrap();
+            let tx = persistence.begin_test().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let context = tx.state().unwrap().as_provider_context();
+            let api = provider::Provider::with_context(
+                Arc::new(context.filesystem()),
+                Arc::new(context.clone()),
+            )
+            .with_root(root.clone());
+            let url = if joined {
+                "series:///joined"
+            } else {
+                "series:///typed"
+            };
+            let session = &context.datafusion_session;
+            let full = api.create_provider_for_url(url, session).await.unwrap();
+            for lower in [3_000_000, 4_000_000] {
+                let predicate = col("timestamp")
+                    .gt_eq(lit(ScalarValue::TimestampMicrosecond(Some(lower), None)));
+                let expected = session
+                    .read_table(full.clone())
+                    .unwrap()
+                    .filter(predicate.clone())
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                let bounded = api
+                    .create_provider_for_url_bounded(
+                        url,
+                        session,
+                        tinyfs::SeriesReadBounds::from_event_time_lo(lower),
+                    )
+                    .await
+                    .unwrap();
+                let frame = session
+                    .read_table(bounded)
+                    .unwrap()
+                    .filter(predicate)
+                    .unwrap();
+                let plan = frame.clone().create_physical_plan().await.unwrap();
+                let display = DisplayableExecutionPlan::new(plan.as_ref())
+                    .indent(true)
+                    .to_string();
+                assert!(
+                    !display.contains("v2_"),
+                    "indexed old chunk was not pruned: {display}"
+                );
+                assert!(
+                    display.contains("v1_"),
+                    "unknown legacy chunk must remain: {display}"
+                );
+                assert_eq!(
+                    display.contains("v3_"),
+                    lower <= 3_000_000,
+                    "append/idle bounds must select only relevant indexed chunks: {display}"
+                );
+                assert_eq!(frame.collect().await.unwrap(), expected);
+            }
+            materialize(root.node_path().id(), &context, url, "/materialized").await;
+            tx.commit_test().await.unwrap();
+
+            let tx = persistence.begin_test().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let timestamp = if unit == "rfc3339" {
+                "1970-01-01T00:00:03Z"
+            } else {
+                "3000000"
+            };
+            let mut writer = root
+                .async_writer_path_with_type("/events.jsonl", EntryType::FilePhysicalSeries)
+                .await
+                .unwrap();
+            writer
+                .write_all(format!("{{\"{field}\":\"{timestamp}\",\"value\":1}}\n").as_bytes())
+                .await
+                .unwrap();
+            writer.set_temporal_metadata(3_000_000, 3_000_000, field.to_owned());
+            writer.set_exact_logical_attributes(
+                serde_json::to_vec(&serde_json::json!({
+                    "watertown.timestamp_column": field,
+                    "watertown.timestamp_unit": unit,
+                }))
+                .unwrap(),
+            );
+            writer.shutdown().await.unwrap();
+            let context = tx.state().unwrap().as_provider_context();
+            let error = provider::factory::materialize_series::execute(
+                serde_json::json!({
+                    "source": url, "target": "/materialized", "time_column": "timestamp",
+                }),
+                FactoryContext::new(context, root.node_path().id()),
+                provider::ExecutionContext::pond_readwriter(Vec::new()),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("rejects retroactive changes"),
+                "{field}: {error}"
+            );
+            tx.commit_test().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn materialization_rejects_recovered_join_input_without_advancing_target() {
+        use tinyfs::arrow::ParquetExt;
+        let (_dir, mut persistence, _) = fixture().await;
+        let batch = |timestamp| {
+            arrow::record_batch::RecordBatch::try_from_iter([
+                (
+                    "timestamp",
+                    Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                        timestamp,
+                    ])) as arrow::array::ArrayRef,
+                ),
+                (
+                    "value",
+                    Arc::new(Int64Array::from(vec![timestamp])) as arrow::array::ArrayRef,
+                ),
+            ])
+            .unwrap()
+        };
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        for path in ["/left", "/right"] {
+            _ = root
+                .write_series_from_batch(path, &batch(1), Some("timestamp"))
+                .await
+                .unwrap();
+        }
+        _ = root
+            .create_dynamic_path(
+                "/joined",
+                EntryType::TableDynamic,
+                "timeseries-join",
+                serde_yaml::to_string(&serde_json::json!({
+                    "time_column": "timestamp",
+                    "inputs": [
+                        {"pattern": "series:///left", "scope": "left"},
+                        {"pattern": "series:///right", "scope": "right"},
+                    ]
+                }))
+                .unwrap()
+                .into_bytes(),
+            )
+            .await
+            .unwrap();
+        let root_id = root.node_path().id();
+        tx.commit_test().await.unwrap();
+        let tx = persistence.begin_test().await.unwrap();
+        materialize(
+            root_id,
+            &tx.state().unwrap().as_provider_context(),
+            "series:///joined",
+            "/target",
+        )
+        .await;
+        tx.commit_test().await.unwrap();
+
+        // The right input's ingest failed, but the left input and target advance.
+        let tx = persistence.begin_test().await.unwrap();
+        _ = tx
+            .root()
+            .await
+            .unwrap()
+            .write_series_from_batch("/left", &batch(3), Some("timestamp"))
+            .await
+            .unwrap();
+        tx.commit_test().await.unwrap();
+        let tx = persistence.begin_test().await.unwrap();
+        materialize(
+            root_id,
+            &tx.state().unwrap().as_provider_context(),
+            "series:///joined",
+            "/target",
+        )
+        .await;
+        tx.commit_test().await.unwrap();
+
+        // Recovery includes both an older event and a same-time join correction.
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        for time in [2, 3] {
+            _ = root
+                .write_series_from_batch("/right", &batch(time), Some("timestamp"))
+                .await
+                .unwrap();
+        }
+        tx.commit_test().await.unwrap();
+        for _ in 0..2 {
+            let tx = persistence.begin_test().await.unwrap();
+            let context = tx.state().unwrap().as_provider_context();
+            let error = provider::factory::materialize_series::execute(
+                serde_json::json!({"source": "series:///joined", "target": "/target", "time_column": "timestamp"}),
+                FactoryContext::new(context, root_id),
+                provider::ExecutionContext::pond_readwriter(Vec::new()),
+            ).await.expect_err("recovered input must not be silently skipped");
+            assert!(
+                error.to_string().contains("rejects retroactive changes"),
+                "{error}"
+            );
+            assert_eq!(
+                tx.root()
+                    .await
+                    .unwrap()
+                    .list_file_versions("/target")
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+        let tx = persistence.begin_test().await.unwrap();
+        assert_eq!(
+            tx.root()
+                .await
+                .unwrap()
+                .list_file_versions("/target")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn materialization_preserves_columns_from_pruned_native_versions() {
         use arrow::array::{ArrayRef, TimestampMicrosecondArray};
         use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -6517,6 +6844,30 @@ mod metadata_query_tests {
             let state = tx.state().unwrap();
             let scans = record_scans(&state).await;
             let context = state.as_provider_context();
+            if target == "/global.series" {
+                let error = provider::factory::materialize_series::execute(
+                    serde_json::json!({"source": source, "target": target, "time_column": "timestamp"}),
+                    FactoryContext::new(context.clone(), root_id),
+                    provider::ExecutionContext::pond_readwriter(Vec::new()),
+                )
+                .await
+                .expect_err("a changed global window must not leave a stale historical prefix");
+                assert!(
+                    error.to_string().contains("rejects retroactive changes"),
+                    "{error}"
+                );
+                assert_eq!(
+                    tx.root()
+                        .await
+                        .unwrap()
+                        .list_file_versions(target)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                continue;
+            }
             materialize(root_id, &context, source, target).await;
             if target != "/global.series" {
                 let source_id = if target == "/renamed.series" {
@@ -6558,25 +6909,6 @@ mod metadata_query_tests {
                 17,
                 "{source}"
             );
-            if target == "/global.series" {
-                let new_totals = output
-                    .iter()
-                    .map(|batch| {
-                        batch
-                            .column_by_name("total")
-                            .unwrap()
-                            .as_any()
-                            .downcast_ref::<Int64Array>()
-                            .unwrap()
-                            .values()
-                            .iter()
-                            .filter(|value| **value == 17)
-                            .count()
-                    })
-                    .sum::<usize>();
-                assert_eq!(new_totals, 1);
-                assert!(context.plan_visibility_metrics().global_plans > 0);
-            }
             tx.commit_test().await.unwrap();
             let tx = persistence.begin_test().await.unwrap();
             let root = tx.root().await.unwrap();

@@ -904,12 +904,25 @@ impl Provider {
 
     /// Resolve a shared event-time axis without constructing source providers.
     ///
-    /// Native table-series metadata and explicit dynamic query contracts are
-    /// authoritative. Host files and external format transformations remain
-    /// unknown because they may change column names or time representations.
+    /// Native metadata, explicit dynamic contracts, and proven format mappings
+    /// are authoritative. Unknown transformations cannot establish an axis.
     pub(crate) async fn event_time_column_for_url(&self, url_str: &str) -> Result<Option<String>> {
+        Ok(self
+            .event_time_axis_for_url(url_str)
+            .await?
+            .map(|axis| axis.column))
+    }
+
+    pub(crate) async fn event_time_axis_for_url(
+        &self,
+        url_str: &str,
+    ) -> Result<Option<crate::format::EventTimeAxis>> {
         let url = Url::parse(url_str)?;
-        if url.is_host() || !matches!(url.scheme(), "file" | "series" | "table" | "data") {
+        if url.is_host() {
+            return Ok(None);
+        }
+        let format = FormatRegistry::get_provider(url.scheme());
+        if format.is_none() && !matches!(url.scheme(), "file" | "series" | "table" | "data") {
             return Ok(None);
         }
         let Some(context) = self.provider_context.as_ref() else {
@@ -926,7 +939,7 @@ impl Provider {
         let mut common = None;
         for (node, _) in nodes {
             let id = node.id();
-            let column = if id.entry_type().is_dynamic() {
+            let column = if id.entry_type().is_dynamic() && format.is_none() {
                 let file = node.as_file().await.map_err(|error| {
                     Error::InvalidUrl(format!(
                         "Event-time source '{}': {error}",
@@ -938,8 +951,13 @@ impl Provider {
                 guard
                     .as_queryable()
                     .and_then(|queryable| queryable.event_time_column())
-                    .map(str::to_owned)
-            } else if id.entry_type() == tinyfs::EntryType::TablePhysicalSeries {
+                    .map(|column| crate::format::EventTimeAxis {
+                        column: column.to_owned(),
+                        encoding: None,
+                    })
+            } else if id.entry_type() == tinyfs::EntryType::TablePhysicalSeries
+                || (format.is_some() && id.entry_type() == tinyfs::EntryType::FilePhysicalSeries)
+            {
                 let versions =
                     context
                         .persistence
@@ -950,6 +968,12 @@ impl Provider {
                         })?;
                 let mut column = None;
                 for version in versions.iter().filter(|version| version.size > 0) {
+                    if format.is_some()
+                        && crate::format_cache::version_max_event_time(version).is_none()
+                    {
+                        // Unindexed legacy versions cannot be pruned anyway.
+                        continue;
+                    }
                     let Some(attributes) = version
                         .extended_metadata
                         .as_ref()
@@ -964,19 +988,27 @@ impl Provider {
                                 version.version
                             ))
                         })?;
-                    let Some(recorded) = attributes
-                        .get("watertown.timestamp_column")
-                        .and_then(serde_json::Value::as_str)
-                    else {
+                    let recorded = if let Some(format) = &format {
+                        format.event_time_axis(&attributes)
+                    } else {
+                        attributes
+                            .get("watertown.timestamp_column")
+                            .and_then(serde_json::Value::as_str)
+                            .map(|column| crate::format::EventTimeAxis {
+                                column: column.to_owned(),
+                                encoding: None,
+                            })
+                    };
+                    let Some(recorded) = recorded else {
                         return Ok(None);
                     };
                     if column
-                        .as_deref()
-                        .is_some_and(|previous| previous != recorded)
+                        .as_ref()
+                        .is_some_and(|previous| previous != &recorded)
                     {
                         return Ok(None);
                     }
-                    column = Some(recorded.to_owned());
+                    column = Some(recorded);
                 }
                 column
             } else {
@@ -1035,6 +1067,7 @@ impl Provider {
         matches.dedup_by_key(|(node, _)| node.id());
 
         let mut lineage = tinyfs::QueryLineage::new(format!("pattern:{url}"));
+        lineage.timestamp_local = true;
         for (node_path, _) in matches {
             let file_id = node_path.id();
             if file_id.entry_type().is_dynamic() {

@@ -1660,7 +1660,7 @@ impl SqlDerivedFile {
             table_mappings.len(),
             effective_sql
         );
-        let declaration = match &self.config.locality {
+        let mut declaration = match &self.config.locality {
             SqlDerivedLocality::Global => {
                 query_foundation::sql::UserSqlDeclaration::global(table_mappings.values().cloned())
                     .map_other_context("SQL-derived global locality declaration failed")?
@@ -1698,6 +1698,24 @@ impl SqlDerivedFile {
                     .map_other_context("SQL-derived timestamp-local declaration failed")?
             }
         };
+        if self.config.locality != SqlDerivedLocality::Global
+            && self.config.provider_wrapper.is_none()
+            && self.config.transforms.as_ref().is_none_or(Vec::is_empty)
+            && self.config.pattern_transforms.is_none()
+            && let Some(pattern) = self.config.patterns.values().next()
+            && let Some(axis) = crate::Provider::with_context(
+                Arc::new(context.filesystem()),
+                Arc::new(context.clone()),
+            )
+            .with_root(self.context.root().await?)
+            .event_time_axis_for_url(&pattern.to_string())
+            .await
+            .map_other_context("SQL-derived input encoding")?
+            && Some(axis.column.as_str()) == self.config.locality.input_event_time()
+            && let Some(encoding) = axis.encoding
+        {
+            declaration = declaration.with_input_encoding(encoding);
+        }
         let planned = query_foundation::sql::plan_user_sql(ctx, &effective_sql, declaration)
             .await
             .map_err(|error| {
@@ -1859,10 +1877,18 @@ impl tinyfs::QueryableFile for SqlDerivedFile {
         }
 
         let mut lineage = tinyfs::QueryLineage::new(recipe_hasher.finalize().to_hex().to_string());
+        lineage.timestamp_local = self.config.transforms.as_ref().is_none_or(Vec::is_empty)
+            && self.config.pattern_transforms.is_none()
+            && self.config.provider_wrapper.is_none();
         let fs = self.context.context.filesystem();
         let mut provider = crate::Provider::with_context(Arc::new(fs), Arc::new(context.clone()));
         provider = provider.with_root(root);
         for pattern in self.config.patterns.values() {
+            let axis = provider
+                .event_time_column_for_url(&pattern.to_string())
+                .await
+                .map_other_context("SQL lineage event-time axis")?;
+            lineage.timestamp_local &= axis.as_deref() == self.config.locality.input_event_time();
             let Some(nested) = provider
                 .query_lineage_for_url(&pattern.to_string())
                 .await

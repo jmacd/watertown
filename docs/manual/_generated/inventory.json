@@ -5939,7 +5939,7 @@
         },
         "timestamp_field": {
           "default": null,
-          "description": "JSON key holding the event time of a record, looked up at any depth in\neach line. Example: \"timeUnixNano\" for OTLP metrics JSON.\n\nAbsent by default, which leaves versions without event-time bounds.\nThat is not free: `temporal-reduce` reads these bounds to decide which\ncached segments a new source version can have touched, and a version\nwithout them is taken to span all of time (`SourceRange::UNKNOWN`), so\nevery build unseals every segment and recomputes the whole history from\nsource. Setting this is what keeps an incremental build incremental.",
+          "description": "JSON key holding the event time of a record, looked up at any depth in\neach line. Example: \"timeUnixNano\" for OTLP metrics JSON.\nWhen configured, every parsed JSON record must contain usable values\nfor this key; missing or malformed timestamps reject the write.\n\nAbsent by default, which leaves versions without event-time bounds.\nThat is not free: `temporal-reduce` reads these bounds to decide which\ncached segments a new source version can have touched, and a version\nwithout them is taken to span all of time (`SourceRange::UNKNOWN`), so\nevery build unseals every segment and recomputes the whole history from\nsource. Setting this is what keeps an incremental build incremental.",
           "type": [
             "string",
             "null"
@@ -7617,6 +7617,13 @@
                   "description": "Event-time column retained by the output.",
                   "type": "string"
                 },
+                "input_event_time": {
+                  "description": "Source event-time column, defaulting to event_time. Only renaming,\nRFC3339 parsing, and integer-microsecond parsing preserve time.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "type": {
                   "const": "timestamp-local",
                   "type": "string"
@@ -7629,11 +7636,18 @@
               "type": "object"
             },
             {
-              "description": "Single-source aggregation grouped only by the exact retained event time.\nThe event-time value/name must be preserved; text may be parsed into a\nnanosecond timestamp. Nonlocal operators and time bucketing are rejected.",
+              "description": "Single-source aggregation grouped only by the exact retained event time.\nThe event-time value must be preserved; text may be parsed into a\nnanosecond timestamp. Nonlocal operators and time bucketing are rejected.",
               "properties": {
                 "event_time": {
-                  "description": "Event-time column retained throughout the query.",
+                  "description": "Event-time column retained by the output.",
                   "type": "string"
+                },
+                "input_event_time": {
+                  "description": "Source event-time column, defaulting to event_time.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "type": {
                   "const": "timestamp-grouped",
@@ -7717,6 +7731,13 @@
                   "description": "Event-time column retained by the output.",
                   "type": "string"
                 },
+                "input_event_time": {
+                  "description": "Source event-time column, defaulting to event_time. Only renaming,\nRFC3339 parsing, and integer-microsecond parsing preserve time.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "type": {
                   "const": "timestamp-local",
                   "type": "string"
@@ -7729,11 +7750,18 @@
               "type": "object"
             },
             {
-              "description": "Single-source aggregation grouped only by the exact retained event time.\nThe event-time value/name must be preserved; text may be parsed into a\nnanosecond timestamp. Nonlocal operators and time bucketing are rejected.",
+              "description": "Single-source aggregation grouped only by the exact retained event time.\nThe event-time value must be preserved; text may be parsed into a\nnanosecond timestamp. Nonlocal operators and time bucketing are rejected.",
               "properties": {
                 "event_time": {
-                  "description": "Event-time column retained throughout the query.",
+                  "description": "Event-time column retained by the output.",
                   "type": "string"
+                },
+                "input_event_time": {
+                  "description": "Source event-time column, defaulting to event_time.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "type": {
                   "const": "timestamp-grouped",

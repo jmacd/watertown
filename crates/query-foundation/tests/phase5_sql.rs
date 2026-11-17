@@ -15,6 +15,52 @@ use query_foundation::sql::{UserSqlDeclaration, plan_user_sql};
 use query_foundation::statistics::TimeInterval;
 use query_foundation::testkit::FoundationFixture;
 
+#[tokio::test]
+async fn declared_text_time_encoding_must_match_the_sql_conversion() -> Result<()> {
+    use query_foundation::sql::EventTimeEncoding;
+    let context = SessionContext::new();
+    _ = context.register_table(
+        "source",
+        Arc::new(datafusion::datasource::empty::EmptyTable::new(Arc::new(
+            Schema::new(vec![Field::new("raw_time", DataType::Utf8, false)]),
+        ))),
+    )?;
+    for (encoding, expression, valid) in [
+        (
+            EventTimeEncoding::Rfc3339,
+            "CAST(raw_time AS TIMESTAMP)",
+            true,
+        ),
+        (
+            EventTimeEncoding::Microseconds,
+            "to_timestamp_micros(CAST(raw_time AS BIGINT))",
+            true,
+        ),
+        (
+            EventTimeEncoding::Microseconds,
+            "CAST(raw_time AS TIMESTAMP)",
+            false,
+        ),
+        (
+            EventTimeEncoding::Rfc3339,
+            "to_timestamp_micros(CAST(raw_time AS BIGINT))",
+            false,
+        ),
+    ] {
+        let declaration = UserSqlDeclaration::timestamp_local("source", "timestamp")?
+            .with_input_event_time("raw_time")?
+            .with_input_encoding(encoding);
+        let planned = plan_user_sql(
+            &context,
+            &format!("SELECT {expression} AS timestamp FROM source"),
+            declaration,
+        )
+        .await;
+        assert_eq!(planned.is_ok(), valid, "{encoding:?}: {expression}");
+    }
+    Ok(())
+}
+
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("ts", DataType::Int64, false),

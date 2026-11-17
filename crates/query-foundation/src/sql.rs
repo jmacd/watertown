@@ -20,6 +20,13 @@ use datafusion::sql::sqlparser::dialect::GenericDialect;
 
 use crate::locality::{LocalityClass, LocalityContract};
 
+/// Proven representation of an external source's textual event time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventTimeEncoding {
+    Rfc3339,
+    Microseconds,
+}
+
 /// Explicit locality declaration attached to user SQL.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserSqlDeclaration {
@@ -27,6 +34,7 @@ pub struct UserSqlDeclaration {
     sources: BTreeSet<Arc<str>>,
     event_time: Option<Arc<str>>,
     input_event_time: Option<Arc<str>>,
+    input_encoding: Option<EventTimeEncoding>,
     timestamp_grouped: bool,
 }
 
@@ -76,6 +84,12 @@ impl UserSqlDeclaration {
         Ok(self)
     }
 
+    #[must_use]
+    pub fn with_input_encoding(mut self, encoding: EventTimeEncoding) -> Self {
+        self.input_encoding = Some(encoding);
+        self
+    }
+
     fn try_new<I, S>(class: LocalityClass, sources: I, event_time: Option<Arc<str>>) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
@@ -92,6 +106,7 @@ impl UserSqlDeclaration {
             locality,
             sources: sources.into_iter().collect(),
             input_event_time: event_time.clone(),
+            input_encoding: None,
             event_time,
             timestamp_grouped: false,
         })
@@ -147,6 +162,7 @@ pub async fn plan_user_sql(
                 .as_deref()
                 .expect("local input event time"),
             declaration.timestamp_grouped,
+            declaration.input_encoding,
         )
         .await?;
     }
@@ -258,6 +274,7 @@ async fn validate_timestamp_local_sql(
     event_time: &str,
     input_event_time: &str,
     grouped: bool,
+    input_encoding: Option<EventTimeEncoding>,
 ) -> Result<()> {
     let validation = SessionContext::new();
     for source in sources {
@@ -279,7 +296,13 @@ async fn validate_timestamp_local_sql(
         .with_allow_dml(false)
         .with_allow_statements(false);
     let frame = validation.sql_with_options(sql, options).await?;
-    validate_local_plan(frame.logical_plan(), event_time, input_event_time, grouped)
+    validate_local_plan(
+        frame.logical_plan(),
+        event_time,
+        input_event_time,
+        grouped,
+        input_encoding,
+    )
 }
 
 fn validate_local_plan(
@@ -287,6 +310,7 @@ fn validate_local_plan(
     event_time: &str,
     input_event_time: &str,
     grouped: bool,
+    input_encoding: Option<EventTimeEncoding>,
 ) -> Result<()> {
     let mode = if grouped {
         "timestamp-grouped"
@@ -297,7 +321,7 @@ fn validate_local_plan(
     _ = plan.apply(|node| {
         let grouped_aggregate = if let (true, LogicalPlan::Aggregate(aggregate)) = (grouped, node) {
             if !matches!(aggregate.group_expr.as_slice(), [Expr::Column(_)])
-                || !preserves_time_expression(&aggregate.group_expr[0], &aggregate.input, input_event_time)?
+                || !preserves_time_expression(&aggregate.group_expr[0], &aggregate.input, input_event_time, input_encoding)?
             {
                 return Err(DataFusionError::Plan(format!(
                     "timestamp-grouped SQL must GROUP BY only the exact event-time column '{event_time}'"
@@ -341,7 +365,7 @@ fn validate_local_plan(
                 "{mode} SQL output must retain event-time column '{event_time}'"
             ))
         })?;
-    if !preserves_time_column(plan, index, input_event_time)? {
+    if !preserves_time_column(plan, index, input_event_time, input_encoding)? {
         return Err(DataFusionError::Plan(format!(
             "{mode} SQL must preserve input event-time column '{input_event_time}' as '{event_time}'"
         )));
@@ -367,19 +391,33 @@ fn validate_local_plan(
 
 // Trace through user projections/CTEs, stopping at the schema-only declared
 // source. Checking only the last projection would allow hidden time changes.
-fn preserves_time_column(plan: &LogicalPlan, index: usize, event_time: &str) -> Result<bool> {
+fn preserves_time_column(
+    plan: &LogicalPlan,
+    index: usize,
+    event_time: &str,
+    encoding: Option<EventTimeEncoding>,
+) -> Result<bool> {
     match plan {
         LogicalPlan::TableScan(_) => Ok(plan.schema().field(index).name() == event_time),
-        LogicalPlan::Projection(projection) => {
-            preserves_time_expression(&projection.expr[index], &projection.input, event_time)
-        }
+        LogicalPlan::Projection(projection) => preserves_time_expression(
+            &projection.expr[index],
+            &projection.input,
+            event_time,
+            encoding,
+        ),
         LogicalPlan::Aggregate(aggregate) => match aggregate.group_expr.get(index) {
-            Some(expression) => preserves_time_expression(expression, &aggregate.input, event_time),
+            Some(expression) => {
+                preserves_time_expression(expression, &aggregate.input, event_time, encoding)
+            }
             None => Ok(false),
         },
-        LogicalPlan::Filter(filter) => preserves_time_column(&filter.input, index, event_time),
-        LogicalPlan::Sort(sort) => preserves_time_column(&sort.input, index, event_time),
-        LogicalPlan::SubqueryAlias(alias) => preserves_time_column(&alias.input, index, event_time),
+        LogicalPlan::Filter(filter) => {
+            preserves_time_column(&filter.input, index, event_time, encoding)
+        }
+        LogicalPlan::Sort(sort) => preserves_time_column(&sort.input, index, event_time, encoding),
+        LogicalPlan::SubqueryAlias(alias) => {
+            preserves_time_column(&alias.input, index, event_time, encoding)
+        }
         _ => Ok(false),
     }
 }
@@ -388,29 +426,37 @@ fn preserves_time_expression(
     expression: &Expr,
     input: &LogicalPlan,
     event_time: &str,
+    encoding: Option<EventTimeEncoding>,
 ) -> Result<bool> {
     match expression {
-        Expr::Alias(alias) => preserves_time_expression(&alias.expr, input, event_time),
-        Expr::Column(column) => {
-            preserves_time_column(input, input.schema().index_of_column(column)?, event_time)
-        }
+        Expr::Alias(alias) => preserves_time_expression(&alias.expr, input, event_time, encoding),
+        Expr::Column(column) => preserves_time_column(
+            input,
+            input.schema().index_of_column(column)?,
+            event_time,
+            encoding,
+        ),
         Expr::Cast(cast) => {
             let input_type = cast.expr.get_type(input.schema())?;
             let preserving_cast = &input_type == cast.field.data_type()
                 || (matches!(
                     input_type,
                     DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
-                ) && matches!(
-                    cast.field.data_type(),
-                    DataType::Timestamp(TimeUnit::Nanosecond, _)
-                ));
-            Ok(preserving_cast && preserves_time_expression(&cast.expr, input, event_time)?)
+                ) && encoding != Some(EventTimeEncoding::Microseconds)
+                    && matches!(
+                        cast.field.data_type(),
+                        DataType::Timestamp(TimeUnit::Nanosecond, _)
+                    ));
+            Ok(preserving_cast
+                && preserves_time_expression(&cast.expr, input, event_time, encoding)?)
         }
         Expr::ScalarFunction(function)
             if function.func.name() == "to_timestamp_micros" && function.args.len() == 1 =>
         {
             let argument = &function.args[0];
-            if argument.get_type(input.schema())? != DataType::Int64 {
+            if encoding == Some(EventTimeEncoding::Rfc3339)
+                || argument.get_type(input.schema())? != DataType::Int64
+            {
                 return Ok(false);
             }
             // Journal timestamps are strings containing integer microseconds.
@@ -426,7 +472,7 @@ fn preserves_time_expression(
                 }
                 _ => argument,
             };
-            preserves_time_expression(argument, input, event_time)
+            preserves_time_expression(argument, input, event_time, encoding)
         }
         _ => Ok(false),
     }
@@ -632,7 +678,7 @@ mod tests {
             panic!("expected a sort plan");
         };
         sort.fetch = Some(1);
-        let error = validate_local_plan(&LogicalPlan::Sort(sort), "value", "value", false)
+        let error = validate_local_plan(&LogicalPlan::Sort(sort), "value", "value", false, None)
             .expect_err("a top-k sort must not be timestamp-local");
         assert!(error.to_string().contains("Sort"), "{error}");
     }

@@ -31,11 +31,16 @@ use datafusion::prelude::{SessionContext, col, lit};
 use datafusion::scalar::ScalarValue;
 use log::{debug, info, warn};
 use query_foundation::frontier::{RepairPolicy, SettledState};
+use query_foundation::locality::ChangeExtent;
 use query_foundation::materialize::{
     MaterializationProgress, MaterializationPublication, materialize_stream_with_progress,
+    plan_materialization_change, verify_append_prefix,
 };
+use query_foundation::statistics::TimeInterval;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tinyfs::Result as TinyFSResult;
 use tinyfs::ResultExt;
@@ -450,6 +455,196 @@ async fn read_watermark(
     })
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceCheckpoint {
+    format: u32,
+    recipe: String,
+    target: String,
+    lineage: Option<tinyfs::QueryLineage>,
+}
+
+enum SourceChange {
+    Unchanged,
+    Append,
+    Verify { lower_us: Option<i64> },
+}
+
+fn source_change(
+    prior: Option<&SourceCheckpoint>,
+    recipe: &str,
+    target: &str,
+    lineage: Option<&tinyfs::QueryLineage>,
+    watermark_us: Option<i64>,
+    matching_axis: bool,
+) -> TinyFSResult<SourceChange> {
+    let Some(prior) = prior.filter(|prior| prior.recipe == recipe && prior.target == target) else {
+        return Ok(SourceChange::Verify { lower_us: None });
+    };
+    let (Some(before), Some(now)) = (prior.lineage.as_ref(), lineage) else {
+        return Ok(SourceChange::Verify { lower_us: None });
+    };
+    if before == now {
+        return Ok(SourceChange::Unchanged);
+    }
+    if watermark_us.is_none()
+        || !matching_axis
+        || !now.timestamp_local
+        || before.recipe_identity != now.recipe_identity
+    {
+        return Ok(SourceChange::Verify { lower_us: None });
+    }
+    let previous: BTreeMap<_, _> = before
+        .leaves
+        .iter()
+        .map(|leaf| (&leaf.identity, leaf))
+        .collect();
+    let current: BTreeMap<_, _> = now
+        .leaves
+        .iter()
+        .map(|leaf| (&leaf.identity, leaf))
+        .collect();
+    if previous
+        .iter()
+        .any(|(identity, leaf)| current.get(identity) != Some(leaf))
+    {
+        // Removal, replacement, repacking, or changed recipe membership needs
+        // an exact check, not an assumption that all changes were appends.
+        return Ok(SourceChange::Verify { lower_us: None });
+    }
+    let mut extent: Option<(i64, i64)> = None;
+    for (identity, leaf) in current
+        .iter()
+        .filter(|(identity, _)| !previous.contains_key(*identity))
+    {
+        if identity.starts_with("recipe:") {
+            return Ok(SourceChange::Verify { lower_us: None });
+        }
+        let (Some(lo), Some(hi)) = (leaf.min_event_time, leaf.max_event_time) else {
+            return Ok(SourceChange::Verify { lower_us: None });
+        };
+        if lo > hi {
+            return Err(tinyfs::Error::Other(format!(
+                "materialize-series: invalid source range [{lo}, {hi}] for {identity}"
+            )));
+        }
+        extent = Some(match extent {
+            None => (lo, hi),
+            Some((min, max)) => (min.min(lo), max.max(hi)),
+        });
+    }
+    let Some((lo, hi)) = extent else {
+        return Ok(SourceChange::Verify { lower_us: None });
+    };
+    let prior = SettledState::try_new(watermark_us, watermark_us, RepairPolicy::reject())
+        .map_other_context("materialize-series: prior frontier")?;
+    let changed = ChangeExtent::Bounded(
+        TimeInterval::try_new(lo, hi).map_other_context("materialize-series: changed range")?,
+    );
+    match plan_materialization_change(prior, changed) {
+        Ok(_) => Ok(SourceChange::Append),
+        // Bounds are conservative microseconds. A same-bin nanosecond append
+        // or a filtered-out source row can still leave the exact prefix intact.
+        Err(_) => Ok(SourceChange::Verify {
+            lower_us: Some(lo.saturating_sub(1)),
+        }),
+    }
+}
+
+async fn target_identity(
+    context: &FactoryContext,
+    config: &MaterializeSeriesConfig,
+    versions: &[tinyfs::FileVersionInfo],
+) -> TinyFSResult<String> {
+    if versions.is_empty() {
+        return Ok("empty".to_owned());
+    }
+    let root = context.root().await?;
+    let id = root.get_node_path(&config.target).await?.id();
+    let mut members = versions
+        .iter()
+        .map(|version| {
+            (
+                version.version,
+                version.timestamp,
+                version.size,
+                version.blake3.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    members.sort();
+    let bytes = serde_json::to_vec(&(id.to_string(), members))
+        .map_other_context("materialize-series: target identity")?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+async fn checkpoint_path(
+    context: &FactoryContext,
+    config: &MaterializeSeriesConfig,
+) -> TinyFSResult<Option<PathBuf>> {
+    let Some(cache) = context.context.cache_dir() else {
+        return Ok(None);
+    };
+    let key = format!(
+        "{}:{}",
+        context.root().await?.node_path().id(),
+        config.target
+    );
+    Ok(Some(cache.join(format!(
+        "materialize_{}.json",
+        blake3::hash(key.as_bytes()).to_hex()
+    ))))
+}
+
+async fn read_checkpoint(path: Option<&std::path::Path>) -> TinyFSResult<Option<SourceCheckpoint>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(tinyfs::Error::Other(format!(
+                "materialize-series: read checkpoint {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let checkpoint: SourceCheckpoint = serde_json::from_slice(&bytes).map_other_context(
+        format!("materialize-series: invalid checkpoint {}", path.display()),
+    )?;
+    if checkpoint.format != 1 {
+        return Err(tinyfs::Error::Other(format!(
+            "materialize-series: unsupported checkpoint format {} at {}",
+            checkpoint.format,
+            path.display()
+        )));
+    }
+    Ok(Some(checkpoint))
+}
+
+fn prefix_frame(
+    frame: datafusion::dataframe::DataFrame,
+    time_column: &str,
+    watermark: &ScalarValue,
+    lower_us: Option<i64>,
+) -> TinyFSResult<datafusion::dataframe::DataFrame> {
+    let time = col(Column::from_name(time_column));
+    let mut predicate = time.clone().lt_eq(lit(watermark.clone()));
+    if let Some(lower) = lower_us {
+        let lower = match watermark {
+            ScalarValue::Int64(_) => ScalarValue::Int64(Some(lower)),
+            _ => ScalarValue::TimestampMicrosecond(Some(lower), None)
+                .cast_to(&watermark.data_type())
+                .map_other_context("materialize-series: verification lower bound")?,
+        };
+        predicate = predicate.and(time.gt_eq(lit(lower)));
+    }
+    frame
+        .filter(predicate)
+        .map_other_context("materialize-series: verify prefix")
+}
+
 /// Append the source rows beyond the target's watermark as one new version.
 pub async fn execute(
     config: Value,
@@ -467,7 +662,63 @@ pub async fn execute(
 
     let session = &context.context.datafusion_session;
     let versions = target_versions(&context, &config).await?;
-    let bounds = source_read_bounds(&context, &config, &versions).await?;
+    let recipe_bytes = serde_json::to_vec(&config)
+        .map_other_context("materialize-series: serialize recipe identity")?;
+    let recipe_id = blake3::hash(&recipe_bytes).to_hex().to_string();
+    let provider = crate::Provider::with_context(
+        Arc::new(context.context.filesystem()),
+        Arc::new(context.context.clone()),
+    )
+    .with_root(context.root().await?);
+    let mut lineage = provider
+        .query_lineage_for_url(&config.source.to_string())
+        .await
+        .map_other_context("materialize-series: source lineage")?;
+    if let Some(lineage) = &mut lineage {
+        lineage.leaves.sort_by(|left, right| {
+            (&left.identity, left.min_event_time, left.max_event_time).cmp(&(
+                &right.identity,
+                right.min_event_time,
+                right.max_event_time,
+            ))
+        });
+    }
+    let checkpoint_path = checkpoint_path(&context, &config).await?;
+    let prior = read_checkpoint(checkpoint_path.as_deref()).await?;
+    let target = target_identity(&context, &config, &versions).await?;
+    let hint =
+        match target_watermark_from_metadata(&versions, &config.time_column, &DataType::Int64)? {
+            TargetWatermark::Exact(ScalarValue::Int64(value)) => value,
+            _ => None,
+        };
+    let matching_axis = provider
+        .event_time_column_for_url(&config.source.to_string())
+        .await
+        .map_other_context("materialize-series: lineage axis")?
+        .as_deref()
+        == Some(config.time_column.as_str());
+    let change = source_change(
+        prior.as_ref(),
+        &recipe_id,
+        &target,
+        lineage.as_ref(),
+        hint,
+        matching_axis,
+    )?;
+    if matches!(change, SourceChange::Unchanged) {
+        debug!(
+            "materialize-series: {} and its exact source snapshot are unchanged",
+            config.target
+        );
+        return Ok(());
+    }
+    let mut bounds = source_read_bounds(&context, &config, &versions).await?;
+    if let SourceChange::Verify { lower_us } = change {
+        bounds.event_time_lo = match (bounds.event_time_lo, lower_us) {
+            (Some(current), Some(lower)) => Some(current.min(lower)),
+            _ => None,
+        };
+    }
     let source = table_for_bounded(&context, &config.source.to_string(), session, bounds).await?;
     let mut frame = session
         .read_table(source)
@@ -484,6 +735,35 @@ pub async fn execute(
         .data_type()
         .clone();
     let watermark = read_watermark(&context, &config, &versions, &source_time_type).await?;
+    if let (Some(watermark), SourceChange::Verify { lower_us }) = (&watermark, &change) {
+        if lower_us.is_none() {
+            context.context.record_non_incremental_plan();
+        }
+        warn!(
+            "materialize-series: verifying {} against source history before append; lower_us={lower_us:?}; \
+             missing/unproven checkpoints never authorize skipping historical changes",
+            config.target
+        );
+        let target = table_for_bounded(
+            &context,
+            &format!("series://{}", config.target),
+            session,
+            lower_us.map_or(
+                tinyfs::SeriesReadBounds::NONE,
+                tinyfs::SeriesReadBounds::from_event_time_lo,
+            ),
+        )
+        .await?;
+        let target = session
+            .read_table(target)
+            .map_other_context("materialize-series: verification target")?;
+        verify_append_prefix(
+            prefix_frame(frame.clone(), &config.time_column, watermark, *lower_us)?,
+            prefix_frame(target, &config.time_column, watermark, *lower_us)?,
+        )
+        .await
+        .map_other_context(format!("materialize-series: target {}", config.target))?;
+    }
     if watermark.is_none() {
         context.context.record_non_incremental_plan();
         info!(
@@ -504,9 +784,6 @@ pub async fn execute(
         .sort_by(vec![col(Column::from_name(&config.time_column))])
         .map_err(|e| tinyfs::Error::Other(format!("materialize-series: sort: {e}")))?;
     let root = context.root().await?;
-    let recipe_bytes = serde_json::to_vec(&config)
-        .map_other_context("materialize-series: serialize recipe identity")?;
-    let recipe_id = blake3::hash(&recipe_bytes).to_hex().to_string();
     let after = watermark.as_ref().map(scalar_event_time_us).transpose()?;
     // The frame already enforces the exact predicate. A second microsecond-only
     // publication boundary would reject valid nanosecond rows in the same bin.
@@ -518,12 +795,16 @@ pub async fn execute(
     } else {
         after
     };
-    let source_generation = context
-        .context
-        .persistence
-        .coherence_state()
-        .map(|state| state.generation());
-    let source_url = config.source.to_string();
+    let source_state_id = match &lineage {
+        Some(lineage) => blake3::hash(
+            &serde_json::to_vec(lineage)
+                .map_other_context("materialize-series: source snapshot identity")?,
+        )
+        .to_hex()
+        .to_string(),
+        None => format!("untracked:{}", config.source),
+    };
+    let publication_recipe = recipe_id.clone();
     let stream = frame
         .execute_stream()
         .await
@@ -541,11 +822,8 @@ pub async fn execute(
             let source_max_us = output
                 .map(|output| output.event_time_bounds().max())
                 .or(after);
-            let source_state_id = format!(
-                "source={source_url};generation={source_generation:?};observed={source_max_us:?}"
-            );
             MaterializationProgress::try_new(
-                recipe_id,
+                publication_recipe,
                 source_state_id,
                 SettledState::try_new(source_max_us, source_max_us, RepairPolicy::reject())?,
             )
@@ -558,6 +836,20 @@ pub async fn execute(
     .await
     .map_err(|error| tinyfs::Error::Other(format!("materialize-series: publish: {error}")))?;
 
+    // This cache is not authoritative progress. It names exact target content,
+    // so a rollback, concurrent publication, or cache loss forces verification.
+    if let Some(path) = checkpoint_path {
+        let target_versions = target_versions(&context, &config).await?;
+        let checkpoint = SourceCheckpoint {
+            format: 1,
+            recipe: recipe_id,
+            target: target_identity(&context, &config, &target_versions).await?,
+            lineage,
+        };
+        crate::version_cache::write_cache_json(&path, &checkpoint)
+            .await
+            .map_other_context("materialize-series: publish source checkpoint")?;
+    }
     match outcome.output {
         Some(output) => info!(
             "materialize-series: appended {} row(s) in {} batch(es) to {} covering [{}, {}], peak batch {} row(s)",
@@ -746,8 +1038,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn materialization_verifies_legacy_targets_and_rejects_same_time_appends() {
+        for target_time_column in [Some("timestamp"), None] {
+            let (fs, context) = crate::factory::test_support::create_test_environment().await;
+            let cache = tempfile::tempdir().unwrap();
+            let context = context.with_cache_dir(cache.path().to_path_buf());
+            let root = fs.root().await.unwrap();
+            let batch = |values| {
+                RecordBatch::try_from_iter([(
+                    "timestamp",
+                    Arc::new(TimestampMicrosecondArray::from(values)) as arrow::array::ArrayRef,
+                )])
+                .unwrap()
+            };
+            _ = root
+                .write_series_from_batch("/source", &batch(vec![1, 2]), Some("timestamp"))
+                .await
+                .unwrap();
+            _ = root
+                .write_series_from_batch("/target", &batch(vec![1, 2]), target_time_column)
+                .await
+                .unwrap();
+            let config = MaterializeSeriesConfig {
+                source: crate::Url::parse("series:///source").unwrap(),
+                target: "/target".to_owned(),
+                time_column: "timestamp".to_owned(),
+            };
+            let factory = crate::factory::test_support::test_context(&context, FileID::root());
+            let run = || {
+                execute(
+                    serde_json::to_value(&config).unwrap(),
+                    factory.clone(),
+                    ExecutionContext::pond_readwriter(Vec::new()),
+                )
+            };
+            run().await.unwrap();
+            let path = checkpoint_path(&factory, &config).await.unwrap().unwrap();
+            std::fs::remove_file(&path).unwrap();
+            run()
+                .await
+                .expect("a consistent existing target can establish its checkpoint");
+            let checkpoint = std::fs::read(&path).unwrap();
+            _ = root
+                .write_series_from_batch("/source", &batch(vec![2]), Some("timestamp"))
+                .await
+                .unwrap();
+            let error = run()
+                .await
+                .expect_err("an extra event at the watermark must not disappear");
+            assert!(
+                error.to_string().contains("rejects retroactive changes"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), checkpoint);
+            assert_eq!(root.list_file_versions("/target").await.unwrap().len(), 1);
+            std::fs::remove_file(&path).unwrap();
+            assert!(
+                run().await.is_err(),
+                "an inconsistent legacy target must not be adopted"
+            );
+            assert!(!path.exists());
+        }
+    }
+
+    #[tokio::test]
     async fn materialize_series_streams_and_skips_empty_versions() {
         let (fs, provider_context) = crate::factory::test_support::create_test_environment().await;
+        let cache = tempfile::tempdir().unwrap();
+        let provider_context = provider_context.with_cache_dir(cache.path().to_path_buf());
         let root = fs.root().await.unwrap();
         let schema = Arc::new(Schema::new(vec![
             Field::new(
@@ -890,8 +1248,8 @@ mod tests {
         let second = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(TimestampNanosecondArray::from(vec![1_500, 1_999, 2_001])),
-                Arc::new(Float64Array::from(vec![20.0, 30.0, 40.0])),
+                Arc::new(TimestampNanosecondArray::from(vec![1_999, 2_001])),
+                Arc::new(Float64Array::from(vec![30.0, 40.0])),
             ],
         )
         .unwrap();

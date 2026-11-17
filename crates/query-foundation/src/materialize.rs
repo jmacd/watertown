@@ -284,6 +284,64 @@ pub fn plan_materialization_change(
     Ok(MaterializationPlan { input, publication })
 }
 
+/// Prove that a source prefix still matches an append-only target, including
+/// duplicate multiplicities and NULL-padded schema evolution.
+pub async fn verify_append_prefix(source: DataFrame, target: DataFrame) -> Result<()> {
+    use crate::plans::transform::{ProjectionColumn, project};
+    use arrow::datatypes::Schema;
+    use datafusion::functions_aggregate::expr_fn::sum;
+
+    let schema = Schema::try_merge([
+        source.schema().as_arrow().clone(),
+        target.schema().as_arrow().clone(),
+    ])?;
+    let mut balance = "__watertown_materialization_balance".to_owned();
+    while schema.field_with_name(&balance).is_ok() {
+        balance.push('_');
+    }
+    let align = |frame: DataFrame, sign: i64| -> Result<DataFrame> {
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if frame
+                    .schema()
+                    .field_with_unqualified_name(field.name())
+                    .is_ok()
+                {
+                    ProjectionColumn::identity(field.name())
+                } else {
+                    ProjectionColumn::null(field.name(), field.data_type().clone())
+                }
+            })
+            .collect();
+        project(frame, columns)?.with_column(&balance, lit(sign))
+    };
+    let difference = align(source, 1)?
+        .union(align(target, -1)?)?
+        .aggregate(
+            schema
+                .fields()
+                .iter()
+                .map(|field| col(Column::from_name(field.name())))
+                .collect(),
+            vec![sum(col(Column::from_name(&balance))).alias(&balance)],
+        )?
+        .filter(col(Column::from_name(&balance)).not_eq(lit(0i64)))?
+        .limit(0, Some(1))?
+        .collect()
+        .await?;
+    if difference.iter().any(|batch| batch.num_rows() != 0) {
+        return Err(DataFusionError::Execution(
+            "source changes at or before the watermark differ from the materialized prefix; \
+             append-only materialization rejects retroactive changes. Reconcile or rebuild the \
+             target explicitly; no target rows or progress were published"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// One hidden staged writer.
 ///
 /// `commit` must atomically publish its optional output and any durable

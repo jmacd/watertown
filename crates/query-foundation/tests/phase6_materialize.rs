@@ -24,6 +24,64 @@ use query_foundation::materialize::{
 use query_foundation::statistics::TimeInterval;
 use query_foundation::testkit::FoundationFixture;
 
+#[tokio::test]
+async fn append_prefix_verification_preserves_multiplicity_and_schema_evolution() -> Result<()> {
+    use query_foundation::materialize::verify_append_prefix;
+    let context = datafusion::prelude::SessionContext::new();
+    let target = RecordBatch::try_from_iter([
+        (
+            "timestamp",
+            Arc::new(Int64Array::from(vec![1])) as arrow::array::ArrayRef,
+        ),
+        (
+            "value",
+            Arc::new(Int64Array::from(vec![10])) as arrow::array::ArrayRef,
+        ),
+    ])?;
+    let source = RecordBatch::try_from_iter([
+        (
+            "timestamp",
+            Arc::new(Int64Array::from(vec![1])) as arrow::array::ArrayRef,
+        ),
+        (
+            "value",
+            Arc::new(Int64Array::from(vec![10])) as arrow::array::ArrayRef,
+        ),
+        (
+            "added",
+            Arc::new(Int64Array::from(vec![None])) as arrow::array::ArrayRef,
+        ),
+    ])?;
+    verify_append_prefix(
+        context.read_batch(source.clone())?,
+        context.read_batch(target.clone())?,
+    )
+    .await?;
+    let doubled = context
+        .read_batch(source.clone())?
+        .union(context.read_batch(source)?)?;
+    let error = verify_append_prefix(doubled, context.read_batch(target.clone())?)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("rejects retroactive changes"),
+        "{error}"
+    );
+    let error = verify_append_prefix(
+        context
+            .read_batch(target.clone())?
+            .filter(datafusion::prelude::lit(false))?,
+        context.read_batch(target)?,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("rejects retroactive changes"),
+        "{error}"
+    );
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 enum FailurePoint {
     #[default]
