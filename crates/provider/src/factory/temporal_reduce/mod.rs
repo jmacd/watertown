@@ -8492,6 +8492,202 @@ output_aliases:
         }
     }
 
+    /// Seal gates fire per level, so sparse data under the one-day backlog gate
+    /// lets either level's sealed frontier pass the other's. A late correction
+    /// between the two frontiers is still hot in one level and sealed in the
+    /// other. Both levels must still equal a from-scratch rebuild, whichever
+    /// output file is built first after the correction.
+    #[tokio::test]
+    async fn crossed_seal_frontiers_repair_late_correction() {
+        let _ = env_logger::try_init();
+        for hourly_first in [false, true] {
+            crossed_seal_frontiers_case(hourly_first).await;
+        }
+    }
+
+    async fn crossed_seal_frontiers_case(hourly_first: bool) {
+        const H: i64 = 3600;
+        let persistence = tinyfs::MemoryPersistence::default();
+        let fs = tinyfs::FS::new(persistence.clone()).await.unwrap();
+        {
+            let root = fs.root().await.unwrap();
+            _ = root.create_dir_path("/ingest").await.unwrap();
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+
+        // The real default seal target, so only the one-day backlog gate seals.
+        let config = || TemporalReduceConfig {
+            resolutions: vec!["1h".to_string(), "1d".to_string()],
+            seal_target_bytes: None,
+            ..lateness_config(Some("1d"))
+        };
+
+        async fn append(fs: &tinyfs::FS, rows: &[(i64, f64)]) {
+            use tokio::io::AsyncWriteExt;
+            let mut csv = String::from("timestamp,temperature\n");
+            for (secs, v) in rows {
+                let ts = chrono::DateTime::from_timestamp(*secs, 0).unwrap();
+                csv.push_str(&format!("{},{v:.2}\n", ts.format("%Y-%m-%dT%H:%M:%S")));
+            }
+            let root = fs.root().await.unwrap();
+            let mut w = root
+                .async_writer_path_with_type("/ingest/weather.csv", EntryType::FilePhysicalSeries)
+                .await
+                .unwrap();
+            w.write_all(csv.as_bytes()).await.unwrap();
+            w.shutdown().await.unwrap();
+            let lo = rows.iter().map(|r| r.0).min().unwrap() * 1_000_000;
+            let hi = rows.iter().map(|r| r.0).max().unwrap() * 1_000_000;
+            root.set_extended_attributes(
+                "/ingest/weather.csv",
+                HashMap::from([
+                    ("min_event_time".to_owned(), lo.to_string()),
+                    ("max_event_time".to_owned(), hi.to_string()),
+                ]),
+            )
+            .await
+            .unwrap();
+        }
+
+        async fn bucket_sums(
+            provider_context: &crate::ProviderContext,
+            config: TemporalReduceConfig,
+            res: &str,
+        ) -> Vec<(i64, f64)> {
+            let context = test_context(provider_context, FileID::root());
+            let temporal_dir = TemporalReduceDirectory::new(config, context).unwrap();
+            let weather = temporal_dir
+                .create_handle()
+                .get("weather")
+                .await
+                .unwrap()
+                .unwrap();
+            let NodeType::Directory(weather_dir) = &weather.node_type else {
+                panic!("expected directory");
+            };
+            let node = weather_dir
+                .get(&format!("res={res}.series"))
+                .await
+                .unwrap()
+                .unwrap();
+            let NodeType::File(file_handle) = &node.node_type else {
+                panic!("expected file node");
+            };
+            let file_arc = file_handle.get_file().await;
+            let file_guard = file_arc.lock().await;
+            let table_provider = file_guard
+                .as_queryable()
+                .expect("queryable")
+                .as_table_provider(node.id, provider_context)
+                .await
+                .expect("table provider");
+            drop(file_guard);
+            let ctx = &provider_context.datafusion_session;
+            let table = format!("crossed_{res}");
+            _ = ctx.register_table(&table, table_provider).unwrap();
+            let batches = ctx
+                .sql(&format!(
+                    "SELECT to_unixtime(timestamp) AS secs, \"temperature.sum\" AS s \
+                     FROM {table} ORDER BY timestamp"
+                ))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            _ = ctx.deregister_table(&table).unwrap();
+            let mut out = Vec::new();
+            for b in &batches {
+                let secs = arrow::compute::cast(b.column(0), &DataType::Int64).unwrap();
+                let secs = secs
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .unwrap();
+                let sums = b.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+                for i in 0..b.num_rows() {
+                    out.push((secs.value(i), sums.value(i)));
+                }
+            }
+            out
+        }
+
+        let sealed_hi = |interval_secs: i64| -> Option<i64> {
+            let dir = format!("res{interval_secs}");
+            let manifests = walk_find(&cache_dir, &|n| n == "manifest.json");
+            let path = manifests
+                .iter()
+                .find(|p| p.parent().unwrap().ends_with(&dir))
+                .unwrap_or_else(|| panic!("no manifest for {dir}: {manifests:?}"));
+            let m: crate::partial_aggregate_cache::SegmentManifest =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            m.sealed_hi_secs
+        };
+        let frontiers = || (sealed_hi(H), sealed_hi(24 * H));
+
+        let hours = |r: std::ops::RangeInclusive<i64>| -> Vec<(i64, f64)> {
+            r.map(|h| (h * H, h as f64 + 0.25)).collect()
+        };
+        let mut all: Vec<(i64, f64)> = Vec::new();
+
+        // Data starts mid-day, so the hourly backlog is measured from 12:00 and
+        // the daily backlog from midnight: the two gates fire on different builds.
+        // Each step: (rows, expected (hourly, daily) sealed_hi after the build).
+        let steps = [
+            // Daily seals day 1; hourly backlog is only 18h.
+            (hours(12..=54), (None, Some(24 * H))),
+            // Hourly passes daily: [12h, 36h) is now a full day of backlog.
+            (hours(55..=60), (Some(36 * H), Some(24 * H))),
+            // Daily passes hourly again: it seals day 2; hourly has only 12h.
+            (hours(61..=72), (Some(36 * H), Some(48 * H))),
+        ];
+        for (rows, want) in steps {
+            append(&fs, &rows).await;
+            all.extend(rows);
+            _ = bucket_sums(&reduce_ctx(&persistence, &cache_dir), config(), "1d").await;
+            assert_eq!(frontiers(), want, "(hourly, daily) sealed_hi");
+        }
+
+        // Late, between the frontiers: hot in the hourly level, sealed in daily.
+        let late = (42 * H + 30 * 60, 999.0);
+        append(&fs, &[late]).await;
+        all.push(late);
+
+        let ctx = reduce_ctx(&persistence, &cache_dir);
+        let (hourly, daily) = if hourly_first {
+            let hourly = bucket_sums(&ctx, config(), "1h").await;
+            (hourly, bucket_sums(&ctx, config(), "1d").await)
+        } else {
+            let daily = bucket_sums(&ctx, config(), "1d").await;
+            (bucket_sums(&ctx, config(), "1h").await, daily)
+        };
+
+        let rebuild_dir = tempfile::tempdir().unwrap();
+        let rebuild_ctx = reduce_ctx(&persistence, rebuild_dir.path());
+        let rebuilt_daily = bucket_sums(&rebuild_ctx, config(), "1d").await;
+        let rebuilt_hourly = bucket_sums(&rebuild_ctx, config(), "1h").await;
+
+        let expected = |interval: i64| -> Vec<(i64, f64)> {
+            let mut m = std::collections::BTreeMap::<i64, f64>::new();
+            for (secs, v) in &all {
+                *m.entry(secs.div_euclid(interval) * interval).or_default() += v;
+            }
+            m.into_iter().collect()
+        };
+        let label = if hourly_first { "1h first" } else { "1d first" };
+        assert_eq!(daily, expected(24 * H), "{label}: daily sums");
+        assert_eq!(hourly, expected(H), "{label}: hourly sums");
+        assert_eq!(daily, rebuilt_daily, "{label}: daily vs rebuild");
+        assert_eq!(hourly, rebuilt_hourly, "{label}: hourly vs rebuild");
+        assert!(
+            daily.contains(&(
+                24 * H,
+                (24..48).map(|h| h as f64 + 0.25).sum::<f64>() + 999.0
+            )),
+            "{label}: sealed daily segment was not repaired: {daily:?}"
+        );
+    }
+
     /// Changing `allowed_lateness` invalidates the sealed layout: the manifest
     /// records the value it was built under, and a build with a different value
     /// wipes the res dir and rebuilds from the retained partials. The rebuilt
