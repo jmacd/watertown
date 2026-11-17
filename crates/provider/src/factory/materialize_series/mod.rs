@@ -763,7 +763,14 @@ pub async fn execute(
             prefix_frame(target, &config.time_column, watermark, *lower_us)?,
         )
         .await
-        .map_other_context(format!("materialize-series: target {}", config.target))?;
+        .map_other_context(format!(
+            "materialize-series: target {target} was not advanced. Recover by retargeting: set \
+             `target` to a new path in this factory's config, re-apply it with `pond mknod \
+             materialize-series <factory-node> --config-path <config> --overwrite`, and repoint \
+             consumers of {target}; the next run rebuilds the new target from source (see the \
+             materialize-series documentation, \"Recovering from a rejection\")",
+            target = config.target
+        ))?;
     }
     if watermark.is_none() {
         context.context.record_non_incremental_plan();
@@ -1086,11 +1093,16 @@ mod tests {
                 .unwrap();
             let error = run()
                 .await
-                .expect_err("an extra event at the watermark must not disappear");
-            assert!(
-                error.to_string().contains("rejects retroactive changes"),
-                "{error}"
-            );
+                .expect_err("an extra event at the watermark must not disappear")
+                .to_string();
+            for expected in [
+                "rejects retroactive changes",
+                "target /target was not advanced",
+                "Recover by retargeting",
+                "--overwrite",
+            ] {
+                assert!(error.contains(expected), "missing {expected:?} in: {error}");
+            }
             assert_eq!(std::fs::read(&path).unwrap(), checkpoint);
             assert_eq!(root.list_file_versions("/target").await.unwrap().len(), 1);
             std::fs::remove_file(&path).unwrap();

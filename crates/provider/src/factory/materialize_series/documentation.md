@@ -40,5 +40,28 @@ verification. These non-incremental checks are logged and counted rather than
 silently treated as bounded work. An already-inconsistent target fails the
 check; deleting the checkpoint does not bypass verification.
 
+### Recovering from a rejection
+
+A rejection repeats on every run until an operator acts. Its usual causes are a
+source that was re-ingested or corrected after its rows were materialized, or a
+row added exactly at the target watermark. Pond has no command that removes a
+materialized target, and this component never rebuilds one implicitly, so
+recovery is an explicit retarget:
+
+1. Decide which history is correct. If the source change was a mistake, restore
+   the source instead; the next run then passes verification.
+2. Change `target` in the factory config to a new, unused series path, for
+   example `/metrics/perf.r2.series`.
+3. Re-apply the config, either with
+   `pond mknod materialize-series <factory-node> --config-path <config> --overwrite`
+   or through the `pond apply` document that declares the node.
+4. Repoint every consumer of the old target, such as a `temporal-reduce`
+   `in_pattern`, to the new path.
+5. Run the factory. With no target watermark, the first run materializes the
+   whole source and establishes a new checkpoint. Expect a one-time full source
+   read; downstream rollup caches rebuild because their input changed.
+
+The old target is left as inert history; nothing writes to it again.
+
 <!-- docs:reference factory:materialize-series -->
 <!-- docs:end-reference -->
