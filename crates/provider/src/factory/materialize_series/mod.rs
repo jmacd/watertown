@@ -467,7 +467,54 @@ struct SourceCheckpoint {
 enum SourceChange {
     Unchanged,
     Append,
-    Verify { lower_us: Option<i64> },
+    /// `removed` describes prior source leaves that are gone or changed. They
+    /// are named if verification rejects, because lost source rows are a
+    /// retroactive change that cannot be appended.
+    Verify {
+        lower_us: Option<i64>,
+        removed: Vec<String>,
+    },
+}
+
+impl SourceChange {
+    fn full() -> Self {
+        Self::Verify {
+            lower_us: None,
+            removed: Vec::new(),
+        }
+    }
+}
+
+/// Exact microsecond extent of a leaf, or `None` when it cannot bound a
+/// verification (unknown bounds or a nested recipe identity).
+fn leaf_range(leaf: &tinyfs::QuerySourceLeaf) -> TinyFSResult<Option<(i64, i64)>> {
+    if leaf.identity.starts_with("recipe:") {
+        return Ok(None);
+    }
+    let (Some(lo), Some(hi)) = (leaf.min_event_time, leaf.max_event_time) else {
+        return Ok(None);
+    };
+    if lo > hi {
+        return Err(tinyfs::Error::Other(format!(
+            "materialize-series: invalid source range [{lo}, {hi}] for {}",
+            leaf.identity
+        )));
+    }
+    Ok(Some((lo, hi)))
+}
+
+fn widen(extent: &mut Option<(i64, i64)>, (lo, hi): (i64, i64)) {
+    *extent = Some(match *extent {
+        None => (lo, hi),
+        Some((min, max)) => (min.min(lo), max.max(hi)),
+    });
+}
+
+fn describe_leaf(leaf: &tinyfs::QuerySourceLeaf) -> String {
+    match (leaf.min_event_time, leaf.max_event_time) {
+        (Some(lo), Some(hi)) => format!("{} [{lo}, {hi}]", leaf.identity),
+        _ => format!("{} [unbounded]", leaf.identity),
+    }
 }
 
 fn source_change(
@@ -479,10 +526,10 @@ fn source_change(
     matching_axis: bool,
 ) -> TinyFSResult<SourceChange> {
     let Some(prior) = prior.filter(|prior| prior.recipe == recipe && prior.target == target) else {
-        return Ok(SourceChange::Verify { lower_us: None });
+        return Ok(SourceChange::full());
     };
     let (Some(before), Some(now)) = (prior.lineage.as_ref(), lineage) else {
-        return Ok(SourceChange::Verify { lower_us: None });
+        return Ok(SourceChange::full());
     };
     if before == now {
         return Ok(SourceChange::Unchanged);
@@ -492,7 +539,7 @@ fn source_change(
         || !now.timestamp_local
         || before.recipe_identity != now.recipe_identity
     {
-        return Ok(SourceChange::Verify { lower_us: None });
+        return Ok(SourceChange::full());
     }
     let previous: BTreeMap<_, _> = before
         .leaves
@@ -504,37 +551,53 @@ fn source_change(
         .iter()
         .map(|leaf| (&leaf.identity, leaf))
         .collect();
-    if previous
-        .iter()
-        .any(|(identity, leaf)| current.get(identity) != Some(leaf))
-    {
-        // Removal, replacement, repacking, or changed recipe membership needs
-        // an exact check, not an assumption that all changes were appends.
-        return Ok(SourceChange::Verify { lower_us: None });
+    // Removal, replacement, repacking, or a rename out of the source pattern is
+    // never assumed to be an append. Timestamp locality confines its effect to
+    // the leaf's own event-time range, so a bounded leaf only needs an exact
+    // check from that range onward; an unbounded one needs all history.
+    let mut removed = Vec::new();
+    let mut removed_extent = None;
+    let mut removed_unbounded = false;
+    for (identity, leaf) in &previous {
+        if current.get(identity) == Some(leaf) {
+            continue;
+        }
+        removed.push(describe_leaf(leaf));
+        match leaf_range(leaf)? {
+            Some(range) => widen(&mut removed_extent, range),
+            None => removed_unbounded = true,
+        }
     }
-    let mut extent: Option<(i64, i64)> = None;
-    for (identity, leaf) in current
-        .iter()
-        .filter(|(identity, _)| !previous.contains_key(*identity))
-    {
-        if identity.starts_with("recipe:") {
-            return Ok(SourceChange::Verify { lower_us: None });
+    let mut extent = None;
+    for (identity, leaf) in &current {
+        if previous.get(identity) == Some(leaf) {
+            continue;
         }
-        let (Some(lo), Some(hi)) = (leaf.min_event_time, leaf.max_event_time) else {
-            return Ok(SourceChange::Verify { lower_us: None });
-        };
-        if lo > hi {
-            return Err(tinyfs::Error::Other(format!(
-                "materialize-series: invalid source range [{lo}, {hi}] for {identity}"
-            )));
+        match leaf_range(leaf)? {
+            Some(range) => widen(&mut extent, range),
+            None => {
+                return Ok(SourceChange::Verify {
+                    lower_us: None,
+                    removed,
+                });
+            }
         }
-        extent = Some(match extent {
-            None => (lo, hi),
-            Some((min, max)) => (min.min(lo), max.max(hi)),
+    }
+    if removed_unbounded {
+        return Ok(SourceChange::Verify {
+            lower_us: None,
+            removed,
+        });
+    }
+    if let Some((removed_lo, _)) = removed_extent {
+        let lo = extent.map_or(removed_lo, |(added_lo, _)| added_lo.min(removed_lo));
+        return Ok(SourceChange::Verify {
+            lower_us: Some(lo.saturating_sub(1)),
+            removed,
         });
     }
     let Some((lo, hi)) = extent else {
-        return Ok(SourceChange::Verify { lower_us: None });
+        return Ok(SourceChange::full());
     };
     let prior = SettledState::try_new(watermark_us, watermark_us, RepairPolicy::reject())
         .map_other_context("materialize-series: prior frontier")?;
@@ -547,6 +610,7 @@ fn source_change(
         // or a filtered-out source row can still leave the exact prefix intact.
         Err(_) => Ok(SourceChange::Verify {
             lower_us: Some(lo.saturating_sub(1)),
+            removed: Vec::new(),
         }),
     }
 }
@@ -713,7 +777,7 @@ pub async fn execute(
         return Ok(());
     }
     let mut bounds = source_read_bounds(&context, &config, &versions).await?;
-    if let SourceChange::Verify { lower_us } = change {
+    if let SourceChange::Verify { lower_us, .. } = change {
         bounds.event_time_lo = match (bounds.event_time_lo, lower_us) {
             (Some(current), Some(lower)) => Some(current.min(lower)),
             _ => None,
@@ -735,14 +799,32 @@ pub async fn execute(
         .data_type()
         .clone();
     let watermark = read_watermark(&context, &config, &versions, &source_time_type).await?;
-    if let (Some(watermark), SourceChange::Verify { lower_us }) = (&watermark, &change) {
+    if let (Some(watermark), SourceChange::Verify { lower_us, removed }) = (&watermark, &change) {
         context.context.record_materialization_verification();
         if lower_us.is_none() {
             context.context.record_non_incremental_plan();
         }
+        let removed_note = if removed.is_empty() {
+            String::new()
+        } else {
+            const SHOWN: usize = 5;
+            let more = removed.len().saturating_sub(SHOWN);
+            format!(
+                "; {} source version(s) were removed or replaced since the last checkpoint \
+                 (for example by log rotation renaming an ingested file out of the source \
+                 pattern, or repacking): {}{}",
+                removed.len(),
+                removed[..removed.len().min(SHOWN)].join(", "),
+                if more > 0 {
+                    format!(", and {more} more")
+                } else {
+                    String::new()
+                }
+            )
+        };
         warn!(
             "materialize-series: verifying {} against source history before append; lower_us={lower_us:?}; \
-             missing/unproven checkpoints never authorize skipping historical changes",
+             missing/unproven checkpoints never authorize skipping historical changes{removed_note}",
             config.target
         );
         let target = table_for_bounded(
@@ -764,7 +846,8 @@ pub async fn execute(
         )
         .await
         .map_other_context(format!(
-            "materialize-series: target {target} was not advanced. Recover by retargeting: set \
+            "materialize-series: target {target} was not advanced{removed_note}. Recover by \
+             restoring the source, or by retargeting: set \
              `target` to a new path in this factory's config, re-apply it with `pond mknod \
              materialize-series <factory-node> --config-path <config> --overwrite`, and repoint \
              consumers of {target}; the next run rebuilds the new target from source (see the \
@@ -1098,7 +1181,7 @@ mod tests {
             for expected in [
                 "rejects retroactive changes",
                 "target /target was not advanced",
-                "Recover by retargeting",
+                "or by retargeting",
                 "--overwrite",
             ] {
                 assert!(error.contains(expected), "missing {expected:?} in: {error}");
@@ -1112,6 +1195,157 @@ mod tests {
             );
             assert!(!path.exists());
         }
+    }
+
+    fn leaf(identity: &str, bounds: Option<(i64, i64)>) -> tinyfs::QuerySourceLeaf {
+        tinyfs::QuerySourceLeaf {
+            identity: identity.to_owned(),
+            min_event_time: bounds.map(|(lo, _)| lo),
+            max_event_time: bounds.map(|(_, hi)| hi),
+        }
+    }
+
+    fn lineage(leaves: Vec<tinyfs::QuerySourceLeaf>) -> tinyfs::QueryLineage {
+        let mut lineage = tinyfs::QueryLineage::new("pattern:test".to_owned());
+        lineage.timestamp_local = true;
+        lineage.leaves = leaves;
+        lineage
+    }
+
+    #[test]
+    fn removed_source_leaves_bound_verification_by_their_range() {
+        let prior = |leaves| SourceCheckpoint {
+            format: 1,
+            recipe: "r".to_owned(),
+            target: "t".to_owned(),
+            lineage: Some(lineage(leaves)),
+        };
+        let lower = |before: Vec<_>, now: Vec<_>| match source_change(
+            Some(&prior(before)),
+            "r",
+            "t",
+            Some(&lineage(now)),
+            Some(100),
+            true,
+        )
+        .unwrap()
+        {
+            SourceChange::Verify { lower_us, removed } => (lower_us, removed.len()),
+            _ => panic!("a removed leaf must be verified"),
+        };
+        let old = leaf("a:1", Some((0, 9)));
+        let b = leaf("b:1", Some((50, 60)));
+        // Removal alone re-proves only the removed range.
+        assert_eq!(
+            lower(vec![old.clone(), b.clone()], vec![old.clone()]),
+            (Some(49), 1)
+        );
+        // Repacking under a new identity starts from the earliest of both.
+        assert_eq!(
+            lower(
+                vec![old.clone(), b.clone()],
+                vec![old.clone(), leaf("c:1", Some((40, 60)))]
+            ),
+            (Some(39), 1)
+        );
+        // A removed leaf without bounds can have affected any time.
+        assert_eq!(
+            lower(vec![old.clone(), leaf("u:1", None)], vec![old.clone()]),
+            (None, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn materialization_bounds_repack_verification_and_names_lost_sources() {
+        let (fs, context) = crate::factory::test_support::create_test_environment().await;
+        let cache = tempfile::tempdir().unwrap();
+        let context = context.with_cache_dir(cache.path().to_path_buf());
+        let root = fs.root().await.unwrap();
+        let batch = |values| {
+            RecordBatch::try_from_iter([(
+                "timestamp",
+                Arc::new(TimestampMicrosecondArray::from(values)) as arrow::array::ArrayRef,
+            )])
+            .unwrap()
+        };
+        let src = root.create_dir_path("/src").await.unwrap();
+        let write = |path: &'static str, values: Vec<i64>| {
+            let root = root.clone();
+            let context = context.clone();
+            let (lo, hi) = (values[0], values[values.len() - 1]);
+            async move {
+                _ = root
+                    .write_series_from_batch(path, &batch(values), Some("timestamp"))
+                    .await
+                    .unwrap();
+                let id = root.get_node_path(path).await.unwrap().id();
+                context
+                    .persistence
+                    .set_extended_attributes(
+                        id,
+                        HashMap::from([
+                            ("min_event_time".to_owned(), lo.to_string()),
+                            ("max_event_time".to_owned(), hi.to_string()),
+                            (
+                                "extended_attributes".to_owned(),
+                                r#"{"watertown.timestamp_column":"timestamp"}"#.to_owned(),
+                            ),
+                        ]),
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        write("/src/a.series", vec![1, 2]).await;
+        write("/src/b.series", vec![10, 11]).await;
+        let config = MaterializeSeriesConfig {
+            source: crate::Url::parse("series:///src/*.series").unwrap(),
+            target: "/target".to_owned(),
+            time_column: "timestamp".to_owned(),
+        };
+        let factory = crate::factory::test_support::test_context(&context, FileID::root());
+        let run = || {
+            execute(
+                serde_json::to_value(&config).unwrap(),
+                factory.clone(),
+                ExecutionContext::pond_readwriter(Vec::new()),
+            )
+        };
+        run().await.unwrap();
+        run().await.unwrap();
+        let metrics = context.plan_visibility_metrics();
+        assert_eq!(metrics.materialization_verifications, 0);
+
+        // Repacking b's rows under a new identity is checked from b's range and passes.
+        src.remove_entry("b.series").await.unwrap();
+        write("/src/c.series", vec![10, 11]).await;
+        run().await.expect("repacked rows match the target");
+        let after = context.plan_visibility_metrics();
+        assert_eq!(after.materialization_verifications, 1);
+        assert_eq!(
+            after.non_incremental_plans, metrics.non_incremental_plans,
+            "a bounded removed leaf must not force a full-history check"
+        );
+        assert_eq!(root.list_file_versions("/target").await.unwrap().len(), 1);
+
+        // Losing rows the target already holds is rejected and names the source.
+        src.remove_entry("c.series").await.unwrap();
+        let error = run()
+            .await
+            .expect_err("rows lost from the source must not be ignored")
+            .to_string();
+        for expected in [
+            "rejects retroactive changes",
+            "1 source version(s) were removed or replaced",
+            "[10, 11]",
+            "or by retargeting",
+        ] {
+            assert!(error.contains(expected), "missing {expected:?} in: {error}");
+        }
+        assert_eq!(
+            context.plan_visibility_metrics().non_incremental_plans,
+            metrics.non_incremental_plans
+        );
     }
 
     #[tokio::test]

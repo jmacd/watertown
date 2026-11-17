@@ -34,17 +34,26 @@ potential late changes are checked against the affected historical prefix,
 preserving duplicate multiplicity.
 
 An existing target without a matching checkpoint must pass a full historical
-consistency check before adoption. Cache loss, changed recipes, removed or
-replaced source versions, and unproven change locality also require full
-verification. These non-incremental checks are logged and counted rather than
-silently treated as bounded work. An already-inconsistent target fails the
+consistency check before adoption. Cache loss, changed recipes, and unproven
+change locality also require full verification. These non-incremental checks
+are logged and counted rather than silently treated as bounded work.
+
+A removed or replaced source version, for example one repacked under a new
+identity or renamed out of a source pattern by log rotation, is never treated
+as an append. For a timestamp-local source with recorded event-time bounds, the
+check starts at the earliest affected time rather than covering all history;
+a version without bounds still requires full verification. If rows the target
+already holds are gone, the run is rejected, and the error names each removed
+version with its event-time range. An already-inconsistent target fails the
 check; deleting the checkpoint does not bypass verification.
 
 ### Recovering from a rejection
 
 A rejection repeats on every run until an operator acts. Its usual causes are a
-source that was re-ingested or corrected after its rows were materialized, or a
-row added exactly at the target watermark. Pond has no command that removes a
+source that was re-ingested or corrected after its rows were materialized, a
+source version that left the source (for example a rotated log file whose
+archived name no longer matches the source pattern), or a row added exactly at
+the target watermark. Pond has no command that removes a
 materialized target, and this component never rebuilds one implicitly, so
 recovery is an explicit retarget:
 
