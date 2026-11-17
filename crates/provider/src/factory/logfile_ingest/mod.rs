@@ -227,16 +227,43 @@ impl LogfileIngestConfig {
 ///
 /// Cost is proportional to the bytes being written, not to the file: the
 /// append path passes only the new tail.
+#[cfg(test)]
 fn scan_temporal_bounds(content: &[u8], field: &str, unit: TimestampUnit) -> Option<(i64, i64)> {
-    // Lossy rather than strict: invalid UTF-8 is corruption of the same kind
-    // as a torn line, and borrows without copying in the common valid case.
-    let text = String::from_utf8_lossy(content);
+    scan_temporal_bounds_detailed(content, field, unit).ok()
+}
+
+/// Why [`scan_temporal_bounds`] could not bound a slice.
+#[derive(Debug, PartialEq, Eq)]
+enum TemporalScanFailure {
+    /// A retained JSON record whose timestamp is missing or unusable.
+    /// `line` is 1-based and `offset` is the record's byte offset, both
+    /// relative to the scanned slice.
+    UnusableRecord { line: usize, offset: usize },
+    /// No record carries a timestamp, or a bound is out of range.
+    NoBounds,
+}
+
+fn scan_temporal_bounds_detailed(
+    content: &[u8],
+    field: &str,
+    unit: TimestampUnit,
+) -> Result<(i64, i64), TemporalScanFailure> {
     let mut acc: Option<(i64, i64)> = None;
     let mut skipped: u64 = 0;
+    let mut offset = 0usize;
 
-    for (line_number, line) in text.lines().enumerate() {
-        // Strip NUL bytes (flash-storage corruption), as the reader does.
-        let cleaned: String = line.chars().filter(|c| *c != '\0').collect();
+    // Split on bytes rather than a lossy string so offsets stay exact even
+    // when invalid UTF-8 is replaced.
+    for (line_number, raw_line) in content.split(|b| *b == b'\n').enumerate() {
+        let line_offset = offset;
+        offset += raw_line.len() + 1;
+        // Lossy rather than strict: invalid UTF-8 is corruption of the same
+        // kind as a torn line. Strip NUL bytes (flash-storage corruption), as
+        // the reader does.
+        let cleaned: String = String::from_utf8_lossy(raw_line)
+            .chars()
+            .filter(|c| *c != '\0')
+            .collect();
         let trimmed = cleaned.trim();
         if trimmed.is_empty() {
             continue;
@@ -257,7 +284,10 @@ fn scan_temporal_bounds(content: &[u8], field: &str, unit: TimestampUnit) -> Opt
                 line_number + 1,
                 field
             );
-            return None;
+            return Err(TemporalScanFailure::UnusableRecord {
+                line: line_number + 1,
+                offset: line_offset,
+            });
         };
         acc = Some(match acc {
             Some((alo, ahi)) => (alo.min(lo), ahi.max(hi)),
@@ -271,10 +301,12 @@ fn scan_temporal_bounds(content: &[u8], field: &str, unit: TimestampUnit) -> Opt
         );
     }
 
-    let (min_raw, max_raw) = acc?;
-    Some((
-        unit.to_micros_floor(min_raw)?,
-        unit.to_micros_ceil(max_raw)?,
+    let (min_raw, max_raw) = acc.ok_or(TemporalScanFailure::NoBounds)?;
+    Ok((
+        unit.to_micros_floor(min_raw)
+            .ok_or(TemporalScanFailure::NoBounds)?,
+        unit.to_micros_ceil(max_raw)
+            .ok_or(TemporalScanFailure::NoBounds)?,
     ))
 }
 
@@ -389,25 +421,26 @@ fn complete_lines(slice: &[u8]) -> &[u8] {
     }
 }
 
-/// Record event-time bounds on a version about to be finalized, when the
-/// config asks for them.
-///
-/// Must be called after the content is written and before `shutdown`, which is
-/// when the metadata is folded into the oplog entry.
+/// Compute event-time bounds for a slice about to be ingested, when the config
+/// asks for them. Called before any writer is opened.
 ///
 /// Naming a `timestamp_field` is the operator saying "this node carries logs or
-/// metrics", so the requirement is declared on the writer before the scan runs.
-/// A slice whose bounds cannot then be determined fails the write rather than
-/// storing an unbounded version: with line-aligned slices the benign cause (a
-/// torn trailing line) can no longer occur, so what remains is a real problem
-/// -- the wrong field name, the wrong unit, or corrupt input -- and silently
-/// degrading it only reappears later as a slow, memory-hungry rollup.
-fn attach_temporal_bounds(
-    writer: &mut std::pin::Pin<Box<dyn tinyfs::FileMetadataWriter>>,
+/// metrics". A slice whose bounds cannot then be determined fails the ingest
+/// rather than storing an unbounded version: with line-aligned slices the
+/// benign cause (a torn trailing line) can no longer occur, so what remains is
+/// a real problem -- the wrong field name, the wrong unit, or corrupt input --
+/// and silently degrading it only reappears later as a slow, memory-hungry
+/// rollup. The error names the host file and absolute byte offset of the first
+/// unusable record so an operator can find it; the offset does not advance.
+///
+/// `source_offset` is the host-file byte offset at which `content` begins.
+fn temporal_bounds(
     config: &LogfileIngestConfig,
     content: &[u8],
     pond_dest: &str,
-) {
+    source: &std::path::Path,
+    source_offset: u64,
+) -> TinyFSResult<Option<(i64, i64)>> {
     let Some(field) = config.timestamp_field.as_deref() else {
         debug!(
             "No timestamp_field configured for {}; storing {} bytes with null event-time bounds. \
@@ -416,12 +449,48 @@ fn attach_temporal_bounds(
             pond_dest,
             content.len()
         );
+        return Ok(None);
+    };
+    let unit = config.timestamp_unit.as_str();
+    let end = source_offset + content.len() as u64;
+    match scan_temporal_bounds_detailed(content, field, config.timestamp_unit) {
+        Ok(bounds) => Ok(Some(bounds)),
+        Err(TemporalScanFailure::UnusableRecord { line, offset }) => {
+            Err(tinyfs::Error::Other(format!(
+                "logfile-ingest: refusing to ingest {} into {pond_dest}: the JSON record at byte \
+                 offset {} (line {line} of the new bytes [{source_offset}, {end})) has a missing \
+                 or unusable '{field}' timestamp for timestamp_unit '{unit}'. Nothing was written \
+                 and the ingest offset did not advance, so this file stays blocked: fix the \
+                 producer, then repair that record in the source log",
+                source.display(),
+                source_offset + offset as u64,
+            )))
+        }
+        Err(TemporalScanFailure::NoBounds) => Err(tinyfs::Error::Other(format!(
+            "logfile-ingest: refusing to ingest {} into {pond_dest}: no record in bytes \
+             [{source_offset}, {end}) has an in-range '{field}' timestamp for timestamp_unit \
+             '{unit}'. Nothing was written and the ingest offset did not advance; check \
+             timestamp_field and timestamp_unit",
+            source.display(),
+        ))),
+    }
+}
+
+/// Declare and attach bounds computed by [`temporal_bounds`]. Must be called
+/// after the content is written and before `shutdown`, which is when the
+/// metadata is folded into the oplog entry. The requirement stays declared on
+/// the writer so tlogfs still refuses an unbounded version.
+fn attach_temporal_bounds(
+    writer: &mut std::pin::Pin<Box<dyn tinyfs::FileMetadataWriter>>,
+    config: &LogfileIngestConfig,
+    bounds: Option<(i64, i64)>,
+    pond_dest: &str,
+) {
+    let Some(field) = config.timestamp_field.as_deref() else {
         return;
     };
-
     writer.require_temporal_metadata(field.to_string());
-
-    if let Some((min_us, max_us)) = scan_temporal_bounds(content, field, config.timestamp_unit) {
+    if let Some((min_us, max_us)) = bounds {
         debug!(
             "Temporal bounds for {}: [{}, {}] us from '{}'",
             pond_dest, min_us, max_us, field
@@ -695,6 +764,8 @@ pub async fn execute(
                                 &config,
                                 active_filename,
                                 new_data,
+                                &matched_archived.path,
+                                pond_active.cumulative_size,
                             )
                             .await?;
                         }
@@ -1082,13 +1153,14 @@ async fn ingest_new_file(
 
     // Write file as FilePhysicalSeries - enables cumulative bao_outboard for append detection
     use tokio::io::AsyncWriteExt;
+    let bounds = temporal_bounds(config, content, &pond_dest, &host_file.path, 0)?;
     let mut writer = root
         .async_writer_path_with_type(&pond_dest, EntryType::FilePhysicalSeries)
         .await?;
 
     // Write content and finalize
     writer.write_all(content).await.map_other()?;
-    attach_temporal_bounds(&mut writer, config, content, &pond_dest);
+    attach_temporal_bounds(&mut writer, config, bounds, &pond_dest);
     writer.shutdown().await.map_other()?;
 
     info!("Wrote file to pond: {}", pond_dest);
@@ -1172,6 +1244,13 @@ async fn ingest_append(
         return Ok(0);
     }
 
+    let bounds = temporal_bounds(
+        config,
+        new_content,
+        &pond_dest,
+        &host_file.path,
+        pond_state.cumulative_size,
+    )?;
     let mut writer = root
         .async_writer_path_with_type(&pond_dest, EntryType::FilePhysicalSeries)
         .await?;
@@ -1179,7 +1258,7 @@ async fn ingest_append(
     // Write only the new content (as a new version in the FilePhysicalSeries)
     // The ChainedReader will concatenate all versions when reading
     writer.write_all(new_content).await.map_other()?;
-    attach_temporal_bounds(&mut writer, config, new_content, &pond_dest);
+    attach_temporal_bounds(&mut writer, config, bounds, &pond_dest);
     writer.shutdown().await.map_other()?;
 
     info!(
@@ -1259,6 +1338,8 @@ async fn append_to_active_pond_file(
     config: &LogfileIngestConfig,
     filename: &str,
     new_data: &[u8],
+    source: &std::path::Path,
+    source_offset: u64,
 ) -> Result<(), tinyfs::Error> {
     let pond_dest = format!("{}/{}", config.pond_path, filename);
 
@@ -1275,12 +1356,13 @@ async fn append_to_active_pond_file(
     // Write new version as FilePhysicalSeries
     // TinyFS automatically computes cumulative blake3 and bao_outboard
     use tokio::io::AsyncWriteExt;
+    let bounds = temporal_bounds(config, new_data, &pond_dest, source, source_offset)?;
     let mut writer = root
         .async_writer_path_with_type(&pond_dest, EntryType::FilePhysicalSeries)
         .await?;
 
     writer.write_all(new_data).await.map_other()?;
-    attach_temporal_bounds(&mut writer, config, new_data, &pond_dest);
+    attach_temporal_bounds(&mut writer, config, bounds, &pond_dest);
     writer.shutdown().await.map_other()?;
 
     info!("Appended missed bytes to pond file: {}", pond_dest);
@@ -1698,6 +1780,32 @@ mod tests {
                 TimestampUnit::Nanoseconds
             ),
             Some((1_661_233_155_151_580, 1_661_233_155_151_581))
+        );
+    }
+
+    #[test]
+    fn unusable_record_location_is_exact_in_bytes() {
+        // Invalid UTF-8 and CRLF before the bad record must not shift its
+        // offset: lossy decoding changes byte lengths.
+        let content = b"{\"ts\":1}\r\n\xff\xfe torn\n\n{\"ts\":\"x\"}\n{\"ts\":2}\n";
+        let bad = content
+            .windows(10)
+            .position(|w| w == b"{\"ts\":\"x\"}")
+            .unwrap();
+        assert_eq!(
+            scan_temporal_bounds_detailed(content, "ts", TimestampUnit::Seconds),
+            Err(TemporalScanFailure::UnusableRecord {
+                line: 4,
+                offset: bad
+            })
+        );
+        assert_eq!(
+            scan_temporal_bounds_detailed(b"{\"value\":1}\n", "other", TimestampUnit::Seconds),
+            Err(TemporalScanFailure::UnusableRecord { line: 1, offset: 0 })
+        );
+        assert_eq!(
+            scan_temporal_bounds_detailed(b"not json\n", "ts", TimestampUnit::Seconds),
+            Err(TemporalScanFailure::NoBounds)
         );
     }
 

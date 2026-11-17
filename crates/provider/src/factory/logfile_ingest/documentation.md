@@ -49,6 +49,16 @@ record; an incomplete tail waits for a later append. Existing corrupt-line
 warnings still apply, and a temporal append with no usable timestamp fails
 rather than publishing an unbounded version.
 
+Syntactically broken JSON lines are skipped with a warning, because readers
+skip them too. A well-formed JSON record whose configured timestamp is missing
+or unusable is different: readers return it, so the bounds would not cover it.
+The whole append is rejected, nothing is written, and the ingest offset does
+not advance. The error names the host file, the record's absolute byte offset,
+and its line within the rejected bytes. Every later run fails the same way, and
+later records in that file are not ingested until the record is repaired. Fix
+the producer, then correct that record in the source log; the next run ingests
+from the same offset.
+
 Deploy a binary supporting this mode before enabling it in configuration.
 Enabling timestamp extraction affects new versions only: existing unbounded
 versions are not rewritten and must still be retained conservatively by bounded

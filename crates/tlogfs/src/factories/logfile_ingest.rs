@@ -150,8 +150,27 @@ mod integration_tests {
             let error = pond
                 .execute_factory(&config)
                 .await
-                .expect_err("mixed-validity timestamps must fail");
-            assert!(error.to_string().contains("without bounds"), "{error}");
+                .expect_err("mixed-validity timestamps must fail")
+                .to_string();
+            // The operator must be able to locate the record: host file,
+            // absolute byte offset, and the slice it was found in.
+            let record_offset = stored.len() + good_tail.len();
+            for expected in [
+                active.display().to_string(),
+                format!("byte offset {record_offset}"),
+                format!(
+                    "line 2 of the new bytes [{}, {})",
+                    stored.len(),
+                    content.len()
+                ),
+                "'ts' timestamp for timestamp_unit 'rfc3339'".to_owned(),
+                "ingest offset did not advance".to_owned(),
+            ] {
+                assert!(
+                    error.contains(&expected),
+                    "missing {expected:?} in: {error}"
+                );
+            }
             let (after, after_failure) = inspect(&pond).await;
             assert_eq!(after.len(), versions.len());
             for (after, before) in after.iter().zip(&versions) {
