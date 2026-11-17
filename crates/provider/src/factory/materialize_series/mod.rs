@@ -736,6 +736,7 @@ pub async fn execute(
         .clone();
     let watermark = read_watermark(&context, &config, &versions, &source_time_type).await?;
     if let (Some(watermark), SourceChange::Verify { lower_us }) = (&watermark, &change) {
+        context.context.record_materialization_verification();
         if lower_us.is_none() {
             context.context.record_non_incremental_plan();
         }

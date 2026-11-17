@@ -49,6 +49,7 @@ pub enum ExportChange {
 pub struct PlanVisibilityMetricsSnapshot {
     pub global_plans: u64,
     pub non_incremental_plans: u64,
+    pub materialization_verifications: u64,
     pub dynamic_source_executions: u64,
     pub bounded_dynamic_source_executions: u64,
     pub minimum_dynamic_event_time_lo: Option<i64>,
@@ -61,6 +62,7 @@ pub struct PlanVisibilityMetricsSnapshot {
 struct PlanVisibilityMetrics {
     global_plans: AtomicU64,
     non_incremental_plans: AtomicU64,
+    materialization_verifications: AtomicU64,
     dynamic_source_executions: AtomicU64,
     bounded_dynamic_source_executions: AtomicU64,
     minimum_dynamic_event_time_lo: AtomicI64,
@@ -74,6 +76,7 @@ impl Default for PlanVisibilityMetrics {
         Self {
             global_plans: AtomicU64::new(0),
             non_incremental_plans: AtomicU64::new(0),
+            materialization_verifications: AtomicU64::new(0),
             dynamic_source_executions: AtomicU64::new(0),
             bounded_dynamic_source_executions: AtomicU64::new(0),
             minimum_dynamic_event_time_lo: AtomicI64::new(i64::MAX),
@@ -294,6 +297,14 @@ impl ProviderContext {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record one check of materialized output against source history.
+    pub fn record_materialization_verification(&self) {
+        _ = self
+            .plan_visibility_metrics
+            .materialization_verifications
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record one recursive dynamic-source execution and its optional lower bound.
     pub fn record_dynamic_source_execution(&self, event_time_lo: Option<i64>) {
         _ = self
@@ -344,6 +355,10 @@ impl ProviderContext {
             non_incremental_plans: self
                 .plan_visibility_metrics
                 .non_incremental_plans
+                .load(Ordering::Relaxed),
+            materialization_verifications: self
+                .plan_visibility_metrics
+                .materialization_verifications
                 .load(Ordering::Relaxed),
             dynamic_source_executions: self
                 .plan_visibility_metrics

@@ -6393,6 +6393,73 @@ mod metadata_query_tests {
             materialize(root.node_path().id(), &context, url, "/materialized").await;
             tx.commit_test().await.unwrap();
 
+            // After a real commit, an idle tick and a strictly newer append must
+            // reuse the checkpoint: no historical verification and no fallback.
+            let root_id = root.node_path().id();
+            let mut target_versions = Vec::new();
+            for (label, append_second) in [("idle", None), ("append", Some(4_i64))] {
+                if let Some(second) = append_second {
+                    let tx = persistence.begin_test().await.unwrap();
+                    let root = tx.root().await.unwrap();
+                    let timestamp = if unit == "rfc3339" {
+                        format!("1970-01-01T00:00:0{second}Z")
+                    } else {
+                        (second * 1_000_000).to_string()
+                    };
+                    let mut writer = root
+                        .async_writer_path_with_type("/events.jsonl", EntryType::FilePhysicalSeries)
+                        .await
+                        .unwrap();
+                    writer
+                        .write_all(
+                            format!("{{\"{field}\":\"{timestamp}\",\"value\":1}}\n").as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    writer.set_temporal_metadata(
+                        second * 1_000_000,
+                        second * 1_000_000,
+                        field.to_owned(),
+                    );
+                    writer.set_exact_logical_attributes(
+                        serde_json::to_vec(&serde_json::json!({
+                            "watertown.timestamp_column": field,
+                            "watertown.timestamp_unit": unit,
+                        }))
+                        .unwrap(),
+                    );
+                    writer.shutdown().await.unwrap();
+                    tx.commit_test().await.unwrap();
+                }
+                let tx = persistence.begin_test().await.unwrap();
+                let context = tx.state().unwrap().as_provider_context();
+                materialize(root_id, &context, url, "/materialized").await;
+                let metrics = context.plan_visibility_metrics();
+                assert_eq!(
+                    (
+                        metrics.materialization_verifications,
+                        metrics.non_incremental_plans
+                    ),
+                    (0, 0),
+                    "{field} {label}: warm checkpoint must avoid historical verification: {metrics:?}"
+                );
+                target_versions.push(
+                    tx.root()
+                        .await
+                        .unwrap()
+                        .list_file_versions("/materialized")
+                        .await
+                        .unwrap()
+                        .len(),
+                );
+                tx.commit_test().await.unwrap();
+            }
+            assert_eq!(
+                target_versions[1],
+                target_versions[0] + 1,
+                "{field}: the strictly newer append adds exactly one target version"
+            );
+
             let tx = persistence.begin_test().await.unwrap();
             let root = tx.root().await.unwrap();
             let timestamp = if unit == "rfc3339" {
