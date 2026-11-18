@@ -158,6 +158,13 @@ Source-read bounds use the input column; the derived node advertises the output
 column. Missing or mismatched source time-axis metadata still causes a visible,
 unbounded event-time read.
 
+Rows within one timestamp group arrive in no guaranteed order, and bounded and
+full reads may order them differently. So `first_value`, `last_value`,
+`nth_value`, `array_agg`, and `string_agg` need an `ORDER BY` inside the
+aggregate, and `any_value` is rejected. Order-insensitive aggregates such as
+`MAX`, `MIN`, `SUM`, `COUNT`, and `AVG` are unrestricted. Choose an ordering
+that is unique within the group, because ties keep their scan order.
+
 Eligible derived nodes expose recursive source lineage so downstream
 reductions can identify unchanged physical inputs without executing the entire
 derived query. When a node cannot supply that contract, do not manufacture a

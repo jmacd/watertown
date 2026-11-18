@@ -556,6 +556,51 @@ async fn timestamp_grouped_rejects_nonlocal_and_time_changing_plans() -> Result<
 }
 
 #[tokio::test]
+async fn timestamp_grouped_requires_order_for_order_sensitive_aggregates() -> Result<()> {
+    let (_fixture, context) = fixture().await?;
+    let declaration = || UserSqlDeclaration::timestamp_grouped("source", "ts");
+    for (sql, expected) in [
+        (
+            "SELECT ts, FIRST_VALUE(value) AS v FROM source GROUP BY ts",
+            "'first_value' depends on input order",
+        ),
+        (
+            "SELECT ts, LAST_VALUE(value) AS v FROM source GROUP BY ts",
+            "'last_value' depends on input order",
+        ),
+        (
+            "SELECT ts, ARRAY_AGG(value) AS v FROM source GROUP BY ts",
+            "'array_agg' depends on input order",
+        ),
+        (
+            "SELECT ts, STRING_AGG(unused, ',') AS v FROM source GROUP BY ts",
+            "'string_agg' depends on input order",
+        ),
+        (
+            "SELECT ts, ANY_VALUE(value) AS v FROM source GROUP BY ts",
+            "'any_value' picks an arbitrary row",
+        ),
+    ] {
+        let error = plan_user_sql(&context, sql, declaration()?)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("order-sensitive aggregate was accepted: {sql}"));
+        assert!(error.to_string().contains(expected), "{sql}: {error}");
+    }
+    for sql in [
+        "SELECT ts, FIRST_VALUE(value ORDER BY unused) AS v FROM source GROUP BY ts",
+        "SELECT ts, ARRAY_AGG(value ORDER BY value) AS v FROM source GROUP BY ts",
+        "SELECT ts, MAX(CASE WHEN unused = 'ops' THEN value END) AS ops,
+                SUM(value) AS total, COUNT(*) AS samples, MIN(value) AS low,
+                AVG(value) AS mean
+         FROM source GROUP BY ts",
+    ] {
+        _ = plan_user_sql(&context, sql, declaration()?).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn timestamp_grouped_parses_text_without_bucketing_instants() -> Result<()> {
     use arrow::array::{ArrayRef, StringArray, TimestampNanosecondArray};
     use arrow::compute::concat_batches;

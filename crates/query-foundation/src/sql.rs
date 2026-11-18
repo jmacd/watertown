@@ -13,7 +13,7 @@ use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::dataframe::DataFrame;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::{SQLOptions, SessionContext};
-use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, Volatility};
+use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, SortExpr as Sort, Volatility};
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{Ident, ObjectName, ObjectNamePart, Query, Visit, Visitor};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
@@ -494,6 +494,9 @@ fn validate_local_expression(expression: &Expr, allow_aggregate: bool) -> Result
                     function.func.name()
                 )));
             }
+            Expr::AggregateFunction(function) => {
+                validate_aggregate_order(function.func.name(), &function.params.order_by)?;
+            }
             Expr::WindowFunction(_)
             | Expr::Exists(_)
             | Expr::InSubquery(_)
@@ -517,6 +520,35 @@ fn validate_local_expression(expression: &Expr, allow_aggregate: bool) -> Result
         }
         Ok(TreeNodeRecursion::Continue)
     })?;
+    Ok(())
+}
+
+/// Aggregates whose result depends on the order rows reach them. Scan order
+/// within a timestamp group is not stable across incremental, repacked, or
+/// repartitioned reads, so these need an explicit ORDER BY to be reproducible.
+const ORDER_SENSITIVE_AGGREGATES: &[&str] = &[
+    "first_value",
+    "last_value",
+    "nth_value",
+    "array_agg",
+    "string_agg",
+];
+
+fn validate_aggregate_order(name: &str, order_by: &[Sort]) -> Result<()> {
+    let name = name.to_ascii_lowercase();
+    if name == "any_value" {
+        return Err(DataFusionError::Plan(
+            "timestamp-grouped SQL aggregate 'any_value' picks an arbitrary row; \
+             use an order-insensitive aggregate such as MAX, or FIRST_VALUE(... ORDER BY ...)"
+                .to_string(),
+        ));
+    }
+    if order_by.is_empty() && ORDER_SENSITIVE_AGGREGATES.contains(&name.as_str()) {
+        return Err(DataFusionError::Plan(format!(
+            "timestamp-grouped SQL aggregate '{name}' depends on input order; \
+             add an ORDER BY inside the aggregate, e.g. {name}(value ORDER BY other_column)"
+        )));
+    }
     Ok(())
 }
 
