@@ -416,15 +416,46 @@ impl CachedSet {
     }
 }
 
+const SCHEMA_INDEX: &str = "schemas-0002.json";
+/// Earlier index formats, removed when the current index is written.
+const LEGACY_SCHEMA_INDEXES: [&str; 1] = ["schemas-0001.json"];
+
 #[derive(Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SchemaIndex {
-    files: BTreeMap<String, String>,
+    files: BTreeMap<String, SchemaIndexEntry>,
     schemas: BTreeMap<String, Vec<u8>>,
+}
+
+/// A sidecar's schema fingerprint, valid only while the file's size and
+/// modification time are unchanged.
+#[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SchemaIndexEntry {
+    fingerprint: String,
+    size: u64,
+    modified_ns: i128,
+}
+
+fn modified_ns(metadata: &std::fs::Metadata, path: &Path) -> Result<i128> {
+    let modified = metadata.modified()?;
+    let ns = match modified.duration_since(std::time::UNIX_EPOCH) {
+        Ok(after) => i128::try_from(after.as_nanos()),
+        Err(before) => i128::try_from(before.duration().as_nanos()).map(|ns| -ns),
+    };
+    ns.map_err(|_| {
+        crate::error::Error::Arrow(format!(
+            "Modification time of '{}' is out of range",
+            path.display()
+        ))
+    })
 }
 
 /// Schema metadata is disposable, but membership always comes from the caller.
 /// An absent index is reconstructed; a present but invalid index is an error.
+///
+/// Concurrent readers may each rewrite the index. Publication is atomic, so a
+/// lost update only costs a later footer read, never a wrong schema.
 async fn cached_parquet_schema(files: &[PathBuf]) -> Result<SchemaRef> {
     let mut directories = BTreeMap::<PathBuf, Vec<&Path>>::new();
     for file in files {
@@ -436,7 +467,7 @@ async fn cached_parquet_schema(files: &[PathBuf]) -> Result<SchemaRef> {
     let mut schemas = BTreeMap::<String, Schema>::new();
     let mut schema_order = Vec::new();
     for (directory, files) in directories {
-        let index_path = directory.join("schemas-0001.json");
+        let index_path = directory.join(SCHEMA_INDEX);
         let mut index: SchemaIndex = match tokio::fs::read(&index_path).await {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
                 crate::error::Error::Arrow(format!(
@@ -447,13 +478,12 @@ async fn cached_parquet_schema(files: &[PathBuf]) -> Result<SchemaRef> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => SchemaIndex::default(),
             Err(error) => return Err(error.into()),
         };
-        let previous_count = index.files.len();
-        index.files.retain(|name, _| directory.join(name).exists());
-        let mut changed = index.files.len() != previous_count;
+        let mut changed = false;
+        let mut members = BTreeSet::new();
         for path in files {
             // A schema hit must not hide a missing live sidecar, even when its
             // rows were pruned or another member has the same schema.
-            _ = tokio::fs::metadata(path).await?;
+            let metadata = tokio::fs::metadata(path).await?;
             let name = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -463,23 +493,36 @@ async fn cached_parquet_schema(files: &[PathBuf]) -> Result<SchemaRef> {
                         path.display()
                     ))
                 })?;
-            let fingerprint = if let Some(fingerprint) = index.files.get(name) {
-                fingerprint.clone()
-            } else {
-                let schema = read_parquet_schema(path).await?;
-                let mut writer = arrow::ipc::writer::StreamWriter::try_new(Vec::new(), &schema)
-                    .map_err(|error| crate::error::Error::Arrow(error.to_string()))?;
-                writer
-                    .finish()
-                    .map_err(|error| crate::error::Error::Arrow(error.to_string()))?;
-                let bytes = writer
-                    .into_inner()
-                    .map_err(|error| crate::error::Error::Arrow(error.to_string()))?;
-                let fingerprint = blake3::hash(&bytes).to_hex().to_string();
-                _ = index.schemas.insert(fingerprint.clone(), bytes);
-                _ = index.files.insert(name.to_owned(), fingerprint.clone());
-                changed = true;
-                fingerprint
+            _ = members.insert(name.to_owned());
+            let size = metadata.len();
+            let modified_ns = modified_ns(&metadata, path)?;
+            let fingerprint = match index.files.get(name) {
+                Some(entry) if entry.size == size && entry.modified_ns == modified_ns => {
+                    entry.fingerprint.clone()
+                }
+                _ => {
+                    let schema = read_parquet_schema(path).await?;
+                    let mut writer = arrow::ipc::writer::StreamWriter::try_new(Vec::new(), &schema)
+                        .map_err(|error| crate::error::Error::Arrow(error.to_string()))?;
+                    writer
+                        .finish()
+                        .map_err(|error| crate::error::Error::Arrow(error.to_string()))?;
+                    let bytes = writer
+                        .into_inner()
+                        .map_err(|error| crate::error::Error::Arrow(error.to_string()))?;
+                    let fingerprint = blake3::hash(&bytes).to_hex().to_string();
+                    _ = index.schemas.insert(fingerprint.clone(), bytes);
+                    _ = index.files.insert(
+                        name.to_owned(),
+                        SchemaIndexEntry {
+                            fingerprint: fingerprint.clone(),
+                            size,
+                            modified_ns,
+                        },
+                    );
+                    changed = true;
+                    fingerprint
+                }
             };
             if let std::collections::btree_map::Entry::Vacant(entry) = schemas.entry(fingerprint) {
                 let fingerprint = entry.key();
@@ -503,11 +546,34 @@ async fn cached_parquet_schema(files: &[PathBuf]) -> Result<SchemaRef> {
             }
         }
         if changed {
-            let live: BTreeSet<_> = index.files.values().collect();
+            // Prune only when already writing: entries for other members are
+            // harmless and checking them would stat every sidecar per read.
+            let mut stale = Vec::new();
+            for name in index.files.keys().filter(|name| !members.contains(*name)) {
+                if !tokio::fs::try_exists(directory.join(name)).await? {
+                    stale.push(name.clone());
+                }
+            }
+            for name in stale {
+                _ = index.files.remove(&name);
+            }
+            let live: BTreeSet<_> = index
+                .files
+                .values()
+                .map(|entry| &entry.fingerprint)
+                .collect();
             index
                 .schemas
                 .retain(|fingerprint, _| live.contains(fingerprint));
             write_cache_json(&index_path, &index).await?;
+            for legacy in LEGACY_SCHEMA_INDEXES {
+                match tokio::fs::remove_file(directory.join(legacy)).await {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(error.into());
+                    }
+                    _ => {}
+                }
+            }
         }
     }
     if schemas.is_empty() {
@@ -776,7 +842,7 @@ mod tests {
                     assert_eq!(SCHEMA_FOOTER_READS.with(std::cell::Cell::get), 0);
                 }
 
-                std::fs::remove_file(tmp.path().join("schemas-0001.json")).unwrap();
+                std::fs::remove_file(tmp.path().join(SCHEMA_INDEX)).unwrap();
                 SCHEMA_FOOTER_READS.with(|reads| reads.set(0));
                 let live = LiveVersions::from_persistence(node(1), versions.clone());
                 _ = dir
@@ -797,7 +863,7 @@ mod tests {
                         .is_err(),
                     "a warm index must not hide a missing schema member"
                 );
-                std::fs::write(tmp.path().join("schemas-0001.json"), b"broken").unwrap();
+                std::fs::write(tmp.path().join(SCHEMA_INDEX), b"broken").unwrap();
                 assert!(
                     dir.cached_set(&live, |_| false)
                         .table_provider()
@@ -889,6 +955,65 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn schema_index_rereads_a_sidecar_rewritten_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = SidecarDir::new(tmp.path().to_path_buf(), SidecarNaming::NodeOwned);
+        let id = node(1);
+        let live = LiveVersions::from_persistence(id, vec![version(1, Some("same"))]);
+        let write = |columns: &'static [&'static str]| {
+            let schema = Arc::new(Schema::new(
+                columns
+                    .iter()
+                    .map(|name| Field::new(*name, DataType::Utf8, false))
+                    .collect::<Vec<_>>(),
+            ));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                columns
+                    .iter()
+                    .map(|_| Arc::new(StringArray::from(vec!["x"])) as arrow::array::ArrayRef)
+                    .collect(),
+            )
+            .unwrap();
+            dir.write_sidecar(
+                &id,
+                &live.as_slice()[0],
+                schema,
+                Box::pin(futures::stream::iter([Ok(batch)])),
+            )
+        };
+        std::fs::write(tmp.path().join("schemas-0001.json"), b"legacy").unwrap();
+        _ = write(&["a"]).await.unwrap();
+        let names = |table: Arc<dyn TableProvider>| {
+            table
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect::<Vec<_>>()
+        };
+        let table = dir
+            .cached_set(&live, |_| false)
+            .table_provider()
+            .await
+            .unwrap();
+        assert_eq!(names(table), ["a"]);
+        assert!(
+            !tmp.path().join("schemas-0001.json").exists(),
+            "a superseded index format is removed when the index is rewritten"
+        );
+
+        // Same name, new contents: the indexed fingerprint must not be trusted.
+        _ = write(&["a", "b"]).await.unwrap();
+        let table = dir
+            .cached_set(&live, |_| false)
+            .table_provider()
+            .await
+            .unwrap();
+        assert_eq!(names(table), ["a", "b"]);
     }
 
     fn node(n: u64) -> tinyfs::NodeID {

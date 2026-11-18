@@ -1307,7 +1307,11 @@ and orphan sidecars contribute nothing. Each shared sidecar directory keeps a
 disposable, deduplicated Arrow schema index so fresh provider contexts avoid
 reopening historical footers. The caller's exact live list remains
 authoritative: a missing member or corrupt index fails explicitly, and an
-absent index is rebuilt from live footers.
+absent index is rebuilt from live footers. Each index entry records the
+sidecar's size and modification time; a mismatch rereads the footer, so a
+sidecar rewritten under the same name cannot reuse a stale schema. Concurrent
+readers may race to rewrite the index; publication is atomic, so a lost update
+costs only a later footer read.
 
 ### 13.4 Factories
 
