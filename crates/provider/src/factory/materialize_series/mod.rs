@@ -680,6 +680,39 @@ async fn read_checkpoint(path: Option<&std::path::Path>) -> TinyFSResult<Option<
     Ok(Some(checkpoint))
 }
 
+/// Express a microsecond lower bound in the watermark's own unit and timezone.
+/// Casting a timezone-less value would read it as local wall-clock time in a
+/// non-UTC zone, shifting the bound or making it NULL at a DST ambiguity.
+/// Coarser units round down so the verified window only widens.
+fn verification_lower_bound(watermark: &ScalarValue, lower_us: i64) -> TinyFSResult<ScalarValue> {
+    Ok(match watermark {
+        ScalarValue::Int64(_) => ScalarValue::Int64(Some(lower_us)),
+        ScalarValue::TimestampSecond(_, tz) => {
+            ScalarValue::TimestampSecond(Some(lower_us.div_euclid(1_000_000)), tz.clone())
+        }
+        ScalarValue::TimestampMillisecond(_, tz) => {
+            ScalarValue::TimestampMillisecond(Some(lower_us.div_euclid(1_000)), tz.clone())
+        }
+        ScalarValue::TimestampMicrosecond(_, tz) => {
+            ScalarValue::TimestampMicrosecond(Some(lower_us), tz.clone())
+        }
+        ScalarValue::TimestampNanosecond(_, tz) => ScalarValue::TimestampNanosecond(
+            Some(lower_us.checked_mul(1_000).ok_or_else(|| {
+                tinyfs::Error::Other(format!(
+                    "materialize-series: verification lower bound {lower_us}us overflows nanoseconds"
+                ))
+            })?),
+            tz.clone(),
+        ),
+        other => {
+            return Err(tinyfs::Error::Other(format!(
+                "materialize-series: unsupported verification watermark type {}",
+                other.data_type()
+            )));
+        }
+    })
+}
+
 fn prefix_frame(
     frame: datafusion::dataframe::DataFrame,
     time_column: &str,
@@ -689,13 +722,7 @@ fn prefix_frame(
     let time = col(Column::from_name(time_column));
     let mut predicate = time.clone().lt_eq(lit(watermark.clone()));
     if let Some(lower) = lower_us {
-        let lower = match watermark {
-            ScalarValue::Int64(_) => ScalarValue::Int64(Some(lower)),
-            _ => ScalarValue::TimestampMicrosecond(Some(lower), None)
-                .cast_to(&watermark.data_type())
-                .map_other_context("materialize-series: verification lower bound")?,
-        };
-        predicate = predicate.and(time.gt_eq(lit(lower)));
+        predicate = predicate.and(time.gt_eq(lit(verification_lower_bound(watermark, lower)?)));
     }
     frame
         .filter(predicate)
@@ -1202,6 +1229,44 @@ mod tests {
         lineage.timestamp_local = true;
         lineage.leaves = leaves;
         lineage
+    }
+
+    #[test]
+    fn verification_lower_bound_keeps_unit_and_timezone() -> TinyFSResult<()> {
+        let tz: Option<Arc<str>> = Some("America/Los_Angeles".into());
+        let lower_us = -1_500_001;
+        for (watermark, expected) in [
+            (
+                ScalarValue::TimestampNanosecond(Some(0), tz.clone()),
+                ScalarValue::TimestampNanosecond(Some(-1_500_001_000), tz.clone()),
+            ),
+            (
+                ScalarValue::TimestampMicrosecond(Some(0), tz.clone()),
+                ScalarValue::TimestampMicrosecond(Some(lower_us), tz.clone()),
+            ),
+            (
+                ScalarValue::TimestampMillisecond(Some(0), tz.clone()),
+                ScalarValue::TimestampMillisecond(Some(-1_501), tz.clone()),
+            ),
+            (
+                ScalarValue::TimestampSecond(Some(0), tz.clone()),
+                ScalarValue::TimestampSecond(Some(-2), tz.clone()),
+            ),
+            (
+                ScalarValue::Int64(Some(0)),
+                ScalarValue::Int64(Some(lower_us)),
+            ),
+        ] {
+            assert_eq!(verification_lower_bound(&watermark, lower_us)?, expected);
+        }
+        assert!(
+            verification_lower_bound(
+                &ScalarValue::TimestampNanosecond(Some(0), None),
+                i64::MAX / 10
+            )
+            .is_err()
+        );
+        Ok(())
     }
 
     #[test]

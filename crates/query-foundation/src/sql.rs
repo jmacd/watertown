@@ -534,14 +534,22 @@ const ORDER_SENSITIVE_AGGREGATES: &[&str] = &[
     "string_agg",
 ];
 
+/// Aggregates whose result depends on input order even with an in-aggregate
+/// ORDER BY (which only orders the value being summarized).
+const ORDER_DEPENDENT_AGGREGATES: &[&str] = &[
+    "any_value",
+    "approx_median",
+    "approx_percentile_cont",
+    "approx_percentile_cont_with_weight",
+];
+
 fn validate_aggregate_order(name: &str, order_by: &[Sort]) -> Result<()> {
     let name = name.to_ascii_lowercase();
-    if name == "any_value" {
-        return Err(DataFusionError::Plan(
-            "timestamp-grouped SQL aggregate 'any_value' picks an arbitrary row; \
-             use an order-insensitive aggregate such as MAX, or FIRST_VALUE(... ORDER BY ...)"
-                .to_string(),
-        ));
+    if ORDER_DEPENDENT_AGGREGATES.contains(&name.as_str()) {
+        return Err(DataFusionError::Plan(format!(
+            "timestamp-grouped SQL aggregate '{name}' can differ between reads of the same \
+             rows; use an exact aggregate such as MAX, MEDIAN, or PERCENTILE_CONT"
+        )));
     }
     if order_by.is_empty() && ORDER_SENSITIVE_AGGREGATES.contains(&name.as_str()) {
         return Err(DataFusionError::Plan(format!(

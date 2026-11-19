@@ -578,7 +578,16 @@ async fn timestamp_grouped_requires_order_for_order_sensitive_aggregates() -> Re
         ),
         (
             "SELECT ts, ANY_VALUE(value) AS v FROM source GROUP BY ts",
-            "'any_value' picks an arbitrary row",
+            "'any_value' can differ between reads",
+        ),
+        (
+            "SELECT ts, APPROX_MEDIAN(value) AS v FROM source GROUP BY ts",
+            "'approx_median' can differ between reads",
+        ),
+        (
+            "SELECT ts, APPROX_PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY value) AS v
+             FROM source GROUP BY ts",
+            "'approx_percentile_cont' can differ between reads",
         ),
     ] {
         let error = plan_user_sql(&context, sql, declaration()?)

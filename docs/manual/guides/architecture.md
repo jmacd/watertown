@@ -161,7 +161,8 @@ unbounded event-time read.
 Rows within one timestamp group arrive in no guaranteed order, and bounded and
 full reads may order them differently. So `first_value`, `last_value`,
 `nth_value`, `array_agg`, and `string_agg` need an `ORDER BY` inside the
-aggregate, and `any_value` is rejected. Order-insensitive aggregates such as
+aggregate. `any_value`, `approx_median`, and `approx_percentile_cont` are
+rejected; use `MEDIAN` or `PERCENTILE_CONT`. Order-insensitive aggregates such as
 `MAX`, `MIN`, `SUM`, `COUNT`, and `AVG` are unrestricted. Choose an ordering
 that is unique within the group, because ties keep their scan order.
 

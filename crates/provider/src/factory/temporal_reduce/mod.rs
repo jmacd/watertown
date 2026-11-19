@@ -4205,6 +4205,36 @@ fn unseal_from(
         .collect())
 }
 
+/// Preserve the ListingTable's rejection of incompatible field types, rather
+/// than letting UNION coerce them. Metadata is removed first: it does not
+/// affect compatibility, and `try_merge` rejects differing values for a key.
+fn check_source_schema_types(schemas: Vec<arrow::datatypes::Schema>) -> TinyFSResult<()> {
+    use arrow::datatypes::{DataType, Field, Fields, Schema};
+    fn strip(field: &Field) -> Field {
+        let data_type = match field.data_type() {
+            DataType::Struct(children) => DataType::Struct(
+                children
+                    .iter()
+                    .map(|child| strip(child))
+                    .collect::<Fields>(),
+            ),
+            DataType::List(child) => DataType::List(Arc::new(strip(child))),
+            DataType::LargeList(child) => DataType::LargeList(Arc::new(strip(child))),
+            DataType::FixedSizeList(child, size) => {
+                DataType::FixedSizeList(Arc::new(strip(child)), *size)
+            }
+            DataType::Map(child, sorted) => DataType::Map(Arc::new(strip(child)), *sorted),
+            other => other.clone(),
+        };
+        Field::new(field.name(), data_type, field.is_nullable())
+    }
+    let schemas = schemas
+        .iter()
+        .map(|schema| Schema::new(schema.fields().iter().map(|f| strip(f)).collect::<Fields>()));
+    _ = Schema::try_merge(schemas).map_other()?;
+    Ok(())
+}
+
 /// The cached source Parquets to aggregate, pruned to versions that can reach
 /// `read_lo_us` (epoch µs). `None` reads every live version.
 /// A provider over the pond-native Parquet source versions that a rebuild of
@@ -4262,9 +4292,7 @@ async fn builtin_source_provider(
                 .map_other()?,
         );
     }
-    // Preserve the ListingTable's rejection of incompatible field types,
-    // rather than letting UNION coerce them.
-    _ = arrow::datatypes::Schema::try_merge(schemas).map_other()?;
+    check_source_schema_types(schemas)?;
     let mut frames = frames.into_iter();
     let mut combined = frames.next().ok_or_else(|| {
         tinyfs::Error::Other("temporal-reduce has no native source files".to_owned())
@@ -4373,6 +4401,23 @@ mod tests {
     use crate::factory::test_support::{
         create_parquet_file, create_test_environment, test_context,
     };
+
+    #[test]
+    fn source_schema_check_ignores_metadata_but_rejects_type_conflicts() {
+        let tagged = |value: &str| {
+            let meta = HashMap::from([("unit".to_string(), value.to_string())]);
+            let inner = Field::new("v", DataType::Float64, true).with_metadata(meta.clone());
+            Schema::new(vec![
+                Field::new("value", DataType::Float64, true).with_metadata(meta.clone()),
+                Field::new("nested", DataType::Struct(vec![inner].into()), true),
+            ])
+            .with_metadata(meta)
+        };
+        check_source_schema_types(vec![tagged("C"), tagged("F")])
+            .expect("differing metadata must not block a multi-source reduction");
+        let conflicting = Schema::new(vec![Field::new("value", DataType::Utf8, true)]);
+        assert!(check_source_schema_types(vec![tagged("C"), conflicting]).is_err());
+    }
 
     fn cfg_with_aggs(aggregations: Vec<AggregationConfig>) -> TemporalReduceConfig {
         TemporalReduceConfig {
