@@ -331,10 +331,12 @@ async fn target_versions(
     root.list_file_versions(&config.target).await
 }
 
-async fn source_read_bounds(
-    context: &FactoryContext,
+/// `source_axis` is the source's resolved event-time column, computed once
+/// per `execute` because resolving it parses every source version's metadata.
+fn source_read_bounds(
     config: &MaterializeSeriesConfig,
     versions: &[tinyfs::FileVersionInfo],
+    source_axis: Option<&str>,
 ) -> TinyFSResult<tinyfs::SeriesReadBounds> {
     // The target's microsecond metadata is a conservative hint even before
     // the source's timestamp type is known. The exact filter is applied later.
@@ -354,19 +356,10 @@ async fn source_read_bounds(
         TargetWatermark::Exact(ScalarValue::Int64(Some(max_us))) => max_us,
         _ => unreachable!("microsecond metadata hint is exact, empty or unavailable"),
     };
-    let provider = crate::Provider::with_context(
-        Arc::new(context.context.filesystem()),
-        Arc::new(context.context.clone()),
-    )
-    .with_root(context.root().await?);
-    let column = provider
-        .event_time_column_for_url(&config.source.to_string())
-        .await
-        .map_other_context("materialize-series: source event-time contract")?;
-    if column.as_deref() != Some(config.time_column.as_str()) {
+    if source_axis != Some(config.time_column.as_str()) {
         warn!(
             "materialize-series: source {} is unbounded: declared event-time column {:?} does not establish requested column {:?}",
-            config.source, column, config.time_column
+            config.source, source_axis, config.time_column
         );
         return Ok(tinyfs::SeriesReadBounds::NONE);
     }
@@ -755,12 +748,11 @@ pub async fn execute(
             TargetWatermark::Exact(ScalarValue::Int64(value)) => value,
             _ => None,
         };
-    let matching_axis = provider
+    let source_axis = provider
         .event_time_column_for_url(&config.source.to_string())
         .await
-        .map_other_context("materialize-series: lineage axis")?
-        .as_deref()
-        == Some(config.time_column.as_str());
+        .map_other_context("materialize-series: source event-time contract")?;
+    let matching_axis = source_axis.as_deref() == Some(config.time_column.as_str());
     let change = source_change(
         prior.as_ref(),
         &recipe_id,
@@ -776,7 +768,7 @@ pub async fn execute(
         );
         return Ok(());
     }
-    let mut bounds = source_read_bounds(&context, &config, &versions).await?;
+    let mut bounds = source_read_bounds(&config, &versions, source_axis.as_deref())?;
     if let SourceChange::Verify { lower_us, .. } = change {
         bounds.event_time_lo = match (bounds.event_time_lo, lower_us) {
             (Some(current), Some(lower)) => Some(current.min(lower)),
