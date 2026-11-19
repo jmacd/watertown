@@ -54,6 +54,10 @@ pub struct QuerySourceLeaf {
 pub struct QueryLineage {
     pub recipe_identity: String,
     pub leaves: Vec<QuerySourceLeaf>,
+    /// True only when a source change cannot affect output at other event times.
+    /// Bounded reads alone do not prove this (windows and stateful queries differ).
+    #[serde(default)]
+    pub timestamp_local: bool,
 }
 
 impl QueryLineage {
@@ -62,10 +66,12 @@ impl QueryLineage {
         Self {
             recipe_identity,
             leaves: Vec::new(),
+            timestamp_local: false,
         }
     }
 
     pub fn extend(&mut self, nested: Self) {
+        self.timestamp_local &= nested.timestamp_local;
         self.leaves.push(QuerySourceLeaf {
             identity: format!("recipe:{}", nested.recipe_identity),
             min_event_time: None,
@@ -276,6 +282,15 @@ pub trait File: Metadata + Send + Sync {
 #[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait QueryableFile: File {
+    /// Output column whose epoch-microsecond range is accepted by
+    /// [`Self::as_table_provider_bounded`]. Unknown or global queries return
+    /// `None`; callers must not infer the axis from a column name or schema.
+    /// Derived implementations must verify each input's axis before forwarding
+    /// event-time bounds, ignoring them for unknown or mismatched inputs.
+    fn event_time_column(&self) -> Option<&str> {
+        None
+    }
+
     /// Convert this file into a DataFusion TableProvider for SQL queries
     ///
     /// The id parameter identifies the file, and context provides access to

@@ -1267,6 +1267,12 @@ TLogFS must prove:
 - selected-version and row-group pruning; and
 - query cost independent of unrelated Delta history.
 
+Latest-record and version-metadata lookups select lightweight candidate
+columns first and load only the chosen record; they never project historical
+payloads or outboards. For a `FilePhysicalSeries`, the latest record is the
+last live row in collapse-range order, not the highest version. Object-store
+reads resolve one exact version once and reuse it for metadata and body ranges.
+
 ### 13.3 Provider
 
 The provider package will translate Watertown URLs and factory configuration
@@ -1283,6 +1289,30 @@ into:
 It should not create hidden materialization boundaries or carry alternative
 implementations of foundation operators.
 
+**Event-time axes.** A source's event-time axis is established only by native
+series metadata, an explicit dynamic-node contract, or a format provider's
+proof over recorded version attributes. For raw formats such as `jsonlogs`,
+newly ingested versions record `watertown.timestamp_column` and
+`watertown.timestamp_unit`; the format proves only the encodings it supports
+(RFC3339 and integer epoch microseconds), and timestamp-local SQL validation
+checks that its parsing conversion matches that encoding. A matching column
+name, an SQL `input_event_time` declaration, or an unknown encoding never
+proves an axis. Unknown or mismatched axes fall back visibly to unbounded
+event-time reads; unknown-bound legacy versions are always retained.
+
+**Cached-format schemas.** Logical schema membership is separate from row
+pruning: a bounded or empty scan still exposes the complete schema of every
+query-selected live sidecar, NULL-filling older-only columns, while superseded
+and orphan sidecars contribute nothing. Each shared sidecar directory keeps a
+disposable, deduplicated Arrow schema index so fresh provider contexts avoid
+reopening historical footers. The caller's exact live list remains
+authoritative: a missing member or corrupt index fails explicitly, and an
+absent index is rebuilt from live footers. Each index entry records the
+sidecar's size and modification time; a mismatch rereads the footer, so a
+sidecar rewritten under the same name cannot reuse a stale schema. Concurrent
+readers may race to rewrite the index; publication is atomic, so a lost update
+costs only a later footer read.
+
 ### 13.4 Factories
 
 Factories become declarative recipes and persistent-state coordinators:
@@ -1294,6 +1324,18 @@ Factories become declarative recipes and persistent-state coordinators:
 - SQL-derived factories declare no locality unless validated; and
 - synthetic sources implement the same projection, filter, and metric
   contracts as physical sources.
+
+`materialize-series` classifies source changes before applying its append
+watermark. A non-authoritative shared-cache checkpoint records the recursive
+source lineage and the exact target version identity. An identical snapshot
+needs no source execution; new leaves wholly beyond the watermark on a proven
+timestamp-local path append with bounded reads. Every other case verifies the
+affected historical prefix as a multiset (preserving duplicates and changed
+exact-time groups) and rejects differences before publication. Missing or
+mismatched checkpoints, recipe changes, removed or replaced leaves, and
+unproven locality require full-prefix verification. Every verification is
+counted as `materialization_verifications`, and full ones also as
+`non_incremental_plans`, so tests and operators can detect lost incrementality.
 
 ### 13.5 Replication and backup
 

@@ -5902,14 +5902,23 @@
     "factory:logfile-ingest": {
       "$defs": {
         "TimestampUnit": {
-          "description": "Unit of the values found under `timestamp_field`.\n\ntlogfs records event times in microseconds, so everything is converted to\nthat. Microseconds is the default because it is what tlogfs itself uses.",
-          "enum": [
-            "seconds",
-            "milliseconds",
-            "microseconds",
-            "nanoseconds"
-          ],
-          "type": "string"
+          "description": "Interpretation of the values found under `timestamp_field`.\n\ntlogfs records event times in microseconds, so everything is converted to\nthat. Microseconds is the default because it is what tlogfs itself uses.",
+          "oneOf": [
+            {
+              "enum": [
+                "seconds",
+                "milliseconds",
+                "microseconds",
+                "nanoseconds"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "rfc3339",
+              "description": "RFC3339 date-time strings, including an explicit UTC offset.",
+              "type": "string"
+            }
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -5930,7 +5939,7 @@
         },
         "timestamp_field": {
           "default": null,
-          "description": "JSON key holding the event time of a record, looked up at any depth in\neach line. Example: \"timeUnixNano\" for OTLP metrics JSON.\n\nAbsent by default, which leaves versions without event-time bounds.\nThat is not free: `temporal-reduce` reads these bounds to decide which\ncached segments a new source version can have touched, and a version\nwithout them is taken to span all of time (`SourceRange::UNKNOWN`), so\nevery build unseals every segment and recomputes the whole history from\nsource. Setting this is what keeps an incremental build incremental.",
+          "description": "JSON key holding the event time of a record, looked up at any depth in\neach line. Example: \"timeUnixNano\" for OTLP metrics JSON.\nWhen configured, every parsed JSON record must contain usable values\nfor this key; missing or malformed timestamps reject the write.\n\nAbsent by default, which leaves versions without event-time bounds.\nThat is not free: `temporal-reduce` reads these bounds to decide which\ncached segments a new source version can have touched, and a version\nwithout them is taken to span all of time (`SourceRange::UNKNOWN`), so\nevery build unseals every segment and recomputes the whole history from\nsource. Setting this is what keeps an incremental build incremental.",
           "type": [
             "string",
             "null"
@@ -5939,7 +5948,7 @@
         "timestamp_unit": {
           "$ref": "#/$defs/TimestampUnit",
           "default": "microseconds",
-          "description": "Unit of the `timestamp_field` values. OTLP's `timeUnixNano` is\nnanoseconds; journald's `__REALTIME_TIMESTAMP` is microseconds."
+          "description": "Numeric unit or explicit string format for `timestamp_field`.\nOTLP's `timeUnixNano` is nanoseconds; journald uses microseconds.\nUse `rfc3339` for complete date-time strings with a UTC offset."
         }
       },
       "required": [
@@ -7602,14 +7611,46 @@
               "type": "object"
             },
             {
-              "description": "A single-source immutable projection/filter that preserves event time.",
+              "description": "A single-source immutable projection/filter that preserves event time,\noptionally sorted without limiting rows.",
               "properties": {
                 "event_time": {
                   "description": "Event-time column retained by the output.",
                   "type": "string"
                 },
+                "input_event_time": {
+                  "description": "Source event-time column, defaulting to event_time. Only renaming,\nRFC3339 parsing, and integer-microsecond parsing preserve time.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "type": {
                   "const": "timestamp-local",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "event_time"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Single-source aggregation grouped only by the exact retained event time.\nThe event-time value must be preserved; text may be parsed into a\nnanosecond timestamp. Nonlocal operators and time bucketing are rejected.",
+              "properties": {
+                "event_time": {
+                  "description": "Event-time column retained by the output.",
+                  "type": "string"
+                },
+                "input_event_time": {
+                  "description": "Source event-time column, defaulting to event_time.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "timestamp-grouped",
                   "type": "string"
                 }
               },
@@ -7684,14 +7725,46 @@
               "type": "object"
             },
             {
-              "description": "A single-source immutable projection/filter that preserves event time.",
+              "description": "A single-source immutable projection/filter that preserves event time,\noptionally sorted without limiting rows.",
               "properties": {
                 "event_time": {
                   "description": "Event-time column retained by the output.",
                   "type": "string"
                 },
+                "input_event_time": {
+                  "description": "Source event-time column, defaulting to event_time. Only renaming,\nRFC3339 parsing, and integer-microsecond parsing preserve time.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "type": {
                   "const": "timestamp-local",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "event_time"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Single-source aggregation grouped only by the exact retained event time.\nThe event-time value must be preserved; text may be parsed into a\nnanosecond timestamp. Nonlocal operators and time bucketing are rejected.",
+              "properties": {
+                "event_time": {
+                  "description": "Event-time column retained by the output.",
+                  "type": "string"
+                },
+                "input_event_time": {
+                  "description": "Source event-time column, defaulting to event_time.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "timestamp-grouped",
                   "type": "string"
                 }
               },
@@ -8145,7 +8218,7 @@
           "type": "array"
         },
         "seal_target_bytes": {
-          "description": "Minimum accumulated size before frozen buckets are sealed into an\nimmutable segment file. Accepts a byte count; defaults to\n[`crate::partial_aggregate_cache::SEAL_TARGET_BYTES`].\n\nUnlike `allowed_lateness`, changing this does NOT invalidate the cache:\na segment already sealed is correct at any target, so the new value simply\ngoverns the next seal. Exposed mainly so the tradeoff can be measured\nagainst real data -- larger means fewer files but a heavier hot-window\nrecompute each build.",
+          "description": "Minimum accumulated size before frozen buckets are sealed into an\nimmutable segment file. Accepts a byte count; defaults to\n[`crate::partial_aggregate_cache::SEAL_TARGET_BYTES`].\n\nUnlike `allowed_lateness`, changing this does NOT invalidate the cache:\na segment already sealed is correct at any target, so the new value simply\ngoverns the next seal. Exposed mainly so the tradeoff can be measured\nagainst real data -- larger means fewer files but a heavier hot-window\nrecompute each build. The fixed sealable-backlog span backstop still\napplies when output remains below this byte target.",
           "format": "uint64",
           "minimum": 0,
           "type": [

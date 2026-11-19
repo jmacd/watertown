@@ -358,9 +358,10 @@ forever.
   `>= watermark` are hot. One aggregate scan obtains the oldest and newest
   output buckets — no per-bucket state.
 - **Seal triggers.** Eligible history seals when its compressed hot output
-  reaches the preferred byte target or its active event-time span reaches 30
-  days. The span backstop covers sparse derived series whose output remains
-  small while recreating it requires an expensive historical source graph.
+  reaches the preferred byte target or its sealable backlog reaches one day.
+  That backlog excludes the allowed-lateness tail: it ends at the adjusted
+  watermark. The backstop covers sparse output whose upstream graph is
+  expensive; it bounds extra duration, not absolute input bytes or source count.
 - **Build classification** (against `manifest.covered` vs the current partial set):
   *Reuse* (equal → serve as-is), *Incremental* (superset → advance watermark,
   seal `[old_sealed_hi, watermark)` into a new run if non-empty, recompute

@@ -71,11 +71,42 @@ pub enum SqlDerivedLocality {
     /// Unrestricted SQL. The query is visible as global and non-incremental.
     #[default]
     Global,
-    /// A single-source immutable projection/filter that preserves event time.
+    /// A single-source immutable projection/filter that preserves event time,
+    /// optionally sorted without limiting rows.
     TimestampLocal {
         /// Event-time column retained by the output.
         event_time: String,
+        /// Source event-time column, defaulting to event_time. Only renaming,
+        /// RFC3339 parsing, and integer-microsecond parsing preserve time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_event_time: Option<String>,
     },
+    /// Single-source aggregation grouped only by the exact retained event time.
+    /// The event-time value must be preserved; text may be parsed into a
+    /// nanosecond timestamp. Nonlocal operators and time bucketing are rejected.
+    TimestampGrouped {
+        /// Event-time column retained by the output.
+        event_time: String,
+        /// Source event-time column, defaulting to event_time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_event_time: Option<String>,
+    },
+}
+
+impl SqlDerivedLocality {
+    fn input_event_time(&self) -> Option<&str> {
+        match self {
+            Self::Global => None,
+            Self::TimestampLocal {
+                event_time,
+                input_event_time,
+            }
+            | Self::TimestampGrouped {
+                event_time,
+                input_event_time,
+            } => Some(input_event_time.as_deref().unwrap_or(event_time)),
+        }
+    }
 }
 
 /// Options for SQL transformation and table name replacement
@@ -221,11 +252,13 @@ impl SqlDerivedConfig {
         self
     }
 
-    /// Declare this SQL as a single-source timestamp-local projection/filter.
+    /// Declare this SQL as a timestamp-local projection/filter, optionally
+    /// sorted without limiting rows.
     #[must_use]
     pub fn with_timestamp_local(mut self, event_time: impl Into<String>) -> Self {
         self.locality = SqlDerivedLocality::TimestampLocal {
             event_time: event_time.into(),
+            input_event_time: None,
         };
         self
     }
@@ -237,7 +270,9 @@ impl SqlDerivedConfig {
                 "At least one pattern must be specified".to_string(),
             ));
         }
-        if let SqlDerivedLocality::TimestampLocal { event_time } = &self.locality {
+        if let SqlDerivedLocality::TimestampLocal { event_time, .. }
+        | SqlDerivedLocality::TimestampGrouped { event_time, .. } = &self.locality
+        {
             if self.patterns.len() != 1 {
                 return Err(tinyfs::Error::Other(
                     "timestamp-local SQL requires exactly one source pattern".to_owned(),
@@ -246,6 +281,11 @@ impl SqlDerivedConfig {
             if event_time.is_empty() {
                 return Err(tinyfs::Error::Other(
                     "timestamp-local SQL event_time must not be empty".to_owned(),
+                ));
+            }
+            if self.locality.input_event_time() == Some("") {
+                return Err(tinyfs::Error::Other(
+                    "timestamp-local SQL input_event_time must not be empty".to_owned(),
                 ));
             }
         }
@@ -1220,12 +1260,11 @@ impl SqlDerivedFile {
 
     /// Resolve a single pattern to its source files, build a source
     /// TableProvider, apply transforms and scope prefixes, and register it in
-    /// the DataFusion session under a deterministic table name.  Records the
-    /// pattern -> table-name mapping in `table_mappings`.  Tables already
+    /// the DataFusion session under a deterministic table name. Tables already
     /// registered (shared source files) are not rebuilt.
     ///
-    /// Returns `true` when a real source table was registered (and mapped), or
-    /// `false` when the pattern matched no files.  A zero-match pattern is NOT
+    /// Returns the registered table name, or `None` when the pattern matched
+    /// no files. A zero-match pattern is NOT
     /// an error: a glob is a set and an empty set is valid.  The caller is
     /// responsible for registering an empty placeholder for the unmatched
     /// pattern (see `register_empty_pattern_table`), because the generated SQL
@@ -1237,9 +1276,9 @@ impl SqlDerivedFile {
         context: &tinyfs::ProviderContext,
         pattern_name: &str,
         pattern: &crate::Url,
-        table_mappings: &mut HashMap<String, String>,
         bounds: tinyfs::SeriesReadBounds,
-    ) -> TinyFSResult<bool> {
+        event_time: Option<&str>,
+    ) -> TinyFSResult<Option<String>> {
         let ctx = &context.datafusion_session;
 
         // Source files can be created by factories (Dynamic) or direct uploads
@@ -1296,7 +1335,37 @@ impl SqlDerivedFile {
         }
 
         if queryable_files.is_empty() {
-            return Ok(false);
+            return Ok(None);
+        }
+
+        let mut bounds = bounds;
+        if bounds.event_time_lo.is_some() {
+            let transforms = match &self.config.pattern_transforms {
+                Some(pattern_transforms) => pattern_transforms.get(pattern_name),
+                None => self.config.transforms.as_ref(),
+            };
+            let source_time = if transforms.is_some_and(|paths| !paths.is_empty())
+                || self.config.provider_wrapper.is_some()
+            {
+                None
+            } else {
+                crate::Provider::with_context(
+                    Arc::new(context.filesystem()),
+                    Arc::new(context.clone()),
+                )
+                .with_root(self.context.root().await?)
+                .event_time_column_for_url(&pattern.to_string())
+                .await
+                .map_other_context("SQL-derived source event-time contract")?
+            };
+            if event_time.is_none() || source_time.as_deref() != event_time {
+                log::warn!(
+                    "SQL-derived source {pattern} is unbounded in event time: \
+                     requested axis {event_time:?}, proven input axis {source_time:?}; \
+                     unknown axes and unproven transforms cannot prune source versions"
+                );
+                bounds.event_time_lo = None;
+            }
         }
 
         // Data-only table name: depends ONLY on the pattern URL and resolved
@@ -1324,8 +1393,6 @@ impl SqlDerivedFile {
             unique_table_name, pattern, has_per_consumer_wrapping
         );
 
-        _ = table_mappings.insert(pattern_name.to_string(), unique_table_name.clone());
-
         // Only the first instance sharing this data table name does the
         // expensive construction.  With per-consumer wrapping the name includes
         // the node_id so the check always misses and each consumer builds its own.
@@ -1344,7 +1411,7 @@ impl SqlDerivedFile {
                 "[GO] SQL-DERIVED: Data table '{}' already registered, skipping construction",
                 unique_table_name
             );
-            return Ok(true);
+            return Ok(Some(unique_table_name));
         }
 
         let scheme = pattern.scheme();
@@ -1435,7 +1502,7 @@ impl SqlDerivedFile {
             unique_table_name, pattern_name
         );
 
-        Ok(true)
+        Ok(Some(unique_table_name))
     }
 
     /// Register an empty placeholder table for a pattern that matched no files.
@@ -1559,7 +1626,8 @@ impl SqlDerivedFile {
     ) -> TinyFSResult<Arc<dyn TableProvider>> {
         let bounds = match self.config.locality {
             SqlDerivedLocality::Global => tinyfs::SeriesReadBounds::NONE,
-            SqlDerivedLocality::TimestampLocal { .. } => requested_bounds,
+            SqlDerivedLocality::TimestampLocal { .. }
+            | SqlDerivedLocality::TimestampGrouped { .. } => requested_bounds,
         };
         let cache_key = crate::TableProviderKey::with_bounds(
             id,
@@ -1575,7 +1643,12 @@ impl SqlDerivedFile {
         debug!("[SAVE] CACHE MISS: Creating new ViewTable for node_id: {id}");
         let ctx = &context.datafusion_session;
         let (table_mappings, _) = self
-            .register_source_tables_bounded(id, context, bounds)
+            .register_source_tables_bounded(
+                id,
+                context,
+                bounds,
+                self.config.locality.input_event_time(),
+            )
             .await?;
         let effective_sql = self.get_effective_sql(&SqlTransformOptions {
             table_mappings: Some(table_mappings.clone()),
@@ -1587,24 +1660,62 @@ impl SqlDerivedFile {
             table_mappings.len(),
             effective_sql
         );
-        let declaration = match &self.config.locality {
+        let mut declaration = match &self.config.locality {
             SqlDerivedLocality::Global => {
                 query_foundation::sql::UserSqlDeclaration::global(table_mappings.values().cloned())
                     .map_other_context("SQL-derived global locality declaration failed")?
             }
-            SqlDerivedLocality::TimestampLocal { event_time } => {
+            SqlDerivedLocality::TimestampLocal { event_time, .. }
+            | SqlDerivedLocality::TimestampGrouped { event_time, .. } => {
                 let source = table_mappings.values().next().ok_or_else(|| {
                     tinyfs::Error::Other(
                         "timestamp-local SQL source registration returned no table".to_owned(),
                     )
                 })?;
-                query_foundation::sql::UserSqlDeclaration::timestamp_local(
-                    source.clone(),
-                    event_time.clone(),
-                )
-                .map_other_context("SQL-derived timestamp-local declaration failed")?
+                let declaration = if matches!(
+                    self.config.locality,
+                    SqlDerivedLocality::TimestampGrouped { .. }
+                ) {
+                    query_foundation::sql::UserSqlDeclaration::timestamp_grouped(
+                        source.clone(),
+                        event_time.clone(),
+                    )
+                } else {
+                    query_foundation::sql::UserSqlDeclaration::timestamp_local(
+                        source.clone(),
+                        event_time.clone(),
+                    )
+                };
+                declaration
+                    .and_then(|declaration| {
+                        declaration.with_input_event_time(
+                            self.config
+                                .locality
+                                .input_event_time()
+                                .expect("local input event time"),
+                        )
+                    })
+                    .map_other_context("SQL-derived timestamp-local declaration failed")?
             }
         };
+        if self.config.locality != SqlDerivedLocality::Global
+            && self.config.provider_wrapper.is_none()
+            && self.config.transforms.as_ref().is_none_or(Vec::is_empty)
+            && self.config.pattern_transforms.is_none()
+            && let Some(pattern) = self.config.patterns.values().next()
+            && let Some(axis) = crate::Provider::with_context(
+                Arc::new(context.filesystem()),
+                Arc::new(context.clone()),
+            )
+            .with_root(self.context.root().await?)
+            .event_time_axis_for_url(&pattern.to_string())
+            .await
+            .map_other_context("SQL-derived input encoding")?
+            && Some(axis.column.as_str()) == self.config.locality.input_event_time()
+            && let Some(encoding) = axis.encoding
+        {
+            declaration = declaration.with_input_encoding(encoding);
+        }
         let planned = query_foundation::sql::plan_user_sql(ctx, &effective_sql, declaration)
             .await
             .map_err(|error| {
@@ -1629,6 +1740,11 @@ impl SqlDerivedFile {
                     "query-plan visibility: node={id} locality=timestamp-local incremental=true reason=declared-user-sql"
                 );
             }
+            SqlDerivedLocality::TimestampGrouped { .. } => {
+                info!(
+                    "query-plan visibility: node={id} locality=timestamp-grouped incremental=true reason=declared-exact-time-aggregation"
+                );
+            }
         }
 
         let table_provider: Arc<dyn TableProvider> = Arc::new(
@@ -1649,30 +1765,29 @@ impl SqlDerivedFile {
         id: FileID,
         context: &tinyfs::ProviderContext,
     ) -> TinyFSResult<(HashMap<String, String>, std::collections::HashSet<String>)> {
-        self.register_source_tables_bounded(id, context, tinyfs::SeriesReadBounds::NONE)
+        self.register_source_tables_bounded(id, context, tinyfs::SeriesReadBounds::NONE, None)
             .await
     }
 
+    /// Qualify event-time bounds against each input before constructing it.
+    /// Output names alone do not prove an input index or transform uses the
+    /// same axis; unproven inputs retain their full event-time history.
     pub(crate) async fn register_source_tables_bounded(
         &self,
         id: FileID,
         context: &tinyfs::ProviderContext,
         bounds: tinyfs::SeriesReadBounds,
+        event_time: Option<&str>,
     ) -> TinyFSResult<(HashMap<String, String>, std::collections::HashSet<String>)> {
         let mut table_mappings = HashMap::new();
         let mut empty_patterns = Vec::new();
         for (pattern_name, pattern) in &self.get_config().patterns {
             let registered = self
-                .register_pattern_source(
-                    id,
-                    context,
-                    pattern_name,
-                    pattern,
-                    &mut table_mappings,
-                    bounds,
-                )
+                .register_pattern_source(id, context, pattern_name, pattern, bounds, event_time)
                 .await?;
-            if !registered {
+            if let Some(table_name) = registered {
+                _ = table_mappings.insert(pattern_name.clone(), table_name);
+            } else {
                 empty_patterns.push(pattern_name.clone());
             }
         }
@@ -1687,6 +1802,14 @@ impl SqlDerivedFile {
 // QueryableFile trait implementation - follows anti-duplication principles
 #[async_trait]
 impl tinyfs::QueryableFile for SqlDerivedFile {
+    fn event_time_column(&self) -> Option<&str> {
+        match &self.config.locality {
+            SqlDerivedLocality::TimestampLocal { event_time, .. }
+            | SqlDerivedLocality::TimestampGrouped { event_time, .. } => Some(event_time),
+            SqlDerivedLocality::Global => None,
+        }
+    }
+
     /// Create TableProvider for SqlDerivedFile using DataFusion's ViewTable
     ///
     /// This approach creates a ViewTable that wraps the SqlDerivedFile's SQL query,
@@ -1754,10 +1877,18 @@ impl tinyfs::QueryableFile for SqlDerivedFile {
         }
 
         let mut lineage = tinyfs::QueryLineage::new(recipe_hasher.finalize().to_hex().to_string());
+        lineage.timestamp_local = self.config.transforms.as_ref().is_none_or(Vec::is_empty)
+            && self.config.pattern_transforms.is_none()
+            && self.config.provider_wrapper.is_none();
         let fs = self.context.context.filesystem();
         let mut provider = crate::Provider::with_context(Arc::new(fs), Arc::new(context.clone()));
         provider = provider.with_root(root);
         for pattern in self.config.patterns.values() {
+            let axis = provider
+                .event_time_column_for_url(&pattern.to_string())
+                .await
+                .map_other_context("SQL lineage event-time axis")?;
+            lineage.timestamp_local &= axis.as_deref() == self.config.locality.input_event_time();
             let Some(nested) = provider
                 .query_lineage_for_url(&pattern.to_string())
                 .await
@@ -2524,6 +2655,7 @@ query: ""
             ),
             locality: SqlDerivedLocality::TimestampLocal {
                 event_time: "timestamp".to_owned(),
+                input_event_time: None,
             },
             ..Default::default()
         };
@@ -2577,6 +2709,7 @@ query: ""
             ]),
             locality: SqlDerivedLocality::TimestampLocal {
                 event_time: "timestamp".to_owned(),
+                input_event_time: None,
             },
             ..Default::default()
         };

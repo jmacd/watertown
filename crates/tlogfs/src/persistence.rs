@@ -165,12 +165,85 @@ pub struct State {
     pond_id: String,
 }
 
-fn file_version_info_from_record(record: OplogEntry) -> FileVersionInfo {
-    let size = if record.is_large_file() {
-        record.size.unwrap_or(0)
-    } else {
-        record.content.as_ref().map(|c| c.len() as i64).unwrap_or(0)
-    };
+#[derive(Deserialize)]
+struct VersionMetadata {
+    file_type: EntryType,
+    timestamp: i64,
+    version: i64,
+    blake3: Option<String>,
+    size: Option<i64>,
+    min_event_time: Option<i64>,
+    max_event_time: Option<i64>,
+    extended_attributes: Option<String>,
+    collapsed_from: Option<i64>,
+    collapsed_through: Option<i64>,
+    logical_leaf_hash: Option<String>,
+    logical_count: Option<i64>,
+    series_schema_fingerprint: Option<String>,
+}
+
+impl From<&OplogEntry> for VersionMetadata {
+    fn from(record: &OplogEntry) -> Self {
+        Self {
+            file_type: record.file_type,
+            timestamp: record.timestamp,
+            version: record.version,
+            blake3: record.blake3.clone(),
+            size: record
+                .size
+                .or_else(|| record.content.as_ref().map(|content| content.len() as i64)),
+            min_event_time: record.min_event_time,
+            max_event_time: record.max_event_time,
+            extended_attributes: record.extended_attributes.clone(),
+            collapsed_from: record.collapsed_from,
+            collapsed_through: record.collapsed_through,
+            logical_leaf_hash: record.logical_leaf_hash.clone(),
+            logical_count: record.logical_count,
+            series_schema_fingerprint: record.series_schema_fingerprint.clone(),
+        }
+    }
+}
+
+struct ResolvedVersion {
+    state: State,
+    record: OplogEntry,
+    info: FileVersionInfo,
+}
+
+#[async_trait]
+impl tinyfs::ResolvedFileVersion for ResolvedVersion {
+    fn info(&self) -> &FileVersionInfo {
+        &self.info
+    }
+
+    async fn open(self: Box<Self>) -> TinyFSResult<Pin<Box<dyn tinyfs::AsyncReadSeek>>> {
+        let Self { state, record, .. } = *self;
+        state.coherence.ensure_open()?;
+        let inner = state.inner.lock().await;
+        inner.open_file_record(record).await
+    }
+
+    async fn read_range(self: Box<Self>, range: Range<u64>) -> TinyFSResult<Bytes> {
+        let Self { state, record, .. } = *self;
+        state.coherence.ensure_open()?;
+        let inner = state.inner.lock().await;
+        inner.read_file_record_range(record, range).await
+    }
+}
+
+fn file_version_info_from_metadata(
+    id: FileID,
+    record: VersionMetadata,
+) -> TinyFSResult<FileVersionInfo> {
+    let size = record
+        .size
+        .and_then(|size| u64::try_from(size).ok())
+        .ok_or_else(|| {
+            tinyfs::Error::Other(format!(
+                "Missing or invalid logical size {:?} for version {} of file {id}",
+                record.size, record.version
+            ))
+        })?;
     let extended_metadata =
         if record.file_type.is_series_file() || record.file_type == EntryType::FilePhysicalSeries {
             let mut metadata = HashMap::new();
@@ -194,14 +267,14 @@ fn file_version_info_from_record(record: OplogEntry) -> FileVersionInfo {
         } else {
             None
         };
-    FileVersionInfo {
+    Ok(FileVersionInfo {
         version: record.version as u64,
         timestamp: record.timestamp,
-        size: size as u64,
+        size,
         blake3: record.blake3,
         entry_type: record.file_type,
         extended_metadata,
-    }
+    })
 }
 
 // Re-export TableProviderKey from provider for backward compatibility
@@ -2141,6 +2214,31 @@ impl PersistenceLayer for State {
     async fn read_file_version(&self, id: FileID, version: u64) -> TinyFSResult<Vec<u8>> {
         self.coherence.ensure_open()?;
         self.inner.lock().await.read_file_version(id, version).await
+    }
+
+    async fn resolve_file_version(
+        &self,
+        id: FileID,
+        version: u64,
+    ) -> TinyFSResult<Option<Box<dyn tinyfs::ResolvedFileVersion + '_>>> {
+        self.coherence.ensure_open()?;
+        let record = match self
+            .inner
+            .lock()
+            .await
+            .load_file_version_record(id, version)
+            .await
+        {
+            Ok(record) => record,
+            Err(tinyfs::Error::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let info = file_version_info_from_metadata(id, VersionMetadata::from(&record))?;
+        Ok(Some(Box::new(ResolvedVersion {
+            state: self.clone(),
+            record,
+            info,
+        })))
     }
 
     async fn open_file_version(
@@ -4145,7 +4243,7 @@ impl InnerState {
         Ok(())
     }
 
-    /// Query for ONLY the latest record for any node type (O(1) performance)
+    /// Query the latest logical version, with pending writes taking precedence.
     async fn query_latest_record(&mut self, id: FileID) -> Result<OplogEntry, TLogFSError> {
         let pond_id_str = id.pond_id().to_string();
 
@@ -4168,10 +4266,8 @@ impl InnerState {
             return Ok(pending);
         }
 
-        self.query_committed_node_records(id)
+        self.query_latest_committed_record(id, false)
             .await?
-            .into_iter()
-            .next()
             .ok_or_else(|| TLogFSError::PartitionNotFound {
                 part_id: id.part_id().to_string(),
                 node_id: id.node_id().to_string(),
@@ -4179,10 +4275,7 @@ impl InnerState {
             })
     }
 
-    /// Query for ONLY the latest directory record (O(1) performance)
-    ///
-    /// This function uses SQL LIMIT 1 to fetch only the most recent directory version,
-    /// avoiding the O(N) cost of reading all historical versions.
+    /// Query the latest directory record without loading historical contents.
     ///
     /// IMPORTANT: This function checks BOTH committed (Delta Lake) and pending (self.records) state.
     /// During a transaction, pending directory records in self.records take precedence over committed ones.
@@ -4203,11 +4296,7 @@ impl InnerState {
             .max_by_key(|r| r.version)
             .cloned();
 
-        let committed_record = self
-            .query_committed_node_records(id)
-            .await?
-            .into_iter()
-            .find(|record| record.file_type.is_directory());
+        let committed_record = self.query_latest_committed_record(id, true).await?;
 
         // Step 3: Return the latest between committed and pending (pending wins if both exist)
         match (committed_record, pending_record) {
@@ -4216,6 +4305,51 @@ impl InnerState {
             (None, Some(p)) => Ok(Some(p)),
             (None, None) => Ok(None),
         }
+    }
+
+    async fn query_latest_committed_record(
+        &self,
+        id: FileID,
+        directory_only: bool,
+    ) -> Result<Option<OplogEntry>, TLogFSError> {
+        #[derive(Deserialize)]
+        struct Revision {
+            version: i64,
+            timestamp: i64,
+        }
+
+        let mut predicate = format!(
+            "pond_id = '{}' AND part_id = '{}' AND node_id = '{}'",
+            id.pond_id(),
+            id.part_id(),
+            id.node_id()
+        );
+        if directory_only {
+            predicate.push_str(&format!(
+                " AND file_type IN ('{}', '{}')",
+                EntryType::DirectoryPhysical,
+                EntryType::DirectoryDynamic
+            ));
+        }
+        // A LIMIT on SELECT * can still scan payload columns while finding
+        // the winning row. Resolve its identity first within this snapshot.
+        let revisions: Vec<Revision> = self
+            .query_oplog_rows(&format!(
+                "SELECT version, timestamp FROM delta_table WHERE {predicate} \
+                 ORDER BY version DESC, timestamp DESC LIMIT 1"
+            ))
+            .await?;
+        let Some(revision) = revisions.into_iter().next() else {
+            return Ok(None);
+        };
+        let records = self
+            .query_oplog_rows(&format!(
+                "SELECT * FROM delta_table WHERE {predicate} AND version = {} \
+                 AND timestamp = to_timestamp_micros({}) LIMIT 1",
+                revision.version, revision.timestamp
+            ))
+            .await?;
+        Ok(records.into_iter().next())
     }
 
     /// Query committed records for one exact node using Delta predicates.
@@ -4230,17 +4364,24 @@ impl InnerState {
             id.part_id(),
             id.node_id()
         );
+        self.query_oplog_rows(&sql).await
+    }
+
+    async fn query_oplog_rows<T: serde::de::DeserializeOwned>(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<T>, TLogFSError> {
         let batches = self
             .session_context
-            .sql(&sql)
+            .sql(sql)
             .await
             .map_err(TLogFSError::DataFusion)?
             .collect()
             .await
             .map_err(TLogFSError::DataFusion)?;
-        let mut records: Vec<OplogEntry> = Vec::new();
+        let mut records = Vec::new();
         for batch in batches {
-            let batch_records: Vec<OplogEntry> = serde_arrow::from_record_batch(&batch)?;
+            let batch_records: Vec<T> = serde_arrow::from_record_batch(&batch)?;
             records.extend(batch_records);
         }
         Ok(records)
@@ -4524,52 +4665,106 @@ impl InnerState {
             });
         }
 
-        // Query Delta Lake for the most recent record for this node using the correct partition
-        let records = self
-            .query_records(id)
+        #[derive(Deserialize)]
+        struct Candidate {
+            version: i64,
+            timestamp: i64,
+            size: Option<i64>,
+            collapsed_from: Option<i64>,
+            collapsed_through: Option<i64>,
+            #[serde(skip)]
+            pending_index: Option<usize>,
+        }
+
+        let pond_id = id.pond_id().to_string();
+        let predicate = format!(
+            "pond_id = '{pond_id}' AND part_id = '{}' AND node_id = '{}'",
+            id.part_id(),
+            id.node_id()
+        );
+        let byte_series = id.entry_type() == EntryType::FilePhysicalSeries;
+        let limit = if byte_series { "" } else { " LIMIT 1" };
+        let mut candidates: Vec<Candidate> = self
+            .query_oplog_rows(&format!(
+                "SELECT version, timestamp, size, collapsed_from, collapsed_through \
+                 FROM delta_table WHERE {predicate} ORDER BY version DESC, timestamp DESC{limit}"
+            ))
             .await
             .map_err(error_utils::to_tinyfs_error)?;
-
-        let record_count = records.len();
-        debug!("metadata: found {record_count} records");
-
-        // Debug: log all records to understand the issue
-        for (i, record) in records.iter().enumerate() {
-            let file_type_str = format!("{:?}", record.file_type);
-            let version = record.version;
-            let timestamp = record.timestamp;
-            debug!(
-                "metadata: record[{i}] - file_type={file_type_str}, version={version}, timestamp={timestamp}"
-            );
-        }
+        candidates.extend(
+            self.records
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| {
+                    record.part_id == id.part_id()
+                        && record.node_id == id.node_id()
+                        && record.pond_id == pond_id
+                })
+                .map(|(index, record)| Candidate {
+                    version: record.version,
+                    timestamp: record.timestamp,
+                    size: record.size,
+                    collapsed_from: record.collapsed_from,
+                    collapsed_through: record.collapsed_through,
+                    pending_index: Some(index),
+                }),
+        );
+        candidates.sort_by_key(|row| std::cmp::Reverse((row.version, row.timestamp)));
 
         // For a FilePhysicalSeries the newest *content* is not necessarily the
         // highest *version*: size-tiered collapse appends a merged run with a
         // fresh (highest) version number while that run stands for versions in
         // the middle of the byte stream. The append path resumes its cumulative
         // bao state from this record, so it must be the row covering the end of
-        // the stream -- the last live row in range order -- not `records.first()`.
-        let newest = if id.entry_type() == EntryType::FilePhysicalSeries {
-            crate::schema::live_series_entries(&records)
+        // the stream -- the last live row in range order -- not the highest version.
+        let selected = if byte_series {
+            let ranges: Vec<_> = candidates
+                .iter()
+                .map(|row| {
+                    (
+                        row.version,
+                        crate::schema::CollapseRange::new(
+                            row.version,
+                            row.collapsed_from,
+                            row.collapsed_through,
+                        ),
+                    )
+                })
+                .collect();
+            crate::schema::live_series_indices(&ranges)
                 .into_iter()
-                .rfind(|r| r.size.unwrap_or(0) > 0)
-                .or_else(|| records.first())
+                .rfind(|index| candidates[*index].size.unwrap_or(0) > 0)
+                .unwrap_or(0)
         } else {
-            records.first()
+            0
         };
-
-        if let Some(record) = newest {
-            // Use the record directly - it's already an OplogEntry with metadata() method
-            let file_type_str = format!("{:?}", record.file_type);
-            debug!(
-                "metadata: returning consolidated metadata from OplogEntry - using file_type={file_type_str}"
-            );
-            Ok(record.metadata())
-        } else {
-            debug!("metadata: no records found");
-            // Node doesn't exist
-            Err(tinyfs::Error::not_found(format!("Node {id}")))
+        let Some(selected) = candidates.get(selected) else {
+            return Err(tinyfs::Error::not_found(format!("Node {id}")));
+        };
+        if let Some(index) = selected.pending_index {
+            return Ok(self.records[index].metadata());
         }
+
+        // Fetch the selected outboard, never the history's contents/outboards.
+        let records: Vec<crate::schema::NodeMetadataRecord> = self
+            .query_oplog_rows(&format!(
+                "SELECT file_type, timestamp, version, blake3, size, bao_outboard \
+                 FROM delta_table WHERE {predicate} AND version = {} \
+                 AND timestamp = to_timestamp_micros({}) LIMIT 1",
+                selected.version, selected.timestamp
+            ))
+            .await
+            .map_err(error_utils::to_tinyfs_error)?;
+        records
+            .into_iter()
+            .next()
+            .map(crate::schema::NodeMetadataRecord::into_metadata)
+            .ok_or_else(|| {
+                tinyfs::Error::Other(format!(
+                    "Selected metadata revision ({}, {}) for node {id} disappeared from the snapshot",
+                    selected.version, selected.timestamp
+                ))
+            })
     }
 
     // Versioning operations implementation
@@ -4585,33 +4780,53 @@ impl InnerState {
             id.entry_type()
         );
 
-        let mut records = self
-            .query_records(id)
-            .await
-            .map_err(error_utils::to_tinyfs_error)?;
+        let mut records = self.query_committed_version_metadata(id, None).await?;
+        let pond_id = id.pond_id().to_string();
+        records.extend(
+            self.records
+                .iter()
+                .filter(|record| {
+                    record.part_id == id.part_id()
+                        && record.node_id == id.node_id()
+                        && record.pond_id == pond_id
+                })
+                .map(VersionMetadata::from),
+        );
 
         let record_count = records.len();
         debug!("list_file_versions found {record_count} records for node {id}");
 
-        // Sort records by version number (which should match timestamp order anyway)
-        records.sort_by_key(|record| record.version);
+        records.sort_by_key(|record| (record.version, std::cmp::Reverse(record.timestamp)));
 
         // Hide versions superseded by a collapse merge row: a merged
         // FilePhysicalSeries row covers the closed version range
         // [collapsed_from, collapsed_through], so rows inside that range are no
         // longer independently readable. Rows of other entry types carry no
         // range and are left unchanged.
-        let live: HashSet<i64> = crate::schema::live_series_entries(&records)
+        let ranges: Vec<_> = records
+            .iter()
+            .map(|record| {
+                (
+                    record.version,
+                    crate::schema::CollapseRange::new(
+                        record.version,
+                        record.collapsed_from,
+                        record.collapsed_through,
+                    ),
+                )
+            })
+            .collect();
+        let live: HashSet<i64> = crate::schema::live_series_versions(&ranges)
             .into_iter()
-            .map(|r| r.version)
             .collect();
 
-        let version_infos = records
+        let mut version_infos = Vec::new();
+        for record in records
             .into_iter()
             .filter(|record| live.contains(&record.version))
-            .map(file_version_info_from_record)
-            .collect();
-
+        {
+            version_infos.push(self.resolve_version_info(id, record).await?);
+        }
         Ok(version_infos)
     }
 
@@ -4620,14 +4835,77 @@ impl InnerState {
         id: FileID,
         version: u64,
     ) -> TinyFSResult<Option<FileVersionInfo>> {
-        match self.load_file_version_record(id, version).await {
-            Ok(record) => Ok(Some(file_version_info_from_record(record))),
-            Err(tinyfs::Error::NotFound(_)) => Ok(None),
-            Err(error) => Err(error),
+        let pond_id = id.pond_id().to_string();
+        let pending = self.records.iter().find(|record| {
+            record.part_id == id.part_id()
+                && record.node_id == id.node_id()
+                && record.pond_id == pond_id
+                && record.version == version as i64
+        });
+        let record = match pending {
+            Some(record) => Some(VersionMetadata::from(record)),
+            None => self
+                .query_committed_version_metadata(id, Some(version))
+                .await?
+                .into_iter()
+                .next(),
+        };
+        match record {
+            Some(record) => self.resolve_version_info(id, record).await.map(Some),
+            None => Ok(None),
         }
     }
 
+    async fn query_committed_version_metadata(
+        &self,
+        id: FileID,
+        version: Option<u64>,
+    ) -> TinyFSResult<Vec<VersionMetadata>> {
+        let selection = version.map_or_else(String::new, |version| {
+            format!(" AND version = {version} LIMIT 1")
+        });
+        self.query_oplog_rows(&format!(
+            "SELECT file_type, timestamp, version, blake3, size, min_event_time, \
+             max_event_time, extended_attributes, collapsed_from, collapsed_through, \
+             logical_leaf_hash, logical_count, series_schema_fingerprint \
+             FROM delta_table WHERE pond_id = '{}' AND part_id = '{}' AND node_id = '{}'{selection}",
+            id.pond_id(), id.part_id(), id.node_id()
+        ))
+        .await
+        .map_err(error_utils::to_tinyfs_error)
+    }
+
+    async fn resolve_version_info(
+        &self,
+        id: FileID,
+        mut record: VersionMetadata,
+    ) -> TinyFSResult<FileVersionInfo> {
+        if record.size.is_none() {
+            if record.file_type.is_file() {
+                warn!(
+                    "Version {} of file {id} has no stored size; reading its record to recover inline size",
+                    record.version
+                );
+            }
+            let full = self
+                .load_file_version_record(id, record.version as u64)
+                .await?;
+            record.size = full.content.as_ref().map(|content| content.len() as i64);
+        }
+        file_version_info_from_metadata(id, record)
+    }
+
     async fn load_file_version_record(&self, id: FileID, version: u64) -> TinyFSResult<OplogEntry> {
+        let pond_id = id.pond_id().to_string();
+        if let Some(record) = self.records.iter().find(|record| {
+            record.part_id == id.part_id()
+                && record.node_id == id.node_id()
+                && record.pond_id == pond_id
+                && record.version == version as i64
+        }) {
+            return Ok(record.clone());
+        }
+
         // OPTIMIZATION: Query for specific version instead of fetching all versions
         // Query for specific version only
         let sql = format!(
@@ -4661,25 +4939,11 @@ impl InnerState {
             }
         };
 
-        // Check pending records too (for uncommitted writes)
-        let pending_record = self
-            .records
-            .iter()
-            .find(|r| {
-                r.part_id == id.part_id()
-                    && r.node_id == id.node_id()
-                    && r.pond_id == id.pond_id().to_string()
-                    && r.version == version as i64
-            })
-            .cloned();
-
-        pending_record
-            .or_else(|| records.into_iter().next())
-            .ok_or_else(|| {
-                tinyfs::Error::NotFound(PathBuf::from(format!(
-                    "Version {version} of file {id} not found",
-                )))
-            })
+        records.into_iter().next().ok_or_else(|| {
+            tinyfs::Error::NotFound(PathBuf::from(format!(
+                "Version {version} of file {id} not found",
+            )))
+        })
     }
 
     async fn large_file_reader(
@@ -4722,7 +4986,13 @@ impl InnerState {
         version: u64,
     ) -> TinyFSResult<Pin<Box<dyn tinyfs::AsyncReadSeek>>> {
         let target_record = self.load_file_version_record(id, version).await?;
+        self.open_file_record(target_record).await
+    }
 
+    async fn open_file_record(
+        &self,
+        target_record: OplogEntry,
+    ) -> TinyFSResult<Pin<Box<dyn tinyfs::AsyncReadSeek>>> {
         // Load content based on file type
         if target_record.is_large_file() {
             Ok(Box::pin(self.large_file_reader(&target_record).await?))
@@ -4752,9 +5022,17 @@ impl InnerState {
         version: u64,
         range: Range<u64>,
     ) -> TinyFSResult<Bytes> {
+        let target_record = self.load_file_version_record(id, version).await?;
+        self.read_file_record_range(target_record, range).await
+    }
+
+    async fn read_file_record_range(
+        &self,
+        target_record: OplogEntry,
+        range: Range<u64>,
+    ) -> TinyFSResult<Bytes> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-        let target_record = self.load_file_version_record(id, version).await?;
         if target_record.is_large_file() {
             let mut reader = self.large_file_reader(&target_record).await?;
             let range =
@@ -5247,6 +5525,2162 @@ mod node_factory {
         // The node will be automatically cached when returned
 
         Ok(node)
+    }
+}
+
+#[cfg(test)]
+mod metadata_query_tests {
+    use super::*;
+    use datafusion::catalog::Session;
+    use datafusion::datasource::{TableProvider, TableType};
+    use datafusion::error::Result as DataFusionResult;
+    use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+    use datafusion::physical_plan::ExecutionPlan;
+
+    #[derive(Debug)]
+    struct Scan {
+        columns: Vec<String>,
+        filters: String,
+    }
+
+    #[derive(Debug)]
+    struct RecordingTable {
+        inner: Arc<dyn TableProvider>,
+        scans: Arc<std::sync::Mutex<Vec<Scan>>>,
+    }
+
+    #[async_trait]
+    impl TableProvider for RecordingTable {
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            self.inner.schema()
+        }
+
+        fn table_type(&self) -> TableType {
+            self.inner.table_type()
+        }
+
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&Expr],
+        ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+            self.inner.supports_filters_pushdown(filters)
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            let schema = self.schema();
+            let columns = projection.map_or_else(
+                || schema.fields().iter().map(|f| f.name().clone()).collect(),
+                |indices| {
+                    indices
+                        .iter()
+                        .map(|i| schema.field(*i).name().clone())
+                        .collect()
+                },
+            );
+            self.scans.lock().expect("scans").push(Scan {
+                columns,
+                filters: filters
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" AND "),
+            });
+            self.inner.scan(state, projection, filters, limit).await
+        }
+    }
+
+    async fn record_scans(state: &State) -> Arc<std::sync::Mutex<Vec<Scan>>> {
+        let session = &state.session_context;
+        let inner = session
+            .table_provider("delta_table")
+            .await
+            .expect("Delta provider");
+        let scans = Arc::new(std::sync::Mutex::new(Vec::new()));
+        _ = session
+            .deregister_table("delta_table")
+            .expect("replace Delta provider");
+        _ = session
+            .register_table(
+                "delta_table",
+                Arc::new(RecordingTable {
+                    inner,
+                    scans: scans.clone(),
+                }),
+            )
+            .expect("record Delta scans");
+        scans
+    }
+
+    async fn fixture() -> (tempfile::TempDir, OpLogPersistence, FileID) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persistence = OpLogPersistence::create_test(dir.path().join("pond").to_str().unwrap())
+            .await
+            .expect("create");
+        let pond = persistence.pond_id().parse().expect("pond UUID");
+        let id = FileID::new_in_partition(
+            FileID::root_for(pond).part_id(),
+            EntryType::FilePhysicalVersion,
+            pond,
+        );
+        (dir, persistence, id)
+    }
+
+    async fn commit_rows(persistence: &mut OpLogPersistence, rows: Vec<OplogEntry>) {
+        let tx = persistence.begin_test().await.expect("begin fixture");
+        tx.state()
+            .expect("state")
+            .inner
+            .lock()
+            .await
+            .records
+            .extend(rows);
+        tx.commit_test().await.expect("commit fixture");
+    }
+
+    fn row(id: FileID, version: i64) -> OplogEntry {
+        // Decreasing mtimes must not override logical version ordering.
+        OplogEntry::new_small_file(id, 1000 - version, version, vec![version as u8; 4096], 2)
+    }
+
+    #[tokio::test]
+    async fn latest_reads_only_selected_payload_and_preserves_identity() {
+        let (_dir, mut persistence, id) = fixture().await;
+        let directory =
+            FileID::new_in_partition(id.part_id(), EntryType::DirectoryPhysical, id.pond_id());
+        let mut rows: Vec<_> = (1..=16).map(|version| row(id, version)).collect();
+        let mut tied = row(id, 16);
+        tied.timestamp += 1;
+        tied.content = Some(b"newer timestamp".to_vec());
+        tied.size = Some(15);
+        rows.push(tied);
+        let mut foreign = row(id, 100);
+        foreign.pond_id = uuid7::uuid7().to_string();
+        rows.push(foreign.clone());
+        rows.extend(
+            (1..=8).map(|v| OplogEntry::new_inline(directory, 1000 - v, v, vec![v as u8; 4096], 2)),
+        );
+        let mut not_directory = row(directory, 50);
+        not_directory.file_type = EntryType::FilePhysicalVersion;
+        rows.push(not_directory);
+        commit_rows(&mut persistence, rows).await;
+
+        let tx = persistence.begin_test().await.expect("begin read");
+        let state = tx.state().expect("state");
+        let scans = record_scans(&state).await;
+        let mut inner = state.inner.lock().await;
+        inner.records.push(foreign);
+        let latest = inner.query_latest_record(id).await.expect("latest");
+        assert_eq!(latest.version, 16);
+        assert_eq!(
+            latest.content.as_deref(),
+            Some(b"newer timestamp".as_slice())
+        );
+        let latest_dir = inner
+            .query_latest_directory_record(directory)
+            .await
+            .expect("directory")
+            .expect("directory exists");
+        assert_eq!(latest_dir.version, 8);
+        {
+            let scans = scans.lock().expect("scans");
+            let payloads: Vec<_> = scans
+                .iter()
+                .filter(|s| s.columns.iter().any(|c| c == "content"))
+                .collect();
+            assert_eq!(payloads.len(), 2, "{scans:?}");
+            for scan in payloads {
+                assert!(
+                    scan.filters.contains("version = Int64(16)")
+                        || scan.filters.contains("version = Int64(8)"),
+                    "payload scans must select an exact version, not sort all historical content: {scan:?}"
+                );
+            }
+        }
+        inner.records.push(row(id, 17));
+        assert_eq!(
+            inner
+                .query_latest_record(id)
+                .await
+                .expect("pending latest")
+                .version,
+            17
+        );
+        inner.records.push(OplogEntry::new_inline(
+            directory,
+            1,
+            9,
+            b"pending".to_vec(),
+            3,
+        ));
+        assert_eq!(
+            inner
+                .query_latest_directory_record(directory)
+                .await
+                .expect("pending dir")
+                .unwrap()
+                .version,
+            9
+        );
+    }
+
+    #[tokio::test]
+    async fn version_metadata_excludes_payload_and_preserves_live_membership() {
+        let (_dir, mut persistence, file) = fixture().await;
+        let id = FileID::new_in_partition(
+            file.part_id(),
+            EntryType::FilePhysicalSeries,
+            file.pond_id(),
+        );
+        let mut rows: Vec<_> = (1..=16)
+            .map(|v| {
+                let mut r = row(id, v);
+                r.min_event_time = Some(v * 10);
+                r.max_event_time = Some(v * 10 + 1);
+                r.extended_attributes = Some(r#"{"timestamp_column":"ts"}"#.to_string());
+                r.logical_leaf_hash = Some(format!("leaf-{v}"));
+                r.logical_count = Some(4096);
+                r.series_schema_fingerprint = Some("schema".to_string());
+                r
+            })
+            .collect();
+        rows[15].collapsed_from = Some(4);
+        rows[15].collapsed_through = Some(12);
+        let mut foreign = rows[0].clone();
+        foreign.pond_id = uuid7::uuid7().to_string();
+        foreign.version = 100;
+        rows.push(foreign.clone());
+        commit_rows(&mut persistence, rows).await;
+
+        let tx = persistence.begin_test().await.expect("begin metadata");
+        let state = tx.state().expect("state");
+        let scans = record_scans(&state).await;
+        state
+            .inner
+            .lock()
+            .await
+            .records
+            .extend([row(id, 17), foreign]);
+        let versions = state.list_file_versions(id).await.expect("versions");
+        assert_eq!(
+            versions.iter().map(|v| v.version).collect::<Vec<_>>(),
+            vec![1, 2, 3, 13, 14, 15, 16, 17]
+        );
+        for info in &versions {
+            assert_eq!(info.size, 4096);
+            assert_eq!(
+                info.blake3.as_deref(),
+                Some(
+                    blake3::hash(&vec![info.version as u8; 4096])
+                        .to_hex()
+                        .as_str()
+                )
+            );
+        }
+        let exact = state
+            .file_version_info(id, 4)
+            .await
+            .expect("superseded exact version")
+            .unwrap();
+        let metadata = exact.extended_metadata.expect("extended metadata");
+        assert_eq!(metadata["min_event_time"], "40");
+        assert_eq!(metadata["max_event_time"], "41");
+        assert_eq!(metadata["logical_leaf_hash"], "leaf-4");
+        assert_eq!(metadata["logical_count"], "4096");
+        assert_eq!(metadata["series_schema_fingerprint"], "schema");
+        assert_eq!(
+            metadata["extended_attributes"],
+            r#"{"timestamp_column":"ts"}"#
+        );
+        assert!(
+            state
+                .file_version_info(id, 999)
+                .await
+                .expect("missing version")
+                .is_none()
+        );
+        {
+            let scans = scans.lock().expect("scans");
+            assert!(!scans.is_empty());
+            for scan in scans.iter() {
+                assert!(
+                    !scan
+                        .columns
+                        .iter()
+                        .any(|c| c == "content" || c == "bao_outboard"),
+                    "metadata query must not load payload columns: {scan:?}"
+                );
+            }
+        }
+        scans.lock().expect("scans").clear();
+        assert_eq!(
+            state
+                .file_version_info(id, 17)
+                .await
+                .expect("pending version")
+                .unwrap()
+                .size,
+            4096
+        );
+        assert!(
+            scans.lock().expect("scans").is_empty(),
+            "pending exact version needs no committed query"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_metadata_handles_legacy_sizes_and_rejects_invalid_sizes() {
+        let (_dir, mut persistence, id) = fixture().await;
+        let mut legacy = row(id, 1);
+        legacy.size = None;
+        let large = OplogEntry::new_large_file(id, 2, 2, "large".to_string(), 131072, 2);
+        let mut invalid = row(id, 3);
+        invalid.size = Some(-1);
+        let mut missing = row(id, 4);
+        missing.size = None;
+        missing.content = None;
+        commit_rows(&mut persistence, vec![legacy, large, invalid, missing]).await;
+        let tx = persistence.begin_test().await.expect("begin sizes");
+        let state = tx.state().expect("state");
+        let scans = record_scans(&state).await;
+        assert_eq!(
+            state
+                .file_version_info(id, 1)
+                .await
+                .expect("legacy")
+                .unwrap()
+                .size,
+            4096
+        );
+        scans.lock().expect("scans").clear();
+        assert_eq!(
+            state
+                .file_version_info(id, 2)
+                .await
+                .expect("large")
+                .unwrap()
+                .size,
+            131072
+        );
+        assert!(
+            scans
+                .lock()
+                .expect("scans")
+                .iter()
+                .all(|s| !s.columns.iter().any(|c| c == "content"))
+        );
+        assert!(
+            state
+                .file_version_info(id, 3)
+                .await
+                .expect_err("negative size")
+                .to_string()
+                .contains("size")
+        );
+        assert!(
+            state
+                .file_version_info(id, 4)
+                .await
+                .expect_err("missing size and content")
+                .to_string()
+                .contains("size")
+        );
+    }
+
+    #[tokio::test]
+    async fn object_store_version_reads_resolve_record_once() {
+        use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt, path::Path};
+
+        let (_dir, mut persistence, id) = fixture().await;
+        let content: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let mut rows: Vec<_> = (1..=16).map(|version| row(id, version)).collect();
+        rows[15].content = Some(content.clone());
+        rows[15].blake3 = Some(blake3::hash(&content).to_hex().to_string());
+        let mut foreign = row(id, 16);
+        foreign.pond_id = uuid7::uuid7().to_string();
+        rows.push(foreign.clone());
+        commit_rows(&mut persistence, rows).await;
+
+        let tx = persistence.begin_test().await.expect("begin object reads");
+        let state = tx.state().expect("state");
+        let scans = record_scans(&state).await;
+        let store = provider::TinyFsObjectStore::new(state.clone());
+        let path = Path::from(provider::TinyFsPathBuilder::specific_version(&id, 16));
+        for (range, expected) in [
+            (GetRange::Bounded(10..27), 10..27),
+            (GetRange::Offset(4080), 4080..4096),
+            (GetRange::Suffix(9), 4087..4096),
+            (GetRange::Bounded(4090..5000), 4090..4096),
+        ] {
+            scans.lock().expect("scans").clear();
+            let result = store
+                .get_opts(
+                    &path,
+                    GetOptions {
+                        range: Some(range),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("range");
+            assert_eq!(result.range, expected);
+            assert_eq!(result.meta.size, content.len() as u64);
+            assert_eq!(
+                result.bytes().await.expect("range bytes").as_ref(),
+                &content[expected.start as usize..expected.end as usize]
+            );
+            assert_eq!(
+                scans.lock().expect("scans").len(),
+                1,
+                "version metadata and content must share one lookup"
+            );
+        }
+        scans.lock().expect("scans").clear();
+        assert_eq!(
+            store
+                .get(&path)
+                .await
+                .expect("full get")
+                .bytes()
+                .await
+                .expect("full bytes")
+                .as_ref(),
+            content
+        );
+        assert_eq!(scans.lock().expect("scans").len(), 1);
+
+        scans.lock().expect("scans").clear();
+        let conditional = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    if_match: Some("*".to_string()),
+                    range: Some(GetRange::Bounded(10..27)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("satisfied precondition");
+        assert_eq!(
+            conditional
+                .bytes()
+                .await
+                .expect("conditional body")
+                .as_ref(),
+            &content[10..27]
+        );
+        assert!(
+            !scans.lock().expect("scans")[0]
+                .columns
+                .iter()
+                .any(|column| column == "content")
+        );
+        let latest = Path::from(provider::TinyFsPathBuilder::all_versions(&id));
+        assert_eq!(
+            store
+                .get(&latest)
+                .await
+                .expect("latest get")
+                .bytes()
+                .await
+                .expect("latest bytes")
+                .as_ref(),
+            content
+        );
+
+        let pending_content = b"pending version contents";
+        let pending = OplogEntry::new_small_file(id, 1, 17, pending_content.to_vec(), 3);
+        state.inner.lock().await.records.extend([pending, foreign]);
+        scans.lock().expect("scans").clear();
+        let pending_path = Path::from(provider::TinyFsPathBuilder::specific_version(&id, 17));
+        assert_eq!(
+            store
+                .get_range(&pending_path, 3..10)
+                .await
+                .expect("pending range")
+                .as_ref(),
+            &pending_content[3..10]
+        );
+        assert!(
+            scans.lock().expect("scans").is_empty(),
+            "pending content must not query committed rows"
+        );
+
+        let missing = Path::from(provider::TinyFsPathBuilder::specific_version(&id, 999));
+        assert!(matches!(
+            store.get_range(&missing, 0..1).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn object_store_metadata_checks_precede_content_access() {
+        use object_store::{GetOptions, GetRange, ObjectStore, path::Path};
+
+        let (_dir, mut persistence, id) = fixture().await;
+        // The metadata exists, but the external content deliberately does not.
+        commit_rows(
+            &mut persistence,
+            vec![OplogEntry::new_large_file(
+                id,
+                1,
+                1,
+                "missing-content".to_string(),
+                100,
+                2,
+            )],
+        )
+        .await;
+        let tx = persistence
+            .begin_test()
+            .await
+            .expect("begin conditional reads");
+        let state = tx.state().expect("state");
+        let scans = record_scans(&state).await;
+        let store = provider::TinyFsObjectStore::new(state);
+        let path = Path::from(provider::TinyFsPathBuilder::specific_version(&id, 1));
+        let head = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    head: true,
+                    range: Some(GetRange::Offset(1000)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("HEAD must not open content or validate a body range");
+        assert_eq!(head.range, 0..100);
+        assert!(head.bytes().await.expect("HEAD bytes").is_empty());
+
+        for options in [
+            GetOptions {
+                if_none_match: Some("*".to_string()),
+                ..Default::default()
+            },
+            GetOptions {
+                if_match: Some("absent".to_string()),
+                ..Default::default()
+            },
+            GetOptions {
+                if_modified_since: Some(chrono::DateTime::<Utc>::MAX_UTC),
+                ..Default::default()
+            },
+            GetOptions {
+                if_unmodified_since: Some(chrono::DateTime::<Utc>::MIN_UTC),
+                ..Default::default()
+            },
+        ] {
+            let error = store
+                .get_opts(&path, options)
+                .await
+                .expect_err("precondition");
+            assert!(
+                matches!(
+                    error,
+                    object_store::Error::NotModified { .. }
+                        | object_store::Error::Precondition { .. }
+                ),
+                "{error}"
+            );
+        }
+        assert!(
+            scans.lock().expect("scans").iter().all(|scan| !scan
+                .columns
+                .iter()
+                .any(|column| column == "content" || column == "bao_outboard")),
+            "HEAD and rejected conditions must remain metadata-only"
+        );
+
+        let error = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Offset(101)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("invalid range");
+        assert!(error.to_string().contains("Invalid range"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn object_store_large_ranges_reuse_resolved_record() {
+        use object_store::{ObjectStoreExt, path::Path};
+
+        let (_dir, mut persistence, _) = fixture().await;
+        let content: Vec<u8> = (0..crate::large_files::LARGE_FILE_THRESHOLD + 50000)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let tx = persistence.begin_test().await.expect("begin large write");
+        let root = tx.root().await.expect("root");
+        root.write_file_path_from_slice("/large.dat", &content)
+            .await
+            .expect("write large");
+        let id = root
+            .get_node_path("/large.dat")
+            .await
+            .expect("large node")
+            .id();
+        tx.commit_test().await.expect("commit large");
+
+        let tx = persistence.begin_test().await.expect("begin large read");
+        let state = tx.state().expect("state");
+        let version = state.list_file_versions(id).await.expect("versions")[0].version;
+        let scans = record_scans(&state).await;
+        let store = provider::TinyFsObjectStore::new(state);
+        let path = Path::from(provider::TinyFsPathBuilder::specific_version(&id, version));
+        let middle = (content.len() / 2) as u64;
+        assert_eq!(
+            store
+                .get_range(&path, middle..middle + 257)
+                .await
+                .expect("large range")
+                .as_ref(),
+            &content[middle as usize..middle as usize + 257]
+        );
+        assert_eq!(
+            scans.lock().expect("scans").len(),
+            1,
+            "large range must use one record lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_versions_preserve_wrapper_and_transaction_contracts() {
+        let (_dir, mut persistence, id) = fixture().await;
+        commit_rows(&mut persistence, vec![row(id, 1)]).await;
+        let tx = persistence.begin_test().await.expect("begin resolved read");
+        let state = tx.state().expect("state");
+        let scans = record_scans(&state).await;
+        let cached = tinyfs::CachingPersistence::new(state.clone());
+        let resolved = cached
+            .resolve_file_version(id, 1)
+            .await
+            .expect("resolve through wrapper")
+            .unwrap();
+        assert_eq!(resolved.info().size, 4096);
+        assert_eq!(
+            resolved
+                .read_range(3..10)
+                .await
+                .expect("resolved range")
+                .as_ref(),
+            &[1; 7]
+        );
+        assert_eq!(
+            scans.lock().expect("scans").len(),
+            1,
+            "wrapper must preserve backend resolution"
+        );
+
+        let ranged = state
+            .resolve_file_version(id, 1)
+            .await
+            .expect("resolve range")
+            .unwrap();
+        let streamed = cached
+            .resolve_file_version(id, 1)
+            .await
+            .expect("resolve stream")
+            .unwrap();
+        tx.commit_test().await.expect("close transaction");
+        scans.lock().expect("scans").clear();
+        assert!(
+            ranged
+                .read_range(0..1)
+                .await
+                .expect_err("closed range")
+                .to_string()
+                .contains("closed")
+        );
+        assert!(
+            streamed
+                .open()
+                .await
+                .err()
+                .expect("closed stream")
+                .to_string()
+                .contains("closed")
+        );
+        assert!(
+            scans.lock().expect("scans").is_empty(),
+            "closed handles must not query storage"
+        );
+    }
+
+    async fn materialize(
+        root_id: FileID,
+        context: &tinyfs::ProviderContext,
+        source: &str,
+        target: &str,
+    ) {
+        provider::factory::materialize_series::execute(
+            serde_json::json!({"source": source, "target": target, "time_column": "timestamp"}),
+            FactoryContext::new(context.clone(), root_id),
+            provider::ExecutionContext::pond_readwriter(Vec::new()),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("materialize {source} -> {target}: {error}"));
+    }
+
+    #[tokio::test]
+    async fn materialization_selfmon_format_axes_prune_before_execution() {
+        use datafusion::physical_plan::display::DisplayableExecutionPlan;
+        use datafusion::prelude::{col, lit};
+        use datafusion::scalar::ScalarValue;
+        use tokio::io::AsyncWriteExt;
+
+        for (field, unit, grouped, joined) in [
+            ("ts", "rfc3339", false, true),
+            ("timestamp", "rfc3339", true, false),
+            ("__REALTIME_TIMESTAMP", "microseconds", false, false),
+        ] {
+            let (_dir, mut persistence, _) = fixture().await;
+            let tx = persistence.begin_test().await.unwrap();
+            let root = tx.root().await.unwrap();
+            for second in 1..=3 {
+                let timestamp = if unit == "rfc3339" {
+                    format!("1970-01-01T00:00:0{second}Z")
+                } else {
+                    (second * 1_000_000).to_string()
+                };
+                let bytes = format!("{{\"{field}\":\"{timestamp}\",\"value\":1}}\n");
+                let mut writer = root
+                    .async_writer_path_with_type("/events.jsonl", EntryType::FilePhysicalSeries)
+                    .await
+                    .unwrap();
+                writer.write_all(bytes.as_bytes()).await.unwrap();
+                // Unknown-bound legacy versions must survive pruning.
+                if second != 1 {
+                    writer.set_temporal_metadata(
+                        second * 1_000_000,
+                        second * 1_000_000,
+                        field.to_owned(),
+                    );
+                    writer.set_exact_logical_attributes(
+                        serde_json::to_vec(&serde_json::json!({
+                            "watertown.timestamp_column": field,
+                            "watertown.timestamp_unit": unit,
+                        }))
+                        .unwrap(),
+                    );
+                }
+                writer.shutdown().await.unwrap();
+            }
+            let expression = if unit == "rfc3339" {
+                format!("CAST(\"{field}\" AS TIMESTAMP)")
+            } else {
+                format!("to_timestamp_micros(CAST(\"{field}\" AS BIGINT))")
+            };
+            let query = if grouped {
+                format!(
+                    "WITH typed AS (SELECT {expression} AS timestamp FROM source) \
+                    SELECT timestamp, COUNT(*) AS count FROM typed GROUP BY timestamp ORDER BY timestamp"
+                )
+            } else {
+                format!(
+                    "SELECT {expression} AS timestamp, CAST(value AS BIGINT) AS value FROM source ORDER BY timestamp"
+                )
+            };
+            let paths: &[&str] = if joined {
+                &["/typed", "/typed-other"]
+            } else {
+                &["/typed"]
+            };
+            for path in paths {
+                _ = root
+                    .create_dynamic_path(
+                        path,
+                        EntryType::TableDynamic,
+                        "sql-derived-series",
+                        serde_json::to_vec(&serde_json::json!({
+                            "patterns": {"source": "jsonlogs:///events.jsonl"},
+                            "locality": {
+                                "type": if grouped { "timestamp-grouped" } else { "timestamp-local" },
+                                "event_time": "timestamp", "input_event_time": field,
+                            },
+                            "query": query,
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            if joined {
+                _ = root
+                    .create_dynamic_path(
+                        "/joined",
+                        EntryType::TableDynamic,
+                        "timeseries-join",
+                        serde_json::to_vec(&serde_json::json!({
+                            "time_column": "timestamp",
+                            "inputs": [
+                                {"pattern": "series:///typed", "scope": "left"},
+                                {"pattern": "series:///typed-other", "scope": "right"},
+                            ],
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            tx.commit_test().await.unwrap();
+            let tx = persistence.begin_test().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let context = tx.state().unwrap().as_provider_context();
+            let api = provider::Provider::with_context(
+                Arc::new(context.filesystem()),
+                Arc::new(context.clone()),
+            )
+            .with_root(root.clone());
+            let url = if joined {
+                "series:///joined"
+            } else {
+                "series:///typed"
+            };
+            let session = &context.datafusion_session;
+            let full = api.create_provider_for_url(url, session).await.unwrap();
+            for lower in [3_000_000, 4_000_000] {
+                let predicate = col("timestamp")
+                    .gt_eq(lit(ScalarValue::TimestampMicrosecond(Some(lower), None)));
+                let expected = session
+                    .read_table(full.clone())
+                    .unwrap()
+                    .filter(predicate.clone())
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                let bounded = api
+                    .create_provider_for_url_bounded(
+                        url,
+                        session,
+                        tinyfs::SeriesReadBounds::from_event_time_lo(lower),
+                    )
+                    .await
+                    .unwrap();
+                let frame = session
+                    .read_table(bounded)
+                    .unwrap()
+                    .filter(predicate)
+                    .unwrap();
+                let plan = frame.clone().create_physical_plan().await.unwrap();
+                let display = DisplayableExecutionPlan::new(plan.as_ref())
+                    .indent(true)
+                    .to_string();
+                assert!(
+                    !display.contains("v2_"),
+                    "indexed old chunk was not pruned: {display}"
+                );
+                assert!(
+                    display.contains("v1_"),
+                    "unknown legacy chunk must remain: {display}"
+                );
+                assert_eq!(
+                    display.contains("v3_"),
+                    lower <= 3_000_000,
+                    "append/idle bounds must select only relevant indexed chunks: {display}"
+                );
+                assert_eq!(frame.collect().await.unwrap(), expected);
+            }
+            materialize(root.node_path().id(), &context, url, "/materialized").await;
+            tx.commit_test().await.unwrap();
+
+            // After a real commit, an idle tick and a strictly newer append must
+            // reuse the checkpoint: no historical verification and no fallback.
+            let root_id = root.node_path().id();
+            let mut target_versions = Vec::new();
+            for (label, append_second) in [("idle", None), ("append", Some(4_i64))] {
+                if let Some(second) = append_second {
+                    let tx = persistence.begin_test().await.unwrap();
+                    let root = tx.root().await.unwrap();
+                    let timestamp = if unit == "rfc3339" {
+                        format!("1970-01-01T00:00:0{second}Z")
+                    } else {
+                        (second * 1_000_000).to_string()
+                    };
+                    let mut writer = root
+                        .async_writer_path_with_type("/events.jsonl", EntryType::FilePhysicalSeries)
+                        .await
+                        .unwrap();
+                    writer
+                        .write_all(
+                            format!("{{\"{field}\":\"{timestamp}\",\"value\":1}}\n").as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    writer.set_temporal_metadata(
+                        second * 1_000_000,
+                        second * 1_000_000,
+                        field.to_owned(),
+                    );
+                    writer.set_exact_logical_attributes(
+                        serde_json::to_vec(&serde_json::json!({
+                            "watertown.timestamp_column": field,
+                            "watertown.timestamp_unit": unit,
+                        }))
+                        .unwrap(),
+                    );
+                    writer.shutdown().await.unwrap();
+                    tx.commit_test().await.unwrap();
+                }
+                let tx = persistence.begin_test().await.unwrap();
+                let context = tx.state().unwrap().as_provider_context();
+                materialize(root_id, &context, url, "/materialized").await;
+                let metrics = context.plan_visibility_metrics();
+                assert_eq!(
+                    (
+                        metrics.materialization_verifications,
+                        metrics.non_incremental_plans
+                    ),
+                    (0, 0),
+                    "{field} {label}: warm checkpoint must avoid historical verification: {metrics:?}"
+                );
+                target_versions.push(
+                    tx.root()
+                        .await
+                        .unwrap()
+                        .list_file_versions("/materialized")
+                        .await
+                        .unwrap()
+                        .len(),
+                );
+                tx.commit_test().await.unwrap();
+            }
+            assert_eq!(
+                target_versions[1],
+                target_versions[0] + 1,
+                "{field}: the strictly newer append adds exactly one target version"
+            );
+
+            let tx = persistence.begin_test().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let timestamp = if unit == "rfc3339" {
+                "1970-01-01T00:00:03Z"
+            } else {
+                "3000000"
+            };
+            let mut writer = root
+                .async_writer_path_with_type("/events.jsonl", EntryType::FilePhysicalSeries)
+                .await
+                .unwrap();
+            writer
+                .write_all(format!("{{\"{field}\":\"{timestamp}\",\"value\":1}}\n").as_bytes())
+                .await
+                .unwrap();
+            writer.set_temporal_metadata(3_000_000, 3_000_000, field.to_owned());
+            writer.set_exact_logical_attributes(
+                serde_json::to_vec(&serde_json::json!({
+                    "watertown.timestamp_column": field,
+                    "watertown.timestamp_unit": unit,
+                }))
+                .unwrap(),
+            );
+            writer.shutdown().await.unwrap();
+            let context = tx.state().unwrap().as_provider_context();
+            let error = provider::factory::materialize_series::execute(
+                serde_json::json!({
+                    "source": url, "target": "/materialized", "time_column": "timestamp",
+                }),
+                FactoryContext::new(context, root.node_path().id()),
+                provider::ExecutionContext::pond_readwriter(Vec::new()),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("rejects retroactive changes"),
+                "{field}: {error}"
+            );
+            tx.commit_test().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn materialization_rejects_recovered_join_input_without_advancing_target() {
+        use tinyfs::arrow::ParquetExt;
+        let (_dir, mut persistence, _) = fixture().await;
+        let batch = |timestamp| {
+            arrow::record_batch::RecordBatch::try_from_iter([
+                (
+                    "timestamp",
+                    Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                        timestamp,
+                    ])) as arrow::array::ArrayRef,
+                ),
+                (
+                    "value",
+                    Arc::new(Int64Array::from(vec![timestamp])) as arrow::array::ArrayRef,
+                ),
+            ])
+            .unwrap()
+        };
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        for path in ["/left", "/right"] {
+            _ = root
+                .write_series_from_batch(path, &batch(1), Some("timestamp"))
+                .await
+                .unwrap();
+        }
+        _ = root
+            .create_dynamic_path(
+                "/joined",
+                EntryType::TableDynamic,
+                "timeseries-join",
+                serde_yaml::to_string(&serde_json::json!({
+                    "time_column": "timestamp",
+                    "inputs": [
+                        {"pattern": "series:///left", "scope": "left"},
+                        {"pattern": "series:///right", "scope": "right"},
+                    ]
+                }))
+                .unwrap()
+                .into_bytes(),
+            )
+            .await
+            .unwrap();
+        let root_id = root.node_path().id();
+        tx.commit_test().await.unwrap();
+        let tx = persistence.begin_test().await.unwrap();
+        materialize(
+            root_id,
+            &tx.state().unwrap().as_provider_context(),
+            "series:///joined",
+            "/target",
+        )
+        .await;
+        tx.commit_test().await.unwrap();
+
+        // The right input's ingest failed, but the left input and target advance.
+        let tx = persistence.begin_test().await.unwrap();
+        _ = tx
+            .root()
+            .await
+            .unwrap()
+            .write_series_from_batch("/left", &batch(3), Some("timestamp"))
+            .await
+            .unwrap();
+        tx.commit_test().await.unwrap();
+        let tx = persistence.begin_test().await.unwrap();
+        materialize(
+            root_id,
+            &tx.state().unwrap().as_provider_context(),
+            "series:///joined",
+            "/target",
+        )
+        .await;
+        tx.commit_test().await.unwrap();
+
+        // Recovery includes both an older event and a same-time join correction.
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        for time in [2, 3] {
+            _ = root
+                .write_series_from_batch("/right", &batch(time), Some("timestamp"))
+                .await
+                .unwrap();
+        }
+        tx.commit_test().await.unwrap();
+        for _ in 0..2 {
+            let tx = persistence.begin_test().await.unwrap();
+            let context = tx.state().unwrap().as_provider_context();
+            let error = provider::factory::materialize_series::execute(
+                serde_json::json!({"source": "series:///joined", "target": "/target", "time_column": "timestamp"}),
+                FactoryContext::new(context, root_id),
+                provider::ExecutionContext::pond_readwriter(Vec::new()),
+            ).await.expect_err("recovered input must not be silently skipped");
+            assert!(
+                error.to_string().contains("rejects retroactive changes"),
+                "{error}"
+            );
+            assert_eq!(
+                tx.root()
+                    .await
+                    .unwrap()
+                    .list_file_versions("/target")
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+        let tx = persistence.begin_test().await.unwrap();
+        assert_eq!(
+            tx.root()
+                .await
+                .unwrap()
+                .list_file_versions("/target")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn materialization_preserves_columns_from_pruned_native_versions() {
+        use arrow::array::{ArrayRef, TimestampMicrosecondArray};
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use arrow::record_batch::RecordBatch;
+        use tinyfs::arrow::ParquetExt;
+
+        let (_dir, mut persistence, _) = fixture().await;
+        let batch = |timestamp| {
+            let mut fields = vec![Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            )];
+            let mut columns =
+                vec![Arc::new(TimestampMicrosecondArray::from(vec![timestamp])) as ArrayRef];
+            if timestamp == 1 {
+                fields.push(Field::new("retired", DataType::Int64, true));
+                columns.push(Arc::new(Int64Array::from(vec![Some(42)])));
+            }
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+        };
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        for timestamp in [1, 2] {
+            _ = root
+                .write_series_from_batch("/source.series", &batch(timestamp), Some("timestamp"))
+                .await
+                .unwrap();
+        }
+        _ = root
+            .create_dynamic_path(
+                "/local",
+                EntryType::TableDynamic,
+                "sql-derived-series",
+                serde_yaml::to_string(&serde_json::json!({
+                    "patterns": {"source": "series:///source.series"},
+                    "locality": {"type": "timestamp-local", "event_time": "timestamp"},
+                    "query": "SELECT timestamp, retired FROM source",
+                }))
+                .unwrap()
+                .into_bytes(),
+            )
+            .await
+            .unwrap();
+        let root_id = root.node_path().id();
+        let source_id = root.get_node_path("/source.series").await.unwrap().id();
+        tx.commit_test().await.unwrap();
+
+        let sources = [
+            ("series:///source.series", "/native.series"),
+            ("series:///local", "/derived.series"),
+        ];
+        for (source, target) in sources {
+            let tx = persistence.begin_test().await.unwrap();
+            let context = tx.state().unwrap().as_provider_context();
+            materialize(root_id, &context, source, target).await;
+            tx.commit_test().await.unwrap();
+        }
+        let tx = persistence.begin_test().await.unwrap();
+        _ = tx
+            .root()
+            .await
+            .unwrap()
+            .write_series_from_batch("/source.series", &batch(3), Some("timestamp"))
+            .await
+            .unwrap();
+        tx.commit_test().await.unwrap();
+
+        for (source, target) in sources {
+            for _ in 0..2 {
+                let tx = persistence.begin_test().await.unwrap();
+                let context = tx.state().unwrap().as_provider_context();
+                materialize(root_id, &context, source, target).await;
+                let root = tx.root().await.unwrap();
+                assert_eq!(root.list_file_versions(target).await.unwrap().len(), 2);
+                let provider = provider::Provider::with_context(
+                    Arc::new(context.filesystem()),
+                    Arc::new(context.clone()),
+                )
+                .with_root(root);
+                let table = provider
+                    .create_provider_for_url(
+                        &format!("series://{target}"),
+                        &context.datafusion_session,
+                    )
+                    .await
+                    .unwrap();
+                let output = context
+                    .datafusion_session
+                    .read_table(table)
+                    .unwrap()
+                    .sort(vec![datafusion::prelude::col("timestamp").sort(true, true)])
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                let output = arrow::compute::concat_batches(&output[0].schema(), &output).unwrap();
+                assert_eq!(output.num_rows(), 3);
+                let retired = output
+                    .column_by_name("retired")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                assert_eq!(retired.iter().collect::<Vec<_>>(), [Some(42), None, None]);
+                tx.commit_test().await.unwrap();
+            }
+        }
+
+        let tx = persistence.begin_test().await.unwrap();
+        let context = tx.state().unwrap().as_provider_context();
+        for selection in [
+            provider::VersionSelection::LatestVersion,
+            provider::VersionSelection::SpecificVersion(2),
+        ] {
+            let table = provider::create_table_provider(
+                source_id,
+                &context,
+                provider::TableProviderOptions {
+                    version_selection: selection,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                table.schema().field_with_name("retired").is_err(),
+                "explicit version selection must not inherit unrelated historical columns"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn materialization_bounds_native_and_declared_derived_sources_before_construction() {
+        use tinyfs::arrow::ParquetExt;
+
+        let (_dir, mut persistence, _) = fixture().await;
+        let batch = |time_column, timestamp| {
+            arrow::record_batch::RecordBatch::try_from_iter([
+                (
+                    time_column,
+                    Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                        timestamp,
+                    ])) as arrow::array::ArrayRef,
+                ),
+                (
+                    "value",
+                    Arc::new(Int64Array::from(vec![timestamp])) as arrow::array::ArrayRef,
+                ),
+            ])
+            .unwrap()
+        };
+        let sources = [
+            ("series:///source.series", "/native.series"),
+            ("series:///local", "/local.series"),
+            ("series:///joined", "/joined.series"),
+            ("series:///global", "/global.series"),
+            ("series:///renamed", "/renamed.series"),
+        ];
+        let tx = persistence.begin_test().await.expect("begin fixture");
+        let root = tx.root().await.expect("root");
+        for timestamp in 1..=16 {
+            _ = root
+                .write_series_from_batch(
+                    "/source.series",
+                    &batch("timestamp", timestamp),
+                    Some("timestamp"),
+                )
+                .await
+                .unwrap();
+            _ = root
+                .write_series_from_batch(
+                    "/other.series",
+                    &batch("timestamp", timestamp),
+                    Some("timestamp"),
+                )
+                .await
+                .unwrap();
+            _ = root
+                .write_series_from_batch(
+                    "/renamed-source.series",
+                    &batch("ts", timestamp),
+                    Some("ts"),
+                )
+                .await
+                .unwrap();
+        }
+        let source_id = root.get_node_path("/source.series").await.unwrap().id();
+        let renamed_source_id = root
+            .get_node_path("/renamed-source.series")
+            .await
+            .unwrap()
+            .id();
+        for (path, pattern, locality, query) in [
+            (
+                "/local",
+                "series:///source.series",
+                serde_json::json!({"type": "timestamp-local", "event_time": "timestamp"}),
+                "SELECT timestamp, value FROM source ORDER BY timestamp",
+            ),
+            (
+                "/global",
+                "series:///source.series",
+                serde_json::json!({"type": "global"}),
+                "SELECT timestamp, COUNT(*) OVER () AS total FROM source",
+            ),
+            (
+                "/renamed",
+                "series:///renamed-source.series",
+                serde_json::json!({
+                    "type": "timestamp-local", "event_time": "timestamp", "input_event_time": "ts"
+                }),
+                "WITH renamed AS (SELECT ts AS raw_time, value FROM source)
+                 SELECT raw_time AS timestamp, value FROM renamed ORDER BY timestamp",
+            ),
+        ] {
+            _ = root
+                .create_dynamic_path(
+                    path,
+                    EntryType::TableDynamic,
+                    "sql-derived-series",
+                    serde_yaml::to_string(&serde_json::json!({
+                        "patterns": {"source": pattern},
+                        "locality": locality, "query": query,
+                    }))
+                    .unwrap()
+                    .into_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        _ = root
+            .create_dynamic_path(
+                "/joined",
+                EntryType::TableDynamic,
+                "timeseries-join",
+                serde_yaml::to_string(&serde_json::json!({
+                    "time_column": "timestamp",
+                    "inputs": [
+                        {"pattern": "series:///local", "scope": "metrics"},
+                        {"pattern": "series:///other.series", "scope": "copy"}
+                    ],
+                }))
+                .unwrap()
+                .into_bytes(),
+            )
+            .await
+            .unwrap();
+        let root_id = root.node_path().id();
+        tx.commit_test().await.unwrap();
+        for (source, target) in sources {
+            let tx = persistence.begin_test().await.unwrap();
+            let context = tx.state().unwrap().as_provider_context();
+            materialize(root_id, &context, source, target).await;
+            tx.commit_test().await.unwrap();
+        }
+
+        let tx = persistence.begin_test().await.unwrap();
+        _ = tx
+            .root()
+            .await
+            .unwrap()
+            .write_series_from_batch("/source.series", &batch("timestamp", 17), Some("timestamp"))
+            .await
+            .unwrap();
+        _ = tx
+            .root()
+            .await
+            .unwrap()
+            .write_series_from_batch("/other.series", &batch("timestamp", 17), Some("timestamp"))
+            .await
+            .unwrap();
+        _ = tx
+            .root()
+            .await
+            .unwrap()
+            .write_series_from_batch("/renamed-source.series", &batch("ts", 17), Some("ts"))
+            .await
+            .unwrap();
+        tx.commit_test().await.unwrap();
+
+        for (source, target) in sources {
+            let tx = persistence.begin_test().await.unwrap();
+            let state = tx.state().unwrap();
+            let scans = record_scans(&state).await;
+            let context = state.as_provider_context();
+            if target == "/global.series" {
+                let error = provider::factory::materialize_series::execute(
+                    serde_json::json!({"source": source, "target": target, "time_column": "timestamp"}),
+                    FactoryContext::new(context.clone(), root_id),
+                    provider::ExecutionContext::pond_readwriter(Vec::new()),
+                )
+                .await
+                .expect_err("a changed global window must not leave a stale historical prefix");
+                assert!(
+                    error.to_string().contains("rejects retroactive changes"),
+                    "{error}"
+                );
+                assert_eq!(
+                    tx.root()
+                        .await
+                        .unwrap()
+                        .list_file_versions(target)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                continue;
+            }
+            materialize(root_id, &context, source, target).await;
+            if target != "/global.series" {
+                let source_id = if target == "/renamed.series" {
+                    renamed_source_id
+                } else {
+                    source_id
+                };
+                let scans = scans.lock().expect("scans");
+                for scan in scans.iter().filter(|scan| {
+                    scan.columns.iter().any(|column| column == "content")
+                        && scan.filters.contains(&source_id.node_id().to_string())
+                }) {
+                    assert!(
+                        scan.filters.contains("version = Int64(16)")
+                            || scan.filters.contains("version = Int64(17)"),
+                        "{source} constructed or read historical source payload before its watermark: {scan:?}"
+                    );
+                }
+            }
+            let root = tx.root().await.unwrap();
+            let query = provider::Provider::with_context(
+                Arc::new(context.filesystem()),
+                Arc::new(context.clone()),
+            )
+            .with_root(root.clone());
+            let table = query
+                .create_provider_for_url(&format!("series://{target}"), &context.datafusion_session)
+                .await
+                .unwrap();
+            let output = context
+                .datafusion_session
+                .read_table(table)
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                output.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                17,
+                "{source}"
+            );
+            tx.commit_test().await.unwrap();
+            let tx = persistence.begin_test().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let context = tx.state().unwrap().as_provider_context();
+            materialize(root_id, &context, source, target).await;
+            assert_eq!(
+                root.list_file_versions(target).await.unwrap().len(),
+                2,
+                "idle pass must not append"
+            );
+            tx.commit_test().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn materialization_preserves_rows_through_mismatched_and_unknown_input_axes() {
+        use tinyfs::arrow::ParquetExt;
+
+        let (_dir, mut persistence, _) = fixture().await;
+        let batch = |time| {
+            arrow::record_batch::RecordBatch::try_from_iter([
+                (
+                    "timestamp",
+                    Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                        time * 100,
+                    ])) as arrow::array::ArrayRef,
+                ),
+                (
+                    "ingest_time",
+                    Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![time]))
+                        as arrow::array::ArrayRef,
+                ),
+                (
+                    "value",
+                    Arc::new(Int64Array::from(vec![time])) as arrow::array::ArrayRef,
+                ),
+            ])
+            .unwrap()
+        };
+        let sources = [
+            ("series:///local", "/local-target.series"),
+            ("series:///grouped", "/grouped-target.series"),
+            ("series:///joined", "/joined-target.series"),
+            ("series:///nested", "/nested-target.series"),
+            ("series:///unknown", "/unknown-target.series"),
+        ];
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        for time in 1..=2 {
+            for (path, column) in [
+                ("/indexed.series", "ingest_time"),
+                ("/unknown.series", "ingest_time"),
+                ("/matched.series", "timestamp"),
+            ] {
+                _ = root
+                    .write_series_from_batch(path, &batch(time), Some(column))
+                    .await
+                    .unwrap();
+            }
+        }
+        let unknown_id = root.get_node_path("/unknown.series").await.unwrap().id();
+        for record in &mut tx.state().unwrap().inner.lock().await.records {
+            if record.node_id == unknown_id.node_id() {
+                record.extended_attributes = None;
+            }
+        }
+        for (path, source, locality, query) in [
+            (
+                "/local",
+                "series:///indexed.series",
+                "timestamp-local",
+                "SELECT timestamp, value FROM source",
+            ),
+            (
+                "/grouped",
+                "series:///indexed.series",
+                "timestamp-grouped",
+                "SELECT timestamp, SUM(value) AS value FROM source GROUP BY timestamp",
+            ),
+            (
+                "/unknown",
+                "series:///unknown.series",
+                "timestamp-local",
+                "SELECT timestamp, value FROM source",
+            ),
+        ] {
+            _ = root
+                .create_dynamic_path(
+                    path,
+                    EntryType::TableDynamic,
+                    "sql-derived-series",
+                    serde_yaml::to_string(&serde_json::json!({
+                        "patterns": {"source": source},
+                        "locality": {"type": locality, "event_time": "timestamp"},
+                        "query": query,
+                    }))
+                    .unwrap()
+                    .into_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        for (path, source) in [
+            ("/joined", "series:///indexed.series"),
+            ("/nested", "series:///local"),
+        ] {
+            _ = root
+                .create_dynamic_path(
+                    path,
+                    EntryType::TableDynamic,
+                    "timeseries-join",
+                    serde_yaml::to_string(&serde_json::json!({
+                        "time_column": "timestamp",
+                        "inputs": [
+                            {"pattern": source, "scope": "metrics"},
+                            {"pattern": "series:///matched.series", "scope": "copy"}
+                        ],
+                    }))
+                    .unwrap()
+                    .into_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        let root_id = root.node_path().id();
+        tx.commit_test().await.unwrap();
+        for (source, target) in sources {
+            let tx = persistence.begin_test().await.unwrap();
+            materialize(
+                root_id,
+                &tx.state().unwrap().as_provider_context(),
+                source,
+                target,
+            )
+            .await;
+            tx.commit_test().await.unwrap();
+        }
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        // Two separate chunks ensure keeping only the newest schema fallback
+        // cannot conceal an incorrectly pruned input.
+        for time in 3..=4 {
+            for (path, column) in [
+                ("/indexed.series", "ingest_time"),
+                ("/unknown.series", "ingest_time"),
+                ("/matched.series", "timestamp"),
+            ] {
+                _ = root
+                    .write_series_from_batch(path, &batch(time), Some(column))
+                    .await
+                    .unwrap();
+            }
+        }
+        for record in &mut tx.state().unwrap().inner.lock().await.records {
+            if record.node_id == unknown_id.node_id() {
+                record.extended_attributes = None;
+            }
+        }
+        tx.commit_test().await.unwrap();
+
+        for _ in 0..2 {
+            for (source, target) in sources {
+                let tx = persistence.begin_test().await.unwrap();
+                let context = tx.state().unwrap().as_provider_context();
+                materialize(root_id, &context, source, target).await;
+                let query = provider::Provider::with_context(
+                    Arc::new(context.filesystem()),
+                    Arc::new(context.clone()),
+                );
+                let table = query
+                    .create_provider_for_url(
+                        &format!("series://{target}"),
+                        &context.datafusion_session,
+                    )
+                    .await
+                    .unwrap();
+                let batches = context
+                    .datafusion_session
+                    .read_table(table)
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                let mut times: Vec<_> = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        batch
+                            .column_by_name("timestamp")
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+                            .unwrap()
+                            .values()
+                            .iter()
+                            .copied()
+                    })
+                    .collect();
+                times.sort_unstable();
+                assert_eq!(times, [100, 200, 300, 400], "{source}");
+                assert_eq!(
+                    tx.root()
+                        .await
+                        .unwrap()
+                        .list_file_versions(target)
+                        .await
+                        .unwrap()
+                        .len(),
+                    2,
+                    "idle materialization must not append for {source}"
+                );
+                tx.commit_test().await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn materialization_preserves_negative_nanoseconds_with_mixed_legacy_bounds() {
+        use tinyfs::arrow::ParquetExt;
+
+        let (_dir, mut persistence, _) = fixture().await;
+        let batch = |timestamp| {
+            arrow::record_batch::RecordBatch::try_from_iter([(
+                "timestamp",
+                Arc::new(arrow::array::TimestampNanosecondArray::from(vec![
+                    timestamp,
+                ])) as arrow::array::ArrayRef,
+            )])
+            .unwrap()
+        };
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        let root_id = root.node_path().id();
+        _ = root
+            .write_series_from_batch("/source.series", &batch(-900), Some("timestamp"))
+            .await
+            .unwrap();
+        let source_id = root.get_node_path("/source.series").await.unwrap().id();
+        let state = tx.state().unwrap();
+        materialize(
+            root_id,
+            &state.as_provider_context(),
+            "series:///source.series",
+            "/target.series",
+        )
+        .await;
+        let target_id = root.get_node_path("/target.series").await.unwrap().id();
+        // The old timestamp extractor truncated negative nanoseconds toward zero.
+        for record in &mut state.inner.lock().await.records {
+            if record.node_id == target_id.node_id() {
+                record.max_event_time = Some(0);
+            }
+        }
+        tx.commit_test().await.unwrap();
+
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        for timestamp in [-800, -100] {
+            _ = root
+                .write_series_from_batch("/source.series", &batch(timestamp), Some("timestamp"))
+                .await
+                .unwrap();
+        }
+        // New chunks may instead carry correctly floored microsecond bounds.
+        for record in &mut tx.state().unwrap().inner.lock().await.records {
+            if record.node_id == source_id.node_id() {
+                record.min_event_time = Some(-1);
+                record.max_event_time = Some(-1);
+            }
+        }
+        tx.commit_test().await.unwrap();
+
+        for _ in 0..2 {
+            let tx = persistence.begin_test().await.unwrap();
+            let context = tx.state().unwrap().as_provider_context();
+            materialize(
+                root_id,
+                &context,
+                "series:///source.series",
+                "/target.series",
+            )
+            .await;
+            let query = provider::Provider::with_context(
+                Arc::new(context.filesystem()),
+                Arc::new(context.clone()),
+            );
+            let table = query
+                .create_provider_for_url("series:///target.series", &context.datafusion_session)
+                .await
+                .unwrap();
+            let batches = context
+                .datafusion_session
+                .read_table(table)
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let mut values: Vec<_> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column_by_name("timestamp")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            values.sort_unstable();
+            assert_eq!(values, [-900, -800, -100]);
+            assert_eq!(
+                tx.root()
+                    .await
+                    .unwrap()
+                    .list_file_versions("/target.series")
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+            tx.commit_test().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn timestamp_grouped_materialization_keeps_complete_groups_and_bounds_reads() {
+        use tinyfs::arrow::ParquetExt;
+
+        let (_dir, mut persistence, _) = fixture().await;
+        let batch = |timestamp, value| {
+            arrow::record_batch::RecordBatch::try_from_iter([
+                (
+                    "timestamp",
+                    Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                        timestamp,
+                    ])) as arrow::array::ArrayRef,
+                ),
+                (
+                    "value",
+                    Arc::new(Int64Array::from(vec![value])) as arrow::array::ArrayRef,
+                ),
+            ])
+            .unwrap()
+        };
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        for time in 1..=8 {
+            _ = root
+                .write_series_from_batch("/source.series", &batch(time, time), Some("timestamp"))
+                .await
+                .unwrap();
+        }
+        let source_id = root.get_node_path("/source.series").await.unwrap().id();
+        _ = root.create_dynamic_path("/grouped", EntryType::TableDynamic, "sql-derived-series",
+            serde_yaml::to_string(&serde_json::json!({
+                "patterns": {"source": "series:///source.series"},
+                "locality": {"type": "timestamp-grouped", "event_time": "timestamp"},
+                "query": "SELECT timestamp, MAX(value) AS value, COUNT(*) AS samples FROM source GROUP BY timestamp ORDER BY timestamp",
+            })).unwrap().into_bytes()
+        ).await.unwrap();
+        let root_id = root.node_path().id();
+        tx.commit_test().await.unwrap();
+        let tx = persistence.begin_test().await.unwrap();
+        materialize(
+            root_id,
+            &tx.state().unwrap().as_provider_context(),
+            "series:///grouped",
+            "/target.series",
+        )
+        .await;
+        tx.commit_test().await.unwrap();
+        let tx = persistence.begin_test().await.unwrap();
+        let root = tx.root().await.unwrap();
+        for (time, value) in [(9, 10), (9, 90), (10, 110)] {
+            _ = root
+                .write_series_from_batch("/source.series", &batch(time, value), Some("timestamp"))
+                .await
+                .unwrap();
+        }
+        tx.commit_test().await.unwrap();
+
+        for _ in 0..2 {
+            let tx = persistence.begin_test().await.unwrap();
+            let state = tx.state().unwrap();
+            let context = state.as_provider_context();
+            let scans = record_scans(&state).await;
+            materialize(root_id, &context, "series:///grouped", "/target.series").await;
+            {
+                let scans = scans.lock().unwrap();
+                for scan in scans.iter().filter(|scan| {
+                    scan.columns.iter().any(|c| c == "content")
+                        && scan.filters.contains(&source_id.node_id().to_string())
+                }) {
+                    assert!(
+                        (8..=11).any(|version| scan
+                            .filters
+                            .contains(&format!("version = Int64({version})"))),
+                        "grouped materialization read old source payload: {scan:?}"
+                    );
+                }
+            }
+            let query = provider::Provider::with_context(
+                Arc::new(context.filesystem()),
+                Arc::new(context.clone()),
+            );
+            let table = query
+                .create_provider_for_url("series:///target.series", &context.datafusion_session)
+                .await
+                .unwrap();
+            let batches = context
+                .datafusion_session
+                .read_table(table)
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let output = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+            assert_eq!(output.num_rows(), 10);
+            let values = output
+                .column_by_name("value")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let counts = output
+                .column_by_name("samples")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let group = values
+                .values()
+                .iter()
+                .position(|value| *value == 90)
+                .expect("both time-9 chunks must contribute");
+            assert_eq!(counts.value(group), 2);
+            assert_eq!(context.plan_visibility_metrics().global_plans, 0);
+            assert_eq!(
+                tx.root()
+                    .await
+                    .unwrap()
+                    .list_file_versions("/target.series")
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+            tx.commit_test().await.unwrap();
+        }
+    }
+
+    fn assert_node_metadata_projection(
+        scans: &Arc<std::sync::Mutex<Vec<Scan>>>,
+        committed_version: Option<i64>,
+    ) {
+        let scans = scans.lock().expect("scans");
+        assert!(
+            scans
+                .iter()
+                .all(|scan| !scan.columns.iter().any(|column| column == "content")),
+            "node metadata must not read content: {scans:?}"
+        );
+        let outboards: Vec<_> = scans
+            .iter()
+            .filter(|scan| scan.columns.iter().any(|column| column == "bao_outboard"))
+            .collect();
+        if let Some(version) = committed_version {
+            assert_eq!(outboards.len(), 1, "{scans:?}");
+            assert!(
+                outboards[0]
+                    .filters
+                    .contains(&format!("version = Int64({version})")),
+                "only the selected revision's outboard may be read: {scans:?}"
+            );
+        } else {
+            assert!(
+                outboards.is_empty(),
+                "pending metadata needs no committed outboard: {scans:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn node_metadata_projects_only_selected_revision_and_merges_pending() {
+        let (_dir, mut persistence, id) = fixture().await;
+        let mut rows: Vec<_> = (1..=16)
+            .map(|version| {
+                let mut record = row(id, version);
+                record.bao_outboard = Some(vec![version as u8; 1024]);
+                record
+            })
+            .collect();
+        let mut foreign = row(id, 100);
+        foreign.pond_id = uuid7::uuid7().to_string();
+        rows.push(foreign.clone());
+        let directory =
+            FileID::new_in_partition(id.part_id(), EntryType::DirectoryPhysical, id.pond_id());
+        let symlink = FileID::new_in_partition(id.part_id(), EntryType::Symlink, id.pond_id());
+        rows.push(OplogEntry::new_inline(
+            directory,
+            10,
+            1,
+            b"directory content".to_vec(),
+            2,
+        ));
+        rows.push(OplogEntry::new_inline(
+            symlink,
+            20,
+            1,
+            b"/target".to_vec(),
+            2,
+        ));
+        commit_rows(&mut persistence, rows).await;
+
+        let tx = persistence.begin_test().await.expect("begin node metadata");
+        let state = tx.state().expect("state");
+        let scans = record_scans(&state).await;
+        let mut older_pending = row(id, 15);
+        older_pending.timestamp = 2000;
+        state
+            .inner
+            .lock()
+            .await
+            .records
+            .extend([older_pending, foreign]);
+        let metadata = state.metadata(id).await.expect("committed metadata");
+        assert_eq!(metadata.version, 16);
+        assert_eq!(metadata.timestamp, 984);
+        assert_eq!(metadata.size, Some(4096));
+        assert_eq!(metadata.bao_outboard, Some(vec![16; 1024]));
+        assert_node_metadata_projection(&scans, Some(16));
+
+        for (node, timestamp) in [(directory, 10), (symlink, 20)] {
+            scans.lock().expect("scans").clear();
+            let metadata = state.metadata(node).await.expect("non-file metadata");
+            assert_eq!(metadata.entry_type, node.entry_type());
+            assert_eq!(metadata.size, None);
+            assert_eq!(metadata.timestamp, timestamp);
+            assert_node_metadata_projection(&scans, Some(1));
+        }
+
+        // A newer timestamp at the same logical version must win, but an
+        // equal timestamp must retain the committed row's precedence.
+        let mut pending = row(id, 16);
+        pending.blake3 = Some("pending".to_string());
+        state.inner.lock().await.records.push(pending.clone());
+        assert_ne!(
+            state
+                .metadata(id)
+                .await
+                .expect("equal revision")
+                .blake3
+                .as_deref(),
+            Some("pending")
+        );
+        pending.timestamp += 1;
+        state.inner.lock().await.records.push(pending);
+        scans.lock().expect("scans").clear();
+        let metadata = state.metadata(id).await.expect("newer pending revision");
+        assert_eq!(metadata.blake3.as_deref(), Some("pending"));
+        assert_eq!(metadata.timestamp, 985);
+        assert_node_metadata_projection(&scans, None);
+    }
+
+    #[tokio::test]
+    async fn node_metadata_preserves_series_tail_and_reads_only_its_outboard() {
+        use utilities::bao_outboard::SeriesOutboard;
+
+        let (_dir, mut persistence, file) = fixture().await;
+        let id = FileID::new_in_partition(
+            file.part_id(),
+            EntryType::FilePhysicalSeries,
+            file.pond_id(),
+        );
+        let mut stream = Vec::new();
+        let mut rows = Vec::new();
+        for version in 1..=25 {
+            let mut record = row(id, version);
+            stream.extend_from_slice(record.content.as_ref().unwrap());
+            let mut outboard = SeriesOutboard::first_version(&stream);
+            outboard.version_size = 4096;
+            record.bao_outboard = Some(outboard.to_bytes());
+            rows.push(record);
+        }
+        let tail = rows[24].metadata();
+        for (version, lo, hi) in [(26, 1, 10), (27, 11, 20)] {
+            let mut merged = rows[hi as usize - 1].clone();
+            merged.version = version;
+            merged.collapsed_from = Some(lo);
+            merged.collapsed_through = Some(hi);
+            merged.content = Some(stream[(lo as usize - 1) * 4096..hi as usize * 4096].to_vec());
+            merged.size = Some((hi - lo + 1) * 4096);
+            rows.push(merged);
+        }
+        let empty = OplogEntry::new_small_file(id, 0, 28, Vec::new(), 2);
+        rows.push(empty.clone());
+        commit_rows(&mut persistence, rows).await;
+
+        let tx = persistence.begin_test().await.expect("begin tail metadata");
+        let state = tx.state().expect("state");
+        let scans = record_scans(&state).await;
+        let metadata = state.metadata(id).await.expect("stream tail");
+        assert_eq!(metadata, tail);
+        assert_eq!(metadata.version, 25);
+        assert_eq!(
+            SeriesOutboard::from_bytes(metadata.bao_outboard.as_ref().unwrap())
+                .unwrap()
+                .cumulative_size,
+            stream.len() as u64
+        );
+        assert_node_metadata_projection(&scans, Some(25));
+
+        let mut pending_run = row(id, 29);
+        pending_run.collapsed_from = Some(1);
+        pending_run.collapsed_through = Some(20);
+        let mut pending_empty = empty;
+        pending_empty.version = 30;
+        state
+            .inner
+            .lock()
+            .await
+            .records
+            .extend([pending_run, pending_empty]);
+        scans.lock().expect("scans").clear();
+        assert_eq!(
+            state
+                .metadata(id)
+                .await
+                .expect("tail with pending mid-stream merge"),
+            tail
+        );
+        assert_node_metadata_projection(&scans, Some(25));
+
+        let mut appended = row(id, 31);
+        stream.extend_from_slice(appended.content.as_ref().unwrap());
+        let mut outboard = SeriesOutboard::first_version(&stream);
+        outboard.version_size = 4096;
+        let expected_hash = blake3::Hash::from_bytes(outboard.cumulative_blake3)
+            .to_hex()
+            .to_string();
+        appended.bao_outboard = Some(outboard.to_bytes());
+        state.inner.lock().await.records.push(appended);
+        scans.lock().expect("scans").clear();
+        let metadata = state.metadata(id).await.expect("pending tail");
+        assert_eq!(metadata.version, 31);
+        assert_eq!(metadata.blake3.as_deref(), Some(expected_hash.as_str()));
+        assert_node_metadata_projection(&scans, None);
+    }
+
+    #[tokio::test]
+    async fn node_metadata_preserves_empty_missing_and_unwritten_states() {
+        let (_dir, mut persistence, file) = fixture().await;
+        let id = FileID::new_in_partition(
+            file.part_id(),
+            EntryType::FilePhysicalSeries,
+            file.pond_id(),
+        );
+        let empty = OplogEntry::new_small_file(id, 10, 1, Vec::new(), 2);
+        let mut unknown_size = row(id, 2);
+        unknown_size.size = None;
+        commit_rows(&mut persistence, vec![empty, unknown_size]).await;
+
+        let tx = persistence
+            .begin_test()
+            .await
+            .expect("begin empty metadata");
+        let state = tx.state().expect("state");
+        let scans = record_scans(&state).await;
+        let metadata = state.metadata(id).await.expect("fallback to latest row");
+        assert_eq!(metadata.version, 2);
+        assert_eq!(metadata.size, None);
+        assert_node_metadata_projection(&scans, Some(2));
+
+        state
+            .inner
+            .lock()
+            .await
+            .records
+            .push(OplogEntry::new_small_file(id, 1, 3, Vec::new(), 3));
+        let metadata = state.metadata(id).await.expect("pending empty fallback");
+        assert_eq!(metadata.version, 3);
+        assert_eq!(metadata.size, Some(0));
+        scans.lock().expect("scans").clear();
+        _ = state
+            .inner
+            .lock()
+            .await
+            .pending_files
+            .insert(file, EntryType::FilePhysicalVersion);
+        let metadata = state.metadata(file).await.expect("unwritten node");
+        assert_eq!(metadata.version, 0);
+        assert_eq!(metadata.size, Some(0));
+        assert!(scans.lock().expect("scans").is_empty());
+
+        let missing = FileID::new_in_partition(
+            file.part_id(),
+            EntryType::FilePhysicalVersion,
+            file.pond_id(),
+        );
+        assert!(matches!(
+            state.metadata(missing).await,
+            Err(tinyfs::Error::NotFound(_))
+        ));
     }
 }
 

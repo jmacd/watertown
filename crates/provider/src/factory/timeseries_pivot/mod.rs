@@ -212,7 +212,7 @@ impl TimeseriesPivotFile {
         let (source_tables, empty_sources) = inner
             .as_ref()
             .expect("inner initialized by ensure_inner")
-            .register_source_tables_bounded(id, context, bounds)
+            .register_source_tables_bounded(id, context, bounds, Some(&self.config.time_column))
             .await?;
         if !empty_sources.is_empty() {
             return Err(tinyfs::Error::Other(format!(

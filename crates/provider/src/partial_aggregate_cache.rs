@@ -143,8 +143,8 @@ pub fn merged_dir(cache_dir: &Path, cfg_hash: &str, node_id: &tinyfs::NodeID) ->
 //                              each build
 //       manifest.json          watermark + segment ranges + source content + digests
 //
-// Buckets below sealed_hi are frozen once and never rescanned, so per-build cost
-// is bounded to the hot window: the allowed-lateness tail plus whatever has
+// Ordinary appends reuse buckets below sealed_hi, so per-build source work is
+// limited to the hot window: the allowed-lateness tail plus whatever has
 // frozen since the last seal, bounded by output size or event-time span. The
 // alternative -- one mutable Parquet whose sealed prefix is rewritten every
 // build -- costs O(history) I/O per build.
@@ -167,17 +167,18 @@ pub fn merged_dir(cache_dir: &Path, cfg_hash: &str, node_id: &tinyfs::NodeID) ->
 ///
 /// Deliberately modest. The cost of raising it is that the hot window -- which is
 /// recomputed in full on every build -- carries the unsealed remainder, so the
-/// target bounds per-build work. 1 MiB keeps that recompute trivial while still
-/// collapsing hundreds of builds into one segment. Compaction is the right tool for
-/// making files genuinely large; this only has to stop the bleeding.
+/// target bounds accumulated output, not the cost of rebuilding its inputs.
+/// The time backstop below covers sparse output with expensive upstream work.
+/// Compaction is the right tool for making files genuinely large.
 pub const SEAL_TARGET_BYTES: u64 = 1024 * 1024;
 
-/// Maximum event-time span that may remain active below the byte target.
+/// Maximum sealable backlog in event-time seconds, excluding allowed lateness.
 ///
-/// Sparse derived output can stay small while remaining expensive to recreate
-/// from a much larger upstream graph. This backstop prevents compressed output
-/// size from leaving years of history in the recomputed hot window.
-pub const MAX_ACTIVE_SPAN_SECS: i64 = 30 * 24 * 60 * 60;
+/// Measured from the prior sealed frontier (or oldest bucket) to the
+/// lateness-adjusted watermark. Changed builds check this policy threshold;
+/// it is not a wall-clock timer or an absolute bound on input bytes/chunks.
+/// Changing it does not invalidate existing segment caches.
+pub const MAX_ACTIVE_SPAN_SECS: i64 = 24 * 60 * 60;
 
 /// The event-time span covered by one source version, in epoch MICROSECONDS.
 ///

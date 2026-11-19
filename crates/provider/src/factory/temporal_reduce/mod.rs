@@ -220,7 +220,8 @@ pub struct TemporalReduceConfig {
     /// a segment already sealed is correct at any target, so the new value simply
     /// governs the next seal. Exposed mainly so the tradeoff can be measured
     /// against real data -- larger means fewer files but a heavier hot-window
-    /// recompute each build.
+    /// recompute each build. The fixed sealable-backlog span backstop still
+    /// applies when output remains below this byte target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seal_target_bytes: Option<u64>,
 
@@ -232,9 +233,8 @@ pub struct TemporalReduceConfig {
     pub max_live_segments: Option<usize>,
 }
 
-/// The two knobs governing how the sealed layout advances, carried together so
-/// they stay in step: `lateness_secs` decides WHICH buckets may freeze, and
-/// `target_bytes` decides WHEN enough have frozen to be worth a file.
+/// Layout policy: lateness decides which buckets may freeze, the byte target
+/// and fixed span backstop decide when to seal, and compaction bounds fan-out.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SealPolicy {
     /// Maximum allowed lateness in seconds; recorded in the manifest because a
@@ -1566,22 +1566,23 @@ impl TemporalReduceSqlFile {
         // `hot_bytes` from the previous build is an upper bound on the seal's
         // size. Sparse derived output can remain below that target while its
         // upstream graph grows expensive to recreate, so event-time span is a
-        // second trigger. The active lower bound is the prior watermark after a
-        // seal, or the oldest bucket before the first seal.
-        let active_lo_secs = match (m.sealed_hi_secs, data_bounds) {
+        // second trigger. Only the sealable backlog counts toward this limit;
+        // the allowed-lateness tail remains in hot independently.
+        let unsealed_lo_secs = match (m.sealed_hi_secs, data_bounds) {
             (Some(sealed_hi), _) => Some(sealed_hi),
             (None, Some((data_lo, _))) => Some(data_lo),
             (None, None) => None,
         };
-        let active_span_large = match (active_lo_secs, watermark) {
-            (Some(active_lo), Some(wm)) => {
-                wm.saturating_sub(active_lo) >= crate::partial_aggregate_cache::MAX_ACTIVE_SPAN_SECS
+        let sealable_backlog_large = match (unsealed_lo_secs, watermark) {
+            (Some(unsealed_lo), Some(wm)) => {
+                wm.saturating_sub(unsealed_lo)
+                    >= crate::partial_aggregate_cache::MAX_ACTIVE_SPAN_SECS
             }
             _ => false,
         };
         if let Some(wm) = watermark
             && m.sealed_hi_secs.is_none_or(|sh| wm > sh)
-            && (m.hot_bytes >= policy.target_bytes || active_span_large)
+            && (m.hot_bytes >= policy.target_bytes || sealable_backlog_large)
         {
             let seal = pieces
                 .merge_partials_frame(
@@ -1615,8 +1616,8 @@ impl TemporalReduceSqlFile {
         }
 
         // Recompute the open hot window [sealed_hi, inf) from the current input --
-        // where new appends and within-window late data land. Bounded to
-        // ~allowed_lateness worth of buckets.
+        // where new appends and within-window late data land. It includes the
+        // allowed-lateness tail plus any backlog remaining below the seal gates.
         let hot = pieces
             .merge_partials_frame(
                 ctx.table(input_table).await.map_other()?,
@@ -2057,9 +2058,9 @@ impl TemporalReduceSqlFile {
     ///  - finer appended (not rebuilt) → advance this level (bounded seal + hot);
     ///  - finer rebuilt, or no compatible manifest → rebuild this level.
     ///
-    /// No beyond-window hard-fail is needed here: this level's watermark aligns
-    /// down at least as far as the finer level's (coarser interval, same
-    /// lateness), so `coarse_sealed_hi ≤ finer_sealed_hi`.
+    /// This level's eligible watermark aligns no later than the finer level's,
+    /// but seal gates can advance their actual frontiers on different builds.
+    /// Dirty-range propagation below keeps earlier coarse segments correct.
     ///
     /// `finer_changed` is what the finer level changed. Late data is NOT a
     /// rebuild -- it takes the finer level's incremental path -- so
@@ -4204,6 +4205,36 @@ fn unseal_from(
         .collect())
 }
 
+/// Preserve the ListingTable's rejection of incompatible field types, rather
+/// than letting UNION coerce them. Metadata is removed first: it does not
+/// affect compatibility, and `try_merge` rejects differing values for a key.
+fn check_source_schema_types(schemas: Vec<arrow::datatypes::Schema>) -> TinyFSResult<()> {
+    use arrow::datatypes::{DataType, Field, Fields, Schema};
+    fn strip(field: &Field) -> Field {
+        let data_type = match field.data_type() {
+            DataType::Struct(children) => DataType::Struct(
+                children
+                    .iter()
+                    .map(|child| strip(child))
+                    .collect::<Fields>(),
+            ),
+            DataType::List(child) => DataType::List(Arc::new(strip(child))),
+            DataType::LargeList(child) => DataType::LargeList(Arc::new(strip(child))),
+            DataType::FixedSizeList(child, size) => {
+                DataType::FixedSizeList(Arc::new(strip(child)), *size)
+            }
+            DataType::Map(child, sorted) => DataType::Map(Arc::new(strip(child)), *sorted),
+            other => other.clone(),
+        };
+        Field::new(field.name(), data_type, field.is_nullable())
+    }
+    let schemas = schemas
+        .iter()
+        .map(|schema| Schema::new(schema.fields().iter().map(|f| strip(f)).collect::<Fields>()));
+    _ = Schema::try_merge(schemas).map_other()?;
+    Ok(())
+}
+
 /// The cached source Parquets to aggregate, pruned to versions that can reach
 /// `read_lo_us` (epoch µs). `None` reads every live version.
 /// A provider over the pond-native Parquet source versions that a rebuild of
@@ -4225,10 +4256,8 @@ async fn builtin_source_provider(
         tinyfs::SeriesReadBounds::from_event_time_lo,
     );
 
-    // One source is the common case and takes the direct path, which also
-    // applies that node's per-file temporal bounds (data-quality filtering).
-    // The multi-URL path cannot carry per-file bounds, exactly as the
-    // format-cache route cannot.
+    // Keep per-node schema discovery ahead of row pruning, including for
+    // globs. A list of only the retained version URLs loses historical columns.
     if let [only] = source_ids {
         return crate::create_table_provider(
             *only,
@@ -4242,25 +4271,39 @@ async fn builtin_source_provider(
         .map_other();
     }
 
-    let mut urls = Vec::new();
+    let mut frames = Vec::with_capacity(source_ids.len());
+    let mut schemas = Vec::with_capacity(source_ids.len());
     for id in source_ids {
-        if let Some(u) = crate::pruned_version_urls(*id, context, bounds)
-            .await
-            .map_other()?
-        {
-            urls.extend(u);
-        }
+        let provider = crate::create_table_provider(
+            *id,
+            context,
+            crate::TableProviderOptions {
+                bounds,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_other()?;
+        schemas.push(provider.schema().as_ref().clone());
+        frames.push(
+            context
+                .datafusion_session
+                .read_table(provider)
+                .map_other()?,
+        );
     }
-    crate::create_table_provider(
-        source_ids[0],
-        context,
-        crate::TableProviderOptions {
-            additional_urls: urls,
-            ..Default::default()
-        },
-    )
-    .await
-    .map_other()
+    check_source_schema_types(schemas)?;
+    let mut frames = frames.into_iter();
+    let mut combined = frames.next().ok_or_else(|| {
+        tinyfs::Error::Other("temporal-reduce has no native source files".to_owned())
+    })?;
+    for frame in frames {
+        combined = combined.union_by_name(frame).map_other()?;
+    }
+    Ok(Arc::new(datafusion::catalog::view::ViewTable::new(
+        combined.logical_plan().clone(),
+        None,
+    )))
 }
 
 fn bounded_source_set(
@@ -4358,6 +4401,23 @@ mod tests {
     use crate::factory::test_support::{
         create_parquet_file, create_test_environment, test_context,
     };
+
+    #[test]
+    fn source_schema_check_ignores_metadata_but_rejects_type_conflicts() {
+        let tagged = |value: &str| {
+            let meta = HashMap::from([("unit".to_string(), value.to_string())]);
+            let inner = Field::new("v", DataType::Float64, true).with_metadata(meta.clone());
+            Schema::new(vec![
+                Field::new("value", DataType::Float64, true).with_metadata(meta.clone()),
+                Field::new("nested", DataType::Struct(vec![inner].into()), true),
+            ])
+            .with_metadata(meta)
+        };
+        check_source_schema_types(vec![tagged("C"), tagged("F")])
+            .expect("differing metadata must not block a multi-source reduction");
+        let conflicting = Schema::new(vec![Field::new("value", DataType::Utf8, true)]);
+        assert!(check_source_schema_types(vec![tagged("C"), conflicting]).is_err());
+    }
 
     fn cfg_with_aggs(aggregations: Vec<AggregationConfig>) -> TemporalReduceConfig {
         TemporalReduceConfig {
@@ -4520,6 +4580,7 @@ mod tests {
         let cache_dir = tempfile::tempdir().unwrap();
         let lineage = tinyfs::QueryLineage {
             recipe_identity: "pivot-recipe".to_owned(),
+            timestamp_local: false,
             leaves: vec![tinyfs::QuerySourceLeaf {
                 identity: "source:content-a".to_owned(),
                 min_event_time: Some(10),
@@ -4552,6 +4613,7 @@ mod tests {
 
         let changed = tinyfs::QueryLineage {
             recipe_identity: lineage.recipe_identity.clone(),
+            timestamp_local: false,
             leaves: vec![tinyfs::QuerySourceLeaf {
                 identity: "source:content-b".to_owned(),
                 min_event_time: Some(21),
@@ -7516,6 +7578,73 @@ output_aliases:
         Ok(rows)
     }
 
+    #[tokio::test]
+    async fn bounded_builtin_glob_preserves_columns_from_pruned_versions() {
+        use arrow::array::{ArrayRef, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use tinyfs::arrow::ParquetExt;
+
+        let (fs, context) = create_test_environment().await;
+        let root = fs.root().await.unwrap();
+        let old = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("timestamp", DataType::Int64, false),
+                Field::new("retired", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![42])),
+            ],
+        )
+        .unwrap();
+        _ = root
+            .write_series_from_batch("/a.series", &old, Some("timestamp"))
+            .await
+            .unwrap();
+        for (path, timestamp) in [("/a.series", 2), ("/b.series", 3)] {
+            let batch = RecordBatch::try_from_iter([(
+                "timestamp",
+                Arc::new(Int64Array::from(vec![timestamp])) as ArrayRef,
+            )])
+            .unwrap();
+            _ = root
+                .write_series_from_batch(path, &batch, Some("timestamp"))
+                .await
+                .unwrap();
+        }
+        let ids = [
+            root.get_node_path("/a.series").await.unwrap().id(),
+            root.get_node_path("/b.series").await.unwrap().id(),
+        ];
+        let provider = builtin_source_provider(&context, &ids, Some(2))
+            .await
+            .unwrap();
+        let batches = context
+            .datafusion_session
+            .read_table(provider)
+            .unwrap()
+            .select_columns(&["timestamp", "retired"])
+            .unwrap()
+            .sort(vec![col("timestamp").sort(true, true)])
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let batch = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .as_ref(),
+            &[2, 3]
+        );
+        assert_eq!(batch.column(1).null_count(), 2);
+    }
+
     /// Guards the invariant the freshness key rests on: a set of content
     /// digests is only a sound identity for the live version set if two live
     /// versions can never share a digest.
@@ -8068,19 +8197,10 @@ output_aliases:
         assert_eq!(on_disk.len(), live, "disk and manifest must agree");
     }
 
-    /// Four days of a handful of rows stay below both default seal triggers:
-    /// the byte target and the maximum active event-time span. No segment file
-    /// is written, yet the query still returns every day correctly from hot.
-    ///
-    /// This is the point of delaying small seals until the active span grows
-    /// large. Sealing used to fire whenever the watermark moved, so a pond
-    /// rebuilt on a timer grew one small file per build regardless of how little
-    /// data had arrived. The companion test
-    /// `test_sealed_runs_advance_as_history_grows` pins the mechanics with the
-    /// gate disabled; this one pins the policy, and together they show that
-    /// whether a bucket is sealed or hot is invisible to the answer.
+    /// Sparse output must seal after one day of eligible backlog, without
+    /// changing results or making older buckets immune to late correction.
     #[tokio::test]
-    async fn small_data_seals_nothing_yet_still_reads_correctly() {
+    async fn sparse_data_seals_daily_and_preserves_late_correction() {
         let _ = env_logger::try_init();
         let persistence = tinyfs::MemoryPersistence::default();
         let fs = tinyfs::FS::new(persistence.clone()).await.unwrap();
@@ -8101,30 +8221,46 @@ output_aliases:
 
         for day in 1..=4u32 {
             append_day_series(&fs, "/ingest/weather.csv", day).await;
+            set_day_bounds(&fs, "/ingest/weather.csv", day).await;
             let rows = daily_max(&reduce_ctx(&persistence, &cache_dir), default_target())
                 .await
                 .expect("append within lateness window must succeed");
             assert_eq!(rows.len(), day as usize, "day {day}: one bucket per day");
+            let manifests = walk_find(&cache_dir, &|n| n == "manifest.json");
+            assert_eq!(manifests.len(), 1);
+            let manifest: crate::partial_aggregate_cache::SegmentManifest =
+                serde_json::from_slice(&std::fs::read(&manifests[0]).unwrap()).unwrap();
+            if day < 3 {
+                assert!(
+                    manifest.segments.is_empty(),
+                    "no day of sealable backlog yet"
+                );
+            } else {
+                assert_eq!(
+                    manifest.sealed_hi_secs,
+                    Some(i64::from(day - 2) * 86_400),
+                    "sparse history must not wait weeks to seal"
+                );
+            }
         }
 
         let segs = walk_find(&cache_dir, &|n| {
             n.starts_with("seg-") && n.ends_with(".parquet")
         });
         assert!(
-            segs.is_empty(),
-            "a few rows per day is far under {} bytes, so nothing should have \
-             been sealed; found {:?}",
-            crate::partial_aggregate_cache::SEAL_TARGET_BYTES,
-            segs
+            !segs.is_empty(),
+            "the age trigger must seal below the byte target"
         );
 
-        // Unsealed does not mean unavailable: every day is still answered, from
-        // the hot window alone.
         let rows = daily_max(&reduce_ctx(&persistence, &cache_dir), default_target())
             .await
             .unwrap();
         let approx = |a: f64, b: f64| (a - b).abs() < 1e-9;
-        assert_eq!(rows.len(), 4, "all four days still present without any run");
+        assert_eq!(
+            rows.len(),
+            4,
+            "sealed and hot results must retain all four days"
+        );
         for (i, day) in (1..=4u32).enumerate() {
             assert!(
                 approx(rows[i], 43.5 + day as f64 * 100.0),
@@ -8132,15 +8268,24 @@ output_aliases:
             );
         }
 
-        // The buckets remain active, waiting to be written as one larger run
-        // rather than four tiny ones.
+        let sums = daily_max_col(
+            &reduce_ctx(&persistence, &cache_dir),
+            default_target(),
+            "temperature.sum",
+        )
+        .await
+        .unwrap();
+        for (i, day) in (1..=4u32).enumerate() {
+            assert!(
+                approx(sums[i], 768.0 + day as f64 * 2400.0),
+                "day {day} was lost or counted twice: {sums:?}"
+            );
+        }
+
         let manifests = walk_find(&cache_dir, &|n| n == "manifest.json");
         assert_eq!(manifests.len(), 1, "one manifest for the single resolution");
         let m: Value = serde_json::from_slice(&std::fs::read(&manifests[0]).unwrap()).unwrap();
-        assert!(
-            m["segments"].as_array().is_some_and(Vec::is_empty),
-            "manifest must record no segments: {m}"
-        );
+        assert!(!m["segments"].as_array().unwrap().is_empty());
 
         // The gate's INPUT must be the real size of hot, not a placeholder.
         // Everything above here is equally satisfied by hot_bytes == 0, which is
@@ -8150,10 +8295,7 @@ output_aliases:
         let hots = walk_find(&cache_dir, &|n| n == "hot.parquet");
         assert_eq!(hots.len(), 1, "one hot file for the single resolution");
         let on_disk = std::fs::metadata(&hots[0]).unwrap().len();
-        assert!(
-            on_disk > 0,
-            "hot.parquet is never empty; it holds four days"
-        );
+        assert!(on_disk > 0, "hot.parquet must retain the recent window");
         assert_eq!(
             m["hot_bytes"].as_u64(),
             Some(on_disk),
@@ -8163,6 +8305,46 @@ output_aliases:
             on_disk < crate::partial_aggregate_cache::SEAL_TARGET_BYTES,
             "the premise of this test is that hot is under the seal target"
         );
+
+        {
+            use tokio::io::AsyncWriteExt;
+            let root = fs.root().await.unwrap();
+            let mut writer = root
+                .async_writer_path_with_type("/ingest/weather.csv", EntryType::FilePhysicalSeries)
+                .await
+                .unwrap();
+            writer
+                .write_all(b"timestamp,temperature\n1970-01-01T12:30:00,999.0\n")
+                .await
+                .unwrap();
+            writer.shutdown().await.unwrap();
+            root.set_extended_attributes(
+                "/ingest/weather.csv",
+                HashMap::from([
+                    ("min_event_time".to_owned(), "45000000000".to_owned()),
+                    ("max_event_time".to_owned(), "45000000000".to_owned()),
+                ]),
+            )
+            .await
+            .unwrap();
+        }
+        let corrected = daily_max(&reduce_ctx(&persistence, &cache_dir), default_target())
+            .await
+            .unwrap();
+        assert_eq!(corrected.len(), 4);
+        assert!(
+            approx(corrected[0], 999.0),
+            "sealed day was not repaired: {corrected:?}"
+        );
+        let corrected_sums = daily_max_col(
+            &reduce_ctx(&persistence, &cache_dir),
+            default_target(),
+            "temperature.sum",
+        )
+        .await
+        .unwrap();
+        assert!(approx(corrected_sums[0], sums[0] + 999.0));
+        assert_eq!(&corrected_sums[1..], &sums[1..]);
     }
 
     /// A backfill that lands INSIDE the allowed_lateness window (nothing older
@@ -8353,6 +8535,202 @@ output_aliases:
                 expected_day_sum(day)
             );
         }
+    }
+
+    /// Seal gates fire per level, so sparse data under the one-day backlog gate
+    /// lets either level's sealed frontier pass the other's. A late correction
+    /// between the two frontiers is still hot in one level and sealed in the
+    /// other. Both levels must still equal a from-scratch rebuild, whichever
+    /// output file is built first after the correction.
+    #[tokio::test]
+    async fn crossed_seal_frontiers_repair_late_correction() {
+        let _ = env_logger::try_init();
+        for hourly_first in [false, true] {
+            crossed_seal_frontiers_case(hourly_first).await;
+        }
+    }
+
+    async fn crossed_seal_frontiers_case(hourly_first: bool) {
+        const H: i64 = 3600;
+        let persistence = tinyfs::MemoryPersistence::default();
+        let fs = tinyfs::FS::new(persistence.clone()).await.unwrap();
+        {
+            let root = fs.root().await.unwrap();
+            _ = root.create_dir_path("/ingest").await.unwrap();
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+
+        // The real default seal target, so only the one-day backlog gate seals.
+        let config = || TemporalReduceConfig {
+            resolutions: vec!["1h".to_string(), "1d".to_string()],
+            seal_target_bytes: None,
+            ..lateness_config(Some("1d"))
+        };
+
+        async fn append(fs: &tinyfs::FS, rows: &[(i64, f64)]) {
+            use tokio::io::AsyncWriteExt;
+            let mut csv = String::from("timestamp,temperature\n");
+            for (secs, v) in rows {
+                let ts = chrono::DateTime::from_timestamp(*secs, 0).unwrap();
+                csv.push_str(&format!("{},{v:.2}\n", ts.format("%Y-%m-%dT%H:%M:%S")));
+            }
+            let root = fs.root().await.unwrap();
+            let mut w = root
+                .async_writer_path_with_type("/ingest/weather.csv", EntryType::FilePhysicalSeries)
+                .await
+                .unwrap();
+            w.write_all(csv.as_bytes()).await.unwrap();
+            w.shutdown().await.unwrap();
+            let lo = rows.iter().map(|r| r.0).min().unwrap() * 1_000_000;
+            let hi = rows.iter().map(|r| r.0).max().unwrap() * 1_000_000;
+            root.set_extended_attributes(
+                "/ingest/weather.csv",
+                HashMap::from([
+                    ("min_event_time".to_owned(), lo.to_string()),
+                    ("max_event_time".to_owned(), hi.to_string()),
+                ]),
+            )
+            .await
+            .unwrap();
+        }
+
+        async fn bucket_sums(
+            provider_context: &crate::ProviderContext,
+            config: TemporalReduceConfig,
+            res: &str,
+        ) -> Vec<(i64, f64)> {
+            let context = test_context(provider_context, FileID::root());
+            let temporal_dir = TemporalReduceDirectory::new(config, context).unwrap();
+            let weather = temporal_dir
+                .create_handle()
+                .get("weather")
+                .await
+                .unwrap()
+                .unwrap();
+            let NodeType::Directory(weather_dir) = &weather.node_type else {
+                panic!("expected directory");
+            };
+            let node = weather_dir
+                .get(&format!("res={res}.series"))
+                .await
+                .unwrap()
+                .unwrap();
+            let NodeType::File(file_handle) = &node.node_type else {
+                panic!("expected file node");
+            };
+            let file_arc = file_handle.get_file().await;
+            let file_guard = file_arc.lock().await;
+            let table_provider = file_guard
+                .as_queryable()
+                .expect("queryable")
+                .as_table_provider(node.id, provider_context)
+                .await
+                .expect("table provider");
+            drop(file_guard);
+            let ctx = &provider_context.datafusion_session;
+            let table = format!("crossed_{res}");
+            _ = ctx.register_table(&table, table_provider).unwrap();
+            let batches = ctx
+                .sql(&format!(
+                    "SELECT to_unixtime(timestamp) AS secs, \"temperature.sum\" AS s \
+                     FROM {table} ORDER BY timestamp"
+                ))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            _ = ctx.deregister_table(&table).unwrap();
+            let mut out = Vec::new();
+            for b in &batches {
+                let secs = arrow::compute::cast(b.column(0), &DataType::Int64).unwrap();
+                let secs = secs
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .unwrap();
+                let sums = b.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+                for i in 0..b.num_rows() {
+                    out.push((secs.value(i), sums.value(i)));
+                }
+            }
+            out
+        }
+
+        let sealed_hi = |interval_secs: i64| -> Option<i64> {
+            let dir = format!("res{interval_secs}");
+            let manifests = walk_find(&cache_dir, &|n| n == "manifest.json");
+            let path = manifests
+                .iter()
+                .find(|p| p.parent().unwrap().ends_with(&dir))
+                .unwrap_or_else(|| panic!("no manifest for {dir}: {manifests:?}"));
+            let m: crate::partial_aggregate_cache::SegmentManifest =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            m.sealed_hi_secs
+        };
+        let frontiers = || (sealed_hi(H), sealed_hi(24 * H));
+
+        let hours = |r: std::ops::RangeInclusive<i64>| -> Vec<(i64, f64)> {
+            r.map(|h| (h * H, h as f64 + 0.25)).collect()
+        };
+        let mut all: Vec<(i64, f64)> = Vec::new();
+
+        // Data starts mid-day, so the hourly backlog is measured from 12:00 and
+        // the daily backlog from midnight: the two gates fire on different builds.
+        // Each step: (rows, expected (hourly, daily) sealed_hi after the build).
+        let steps = [
+            // Daily seals day 1; hourly backlog is only 18h.
+            (hours(12..=54), (None, Some(24 * H))),
+            // Hourly passes daily: [12h, 36h) is now a full day of backlog.
+            (hours(55..=60), (Some(36 * H), Some(24 * H))),
+            // Daily passes hourly again: it seals day 2; hourly has only 12h.
+            (hours(61..=72), (Some(36 * H), Some(48 * H))),
+        ];
+        for (rows, want) in steps {
+            append(&fs, &rows).await;
+            all.extend(rows);
+            _ = bucket_sums(&reduce_ctx(&persistence, &cache_dir), config(), "1d").await;
+            assert_eq!(frontiers(), want, "(hourly, daily) sealed_hi");
+        }
+
+        // Late, between the frontiers: hot in the hourly level, sealed in daily.
+        let late = (42 * H + 30 * 60, 999.0);
+        append(&fs, &[late]).await;
+        all.push(late);
+
+        let ctx = reduce_ctx(&persistence, &cache_dir);
+        let (hourly, daily) = if hourly_first {
+            let hourly = bucket_sums(&ctx, config(), "1h").await;
+            (hourly, bucket_sums(&ctx, config(), "1d").await)
+        } else {
+            let daily = bucket_sums(&ctx, config(), "1d").await;
+            (bucket_sums(&ctx, config(), "1h").await, daily)
+        };
+
+        let rebuild_dir = tempfile::tempdir().unwrap();
+        let rebuild_ctx = reduce_ctx(&persistence, rebuild_dir.path());
+        let rebuilt_daily = bucket_sums(&rebuild_ctx, config(), "1d").await;
+        let rebuilt_hourly = bucket_sums(&rebuild_ctx, config(), "1h").await;
+
+        let expected = |interval: i64| -> Vec<(i64, f64)> {
+            let mut m = std::collections::BTreeMap::<i64, f64>::new();
+            for (secs, v) in &all {
+                *m.entry(secs.div_euclid(interval) * interval).or_default() += v;
+            }
+            m.into_iter().collect()
+        };
+        let label = if hourly_first { "1h first" } else { "1d first" };
+        assert_eq!(daily, expected(24 * H), "{label}: daily sums");
+        assert_eq!(hourly, expected(H), "{label}: hourly sums");
+        assert_eq!(daily, rebuilt_daily, "{label}: daily vs rebuild");
+        assert_eq!(hourly, rebuilt_hourly, "{label}: hourly vs rebuild");
+        assert!(
+            daily.contains(&(
+                24 * H,
+                (24..48).map(|h| h as f64 + 0.25).sum::<f64>() + 999.0
+            )),
+            "{label}: sealed daily segment was not repaired: {daily:?}"
+        );
     }
 
     /// Changing `allowed_lateness` invalidates the sealed layout: the manifest

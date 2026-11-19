@@ -2964,6 +2964,7 @@ mod tests {
         let before = tinyfs::PlanVisibilityMetricsSnapshot {
             global_plans: 10,
             non_incremental_plans: 7,
+            materialization_verifications: 0,
             dynamic_source_executions: 4,
             bounded_dynamic_source_executions: 3,
             minimum_dynamic_event_time_lo: Some(100),
@@ -2974,6 +2975,7 @@ mod tests {
         let after = tinyfs::PlanVisibilityMetricsSnapshot {
             global_plans: 12,
             non_incremental_plans: 8,
+            materialization_verifications: 0,
             dynamic_source_executions: 7,
             bounded_dynamic_source_executions: 5,
             minimum_dynamic_event_time_lo: Some(50),

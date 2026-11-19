@@ -417,6 +417,10 @@ async fn write_entries(
                 bounds.max_timestamp,
                 config.timestamp_field.clone(),
             );
+            writer.set_exact_logical_attributes(crate::format::temporal_log_attributes(
+                &config.timestamp_field,
+                "microseconds",
+            ));
         }
 
         writer.shutdown().await.map_other()?;

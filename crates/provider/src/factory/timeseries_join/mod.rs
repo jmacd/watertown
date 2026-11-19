@@ -23,7 +23,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tinyfs::{FileHandle, FileID, Result as TinyFSResult};
+use tinyfs::{FileHandle, FileID, Result as TinyFSResult, ResultExt};
 
 /// Time range bounds for filtering
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,7 +224,7 @@ impl TimeseriesJoinFile {
         let (source_tables, empty_sources) = inner
             .as_ref()
             .expect("inner initialized by ensure_inner")
-            .register_source_tables_bounded(id, context, bounds)
+            .register_source_tables_bounded(id, context, bounds, Some(&self.config.time_column))
             .await?;
 
         let mut scope_groups: BTreeMap<String, Vec<(usize, datafusion::dataframe::DataFrame)>> =
@@ -324,6 +324,10 @@ crate::factory::lazy_sql_file::impl_lazy_sql_derived_file_metadata!(TimeseriesJo
 
 #[async_trait::async_trait]
 impl tinyfs::QueryableFile for TimeseriesJoinFile {
+    fn event_time_column(&self) -> Option<&str> {
+        Some(&self.config.time_column)
+    }
+
     async fn as_table_provider(
         &self,
         id: FileID,
@@ -385,10 +389,17 @@ impl tinyfs::QueryableFile for TimeseriesJoinFile {
         }
 
         let mut lineage = tinyfs::QueryLineage::new(recipe_hasher.finalize().to_hex().to_string());
+        lineage.timestamp_local = true;
         let fs = self.context.context.filesystem();
         let mut provider = crate::Provider::with_context(Arc::new(fs), Arc::new(context.clone()));
         provider = provider.with_root(root);
         for input in &self.config.inputs {
+            let axis = provider
+                .event_time_column_for_url(&input.pattern.to_string())
+                .await
+                .map_other_context("join lineage event-time axis")?;
+            lineage.timestamp_local &= input.transforms.as_ref().is_none_or(Vec::is_empty)
+                && axis.as_deref() == Some(self.config.time_column.as_str());
             let Some(nested) = provider
                 .query_lineage_for_url(&input.pattern.to_string())
                 .await

@@ -86,6 +86,8 @@ pub struct LogfileIngestConfig {
 
     /// JSON key holding the event time of a record, looked up at any depth in
     /// each line. Example: "timeUnixNano" for OTLP metrics JSON.
+    /// When configured, every parsed JSON record must contain usable values
+    /// for this key; missing or malformed timestamps reject the write.
     ///
     /// Absent by default, which leaves versions without event-time bounds.
     /// That is not free: `temporal-reduce` reads these bounds to decide which
@@ -96,13 +98,14 @@ pub struct LogfileIngestConfig {
     #[serde(default)]
     pub timestamp_field: Option<String>,
 
-    /// Unit of the `timestamp_field` values. OTLP's `timeUnixNano` is
-    /// nanoseconds; journald's `__REALTIME_TIMESTAMP` is microseconds.
+    /// Numeric unit or explicit string format for `timestamp_field`.
+    /// OTLP's `timeUnixNano` is nanoseconds; journald uses microseconds.
+    /// Use `rfc3339` for complete date-time strings with a UTC offset.
     #[serde(default)]
     pub timestamp_unit: TimestampUnit,
 }
 
-/// Unit of the values found under `timestamp_field`.
+/// Interpretation of the values found under `timestamp_field`.
 ///
 /// tlogfs records event times in microseconds, so everything is converted to
 /// that. Microseconds is the default because it is what tlogfs itself uses.
@@ -115,9 +118,21 @@ pub enum TimestampUnit {
     #[default]
     Microseconds,
     Nanoseconds,
+    /// RFC3339 date-time strings, including an explicit UTC offset.
+    Rfc3339,
 }
 
 impl TimestampUnit {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Seconds => "seconds",
+            Self::Milliseconds => "milliseconds",
+            Self::Microseconds => "microseconds",
+            Self::Nanoseconds => "nanoseconds",
+            Self::Rfc3339 => "rfc3339",
+        }
+    }
+
     /// Microseconds per unit.
     fn per_micro(self) -> (i64, bool) {
         // (factor, divide) -- divide when the unit is finer than a microsecond.
@@ -126,6 +141,8 @@ impl TimestampUnit {
             TimestampUnit::Milliseconds => (1_000, false),
             TimestampUnit::Microseconds => (1, false),
             TimestampUnit::Nanoseconds => (1_000, true),
+            // RFC3339 values are parsed directly into microsecond bounds.
+            TimestampUnit::Rfc3339 => (1, false),
         }
     }
 
@@ -194,105 +211,150 @@ impl LogfileIngestConfig {
 /// Event-time bounds of one version's content, in microseconds, `max`
 /// inclusive -- the shape `set_temporal_metadata` wants.
 ///
-/// Returns `None` only when *no* line yielded a usable timestamp, and the
-/// caller then writes the version without them (or fails, if the node declared
-/// itself temporal).
+/// Returns `None` when no timestamp is found or any parsed JSON record cannot
+/// be fully bounded. A configured temporal writer then rejects the version.
 ///
 /// The correctness condition is that the bounds cover every record the reader
 /// will actually produce from this content -- not every byte. Bounds that are
 /// too narrow would let the rollup skip buckets this content belongs to and
-/// silently keep stale aggregates, so this scan must not be *looser* than the
-/// reader. But it must not be *stricter* either: a line the reader discards
-/// contributes to no bucket, so excluding its unknown timestamp cannot narrow
-/// the bounds below the data that exists.
+/// silently keep stale aggregates. In particular, jsonlogs retains valid JSON
+/// objects even if their timestamp is missing or malformed; those records must
+/// invalidate the entire range, not just disappear from the accumulator.
 ///
-/// So this mirrors `format::batch::read_clean_lines` exactly -- same NUL
-/// stripping, same trim, same per-line skip -- and a corrupt line is dropped
-/// from the scan rather than abandoning it. That matters on real data: a
-/// single torn record in a 100 MB rotation (NUL padding from a crashed write,
-/// which the reader strips and recovers) would otherwise discard the event
-/// times of every other record in the file.
+/// Line cleanup matches `format::batch::read_clean_lines`: strip NULs, trim,
+/// and ignore blanks. Syntactically corrupt JSON that readers discard is still
+/// skipped, so a torn record does not invalidate the other records' bounds.
 ///
 /// Cost is proportional to the bytes being written, not to the file: the
 /// append path passes only the new tail.
+#[cfg(test)]
 fn scan_temporal_bounds(content: &[u8], field: &str, unit: TimestampUnit) -> Option<(i64, i64)> {
-    // Lossy rather than strict: invalid UTF-8 is corruption of the same kind
-    // as a torn line, and borrows without copying in the common valid case.
-    let text = String::from_utf8_lossy(content);
+    scan_temporal_bounds_detailed(content, field, unit).ok()
+}
+
+/// Why [`scan_temporal_bounds`] could not bound a slice.
+#[derive(Debug, PartialEq, Eq)]
+enum TemporalScanFailure {
+    /// A retained JSON record whose timestamp is missing or unusable.
+    /// `line` is 1-based and `offset` is the record's byte offset, both
+    /// relative to the scanned slice.
+    UnusableRecord { line: usize, offset: usize },
+    /// No record carries a timestamp, or a bound is out of range.
+    NoBounds,
+}
+
+fn scan_temporal_bounds_detailed(
+    content: &[u8],
+    field: &str,
+    unit: TimestampUnit,
+) -> Result<(i64, i64), TemporalScanFailure> {
     let mut acc: Option<(i64, i64)> = None;
     let mut skipped: u64 = 0;
+    let mut offset = 0usize;
 
-    for line in text.lines() {
-        // Strip NUL bytes (flash-storage corruption), as the reader does.
-        let cleaned: String = line.chars().filter(|c| *c != '\0').collect();
+    // Split on bytes rather than a lossy string so offsets stay exact even
+    // when invalid UTF-8 is replaced.
+    for (line_number, raw_line) in content.split(|b| *b == b'\n').enumerate() {
+        let line_offset = offset;
+        offset += raw_line.len() + 1;
+        // Lossy rather than strict: invalid UTF-8 is corruption of the same
+        // kind as a torn line. Strip NUL bytes (flash-storage corruption), as
+        // the reader does.
+        let cleaned: String = String::from_utf8_lossy(raw_line)
+            .chars()
+            .filter(|c| *c != '\0')
+            .collect();
         let trimmed = cleaned.trim();
         if trimmed.is_empty() {
             continue;
         }
 
-        // Fold into a per-line accumulator so a line carrying a malformed
-        // timestamp contributes nothing rather than a partial range.
-        let mut line_acc: Option<(i64, i64)> = None;
-        let parsed = serde_json::from_str::<Value>(trimmed)
-            .ok()
-            .filter(|value| fold_timestamps(value, field, &mut line_acc));
-
-        match parsed.and(line_acc) {
-            Some((lo, hi)) => {
-                acc = Some(match acc {
-                    Some((alo, ahi)) => (alo.min(lo), ahi.max(hi)),
-                    None => (lo, hi),
-                });
+        let value = match serde_json::from_str::<Value>(trimmed) {
+            Ok(value) => value,
+            Err(_) => {
+                skipped += 1;
+                continue;
             }
-            None => skipped += 1,
-        }
+        };
+        let mut line_acc: Option<(i64, i64)> = None;
+        let complete = fold_timestamps(&value, field, unit, &mut line_acc);
+        let Some((lo, hi)) = line_acc.filter(|_| complete) else {
+            log::warn!(
+                "logfile-ingest: JSON record on line {} has missing or unusable '{}' timestamps; refusing partial event-time bounds",
+                line_number + 1,
+                field
+            );
+            return Err(TemporalScanFailure::UnusableRecord {
+                line: line_number + 1,
+                offset: line_offset,
+            });
+        };
+        acc = Some(match acc {
+            Some((alo, ahi)) => (alo.min(lo), ahi.max(hi)),
+            None => (lo, hi),
+        });
     }
 
     if skipped > 0 {
         log::warn!(
-            "logfile-ingest: skipped {skipped} corrupt or timestamp-less line(s) while scanning event-time bounds for '{field}'"
+            "logfile-ingest: skipped {skipped} unparseable JSON line(s) while scanning event-time bounds for '{field}'"
         );
     }
 
-    let (min_raw, max_raw) = acc?;
-    Some((
-        unit.to_micros_floor(min_raw)?,
-        unit.to_micros_ceil(max_raw)?,
+    let (min_raw, max_raw) = acc.ok_or(TemporalScanFailure::NoBounds)?;
+    Ok((
+        unit.to_micros_floor(min_raw)
+            .ok_or(TemporalScanFailure::NoBounds)?,
+        unit.to_micros_ceil(max_raw)
+            .ok_or(TemporalScanFailure::NoBounds)?,
     ))
 }
 
 /// Fold every value stored under `field`, at any depth of `value`, into `acc`
 /// as a running (min, max).
 ///
-/// Returns false if a value under that key is not a usable number, which drops the
-/// line from the scan -- see `scan_temporal_bounds` for why that is preferred
-/// to guessing.
-fn fold_timestamps(value: &Value, field: &str, acc: &mut Option<(i64, i64)>) -> bool {
+/// Returns false if a value under that key is not usable in the configured
+/// representation, invalidating the version's bounds rather than guessing.
+fn fold_timestamps(
+    value: &Value,
+    field: &str,
+    unit: TimestampUnit,
+    acc: &mut Option<(i64, i64)>,
+) -> bool {
     match value {
         Value::Object(map) => {
             for (key, child) in map {
                 if key == field {
-                    // OTLP writes 64-bit times as JSON strings; journald and
-                    // plain numeric logs write them as numbers.
-                    let Some((lower, upper)) = timestamp_bounds(child) else {
+                    let Some((lower, upper)) = timestamp_bounds(child, unit) else {
                         return false;
                     };
                     *acc = Some(match *acc {
                         Some((lo, hi)) => (lo.min(lower), hi.max(upper)),
                         None => (lower, upper),
                     });
-                } else if !fold_timestamps(child, field, acc) {
+                } else if !fold_timestamps(child, field, unit, acc) {
                     return false;
                 }
             }
             true
         }
-        Value::Array(items) => items.iter().all(|v| fold_timestamps(v, field, acc)),
+        Value::Array(items) => items.iter().all(|v| fold_timestamps(v, field, unit, acc)),
         _ => true,
     }
 }
 
-fn timestamp_bounds(value: &Value) -> Option<(i64, i64)> {
+fn timestamp_bounds(value: &Value, unit: TimestampUnit) -> Option<(i64, i64)> {
+    if unit == TimestampUnit::Rfc3339 {
+        let timestamp = chrono::DateTime::parse_from_rfc3339(value.as_str()?).ok()?;
+        let lower = timestamp.timestamp_micros();
+        let upper = if timestamp.timestamp_subsec_nanos().is_multiple_of(1_000) {
+            lower
+        } else {
+            lower.checked_add(1)?
+        };
+        return Some((lower, upper));
+    }
+
     let integer = match value {
         Value::String(s) => s.parse::<i64>().ok(),
         Value::Number(n) => n.as_i64(),
@@ -359,25 +421,26 @@ fn complete_lines(slice: &[u8]) -> &[u8] {
     }
 }
 
-/// Record event-time bounds on a version about to be finalized, when the
-/// config asks for them.
-///
-/// Must be called after the content is written and before `shutdown`, which is
-/// when the metadata is folded into the oplog entry.
+/// Compute event-time bounds for a slice about to be ingested, when the config
+/// asks for them. Called before any writer is opened.
 ///
 /// Naming a `timestamp_field` is the operator saying "this node carries logs or
-/// metrics", so the requirement is declared on the writer before the scan runs.
-/// A slice whose bounds cannot then be determined fails the write rather than
-/// storing an unbounded version: with line-aligned slices the benign cause (a
-/// torn trailing line) can no longer occur, so what remains is a real problem
-/// -- the wrong field name, the wrong unit, or corrupt input -- and silently
-/// degrading it only reappears later as a slow, memory-hungry rollup.
-fn attach_temporal_bounds(
-    writer: &mut std::pin::Pin<Box<dyn tinyfs::FileMetadataWriter>>,
+/// metrics". A slice whose bounds cannot then be determined fails the ingest
+/// rather than storing an unbounded version: with line-aligned slices the
+/// benign cause (a torn trailing line) can no longer occur, so what remains is
+/// a real problem -- the wrong field name, the wrong unit, or corrupt input --
+/// and silently degrading it only reappears later as a slow, memory-hungry
+/// rollup. The error names the host file and absolute byte offset of the first
+/// unusable record so an operator can find it; the offset does not advance.
+///
+/// `source_offset` is the host-file byte offset at which `content` begins.
+fn temporal_bounds(
     config: &LogfileIngestConfig,
     content: &[u8],
     pond_dest: &str,
-) {
+    source: &std::path::Path,
+    source_offset: u64,
+) -> TinyFSResult<Option<(i64, i64)>> {
     let Some(field) = config.timestamp_field.as_deref() else {
         debug!(
             "No timestamp_field configured for {}; storing {} bytes with null event-time bounds. \
@@ -386,17 +449,57 @@ fn attach_temporal_bounds(
             pond_dest,
             content.len()
         );
+        return Ok(None);
+    };
+    let unit = config.timestamp_unit.as_str();
+    let end = source_offset + content.len() as u64;
+    match scan_temporal_bounds_detailed(content, field, config.timestamp_unit) {
+        Ok(bounds) => Ok(Some(bounds)),
+        Err(TemporalScanFailure::UnusableRecord { line, offset }) => {
+            Err(tinyfs::Error::Other(format!(
+                "logfile-ingest: refusing to ingest {} into {pond_dest}: the JSON record at byte \
+                 offset {} (line {line} of the new bytes [{source_offset}, {end})) has a missing \
+                 or unusable '{field}' timestamp for timestamp_unit '{unit}'. Nothing was written \
+                 and the ingest offset did not advance, so this file stays blocked: fix the \
+                 producer, then repair that record in the source log",
+                source.display(),
+                source_offset + offset as u64,
+            )))
+        }
+        Err(TemporalScanFailure::NoBounds) => Err(tinyfs::Error::Other(format!(
+            "logfile-ingest: refusing to ingest {} into {pond_dest}: no record in bytes \
+             [{source_offset}, {end}) has an in-range '{field}' timestamp for timestamp_unit \
+             '{unit}'. Nothing was written and the ingest offset did not advance; check \
+             timestamp_field and timestamp_unit",
+            source.display(),
+        ))),
+    }
+}
+
+/// Declare and attach bounds computed by [`temporal_bounds`]. Must be called
+/// after the content is written and before `shutdown`, which is when the
+/// metadata is folded into the oplog entry. The requirement stays declared on
+/// the writer so tlogfs still refuses an unbounded version.
+fn attach_temporal_bounds(
+    writer: &mut std::pin::Pin<Box<dyn tinyfs::FileMetadataWriter>>,
+    config: &LogfileIngestConfig,
+    bounds: Option<(i64, i64)>,
+    pond_dest: &str,
+) {
+    let Some(field) = config.timestamp_field.as_deref() else {
         return;
     };
-
     writer.require_temporal_metadata(field.to_string());
-
-    if let Some((min_us, max_us)) = scan_temporal_bounds(content, field, config.timestamp_unit) {
+    if let Some((min_us, max_us)) = bounds {
         debug!(
             "Temporal bounds for {}: [{}, {}] us from '{}'",
             pond_dest, min_us, max_us, field
         );
         writer.set_temporal_metadata(min_us, max_us, field.to_string());
+        writer.set_exact_logical_attributes(crate::format::temporal_log_attributes(
+            field,
+            config.timestamp_unit.as_str(),
+        ));
     }
 }
 
@@ -661,6 +764,8 @@ pub async fn execute(
                                 &config,
                                 active_filename,
                                 new_data,
+                                &matched_archived.path,
+                                pond_active.cumulative_size,
                             )
                             .await?;
                         }
@@ -1048,13 +1153,14 @@ async fn ingest_new_file(
 
     // Write file as FilePhysicalSeries - enables cumulative bao_outboard for append detection
     use tokio::io::AsyncWriteExt;
+    let bounds = temporal_bounds(config, content, &pond_dest, &host_file.path, 0)?;
     let mut writer = root
         .async_writer_path_with_type(&pond_dest, EntryType::FilePhysicalSeries)
         .await?;
 
     // Write content and finalize
     writer.write_all(content).await.map_other()?;
-    attach_temporal_bounds(&mut writer, config, content, &pond_dest);
+    attach_temporal_bounds(&mut writer, config, bounds, &pond_dest);
     writer.shutdown().await.map_other()?;
 
     info!("Wrote file to pond: {}", pond_dest);
@@ -1138,6 +1244,13 @@ async fn ingest_append(
         return Ok(0);
     }
 
+    let bounds = temporal_bounds(
+        config,
+        new_content,
+        &pond_dest,
+        &host_file.path,
+        pond_state.cumulative_size,
+    )?;
     let mut writer = root
         .async_writer_path_with_type(&pond_dest, EntryType::FilePhysicalSeries)
         .await?;
@@ -1145,7 +1258,7 @@ async fn ingest_append(
     // Write only the new content (as a new version in the FilePhysicalSeries)
     // The ChainedReader will concatenate all versions when reading
     writer.write_all(new_content).await.map_other()?;
-    attach_temporal_bounds(&mut writer, config, new_content, &pond_dest);
+    attach_temporal_bounds(&mut writer, config, bounds, &pond_dest);
     writer.shutdown().await.map_other()?;
 
     info!(
@@ -1225,6 +1338,8 @@ async fn append_to_active_pond_file(
     config: &LogfileIngestConfig,
     filename: &str,
     new_data: &[u8],
+    source: &std::path::Path,
+    source_offset: u64,
 ) -> Result<(), tinyfs::Error> {
     let pond_dest = format!("{}/{}", config.pond_path, filename);
 
@@ -1241,12 +1356,13 @@ async fn append_to_active_pond_file(
     // Write new version as FilePhysicalSeries
     // TinyFS automatically computes cumulative blake3 and bao_outboard
     use tokio::io::AsyncWriteExt;
+    let bounds = temporal_bounds(config, new_data, &pond_dest, source, source_offset)?;
     let mut writer = root
         .async_writer_path_with_type(&pond_dest, EntryType::FilePhysicalSeries)
         .await?;
 
     writer.write_all(new_data).await.map_other()?;
-    attach_temporal_bounds(&mut writer, config, new_data, &pond_dest);
+    attach_temporal_bounds(&mut writer, config, bounds, &pond_dest);
     writer.shutdown().await.map_other()?;
 
     info!("Appended missed bytes to pond file: {}", pond_dest);
@@ -1433,6 +1549,102 @@ mod tests {
     }
 
     #[test]
+    fn rfc3339_bounds_normalize_offsets_and_round_outward() {
+        let unit: TimestampUnit = serde_json::from_str("\"rfc3339\"").unwrap();
+        for (timestamp, expected) in [
+            ("1970-01-01T00:00:01Z", (1_000_000, 1_000_000)),
+            ("1970-01-01T01:00:00.0000005+01:00", (0, 1)),
+            ("1969-12-31T23:59:59.9999995Z", (-1, 0)),
+            ("1969-12-31T19:00:00-05:00", (0, 0)),
+        ] {
+            let content = format!(r#"{{"ts":"{timestamp}","committed.txn_ids":7}}"#);
+            assert_eq!(
+                scan_temporal_bounds(content.as_bytes(), "ts", unit),
+                Some(expected)
+            );
+        }
+        let nested = b"{\"samples\":[{\"timestamp\":\"1970-01-01T00:00:02.123456789Z\"}]}\n\
+                       {\"timestamp\":\"1970-01-01T01:00:00+01:00\",\"charged\":42}\n";
+        assert_eq!(
+            scan_temporal_bounds(nested, "timestamp", unit),
+            Some((0, 2_123_457))
+        );
+    }
+
+    #[test]
+    fn rfc3339_mode_is_explicit_and_requires_a_complete_zoned_timestamp() {
+        let unit: TimestampUnit = serde_json::from_str("\"rfc3339\"").unwrap();
+        for value in [
+            r#""1970-01-01""#,
+            r#""1970-01-01T00:00:00""#,
+            r#""2026-02-30T00:00:00Z""#,
+            r#""not a date""#,
+            r#""1000000""#,
+            "1000000",
+            "null",
+        ] {
+            let content = format!(r#"{{"ts":{value}}}"#);
+            assert_eq!(
+                scan_temporal_bounds(content.as_bytes(), "ts", unit),
+                None,
+                "{value}"
+            );
+        }
+        assert_eq!(
+            scan_temporal_bounds(
+                br#"{"ts":"1970-01-01T00:00:01Z"}"#,
+                "ts",
+                TimestampUnit::Seconds
+            ),
+            None,
+            "numeric modes must not silently reinterpret date strings"
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_json_records_must_not_be_excluded_from_bounds() {
+        use crate::format::{FormatProvider, jsonlogs::JsonLogsProvider};
+        use futures::StreamExt;
+        use std::io::Cursor;
+
+        for (unit, early, late) in [
+            (
+                TimestampUnit::Rfc3339,
+                "1970-01-01T00:00:01Z",
+                "1970-01-01T00:00:10Z",
+            ),
+            (TimestampUnit::Microseconds, "1000000", "10000000"),
+        ] {
+            let good = serde_json::json!({"ts": early});
+            for suspect in [
+                serde_json::json!({"ts": "not a timestamp"}),
+                serde_json::json!({"ts": null}),
+                serde_json::json!({"value": 7}),
+                serde_json::json!({"ts": late, "nested": {"ts": "not a timestamp"}}),
+                serde_json::json!({"ts": late, "nested": [{"ts": early}, {"ts": null}]}),
+            ] {
+                for records in [[&good, &suspect], [&suspect, &good]] {
+                    let content = format!("{}\n{}\n", records[0], records[1]);
+                    let (_, mut stream) = JsonLogsProvider::new()
+                        .open_stream(
+                            Box::pin(Cursor::new(content.as_bytes().to_vec())),
+                            &crate::Url::parse("jsonlogs:///mixed.jsonl").unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    let batch = stream.next().await.unwrap().unwrap();
+                    assert_eq!(batch.num_rows(), 2, "the reader retains both records");
+                    assert_eq!(
+                        scan_temporal_bounds(content.as_bytes(), "ts", unit),
+                        None,
+                        "partial bounds would omit a retained record: {content}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn fractional_timestamps_bound_whole_input_units() {
         for value in ["1700000000.789", "\"1700000000.789\"", "1.700000000789e9"] {
             let content = format!(r#"{{"ts":{value}}}"#);
@@ -1572,7 +1784,33 @@ mod tests {
     }
 
     #[test]
-    fn a_nonnumeric_timestamp_drops_the_line() {
+    fn unusable_record_location_is_exact_in_bytes() {
+        // Invalid UTF-8 and CRLF before the bad record must not shift its
+        // offset: lossy decoding changes byte lengths.
+        let content = b"{\"ts\":1}\r\n\xff\xfe torn\n\n{\"ts\":\"x\"}\n{\"ts\":2}\n";
+        let bad = content
+            .windows(10)
+            .position(|w| w == b"{\"ts\":\"x\"}")
+            .unwrap();
+        assert_eq!(
+            scan_temporal_bounds_detailed(content, "ts", TimestampUnit::Seconds),
+            Err(TemporalScanFailure::UnusableRecord {
+                line: 4,
+                offset: bad
+            })
+        );
+        assert_eq!(
+            scan_temporal_bounds_detailed(b"{\"value\":1}\n", "other", TimestampUnit::Seconds),
+            Err(TemporalScanFailure::UnusableRecord { line: 1, offset: 0 })
+        );
+        assert_eq!(
+            scan_temporal_bounds_detailed(b"not json\n", "ts", TimestampUnit::Seconds),
+            Err(TemporalScanFailure::NoBounds)
+        );
+    }
+
+    #[test]
+    fn a_nonnumeric_timestamp_invalidates_bounds() {
         let content =
             r#"{"resourceMetrics":[{"gauge":{"dataPoints":[{"timeUnixNano":"not-a-number"}]}}]}"#;
         assert_eq!(

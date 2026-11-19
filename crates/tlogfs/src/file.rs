@@ -669,9 +669,9 @@ impl AsyncWrite for OpLogFileWriter {
                                 return Err(tinyfs::Error::Other(format!(
                                     "FilePhysicalSeries declared temporal via \
                                      FileMetadataWriter::require_temporal_metadata('{column}') but \
-                                     was finalized without bounds: no usable '{column}' timestamp \
-                                     was found in {content_len} bytes. Check that the configured \
-                                     timestamp field matches the records being ingested."
+                                     was finalized without bounds: complete '{column}' event-time \
+                                     coverage was not established for {content_len} bytes. Check \
+                                     the configured timestamp field and the values in every record."
                                 )));
                             } else {
                                 // No extractor: nothing declared this series

@@ -31,11 +31,16 @@ use datafusion::prelude::{SessionContext, col, lit};
 use datafusion::scalar::ScalarValue;
 use log::{debug, info, warn};
 use query_foundation::frontier::{RepairPolicy, SettledState};
+use query_foundation::locality::ChangeExtent;
 use query_foundation::materialize::{
     MaterializationProgress, MaterializationPublication, materialize_stream_with_progress,
+    plan_materialization_change, verify_append_prefix,
 };
+use query_foundation::statistics::TimeInterval;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tinyfs::Result as TinyFSResult;
 use tinyfs::ResultExt;
@@ -295,7 +300,7 @@ fn target_watermark_from_metadata(
             };
             TargetWatermark::BoundedNanosecond {
                 lower: ScalarValue::TimestampNanosecond(Some(lower_ns), timezone.clone()),
-                lower_us: max_us,
+                lower_us: lower_ns.div_euclid(1_000),
             }
         }
         other => {
@@ -307,24 +312,13 @@ fn target_watermark_from_metadata(
     Ok(scalar)
 }
 
-/// The largest event time already materialized into `target`, or `None` when
-/// the target does not exist yet.
-///
-/// Every live physical-series version records its event-time maximum in epoch
-/// microseconds. Taking the maximum across all live versions remains correct
-/// after size-tiered collapse, unlike inspecting only the numerically newest
-/// version. Microsecond and coarser target types use that value directly.
-/// Nanosecond targets perform an exact `MAX` only over the metadata-selected
-/// tail because sub-microsecond precision is not present in the version bound.
-/// A legacy target with missing bounds falls back visibly to the full scan.
-async fn read_watermark(
+async fn target_versions(
     context: &FactoryContext,
     config: &MaterializeSeriesConfig,
-    source_time_type: &DataType,
-) -> Result<Option<ScalarValue>, tinyfs::Error> {
+) -> TinyFSResult<Vec<tinyfs::FileVersionInfo>> {
     let root = context.root().await?;
     if !root.exists(&config.target).await {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let metadata = root.metadata_for_path(&config.target).await?;
     if metadata.entry_type != tinyfs::EntryType::TablePhysicalSeries {
@@ -334,8 +328,61 @@ async fn read_watermark(
         )));
     }
 
-    let versions = root.list_file_versions(&config.target).await?;
-    let plan = target_watermark_from_metadata(&versions, &config.time_column, source_time_type)?;
+    root.list_file_versions(&config.target).await
+}
+
+/// `source_axis` is the source's resolved event-time column, computed once
+/// per `execute` because resolving it parses every source version's metadata.
+fn source_read_bounds(
+    config: &MaterializeSeriesConfig,
+    versions: &[tinyfs::FileVersionInfo],
+    source_axis: Option<&str>,
+) -> TinyFSResult<tinyfs::SeriesReadBounds> {
+    // The target's microsecond metadata is a conservative hint even before
+    // the source's timestamp type is known. The exact filter is applied later.
+    let hint = match target_watermark_from_metadata(
+        versions,
+        &config.time_column,
+        &DataType::Int64,
+    )? {
+        TargetWatermark::Empty => return Ok(tinyfs::SeriesReadBounds::NONE),
+        TargetWatermark::FullScan { reason } => {
+            warn!(
+                "materialize-series: source {} is unbounded because target metadata is incomplete: {reason}",
+                config.source
+            );
+            return Ok(tinyfs::SeriesReadBounds::NONE);
+        }
+        TargetWatermark::Exact(ScalarValue::Int64(Some(max_us))) => max_us,
+        _ => unreachable!("microsecond metadata hint is exact, empty or unavailable"),
+    };
+    if source_axis != Some(config.time_column.as_str()) {
+        warn!(
+            "materialize-series: source {} is unbounded: declared event-time column {:?} does not establish requested column {:?}",
+            config.source, source_axis, config.time_column
+        );
+        return Ok(tinyfs::SeriesReadBounds::NONE);
+    }
+    // Legacy nanosecond metadata truncated toward zero. Retain the preceding
+    // microsecond bin until the source type and exact target maximum are known.
+    let lower = if hint <= 0 {
+        hint.saturating_sub(1)
+    } else {
+        hint
+    };
+    Ok(tinyfs::SeriesReadBounds::from_event_time_lo(lower))
+}
+
+/// Resolve the exact target watermark from already-read version metadata.
+/// Nanosecond targets need a bounded tail scan; legacy metadata needs a visible
+/// full scan. Microsecond and coarser types normally require no target payload.
+async fn read_watermark(
+    context: &FactoryContext,
+    config: &MaterializeSeriesConfig,
+    versions: &[tinyfs::FileVersionInfo],
+    source_time_type: &DataType,
+) -> Result<Option<ScalarValue>, tinyfs::Error> {
+    let plan = target_watermark_from_metadata(versions, &config.time_column, source_time_type)?;
     match plan {
         TargetWatermark::Empty => return Ok(None),
         TargetWatermark::Exact(watermark) => {
@@ -401,6 +448,287 @@ async fn read_watermark(
     })
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceCheckpoint {
+    format: u32,
+    recipe: String,
+    target: String,
+    lineage: Option<tinyfs::QueryLineage>,
+}
+
+enum SourceChange {
+    Unchanged,
+    Append,
+    /// `removed` describes prior source leaves that are gone or changed. They
+    /// are named if verification rejects, because lost source rows are a
+    /// retroactive change that cannot be appended.
+    Verify {
+        lower_us: Option<i64>,
+        removed: Vec<String>,
+    },
+}
+
+impl SourceChange {
+    fn full() -> Self {
+        Self::Verify {
+            lower_us: None,
+            removed: Vec::new(),
+        }
+    }
+}
+
+/// Exact microsecond extent of a leaf, or `None` when it cannot bound a
+/// verification (unknown bounds or a nested recipe identity).
+fn leaf_range(leaf: &tinyfs::QuerySourceLeaf) -> TinyFSResult<Option<(i64, i64)>> {
+    if leaf.identity.starts_with("recipe:") {
+        return Ok(None);
+    }
+    let (Some(lo), Some(hi)) = (leaf.min_event_time, leaf.max_event_time) else {
+        return Ok(None);
+    };
+    if lo > hi {
+        return Err(tinyfs::Error::Other(format!(
+            "materialize-series: invalid source range [{lo}, {hi}] for {}",
+            leaf.identity
+        )));
+    }
+    Ok(Some((lo, hi)))
+}
+
+fn widen(extent: &mut Option<(i64, i64)>, (lo, hi): (i64, i64)) {
+    *extent = Some(match *extent {
+        None => (lo, hi),
+        Some((min, max)) => (min.min(lo), max.max(hi)),
+    });
+}
+
+fn describe_leaf(leaf: &tinyfs::QuerySourceLeaf) -> String {
+    match (leaf.min_event_time, leaf.max_event_time) {
+        (Some(lo), Some(hi)) => format!("{} [{lo}, {hi}]", leaf.identity),
+        _ => format!("{} [unbounded]", leaf.identity),
+    }
+}
+
+fn source_change(
+    prior: Option<&SourceCheckpoint>,
+    recipe: &str,
+    target: &str,
+    lineage: Option<&tinyfs::QueryLineage>,
+    watermark_us: Option<i64>,
+    matching_axis: bool,
+) -> TinyFSResult<SourceChange> {
+    let Some(prior) = prior.filter(|prior| prior.recipe == recipe && prior.target == target) else {
+        return Ok(SourceChange::full());
+    };
+    let (Some(before), Some(now)) = (prior.lineage.as_ref(), lineage) else {
+        return Ok(SourceChange::full());
+    };
+    if before == now {
+        return Ok(SourceChange::Unchanged);
+    }
+    if watermark_us.is_none()
+        || !matching_axis
+        || !now.timestamp_local
+        || before.recipe_identity != now.recipe_identity
+    {
+        return Ok(SourceChange::full());
+    }
+    let previous: BTreeMap<_, _> = before
+        .leaves
+        .iter()
+        .map(|leaf| (&leaf.identity, leaf))
+        .collect();
+    let current: BTreeMap<_, _> = now
+        .leaves
+        .iter()
+        .map(|leaf| (&leaf.identity, leaf))
+        .collect();
+    // Removal, replacement, repacking, or a rename out of the source pattern is
+    // never assumed to be an append. Timestamp locality confines its effect to
+    // the leaf's own event-time range, so a bounded leaf only needs an exact
+    // check from that range onward; an unbounded one needs all history.
+    let mut removed = Vec::new();
+    let mut removed_extent = None;
+    let mut removed_unbounded = false;
+    for (identity, leaf) in &previous {
+        if current.get(identity) == Some(leaf) {
+            continue;
+        }
+        removed.push(describe_leaf(leaf));
+        match leaf_range(leaf)? {
+            Some(range) => widen(&mut removed_extent, range),
+            None => removed_unbounded = true,
+        }
+    }
+    let mut extent = None;
+    for (identity, leaf) in &current {
+        if previous.get(identity) == Some(leaf) {
+            continue;
+        }
+        match leaf_range(leaf)? {
+            Some(range) => widen(&mut extent, range),
+            None => {
+                return Ok(SourceChange::Verify {
+                    lower_us: None,
+                    removed,
+                });
+            }
+        }
+    }
+    if removed_unbounded {
+        return Ok(SourceChange::Verify {
+            lower_us: None,
+            removed,
+        });
+    }
+    if let Some((removed_lo, _)) = removed_extent {
+        let lo = extent.map_or(removed_lo, |(added_lo, _)| added_lo.min(removed_lo));
+        return Ok(SourceChange::Verify {
+            lower_us: Some(lo.saturating_sub(1)),
+            removed,
+        });
+    }
+    let Some((lo, hi)) = extent else {
+        return Ok(SourceChange::full());
+    };
+    let prior = SettledState::try_new(watermark_us, watermark_us, RepairPolicy::reject())
+        .map_other_context("materialize-series: prior frontier")?;
+    let changed = ChangeExtent::Bounded(
+        TimeInterval::try_new(lo, hi).map_other_context("materialize-series: changed range")?,
+    );
+    match plan_materialization_change(prior, changed) {
+        Ok(_) => Ok(SourceChange::Append),
+        // Bounds are conservative microseconds. A same-bin nanosecond append
+        // or a filtered-out source row can still leave the exact prefix intact.
+        Err(_) => Ok(SourceChange::Verify {
+            lower_us: Some(lo.saturating_sub(1)),
+            removed: Vec::new(),
+        }),
+    }
+}
+
+async fn target_identity(
+    context: &FactoryContext,
+    config: &MaterializeSeriesConfig,
+    versions: &[tinyfs::FileVersionInfo],
+) -> TinyFSResult<String> {
+    if versions.is_empty() {
+        return Ok("empty".to_owned());
+    }
+    let root = context.root().await?;
+    let id = root.get_node_path(&config.target).await?.id();
+    let mut members = versions
+        .iter()
+        .map(|version| {
+            (
+                version.version,
+                version.timestamp,
+                version.size,
+                version.blake3.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    members.sort();
+    let bytes = serde_json::to_vec(&(id.to_string(), members))
+        .map_other_context("materialize-series: target identity")?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+async fn checkpoint_path(
+    context: &FactoryContext,
+    config: &MaterializeSeriesConfig,
+) -> TinyFSResult<Option<PathBuf>> {
+    let Some(cache) = context.context.cache_dir() else {
+        return Ok(None);
+    };
+    let key = format!(
+        "{}:{}",
+        context.root().await?.node_path().id(),
+        config.target
+    );
+    Ok(Some(cache.join(format!(
+        "materialize_{}.json",
+        blake3::hash(key.as_bytes()).to_hex()
+    ))))
+}
+
+async fn read_checkpoint(path: Option<&std::path::Path>) -> TinyFSResult<Option<SourceCheckpoint>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(tinyfs::Error::Other(format!(
+                "materialize-series: read checkpoint {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let checkpoint: SourceCheckpoint = serde_json::from_slice(&bytes).map_other_context(
+        format!("materialize-series: invalid checkpoint {}", path.display()),
+    )?;
+    if checkpoint.format != 1 {
+        return Err(tinyfs::Error::Other(format!(
+            "materialize-series: unsupported checkpoint format {} at {}",
+            checkpoint.format,
+            path.display()
+        )));
+    }
+    Ok(Some(checkpoint))
+}
+
+/// Express a microsecond lower bound in the watermark's own unit and timezone.
+/// Casting a timezone-less value would read it as local wall-clock time in a
+/// non-UTC zone, shifting the bound or making it NULL at a DST ambiguity.
+/// Coarser units round down so the verified window only widens.
+fn verification_lower_bound(watermark: &ScalarValue, lower_us: i64) -> TinyFSResult<ScalarValue> {
+    Ok(match watermark {
+        ScalarValue::Int64(_) => ScalarValue::Int64(Some(lower_us)),
+        ScalarValue::TimestampSecond(_, tz) => {
+            ScalarValue::TimestampSecond(Some(lower_us.div_euclid(1_000_000)), tz.clone())
+        }
+        ScalarValue::TimestampMillisecond(_, tz) => {
+            ScalarValue::TimestampMillisecond(Some(lower_us.div_euclid(1_000)), tz.clone())
+        }
+        ScalarValue::TimestampMicrosecond(_, tz) => {
+            ScalarValue::TimestampMicrosecond(Some(lower_us), tz.clone())
+        }
+        ScalarValue::TimestampNanosecond(_, tz) => ScalarValue::TimestampNanosecond(
+            Some(lower_us.checked_mul(1_000).ok_or_else(|| {
+                tinyfs::Error::Other(format!(
+                    "materialize-series: verification lower bound {lower_us}us overflows nanoseconds"
+                ))
+            })?),
+            tz.clone(),
+        ),
+        other => {
+            return Err(tinyfs::Error::Other(format!(
+                "materialize-series: unsupported verification watermark type {}",
+                other.data_type()
+            )));
+        }
+    })
+}
+
+fn prefix_frame(
+    frame: datafusion::dataframe::DataFrame,
+    time_column: &str,
+    watermark: &ScalarValue,
+    lower_us: Option<i64>,
+) -> TinyFSResult<datafusion::dataframe::DataFrame> {
+    let time = col(Column::from_name(time_column));
+    let mut predicate = time.clone().lt_eq(lit(watermark.clone()));
+    if let Some(lower) = lower_us {
+        predicate = predicate.and(time.gt_eq(lit(verification_lower_bound(watermark, lower)?)));
+    }
+    frame
+        .filter(predicate)
+        .map_other_context("materialize-series: verify prefix")
+}
+
 /// Append the source rows beyond the target's watermark as one new version.
 pub async fn execute(
     config: Value,
@@ -417,7 +745,64 @@ pub async fn execute(
     }
 
     let session = &context.context.datafusion_session;
-    let source = table_for(&context, &config.source.to_string(), session).await?;
+    let versions = target_versions(&context, &config).await?;
+    let recipe_bytes = serde_json::to_vec(&config)
+        .map_other_context("materialize-series: serialize recipe identity")?;
+    let recipe_id = blake3::hash(&recipe_bytes).to_hex().to_string();
+    let provider = crate::Provider::with_context(
+        Arc::new(context.context.filesystem()),
+        Arc::new(context.context.clone()),
+    )
+    .with_root(context.root().await?);
+    let mut lineage = provider
+        .query_lineage_for_url(&config.source.to_string())
+        .await
+        .map_other_context("materialize-series: source lineage")?;
+    if let Some(lineage) = &mut lineage {
+        lineage.leaves.sort_by(|left, right| {
+            (&left.identity, left.min_event_time, left.max_event_time).cmp(&(
+                &right.identity,
+                right.min_event_time,
+                right.max_event_time,
+            ))
+        });
+    }
+    let checkpoint_path = checkpoint_path(&context, &config).await?;
+    let prior = read_checkpoint(checkpoint_path.as_deref()).await?;
+    let target = target_identity(&context, &config, &versions).await?;
+    let hint =
+        match target_watermark_from_metadata(&versions, &config.time_column, &DataType::Int64)? {
+            TargetWatermark::Exact(ScalarValue::Int64(value)) => value,
+            _ => None,
+        };
+    let source_axis = provider
+        .event_time_column_for_url(&config.source.to_string())
+        .await
+        .map_other_context("materialize-series: source event-time contract")?;
+    let matching_axis = source_axis.as_deref() == Some(config.time_column.as_str());
+    let change = source_change(
+        prior.as_ref(),
+        &recipe_id,
+        &target,
+        lineage.as_ref(),
+        hint,
+        matching_axis,
+    )?;
+    if matches!(change, SourceChange::Unchanged) {
+        debug!(
+            "materialize-series: {} and its exact source snapshot are unchanged",
+            config.target
+        );
+        return Ok(());
+    }
+    let mut bounds = source_read_bounds(&config, &versions, source_axis.as_deref())?;
+    if let SourceChange::Verify { lower_us, .. } = change {
+        bounds.event_time_lo = match (bounds.event_time_lo, lower_us) {
+            (Some(current), Some(lower)) => Some(current.min(lower)),
+            _ => None,
+        };
+    }
+    let source = table_for_bounded(&context, &config.source.to_string(), session, bounds).await?;
     let mut frame = session
         .read_table(source)
         .map_err(|e| tinyfs::Error::Other(format!("materialize-series: read source: {e}")))?;
@@ -432,7 +817,63 @@ pub async fn execute(
         })?
         .data_type()
         .clone();
-    let watermark = read_watermark(&context, &config, &source_time_type).await?;
+    let watermark = read_watermark(&context, &config, &versions, &source_time_type).await?;
+    if let (Some(watermark), SourceChange::Verify { lower_us, removed }) = (&watermark, &change) {
+        context.context.record_materialization_verification();
+        if lower_us.is_none() {
+            context.context.record_non_incremental_plan();
+        }
+        let removed_note = if removed.is_empty() {
+            String::new()
+        } else {
+            const SHOWN: usize = 5;
+            let more = removed.len().saturating_sub(SHOWN);
+            format!(
+                "; {} source version(s) were removed or replaced since the last checkpoint \
+                 (for example by log rotation renaming an ingested file out of the source \
+                 pattern, or repacking): {}{}",
+                removed.len(),
+                removed[..removed.len().min(SHOWN)].join(", "),
+                if more > 0 {
+                    format!(", and {more} more")
+                } else {
+                    String::new()
+                }
+            )
+        };
+        warn!(
+            "materialize-series: verifying {} against source history before append; lower_us={lower_us:?}; \
+             missing/unproven checkpoints never authorize skipping historical changes{removed_note}",
+            config.target
+        );
+        let target = table_for_bounded(
+            &context,
+            &format!("series://{}", config.target),
+            session,
+            lower_us.map_or(
+                tinyfs::SeriesReadBounds::NONE,
+                tinyfs::SeriesReadBounds::from_event_time_lo,
+            ),
+        )
+        .await?;
+        let target = session
+            .read_table(target)
+            .map_other_context("materialize-series: verification target")?;
+        verify_append_prefix(
+            prefix_frame(frame.clone(), &config.time_column, watermark, *lower_us)?,
+            prefix_frame(target, &config.time_column, watermark, *lower_us)?,
+        )
+        .await
+        .map_other_context(format!(
+            "materialize-series: target {target} was not advanced{removed_note}. Recover by \
+             restoring the source, or by retargeting: set \
+             `target` to a new path in this factory's config, re-apply it with `pond mknod \
+             materialize-series <factory-node> --config-path <config> --overwrite`, and repoint \
+             consumers of {target}; the next run rebuilds the new target from source (see the \
+             materialize-series documentation, \"Recovering from a rejection\")",
+            target = config.target
+        ))?;
+    }
     if watermark.is_none() {
         context.context.record_non_incremental_plan();
         info!(
@@ -453,16 +894,27 @@ pub async fn execute(
         .sort_by(vec![col(Column::from_name(&config.time_column))])
         .map_err(|e| tinyfs::Error::Other(format!("materialize-series: sort: {e}")))?;
     let root = context.root().await?;
-    let recipe_bytes = serde_json::to_vec(&config)
-        .map_other_context("materialize-series: serialize recipe identity")?;
-    let recipe_id = blake3::hash(&recipe_bytes).to_hex().to_string();
     let after = watermark.as_ref().map(scalar_event_time_us).transpose()?;
-    let source_generation = context
-        .context
-        .persistence
-        .coherence_state()
-        .map(|state| state.generation());
-    let source_url = config.source.to_string();
+    // The frame already enforces the exact predicate. A second microsecond-only
+    // publication boundary would reject valid nanosecond rows in the same bin.
+    let publication_after = if matches!(
+        source_time_type,
+        DataType::Timestamp(TimeUnit::Nanosecond, _)
+    ) {
+        None
+    } else {
+        after
+    };
+    let source_state_id = match &lineage {
+        Some(lineage) => blake3::hash(
+            &serde_json::to_vec(lineage)
+                .map_other_context("materialize-series: source snapshot identity")?,
+        )
+        .to_hex()
+        .to_string(),
+        None => format!("untracked:{}", config.source),
+    };
+    let publication_recipe = recipe_id.clone();
     let stream = frame
         .execute_stream()
         .await
@@ -480,21 +932,34 @@ pub async fn execute(
             let source_max_us = output
                 .map(|output| output.event_time_bounds().max())
                 .or(after);
-            let source_state_id = format!(
-                "source={source_url};generation={source_generation:?};observed={source_max_us:?}"
-            );
             MaterializationProgress::try_new(
-                recipe_id,
+                publication_recipe,
                 source_state_id,
                 SettledState::try_new(source_max_us, source_max_us, RepairPolicy::reject())?,
             )
         },
-        MaterializationPublication::Append { after },
+        MaterializationPublication::Append {
+            after: publication_after,
+        },
         stream,
     )
     .await
     .map_err(|error| tinyfs::Error::Other(format!("materialize-series: publish: {error}")))?;
 
+    // This cache is not authoritative progress. It names exact target content,
+    // so a rollback, concurrent publication, or cache loss forces verification.
+    if let Some(path) = checkpoint_path {
+        let target_versions = target_versions(&context, &config).await?;
+        let checkpoint = SourceCheckpoint {
+            format: 1,
+            recipe: recipe_id,
+            target: target_identity(&context, &config, &target_versions).await?,
+            lineage,
+        };
+        crate::version_cache::write_cache_json(&path, &checkpoint)
+            .await
+            .map_other_context("materialize-series: publish source checkpoint")?;
+    }
     match outcome.output {
         Some(output) => info!(
             "materialize-series: appended {} row(s) in {} batch(es) to {} covering [{}, {}], peak batch {} row(s)",
@@ -624,7 +1089,7 @@ mod tests {
             watermark,
             TargetWatermark::BoundedNanosecond {
                 lower: ScalarValue::TimestampNanosecond(Some(-1_999), None),
-                lower_us: -1,
+                lower_us: -2,
             }
         ));
     }
@@ -683,8 +1148,268 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn materialization_verifies_legacy_targets_and_rejects_same_time_appends() {
+        for target_time_column in [Some("timestamp"), None] {
+            let (fs, context) = crate::factory::test_support::create_test_environment().await;
+            let cache = tempfile::tempdir().unwrap();
+            let context = context.with_cache_dir(cache.path().to_path_buf());
+            let root = fs.root().await.unwrap();
+            let batch = |values| {
+                RecordBatch::try_from_iter([(
+                    "timestamp",
+                    Arc::new(TimestampMicrosecondArray::from(values)) as arrow::array::ArrayRef,
+                )])
+                .unwrap()
+            };
+            _ = root
+                .write_series_from_batch("/source", &batch(vec![1, 2]), Some("timestamp"))
+                .await
+                .unwrap();
+            _ = root
+                .write_series_from_batch("/target", &batch(vec![1, 2]), target_time_column)
+                .await
+                .unwrap();
+            let config = MaterializeSeriesConfig {
+                source: crate::Url::parse("series:///source").unwrap(),
+                target: "/target".to_owned(),
+                time_column: "timestamp".to_owned(),
+            };
+            let factory = crate::factory::test_support::test_context(&context, FileID::root());
+            let run = || {
+                execute(
+                    serde_json::to_value(&config).unwrap(),
+                    factory.clone(),
+                    ExecutionContext::pond_readwriter(Vec::new()),
+                )
+            };
+            run().await.unwrap();
+            let path = checkpoint_path(&factory, &config).await.unwrap().unwrap();
+            std::fs::remove_file(&path).unwrap();
+            run()
+                .await
+                .expect("a consistent existing target can establish its checkpoint");
+            let checkpoint = std::fs::read(&path).unwrap();
+            _ = root
+                .write_series_from_batch("/source", &batch(vec![2]), Some("timestamp"))
+                .await
+                .unwrap();
+            let error = run()
+                .await
+                .expect_err("an extra event at the watermark must not disappear")
+                .to_string();
+            for expected in [
+                "rejects retroactive changes",
+                "target /target was not advanced",
+                "or by retargeting",
+                "--overwrite",
+            ] {
+                assert!(error.contains(expected), "missing {expected:?} in: {error}");
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), checkpoint);
+            assert_eq!(root.list_file_versions("/target").await.unwrap().len(), 1);
+            std::fs::remove_file(&path).unwrap();
+            assert!(
+                run().await.is_err(),
+                "an inconsistent legacy target must not be adopted"
+            );
+            assert!(!path.exists());
+        }
+    }
+
+    fn leaf(identity: &str, bounds: Option<(i64, i64)>) -> tinyfs::QuerySourceLeaf {
+        tinyfs::QuerySourceLeaf {
+            identity: identity.to_owned(),
+            min_event_time: bounds.map(|(lo, _)| lo),
+            max_event_time: bounds.map(|(_, hi)| hi),
+        }
+    }
+
+    fn lineage(leaves: Vec<tinyfs::QuerySourceLeaf>) -> tinyfs::QueryLineage {
+        let mut lineage = tinyfs::QueryLineage::new("pattern:test".to_owned());
+        lineage.timestamp_local = true;
+        lineage.leaves = leaves;
+        lineage
+    }
+
+    #[test]
+    fn verification_lower_bound_keeps_unit_and_timezone() -> TinyFSResult<()> {
+        let tz: Option<Arc<str>> = Some("America/Los_Angeles".into());
+        let lower_us = -1_500_001;
+        for (watermark, expected) in [
+            (
+                ScalarValue::TimestampNanosecond(Some(0), tz.clone()),
+                ScalarValue::TimestampNanosecond(Some(-1_500_001_000), tz.clone()),
+            ),
+            (
+                ScalarValue::TimestampMicrosecond(Some(0), tz.clone()),
+                ScalarValue::TimestampMicrosecond(Some(lower_us), tz.clone()),
+            ),
+            (
+                ScalarValue::TimestampMillisecond(Some(0), tz.clone()),
+                ScalarValue::TimestampMillisecond(Some(-1_501), tz.clone()),
+            ),
+            (
+                ScalarValue::TimestampSecond(Some(0), tz.clone()),
+                ScalarValue::TimestampSecond(Some(-2), tz.clone()),
+            ),
+            (
+                ScalarValue::Int64(Some(0)),
+                ScalarValue::Int64(Some(lower_us)),
+            ),
+        ] {
+            assert_eq!(verification_lower_bound(&watermark, lower_us)?, expected);
+        }
+        assert!(
+            verification_lower_bound(
+                &ScalarValue::TimestampNanosecond(Some(0), None),
+                i64::MAX / 10
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn removed_source_leaves_bound_verification_by_their_range() {
+        let prior = |leaves| SourceCheckpoint {
+            format: 1,
+            recipe: "r".to_owned(),
+            target: "t".to_owned(),
+            lineage: Some(lineage(leaves)),
+        };
+        let lower = |before: Vec<_>, now: Vec<_>| match source_change(
+            Some(&prior(before)),
+            "r",
+            "t",
+            Some(&lineage(now)),
+            Some(100),
+            true,
+        )
+        .unwrap()
+        {
+            SourceChange::Verify { lower_us, removed } => (lower_us, removed.len()),
+            _ => panic!("a removed leaf must be verified"),
+        };
+        let old = leaf("a:1", Some((0, 9)));
+        let b = leaf("b:1", Some((50, 60)));
+        // Removal alone re-proves only the removed range.
+        assert_eq!(
+            lower(vec![old.clone(), b.clone()], vec![old.clone()]),
+            (Some(49), 1)
+        );
+        // Repacking under a new identity starts from the earliest of both.
+        assert_eq!(
+            lower(
+                vec![old.clone(), b.clone()],
+                vec![old.clone(), leaf("c:1", Some((40, 60)))]
+            ),
+            (Some(39), 1)
+        );
+        // A removed leaf without bounds can have affected any time.
+        assert_eq!(
+            lower(vec![old.clone(), leaf("u:1", None)], vec![old.clone()]),
+            (None, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn materialization_bounds_repack_verification_and_names_lost_sources() {
+        let (fs, context) = crate::factory::test_support::create_test_environment().await;
+        let cache = tempfile::tempdir().unwrap();
+        let context = context.with_cache_dir(cache.path().to_path_buf());
+        let root = fs.root().await.unwrap();
+        let batch = |values| {
+            RecordBatch::try_from_iter([(
+                "timestamp",
+                Arc::new(TimestampMicrosecondArray::from(values)) as arrow::array::ArrayRef,
+            )])
+            .unwrap()
+        };
+        let src = root.create_dir_path("/src").await.unwrap();
+        let write = |path: &'static str, values: Vec<i64>| {
+            let root = root.clone();
+            let context = context.clone();
+            let (lo, hi) = (values[0], values[values.len() - 1]);
+            async move {
+                _ = root
+                    .write_series_from_batch(path, &batch(values), Some("timestamp"))
+                    .await
+                    .unwrap();
+                let id = root.get_node_path(path).await.unwrap().id();
+                context
+                    .persistence
+                    .set_extended_attributes(
+                        id,
+                        HashMap::from([
+                            ("min_event_time".to_owned(), lo.to_string()),
+                            ("max_event_time".to_owned(), hi.to_string()),
+                            (
+                                "extended_attributes".to_owned(),
+                                r#"{"watertown.timestamp_column":"timestamp"}"#.to_owned(),
+                            ),
+                        ]),
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        write("/src/a.series", vec![1, 2]).await;
+        write("/src/b.series", vec![10, 11]).await;
+        let config = MaterializeSeriesConfig {
+            source: crate::Url::parse("series:///src/*.series").unwrap(),
+            target: "/target".to_owned(),
+            time_column: "timestamp".to_owned(),
+        };
+        let factory = crate::factory::test_support::test_context(&context, FileID::root());
+        let run = || {
+            execute(
+                serde_json::to_value(&config).unwrap(),
+                factory.clone(),
+                ExecutionContext::pond_readwriter(Vec::new()),
+            )
+        };
+        run().await.unwrap();
+        run().await.unwrap();
+        let metrics = context.plan_visibility_metrics();
+        assert_eq!(metrics.materialization_verifications, 0);
+
+        // Repacking b's rows under a new identity is checked from b's range and passes.
+        src.remove_entry("b.series").await.unwrap();
+        write("/src/c.series", vec![10, 11]).await;
+        run().await.expect("repacked rows match the target");
+        let after = context.plan_visibility_metrics();
+        assert_eq!(after.materialization_verifications, 1);
+        assert_eq!(
+            after.non_incremental_plans, metrics.non_incremental_plans,
+            "a bounded removed leaf must not force a full-history check"
+        );
+        assert_eq!(root.list_file_versions("/target").await.unwrap().len(), 1);
+
+        // Losing rows the target already holds is rejected and names the source.
+        src.remove_entry("c.series").await.unwrap();
+        let error = run()
+            .await
+            .expect_err("rows lost from the source must not be ignored")
+            .to_string();
+        for expected in [
+            "rejects retroactive changes",
+            "1 source version(s) were removed or replaced",
+            "[10, 11]",
+            "or by retargeting",
+        ] {
+            assert!(error.contains(expected), "missing {expected:?} in: {error}");
+        }
+        assert_eq!(
+            context.plan_visibility_metrics().non_incremental_plans,
+            metrics.non_incremental_plans
+        );
+    }
+
+    #[tokio::test]
     async fn materialize_series_streams_and_skips_empty_versions() {
         let (fs, provider_context) = crate::factory::test_support::create_test_environment().await;
+        let cache = tempfile::tempdir().unwrap();
+        let provider_context = provider_context.with_cache_dir(cache.path().to_path_buf());
         let root = fs.root().await.unwrap();
         let schema = Arc::new(Schema::new(vec![
             Field::new(
@@ -787,7 +1512,7 @@ mod tests {
         let first = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
-                Arc::new(TimestampNanosecondArray::from(vec![1_001, 1_999])),
+                Arc::new(TimestampNanosecondArray::from(vec![1_001, 1_500])),
                 Arc::new(Float64Array::from(vec![10.0, 20.0])),
             ],
         )
@@ -827,8 +1552,8 @@ mod tests {
         let second = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(TimestampNanosecondArray::from(vec![2_001])),
-                Arc::new(Float64Array::from(vec![30.0])),
+                Arc::new(TimestampNanosecondArray::from(vec![1_999, 2_001])),
+                Arc::new(Float64Array::from(vec![30.0, 40.0])),
             ],
         )
         .unwrap();
@@ -865,13 +1590,91 @@ mod tests {
                     .copied()
             })
             .collect::<Vec<_>>();
-        assert_eq!(timestamps, vec![1_001, 1_999, 2_001]);
+        assert_eq!(timestamps, vec![1_001, 1_500, 1_999, 2_001]);
         assert_eq!(
             root.list_file_versions("/target-ns.series")
                 .await
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_does_not_prune_using_a_different_source_time_column() {
+        let (fs, provider_context) = crate::factory::test_support::create_test_environment().await;
+        let root = fs.root().await.unwrap();
+        let batch = |value| {
+            RecordBatch::try_from_iter([
+                (
+                    "timestamp",
+                    Arc::new(TimestampMicrosecondArray::from(vec![value]))
+                        as arrow::array::ArrayRef,
+                ),
+                (
+                    "other_time",
+                    Arc::new(TimestampMicrosecondArray::from(vec![value * 100]))
+                        as arrow::array::ArrayRef,
+                ),
+            ])
+            .unwrap()
+        };
+        let config = serde_json::json!({
+            "source": "series:///source.series",
+            "target": "/target.series",
+            "time_column": "other_time",
+        });
+        let context = crate::factory::test_support::test_context(&provider_context, FileID::root());
+        for values in [1..=2, 3..=4] {
+            for value in values {
+                _ = root
+                    .write_series_from_batch("/source.series", &batch(value), Some("timestamp"))
+                    .await
+                    .unwrap();
+                let id = root.get_node_path("/source.series").await.unwrap().id();
+                provider_context
+                    .persistence
+                    .set_extended_attributes(
+                        id,
+                        HashMap::from([
+                            ("min_event_time".to_owned(), value.to_string()),
+                            ("max_event_time".to_owned(), value.to_string()),
+                            (
+                                "extended_attributes".to_owned(),
+                                r#"{"watertown.timestamp_column":"timestamp"}"#.to_owned(),
+                            ),
+                        ]),
+                    )
+                    .await
+                    .unwrap();
+            }
+            execute(
+                config.clone(),
+                context.clone(),
+                ExecutionContext::pond_readwriter(Vec::new()),
+            )
+            .await
+            .unwrap();
+        }
+        let context = crate::factory::test_support::test_context(&provider_context, FileID::root());
+        let table = table_for(
+            &context,
+            "series:///target.series",
+            &provider_context.datafusion_session,
+        )
+        .await
+        .unwrap();
+        let output = provider_context
+            .datafusion_session
+            .read_table(table)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            output.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            4,
+            "a different temporal index must not hide valid rows"
         );
     }
 }

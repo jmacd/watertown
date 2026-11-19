@@ -61,6 +61,150 @@ mod integration_tests {
     use tinyfs::persistence::PersistenceLayer;
     use tokio::fs;
 
+    #[tokio::test]
+    async fn rfc3339_appends_preserve_legacy_versions_and_line_boundaries() {
+        async fn inspect(pond: &PondSimulator) -> (Vec<tinyfs::FileVersionInfo>, Vec<u8>) {
+            let mut persistence = crate::persistence::OpLogPersistence::open(
+                pond.store_path(),
+                pond.pond_id().to_string(),
+            )
+            .await
+            .unwrap();
+            let tx = persistence.begin_test().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let versions = root.list_file_versions("/logs/perf/app.log").await.unwrap();
+            let content = root
+                .read_file_path_to_vec("/logs/perf/app.log")
+                .await
+                .unwrap();
+            (versions, content)
+        }
+
+        let host = TempDir::new().unwrap();
+        let active = host.path().join("app.log");
+        let legacy = b"{\"ts\":\"1970-01-01T00:00:01Z\",\"read.seconds\":1}\n";
+        fs::write(&active, legacy).await.unwrap();
+        let mut config = LogfileIngestConfig {
+            active_pattern: active.to_str().unwrap().to_owned(),
+            archived_pattern: host.path().join("app-*.log").to_str().unwrap().to_owned(),
+            pond_path: "/logs/perf".to_owned(),
+            timestamp_field: None,
+            timestamp_unit: Default::default(),
+        };
+        let pond = PondSimulator::new(&config).await.unwrap();
+        pond.execute_factory(&config).await.unwrap();
+        let (before, _) = inspect(&pond).await;
+        assert_eq!(before.len(), 1);
+        assert!(
+            before[0]
+                .extended_metadata
+                .as_ref()
+                .is_none_or(|m| !m.contains_key("max_event_time"))
+        );
+
+        config.timestamp_field = Some("ts".to_owned());
+        config.timestamp_unit = serde_json::from_str("\"rfc3339\"").unwrap();
+        let second = b"{\"ts\":\"1970-01-01T00:00:02.0000005+00:00\",\"read.seconds\":2}\n";
+        let third = b"{\"ts\":\"1970-01-01T00:00:03.0000005Z\",\"read.seconds\":3}\n";
+        let split = third.len() - 3;
+        let mut content = [legacy.as_slice(), second.as_slice(), &third[..split]].concat();
+        fs::write(&active, &content).await.unwrap();
+        pond.execute_factory(&config).await.unwrap();
+        let (versions, stored) = inspect(&pond).await;
+        assert_eq!(versions.len(), 2);
+        assert_eq!(stored, [legacy.as_slice(), second.as_slice()].concat());
+        assert_eq!(versions[0].extended_metadata, before[0].extended_metadata);
+        assert_eq!(versions[0].blake3, before[0].blake3);
+        let metadata = versions[1].extended_metadata.as_ref().unwrap();
+        assert_eq!(metadata["min_event_time"], "2000000");
+        assert_eq!(metadata["max_event_time"], "2000001");
+        let attributes: serde_json::Value =
+            serde_json::from_str(&metadata["extended_attributes"]).unwrap();
+        assert_eq!(attributes["watertown.timestamp_column"], "ts");
+
+        pond.execute_factory(&config).await.unwrap();
+        assert_eq!(
+            inspect(&pond).await.0.len(),
+            2,
+            "a partial line must not create a version"
+        );
+        content.extend_from_slice(&third[split..]);
+        fs::write(&active, &content).await.unwrap();
+        pond.execute_factory(&config).await.unwrap();
+        let (versions, stored) = inspect(&pond).await;
+        assert_eq!(stored, content);
+        assert_eq!(versions.len(), 3);
+        let metadata = versions[2].extended_metadata.as_ref().unwrap();
+        assert_eq!(metadata["min_event_time"], "3000000");
+        assert_eq!(metadata["max_event_time"], "3000001");
+
+        let good_tail = b"{\"ts\":\"1970-01-01T00:00:04Z\",\"read.seconds\":4}\n";
+        for suspect in [
+            "{\"ts\":\"not a date\"}\n",
+            "{\"ts\":null}\n",
+            "{\"read.seconds\":5}\n",
+            "{\"ts\":\"1970-01-01T00:00:10Z\",\"nested\":{\"ts\":\"unrelated text\"}}\n",
+        ] {
+            let content = [stored.as_slice(), good_tail.as_slice(), suspect.as_bytes()].concat();
+            fs::write(&active, &content).await.unwrap();
+            let error = pond
+                .execute_factory(&config)
+                .await
+                .expect_err("mixed-validity timestamps must fail")
+                .to_string();
+            // The operator must be able to locate the record: host file,
+            // absolute byte offset, and the slice it was found in.
+            let record_offset = stored.len() + good_tail.len();
+            for expected in [
+                active.display().to_string(),
+                format!("byte offset {record_offset}"),
+                format!(
+                    "line 2 of the new bytes [{}, {})",
+                    stored.len(),
+                    content.len()
+                ),
+                "'ts' timestamp for timestamp_unit 'rfc3339'".to_owned(),
+                "ingest offset did not advance".to_owned(),
+            ] {
+                assert!(
+                    error.contains(&expected),
+                    "missing {expected:?} in: {error}"
+                );
+            }
+            let (after, after_failure) = inspect(&pond).await;
+            assert_eq!(after.len(), versions.len());
+            for (after, before) in after.iter().zip(&versions) {
+                assert_eq!(after.version, before.version);
+                assert_eq!(after.blake3, before.blake3);
+                assert_eq!(after.extended_metadata, before.extended_metadata);
+            }
+            assert_eq!(
+                after_failure, stored,
+                "a failed append must not alter committed content"
+            );
+        }
+
+        let repaired = b"{\"ts\":\"1970-01-01T00:00:10Z\",\"read.seconds\":5}\n";
+        let content = [stored.as_slice(), good_tail.as_slice(), repaired.as_slice()].concat();
+        fs::write(&active, &content).await.unwrap();
+        pond.execute_factory(&config).await.unwrap();
+        let (versions, after_retry) = inspect(&pond).await;
+        assert_eq!(
+            after_retry, content,
+            "retry must not skip any rejected bytes"
+        );
+        assert_eq!(versions.len(), 4);
+        let metadata = versions[3].extended_metadata.as_ref().unwrap();
+        assert_eq!(metadata["min_event_time"], "4000000");
+        assert_eq!(metadata["max_event_time"], "10000000");
+        pond.execute_factory(&config).await.unwrap();
+        assert_eq!(
+            inspect(&pond).await.0.len(),
+            4,
+            "idle retry must not append"
+        );
+    }
+
     /// Test fixture for simulating a growing logfile
     struct LogfileSimulator {
         _temp_dir: TempDir,

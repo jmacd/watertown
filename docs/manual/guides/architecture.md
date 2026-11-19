@@ -143,6 +143,29 @@ Arbitrary user SQL is conservatively global. The `timestamp-local`
 SQL-derived declaration is a validated, restricted projection/filter contract,
 not a way to label an arbitrary join or aggregate incremental.
 
+Local SQL must preserve its declared `event_time` value, including through CTEs.
+When the source column has a different name, set `locality.input_event_time`
+(otherwise it defaults to `event_time`). Renaming, identity casts, RFC3339 text
+parsing with `CAST(... AS TIMESTAMP)`, and integer epoch-microsecond parsing with
+`to_timestamp_micros(...)` are supported. Journal text may use
+`to_timestamp_micros(CAST("__REALTIME_TIMESTAMP" AS BIGINT))`. Arithmetic,
+replacement timestamps, and precision-reducing casts require `type: global`;
+declaring an input column does not authorize changing its value.
+
+`timestamp-grouped` additionally permits aggregation over complete groups of the
+exact, typed event time, not time buckets. It supports the same input mapping.
+Source-read bounds use the input column; the derived node advertises the output
+column. Missing or mismatched source time-axis metadata still causes a visible,
+unbounded event-time read.
+
+Rows within one timestamp group arrive in no guaranteed order, and bounded and
+full reads may order them differently. So `first_value`, `last_value`,
+`nth_value`, `array_agg`, and `string_agg` need an `ORDER BY` inside the
+aggregate. `any_value`, `approx_median`, and `approx_percentile_cont` are
+rejected; use `MEDIAN` or `PERCENTILE_CONT`. Order-insensitive aggregates such as
+`MAX`, `MIN`, `SUM`, `COUNT`, and `AVG` are unrestricted. Choose an ordering
+that is unique within the group, because ties keep their scan order.
+
 Eligible derived nodes expose recursive source lineage so downstream
 reductions can identify unchanged physical inputs without executing the entire
 derived query. When a node cannot supply that contract, do not manufacture a

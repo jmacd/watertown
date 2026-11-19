@@ -262,8 +262,8 @@ async fn sparse_dynamic_reduction_seals_by_active_span_and_bounds_the_next_appen
         _ = root.create_dir_path("/sources").await.unwrap();
         _ = root.create_dir_path("/combined").await.unwrap();
         _ = root.create_dir_path("/singled").await.unwrap();
-        let samples_a = source_samples(&[(DAY_US, 10.0), (20 * DAY_US, 11.0), (40 * DAY_US, 12.0)]);
-        let samples_b = source_samples(&[(DAY_US, 20.0), (20 * DAY_US, 21.0), (40 * DAY_US, 22.0)]);
+        let samples_a = source_samples(&[(DAY_US, 10.0), (2 * DAY_US, 11.0), (3 * DAY_US, 12.0)]);
+        let samples_b = source_samples(&[(DAY_US, 20.0), (2 * DAY_US, 21.0), (3 * DAY_US, 22.0)]);
         _ = root
             .create_series_from_batch("/sources/a.series", &samples_a, Some("timestamp"))
             .await
@@ -344,19 +344,54 @@ async fn sparse_dynamic_reduction_seals_by_active_span_and_bounds_the_next_appen
         !manifest.segments.is_empty(),
         "a sparse graph spanning more than the active-span limit must seal history"
     );
-    assert!(
-        manifest.sealed_hi_secs.is_some(),
-        "sealing must establish the lower bound for the next source execution"
-    );
+    assert_eq!(manifest.sealed_hi_secs, Some(2 * DAY_US / 1_000_000));
+    let sealed_files = |snapshot: BTreeMap<PathBuf, Vec<u8>>| {
+        snapshot
+            .into_iter()
+            .filter(|(path, _)| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("seg-")
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let sealed_before = sealed_files(cache_snapshot(&cache_dir));
 
-    {
+    for hour in 1..=3 {
         let tx = persistence.begin_test().await.unwrap();
         let root = tx.root().await.unwrap();
-        append_source(&root, "/sources/a.series", 41 * DAY_US, 30.0).await;
+        append_source(
+            &root,
+            "/sources/a.series",
+            3 * DAY_US + hour * 3_600_000_000,
+            30.0 + hour as f64,
+        )
+        .await;
         tx.commit_test().await.unwrap();
+        let (rows, columns, metrics) = query_reduced(&mut persistence).await;
+        assert_eq!(rows, 3 + hour as usize);
+        assert_eq!(columns, cold_columns);
+        assert_eq!(metrics.bounded_dynamic_source_executions, 1);
+        assert_eq!(metrics.minimum_dynamic_event_time_lo, Some(2 * DAY_US));
+        assert_eq!(
+            sealed_files(cache_snapshot(&cache_dir)),
+            sealed_before,
+            "sub-day backlog must not create or rewrite sealed files"
+        );
     }
+
+    let tx = persistence.begin_test().await.unwrap();
+    append_source(
+        &tx.root().await.unwrap(),
+        "/sources/a.series",
+        4 * DAY_US,
+        40.0,
+    )
+    .await;
+    tx.commit_test().await.unwrap();
     let (append_rows, append_columns, append_metrics) = query_reduced(&mut persistence).await;
-    assert_eq!(append_rows, 4);
+    assert_eq!(append_rows, 7);
     assert_eq!(append_columns, cold_columns);
     assert_eq!(append_metrics.dynamic_source_executions, 1);
     assert_eq!(append_metrics.bounded_dynamic_source_executions, 1);
@@ -364,8 +399,41 @@ async fn sparse_dynamic_reduction_seals_by_active_span_and_bounds_the_next_appen
         .minimum_dynamic_event_time_lo
         .expect("sparse append must carry an event-time lower bound");
     assert!(
-        read_lo > DAY_US && read_lo <= 41 * DAY_US,
+        read_lo == 2 * DAY_US,
         "bounded sparse append must exclude old history, got lower bound {read_lo}"
+    );
+    let next_manifests = segment_manifests(&cache_snapshot(&cache_dir));
+    assert_eq!(
+        next_manifests.keys().collect::<Vec<_>>(),
+        manifests.keys().collect::<Vec<_>>(),
+        "ordinary sealing must reuse the existing cache namespace"
+    );
+    let next: provider::partial_aggregate_cache::SegmentManifest =
+        serde_json::from_slice(next_manifests.values().next().unwrap()).unwrap();
+    assert_eq!(next.sealed_hi_secs, Some(3 * DAY_US / 1_000_000));
+    let after = sealed_files(cache_snapshot(&cache_dir));
+    for (path, bytes) in &sealed_before {
+        assert_eq!(
+            after.get(path),
+            Some(bytes),
+            "old sealed history was rewritten"
+        );
+    }
+    let tx = persistence.begin_test().await.unwrap();
+    append_source(
+        &tx.root().await.unwrap(),
+        "/sources/a.series",
+        4 * DAY_US + 3_600_000_000,
+        41.0,
+    )
+    .await;
+    tx.commit_test().await.unwrap();
+    let (rows, _, metrics) = query_reduced(&mut persistence).await;
+    assert_eq!(rows, 8);
+    assert_eq!(
+        metrics.minimum_dynamic_event_time_lo,
+        Some(3 * DAY_US),
+        "the next append must use the advanced sealed frontier"
     );
 }
 
@@ -435,6 +503,7 @@ async fn pump_state_manifest_bounds_incremental_daily_usage() {
             ),
             locality: SqlDerivedLocality::TimestampLocal {
                 event_time: "timestamp".to_owned(),
+                input_event_time: None,
             },
             transforms: None,
             pattern_transforms: None,
@@ -557,6 +626,7 @@ async fn direct_reduction_reuses_and_repairs_timestamp_local_dynamic_source() {
             ),
             locality: SqlDerivedLocality::TimestampLocal {
                 event_time: "timestamp".to_owned(),
+                input_event_time: None,
             },
             transforms: None,
             pattern_transforms: None,

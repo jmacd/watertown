@@ -120,6 +120,20 @@ impl FormatProvider for JsonLogsProvider {
         "jsonlogs"
     }
 
+    fn event_time_axis(&self, attributes: &Value) -> Option<crate::format::EventTimeAxis> {
+        use query_foundation::sql::EventTimeEncoding;
+        let column = attributes.get("watertown.timestamp_column")?.as_str()?;
+        let encoding = match attributes.get("watertown.timestamp_unit")?.as_str()? {
+            "rfc3339" => EventTimeEncoding::Rfc3339,
+            "microseconds" => EventTimeEncoding::Microseconds,
+            _ => return None,
+        };
+        Some(crate::format::EventTimeAxis {
+            column: column.to_owned(),
+            encoding: Some(encoding),
+        })
+    }
+
     async fn infer_schema(
         &self,
         reader: Pin<Box<dyn AsyncRead + Send>>,
