@@ -82,6 +82,48 @@ async fn append_prefix_verification_preserves_multiplicity_and_schema_evolution(
     Ok(())
 }
 
+#[tokio::test]
+async fn append_prefix_verification_ignores_string_view_encoding() -> Result<()> {
+    use arrow::array::{ArrayRef, StringArray, StringViewArray};
+    use query_foundation::materialize::verify_append_prefix;
+    let context = datafusion::prelude::SessionContext::new();
+    let target = RecordBatch::try_from_iter([
+        (
+            "timestamp",
+            Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+        ),
+        (
+            "pond",
+            Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
+        ),
+    ])?;
+    let view = |pond: Vec<&str>| -> Result<RecordBatch> {
+        Ok(RecordBatch::try_from_iter([
+            (
+                "timestamp",
+                Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+            ),
+            ("pond", Arc::new(StringViewArray::from(pond)) as ArrayRef),
+        ])?)
+    };
+    verify_append_prefix(
+        context.read_batch(view(vec!["a", "b"])?)?,
+        context.read_batch(target.clone())?,
+    )
+    .await?;
+    let error = verify_append_prefix(
+        context.read_batch(view(vec!["a", "c"])?)?,
+        context.read_batch(target)?,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("rejects retroactive changes"),
+        "{error}"
+    );
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 enum FailurePoint {
     #[default]

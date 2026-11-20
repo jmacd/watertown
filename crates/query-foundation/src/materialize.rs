@@ -288,13 +288,38 @@ pub fn plan_materialization_change(
 /// duplicate multiplicities and NULL-padded schema evolution.
 pub async fn verify_append_prefix(source: DataFrame, target: DataFrame) -> Result<()> {
     use crate::plans::transform::{ProjectionColumn, project};
-    use arrow::datatypes::Schema;
+    use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::functions_aggregate::expr_fn::sum;
 
-    let schema = Schema::try_merge([
-        source.schema().as_arrow().clone(),
-        target.schema().as_arrow().clone(),
-    ])?;
+    // Physical encodings differ between a computed source and the same rows
+    // read back from storage (for example Utf8View vs Utf8), so compare on a
+    // canonical logical type. Metadata does not affect row equality.
+    fn canonical(data_type: &DataType) -> DataType {
+        match data_type {
+            DataType::Utf8View | DataType::LargeUtf8 => DataType::Utf8,
+            DataType::BinaryView | DataType::LargeBinary => DataType::Binary,
+            DataType::Dictionary(_, value) => canonical(value),
+            other => other.clone(),
+        }
+    }
+    let canonical_schema = |frame: &DataFrame| {
+        Schema::new(
+            frame
+                .schema()
+                .as_arrow()
+                .fields()
+                .iter()
+                .map(|field| {
+                    Field::new(
+                        field.name(),
+                        canonical(field.data_type()),
+                        field.is_nullable(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    let schema = Schema::try_merge([canonical_schema(&source), canonical_schema(&target)])?;
     let mut balance = "__watertown_materialization_balance".to_owned();
     while schema.field_with_name(&balance).is_ok() {
         balance.push('_');
@@ -303,17 +328,19 @@ pub async fn verify_append_prefix(source: DataFrame, target: DataFrame) -> Resul
         let columns = schema
             .fields()
             .iter()
-            .map(|field| {
-                if frame
-                    .schema()
-                    .field_with_unqualified_name(field.name())
-                    .is_ok()
-                {
-                    ProjectionColumn::identity(field.name())
-                } else {
-                    ProjectionColumn::null(field.name(), field.data_type().clone())
-                }
-            })
+            .map(
+                |field| match frame.schema().field_with_unqualified_name(field.name()) {
+                    Ok(existing) if existing.data_type() == field.data_type() => {
+                        ProjectionColumn::identity(field.name())
+                    }
+                    Ok(_) => ProjectionColumn::cast(
+                        field.name(),
+                        field.name(),
+                        field.data_type().clone(),
+                    ),
+                    Err(_) => ProjectionColumn::null(field.name(), field.data_type().clone()),
+                },
+            )
             .collect();
         project(frame, columns)?.with_column(&balance, lit(sign))
     };
