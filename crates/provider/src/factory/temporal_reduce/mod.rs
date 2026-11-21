@@ -2542,6 +2542,12 @@ crate::factory::lazy_sql_file::impl_lazy_sql_derived_file_metadata!(TemporalRedu
 
 #[async_trait::async_trait]
 impl tinyfs::QueryableFile for TemporalReduceSqlFile {
+    // Bounded reads filter the reduced output on its own bucket column; no
+    // bound is forwarded to the inputs, so no input axis needs proving here.
+    fn event_time_column(&self) -> Option<&str> {
+        Some(&self.config.time_column)
+    }
+
     async fn as_table_provider(
         &self,
         id: tinyfs::FileID,
@@ -4401,6 +4407,88 @@ mod tests {
     use crate::factory::test_support::{
         create_parquet_file, create_test_environment, test_context,
     };
+
+    /// Consumers such as pump-state take bounded incremental reads only from
+    /// sources that declare their event-time axis, and the bound must apply to
+    /// exactly that output column.
+    #[tokio::test]
+    async fn reduced_output_declares_the_axis_its_bounded_reads_honor() {
+        use tokio::io::AsyncWriteExt;
+        let (fs, context) = create_test_environment().await;
+        let root = fs.root().await.unwrap();
+        _ = root.create_dir_path("/ingest").await.unwrap();
+        let mut writer = root
+            .async_writer_path_with_type("/ingest/weather-1.csv", EntryType::FilePhysicalVersion)
+            .await
+            .unwrap();
+        writer
+            .write_all(b"timestamp,temperature\n1970-01-01T00:00:00,1.0\n1970-01-01T02:00:00,3.0\n")
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+        let config = TemporalReduceConfig {
+            in_pattern: crate::Url::parse("csv:///ingest/weather-*.csv").unwrap(),
+            out_pattern: "weather".to_string(),
+            time_column: "timestamp".to_string(),
+            group_by: Vec::new(),
+            resolutions: vec!["1h".to_string()],
+            aggregations: vec![agg(AggregationType::Avg, &["temperature"])],
+            output_aliases: None,
+            transforms: None,
+            allowed_lateness: None,
+            seal_target_bytes: None,
+            max_live_segments: None,
+        };
+        let directory =
+            TemporalReduceDirectory::new(config, test_context(&context, FileID::root())).unwrap();
+        let NodeType::Directory(site) = directory
+            .create_handle()
+            .get("weather")
+            .await
+            .unwrap()
+            .unwrap()
+            .node_type
+        else {
+            panic!("expected directory");
+        };
+        let node = site.get("res=1h.series").await.unwrap().unwrap();
+        let NodeType::File(handle) = &node.node_type else {
+            panic!("expected file");
+        };
+        let file = handle.get_file().await;
+        let guard = file.lock().await;
+        let queryable = guard.as_queryable().unwrap();
+        assert_eq!(queryable.event_time_column(), Some("timestamp"));
+
+        let bounded = queryable
+            .as_table_provider_bounded(
+                node.id,
+                &context,
+                tinyfs::SeriesReadBounds::from_event_time_lo(3_600_000_000),
+            )
+            .await
+            .unwrap();
+        let batches = context
+            .datafusion_session
+            .read_table(bounded)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let times: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                arrow::compute::cast(batch.column_by_name("timestamp").unwrap(), &DataType::Int64)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(times, vec![7_200_000_000]);
+    }
 
     #[test]
     fn source_schema_check_ignores_metadata_but_rejects_type_conflicts() {
