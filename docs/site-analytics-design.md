@@ -5,7 +5,9 @@ configuration exist. A two-site `analytics-staging` pond runs on Watershop
 (independent `/analytics/caspar` and `/analytics/noyo` trees, beacon routes,
 ingestion, inventory copy from site-staging, two bounded Sitegen reports),
 gated by `staging_analytics_enabled` in the enclosing repository's
-`analytics` branch. Production collection is not enabled. Public reporting
+`analytics` branch. Staging has been exercised at volume with synthetic
+traffic (see [Staging hardening](#staging-hardening-with-synthetic-traffic)).
+Production collection is not enabled. Public reporting
 and production ownership/deployment decisions remain pending. Platform defects
 found while staging this work are tracked in
 [Platform defects found while staging](#platform-defects-found-while-staging).
@@ -30,6 +32,8 @@ The outer repository contains the concrete configuration:
 - `config/analytics.yaml`: ordinary ingestion, typed observations, daily counts.
 - `README.operations.md`: opt-in setup and operational boundaries.
 - `config/scripts/test-beacons.py`: Caddy routing and pond ingestion coverage.
+- `config/scripts/synthetic-traffic.py`: staging load and collection-coverage
+  check (see [Staging hardening](#staging-hardening-with-synthetic-traffic)).
 
 The old standalone collector, inventory protocol, collector-specific format,
 custom rollup/table factories, and host report-state command have been removed.
@@ -68,9 +72,12 @@ catalog and does not promise fsync-before-response durability.
 Beacon requests do not also enter the ordinary access log. The dedicated log
 removes the request object, response headers, and authenticated-user field.
 Only selected fields are retained; unknown request parameters are not logged.
-Caddy's default fractional Unix-second `ts` is accepted by ordinary ingestion,
-which records conservative event-time bounds. No custom timestamp format,
-event parser, or collector journal is needed.
+Caddy logs `ts` as an RFC 3339 UTC string (`wrap json { time_format
+rfc3339_nano }`), and ingestion records `timestamp_unit: rfc3339`. Caddy's
+default fractional Unix-second `ts` cannot be converted by a
+timestamp-preserving expression (see below), so it is not supported; switching
+formats needs new source logs and a new pond generation. No event parser or
+collector journal is needed.
 
 Original Caddy logs remain recoverable source material. Ordinary
 `logfile-ingest` handles appends and rotation and records event-time bounds.
@@ -83,8 +90,12 @@ and retention approval are deployment prerequisites.
 The example imports source versions under `/analytics/raw`, exposes typed
 accepted observations at `/analytics/views`, and groups daily counts at
 `/analytics/daily`. These are ordinary pond paths and query factories.
-The typed projection floors timestamps to whole seconds, preserving UTC day
-membership without requiring subsecond precision for page-view counts.
+The typed projection is `CAST(ts AS TIMESTAMP)` at full precision, declared
+`timestamp-local` with `input_event_time: ts`. Pond admits that declaration
+only for expressions it can prove preserve event time; a floor to whole
+seconds or a float conversion is rejected. Timestamp-local views expose query
+lineage, which lets `temporal-reduce-series` reuse its partial aggregates; a
+`global` projection forces a full single pass on every run.
 Parsed source versions use the shared format cache.
 
 Daily counts use `temporal-reduce-series` with `group_by: [site_id, page_uri]`.
@@ -177,11 +188,48 @@ The shared Parquet dictionary policy remains independent work, with lifecycle
 coverage over ordinary pond series, maintenance, restore, and export. Keeping
 that policy does not require the removed analytics storage design.
 
+## Staging hardening with synthetic traffic
+
+Before production, staging was exercised at volume on 2026-11-22.
+`config/scripts/synthetic-traffic.py` in the enclosing repository runs on
+Watershop with only the Python standard library:
+
+- `send` reads each site's published catalog and beacon endpoint, then makes
+  real headless-Chromium page loads (exercising the published script) and
+  direct bodyless POSTs identical to the script's request. A share of beacons
+  go to uncataloged `/synthetic-unknown/N` pages, and some are malformed and
+  must get HTTP 400. Every attempt is appended to a JSONL ledger.
+- `check` requires that every accepted ledger entry appears in the Caddy logs
+  (exactly, for the synthetic-unknown pages, which nothing else visits); that
+  Caddy's 204 views up to the newest ingested view equal `daily` per UTC day
+  and page; and that `public` equals those views per day and section,
+  classified through the pond's own `pages.parquet`. It reads rotated archives
+  and exits non-zero on any mismatch.
+
+This is an operator check of staging collection, not a published coverage
+fact. Synthetic views are indistinguishable from real ones, so it must never
+run against production.
+
+Results on Watershop (`pond 0.308.227`):
+
+- The first use found a live defect: the staging pond template still declared
+  the whole-second floor as timestamp-local, which
+  [jmacd/watertown#224](https://github.com/jmacd/watertown/pull/224) correctly
+  rejects. The cached `daily` hid the failure until new beacons arrived. Fixed
+  by the RFC 3339 change above, with a pond reset.
+- 4 browser visits, 400 direct beacons, and 8 malformed requests reconciled
+  exactly; unknown pages appeared only in Other / unclassified.
+- 40,000 beacons at 100/s rotated the caspar log at 10 MiB between ingests.
+  Ingestion appended the unseen 6.5 MB tail before renaming, and 30,383 caspar
+  and 10,023 noyo views reconciled exactly through `daily` and `public`.
+- Each 5-minute run peaked at 55 MB and 3.4 s during the burst, and fell back
+  to under 1 s and 8–12 MB once idle: cost follows new data, not history.
+
 ## Platform defects found while staging
 
 Staging analytics on Watershop meant wiring `analytics-staging` into selfmon,
 which exposed selfmon and query-engine defects. Track them here so analytics
-work can resume without losing them. Status as of 2026-11-21.
+work can resume without losing them. Status as of 2026-11-22.
 
 | Item | Status |
 |---|---|
@@ -190,8 +238,11 @@ work can resume without losing them. Status as of 2026-11-21.
 | [jmacd/watertown#226](https://github.com/jmacd/watertown/pull/226): `temporal-reduce` did not declare its event-time axis | **Merged; deployed as `pond 0.307.226`.** Without it, `pump-state` over `/reduced/well-depth` warned "unproven event-time axis" and rebuilt from full history on every run (water-staging, site-staging). Confirmed gone on both after deploy. Sitegen time did not change (site-staging 730–900 s before and after); `pump-state` was not the bottleneck. Production runs an older image and would have regressed on promotion without this fix. |
 | Selfmon `materialize-perf` rejected as a retroactive change | The new `input_event_time` contract changed the perf source rows, which the append-only target rejects. Fix: retarget to `/metrics/perf.r2.series` (outer `config/watershop-selfmon.yaml`, committed; deployed 2026-11-20 18:07Z). **Fixed:** `materialize-perf` now succeeds every tick, in about 55 s with a 1.2 GB peak. Pond cannot delete a series. |
 | Selfmon `materialize-azure-access` verifies full history every tick (about 6 min, 6 GB) | Journal versions written before #224 record event-time bounds but not `watertown.timestamp_column`, so `event_time_axis_for_url` cannot prove the axis and lineage is never timestamp-local. It never self-heals. Options: reset the throwaway selfmon pond, or treat unlabeled bounded versions as the ingest factory's default column. **Undecided.** |
-| Water monitor (`/system/run/00-monitor`) crashed with "No field named system_pressure_value" during the Nov 18 pumphouse outage | Each check reads its source bounded to its window. Before [jmacd/watertown#224](https://github.com/jmacd/watertown/pull/224) a bounded cached read took its schema only from the versions inside the window. Other metrics kept arriving during the outage, so the 5m window held versions with no pressure column, and the SQL error aborted the whole report. #224 made schema membership independent of pruning, which fixes that case; production still runs an older image. A column absent from every version (a new or reset pond, or a sensor not yet reporting) still aborted the report. Fix in [jmacd/watertown#227](https://github.com/jmacd/watertown/pull/227) (**open**): a missing column counts as no samples (the check reports `unknown`, with a warning) and the other checks publish. `testsuite/tests/215-monitor-report-data-gap.sh` covers both cases end to end; it fails without the fix with the production error. |
-| Site sitegen reuse cost: `/sources/water/reduced/*/res=1m.series` 60–117 s each | Diagnosed on watershop: export reuse itself takes under 0.2 s. The cost is temporal-reduce source discovery at the finest level. Globbing the 121 `casparwater*.json` files took 64 s through the site import (two record queries per directory child). Each file was then re-resolved from the root and its versions listed one query at a time. All five water reduces (six septic) repeated this. Fix in [jmacd/watertown#227](https://github.com/jmacd/watertown/pull/227) (**open**): directory children of physical types load without queries, version listing is batched per partition, and glob resolution and discovery are memoized per transaction, so reduces that share a source pattern discover it once. Measure site-staging sitegen time after deploy. |
+| Water monitor (`/system/run/00-monitor`) crashed with "No field named system_pressure_value" during the Nov 18 pumphouse outage | Each check reads its source bounded to its window. Before [jmacd/watertown#224](https://github.com/jmacd/watertown/pull/224) a bounded cached read took its schema only from the versions inside the window. Other metrics kept arriving during the outage, so the 5m window held versions with no pressure column, and the SQL error aborted the whole report. #224 made schema membership independent of pruning, which fixes that case; production still runs an older image. A column absent from every version (a new or reset pond, or a sensor not yet reporting) still aborted the report. Fix in [jmacd/watertown#227](https://github.com/jmacd/watertown/pull/227) (**merged; deployed as `pond 0.308.227`**): a missing column counts as no samples (the check reports `unknown`, with a warning) and the other checks publish. `testsuite/tests/215-monitor-report-data-gap.sh` covers both cases end to end; it fails without the fix with the production error. Water-staging's monitor publishes "healthy" after deploy. |
+| Site sitegen reuse cost: `/sources/water/reduced/*/res=1m.series` 60–117 s each | Diagnosed on watershop: export reuse itself takes under 0.2 s. The cost is temporal-reduce source discovery at the finest level. Globbing the 121 `casparwater*.json` files took 64 s through the site import (two record queries per directory child). Each file was then re-resolved from the root and its versions listed one query at a time. All five water reduces (six septic) repeated this. Fix in [jmacd/watertown#227](https://github.com/jmacd/watertown/pull/227) (**merged; deployed as `pond 0.308.227`**): directory children of physical types load without queries, version listing is batched per partition, and glob resolution and discovery are memoized per transaction, so reduces that share a source pattern discover it once. After deploy, site-staging sitegen fell from 728–812 s to 123–247 s, and each water `res=1m` reduce from 60–117 s to 0.8–2 s. The analysis stage remains (53 s: `drawdown-by-month` 33 s, `horner-by-month` 21 s). Site-prod still runs the older `prod-arm64` image (470–1,545 s). |
+| Staging analytics views declared a whole-second floor as timestamp-local | The staging template was missed when the single-site example moved to `global`; [jmacd/watertown#224](https://github.com/jmacd/watertown/pull/224) rejects the declaration, and the first new beacons failed `pond@analytics-staging`. **Fixed** in the enclosing repository: Caddy logs RFC 3339 time and views use `CAST(ts AS TIMESTAMP)` as timestamp-local, which also restores the `temporal-reduce` partial-aggregate cache. Deployed with an `analytics-staging` reset. |
+| An empty beacon source fails view planning | With no accepted lines, the jsonlogs source has no columns, so `views` fails with "No field named schema_version", the report publishes as unavailable, and the timer unit is marked failed until the first beacon. It also aborted the Terraform reset seed step, leaving staging timers stopped until a second apply (fixed in Terraform by skipping that step for `analytics-staging`). Option: treat an empty source as no data, as the monitor now treats a missing column. **Undecided.** |
+| `logfile-ingest` summary after rotation reported "0 appended (+0 bytes)" | The unseen tail appended before renaming a rotated file was ingested correctly but not counted, and the archive was counted as unchanged. **Fix in this branch:** the tail counts once as appended; `testsuite/tests/633-logfile-ingest-rotation-past-size.sh` phase 4 covers it. Logging only; no data effect. |
 | `cargo audit`: `quick-xml` 0.39.4 (RUSTSEC-2026-0194, -0195) | Pulled in only by `object_store` 0.13; the fix needs `object_store` 0.14, which DataFusion 55.3 and deltalake 1.1.4 do not yet accept. DoS only, from trusted S3/Azure responses. Option: ignore both in `.cargo/audit.toml` until upstream moves. **Undecided.** |
 
 Operational findings, no action needed:
@@ -201,7 +252,7 @@ Operational findings, no action needed:
 - The gateway's NFS server (UniFi appliance) stalls for 2 to 4 minutes at about
   02:03 and 03:03 Pacific each night, causing export retries and duplicate points
   but no gaps.
-- Site sitegen is dominated by reuse checks, not by writing. In one site-staging run,
+- Before #227, site sitegen was dominated by reuse checks, not by writing. In one site-staging run,
   `/sources/water/reduced/*/res=1m.series` took 60–117 s each while reusing 1,522 of
   1,523 partitions. The analysis stage (`drawdown-by-month`, `horner-by-month`) and the
   noyo `res=1h` params take 35–100 s each. site-prod (about 1,400 s, sometimes about
