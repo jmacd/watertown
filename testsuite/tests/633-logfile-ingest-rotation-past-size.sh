@@ -153,6 +153,45 @@ HOST_HASH3=$(b3sum /var/log/testapp/app.log | awk '{print $1}')
 check "[ '${POND_HASH3}' = '${HOST_HASH3}' ]" \
     "phase 3: blake3 correct after post-rotation append"
 
+#############################
+# PHASE 4: Rotation with an unseen tail
+#
+# Lines appended after the last ingest are rotated away before the next one.
+# The ingest appends that tail to the pond file before renaming it, and its
+# summary must count it once, as appended (observed on watershop staging as
+# "0 appended (+0 bytes)" after a 6.5 MB tail was ingested).
+#############################
+
+echo ""
+echo "=== Phase 4: Rotation with an unseen tail ==="
+
+SIZE_TRACKED=$(wc -c < /var/log/testapp/app.log | tr -d ' ')
+for i in $(seq 401 450); do
+    printf '{"ts":"2024-02-03T%02d:%02d:%02dZ","level":"INFO","msg":"Unseen tail entry %04d"}\n' $((i/3600%24)) $((i/60%60)) $((i%60)) $i
+done >> /var/log/testapp/app.log
+SIZE_ROTATED=$(wc -c < /var/log/testapp/app.log | tr -d ' ')
+MISSED=$((SIZE_ROTATED - SIZE_TRACKED))
+
+mv /var/log/testapp/app.log /var/log/testapp/app.log.2
+for i in $(seq 1 20); do
+    printf '{"ts":"2024-02-04T00:00:%02dZ","level":"INFO","msg":"Third-generation entry %04d"}\n' $i $i
+done > /var/log/testapp/app.log
+SIZE_NEW=$(wc -c < /var/log/testapp/app.log | tr -d ' ')
+echo "  Rotated ${SIZE_ROTATED} bytes (${MISSED} unseen); new active ${SIZE_NEW} bytes"
+
+pond run /system/run/10-logs 2>/tmp/run4.log
+
+pond cat /logs/app/app.log.2 > /tmp/archived4.out
+check "diff /var/log/testapp/app.log.2 /tmp/archived4.out" \
+    "phase 4: rotated file includes the unseen tail"
+
+pond cat /logs/app/app.log > /tmp/active4.out
+check "diff /var/log/testapp/app.log /tmp/active4.out" \
+    "phase 4: new active file ingested correctly"
+
+check "grep -qF 'Logfile ingestion complete: 1 new (${SIZE_NEW} bytes), 1 appended (+${MISSED} bytes), 1 unchanged' /tmp/run4.log" \
+    "phase 4: summary counts the unseen tail once, as appended"
+
 echo ""
 echo "=== All phases complete ==="
 check_finish
