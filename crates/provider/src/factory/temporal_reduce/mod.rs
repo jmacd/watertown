@@ -1262,58 +1262,44 @@ impl TemporalReduceSqlFile {
                 let _ = now.insert(leaf.identity.clone(), range);
             }
         } else {
-            if source_files.is_none() {
-                let resolved = self.resolve_source_files().await?;
-                if resolved.is_empty() {
-                    return Ok(None);
+            // Every reduce sharing this source pattern discovers the same
+            // sources, so one transaction discovers them once.
+            let memo_key = format!(
+                "temporal-reduce:discover:{}:{}:{}",
+                self.root_identity().await?,
+                cache_dir.display(),
+                self.pattern_url
+            );
+            let discovered = match context.get_transaction_memo::<DiscoveredSources>(&memo_key) {
+                Some(discovered) => discovered,
+                None => {
+                    if source_files.is_none() {
+                        let resolved = self.resolve_source_files().await?;
+                        if resolved.is_empty() {
+                            return Ok(None);
+                        }
+                        source_files = Some(resolved);
+                    }
+                    let discovered = Arc::new(
+                        self.discover_sources(
+                            &provider_api,
+                            source_files
+                                .as_ref()
+                                .expect("source files resolved for exact discovery"),
+                            format_provider.as_deref(),
+                            &cache_dir,
+                        )
+                        .await?,
+                    );
+                    context.set_transaction_memo(memo_key, discovered.clone())?;
+                    discovered
                 }
-                source_files = Some(resolved);
+            };
+            if discovered.source_nodes.is_empty() {
+                return Ok(None);
             }
-            for node_path in source_files
-                .as_ref()
-                .expect("source files resolved for exact discovery")
-            {
-                let file_url_str = node_file_url(scheme, node_path);
-                let file_url = crate::Url::parse(&file_url_str).map_other()?;
-
-                let (source_node_id, versions) = match format_provider.as_ref() {
-                    Some(fp) => provider_api
-                        .cache_url_contents(&file_url, fp.as_ref(), &cache_dir)
-                        .await
-                        .map_other()?,
-                    // Pond-native Parquet: the node's own version files are already
-                    // the leaves, so only the version list is needed.
-                    None => provider_api
-                        .list_url_versions(&file_url)
-                        .await
-                        .map_other()?,
-                };
-
-                // Series versions are disjoint chunks. Non-series sources must
-                // select one revision, not merge replacement history. Format-backed
-                // files were narrowed to current contents above; keep the guard
-                // for other sources still exposing multiple non-series versions.
-                let is_series = matches!(
-                    node_path.id().entry_type(),
-                    EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries
-                );
-                if !is_series && versions.len() > 1 {
-                    return Err(tinyfs::Error::Other(format!(
-                        "temporal-reduce rollup: source '{}' is a non-series file with \
-                     {} selected versions. Each version is a full re-snapshot, so they \
-                     overlap and cannot be aggregated together without \
-                     double-counting. Use a series entry type for incrementally \
-                     appended data, or reduce a single-version source.",
-                        node_path.path().display(),
-                        versions.len()
-                    )));
-                }
-
-                for v in &versions {
-                    let _ = now.insert(source_version_key(&source_node_id, v), source_range(v));
-                }
-                source_nodes.push((source_node_id, versions));
-            }
+            source_nodes.clone_from(&discovered.source_nodes);
+            now.clone_from(&discovered.identities);
         }
         if !source_snapshot_hit && let Some((path, snapshot)) = &source_identity_cache {
             self.write_source_identity_cache(path, snapshot, &now)
@@ -2356,10 +2342,93 @@ impl TemporalReduceSqlFile {
         Ok(vec![old_path])
     }
 
+    /// Read every source's selected live versions (caching format-backed
+    /// parses) and the content identity of the set: blake3 -> event-time range.
+    async fn discover_sources(
+        &self,
+        provider_api: &crate::Provider,
+        source_files: &[tinyfs::NodePath],
+        format_provider: Option<&dyn crate::FormatProvider>,
+        cache_dir: &std::path::Path,
+    ) -> TinyFSResult<DiscoveredSources> {
+        let scheme = self.config.in_pattern.scheme();
+        let mut sources = Vec::with_capacity(source_files.len());
+        for node_path in source_files {
+            let file_url = crate::Url::parse(&node_file_url(scheme, node_path)).map_other()?;
+            sources.push((file_url, node_path.clone()));
+        }
+        let listed = provider_api
+            .discover_node_contents(&sources, format_provider, cache_dir)
+            .await
+            .map_other()?;
+
+        let mut discovered = DiscoveredSources {
+            source_nodes: Vec::with_capacity(listed.len()),
+            identities: std::collections::BTreeMap::new(),
+        };
+        for (node_path, (source_node_id, versions)) in source_files.iter().zip(listed) {
+            // Series versions are disjoint chunks. Non-series sources must
+            // select one revision, not merge replacement history. Format-backed
+            // files were narrowed to current contents above; keep the guard
+            // for other sources still exposing multiple non-series versions.
+            let is_series = matches!(
+                node_path.id().entry_type(),
+                EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries
+            );
+            if !is_series && versions.len() > 1 {
+                return Err(tinyfs::Error::Other(format!(
+                    "temporal-reduce rollup: source '{}' is a non-series file with \
+                 {} selected versions. Each version is a full re-snapshot, so they \
+                 overlap and cannot be aggregated together without \
+                 double-counting. Use a series entry type for incrementally \
+                 appended data, or reduce a single-version source.",
+                    node_path.path().display(),
+                    versions.len()
+                )));
+            }
+
+            for v in &versions {
+                let _ = discovered
+                    .identities
+                    .insert(source_version_key(&source_node_id, v), source_range(v));
+            }
+            discovered.source_nodes.push((source_node_id, versions));
+        }
+        Ok(discovered)
+    }
+
+    /// Identity of the root this reduce resolves its pattern against; imported
+    /// nodes resolve against their own pond's root.
+    async fn root_identity(&self) -> TinyFSResult<tinyfs::FileID> {
+        Ok(self
+            .context
+            .root()
+            .await
+            .map_other_context("Failed to get root")?
+            .node_path()
+            .id())
+    }
+
     /// Resolve this partition's `pattern_url` to concrete source file
     /// NodePaths, deduplicated by node id. Directories and non-file nodes are
-    /// skipped.
+    /// skipped. Memoized for the transaction: schema discovery, config filling
+    /// and source discovery all ask for the same set.
     async fn resolve_source_files(&self) -> TinyFSResult<Vec<tinyfs::NodePath>> {
+        let memo_key = format!(
+            "temporal-reduce:resolve:{}:{}",
+            self.root_identity().await?,
+            self.pattern_url
+        );
+        let context = &self.context.context;
+        if let Some(files) = context.get_transaction_memo::<Vec<tinyfs::NodePath>>(&memo_key) {
+            return Ok(files.as_ref().clone());
+        }
+        let files = self.resolve_source_files_uncached().await?;
+        context.set_transaction_memo(memo_key, Arc::new(files.clone()))?;
+        Ok(files)
+    }
+
+    async fn resolve_source_files_uncached(&self) -> TinyFSResult<Vec<tinyfs::NodePath>> {
         // Resolve the partition-scoped pattern_url, not the original in_pattern
         // glob. pattern_url is the concrete file for a 1:1 source->output
         // mapping and the original glob only when several files share one
@@ -2639,6 +2708,13 @@ impl tinyfs::QueryableFile for TemporalReduceSqlFile {
 
 /// Build the full source URL string for a matched source file under a format
 /// provider scheme. Mirrors `SqlDerivedFile::node_file_url`.
+/// One transaction's discovery of a source pattern, shared by every reduce of
+/// that pattern.
+struct DiscoveredSources {
+    source_nodes: Vec<(tinyfs::NodeID, Vec<tinyfs::FileVersionInfo>)>,
+    identities: std::collections::BTreeMap<String, crate::partial_aggregate_cache::SourceRange>,
+}
+
 fn node_file_url(scheme: &str, node_path: &tinyfs::NodePath) -> String {
     format!("{}://{}", scheme, node_path.path().display())
 }
@@ -5900,6 +5976,114 @@ output_aliases:
         assert!(
             persistence.metrics().version_lists > 0,
             "a changed snapshot must fall back to exact source discovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn reduces_sharing_a_source_pattern_discover_it_once_per_generation() {
+        use tokio::io::AsyncWriteExt;
+        let persistence = tinyfs::MemoryPersistence::default();
+        let fs = tinyfs::FS::new(persistence.clone()).await.unwrap();
+        let root = fs.root().await.unwrap();
+        _ = root.create_dir_path("/ingest").await.unwrap();
+        async fn append(root: &tinyfs::WD, path: &str, csv: String) {
+            let mut writer = root
+                .async_writer_path_with_type(path, EntryType::FilePhysicalSeries)
+                .await
+                .unwrap();
+            writer.write_all(csv.as_bytes()).await.unwrap();
+            writer.shutdown().await.unwrap();
+        }
+        for (station, day) in [("a", 1), ("a", 2), ("b", 1)] {
+            append(
+                &root,
+                &format!("/ingest/{station}.csv"),
+                format!("timestamp,temperature\n1970-02-{day:02}T00:00:00,{day}.5\n"),
+            )
+            .await;
+        }
+
+        let session = Arc::new(datafusion::prelude::SessionContext::new());
+        _ = crate::register_tinyfs_object_store(&session, persistence.clone()).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let context = crate::ProviderContext::new(session, Arc::new(persistence.clone()))
+            .with_cache_dir(cache.path().to_path_buf());
+        let reduce = |site: &str, aggregation| TemporalReduceConfig {
+            in_pattern: crate::Url::parse("csv:///ingest/*.csv").unwrap(),
+            out_pattern: site.to_owned(),
+            time_column: "timestamp".to_owned(),
+            group_by: Vec::new(),
+            resolutions: vec!["1d".to_owned()],
+            aggregations: vec![agg(aggregation, &["temperature"])],
+            output_aliases: None,
+            transforms: None,
+            allowed_lateness: None,
+            seal_target_bytes: Some(0),
+            max_live_segments: None,
+        };
+        async fn rows(site: &str, config: TemporalReduceConfig, context: &crate::ProviderContext) {
+            let directory =
+                TemporalReduceDirectory::new(config, test_context(context, FileID::root()))
+                    .unwrap();
+            let site_node = directory.create_handle().get(site).await.unwrap().unwrap();
+            let NodeType::Directory(site_dir) = site_node.node_type else {
+                panic!("{site} must be a directory");
+            };
+            let output = site_dir.get("res=1d.series").await.unwrap().unwrap();
+            let NodeType::File(file) = output.node_type else {
+                panic!("daily output must be a file");
+            };
+            let file = file.get_file().await;
+            let guard = file.lock().await;
+            let provider = guard
+                .as_queryable()
+                .unwrap()
+                .as_table_provider(output.id, context)
+                .await
+                .unwrap();
+            assert!(
+                context.get_export_hint(&output.id).is_some(),
+                "{site} must take the incremental rollup path"
+            );
+            let table = format!("rollup_{}", site.replace('-', "_"));
+            _ = context
+                .datafusion_session
+                .register_table(&table, provider)
+                .unwrap();
+            let count = context
+                .datafusion_session
+                .sql(&format!("SELECT COUNT(*) FROM {table}"))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert!(count[0].num_rows() == 1);
+        }
+
+        rows("max", reduce("max", AggregationType::Max), &context).await;
+        let first = persistence.metrics().version_lists;
+        assert!(first > 0, "the first reduce discovers its sources");
+
+        persistence.reset_metrics();
+        rows("min", reduce("min", AggregationType::Min), &context).await;
+        assert_eq!(
+            persistence.metrics().version_lists,
+            0,
+            "a second reduce of the same pattern reuses the transaction's discovery"
+        );
+
+        append(
+            &root,
+            "/ingest/b.csv",
+            "timestamp,temperature\n1970-02-03T00:00:00,9.5\n".to_owned(),
+        )
+        .await;
+        persistence.reset_metrics();
+        rows("avg", reduce("avg", AggregationType::Avg), &context).await;
+        assert!(
+            persistence.metrics().version_lists > 0,
+            "a mutation invalidates the memoized discovery"
         );
     }
 

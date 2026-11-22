@@ -1117,6 +1117,7 @@ async fn evaluate_stale_or_below_any_column_check(
 
     let result: tinyfs::Result<(Vec<Sample>, Vec<Sample>)> = async {
         let primary_samples = query_samples(
+            &config.id,
             &provider_context.datafusion_session,
             &table_name,
             &config.timestamp_column,
@@ -1132,6 +1133,7 @@ async fn evaluate_stale_or_below_any_column_check(
         let mut threshold_samples = Vec::new();
         for column in &config.threshold_columns {
             let mut samples = query_samples(
+                &config.id,
                 &provider_context.datafusion_session,
                 &table_name,
                 &config.timestamp_column,
@@ -1252,6 +1254,7 @@ async fn collect_rate_samples(
         return Ok(Vec::new());
     };
     let result = query_rate_samples(
+        &config.id,
         &provider_context.datafusion_session,
         &table_name,
         &config.measurement.timestamp,
@@ -1288,6 +1291,7 @@ async fn collect_condition_samples(
         return Ok(Vec::new());
     };
     let result = query_condition_samples(
+        &config.id,
         &provider_context.datafusion_session,
         &table_name,
         &config.condition.timestamp,
@@ -1408,6 +1412,7 @@ async fn collect_samples(
         return Ok(Vec::new());
     };
     let result = query_samples(
+        config.id(),
         &provider_context.datafusion_session,
         &table_name,
         config.timestamp_column(),
@@ -1425,7 +1430,44 @@ async fn collect_samples(
     )
 }
 
+/// Whether the registered source carries every column a check reads.
+///
+/// A self-describing source (oteljson, csv, ...) has a column only for the
+/// metrics it has received, so a metric the pond has never received (a new or
+/// reset pond, a sensor not yet reporting) has no column at all. That is a gap
+/// in the data, not a broken check: it reads as no samples, so the check
+/// reports unknown or stale instead of failing the whole report.
+async fn source_has_columns(
+    check_id: &str,
+    session: &datafusion::prelude::SessionContext,
+    table_name: &str,
+    columns: &[&str],
+) -> tinyfs::Result<bool> {
+    let schema = session
+        .table_provider(TableReference::bare(table_name))
+        .await
+        .map_err(|error| {
+            tinyfs::Error::Other(format!(
+                "monitor check '{check_id}' lost its registered source: {error}"
+            ))
+        })?
+        .schema();
+    let missing: Vec<&str> = columns
+        .iter()
+        .copied()
+        .filter(|column| schema.field_with_name(column).is_err())
+        .collect();
+    if missing.is_empty() {
+        return Ok(true);
+    }
+    log::warn!(
+        "monitor check '{check_id}': source has no {missing:?} column; treating it as no data"
+    );
+    Ok(false)
+}
+
 async fn query_samples(
+    check_id: &str,
     session: &datafusion::prelude::SessionContext,
     table_name: &str,
     timestamp_column: &str,
@@ -1433,6 +1475,16 @@ async fn query_samples(
     period_start: DateTime<Utc>,
     period_end: DateTime<Utc>,
 ) -> tinyfs::Result<Vec<Sample>> {
+    if !source_has_columns(
+        check_id,
+        session,
+        table_name,
+        &[timestamp_column, value_column],
+    )
+    .await?
+    {
+        return Ok(Vec::new());
+    }
     let timestamp = quote_identifier(timestamp_column);
     let value = quote_identifier(value_column);
     let table = quote_identifier(table_name);
@@ -1455,6 +1507,7 @@ async fn query_samples(
 }
 
 async fn query_rate_samples(
+    check_id: &str,
     session: &datafusion::prelude::SessionContext,
     table_name: &str,
     timestamp_column: &str,
@@ -1462,6 +1515,16 @@ async fn query_rate_samples(
     period_start: DateTime<Utc>,
     period_end: DateTime<Utc>,
 ) -> tinyfs::Result<Vec<RateSample>> {
+    if !source_has_columns(
+        check_id,
+        session,
+        table_name,
+        &[timestamp_column, value_column],
+    )
+    .await?
+    {
+        return Ok(Vec::new());
+    }
     let timestamp = quote_identifier(timestamp_column);
     let value = quote_identifier(value_column);
     let table = quote_identifier(table_name);
@@ -1485,6 +1548,7 @@ async fn query_rate_samples(
 }
 
 async fn query_condition_samples(
+    check_id: &str,
     session: &datafusion::prelude::SessionContext,
     table_name: &str,
     timestamp_column: &str,
@@ -1492,6 +1556,16 @@ async fn query_condition_samples(
     period_start: DateTime<Utc>,
     period_end: DateTime<Utc>,
 ) -> tinyfs::Result<Vec<ConditionSample>> {
+    if !source_has_columns(
+        check_id,
+        session,
+        table_name,
+        &[timestamp_column, value_column],
+    )
+    .await?
+    {
+        return Ok(Vec::new());
+    }
     let timestamp = quote_identifier(timestamp_column);
     let value = quote_identifier(value_column);
     let table = quote_identifier(table_name);
@@ -3256,5 +3330,73 @@ checks:
         let value: serde_json::Value = serde_json::from_str(&json).expect("status json");
         assert_eq!(value["state"], "unknown");
         assert_eq!(value["checks"][0]["sample_count"], 0);
+    }
+
+    /// A source that has never received a metric has no column for it. That
+    /// is a data gap, and must not abort the other checks' report.
+    #[tokio::test]
+    async fn factory_treats_a_never_reported_column_as_no_data() {
+        let output = tempfile::tempdir().expect("tempdir");
+        let persistence = tinyfs::MemoryPersistence::default();
+        let filesystem = tinyfs::FS::new(persistence.clone())
+            .await
+            .expect("filesystem");
+        let session = Arc::new(SessionContext::new());
+        provider::register_tinyfs_object_store(&session, persistence.clone())
+            .expect("object store");
+        let provider_context = tinyfs::ProviderContext::new(session, Arc::new(persistence.clone()));
+        let root = filesystem.root().await.expect("root");
+        let now = Utc::now();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new(
+                    "timestamp",
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    false,
+                ),
+                Field::new("tank_level_value", DataType::Float64, false),
+            ])),
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    (now - chrono::Duration::minutes(30)).timestamp_micros(),
+                    (now - chrono::Duration::minutes(1)).timestamp_micros(),
+                ])),
+                Arc::new(Float64Array::from(vec![3.2, 2.9])),
+            ],
+        )
+        .expect("batch");
+        root.create_series_from_batch("/measurements", &batch, Some("timestamp"))
+            .await
+            .expect("series");
+
+        let mut any_below = any_below_config();
+        any_below.source = "series:///measurements".to_string();
+        let mut average_range = average_range_config();
+        average_range.source = "series:///measurements".to_string();
+        let config = MonitorConfig {
+            pond: "water-staging".to_string(),
+            title: "Water status".to_string(),
+            output_dir: output.path().to_string_lossy().into_owned(),
+            checks: vec![
+                CheckConfig::AnyObservedBelow(any_below),
+                CheckConfig::AverageRange(average_range),
+            ],
+        };
+        execute(
+            serde_json::to_value(config).expect("config"),
+            FactoryContext::new(provider_context, tinyfs::FileID::root()).with_txn_seq(10),
+            ExecutionContext::control_reader(vec!["push".to_string()]),
+        )
+        .await
+        .expect("a missing column is a gap, not a failure");
+
+        let json = std::fs::read_to_string(output.path().join("status.json")).expect("json");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("status json");
+        assert_eq!(value["checks"][0]["rule"], "any-observed-below");
+        assert_eq!(value["checks"][0]["state"], "alarm");
+        assert_eq!(value["checks"][0]["sample_count"], 2);
+        assert_eq!(value["checks"][1]["rule"], "average-range");
+        assert_eq!(value["checks"][1]["state"], "unknown");
+        assert_eq!(value["checks"][1]["sample_count"], 0);
     }
 }

@@ -20,6 +20,13 @@ pub type QueryLineageCache = Arc<
     std::sync::Mutex<std::collections::HashMap<String, (Option<u64>, Option<crate::QueryLineage>)>>,
 >;
 
+type TransactionMemoValue = Arc<dyn std::any::Any + Send + Sync>;
+
+/// Transaction-scoped memo of derived values, shared by every provider context
+/// of one transaction and invalidated by any mutation (coherence generation).
+pub type TransactionMemo =
+    Arc<std::sync::Mutex<std::collections::HashMap<String, (Option<u64>, TransactionMemoValue)>>>;
+
 /// Result type for tinyfs context operations
 pub type Result<T> = std::result::Result<T, crate::Error>;
 
@@ -106,6 +113,8 @@ pub struct ProviderContext {
 
     query_lineage_cache: QueryLineageCache,
 
+    transaction_memo: TransactionMemo,
+
     /// TinyFS persistence layer for transaction management
     pub persistence: Arc<dyn PersistenceLayer>,
 
@@ -136,6 +145,7 @@ impl ProviderContext {
             datafusion_session,
             table_provider_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             query_lineage_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            transaction_memo: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             persistence,
             cache_dir: None,
             pond_path: None,
@@ -162,6 +172,57 @@ impl ProviderContext {
     pub fn with_query_lineage_cache(mut self, cache: QueryLineageCache) -> Self {
         self.query_lineage_cache = cache;
         self
+    }
+
+    /// Share a transaction memo, so every provider context of one transaction
+    /// reuses the values derived by the others.
+    #[must_use]
+    pub fn with_transaction_memo(mut self, memo: TransactionMemo) -> Self {
+        self.transaction_memo = memo;
+        self
+    }
+
+    /// A value memoized earlier in this transaction, if no mutation has
+    /// happened since it was stored.
+    #[must_use]
+    pub fn get_transaction_memo<T: std::any::Any + Send + Sync>(
+        &self,
+        key: &str,
+    ) -> Option<Arc<T>> {
+        let generation = self.current_generation().ok()?;
+        let mut memo = self.transaction_memo.lock().ok()?;
+        let (cached_generation, value) = memo.get(key)?;
+        if *cached_generation == generation {
+            value.clone().downcast::<T>().ok()
+        } else {
+            _ = memo.remove(key);
+            None
+        }
+    }
+
+    /// Memoize a value derived from the current transaction state.
+    pub fn set_transaction_memo<T: std::any::Any + Send + Sync>(
+        &self,
+        key: String,
+        value: Arc<T>,
+    ) -> Result<()> {
+        let generation = self.current_generation()?;
+        _ = self
+            .transaction_memo
+            .lock()
+            .map_other_context("transaction memo mutex poisoned")?
+            .insert(key, (generation, value));
+        Ok(())
+    }
+
+    fn current_generation(&self) -> Result<Option<u64>> {
+        match self.persistence.coherence_state() {
+            Some(state) => {
+                state.ensure_open()?;
+                Ok(Some(state.generation()))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Get cached TableProvider by cache key

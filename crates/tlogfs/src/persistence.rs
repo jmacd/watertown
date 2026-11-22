@@ -151,6 +151,7 @@ pub struct State {
         std::sync::Mutex<HashMap<TableProviderKey, Arc<dyn datafusion::catalog::TableProvider>>>,
     >,
     query_lineage_cache: tinyfs::QueryLineageCache,
+    transaction_memo: tinyfs::TransactionMemo,
     /// Transaction state for enforcing single-writer pattern (shared with tinyfs)
     txn_state: Arc<TinyFsTransactionState>,
     /// Shared transaction lifecycle and provider-cache generation.
@@ -165,7 +166,25 @@ pub struct State {
     pond_id: String,
 }
 
-#[derive(Deserialize)]
+/// Columns decoded into [`VersionMetadata`]; never the payload.
+const VERSION_METADATA_COLUMNS: &str = "file_type, timestamp, version, blake3, size, \
+     min_event_time, max_event_time, extended_attributes, collapsed_from, collapsed_through, \
+     logical_leaf_hash, logical_count, series_schema_fingerprint";
+
+/// Upper bound on node ids in one batched version-listing predicate.
+const LIST_VERSIONS_BATCH_NODES: usize = 512;
+
+fn assert_listable(id: FileID) {
+    assert!(
+        !id.entry_type().is_dynamic(),
+        "list_file_versions called with dynamic FileID {id} (entry_type={:?}). \
+         Dynamic files are ephemeral and have no oplog records. \
+         Callers must handle dynamic files without querying the persistence layer.",
+        id.entry_type()
+    );
+}
+
+#[derive(Clone, Deserialize)]
 struct VersionMetadata {
     file_type: EntryType,
     timestamp: i64,
@@ -1037,6 +1056,7 @@ impl OpLogPersistence {
             session_context,
             table_provider_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             query_lineage_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            transaction_memo: Arc::new(std::sync::Mutex::new(HashMap::new())),
             txn_state: self.txn_state.clone(),
             coherence: Arc::new(tinyfs::CoherenceState::default()),
             large_file_options: self.large_file_options.clone(),
@@ -2028,6 +2048,7 @@ impl State {
             ctx = ctx.with_pond_path(pond_path.clone());
         }
         ctx.with_query_lineage_cache(self.query_lineage_cache.clone())
+            .with_transaction_memo(self.transaction_memo.clone())
     }
 }
 
@@ -2163,6 +2184,11 @@ impl PersistenceLayer for State {
         self.inner.lock().await.list_file_versions(id).await
     }
 
+    async fn list_files_versions(&self, ids: &[FileID]) -> TinyFSResult<Vec<Vec<FileVersionInfo>>> {
+        self.coherence.ensure_open()?;
+        self.inner.lock().await.list_files_versions(ids).await
+    }
+
     async fn snapshot_identity(&self) -> TinyFSResult<Option<String>> {
         self.coherence.ensure_open()?;
         let (path, version) = {
@@ -2284,6 +2310,35 @@ impl State {
     pub async fn load_symlink_target(&self, id: FileID) -> TinyFSResult<PathBuf> {
         self.coherence.ensure_open()?;
         self.inner.lock().await.load_symlink_target(id).await
+    }
+
+    /// Load the node a directory entry names.
+    ///
+    /// The entry's `NodeID` carries its entry type, and a physical node is
+    /// built from its id alone, so the directory entry is sufficient evidence
+    /// for it. Looking up the latest record would cost two Delta queries per
+    /// child (one reading the payload) and change nothing; on a glob over a
+    /// large directory that lookup dominated path resolution. Dynamic nodes
+    /// still need their persisted factory config.
+    pub async fn load_directory_child(&self, id: FileID) -> TinyFSResult<Node> {
+        self.coherence.ensure_open()?;
+        match id.entry_type() {
+            EntryType::DirectoryPhysical => node_factory::create_directory_node(id, self.clone()),
+            EntryType::Symlink => {
+                let symlink = OpLogSymlink::new_from_persistence(id, self.clone());
+                Ok(Node::new(
+                    id,
+                    NodeType::Symlink(OpLogSymlink::create_handle(symlink)),
+                ))
+            }
+            EntryType::FilePhysicalVersion
+            | EntryType::FilePhysicalSeries
+            | EntryType::TablePhysicalVersion
+            | EntryType::TablePhysicalSeries => node_factory::create_file_node(id, self.clone()),
+            EntryType::DirectoryDynamic | EntryType::FileDynamic | EntryType::TableDynamic => {
+                self.load_node(id).await
+            }
+        }
     }
 
     /// Query oplog records for a node (used by directory operations)
@@ -4771,16 +4826,91 @@ impl InnerState {
 
     async fn list_file_versions(&mut self, id: FileID) -> TinyFSResult<Vec<FileVersionInfo>> {
         debug!("list_file_versions called for id={id}");
+        assert_listable(id);
+        let records = self.query_committed_version_metadata(id, None).await?;
+        self.finish_version_listing(id, records).await
+    }
 
-        assert!(
-            !id.entry_type().is_dynamic(),
-            "list_file_versions called with dynamic FileID {id} (entry_type={:?}). \
-             Dynamic files are ephemeral and have no oplog records. \
-             Callers must handle dynamic files without querying the persistence layer.",
-            id.entry_type()
-        );
+    /// List several files' versions with one committed-metadata query per
+    /// partition instead of one per file.
+    async fn list_files_versions(
+        &mut self,
+        ids: &[FileID],
+    ) -> TinyFSResult<Vec<Vec<FileVersionInfo>>> {
+        #[derive(Deserialize)]
+        struct Owner {
+            node_id: String,
+        }
 
-        let mut records = self.query_committed_version_metadata(id, None).await?;
+        let mut committed: Vec<Vec<VersionMetadata>> = ids.iter().map(|_| Vec::new()).collect();
+        let mut partitions: std::collections::BTreeMap<
+            (String, String),
+            HashMap<String, Vec<usize>>,
+        > = std::collections::BTreeMap::new();
+        for (index, id) in ids.iter().enumerate() {
+            assert_listable(*id);
+            partitions
+                .entry((id.pond_id().to_string(), id.part_id().to_string()))
+                .or_default()
+                .entry(id.node_id().to_string())
+                .or_default()
+                .push(index);
+        }
+
+        for ((pond_id, part_id), nodes) in &partitions {
+            let node_ids: Vec<&String> = nodes.keys().collect();
+            for chunk in node_ids.chunks(LIST_VERSIONS_BATCH_NODES) {
+                let in_list = chunk
+                    .iter()
+                    .map(|node_id| format!("'{node_id}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let batches = self
+                    .session_context
+                    .sql(&format!(
+                        "SELECT node_id, {VERSION_METADATA_COLUMNS} FROM delta_table \
+                         WHERE pond_id = '{pond_id}' AND part_id = '{part_id}' \
+                         AND node_id IN ({in_list})"
+                    ))
+                    .await
+                    .map_err(|e| error_utils::to_tinyfs_error(TLogFSError::DataFusion(e)))?
+                    .collect()
+                    .await
+                    .map_err(|e| error_utils::to_tinyfs_error(TLogFSError::DataFusion(e)))?;
+                for batch in batches {
+                    let owners: Vec<Owner> = serde_arrow::from_record_batch(&batch)
+                        .map_other_context("decode version owners")?;
+                    let rows: Vec<VersionMetadata> = serde_arrow::from_record_batch(&batch)
+                        .map_other_context("decode version metadata")?;
+                    for (owner, row) in owners.into_iter().zip(rows) {
+                        let indices = nodes.get(&owner.node_id).ok_or_else(|| {
+                            tinyfs::Error::Other(format!(
+                                "version listing returned unrequested node {}",
+                                owner.node_id
+                            ))
+                        })?;
+                        for index in indices {
+                            committed[*index].push(row.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut listed = Vec::with_capacity(ids.len());
+        for (id, records) in ids.iter().zip(committed) {
+            listed.push(self.finish_version_listing(*id, records).await?);
+        }
+        Ok(listed)
+    }
+
+    /// Merge pending rows into a node's committed version metadata and
+    /// select its live versions in version order.
+    async fn finish_version_listing(
+        &self,
+        id: FileID,
+        mut records: Vec<VersionMetadata>,
+    ) -> TinyFSResult<Vec<FileVersionInfo>> {
         let pond_id = id.pond_id().to_string();
         records.extend(
             self.records
@@ -4865,9 +4995,7 @@ impl InnerState {
             format!(" AND version = {version} LIMIT 1")
         });
         self.query_oplog_rows(&format!(
-            "SELECT file_type, timestamp, version, blake3, size, min_event_time, \
-             max_event_time, extended_attributes, collapsed_from, collapsed_through, \
-             logical_leaf_hash, logical_count, series_schema_fingerprint \
+            "SELECT {VERSION_METADATA_COLUMNS} \
              FROM delta_table WHERE pond_id = '{}' AND part_id = '{}' AND node_id = '{}'{selection}",
             id.pond_id(), id.part_id(), id.node_id()
         ))
@@ -7681,6 +7809,132 @@ mod metadata_query_tests {
             state.metadata(missing).await,
             Err(tinyfs::Error::NotFound(_))
         ));
+    }
+
+    async fn append_series(root: &tinyfs::WD, path: &str, bytes: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+        let mut writer = root
+            .async_writer_path_with_type(path, EntryType::FilePhysicalSeries)
+            .await
+            .expect("series writer");
+        writer.write_all(bytes).await.expect("write series");
+        writer.shutdown().await.expect("close series");
+    }
+
+    #[tokio::test]
+    async fn glob_loads_physical_children_without_record_scans() {
+        let (_dir, mut persistence, _) = fixture().await;
+        let tx = persistence.begin_test().await.expect("begin write");
+        let root = tx.root().await.expect("root");
+        _ = root.create_dir_path("/ingest").await.expect("mkdir");
+        for index in 0..6 {
+            root.write_file_path_from_slice(
+                format!("/ingest/f{index}.json"),
+                format!("{{\"n\":{index}}}").as_bytes(),
+            )
+            .await
+            .expect("write");
+            append_series(&root, &format!("/ingest/s{index}.json"), b"{\"n\":1}\n").await;
+        }
+        tx.commit_test().await.expect("commit");
+
+        let tx = persistence.begin_test().await.expect("begin read");
+        let state = tx.state().expect("state");
+        let root = tx.root().await.expect("root");
+        let scans = record_scans(&state).await;
+        let matches = root.collect_matches("/ingest/*.json").await.expect("glob");
+        assert_eq!(matches.len(), 12);
+        {
+            let scans = scans.lock().expect("scans");
+            for (node_path, _) in &matches {
+                let node_id = node_path.id().node_id().to_string();
+                assert!(
+                    !scans.iter().any(|scan| scan.filters.contains(&node_id)),
+                    "child {} was looked up record by record: {scans:?}",
+                    node_path.path().display()
+                );
+            }
+        }
+
+        let first = root
+            .read_file_path_to_vec("/ingest/f3.json")
+            .await
+            .expect("read physical child");
+        assert_eq!(first, b"{\"n\":3}");
+    }
+
+    #[tokio::test]
+    async fn batched_version_listing_matches_per_file_listing_in_one_scan_per_partition() {
+        let (_dir, mut persistence, _) = fixture().await;
+        let tx = persistence.begin_test().await.expect("begin write");
+        let root = tx.root().await.expect("root");
+        _ = root.create_dir_path("/a").await.expect("mkdir a");
+        _ = root.create_dir_path("/b").await.expect("mkdir b");
+        for dir in ["a", "b"] {
+            for index in 0..3 {
+                append_series(&root, &format!("/{dir}/s{index}"), b"one\n").await;
+            }
+            root.write_file_path_from_slice(format!("/{dir}/v"), b"v1")
+                .await
+                .expect("write v");
+        }
+        tx.commit_test().await.expect("commit first");
+        let tx = persistence.begin_test().await.expect("begin second");
+        let root = tx.root().await.expect("root");
+        append_series(&root, "/a/s1", b"two\n").await;
+        append_series(&root, "/b/s2", b"two\n").await;
+        tx.commit_test().await.expect("commit second");
+
+        let tx = persistence.begin_test().await.expect("begin read");
+        let state = tx.state().expect("state");
+        let root = tx.root().await.expect("root");
+        // A pending version must be merged exactly as the per-file path does.
+        append_series(&root, "/a/s0", b"pending\n").await;
+        let mut ids = Vec::new();
+        for path in ["/a/s0", "/a/s1", "/a/s2", "/a/v", "/b/s0", "/b/s2", "/b/v"] {
+            ids.push(root.get_node_path(path).await.expect("node").id());
+        }
+        ids.push(ids[1]);
+
+        let normalize = |versions: &[FileVersionInfo]| {
+            versions
+                .iter()
+                .map(|info| {
+                    let extended = info.extended_metadata.as_ref().map(|metadata| {
+                        metadata
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value.clone()))
+                            .collect::<std::collections::BTreeMap<_, _>>()
+                    });
+                    format!(
+                        "{} {} {} {:?} {:?} {extended:?}",
+                        info.version, info.timestamp, info.size, info.blake3, info.entry_type
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut expected = Vec::new();
+        for id in &ids {
+            expected.push(normalize(
+                &state.list_file_versions(*id).await.expect("one"),
+            ));
+        }
+        let scans = record_scans(&state).await;
+        let listed = state.list_files_versions(&ids).await.expect("batch");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|versions| normalize(versions))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(listed[0].len(), 2, "committed plus pending version");
+        assert_eq!(listed[1].len(), 2);
+        assert_eq!(
+            scans.lock().expect("scans").len(),
+            2,
+            "one metadata scan per partition"
+        );
     }
 }
 

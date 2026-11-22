@@ -1,8 +1,14 @@
 # First-party site analytics
 
 **Status:** opt-in browser instrumentation and Caddy-to-pond collection/query
-configuration exist. Collection is not deployed or enabled. Public reporting
-and ownership/deployment decisions remain pending.
+configuration exist. A two-site `analytics-staging` pond runs on Watershop
+(independent `/analytics/caspar` and `/analytics/noyo` trees, beacon routes,
+ingestion, inventory copy from site-staging, two bounded Sitegen reports),
+gated by `staging_analytics_enabled` in the enclosing repository's
+`analytics` branch. Production collection is not enabled. Public reporting
+and production ownership/deployment decisions remain pending. Platform defects
+found while staging this work are tracked in
+[Platform defects found while staging](#platform-defects-found-while-staging).
 
 Read [Architecture for developers](manual/guides/architecture.md) before
 extending this path. Analytics should be configuration over existing services,
@@ -170,3 +176,34 @@ The next integration must establish:
 The shared Parquet dictionary policy remains independent work, with lifecycle
 coverage over ordinary pond series, maintenance, restore, and export. Keeping
 that policy does not require the removed analytics storage design.
+
+## Platform defects found while staging
+
+Staging analytics on Watershop meant wiring `analytics-staging` into selfmon,
+which exposed selfmon and query-engine defects. Track them here so analytics
+work can resume without losing them. Status as of 2026-11-21.
+
+| Item | Status |
+|---|---|
+| [jmacd/watertown#224](https://github.com/jmacd/watertown/pull/224): selfmon incremental reads and rollup backlog | Merged, deployed (`0.305.224`). Selfmon limiters dropped from about 530 s and 6.6 GB per tick to about 30 s and 0.5 GB after one catch-up tick. |
+| [jmacd/watertown#225](https://github.com/jmacd/watertown/pull/225): `verify_append_prefix` failed on `Utf8View` vs `Utf8` | Merged, deployed (`0.306.225`). `materialize-azure-access` succeeds. |
+| [jmacd/watertown#226](https://github.com/jmacd/watertown/pull/226): `temporal-reduce` did not declare its event-time axis | **Merged; deployed as `pond 0.307.226`.** Without it, `pump-state` over `/reduced/well-depth` warned "unproven event-time axis" and rebuilt from full history on every run (water-staging, site-staging). Confirmed gone on both after deploy. Sitegen time did not change (site-staging 730–900 s before and after); `pump-state` was not the bottleneck. Production runs an older image and would have regressed on promotion without this fix. |
+| Selfmon `materialize-perf` rejected as a retroactive change | The new `input_event_time` contract changed the perf source rows, which the append-only target rejects. Fix: retarget to `/metrics/perf.r2.series` (outer `config/watershop-selfmon.yaml`, committed; deployed 2026-11-20 18:07Z). **Fixed:** `materialize-perf` now succeeds every tick, in about 55 s with a 1.2 GB peak. Pond cannot delete a series. |
+| Selfmon `materialize-azure-access` verifies full history every tick (about 6 min, 6 GB) | Journal versions written before #224 record event-time bounds but not `watertown.timestamp_column`, so `event_time_axis_for_url` cannot prove the axis and lineage is never timestamp-local. It never self-heals. Options: reset the throwaway selfmon pond, or treat unlabeled bounded versions as the ingest factory's default column. **Undecided.** |
+| Water monitor (`/system/run/00-monitor`) crashed with "No field named system_pressure_value" during the Nov 18 pumphouse outage | Each check reads its source bounded to its window. Before [jmacd/watertown#224](https://github.com/jmacd/watertown/pull/224) a bounded cached read took its schema only from the versions inside the window. Other metrics kept arriving during the outage, so the 5m window held versions with no pressure column, and the SQL error aborted the whole report. #224 made schema membership independent of pruning, which fixes that case; production still runs an older image. A column absent from every version (a new or reset pond, or a sensor not yet reporting) still aborted the report. Fix in [jmacd/watertown#227](https://github.com/jmacd/watertown/pull/227) (**open**): a missing column counts as no samples (the check reports `unknown`, with a warning) and the other checks publish. `testsuite/tests/215-monitor-report-data-gap.sh` covers both cases end to end; it fails without the fix with the production error. |
+| Site sitegen reuse cost: `/sources/water/reduced/*/res=1m.series` 60–117 s each | Diagnosed on watershop: export reuse itself takes under 0.2 s. The cost is temporal-reduce source discovery at the finest level. Globbing the 121 `casparwater*.json` files took 64 s through the site import (two record queries per directory child). Each file was then re-resolved from the root and its versions listed one query at a time. All five water reduces (six septic) repeated this. Fix in [jmacd/watertown#227](https://github.com/jmacd/watertown/pull/227) (**open**): directory children of physical types load without queries, version listing is batched per partition, and glob resolution and discovery are memoized per transaction, so reduces that share a source pattern discover it once. Measure site-staging sitegen time after deploy. |
+| `cargo audit`: `quick-xml` 0.39.4 (RUSTSEC-2026-0194, -0195) | Pulled in only by `object_store` 0.13; the fix needs `object_store` 0.14, which DataFusion 55.3 and deltalake 1.1.4 do not yet accept. DoS only, from trusted S3/Azure responses. Option: ignore both in `.cargo/audit.toml` until upstream moves. **Undecided.** |
+
+Operational findings, no action needed:
+
+- The 2026-11-18 well-depth gap (10:44Z to 19:03Z) was a pumphouse power loss.
+  The well pump is not controlled by the pumphouse host.
+- The gateway's NFS server (UniFi appliance) stalls for 2 to 4 minutes at about
+  02:03 and 03:03 Pacific each night, causing export retries and duplicate points
+  but no gaps.
+- Site sitegen is dominated by reuse checks, not by writing. In one site-staging run,
+  `/sources/water/reduced/*/res=1m.series` took 60–117 s each while reusing 1,522 of
+  1,523 partitions. The analysis stage (`drawdown-by-month`, `horner-by-month`) and the
+  noyo `res=1h` params take 35–100 s each. site-prod (about 1,400 s, sometimes about
+  470 s) is slower than site-staging (730–900 s). Their timers overlap at :41–:42, so
+  they compete for the host.
