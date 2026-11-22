@@ -615,6 +615,11 @@ pub async fn execute(
     let pond_files = read_pond_state(&context, &config.pond_path).await?;
     info!("Found {} files in pond", pond_files.len());
 
+    let mut stats = IngestionStats::default();
+    // An archive whose missed tail was appended during rotation handling is
+    // already counted as appended; step 4 only verifies it.
+    let mut appended_archive: Option<String> = None;
+
     // Step 3: Detect rotation - must happen BEFORE processing individual files
     // Rotation is detected when:
     // - Active file shrunk (size < pond's cumulative_size)
@@ -768,6 +773,9 @@ pub async fn execute(
                                 pond_active.cumulative_size,
                             )
                             .await?;
+                            stats.appended.0 += 1;
+                            stats.appended.1 += missed_bytes;
+                            appended_archive = Some(archived_filename.to_string());
                         }
 
                         // THEN: Rename the (now complete) active pond file to archived name
@@ -794,7 +802,6 @@ pub async fn execute(
     let pond_files = read_pond_state(&context, &config.pond_path).await?;
 
     // Step 4: Process all files (with updated pond state after any rotation handling)
-    let mut stats = IngestionStats::default();
     for host_file in &host_files {
         let filename = host_file
             .path
@@ -807,6 +814,10 @@ pub async fn execute(
         if host_file.is_active {
             // Active file: detect appends or ingest new after rotation
             process_active_file(&context, &config, host_file, pond_file, &mut stats).await?;
+        } else if appended_archive.as_deref() == Some(filename) {
+            let mut verify_only = IngestionStats::default();
+            process_archived_file(&context, &config, host_file, pond_file, &mut verify_only)
+                .await?;
         } else {
             // Archived file: detect new or changed
             process_archived_file(&context, &config, host_file, pond_file, &mut stats).await?;
