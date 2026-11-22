@@ -261,6 +261,10 @@ impl<P: PersistenceLayer + Send + Sync + 'static> PersistenceLayer for CachingPe
         self.inner.list_file_versions(id).await
     }
 
+    async fn list_files_versions(&self, ids: &[FileID]) -> Result<Vec<Vec<FileVersionInfo>>> {
+        self.inner.list_files_versions(ids).await
+    }
+
     async fn snapshot_identity(&self) -> Result<Option<String>> {
         self.inner.snapshot_identity().await
     }

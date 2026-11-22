@@ -526,51 +526,16 @@ impl Provider {
     ) -> Result<(tinyfs::NodeID, Vec<tinyfs::FileVersionInfo>)> {
         let node_path = self.resolve_url_node(url).await?;
         let file_id = node_path.id();
-        let node_id = file_id.node_id();
-
-        // Dynamic nodes have no persistence records; synthesize the one version
-        // their metadata describes, as the cached path does.
         if file_id.entry_type().is_dynamic() {
-            let file_node = node_path
-                .as_file()
-                .await
-                .map_err(|e| Error::InvalidUrl(format!("Dynamic node is not a file: {}", e)))?;
-            let metadata = file_node
-                .metadata()
-                .await
-                .map_err(|e| Error::InvalidUrl(format!("Failed to get metadata: {}", e)))?;
-            return Ok((
-                node_id,
-                vec![tinyfs::FileVersionInfo {
-                    version: metadata.version,
-                    timestamp: metadata.timestamp,
-                    size: metadata.size.unwrap_or(0),
-                    blake3: None,
-                    entry_type: metadata.entry_type,
-                    extended_metadata: None,
-                }],
-            ));
+            let version = dynamic_version_info(&node_path).await?;
+            return Ok((file_id.node_id(), vec![version]));
         }
-
-        let persistence = self
-            .provider_context
-            .as_ref()
-            .expect("version listing requires ProviderContext");
-
-        let versions = persistence
-            .persistence
+        let versions = self
+            .version_persistence()
             .list_file_versions(file_id)
             .await
             .map_err(|e| Error::InvalidUrl(format!("Failed to list versions: {}", e)))?;
-
-        if versions.is_empty() {
-            return Err(Error::InvalidUrl(format!(
-                "No versions found for file: {}",
-                url.path()
-            )));
-        }
-
-        Ok((node_id, versions))
+        Ok((file_id.node_id(), require_versions(url, versions)?))
     }
 
     /// Cache all live versions for callers explicitly inspecting version history.
@@ -598,6 +563,69 @@ impl Provider {
             .await
     }
 
+    /// [`Self::cache_url_contents`] (with a format provider) or the version
+    /// listing alone (pond-native Parquet, without one) for many already
+    /// resolved nodes at once.
+    ///
+    /// The nodes' version histories are read with one batched persistence
+    /// listing instead of one query per node, and no URL is re-resolved from
+    /// the root. Results are in input order.
+    pub(crate) async fn discover_node_contents(
+        &self,
+        sources: &[(Url, tinyfs::NodePath)],
+        format_provider: Option<&dyn FormatProvider>,
+        cache_dir: &std::path::Path,
+    ) -> Result<Vec<(tinyfs::NodeID, Vec<tinyfs::FileVersionInfo>)>> {
+        let persisted: Vec<tinyfs::FileID> = sources
+            .iter()
+            .map(|(_, node_path)| node_path.id())
+            .filter(|id| !id.entry_type().is_dynamic())
+            .collect();
+        let mut listed = self
+            .version_persistence()
+            .list_files_versions(&persisted)
+            .await
+            .map_err(|e| Error::InvalidUrl(format!("Failed to list versions: {}", e)))?
+            .into_iter();
+
+        let mut discovered = Vec::with_capacity(sources.len());
+        for (url, node_path) in sources {
+            let file_id = node_path.id();
+            let versions = if file_id.entry_type().is_dynamic() {
+                let version = dynamic_version_info(node_path).await?;
+                if let Some(fp) = format_provider {
+                    self.cache_dynamic_version(url, node_path, &version, fp, cache_dir)
+                        .await?;
+                }
+                vec![version]
+            } else {
+                let versions = require_versions(
+                    url,
+                    listed
+                        .next()
+                        .expect("batched listing returns one entry per persisted node"),
+                )?;
+                match format_provider {
+                    Some(fp) => {
+                        self.cache_listed_versions(url, file_id, versions, fp, cache_dir, true)
+                            .await?
+                    }
+                    None => versions,
+                }
+            };
+            discovered.push((file_id.node_id(), versions));
+        }
+        Ok(discovered)
+    }
+
+    fn version_persistence(&self) -> &Arc<dyn tinyfs::PersistenceLayer> {
+        &self
+            .provider_context
+            .as_ref()
+            .expect("version listing requires ProviderContext")
+            .persistence
+    }
+
     async fn cache_url_versions(
         &self,
         url: &Url,
@@ -605,11 +633,7 @@ impl Provider {
         cache_dir: &std::path::Path,
         current_contents_only: bool,
     ) -> Result<(tinyfs::NodeID, Vec<tinyfs::FileVersionInfo>)> {
-        let scheme = url.scheme();
-        let path = url.path();
-
         let node_path = self.resolve_url_node(url).await?;
-
         let file_id = node_path.id();
         let node_id = file_id.node_id();
 
@@ -617,86 +641,95 @@ impl Provider {
         // persistence records.  Read them directly via their File handle and
         // synthesize a single version from metadata.
         if file_id.entry_type().is_dynamic() {
-            let file_node = node_path
-                .as_file()
-                .await
-                .map_err(|e| Error::InvalidUrl(format!("Dynamic node is not a file: {}", e)))?;
-
-            let metadata = file_node
-                .metadata()
-                .await
-                .map_err(|e| Error::InvalidUrl(format!("Failed to get metadata: {}", e)))?;
-
-            let version_info = tinyfs::FileVersionInfo {
-                version: metadata.version,
-                timestamp: metadata.timestamp,
-                size: metadata.size.unwrap_or(0),
-                blake3: None,
-                entry_type: metadata.entry_type,
-                extended_metadata: None,
-            };
-
-            // Check if already cached
-            let uncached = crate::format_cache::find_uncached_versions(
-                cache_dir,
-                scheme,
-                &node_id,
-                std::slice::from_ref(&version_info),
-            );
-
-            if !uncached.is_empty() {
-                log::info!(
-                    "[SAVE] Format cache: writing dynamic file {}://{}",
-                    scheme,
-                    path
-                );
-
-                // Read content via async_reader
-                let reader = file_node.async_reader().await.map_err(|e| {
-                    Error::InvalidUrl(format!("Failed to read dynamic file: {}", e))
-                })?;
-
-                let reader: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> = reader;
-
-                // Apply decompression if needed
-                let reader = crate::format::compression::decompress(reader, url.compression())?;
-
-                // Parse through format provider
-                let (schema, stream) = format_provider.open_stream(reader, url).await?;
-
-                // Stream to cache Parquet
-                let _ = crate::format_cache::cache_write_version(
-                    cache_dir,
-                    scheme,
-                    &node_id,
-                    &version_info,
-                    schema,
-                    stream,
-                )
+            let version_info = dynamic_version_info(&node_path).await?;
+            self.cache_dynamic_version(url, &node_path, &version_info, format_provider, cache_dir)
                 .await?;
-            }
-
             return Ok((node_id, vec![version_info]));
         }
 
-        let persistence = self
-            .provider_context
-            .as_ref()
-            .expect("cache path requires ProviderContext");
-
-        // List all versions
-        let mut versions = persistence
-            .persistence
+        let versions = self
+            .version_persistence()
             .list_file_versions(file_id)
             .await
             .map_err(|e| Error::InvalidUrl(format!("Failed to list versions: {}", e)))?;
+        let versions = require_versions(url, versions)?;
+        let versions = self
+            .cache_listed_versions(
+                url,
+                file_id,
+                versions,
+                format_provider,
+                cache_dir,
+                current_contents_only,
+            )
+            .await?;
+        Ok((node_id, versions))
+    }
 
-        if versions.is_empty() {
-            return Err(Error::InvalidUrl(format!(
-                "No versions found for file: {}",
-                path
-            )));
+    /// Parse a dynamic file once into the format cache, unless already cached.
+    async fn cache_dynamic_version(
+        &self,
+        url: &Url,
+        node_path: &tinyfs::NodePath,
+        version_info: &tinyfs::FileVersionInfo,
+        format_provider: &dyn FormatProvider,
+        cache_dir: &std::path::Path,
+    ) -> Result<()> {
+        let scheme = url.scheme();
+        let node_id = node_path.id().node_id();
+        let uncached = crate::format_cache::find_uncached_versions(
+            cache_dir,
+            scheme,
+            &node_id,
+            std::slice::from_ref(version_info),
+        );
+        if uncached.is_empty() {
+            return Ok(());
         }
+        log::info!(
+            "[SAVE] Format cache: writing dynamic file {}://{}",
+            scheme,
+            url.path()
+        );
+
+        let file_node = node_path
+            .as_file()
+            .await
+            .map_err(|e| Error::InvalidUrl(format!("Dynamic node is not a file: {}", e)))?;
+        let reader = file_node
+            .async_reader()
+            .await
+            .map_err(|e| Error::InvalidUrl(format!("Failed to read dynamic file: {}", e)))?;
+        let reader: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> = reader;
+        let reader = crate::format::compression::decompress(reader, url.compression())?;
+        let (schema, stream) = format_provider.open_stream(reader, url).await?;
+        let _ = crate::format_cache::cache_write_version(
+            cache_dir,
+            scheme,
+            &node_id,
+            version_info,
+            schema,
+            stream,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Reconcile a persisted node's complete live version list against the
+    /// format cache, parse whatever is missing, and return the selected
+    /// versions.
+    async fn cache_listed_versions(
+        &self,
+        url: &Url,
+        file_id: tinyfs::FileID,
+        mut versions: Vec<tinyfs::FileVersionInfo>,
+        format_provider: &dyn FormatProvider,
+        cache_dir: &std::path::Path,
+        current_contents_only: bool,
+    ) -> Result<Vec<tinyfs::FileVersionInfo>> {
+        let scheme = url.scheme();
+        let path = url.path();
+        let node_id = file_id.node_id();
 
         // Reconcile, not merely check: `versions` is this node's complete live
         // set, so this is the one place that can also retire the sidecars of
@@ -727,8 +760,8 @@ impl Provider {
 
             for version in &uncached {
                 // Read this specific version's raw bytes
-                let bytes = persistence
-                    .persistence
+                let bytes = self
+                    .version_persistence()
                     .read_file_version(file_id, version.version)
                     .await
                     .map_err(|e| {
@@ -756,7 +789,7 @@ impl Provider {
             }
         }
 
-        Ok((node_id, versions))
+        Ok(versions)
     }
 
     /// Create a single `TableProvider` for a URL that may contain wildcards.
@@ -1146,6 +1179,40 @@ fn retain_file_query_versions(
             .max();
         versions.retain(|version| Some(version.version) == current);
     }
+}
+
+/// Dynamic nodes have no persistence records; synthesize the one version their
+/// metadata describes.
+async fn dynamic_version_info(node_path: &tinyfs::NodePath) -> Result<tinyfs::FileVersionInfo> {
+    let file_node = node_path
+        .as_file()
+        .await
+        .map_err(|e| Error::InvalidUrl(format!("Dynamic node is not a file: {}", e)))?;
+    let metadata = file_node
+        .metadata()
+        .await
+        .map_err(|e| Error::InvalidUrl(format!("Failed to get metadata: {}", e)))?;
+    Ok(tinyfs::FileVersionInfo {
+        version: metadata.version,
+        timestamp: metadata.timestamp,
+        size: metadata.size.unwrap_or(0),
+        blake3: None,
+        entry_type: metadata.entry_type,
+        extended_metadata: None,
+    })
+}
+
+fn require_versions(
+    url: &Url,
+    versions: Vec<tinyfs::FileVersionInfo>,
+) -> Result<Vec<tinyfs::FileVersionInfo>> {
+    if versions.is_empty() {
+        return Err(Error::InvalidUrl(format!(
+            "No versions found for file: {}",
+            url.path()
+        )));
+    }
+    Ok(versions)
 }
 
 /// Read a non-queryable data-archetype node (e.g. a git-ingested `FileDynamic`

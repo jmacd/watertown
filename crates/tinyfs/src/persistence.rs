@@ -182,6 +182,19 @@ pub trait PersistenceLayer: Send + Sync {
     /// Returns versions in chronological order (oldest to newest)
     async fn list_file_versions(&self, id: FileID) -> Result<Vec<FileVersionInfo>>;
 
+    /// List the versions of several files, in the order of `ids`.
+    ///
+    /// Equivalent to calling [`Self::list_file_versions`] for each id.
+    /// Backends whose per-call cost is a query should override this to share
+    /// one query across files of the same partition.
+    async fn list_files_versions(&self, ids: &[FileID]) -> Result<Vec<Vec<FileVersionInfo>>> {
+        let mut listed = Vec::with_capacity(ids.len());
+        for id in ids {
+            listed.push(self.list_file_versions(*id).await?);
+        }
+        Ok(listed)
+    }
+
     /// Stable identity of the complete readable persistence snapshot.
     ///
     /// Equal identities must mean every node, version, and directory entry

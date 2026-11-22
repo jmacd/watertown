@@ -29,7 +29,7 @@ mod wd;
 // Public exports - Core filesystem API
 pub use context::{
     ExportChange, ExportHint, FactoryContext, PlanVisibilityMetricsSnapshot, PondMetadata,
-    ProviderContext, QueryLineageCache,
+    ProviderContext, QueryLineageCache, TransactionMemo,
 };
 pub use dir::{Directory, DirectoryEntry, Handle as DirHandle, Pathed};
 pub use file::{

@@ -88,7 +88,7 @@ impl Directory for OpLogDirectory {
         };
 
         // Load the child node
-        let child_node = self.state.load_node(child_file_id).await?;
+        let child_node = self.state.load_directory_child(child_file_id).await?;
         Ok(Some(child_node))
     }
 
@@ -167,7 +167,7 @@ impl Directory for OpLogDirectory {
                 } else {
                     FileID::new_from_ids(self.id.part_id(), entry.child_node_id, child_pond_id)
                 };
-                let child_node = self.state.load_node(child_file_id).await?;
+                let child_node = self.state.load_directory_child(child_file_id).await?;
                 Ok(Some(child_node))
             }
             None => Ok(None),
