@@ -7,8 +7,13 @@ ingestion, inventory copy from site-staging, two bounded Sitegen reports),
 gated by `staging_analytics_enabled` in the enclosing repository's
 `analytics` branch. Staging has been exercised at volume with synthetic
 traffic (see [Staging hardening](#staging-hardening-with-synthetic-traffic)).
-Production collection is not enabled. Public reporting
-and production ownership/deployment decisions remain pending. Platform defects
+Production collection is enabled (2026-11-23): the cloud host's Caddy logs
+`caspar-prod`/`noyo-prod` beacons, and a native `analytics-prod` pond there
+(backed up to Azure `analytics-prod-0001`) publishes public reports at
+`casparwater.us/analytics/{caspar,noyo}/`, gated by Watershop's
+`production_analytics_enabled`. Until a site has an accepted view, its report
+is unavailable and the run fails, because an empty beacon source is not yet
+treated as no data. Platform defects
 found while staging this work are tracked in
 [Platform defects found while staging](#platform-defects-found-while-staging).
 
