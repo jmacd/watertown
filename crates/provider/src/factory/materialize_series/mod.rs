@@ -529,21 +529,24 @@ fn source_change(
     }
     if watermark_us.is_none()
         || !matching_axis
+        || !before.timestamp_local
         || !now.timestamp_local
         || before.recipe_identity != now.recipe_identity
     {
         return Ok(SourceChange::full());
     }
-    let previous: BTreeMap<_, _> = before
-        .leaves
-        .iter()
-        .map(|leaf| (&leaf.identity, leaf))
-        .collect();
-    let current: BTreeMap<_, _> = now
-        .leaves
-        .iter()
-        .map(|leaf| (&leaf.identity, leaf))
-        .collect();
+    // Two versions of the same file can contain identical bytes and bounds.
+    // Their rows contribute twice; comparison by content identity alone
+    // would miss a late duplicate alongside a genuinely newer append.
+    fn counts(lineage: &tinyfs::QueryLineage) -> BTreeMap<&tinyfs::QuerySourceLeaf, usize> {
+        let mut counts = BTreeMap::new();
+        for leaf in &lineage.leaves {
+            *counts.entry(leaf).or_default() += 1;
+        }
+        counts
+    }
+    let previous = counts(before);
+    let current = counts(now);
     // Removal, replacement, repacking, or a rename out of the source pattern is
     // never assumed to be an append. Timestamp locality confines its effect to
     // the leaf's own event-time range, so a bounded leaf only needs an exact
@@ -551,8 +554,8 @@ fn source_change(
     let mut removed = Vec::new();
     let mut removed_extent = None;
     let mut removed_unbounded = false;
-    for (identity, leaf) in &previous {
-        if current.get(identity) == Some(leaf) {
+    for (&leaf, &n) in &previous {
+        if current.get(leaf).copied().unwrap_or(0) >= n {
             continue;
         }
         removed.push(describe_leaf(leaf));
@@ -562,8 +565,8 @@ fn source_change(
         }
     }
     let mut extent = None;
-    for (identity, leaf) in &current {
-        if previous.get(identity) == Some(leaf) {
+    for (&leaf, &n) in &current {
+        if previous.get(leaf).copied().unwrap_or(0) >= n {
             continue;
         }
         match leaf_range(leaf)? {
@@ -759,13 +762,7 @@ pub async fn execute(
         .await
         .map_other_context("materialize-series: source lineage")?;
     if let Some(lineage) = &mut lineage {
-        lineage.leaves.sort_by(|left, right| {
-            (&left.identity, left.min_event_time, left.max_event_time).cmp(&(
-                &right.identity,
-                right.min_event_time,
-                right.max_event_time,
-            ))
-        });
+        lineage.leaves.sort();
     }
     let checkpoint_path = checkpoint_path(&context, &config).await?;
     let prior = read_checkpoint(checkpoint_path.as_deref()).await?;
@@ -1292,6 +1289,17 @@ mod tests {
         };
         let old = leaf("a:1", Some((0, 9)));
         let b = leaf("b:1", Some((50, 60)));
+        let new = leaf("new", Some((101, 102)));
+        // A net change in the multiplicity of an old leaf still needs prefix
+        // verification even when a strictly newer leaf was also appended.
+        assert_eq!(
+            lower(vec![b.clone()], vec![b.clone(), b.clone(), new.clone()]),
+            (Some(49), 0)
+        );
+        assert_eq!(
+            lower(vec![b.clone(), b.clone()], vec![b.clone(), new]),
+            (Some(49), 1)
+        );
         // Removal alone re-proves only the removed range.
         assert_eq!(
             lower(vec![old.clone(), b.clone()], vec![old.clone()]),

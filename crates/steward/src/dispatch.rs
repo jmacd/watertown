@@ -435,8 +435,22 @@ impl<'a> Transaction<'a> {
     /// write that produced no changes. `Host` transactions have no
     /// versioning concept and always return `Ok(None)`.
     pub async fn commit(self) -> Result<Option<i64>, StewardError> {
+        self.commit_reporting_local_completion(|| {}).await
+    }
+
+    /// Like `commit`, but notify a timing observer once local commit and control
+    /// bookkeeping finish, before tile publication, factories or remote retries.
+    /// No notification is made for a failed local commit or a read transaction.
+    pub async fn commit_reporting_local_completion(
+        self,
+        local_complete: impl FnOnce(),
+    ) -> Result<Option<i64>, StewardError> {
         match self {
-            Transaction::Pond(guard) => guard.commit().await,
+            Transaction::Pond(guard) => {
+                guard
+                    .commit_reporting_local_completion(local_complete)
+                    .await
+            }
             Transaction::Host(_) => Ok(None), // No-op: host writes are immediate
         }
     }

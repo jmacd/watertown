@@ -31,8 +31,48 @@ use deltalake::operations::optimize::OptimizeType;
 use deltalake::{DeltaTable, FilterOp, FilterValue};
 use log::{debug, info, warn};
 use std::collections::HashMap;
+use std::fmt::Arguments;
 use std::num::NonZeroU64;
+use std::time::Instant;
 use uuid::Uuid;
+
+/// An opt-in wall clock for a single maintenance operation. A phase that
+/// exits via `?` is distinguishable from a successful zero-work phase.
+pub struct PhaseTimer<'a> {
+    scope: &'a str,
+    phase: &'static str,
+    started: Option<Instant>,
+}
+
+impl<'a> PhaseTimer<'a> {
+    #[must_use]
+    pub fn start(scope: &'a str, phase: &'static str) -> Self {
+        Self {
+            scope,
+            phase,
+            started: log::log_enabled!(target: "pond::maintain_phases", log::Level::Debug)
+                .then(Instant::now),
+        }
+    }
+
+    pub fn finish(mut self, work: Arguments<'_>) {
+        self.emit("ok", work);
+    }
+
+    fn emit(&mut self, outcome: &str, work: Arguments<'_>) {
+        if let Some(started) = self.started.take() {
+            debug!(target: "pond::maintain_phases",
+                "Maintain phase scope={} phase={} elapsed_ms={} outcome={outcome} {work}",
+                self.scope, self.phase, started.elapsed().as_millis());
+        }
+    }
+}
+
+impl Drop for PhaseTimer<'_> {
+    fn drop(&mut self) {
+        self.emit("incomplete", format_args!(""));
+    }
+}
 
 /// How often to create checkpoints (every N versions).
 /// Delta Lake standard is 10.
@@ -186,6 +226,7 @@ pub async fn maintain_table(
     let version = table.version().unwrap_or(0);
     let should_checkpoint = version > 0 && (force || version.is_multiple_of(CHECKPOINT_INTERVAL));
     if should_checkpoint {
+        let phase = PhaseTimer::start(table_name, "checkpoint");
         debug!(
             "[MAINTAIN] Creating checkpoint for {} at version {}",
             table_name, version
@@ -197,6 +238,7 @@ pub async fn maintain_table(
                     table_name, version
                 );
                 result.checkpoint_created = true;
+                phase.finish(format_args!("version={version}"));
             }
             Err(e) => {
                 if force {
@@ -214,6 +256,7 @@ pub async fn maintain_table(
 
     // 2. Clean up expired log files (only meaningful after a checkpoint exists)
     if result.checkpoint_created {
+        let phase = PhaseTimer::start(table_name, "log_cleanup");
         let cleanup = match log_retention {
             Some(retention) => {
                 let cutoff = Utc::now().timestamp_millis() - retention.num_milliseconds();
@@ -243,8 +286,10 @@ pub async fn maintain_table(
                     );
                 }
                 result.logs_cleaned = cleaned;
+                phase.finish(format_args!("files_removed={cleaned}"));
             }
             Err(e) => {
+                drop(phase);
                 if force {
                     return Err(crate::StewardError::DeltaLake(format!(
                         "clean expired logs for {table_name}: {e}"
@@ -258,6 +303,7 @@ pub async fn maintain_table(
         // `table`'s in-memory state. A later vacuum internally replays the
         // log from that stale state and would otherwise try to read a JSON
         // commit file that cleanup just deleted from disk.
+        let phase = PhaseTimer::start(table_name, "reload");
         if let Err(e) = table.load().await {
             if force {
                 return Err(crate::StewardError::DeltaLake(format!(
@@ -268,6 +314,8 @@ pub async fn maintain_table(
                 "[MAINTAIN] Reload after log cleanup failed for {}: {}",
                 table_name, e
             );
+        } else {
+            phase.finish(format_args!("version={version}"));
         }
     }
 
@@ -276,6 +324,7 @@ pub async fn maintain_table(
         force || has_remove_actions(&table) || version.is_multiple_of(VACUUM_INTERVAL);
 
     if should_vacuum {
+        let phase = PhaseTimer::start(table_name, "vacuum");
         match table
             .clone()
             .vacuum()
@@ -297,6 +346,7 @@ pub async fn maintain_table(
                 }
                 result.files_vacuumed = count;
                 table = new_table;
+                phase.finish(format_args!("files_removed={count}"));
             }
             Err(e) => {
                 if force {
@@ -317,6 +367,7 @@ pub async fn maintain_table(
 
     // 4. Compact small files (only when explicitly requested)
     if do_compact {
+        let phase = PhaseTimer::start(table_name, "compact");
         debug!("[MAINTAIN] Running compaction for {}", table_name);
         match table
             .clone()
@@ -334,6 +385,10 @@ pub async fn maintain_table(
                 result.compact_files_added = metrics.num_files_added;
                 result.compact_files_removed = metrics.num_files_removed;
                 table = new_table;
+                phase.finish(format_args!(
+                    "files_added={} files_removed={}",
+                    metrics.num_files_added, metrics.num_files_removed
+                ));
             }
             Err(e) => {
                 if force {

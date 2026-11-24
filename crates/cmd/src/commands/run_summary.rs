@@ -17,6 +17,7 @@
 //! one-shot CLI: each invocation runs exactly one subcommand.
 
 use std::sync::Mutex;
+use std::time::Instant;
 
 static FACTORY: Mutex<Option<String>> = Mutex::new(None);
 
@@ -38,4 +39,43 @@ pub fn take_factory() -> Option<String> {
         .lock()
         .expect("run_summary FACTORY mutex poisoned")
         .take()
+}
+
+/// Non-overlapping wall times for one pond run. Unreached phases are omitted.
+pub(super) struct RunPhases {
+    phase: &'static str,
+    since: Instant,
+    fields: String,
+}
+
+impl RunPhases {
+    pub(super) fn new() -> Self {
+        Self {
+            phase: "open",
+            since: Instant::now(),
+            fields: String::new(),
+        }
+    }
+
+    pub(super) fn enter(&mut self, next: &'static str) {
+        use std::fmt::Write;
+        let now = Instant::now();
+        if log::log_enabled!(target: "pond::run_phases", log::Level::Debug) {
+            write!(
+                self.fields,
+                " {}_ms={}",
+                self.phase,
+                (now - self.since).as_millis()
+            )
+            .expect("writing to a String cannot fail");
+        }
+        self.phase = next;
+        self.since = now;
+    }
+
+    pub(super) fn report(mut self, path: &str, ok: bool) {
+        self.enter("done");
+        log::debug!(target: "pond::run_phases", "Run phases path={path} outcome={}{}",
+            if ok { "ok" } else { "err" }, self.fields);
+    }
 }

@@ -38,3 +38,12 @@ The whole parsed input is buffered, not streamed in bounded memory.
 Blank/NUL handling and malformed/non-object lines are parser-specific;
 unparseable/non-object lines are skipped with a counted warning. Unit tests
 cover parser cases; the URL example is not a runnable documentation fixture.
+
+For plain pond `jsonlogs` series, older chunks may have numeric time bounds
+but no recorded unit. A labeled chunk in the same matched source can supply
+the candidate microsecond column. Before using legacy bounds, the provider
+checks **every** row of each such chunk against its own range. Successful
+checks are cached by file, version, content hash, column and bounds; losing
+the cache requires rechecking the bytes, not resetting the pond. A filename
+or a field name alone never authorizes pruning. Conflicting metadata or an
+unverifiable row leaves the query on its unbounded path.

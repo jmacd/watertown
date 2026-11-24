@@ -38,7 +38,7 @@ pub struct SeriesReadBounds {
 /// `identity` is content-addressed when the backend supplies a logical/content
 /// hash and otherwise includes the backend version identity. Missing temporal
 /// bounds are explicit: consumers must treat such a leaf as spanning all time.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct QuerySourceLeaf {
     pub identity: String,
     pub min_event_time: Option<i64>,

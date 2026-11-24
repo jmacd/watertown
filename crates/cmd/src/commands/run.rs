@@ -12,6 +12,8 @@ use provider::registry::ExecutionContext;
 use tokio::io::AsyncReadExt;
 use utilities::env_substitution;
 
+use super::run_summary::RunPhases;
+
 /// Execute a run configuration
 pub async fn run_command(
     ship_context: &ShipContext,
@@ -37,7 +39,10 @@ pub async fn run_command(
             } else {
                 path.clone()
             };
-            run_pond_command(ship_context, &resolved, extra_args).await
+            let mut phases = RunPhases::new();
+            let result = run_pond_command(ship_context, &resolved, extra_args, &mut phases).await;
+            phases.report(&resolved, result.is_ok());
+            result
         }
     }
 }
@@ -182,9 +187,11 @@ async fn run_pond_command(
     ship_context: &ShipContext,
     config_path: &str,
     extra_args: Vec<String>,
+    phases: &mut RunPhases,
 ) -> Result<()> {
     // Open pond
     let mut ship = ship_context.open_pond().await?;
+    phases.enter("begin");
 
     // Pre-load all factory modes and pond metadata before starting transaction
     let all_factory_modes = ship.control_table().factory_modes().clone();
@@ -194,6 +201,7 @@ async fn run_pond_command(
 
     // Start write transaction for the entire operation
     let mut tx = ship.begin_write(&ship_context.command_metadata()).await?;
+    phases.enter("setup");
 
     match run_pond_command_impl(
         &mut tx,
@@ -202,16 +210,23 @@ async fn run_pond_command(
         all_factory_modes,
         pond_metadata,
         ship_context.explicit_host_root()?,
+        phases,
     )
     .await
     {
         Ok(()) => {
-            _ = tx.commit().await?;
+            phases.enter("local_commit");
+            _ = tx
+                .commit_reporting_local_completion(|| phases.enter("post_commit"))
+                .await?;
             log::debug!("Configuration executed successfully");
             debug!("[OK] Execution complete");
             Ok(())
         }
-        Err(e) => Err(tx.abort(&e).await.into()),
+        Err(e) => {
+            phases.enter("abort");
+            Err(tx.abort(&e).await.into())
+        }
     }
 }
 
@@ -223,6 +238,7 @@ async fn run_pond_command_impl(
     all_factory_modes: std::collections::HashMap<String, String>,
     pond_metadata: tlogfs::PondMetadata,
     host_root: Option<std::path::PathBuf>,
+    phases: &mut RunPhases,
 ) -> Result<()> {
     // Get filesystem root (guard derefs to FS)
     let root = tx.root().await?;
@@ -340,6 +356,7 @@ async fn run_pond_command_impl(
     if let Some(host_root) = host_root {
         execution_context = execution_context.with_host_root(host_root);
     }
+    phases.enter("factory");
     FactoryRegistry::execute::<tlogfs::TLogFSError>(
         &factory_name,
         &config_bytes,

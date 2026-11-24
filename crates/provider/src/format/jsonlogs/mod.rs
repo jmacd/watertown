@@ -15,6 +15,8 @@
 //! Designed for systemd journal JSON output (`journalctl --output=json`) but
 //! works with any JSON Lines source.
 
+pub(crate) mod legacy_bounds;
+
 use crate::format::FormatProvider;
 use crate::{Result, Url};
 use arrow::array::StringArray;
