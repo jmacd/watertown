@@ -486,7 +486,14 @@ impl<'a> StewardTransactionGuard<'a> {
         Ok(())
     }
 
-    pub async fn commit(mut self) -> Result<Option<i64>, StewardError> {
+    pub async fn commit(self) -> Result<Option<i64>, StewardError> {
+        self.commit_reporting_local_completion(|| {}).await
+    }
+
+    pub(crate) async fn commit_reporting_local_completion(
+        mut self,
+        local_complete: impl FnOnce(),
+    ) -> Result<Option<i64>, StewardError> {
         let args_fmt = format!("{:?}", self.txn_meta.user.args);
         debug!(
             "Committing steward transaction {} {}",
@@ -603,6 +610,7 @@ impl<'a> StewardTransactionGuard<'a> {
                     "Steward transaction {} committed (seq={}, version={})",
                     self.txn_meta.user.txn_id, self.txn_meta.txn_seq, new_version
                 );
+                local_complete();
 
                 // Materialize/reconcile the transparency-log tiles for this
                 // commit (Decision D5/D9).  This is a best-effort publishing
@@ -675,6 +683,7 @@ impl<'a> StewardTransactionGuard<'a> {
                         self.txn_meta.user.txn_id, self.txn_meta.txn_seq
                     );
                     self.committed = true;
+                    local_complete();
                     if !self.suppress_post_commit
                         && !self.control_table.post_commit_dispatch_suppressed()
                     {
