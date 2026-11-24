@@ -191,6 +191,34 @@ async fn dropped_export_reconciles_to_committed_leaf_count_on_next_commit() {
     assert_eq!(tile_leaves, leaves, "rebuilt tile leaves match the log");
 }
 
+#[tokio::test]
+async fn lagging_checkpoint_catches_up_to_the_same_tiles_as_full_replay() {
+    let tmp = tempdir().unwrap();
+    let pond = tmp.path().join("pond");
+    let mut ship = Ship::create_pond(&pond, "tlog-lag").await.unwrap();
+    let dir = get_tlog_path(&pond);
+    write_file(&mut ship, "/first", b"first").await;
+    let prefix = tmp.path().join("one-leaf-export");
+    std::fs::rename(&dir, &prefix).unwrap();
+    write_file(&mut ship, "/second", b"second").await;
+    std::fs::rename(&dir, tmp.path().join("two-leaf-export")).unwrap();
+    std::fs::rename(prefix, &dir).unwrap();
+    write_file(&mut ship, "/third", b"third").await;
+
+    let hashes = leaves_from_control_table(&ship, ship.last_write_seq()).await;
+    let oracle = TileLog::new(
+        tmp.path().join("replayed"),
+        format!("watertown/{}", ship.control_table().pond_id_uuid()),
+    );
+    let expected = oracle.materialize(&hashes).unwrap();
+    assert_eq!(Checkpoint::read(&dir).unwrap(), Some(expected));
+    let tile = sync_store::tlog::data_tile_rel(0, 0, hashes.len());
+    assert_eq!(
+        std::fs::read(dir.join(&tile)).unwrap(),
+        std::fs::read(oracle.dir().join(tile)).unwrap()
+    );
+}
+
 /// Every published checkpoint is recorded in the append-only history, and each
 /// one proves append-only consistency against the current tree (the key-free
 /// half of the transparency log, verifiable without any signing key).

@@ -70,41 +70,48 @@ pub(crate) async fn materialize_tlog(
     table: deltalake::DeltaTable,
     pond_id: uuid::Uuid,
 ) {
+    let start = std::time::Instant::now();
     let dir = crate::get_tlog_path(pond_path);
     let origin = format!("watertown/{pond_id}");
-    let log = sync_store::TileLog::new(dir, origin);
+    let exported = match sync_store::Checkpoint::read(&dir) {
+        Ok(Some(cp)) if cp.origin != origin => {
+            log::error!(
+                "transparency-log checkpoint belongs to {}, expected {origin}",
+                cp.origin
+            );
+            return;
+        }
+        Ok(cp) => cp.map_or(0, |cp| cp.size),
+        Err(e) => {
+            log::error!("failed to read transparency-log checkpoint: {e}");
+            return;
+        }
+    };
 
-    // Decision D9: the authoritative leaf sequence is the pond-resident commit
-    // log node, not the disposable control table.  Each log-node version holds
-    // one encoded commit object; the tile export is reconciled against them.
     let data_path = crate::get_data_path(pond_path);
-    let leaves = match read_log_leaves(table, &data_path, &pond_id.to_string()).await {
-        Ok(l) => l,
+    let missing = match read_log_suffix(table, &data_path, &pond_id.to_string(), exported).await {
+        Ok(leaves) => leaves,
         Err(e) => {
             log::error!("failed to read transparency-log leaf sequence: {e}");
             return;
         }
     };
-
-    let exported = match log.size() {
-        Ok(n) => n as usize,
-        Err(e) => {
-            log::error!("failed to read transparency-log checkpoint size: {e}");
-            return;
-        }
-    };
-
-    if exported >= leaves.len() {
+    if missing.is_empty() {
+        log::debug!(
+            "transparency log caught up (size={exported}, elapsed_ms={})",
+            start.elapsed().as_millis()
+        );
         return;
     }
 
-    let missing: Vec<Vec<u8>> = leaves[exported..].to_vec();
-
+    let log = sync_store::TileLog::new(dir, origin);
+    let appended = missing.len();
     match log.append_leaf_data(missing) {
         Ok(checkpoint) => log::debug!(
-            "transparency log checkpoint emitted (size={}, root={})",
+            "transparency log checkpoint emitted (size={}, root={}, appended={appended}, elapsed_ms={})",
             checkpoint.size,
-            checkpoint.root.to_hex()
+            checkpoint.root.to_hex(),
+            start.elapsed().as_millis()
         ),
         Err(e) => log::error!("failed to materialize transparency-log tiles: {e}"),
     }
@@ -2071,6 +2078,15 @@ pub(crate) async fn read_log_leaves(
     data_path: &std::path::Path,
     pond_id: &str,
 ) -> Result<Vec<Vec<u8>>, StewardError> {
+    read_log_suffix(table, data_path, pond_id, 0).await
+}
+
+async fn read_log_suffix(
+    table: deltalake::DeltaTable,
+    data_path: &std::path::Path,
+    pond_id: &str,
+    exported: u64,
+) -> Result<Vec<Vec<u8>>, StewardError> {
     let ctx = SessionContext::new();
     let provider = table
         .table_provider()
@@ -2079,47 +2095,107 @@ pub(crate) async fn read_log_leaves(
     let _previous = ctx
         .register_table("log_live", provider)
         .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
-    let sql = format!(
-        "SELECT version, content, blake3 FROM log_live \
-         WHERE pond_id = '{pond_id}' AND node_id = '{log}' ORDER BY version",
+    let source = format!(
+        "FROM log_live WHERE pond_id = '{pond_id}' AND node_id = '{log}'",
         log = tinyfs::LOG_NODE_UUID,
     );
+    let bound = if exported == 0 {
+        String::new() // Missing export or explicit full replay.
+    } else {
+        #[derive(serde::Deserialize)]
+        struct LogHead {
+            leaf_count: i64,
+            tip: Option<i64>,
+        }
+        let heads: Vec<LogHead> = log_query(
+            &ctx,
+            &format!("SELECT COUNT(*) AS leaf_count, MAX(version) AS tip {source}"),
+        )
+        .await?;
+        let [head] = heads.as_slice() else {
+            return Err(StewardError::Content("missing commit-log aggregate".into()));
+        };
+        let count = u64::try_from(head.leaf_count)
+            .map_err(|e| StewardError::Content(format!("invalid commit-log count: {e}")))?;
+        let missing = count.checked_sub(exported).ok_or_else(|| {
+            StewardError::Content(format!(
+                "exported {exported} leaves but only {count} committed"
+            ))
+        })?;
+        let first = match missing {
+            0 => return Ok(Vec::new()),
+            1 => head
+                .tip
+                .ok_or_else(|| StewardError::Content("missing commit-log tip".into()))?,
+            _ => {
+                // A checkpoint counts leaves, not Delta versions or txn sequences.
+                // Resolve its ordinal on version metadata before fetching any payloads.
+                #[derive(serde::Deserialize)]
+                struct LogVersion {
+                    version: i64,
+                }
+                let rows: Vec<LogVersion> = log_query(
+                    &ctx,
+                    &format!("SELECT version {source} ORDER BY version LIMIT 1 OFFSET {exported}"),
+                )
+                .await?;
+                let [row] = rows.as_slice() else {
+                    return Err(StewardError::Content(
+                        "missing commit-log suffix boundary".into(),
+                    ));
+                };
+                row.version
+            }
+        };
+        format!(" AND version >= {first}")
+    };
+    let rows: Vec<LogLeaf> = log_query(
+        &ctx,
+        &format!("SELECT version, content, blake3 {source}{bound} ORDER BY version"),
+    )
+    .await?;
+    let mut leaves = Vec::with_capacity(rows.len());
+    for row in rows {
+        let bytes = match (row.content, row.blake3) {
+            (Some(bytes), _) => bytes,
+            (None, Some(blake3)) => tlogfs::large_files::read_external_bytes(data_path, &blake3)
+                .await
+                .map_err(|error| {
+                    StewardError::Content(format!(
+                        "read external commit-log leaf at version {} ({blake3}): {error}",
+                        row.version
+                    ))
+                })?,
+            (None, None) => {
+                return Err(StewardError::Content(format!(
+                    "commit-log leaf at version {} has neither inline content nor an external blob hash",
+                    row.version
+                )));
+            }
+        };
+        leaves.push(bytes);
+    }
+    Ok(leaves)
+}
+
+async fn log_query<T: serde::de::DeserializeOwned>(
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<Vec<T>, StewardError> {
     let batches = ctx
-        .sql(&sql)
+        .sql(sql)
         .await
         .map_err(|e| StewardError::DeltaLake(e.to_string()))?
         .collect()
         .await
         .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
-    let mut leaves: Vec<Vec<u8>> = Vec::new();
+    let mut rows = Vec::new();
     for batch in &batches {
-        let parsed: Vec<LogLeaf> = serde_arrow::from_record_batch(batch)
+        let parsed: Vec<T> = serde_arrow::from_record_batch(batch)
             .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
-        for row in parsed {
-            let bytes = match (row.content, row.blake3) {
-                (Some(bytes), _) => bytes,
-                (None, Some(blake3)) => {
-                    tlogfs::large_files::read_external_bytes(data_path, &blake3)
-                        .await
-                        .map_err(|error| {
-                            StewardError::Content(format!(
-                                "read external commit-log leaf at version {} ({blake3}): {error}",
-                                row.version
-                            ))
-                        })?
-                }
-                (None, None) => {
-                    return Err(StewardError::Content(format!(
-                        "commit-log leaf at version {} has neither inline content nor an \
-                         external blob hash",
-                        row.version
-                    )));
-                }
-            };
-            leaves.push(bytes);
-        }
+        rows.extend(parsed);
     }
-    Ok(leaves)
+    Ok(rows)
 }
 
 /// One commit-log leaf row: its series version plus the inline commit-object
@@ -3545,7 +3621,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn commit_log_reads_externalized_commit_objects() {
+    async fn commit_log_reads_externalized_leaves_only_in_requested_suffix() {
         let temp_dir = tempfile::TempDir::new().expect("tempdir");
         let pond_path = temp_dir.path().join("pond");
         let mut ship = Ship::create_pond(&pond_path, "test-host")
@@ -3587,6 +3663,46 @@ mod tests {
         .expect("read externalized tip")
         .expect("tip exists");
         assert_eq!(tip, commit.hash());
+
+        for dir in ["/second", "/third"] {
+            ship.write_transaction(
+                &crate::PondUserMetadata::new(vec![dir.into()]),
+                async |fs| {
+                    let _ = fs.root().await?.create_dir_path(dir).await?;
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let table = ship.data_persistence().table().clone();
+        let all = read_log_leaves(
+            table.clone(),
+            ship.data_persistence().store_path(),
+            &pond_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(all.len(), 3);
+        // The first leaf cannot be read from this path. Reading all payloads and
+        // slicing afterward would fail even on a caught-up or one-leaf export.
+        let no_blobs = temp_dir.path().join("no-blobs");
+        assert!(
+            read_log_suffix(table.clone(), &no_blobs, &pond_id, 0)
+                .await
+                .is_err()
+        );
+        for exported in 1..=3 {
+            let missing = read_log_suffix(table.clone(), &no_blobs, &pond_id, exported)
+                .await
+                .unwrap();
+            assert_eq!(missing, all[exported as usize..]);
+        }
+        assert!(
+            read_log_suffix(table, &no_blobs, &pond_id, 4)
+                .await
+                .is_err()
+        );
     }
 
     #[test]
