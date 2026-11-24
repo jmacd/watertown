@@ -970,8 +970,10 @@ impl Provider {
             vec![(self.resolve_url_node(&url).await?, Vec::new())]
         };
         let mut common = None;
+        let mut legacy_nodes = Vec::new();
         for (node, _) in nodes {
             let id = node.id();
+            let mut legacy = Vec::new();
             let column = if id.entry_type().is_dynamic() && format.is_none() {
                 let file = node.as_file().await.map_err(|error| {
                     Error::InvalidUrl(format!(
@@ -1000,32 +1002,33 @@ impl Provider {
                             Error::InvalidUrl(format!("Event-time metadata for {id}: {error}"))
                         })?;
                 let mut column = None;
-                for version in versions.iter().filter(|version| version.size > 0) {
+                for version in versions.into_iter().filter(|version| version.size > 0) {
                     if format.is_some()
-                        && crate::format_cache::version_max_event_time(version).is_none()
+                        && crate::format_cache::version_max_event_time(&version).is_none()
                     {
                         // Unindexed legacy versions cannot be pruned anyway.
                         continue;
                     }
-                    let Some(attributes) = version
+                    let attributes: Option<serde_json::Value> = version
                         .extended_metadata
                         .as_ref()
                         .and_then(|metadata| metadata.get("extended_attributes"))
-                    else {
-                        return Ok(None);
-                    };
-                    let attributes: serde_json::Value =
-                        serde_json::from_str(attributes).map_err(|error| {
+                        .map(|raw| serde_json::from_str(raw))
+                        .transpose()
+                        .map_err(|error| {
                             Error::InvalidUrl(format!(
                                 "Invalid event-time attributes for {id} version {}: {error}",
                                 version.version
                             ))
                         })?;
                     let recorded = if let Some(format) = &format {
-                        format.event_time_axis(&attributes)
+                        attributes
+                            .as_ref()
+                            .and_then(|attrs| format.event_time_axis(attrs))
                     } else {
                         attributes
-                            .get("watertown.timestamp_column")
+                            .as_ref()
+                            .and_then(|attrs| attrs.get("watertown.timestamp_column"))
                             .and_then(serde_json::Value::as_str)
                             .map(|column| crate::format::EventTimeAxis {
                                 column: column.to_owned(),
@@ -1033,6 +1036,16 @@ impl Provider {
                             })
                     };
                     let Some(recorded) = recorded else {
+                        if url.full_scheme() == "jsonlogs"
+                            && id.entry_type() == tinyfs::EntryType::FilePhysicalSeries
+                            && let Some(hint) =
+                                crate::format::jsonlogs::legacy_bounds::candidate_column(
+                                    attributes.as_ref(),
+                                )
+                        {
+                            legacy.push((hint.map(str::to_owned), version));
+                            continue;
+                        }
                         return Ok(None);
                     };
                     if column
@@ -1047,6 +1060,12 @@ impl Provider {
             } else {
                 None
             };
+            if !legacy.is_empty() {
+                legacy_nodes.push((id, legacy));
+                if column.is_none() {
+                    continue; // Another matched node may supply the declared axis.
+                }
+            }
             let Some(column) = column else {
                 return Ok(None);
             };
@@ -1054,6 +1073,36 @@ impl Provider {
                 return Ok(None);
             }
             common = Some(column);
+        }
+        if !legacy_nodes.is_empty() {
+            let Some(axis) = common.as_ref().filter(|axis| {
+                axis.encoding == Some(query_foundation::sql::EventTimeEncoding::Microseconds)
+            }) else {
+                return Ok(None);
+            };
+            let Some(cache) = context.cache_dir() else {
+                return Ok(None);
+            };
+            for (id, legacy) in legacy_nodes {
+                if legacy
+                    .iter()
+                    .any(|(hint, _)| hint.as_ref().is_some_and(|name| name != &axis.column))
+                {
+                    return Ok(None);
+                }
+                let versions: Vec<_> = legacy.into_iter().map(|(_, v)| v).collect();
+                if !crate::format::jsonlogs::legacy_bounds::verify(
+                    context.persistence.as_ref(),
+                    cache,
+                    id,
+                    &axis.column,
+                    &versions,
+                )
+                .await?
+                {
+                    return Ok(None);
+                }
+            }
         }
         Ok(common)
     }

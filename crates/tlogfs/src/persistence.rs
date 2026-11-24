@@ -6379,7 +6379,13 @@ mod metadata_query_tests {
                 } else {
                     (second * 1_000_000).to_string()
                 };
-                let bytes = format!("{{\"{field}\":\"{timestamp}\",\"value\":1}}\n");
+                let row = format!("{{\"{field}\":\"{timestamp}\",\"value\":1}}\n");
+                // Exercise multiset semantics on the legacy journal chunk.
+                let bytes = row.repeat(if unit == "microseconds" && second == 2 {
+                    2
+                } else {
+                    1
+                });
                 let mut writer = root
                     .async_writer_path_with_type("/events.jsonl", EntryType::FilePhysicalSeries)
                     .await
@@ -6392,13 +6398,19 @@ mod metadata_query_tests {
                         second * 1_000_000,
                         field.to_owned(),
                     );
-                    writer.set_exact_logical_attributes(
-                        serde_json::to_vec(&serde_json::json!({
-                            "watertown.timestamp_column": field,
-                            "watertown.timestamp_unit": unit,
-                        }))
-                        .unwrap(),
-                    );
+                    // The pre-unit journal writer stored bounds but not the
+                    // complete time-axis attributes. A later version is labeled.
+                    if unit != "microseconds" || second != 2 {
+                        writer.set_exact_logical_attributes(
+                            serde_json::to_vec(&serde_json::json!({
+                                "watertown.timestamp_column": field,
+                                "watertown.timestamp_unit": unit,
+                            }))
+                            .unwrap(),
+                        );
+                    } else {
+                        writer.set_exact_logical_attributes(b"{}".to_vec());
+                    }
                 }
                 writer.shutdown().await.unwrap();
             }
@@ -6475,7 +6487,7 @@ mod metadata_query_tests {
             };
             let session = &context.datafusion_session;
             let full = api.create_provider_for_url(url, session).await.unwrap();
-            for lower in [3_000_000, 4_000_000] {
+            for lower in [2_000_000, 3_000_000, 4_000_000] {
                 let predicate = col("timestamp")
                     .gt_eq(lit(ScalarValue::TimestampMicrosecond(Some(lower), None)));
                 let expected = session
@@ -6503,9 +6515,10 @@ mod metadata_query_tests {
                 let display = DisplayableExecutionPlan::new(plan.as_ref())
                     .indent(true)
                     .to_string();
-                assert!(
-                    !display.contains("v2_"),
-                    "indexed old chunk was not pruned: {display}"
+                assert_eq!(
+                    display.contains("v2_"),
+                    lower <= 2_000_000,
+                    "prune the old indexed chunk only above its bound: {display}"
                 );
                 assert!(
                     display.contains("v1_"),
@@ -6516,6 +6529,9 @@ mod metadata_query_tests {
                     lower <= 3_000_000,
                     "append/idle bounds must select only relevant indexed chunks: {display}"
                 );
+                if unit == "microseconds" && lower == 2_000_000 {
+                    assert_eq!(expected.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+                }
                 assert_eq!(frame.collect().await.unwrap(), expected);
             }
             materialize(root.node_path().id(), &context, url, "/materialized").await;
