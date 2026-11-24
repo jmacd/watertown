@@ -5,6 +5,7 @@
 use crate::common::ShipContext;
 use anyhow::{Result, anyhow};
 use log::info;
+use steward::maintenance::PhaseTimer;
 
 /// Run Delta Lake maintenance on both data and control tables.
 ///
@@ -45,10 +46,12 @@ pub async fn maintain_command(
     let pond_path = ship_context.resolve_pond_path()?;
     info!("Running maintenance on pond: {}", pond_path.display());
 
+    let phase = PhaseTimer::start("command", "open");
     let mut ship = ship_context
         .open_pond()
         .await
         .map_err(|e| anyhow!("Failed to open pond: {}", e))?;
+    phase.finish(format_args!("dry_run={dry_run}"));
 
     if dry_run {
         return report_dry_run(
@@ -77,11 +80,13 @@ pub async fn maintain_command(
     // Prune BEFORE maintain so the deletion's tombstones are reclaimed by
     // the checkpoint + vacuum below, in the same maintenance pass.
     let pruned = if prune {
+        let phase = PhaseTimer::start("control", "prune");
         let h =
             crate::commands::control::compute_prune_horizon(&mut ship, keep_txns, allow_no_remote)
                 .await?;
         let deleted =
             crate::commands::control::prune_history_at_horizon(&mut ship, h.horizon).await?;
+        phase.finish(format_args!("horizon={} rows_deleted={deleted}", h.horizon));
         Some((h.horizon, deleted))
     } else {
         None

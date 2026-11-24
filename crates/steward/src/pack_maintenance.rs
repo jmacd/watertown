@@ -90,7 +90,7 @@ use sync_store::content::{
     effective_leaf_schema_fingerprint,
 };
 
-use crate::{StewardError, content_pull, content_tree, pack_store};
+use crate::{StewardError, content_pull, content_tree, maintenance::PhaseTimer, pack_store};
 
 /// Maximum bytes any one File-payload physical pack object may hold.
 /// Physical object boundaries are independent of leaf boundaries: a leaf
@@ -1490,6 +1490,7 @@ pub(crate) async fn run_pack_maintenance(
     txn_meta.pond_id = ship.control_table().pond_id_uuid().to_string();
     let _write_lock = crate::write_lock::WriteLockGuard::try_acquire(&control_dir, &txn_meta)?;
 
+    let phase = PhaseTimer::start("pack", "discover");
     let survey = survey_all_v2_series(ship, Some(threshold)).await?;
     let discovered = classify_discovery(&survey, threshold);
     let pond_root = ship.pond_path().to_path_buf();
@@ -1520,6 +1521,13 @@ pub(crate) async fn run_pack_maintenance(
             .collect();
         requested_content.push((node_id.clone(), versions));
     }
+    phase.finish(format_args!(
+        "surveyed={} candidates={} selected={}",
+        survey.len(),
+        discovered.len(),
+        requested_content.len()
+    ));
+    let phase = PhaseTimer::start("pack", "spool");
     let mut inline_content = content_tree::spool_series_inline_content(
         table.clone(),
         &pond_root,
@@ -1528,7 +1536,12 @@ pub(crate) async fn run_pack_maintenance(
     )
     .await?;
     report.content_delta_scans = inline_content.delta_scans();
+    phase.finish(format_args!(
+        "delta_scans={} inline_bytes={}",
+        report.content_delta_scans, inline_content.bytes_spooled
+    ));
 
+    let phase = PhaseTimer::start("pack", "repack");
     for entry in discovered {
         match entry {
             Discovery::Legacy(_) => {
@@ -1572,6 +1585,11 @@ pub(crate) async fn run_pack_maintenance(
         }
     }
 
+    phase.finish(format_args!(
+        "series={} objects_written={} bytes_written={}",
+        report.series_repacked, report.pack_objects_written, report.pack_bytes_written
+    ));
+    let phase = PhaseTimer::start("pack", "gc");
     // Requirement 2: prune every `series=<hash>` directory whose hash is
     // not among any series currently live pond-wide (independent of this
     // run's `threshold`), only now that every repack above has already
@@ -1608,6 +1626,10 @@ pub(crate) async fn run_pack_maintenance(
     let sweep = pack_store::sweep_unreferenced_pack_objects(&pond_root, &referenced).await?;
     report.pack_objects_removed = sweep.removed;
     report.pack_bytes_freed = sweep.bytes_freed;
+    phase.finish(format_args!(
+        "series_dirs_removed={} objects_removed={} bytes_freed={}",
+        report.series_dirs_removed, report.pack_objects_removed, report.pack_bytes_freed
+    ));
 
     Ok(report)
 }

@@ -1755,6 +1755,7 @@ pub(crate) struct SeriesInlineContentSpool {
     file: tokio::fs::File,
     entries: HashMap<(String, i64), Option<(u64, u64)>>,
     delta_scans: usize,
+    pub(crate) bytes_spooled: u64,
 }
 
 impl SeriesInlineContentSpool {
@@ -1841,6 +1842,7 @@ pub(crate) async fn spool_series_inline_content(
         file: tokio::fs::File::from_std(file),
         entries: HashMap::with_capacity(requested.len()),
         delta_scans: 0,
+        bytes_spooled: 0,
     };
     if requested.is_empty() {
         return Ok(spool);
@@ -1954,6 +1956,7 @@ pub(crate) async fn spool_series_inline_content(
         )));
     }
     spool.file.flush().await?;
+    spool.bytes_spooled = offset;
     Ok(spool)
 }
 

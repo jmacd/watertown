@@ -8,7 +8,7 @@ use crate::{
     RecoveryResult, StewardError, StewardTransactionGuard,
     control_table::{ControlTable, TransactionType},
     get_control_path, get_data_path,
-    maintenance::{self, MaintenanceReport},
+    maintenance::{self, MaintenanceReport, PhaseTimer},
 };
 use anyhow::Result;
 use log::{debug, info, warn};
@@ -1124,17 +1124,11 @@ impl Ship {
             "--collapse-versions".to_string(),
         ]);
 
-        // Coarse candidate count for reporting -- the exact same discovery
-        // `pack_maintenance::run_pack_maintenance` reruns under its own
-        // write lock below; a plain read here, taking no control-table
-        // records and consuming no sequence number.
-        let candidates = self.survey_collapsible_series(threshold).await?;
-
         let maintenance =
             crate::pack_maintenance::run_pack_maintenance(self, threshold, &meta).await?;
 
         let mut report = CollapseReport {
-            candidates: candidates.len(),
+            candidates: maintenance.candidates.len(),
             series_repacked: maintenance.series_repacked,
             content_delta_scans: maintenance.content_delta_scans,
             already_bounded: maintenance.already_bounded,
@@ -1149,7 +1143,12 @@ impl Ship {
         // The reserved manifest index collapses its prior pointer on every
         // content commit. Delete those excluded, obsolete rows regardless of
         // whether a user series needed repacking.
+        let phase = PhaseTimer::start("data", "reclaim_index");
         report.reclaimed = self.reclaim(&meta).await?;
+        phase.finish(format_args!(
+            "rows_deleted={}",
+            report.reclaimed.rows_deleted
+        ));
 
         Ok(report)
     }
@@ -1245,13 +1244,14 @@ impl Ship {
         //    content-preserving, so the pond's `root_tree_hash` must be
         //    byte-identical before and after the optimize (Decision D9, step
         //    5b: the content root subsumes the retired partition checksums).
+        let phase = PhaseTimer::start("data", "root_before");
         let pre = crate::content_tree::compute_content_tree_for_table(
             self.data_persistence.table().clone(),
             &pond_id.to_string(),
         )
         .await
-        .map_err(|e| StewardError::ControlTable(format!("compact: pre snapshot: {}", e)))?
-        .root_tree_hash;
+        .map_err(|e| StewardError::ControlTable(format!("compact: pre snapshot: {}", e)))?;
+        phase.finish(format_args!("nodes_hashed={}", pre.nodes_hashed));
 
         // 3. Run the Delta optimize, scoped to our own pond_id partitions.
         //    Stamp the compaction's txn_seq into the commit's `pond_txn`
@@ -1261,6 +1261,7 @@ impl Ship {
         let mut commit_meta = txn_meta.clone();
         commit_meta.pond_id = pond_id.to_string();
         let app_metadata = commit_meta.to_delta_metadata();
+        let phase = PhaseTimer::start("data", "compact");
         let stats = match maintenance::compact_pond_partitions(
             self.data_persistence.table().clone(),
             pond_id,
@@ -1287,6 +1288,10 @@ impl Ship {
             }
         };
 
+        phase.finish(format_args!(
+            "files_added={} files_removed={}",
+            stats.files_added, stats.files_removed
+        ));
         // 4. No-op: nothing merged.  Write Completed (terminal for a
         //    write-no-op) and do not advance the committed sequence.
         if stats.is_noop() {
@@ -1316,18 +1321,19 @@ impl Ship {
 
         // 5. Post-compaction content root + invariant: content must be
         //    unchanged.
+        let phase = PhaseTimer::start("data", "root_after");
         let post = crate::content_tree::compute_content_tree_for_table(
             self.data_persistence.table().clone(),
             &pond_id.to_string(),
         )
         .await
-        .map_err(|e| StewardError::ControlTable(format!("compact: post snapshot: {}", e)))?
-        .root_tree_hash;
-        if let Err(e) = assert_compaction_invariant(pre, post) {
+        .map_err(|e| StewardError::ControlTable(format!("compact: post snapshot: {}", e)))?;
+        if let Err(e) = assert_compaction_invariant(pre.root_tree_hash, post.root_tree_hash) {
             let reason = format!("{}", e);
             self.record_compact_failed(&txn_meta, started, reason).await;
             return Err(e);
         }
+        phase.finish(format_args!("nodes_hashed={}", post.nodes_hashed));
 
         // 6. Record DataCommitted(Compact) at the new data Delta version.
         //    DataCommitted is the terminal record for a data write in the
