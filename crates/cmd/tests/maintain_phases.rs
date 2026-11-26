@@ -43,6 +43,15 @@ fn maintenance_phases_distinguish_work_noops_and_refused_prune() {
     ] {
         let _ = pond(&args, "warn", true);
     }
+    // Enough independent cold series to cross a discovery batch boundary.
+    // Only the active file below has multiple versions and should be repacked.
+    for n in 0..129 {
+        fs::write(
+            dir.path().join(format!("input.log.{n}")),
+            format!("archived {n}\n"),
+        )
+        .unwrap();
+    }
     for content in ["one\n", "one\ntwo\n"] {
         fs::write(&logs, content).unwrap();
         let _ = pond(&["run", "/ingest", "push"], "warn", true);
@@ -70,6 +79,13 @@ fn maintenance_phases_distinguish_work_noops_and_refused_prune() {
         work.to_owned()
     };
     assert!(phase(&first, "pack", "discover").contains("selected=1"));
+    for run in [&first, &warm] {
+        let detail = run
+            .lines()
+            .find(|l| l.contains("Pack discovery detail"))
+            .unwrap();
+        assert!(detail.contains(" metadata_queries=2 "), "{detail}");
+    }
     assert!(phase(&first, "pack", "spool").contains("delta_scans=1 inline_bytes=8"));
     assert!(phase(&first, "pack", "repack").contains("series=1 "));
     assert!(phase(&warm, "pack", "spool").contains("delta_scans=0 inline_bytes=0"));

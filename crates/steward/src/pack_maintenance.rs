@@ -506,90 +506,143 @@ async fn survey_all_v2_series(
     ship: &mut crate::Ship,
     retain_metadata_above: Option<usize>,
 ) -> Result<Vec<V2SeriesSurvey>, StewardError> {
-    let coarse = ship.survey_collapsible_series(0).await?;
-    let table = ship.data_persistence().table().clone();
     let pond_id = ship.data_persistence().pond_id().to_string();
     let pond_root = ship.pond_path().to_path_buf();
+    let meta = tlogfs::PondUserMetadata::new(vec!["pond".into(), "survey-packs".into()]);
+    let tx = ship.begin_read(&meta).await?;
+    let result = survey_snapshot(&tx.state()?, &pond_root, &pond_id, retain_metadata_above).await;
+    _ = tx.commit().await?;
+    result
+}
 
+async fn survey_snapshot(
+    state: &tlogfs::persistence::State,
+    pond_root: &Path,
+    pond_id: &str,
+    retain_metadata_above: Option<usize>,
+) -> Result<Vec<V2SeriesSurvey>, StewardError> {
+    let coarse = state.survey_collapsible_series(0).await?;
+    // Both queries see the same Delta snapshot. The sort can spill under
+    // the pond's configured DataFusion memory pool instead of an unlimited one.
+    let ctx = state.session_context().await?;
     let mut out = Vec::with_capacity(coarse.len());
-    for candidate in coarse {
-        let entry_type = candidate.file_id.entry_type();
-        if !matches!(
-            entry_type,
-            EntryType::FilePhysicalSeries | EntryType::TablePhysicalSeries
-        ) {
-            // The coarse discovery SQL itself only ever selects these two
-            // kinds; this is a defensive check, not an expected path.
-            continue;
-        }
-        let file_id = candidate.file_id;
-        let live_versions = candidate.live_versions;
-        let node_id = file_id.node_id().to_string();
-        let ordered_meta =
-            content_tree::read_series_live_metadata_ordered(table.clone(), &pond_id, &node_id)
-                .await?;
-
-        // A genuinely pre-v2 series carries no `logical_leaf_hash` on *any*
-        // row (v2 leaf stamping never ran) -- not corruption, simply a
-        // physical layout this maintenance does not yet cover.
-        // `build_series_manifest` cannot even be called on it: it treats
-        // any nonempty leafless row as corrupt, which is the right call
-        // for a genuinely mixed v1/v2 series but not for one that is
-        // wholly pre-v2.
-        let has_any_v2_identity = ordered_meta.iter().any(|v| v.logical_leaf_hash.is_some());
-        if !has_any_v2_identity {
-            out.push(V2SeriesSurvey {
-                file_id,
-                live_versions,
-                kind: V2SeriesSurveyKind::Legacy,
-            });
-            continue;
-        }
-
-        let (manifest, _meta) = content_tree::build_series_manifest(entry_type, &ordered_meta)?;
-        let series_hash = manifest.hash();
-        let (current_physical_objects, best_pack_hash) =
-            current_pack_fanout(&pond_root, series_hash, &manifest).await?;
-        let proposed_physical_objects =
-            proposed_physical_objects(entry_type, &manifest, &ordered_meta)?;
-        let retained_metadata = retain_metadata_above
-            .is_some_and(|threshold| live_versions > threshold)
-            .then_some(ordered_meta);
-
-        // For a table series, a matching layout marker on the current best
-        // full-range pack is a stronger, exact signal than the row-count
-        // estimate above (which the byte safeguard can make inaccurate):
-        // it means *this* deterministic layout already produced that exact
-        // pack, so re-repacking it would be a no-op no matter how its
-        // actual object count compares to the estimate (requirement 3).
-        let already_deterministic = match (entry_type, best_pack_hash) {
-            (EntryType::TablePhysicalSeries, Some(pack_hash)) => {
-                table_pack_is_current_deterministic_layout(&pond_root, series_hash, pack_hash)
-                    .await?
+    let mut metadata_queries = 0;
+    let mut max_history_rows = 0;
+    let mut metadata_time = std::time::Duration::ZERO;
+    let mut series_time = std::time::Duration::ZERO;
+    let mut pending = coarse.as_slice();
+    while !pending.is_empty() {
+        // Cap both SQL predicate size and estimated live metadata per batch.
+        // A single large history is processed alone, never split across folds.
+        let mut count = 1;
+        let mut live_versions = pending[0].live_versions;
+        for series in pending.iter().take(128).skip(1) {
+            live_versions = live_versions.saturating_add(series.live_versions);
+            if live_versions > 4096 {
+                break;
             }
-            _ => false,
-        };
+            count += 1;
+        }
+        let (batch, rest) = pending.split_at(count);
+        pending = rest;
+        let start = std::time::Instant::now();
+        let (metadata, batch_peak) =
+            content_tree::read_series_live_metadata_ordered(&ctx, pond_id, batch).await?;
+        max_history_rows = max_history_rows.max(batch_peak);
+        metadata_queries += 1;
+        metadata_time += start.elapsed();
+        let start = std::time::Instant::now();
+        for candidate in batch {
+            let file_id = candidate.file_id;
+            let ordered_meta = match metadata.get(&file_id.node_id().to_string()) {
+                Some(versions) => versions.as_slice(),
+                // As in the point lookup, only this pond's rows supply
+                // local packs. A foreign-only node has no local identity.
+                None if file_id.pond_id().to_string() != pond_id => &[],
+                None => {
+                    return Err(StewardError::Content(format!(
+                        "pack discovery: missing metadata for surveyed series {file_id}"
+                    )));
+                }
+            };
+            out.push(
+                survey_one_series(pond_root, candidate, ordered_meta, retain_metadata_above)
+                    .await?,
+            );
+        }
+        series_time += start.elapsed();
+    }
+    log::debug!(target: "pond::maintain_phases",
+        "Pack discovery detail surveyed={} metadata_queries={metadata_queries} metadata_ms={} manifest_and_layout_ms={} max_history_rows={max_history_rows}",
+        out.len(), metadata_time.as_millis(), series_time.as_millis());
+    Ok(out)
+}
 
-        out.push(V2SeriesSurvey {
+async fn survey_one_series(
+    pond_root: &Path,
+    candidate: &tlogfs::CollapsibleSeries,
+    ordered_meta: &[content_tree::SeriesVersionData],
+    retain_metadata_above: Option<usize>,
+) -> Result<V2SeriesSurvey, StewardError> {
+    let file_id = candidate.file_id;
+    let live_versions = candidate.live_versions;
+    let entry_type = file_id.entry_type();
+    // A genuinely pre-v2 series carries no `logical_leaf_hash` on *any*
+    // row (v2 leaf stamping never ran) -- not corruption, simply a
+    // physical layout this maintenance does not yet cover.
+    // `build_series_manifest` cannot even be called on it: it treats
+    // any nonempty leafless row as corrupt, which is the right call
+    // for a genuinely mixed v1/v2 series but not for one that is
+    // wholly pre-v2.
+    let has_any_v2_identity = ordered_meta.iter().any(|v| v.logical_leaf_hash.is_some());
+    if !has_any_v2_identity {
+        return Ok(V2SeriesSurvey {
             file_id,
             live_versions,
-            kind: V2SeriesSurveyKind::V2(Box::new(V2SeriesDetails {
-                entry_type,
-                series_hash,
-                manifest,
-                ordered_meta: retained_metadata,
-                current_physical_objects,
-                proposed_physical_objects: if already_deterministic {
-                    current_physical_objects
-                } else {
-                    proposed_physical_objects
-                },
-                existing_pack_hash: best_pack_hash,
-                already_deterministic,
-            })),
+            kind: V2SeriesSurveyKind::Legacy,
         });
     }
-    Ok(out)
+
+    let (manifest, _meta) = content_tree::build_series_manifest(entry_type, ordered_meta)?;
+    let series_hash = manifest.hash();
+    let (current_physical_objects, best_pack_hash) =
+        current_pack_fanout(pond_root, series_hash, &manifest).await?;
+    let proposed_physical_objects = proposed_physical_objects(entry_type, &manifest, ordered_meta)?;
+    let retained_metadata = retain_metadata_above
+        .is_some_and(|threshold| live_versions > threshold)
+        .then(|| ordered_meta.to_vec());
+
+    // For a table series, a matching layout marker on the current best
+    // full-range pack is a stronger, exact signal than the row-count
+    // estimate above (which the byte safeguard can make inaccurate):
+    // it means *this* deterministic layout already produced that exact
+    // pack, so re-repacking it would be a no-op no matter how its
+    // actual object count compares to the estimate (requirement 3).
+    let already_deterministic = match (entry_type, best_pack_hash) {
+        (EntryType::TablePhysicalSeries, Some(pack_hash)) => {
+            table_pack_is_current_deterministic_layout(pond_root, series_hash, pack_hash).await?
+        }
+        _ => false,
+    };
+
+    Ok(V2SeriesSurvey {
+        file_id,
+        live_versions,
+        kind: V2SeriesSurveyKind::V2(Box::new(V2SeriesDetails {
+            entry_type,
+            series_hash,
+            manifest,
+            ordered_meta: retained_metadata,
+            current_physical_objects,
+            proposed_physical_objects: if already_deterministic {
+                current_physical_objects
+            } else {
+                proposed_physical_objects
+            },
+            existing_pack_hash: best_pack_hash,
+            already_deterministic,
+        })),
+    })
 }
 
 /// Filter/classify one [`survey_all_v2_series`] pass down to exactly what

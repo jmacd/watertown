@@ -1960,7 +1960,7 @@ pub(crate) async fn spool_series_inline_content(
     Ok(spool)
 }
 
-/// Read one series node's current *live* versions' identity/bookkeeping
+/// Read a batch of series nodes' current *live* versions' identity/bookkeeping
 /// metadata only, oldest first -- everything [`build_series_manifest`] and
 /// pack-maintenance candidacy need (`logical_leaf_hash`, `logical_count`,
 /// `series_schema_fingerprint`, event-time bounds, extended attributes,
@@ -1979,41 +1979,95 @@ pub(crate) async fn spool_series_inline_content(
 /// this feeds ([`build_series_manifest`], [`current_pack_fanout`]) reads
 /// `content` at all, so leaving it unset is correct, not merely convenient.
 ///
+/// Returns live metadata by node and the largest number of stored rows
+/// buffered in the node fold (excluding DataFusion's input batches).
+///
 /// # Errors
 ///
 /// Returns an error if the series rows cannot be read or deserialized.
 pub(crate) async fn read_series_live_metadata_ordered(
-    table: deltalake::DeltaTable,
+    ctx: &SessionContext,
     pond_id: &str,
-    node_id: &str,
-) -> Result<Vec<SeriesVersionData>, StewardError> {
-    let ctx = SessionContext::new();
-    let provider = table
-        .table_provider()
-        .await
-        .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
-    let _previous = ctx
-        .register_table("series_live", provider)
-        .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
+    nodes: &[tlogfs::CollapsibleSeries],
+) -> Result<(HashMap<String, Vec<SeriesVersionData>>, usize), StewardError> {
+    let ids = nodes
+        .iter()
+        .map(|n| format!("'{}'", n.file_id.node_id()))
+        .collect::<Vec<_>>()
+        .join(", ");
     let sql = format!(
-        "SELECT version, timestamp, blake3, collapsed_from, collapsed_through, \
+        "SELECT node_id, version, timestamp, blake3, collapsed_from, collapsed_through, \
          min_event_time, max_event_time, extended_attributes, logical_leaf_hash, \
-         logical_count, series_schema_fingerprint, size FROM series_live \
-         WHERE pond_id = '{pond_id}' AND node_id = '{node_id}' ORDER BY version",
+         logical_count, series_schema_fingerprint, size FROM delta_table \
+         WHERE pond_id = '{pond_id}' AND node_id IN ({ids}) ORDER BY node_id, version",
     );
-    let batches = ctx
+    let mut batches = ctx
         .sql(&sql)
         .await
         .map_err(|e| StewardError::DeltaLake(e.to_string()))?
-        .collect()
+        .execute_stream()
         .await
         .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
-    let mut rows: Vec<SeriesVersionMetaRow> = Vec::new();
-    for batch in &batches {
-        let parsed: Vec<SeriesVersionMetaRow> = serde_arrow::from_record_batch(batch)
+    let mut fold = SeriesMetadataFold::default();
+    while let Some(batch) = batches.next().await {
+        let batch = batch.map_err(|e| StewardError::DeltaLake(e.to_string()))?;
+        let parsed: Vec<SeriesVersionMetaRow> = serde_arrow::from_record_batch(&batch)
             .map_err(|e| StewardError::DeltaLake(e.to_string()))?;
-        rows.extend(parsed);
+        fold.extend(pond_id, parsed)?;
     }
+    fold.flush(pond_id)?;
+    Ok((fold.live, fold.max_history_rows))
+}
+
+/// A batch is sized by *live* versions. Do not retain the potentially much
+/// larger superseded histories of more than one node between Arrow batches.
+#[derive(Default)]
+struct SeriesMetadataFold {
+    history: Vec<SeriesVersionMetaRow>,
+    live: HashMap<String, Vec<SeriesVersionData>>,
+    max_history_rows: usize,
+}
+
+impl SeriesMetadataFold {
+    fn extend(
+        &mut self,
+        pond_id: &str,
+        rows: Vec<SeriesVersionMetaRow>,
+    ) -> Result<(), StewardError> {
+        for row in rows {
+            if self
+                .history
+                .last()
+                .is_some_and(|last| last.node_id != row.node_id)
+            {
+                self.flush(pond_id)?;
+            }
+            self.history.push(row);
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self, pond_id: &str) -> Result<(), StewardError> {
+        let Some(first) = self.history.first_mut() else {
+            return Ok(());
+        };
+        let node_id = std::mem::take(&mut first.node_id);
+        let desc = format!("{pond_id}/{node_id}");
+        self.max_history_rows = self.max_history_rows.max(self.history.len());
+        let versions = ordered_series_metadata(std::mem::take(&mut self.history), &desc)?;
+        if self.live.insert(node_id, versions).is_some() {
+            return Err(StewardError::Content(format!(
+                "pack discovery: noncontiguous metadata for {desc}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn ordered_series_metadata(
+    rows: Vec<SeriesVersionMetaRow>,
+    node_desc: &str,
+) -> Result<Vec<SeriesVersionData>, StewardError> {
     let ranges: Vec<(i64, CollapseRange)> = rows
         .iter()
         .map(|r| {
@@ -2023,7 +2077,6 @@ pub(crate) async fn read_series_live_metadata_ordered(
             )
         })
         .collect();
-    let node_desc = format!("{pond_id}/{node_id}");
     let mut versions: BTreeMap<i64, SeriesVersionData> = BTreeMap::new();
     for row in rows {
         let version = row.version;
@@ -2039,7 +2092,7 @@ pub(crate) async fn read_series_live_metadata_ordered(
             row.logical_count,
             &row.series_schema_fingerprint,
             row.size,
-            &node_desc,
+            node_desc,
         )?;
         let _ = versions.insert(version, data);
     }
@@ -2053,6 +2106,7 @@ pub(crate) async fn read_series_live_metadata_ordered(
 /// the inline `content` column -- see [`read_series_live_metadata_ordered`].
 #[derive(serde::Deserialize)]
 struct SeriesVersionMetaRow {
+    node_id: String,
     version: i64,
     timestamp: i64,
     blake3: Option<String>,
@@ -3622,6 +3676,55 @@ fn leaf_facts<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pack_metadata_folds_superseded_history_one_node_at_a_time() {
+        use tlogfs::schema::ForArrow;
+        const HISTORY: i64 = 257;
+        let root = tinyfs::FileID::root();
+        let nodes: Vec<_> = (0..8)
+            .map(|_| tlogfs::CollapsibleSeries {
+                file_id: root.new_child_id(EntryType::FilePhysicalSeries),
+                live_versions: 2,
+                total_bytes: 2,
+            })
+            .collect();
+        let mut entries = Vec::new();
+        // Interleave owners; the last version replaces [1, HISTORY - 1],
+        // so its content precedes the remaining loose version.
+        for version in (1..=HISTORY + 1).rev() {
+            for (i, node) in nodes.iter().enumerate() {
+                let mut row =
+                    OplogEntry::new_small_file(node.file_id, i as i64, version, vec![1], 1);
+                if version == HISTORY + 1 {
+                    row.collapsed_from = Some(1);
+                    row.collapsed_through = Some(HISTORY - 1);
+                }
+                entries.push(row);
+            }
+        }
+        let batch = serde_arrow::to_record_batch(&OplogEntry::for_arrow(), &entries).unwrap();
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_batch_size(31));
+        let _ = ctx.register_batch("delta_table", batch).unwrap();
+        let (live, peak) =
+            read_series_live_metadata_ordered(&ctx, &root.pond_id().to_string(), &nodes)
+                .await
+                .unwrap();
+        assert_eq!(
+            peak,
+            (HISTORY + 1) as usize,
+            "buffer one stored history, not all eight"
+        );
+        assert_eq!(live.len(), nodes.len());
+        for (i, node) in nodes.iter().enumerate() {
+            let versions = &live[&node.file_id.node_id().to_string()];
+            assert_eq!(
+                versions.iter().map(|v| v.version).collect::<Vec<_>>(),
+                [HISTORY + 1, HISTORY]
+            );
+            assert!(versions.iter().all(|v| v.meta.timestamp == Some(i as i64)));
+        }
+    }
 
     #[tokio::test]
     async fn commit_log_reads_externalized_leaves_only_in_requested_suffix() {

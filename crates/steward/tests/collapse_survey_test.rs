@@ -178,18 +178,25 @@ async fn the_survey_agrees_with_what_collapse_repacks() {
     );
     assert_eq!(report.candidates, predicted.len());
 
+    // The packed series is below this new threshold, but still a GC root.
+    // Run twice: the first sweep only marks an unreferenced pack stale.
+    for _ in 0..2 {
+        let below = ship.collapse_versions(VERSIONS).await.expect("GC pass");
+        assert_eq!(below.candidates, 0);
+    }
+
     // A repeated survey now finds nothing left to repack: the bounded layout
     // just published already satisfies the same threshold.
     let resurvey = ship
         .survey_pack_maintenance(1)
         .await
         .expect("resurvey after real maintenance");
-    assert!(
-        resurvey
-            .iter()
-            .all(|c| c.outcome != PackCandidateOutcome::NeedsRepack),
-        "a repeated survey must find nothing left to repack once maintenance has settled: \
-         {resurvey:?}"
+    assert_eq!(resurvey.len(), 1);
+    assert_eq!(resurvey[0].series_hash, predicted_repacks[0].series_hash);
+    assert_eq!(
+        resurvey[0].outcome,
+        PackCandidateOutcome::AlreadyBounded,
+        "below-threshold GC must preserve the selected pack: {resurvey:?}"
     );
 }
 
