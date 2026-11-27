@@ -237,26 +237,24 @@ export function buildDailyStackedAreaSpec(rows, opts = {}) {
   const domain = [...new Set(order), ...[...categories].filter((s) => !order.includes(s)).sort()];
   const dates = [...byDay.keys()].sort((a, b) => a - b);
   const values = [];
-  let segment = 0;
-  for (let i = 0; i < dates.length; i++) {
-    const timestamp = dates[i];
-    if (i && timestamp !== dates[i - 1] + dayMs) segment++;
+  let windowTotal = 0;
+  for (const timestamp of dates) {
     const counts = byDay.get(timestamp);
     const total = [...counts.values()].reduce((a, b) => a + b, 0);
     if (!Number.isSafeInteger(total)) throw new Error("Daily total exceeds exact browser numeric precision.");
-    const daily = domain.map((series, rank) => ({
-      timestamp, series, rank, segment, total,
+    windowTotal += total;
+    if (!Number.isSafeInteger(windowTotal)) throw new Error("Window total exceeds exact browser numeric precision.");
+    values.push(...domain.map((series, rank) => ({
+      timestamp, end: timestamp + dayMs, series, rank, total,
       day: new Date(timestamp).toISOString().slice(0, 10),
       period: timestamp === today ? "Partial day" : "Past UTC day",
       // Only a day with reported rows establishes absent categories as zero.
       value: counts.get(series) || 0,
-    }));
-    values.push(...daily);
-    if (dates[i + 1] !== timestamp + dayMs) {
-      values.push(...daily.map((row) => ({ ...row, timestamp: timestamp + dayMs })));
-    }
+    })));
   }
+  const latest = values[values.length - 1];
   return {
+    summary: { windowTotal, latestDay: latest.day, latestTotal: latest.total },
     spec: {
       $schema: "https://vega.github.io/schema/vega-lite/v5.json",
       width: "container",
@@ -276,22 +274,23 @@ export function buildDailyStackedAreaSpec(rows, opts = {}) {
           data: { values },
           transform: [{
             stack: "value",
-            groupby: ["timestamp", "segment"],
+            groupby: ["timestamp"],
             sort: [{ field: "rank", order: "ascending" }],
             as: ["lower", "upper"],
           }],
-          mark: { type: "area", interpolate: "step-after", clip: true },
+          // Each section occupies a whole UTC-day interval. A Vega area can be
+          // split into one zero-width path per day by its tooltip fields.
+          mark: { type: "rect", clip: true },
           encoding: {
             x: {
               field: "timestamp", type: "temporal",
               scale: { type: "utc", domain: [start, end], nice: false },
               axis: { title: "UTC day", format: "%b %d" },
             },
+            x2: { field: "end" },
             y: { field: "upper", type: "quantitative", scale: { zero: true }, title: yTitle },
             y2: { field: "lower" },
             color: { field: "series", type: "nominal", scale: { domain, scheme: "tableau10" }, title: null },
-            detail: { field: "segment", type: "nominal" },
-            order: { field: "timestamp", type: "temporal" },
             tooltip: [
               { field: "day", type: "nominal", title: "UTC day" },
               { field: "series", type: "nominal", title: "Series" },

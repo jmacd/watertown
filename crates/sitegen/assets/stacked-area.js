@@ -9,6 +9,7 @@ import { loadVega, buildDailyStackedAreaSpec } from "./vega-shared.js";
   const container = document.getElementById("stacked-area");
   const manifestEl = container?.querySelector('script.stacked-area-data[type="application/json"]');
   if (!manifestEl) return;
+  let errorTarget = container;
   try {
     const manifest = JSON.parse(manifestEl.textContent);
     const optionsEl = document.querySelector('script.stacked-area-options[type="application/json"]');
@@ -41,10 +42,12 @@ import { loadVega, buildDailyStackedAreaSpec } from "./vega-shared.js";
       await conn.close();
       await db.terminate();
     }
-    const { spec, error } = buildDailyStackedAreaSpec(rows, {
-      days: Number(options.days || 30),
+    const days = Number(options.days || 30);
+    const yTitle = options.y_title || options.y || "Count";
+    const { spec, summary, error } = buildDailyStackedAreaSpec(rows, {
+      days,
       order: (options.order || "").split(",").map((s) => s.trim()).filter(Boolean),
-      yTitle: options.y_title || options.y || "Count",
+      yTitle,
       theme: { fg: getComputedStyle(document.body).getPropertyValue("--fg").trim() || "#333333" },
     });
     if (error) {
@@ -52,15 +55,18 @@ import { loadVega, buildDailyStackedAreaSpec } from "./vega-shared.js";
       return;
     }
     const note = document.createElement("p");
-    note.textContent = "UTC days; today is partial. Gaps mean no reported data, not confirmed zero.";
+    note.textContent = `${yTitle} in the last ${days} UTC days: ${summary.windowTotal.toLocaleString()}. ` +
+      `Latest reported day (${summary.latestDay} UTC): ${summary.latestTotal.toLocaleString()}. ` +
+      "Today is partial. Gaps mean no reported data, not confirmed zero.";
     const plot = document.createElement("div");
     plot.style.width = "100%";
     container.replaceChildren(note, plot);
+    errorTarget = plot; // Keep verified counts visible even if plotting fails.
     const embed = await loadVega();
     const { view } = await embed(plot, spec, { actions: false, renderer: "svg" });
     window.addEventListener("pagehide", () => view.finalize(), { once: true });
   } catch (error) {
     console.error("stacked-area: render failed", error);
-    container.textContent = "Chart unavailable: data could not be loaded or rendered.";
+    errorTarget.textContent = "Chart unavailable: data could not be loaded or rendered.";
   }
 })();

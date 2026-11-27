@@ -14,7 +14,7 @@ const options = { now: today + 3600000, days: 4, order: ["Blog", "Monitoring"] }
 const row = (day, series, value) => ({ timestamp: today + day * DAY, series, value });
 
 test("daily stacks preserve totals and leave whole missing days as gaps", () => {
-  const { spec } = buildDailyStackedAreaSpec([
+  const { spec, summary } = buildDailyStackedAreaSpec([
     row(-3, "Blog", 2), row(-3, "Monitoring", 3),
     row(-2, "Blog", 4), row(0, "Monitoring", 7),
   ], options);
@@ -23,16 +23,14 @@ test("daily stacks preserve totals and leave whole missing days as gaps", () => 
   assert.equal(area.encoding.x.scale.type, "utc");
   assert.deepEqual(area.encoding.x.scale.domain, [today - 3 * DAY, today + DAY]);
   assert.equal(area.encoding.y.scale.zero, true);
-  assert.equal(area.mark.interpolate, "step-after");
-  assert.equal(area.encoding.detail.field, "segment");
+  assert.equal(area.encoding.x2.field, "end");
   assert.equal(area.transform[0].stack, "value");
   const observed = data.filter((r) => r.timestamp === Date.parse(`${r.day}T00:00:00Z`));
   assert.deepEqual(observed.map((r) => r.value), [2, 3, 4, 0, 0, 7]);
   assert.deepEqual(observed.map((r) => r.total), [5, 5, 4, 4, 7, 7]);
-  assert.deepEqual([...new Set(observed.map((r) => r.segment))], [0, 1]);
   assert.ok(!observed.some((r) => r.timestamp === today - DAY));
-  assert.equal(Math.max(...data.filter((r) => r.segment === 0).map((r) => r.timestamp)), today - DAY);
-  assert.equal(Math.min(...data.filter((r) => r.segment === 1).map((r) => r.timestamp)), today);
+  assert.ok(data.every((r) => r.end === r.timestamp + DAY));
+  assert.deepEqual(summary, { windowTotal: 16, latestDay: "2026-11-08", latestTotal: 7 });
   assert.ok(observed.filter((r) => r.timestamp === today).every((r) => r.period === "Partial day"));
 });
 
@@ -115,7 +113,7 @@ test("the renderer loads Parquet once, quotes mapped fields, and converts Arrow 
   assert.ok(result.queries[0].includes('"reported.views" AS value'));
   assert.ok(result.queries[0].includes('"site.section" AS VARCHAR'));
   assert.equal(result.rendered[0].layer[1].data.values[0].value, 3);
-  assert.match(result.container.children[0].textContent, /today is partial/);
+  assert.match(result.container.children[0].textContent, /last 30 UTC days: 3\. Latest reported day \(2026-11-08 UTC\): 3\./);
   assert.deepEqual(result.closed, ["conn", "db"]);
   assert.equal(result.errors.length, 0);
 });
