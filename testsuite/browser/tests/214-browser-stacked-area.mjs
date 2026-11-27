@@ -62,13 +62,17 @@ try {
   const result = await page.evaluate(() => ({
     error: window.__fixtureError,
     text: document.getElementById("stacked-area").textContent,
-    areas: [...document.querySelectorAll("#stacked-area svg g.mark-area path")]
-      .filter((path) => path.getBBox().height > 0).length,
+    bands: [...document.querySelectorAll('#stacked-area svg .role-mark path[aria-label*="Daily total"]')]
+      .filter((path) => {
+        const { width, height } = path.getBBox();
+        return width > 0 && height > 0;
+      }).length,
   }));
   assert.equal(result.error, undefined);
   assert.deepEqual(errors, []);
-  assert.ok(result.areas >= 3, JSON.stringify(result));
-  assert.match(result.text, /today is partial/);
+  assert.equal(result.bands, 3, "the three nonzero day/section counts must paint visible bands");
+  assert.match(result.text, /last 4 UTC days: 10\. Latest reported day \(\d{4}-\d{2}-\d{2} UTC\): 7\./);
+  assert.match(result.text, /Today is partial/);
   assert.match(result.text, /UTC day/);
   assert.match(result.text, /Blog/);
   assert.match(result.text, /Monitoring/);

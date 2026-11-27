@@ -195,7 +195,7 @@ try {
   check(dottedPaths > 0, `dotted-column spec drew line geometry (${dottedPaths})`);
 
   const daily = await tab.evaluate(() => {
-    const paths = [...document.querySelectorAll("#daily svg g.mark-area path")];
+    const paths = [...document.querySelectorAll('#daily svg .role-mark path[aria-label*="Daily total"]')];
     const width = window.__dailyView.width();
     const boxes = paths.map((path) => {
       const box = path.getBBox();
@@ -216,7 +216,8 @@ try {
   });
   check(daily.axis, "stacked area labels the UTC axis");
   check(JSON.stringify(daily.totals) === "[5,4,7]", `Vega stacks actual daily totals (${daily.totals})`);
-  check(daily.boxes.filter((box) => box.height > 0).length >= 3, "stacked area draws both runs, including an isolated day");
+  check(daily.boxes.filter((box) => box.end > box.x && box.height > 0).length === 4,
+    "each nonzero section paints a visible day-wide band, including on an isolated day");
   check(daily.boxes.every((box) => box.end <= daily.width / 2 + 0.1 || box.x >= daily.width * 3 / 4 - 0.1),
     "no area polygon bridges the missing UTC day");
 
